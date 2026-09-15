@@ -1,0 +1,9 @@
+{
+  "name": "agent-swarm",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "build-agents": "bun scripts/ts/build_agents.ts"
+  }
+}

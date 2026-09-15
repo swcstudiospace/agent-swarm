@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /root/src/repos/agent-swarm/hooks/user_prompt_submit.py"
+          }
+        ]
+      }
+    ]
+  }
+}
