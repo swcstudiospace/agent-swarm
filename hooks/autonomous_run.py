@@ -50,7 +50,8 @@ def acquire(lock: Path) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cwd", default=".", help="target application repo")
-    ap.add_argument("--brief", required=True)
+    ap.add_argument("--brief", required=True, help="the user's original prompt (classification + dedupe key)")
+    ap.add_argument("--spec", default="", help="uplifted XML spec file; when readable, A01 plans from it instead of --brief")
     ap.add_argument("--runtime", default="auto", choices=["auto", "claude", "grok"])
     ap.add_argument("--swarm-root", default=os.environ.get("SWARM_ROOT", str(Path(__file__).resolve().parent.parent)))
     ap.add_argument("--dry-run", action="store_true")
@@ -68,11 +69,10 @@ def main() -> int:
     if not acquire(lock):
         log.write_text((log.read_text() if log.exists() else "") + f"skip duplicate {digest}\n")
         return 0
-    env = {**os.environ, "SWARM_DIR": str(swarm_dir)}
-    plan = [
-        sys.executable, str(root / "scripts" / "orch_plan.py"),
-        "--brief-text", args.brief, "--pattern", pattern_for(args.brief), "--json",
-    ]
+    env = {**os.environ, "SWARM_DIR": str(swarm_dir), "SWARM_CHILD": "1", "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
+    spec = Path(args.spec) if args.spec and Path(args.spec).is_file() else None
+    plan = [sys.executable, str(root / "scripts" / "orch_plan.py"), "--pattern", pattern_for(args.brief), "--json"]
+    plan += ["--brief", str(spec)] if spec else ["--brief-text", args.brief]
     run = [
         sys.executable, str(root / "scripts" / "swarm_run.py"),
         "--repo", str(repo), "--runtime", args.runtime, "--json",
@@ -86,6 +86,7 @@ def main() -> int:
             json.dumps({
                 "brief": args.brief[:500],
                 "repo": str(repo),
+                "spec": str(spec) if spec else None,
                 "plan_rc": p1.returncode,
                 "run_rc": p2.returncode,
                 "plan_out": p1.stdout[-4000:],

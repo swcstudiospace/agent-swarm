@@ -120,7 +120,9 @@ def resolve_runtime(explicit: str) -> str:
 
 def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
-    env = dict(os.environ, SWARM_DIR=str(SWARM_DIR.resolve()))
+    # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
+    # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
+    env = dict(os.environ, SWARM_DIR=str(SWARM_DIR.resolve()), SWARM_CHILD="1", AIO_UPLIFT="0", AIO_SWARM="0")
     if runtime == "grok":
         grok_bin = getattr(args, "grok_bin", "grok")
         cmd = [grok_bin, "-p", "--agent", agent["slug"], "--output-format", "json",

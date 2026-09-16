@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-open UserPromptSubmit hook: inject AgentSwarm orchestration on SDLC-shaped prompts."""
+"""Fail-open UserPromptSubmit hook: inject AgentSwarm orchestration on SDLC-shaped prompts.
+
+Skips entirely inside headless swarm agent sessions (SWARM_CHILD=1)."""
 from __future__ import annotations
 import json
+import os
 import re
 import sys
 
@@ -49,25 +52,13 @@ def main() -> int:
             print("{}")
             return 0
         prompt = extract_prompt(payload)
-        cwd = ""
-        if isinstance(payload, dict):
-            cwd = str(payload.get("cwd") or payload.get("cwd_path") or "")
-        if classify(prompt):
+        if os.environ.get("SWARM_CHILD") == "1":
+            # Headless swarm agent session: never re-inject orchestration or re-kick the swarm.
+            print("{}")
+        elif classify(prompt):
+            # Context only. The detached runner is started once by the all-in-one plugin
+            # after Prompt Uplift finishes (src/swarm/kickoff.ts), not here in parallel.
             json.dump({"additionalContext": CONTEXT}, sys.stdout)
-            try:
-                import os
-                import subprocess
-                from pathlib import Path
-                if os.environ.get("AIO_SWARM") != "0":
-                    runner = Path(__file__).resolve().parent / "autonomous_run.py"
-                    subprocess.Popen(
-                        [sys.executable, str(runner), "--cwd", cwd or ".", "--brief", prompt, "--runtime", "auto"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-            except Exception:
-                pass
         else:
             print("{}")
     except Exception:

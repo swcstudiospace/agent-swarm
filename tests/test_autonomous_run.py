@@ -47,3 +47,22 @@ def test_autonomous_skips_trivia(tmp_path):
     )
     assert r.returncode == 0
     assert not (tmp_path / ".swarm" / "autonomous.log").exists()
+
+
+def test_autonomous_plans_from_uplifted_spec(tmp_path):
+    """The brief classifies the kick; the uplifted spec (when given) is what A01 plans from."""
+    spec = tmp_path / "spec.xml"
+    spec.write_text("<task><goal>Add invoice PDF export</goal><acceptance>PDF matches fixture</acceptance></task>\n")
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement invoice export",
+         "--spec", str(spec), "--swarm-root", str(ROOT), "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
+    assert log["plan_rc"] == 0
+    assert log["spec"] == str(spec)
+    corr = (tmp_path / ".swarm" / "latest_correlation").read_text().strip()
+    plan = json.loads((tmp_path / ".swarm" / "plans" / f"{corr}.json").read_text())
+    assert plan["brief"].strip() == spec.read_text().strip()
