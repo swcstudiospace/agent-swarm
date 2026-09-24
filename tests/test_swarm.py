@@ -11,18 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-@pytest.fixture()
-def swarm_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
-    # reload modules that cache SWARM_DIR at import time
-    for m in [m for m in list(sys.modules) if m.startswith("swarm")]:
-        del sys.modules[m]
-    return tmp_path / ".swarm"
-
-
-def run_script(name, *args, env=None):
-    cmd = [sys.executable, str(ROOT / "scripts" / name), *args]
-    return subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **(env or {})}, cwd=ROOT)
+from conftest import run_script  # noqa: E402
 
 
 # ---------------------------------------------------------------- envelope

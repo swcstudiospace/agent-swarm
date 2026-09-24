@@ -16,7 +16,6 @@ applied between rounds by the Task Store.
 from __future__ import annotations
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -32,8 +31,8 @@ from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
 from swarm.runlog import SWARM_DIR  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
 
-JSON_BLOCK = re.compile(r"```json\s*(\{.*?\})\s*```", re.S)
 
 
 def latest_correlation() -> str | None:
@@ -175,96 +174,7 @@ def canned_result(task: dict, agent: dict) -> str:
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
 
 
-def parse_result(text: str) -> dict | None:
-    blocks = JSON_BLOCK.findall(text or "")
-    for raw in reversed(blocks):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
-def apply_result(store: TaskStore, task: dict, agent: dict, result: dict | None, meta: dict, ctx) -> str:
-    tid = task["task_id"]
-    ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta, "parsed": bool(result)})
-    if result is None:
-        store.transition(tid, S.FAILED, reason="no JSON result block from agent")
-        return "FAILED"
-    store.set_notes(tid, result=result, meta=meta)
-    state = str(result.get("state", "IN_REVIEW")).upper()
-    for o in result.get("outputs", []) or []:
-        store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""), version=str(o.get("version", "1")),
-                           digest=o.get("digest", ""), producer=agent["id"])
-    if state == "BLOCKED":
-        store.transition(tid, S.BLOCKED, reason=str(result.get("needs", "blocked"))[:500])
-        return "BLOCKED"
-    if state == "FAILED":
-        store.transition(tid, S.FAILED, reason=json.dumps(result.get("error", {}))[:500])
-        return "FAILED"
-    # gate task: record verdicts on targets
-    gate = task["notes_json"].get("gate")
-    if gate:
-        verdicts = result.get("verdicts") or {}
-        if not verdicts and result.get("verdict"):
-            verdicts = {t: {"verdict": result["verdict"], "findings": result.get("findings", [])} for t in task["notes_json"]["gate_for"]}
-        for target, v in verdicts.items():
-            verdict = v.get("verdict", "fail")
-            if verdict == "waive" and not v.get("waived_by"):
-                verdict = "fail"  # self-waive is E-POLICY
-            store.record_verdict(target, gate, verdict, agent["id"], v.get("findings", []))
-            if verdict == "fail":
-                fb = store.get(target)["notes_json"].get("feedback", [])
-                fb.append({"gate": gate, "findings": v.get("findings", [])})
-                store.set_notes(target, feedback=fb)
-    store.transition(tid, S.IN_REVIEW, reason="agent reported IN_REVIEW")
-    return "IN_REVIEW"
-
-
-def reconcile(store: TaskStore, corr: str, ctx) -> list[str]:
-    """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework."""
-    notes_log = []
-    for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
-        tid = t["task_id"]
-        latest = store.latest_verdicts(tid)
-        failing = [g for g in store.required_gates(tid) if latest.get(g, {}).get("verdict") == "fail"]
-        if failing:
-            before = t["rework_loops"]
-            nt = store.transition(tid, S.CHANGES_REQUESTED, reason=f"gates failed: {failing}")
-            if nt["state"] == S.ESCALATED.value:
-                ctx.emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": failing,
-                                                "options": ["human review", "cancel", "waive gate (L3)"]})
-                notes_log.append(f"{tid}: ESCALATED after {before} rework loops")
-            else:
-                store.transition(tid, S.IN_PROGRESS, reason="rework loop")
-                notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
-                # reopen gate tasks that target this task so they re-run after rework
-                for g in store.list(correlation_id=corr):
-                    if tid in g["notes_json"].get("gate_for", []) and g["state"] in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value):
-                        new_id = f"{g['task_id']}.r{nt['rework_loops']}"
-                        try:
-                            store.get(new_id)
-                        except SwarmError:
-                            store.create(task_id=new_id, correlation_id=corr, capability=g["capability"], title=g["title"] + " (rerun)",
-                                         agent_id=g["agent_id"], dag_depth=g["dag_depth"], depends_on=g["depends_on"],
-                                         acceptance=g["acceptance"], budget=g["budget"], risk_class=g["risk_class"],
-                                         priority=g["priority"], notes={k: v for k, v in g["notes_json"].items() if k not in ("result", "meta")})
-                            store.transition(new_id, S.VALIDATED)
-                            store.transition(new_id, S.PLANNED, reason="gate rerun")
-                            # downstream of the old gate must now wait for the rerun too
-                            for d in store.list(correlation_id=corr):
-                                if g["task_id"] in d["depends_on"] and new_id not in d["depends_on"] and d["state"] not in (S.DONE.value,):
-                                    store.update(d["task_id"], depends_on=d["depends_on"] + [new_id])
-            continue
-        if not store.missing_gates(tid):
-            store.transition(tid, S.APPROVED, reason="all required gates pass")
-            store.transition(tid, S.DONE, reason="approved")
-            notes_log.append(f"{tid}: DONE")
-    # rework: a task in IN_PROGRESS from rework must become ready again — handled by dispatch (state IN_PROGRESS w/ rework)
-    return notes_log
-
-
-def dispatchable(store: TaskStore, corr: str) -> list[dict]:
+def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
     ready = store.ready(corr)
     # rework tasks sit in IN_PROGRESS with no running session; treat them as ready too
     for t in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
@@ -276,6 +186,8 @@ def dispatchable(store: TaskStore, corr: str) -> list[dict]:
             ready.append(store.get(t["task_id"]))
         else:
             store.transition(t["task_id"], S.ESCALATED, reason="max_attempts reached")
+            emit("escalation.request", {"task_id": t["task_id"], "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
+                                        "options": ["human review", "cancel", "re-plan"]})
     return ready
 
 
@@ -297,7 +209,14 @@ def execute_one(store_path, task, agent, args, ctx, repo):
             text, meta = run_agent_headless(agent, prompt, repo, args)
         (SWARM_DIR / "results").mkdir(parents=True, exist_ok=True)
         (SWARM_DIR / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
-        outcome = apply_result(store, task, agent, parse_result(text), meta, ctx)
+        ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
+        store.set_notes(tid, meta=meta)
+        try:
+            result = validate_result(parse_result(text), task_id=tid)
+        except SwarmError as e:
+            outcome = reject(store, tid, reason=str(e), mode="headless", emit=ctx.emit)
+        else:
+            outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit, mode="headless")
     except subprocess.TimeoutExpired:
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
         outcome = "FAILED"
@@ -324,8 +243,8 @@ def run(args, ctx) -> dict:
     log, rounds = [], 0
     while True:
         rounds += 1
-        log += reconcile(store, corr, ctx)
-        ready = dispatchable(store, corr)
+        log += reconcile(store, corr, ctx.emit)
+        ready = dispatchable(store, corr, ctx.emit)
         if not ready:
             remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
             if remaining:
@@ -347,7 +266,7 @@ def run(args, ctx) -> dict:
                 print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
         if args.once or rounds >= args.max_rounds:
             break
-    log += reconcile(store, corr, ctx)
+    log += reconcile(store, corr, ctx.emit)
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}
     for t in tasks:
