@@ -18,7 +18,7 @@ a Claude Code and Grok Build subagent whose Prompt-Uplift XML prompt lives in `p
 | `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier |
 | `swarm/` | Runtime toolkit: envelope (signed `swarm.v1`), Task Store (SQLite state machine), gates, manifest, run log |
 | `scripts/` | Per-agent tools (see table below) + orchestration (`orch_plan.py`, `orch_status.py`, `swarm_run.py`) |
-| `.swarm/` | Runtime state (task DB, plans, verdicts, assignments, results, `events.jsonl`). Git-ignored. `SWARM_DIR` overrides. |
+| `.swarm/` | Runtime state (task DB, plans, verdicts, assignments, results, `events.jsonl`). Resolved per call: `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. Created with its own `.gitignore` of `*`. |
 | `tests/` | `pytest -q` |
 
 ## Agent → subagent → scripts

@@ -94,7 +94,7 @@ flowchart LR
 | `03-agents/` | Original 7-section agent specs (Purpose, Stack, Communication, Decision logic, Errors, Metrics, Security) |
 | `hooks/` | `user_prompt_submit.py` and `autonomous_run.py` |
 | `.claude/agents/`, `.grok/agents/`, `.trae/`, `skills/` | **Generated.** Never hand-edit |
-| `.swarm/` | Runtime state, git-ignored: `tasks.db`, `events.jsonl`, `plans/`, `assignments/`, `results/`, `verdicts/`, `kickoffs/`, `releases/`, `artifacts/`, `slo/`, `incidents/`, `patch_tasks/` |
+| `.swarm/` | Runtime state (own `.gitignore` of `*`, written on creation; the repo's `.gitignore` is never touched): `tasks.db`, `events.jsonl`, `plans/`, `assignments/`, `results/`, `verdicts/`, `kickoffs/`, `releases/`, `artifacts/`, `slo/`, `incidents/`, `patch_tasks/` |
 | `docs/superpowers/specs/` | Spec for the prompt uplift, TS twins, skills and hooks |
 
 ## Development Commands
@@ -112,7 +112,7 @@ python3 scripts/build_trae_agents.py                  # .trae/                  
 python3 scripts/_write_skills.py                      # skills/ (overwrites everything; has no --check)
 python3 scripts/build_agents.py --install-workspace /path/to/ws   # copy agents, skills and hooks into another workspace
 
-# run the swarm in isolation (SWARM_DIR otherwise defaults to ./.swarm under the CWD)
+# run the swarm in isolation (SWARM_DIR otherwise defaults to <git toplevel of --root or cwd>/.swarm)
 export SWARM_DIR=/tmp/sw/.swarm
 python3 scripts/orch_plan.py --brief-text "Add /health" --pattern feature --risk-class medium
 python3 scripts/swarm_run.py --dry-run --json         # no model calls; canned results
@@ -192,7 +192,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 - **Bun** runs the TS twins (`#!/usr/bin/env bun`). There are no npm dependencies, no lockfile and no `node_modules`.
 - **Python is canonical.** Put logic in the Python script; TS twins pass through, and the TS generators call the Python ones.
 - **`claude` must be on PATH** for real runs, even with `--runtime grok`: `swarm_run.py` calls `claude auth status`.
-- **Resolve `SWARM_DIR` explicitly.** It is read **at import time**, relative to the current directory, and `--root` does not move it. TS passthroughs run with cwd set to this repo. Set `SWARM_DIR` explicitly when running from elsewhere or in tests.
+- **State dir resolution (`swarm/paths.py`).** Resolved per call, never at import: env `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. `swarm_run.py` and `hooks/autonomous_run.py` pass the absolute path to children. Creating the dir writes `.swarm/.gitignore` = `*` (never overwritten). Tests still set `SWARM_DIR` explicitly.
 - **Other env vars:** `SWARM_AGENTS_FILE`, `SWARM_RUNTIME`, `SWARM_DRYRUN_FAIL`, `SWARM_CHILD`, `SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY`.
 - **No git repo of its own.** This directory has no `.git`; it is untracked under `/root/src/repos`.
 - **Host-specific absolute paths.** `.mcp.json`, `skills/orchestrate/SKILL.md` and `.grok/hooks/agent-swarm.json` hard-code `/root/src/repos/agent-swarm`.
@@ -206,7 +206,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 **Isolation**
 - Tests run scripts as subprocesses (`[sys.executable, ...]`, `cwd=ROOT`).
 - They set `SWARM_DIR` to `tmp_path`.
-- `test_swarm.py`'s `swarm_dir` fixture purges the cached `swarm*` modules, because `SWARM_DIR` is read at import time.
+- The `swarm_dir` fixture in `tests/conftest.py` purges the cached `swarm*` modules (harmless; resolution is lazy).
 
 **Invariants the tests pin** — keep these true when editing:
 - **Prompt tags.** Each `prompts/A*.md` has `<agent id="Axx"` and these 20 tag pairs: role, inputs, outputs, output_format, tools, decision_logic, autonomy, error_handling, metrics, security, constraints, system_role, scope, out_of_scope, workflow, acceptance_criteria, states, graph_of_thought, graceful_degradation, security_and_validation. It must also contain `<script path=`, `python3 scripts/` and `scripts/ts/`, and end with `</agent>`.
