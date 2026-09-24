@@ -82,3 +82,20 @@ def test_gitignore_not_overwritten(tmp_path, monkeypatch):
     first, second = swarm_dir(create=True), swarm_dir(create=True)
     assert first == second
     assert (tmp_path / ".swarm" / ".gitignore").read_text() == "custom"
+
+
+def test_swarm_run_children_get_absolute_dir(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps(ONE_TASK))
+    env = {**_env_without_swarm_dir(), "SWARM_DIR": "rel/.swarm"}
+    p = _run("orch_plan.py", "--plan", str(plan), "--json", cwd=work, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    r = _run("swarm_run.py", "--dry-run", "--repo", str(tmp_path), "--json", cwd=work, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    sdir = (work / "rel" / ".swarm").resolve()
+    assert (sdir / "events.jsonl").exists() and (sdir / "results").is_dir()
+    logs = [q for q in tmp_path.rglob("events.jsonl")]
+    assert logs == [sdir / "events.jsonl"]
+    assert json.loads(r.stdout)["complete"] is True

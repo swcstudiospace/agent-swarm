@@ -4,7 +4,7 @@
  * Mirrors swarm/script_base.py: --task-id --correlation-id --root --json --dry-run
  * Exit 0 ok / 1 finding-fail / 2 taxonomy error.
  */
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export const EXIT = { OK: 0, FAIL: 1, ERROR: 2 } as const;
@@ -34,13 +34,20 @@ export function parseAgentArgs(argv: string[]): AgentArgs {
 }
 
 function swarmDir(root: string): string {
-  return process.env.SWARM_DIR || resolve(root, ".swarm");
+  // D-10: env SWARM_DIR (made absolute) → <git toplevel of root>/.swarm → <root>/.swarm
+  if (process.env.SWARM_DIR) return resolve(process.env.SWARM_DIR);
+  const git = Bun.spawnSync(["git", "-C", root, "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "ignore" });
+  const top = git.exitCode === 0 ? git.stdout.toString().trim() : "";
+  return top ? resolve(top, ".swarm") : resolve(root, ".swarm");
 }
 
 function emitEvent(root: string, payload: Record<string, unknown>): void {
   const dir = swarmDir(root);
   if (!existsSync(dir) && !process.env.SWARM_DIR) return;
   mkdirSync(dir, { recursive: true });
+  try {
+    writeFileSync(resolve(dir, ".gitignore"), "*", { flag: "wx" }); // D-11: never overwrite
+  } catch {}
   const line = JSON.stringify({ ts: new Date().toISOString(), ...payload }) + "\n";
   appendFileSync(resolve(dir, "events.jsonl"), line);
 }

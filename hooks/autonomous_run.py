@@ -64,8 +64,9 @@ def main() -> int:
         return 0
     root = Path(args.swarm_root).resolve()
     repo = Path(args.cwd).resolve()
-    swarm_dir = Path(os.environ.get("SWARM_DIR", str(root / ".swarm")))
-    swarm_dir.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(root))
+    from swarm.paths import swarm_dir as resolve_swarm_dir
+    swarm_dir = resolve_swarm_dir(repo, create=True)  # absolute; exported to both children
     digest = hashlib.sha256(f"{repo}|{args.brief}".encode()).hexdigest()[:16]
     lock = swarm_dir / "kickoffs" / f"{digest}.lock"
     log = swarm_dir / "autonomous.log"
