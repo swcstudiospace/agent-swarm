@@ -61,24 +61,19 @@ def reject(store: TaskStore, task_id: str, *, reason: str, mode: str, emit: Emit
     return store.get(task_id)["state"]
 
 
-def _record_agent_verdicts(store: TaskStore, task: dict, agent_id: str, result: dict) -> None:
-    gate = task["notes_json"].get("gate")
+def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
+    """A gate agent's verdicts{} is advisory text only (D-12): fail entries become feedback on the gate task's own
+    gate_for targets. Verdict rows are written solely by the gate scripts (swarm.verdicts)."""
+    notes = task["notes_json"]
+    gate = notes.get("gate")
     if not gate:
         return
-    verdicts = result.get("verdicts") or {}
-    if not verdicts and result.get("verdict"):
-        verdicts = {t: {"verdict": result["verdict"], "findings": result.get("findings", [])} for t in task["notes_json"]["gate_for"]}
-    for target, v in verdicts.items():
-        if target not in task["notes_json"].get("gate_for", []):
-            continue  # an agent may only judge the tasks its gate task targets
-        verdict = v.get("verdict", "fail")
-        if verdict == "waive" and not v.get("waived_by"):
-            verdict = "fail"  # self-waive is E-POLICY
-        store.record_verdict(target, gate, verdict, agent_id, v.get("findings", []))
-        if verdict == "fail":
-            fb = store.get(target)["notes_json"].get("feedback", [])
-            fb.append({"gate": gate, "findings": v.get("findings", [])})
-            store.set_notes(target, feedback=fb)
+    for target, v in (result.get("verdicts") or {}).items():
+        if target not in notes.get("gate_for", []) or not isinstance(v, dict) or v.get("verdict") != "fail":
+            continue
+        fb = store.get(target)["notes_json"].get("feedback", [])
+        fb.append({"gate": gate, "source": "agent", "findings": v.get("findings", [])})
+        store.set_notes(target, feedback=fb)
 
 
 def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, meta: dict, emit: Emit, mode: str) -> str:
@@ -108,8 +103,8 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
     for o in result.get("outputs", []) or []:
         store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""), version=str(o.get("version", "1")),
                            digest=o.get("digest", ""), producer=agent_id)
-    if target is S.IN_REVIEW and mode == "headless":
-        _record_agent_verdicts(store, task, agent_id, result)
+    if target is S.IN_REVIEW:
+        _agent_verdict_feedback(store, task, result)
     return store.get(tid)["state"]
 
 

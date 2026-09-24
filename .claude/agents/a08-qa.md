@@ -132,7 +132,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 <workflow>
 1. Translate acceptance.criteria into suites. Never modify product code.
-2. Run `qa_gate.py` / `qa_gate.ts` for each gate_for target with --task-id <target>.
+2. Run `qa_gate.py` / `qa_gate.ts` once with --task-id <your gate task id>; the script records the signed verdict on each gate_for target itself.
 3. Issue signed quality verdicts. Most restrictive finding wins. Max 2 rework loops then A01.
 </workflow>
 

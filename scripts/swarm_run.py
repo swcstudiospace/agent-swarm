@@ -4,8 +4,8 @@
 Each ready task is dispatched to its agent as a headless session
     claude -p --agent <slug> --output-format json --permission-mode <mode> "<task.assign prompt>"
 run from --repo (the codebase being worked on
-defaults to cwd). Gate tasks record
-verdicts on their targets
+defaults to cwd). Gate agents run their gate script once with their own gate task id; the script
+records signed verdicts on the gate task's Task Store gate_for targets (the runner writes none).
 A01 rules (fail-closed gates, bounded rework, escalation) are
 applied between rounds by the Task Store.
 
@@ -31,6 +31,7 @@ from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
 from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
 
 
@@ -66,8 +67,10 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path) -> 
     gate_note = ""
     if notes.get("gate"):
         gate_note = (f"\n## Gate instructions\nYou are issuing the **{notes['gate']}** gate for tasks {notes['gate_for']}. "
-                     f"Run your gate script with `--task-id <target>` for EACH target, then report one JSON with "
-                     f"`\"gate\": \"{notes['gate']}\"` and `\"verdicts\": {{\"<target_task_id>\": {{\"verdict\": \"pass|fail\", \"findings\": [...]}}}}`.")
+                     f"Run your gate script ONCE with `--task-id {task['task_id']}` (this gate task's own id); the script "
+                     f"records the signed verdict on each gate_for target itself. Then report one JSON with "
+                     f"`\"gate\": \"{notes['gate']}\"` and `\"verdicts\": {{\"<target_task_id>\": {{\"verdict\": \"pass|fail\", \"findings\": [...]}}}}` "
+                     f"(advisory: fail findings become rework feedback; only script-written verdicts count).")
     return f"""# task.assign (signed envelope)
 ```json
 {json.dumps(env, indent=2)}
@@ -144,15 +147,10 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     return text, meta
 
 
-def _simulated_failures() -> set[str]:
-    """SWARM_DRYRUN_FAIL='T-be:quality,T-fe:review' makes those dry-run gate verdicts fail every time."""
-    return {x.strip() for x in os.environ.get("SWARM_DRYRUN_FAIL", "").split(",") if x.strip()}
-
-
 def canned_result(task: dict, agent: dict) -> str:
     notes = task["notes_json"]
     if notes.get("gate"):
-        fails = _simulated_failures()
+        fails = simulated_failures()
         verdicts = {}
         for t in notes["gate_for"]:
             if f"{t}:{notes['gate']}" in fails:
@@ -167,6 +165,18 @@ def canned_result(task: dict, agent: dict) -> str:
                    "outputs": [{"kind": task["capability"], "uri": f"dry://{task['task_id']}", "version": "1", "digest": ""}],
                    "metrics": {}, "summary_md": f"dry-run output of {agent['id']} for {task['title']}"}
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
+
+
+def run_gate_script(task: dict, repo: Path, sdir: Path) -> None:
+    """Dry-run stand-in for the gate agent's tool call: the real gate script, --dry-run, on the gate task's own id."""
+    script = ROOT / "scripts" / f"{GATE_SCRIPTS[task['notes_json']['gate']]}.py"
+    cmd = [sys.executable, str(script), "--dry-run", "--task-id", task["task_id"],
+           "--correlation-id", task["correlation_id"], "--root", str(repo), "--json"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                          env=dict(os.environ, SWARM_DIR=str(Path(sdir).resolve())))
+    if proc.returncode == 2:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed: {(proc.stdout or proc.stderr)[-400:]}",
+                         task_id=task["task_id"])
 
 
 def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
@@ -200,6 +210,8 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
         (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
+            if task["notes_json"].get("gate"):
+                run_gate_script(task, repo, sdir)
             text, meta = canned_result(task, agent), {"dry_run": True}
         else:
             text, meta = run_agent_headless(agent, prompt, repo, args)

@@ -134,3 +134,40 @@ def test_record_verdict_binds_envelope_task(swarm_dir):
     with pytest.raises(SwarmError) as e:
         ts.record_verdict("T-b", env)
     assert e.value.code.value == "E-CONTRACT"
+
+
+def test_runner_inserts_no_verdicts(swarm_dir):
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    r = run_script("swarm_run.py", "--dry-run", "--json", env=env)
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-800:]
+    con = sqlite3.connect(swarm_dir / "tasks.db")
+    gates = {tid: json.loads(n) for tid, n in con.execute("SELECT task_id, notes FROM tasks")}
+    con.close()
+    gate_tasks = {t: n for t, n in gates.items() if n.get("gate")}
+    rows = _rows(swarm_dir)
+    assert rows and {x["agent_id"] for x in rows} <= {"A08@dry", "A09@dry", "A10@dry", "A12@dry"}
+    assert len(rows) == sum(len(n["gate_for"]) for n in gate_tasks.values())
+    for x in rows:
+        assert any(x["task_id"] in n["gate_for"] and n["gate"] == x["gate"] for n in gate_tasks.values())
+    for gid, n in gate_tasks.items():
+        payload = json.loads((swarm_dir / "verdicts" / f"{gid}.{n['gate']}.json").read_text())["payload"]
+        assert payload["task_id"] == gid
+
+
+def test_ingest_gate_result_no_rows(tmp_path, swarm_dir):
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    targets = _notes(swarm_dir, "X-qa")["gate_for"]
+    fnd = [{"id": "Q-1", "severity": "major", "kind": "functional", "summary": "broken"}]
+    res = {"task_id": "X-qa", "gate": "quality", "state": "IN_REVIEW",
+           "verdicts": {targets[0]: {"verdict": "fail", "findings": fnd}, targets[1]: {"verdict": "pass", "findings": []},
+                        "X-rel": {"verdict": "pass", "findings": []}}}
+    f = tmp_path / "r.json"
+    f.write_text(json.dumps(res))
+    r = run_script("orch_status.py", "--ingest", str(f), "--json", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _rows(swarm_dir) == []
+    assert _notes(swarm_dir, targets[0])["feedback"] == [{"gate": "quality", "source": "agent", "findings": fnd}]
+    assert "feedback" not in _notes(swarm_dir, targets[1])
+    assert _notes(swarm_dir, "X-qa")["result"]["verdicts"] == res["verdicts"]

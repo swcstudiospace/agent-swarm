@@ -109,7 +109,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 <workflow>
 1. Read the diff and bound contracts. Do not edit product code.
-2. Run `rev_gate.py` / `rev_gate.ts` per target. Structured findings only.
+2. Run `rev_gate.py` / `rev_gate.ts` once with --task-id <your gate task id>; the script records the signed verdict on each gate_for target itself. Structured findings only.
 3. Waive is L3. Emit review gate.verdict.
 </workflow>
 

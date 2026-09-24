@@ -110,7 +110,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 <workflow>
 1. SAST/secrets/deps/IaC/threat-model. Do not edit product code. Never accept risk (L4 human).
-2. Run `sec_gate.py` / `sec_gate.ts` per target. Fail-closed. Emit security gate.verdict.
+2. Run `sec_gate.py` / `sec_gate.ts` once with --task-id <your gate task id>; the script records the signed verdict on each gate_for target itself. Fail-closed. Emit security gate.verdict.
 </workflow>
 
 

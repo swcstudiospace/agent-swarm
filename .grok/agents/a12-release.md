@@ -138,7 +138,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 <workflow>
 1. Confirm required gates green for the risk class. Plan canary + rollback.
-2. Run `rel_plan.py` / `rel_plan.ts`. High-risk prod promote is L4 — BLOCKED.
+2. Run `rel_plan.py` / `rel_plan.ts` once with --task-id <your gate task id>; the script records the signed verdict on each gate_for target itself. High-risk prod promote is L4 — BLOCKED.
 3. Emit release.plan and release gate.verdict.
 </workflow>
 
