@@ -40,7 +40,7 @@ class Ctx:
 
     def emit(self, event_type: str, payload: dict, *, task_id: str | None = None) -> dict:
         return emit(event_type, payload, source=f"{self.agent_id}@{self.script}",
-                    correlation_id=self.correlation_id, task_id=task_id or self.task_id or payload.get("task_id"))
+                    correlation_id=self.correlation_id, task_id=task_id or self.task_id or payload.get("task_id"), root=self.root)
 
 
 class AgentScript:

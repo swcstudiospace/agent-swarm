@@ -14,7 +14,8 @@ from .envelope import build_envelope, validate_envelope, sign_envelope, verify_e
 from .taskstore import TaskStore, TaskState
 from .gates import make_verdict, validate_verdict, conjunction
 from .manifest import load_manifest, get_agent, AGENTS_FILE
-from .runlog import emit, SWARM_DIR
+from .runlog import emit
+from .paths import swarm_dir
 
 __version__ = "1.0.0"
 __all__ = [
@@ -23,5 +24,5 @@ __all__ = [
     "TaskStore", "TaskState",
     "make_verdict", "validate_verdict", "conjunction",
     "load_manifest", "get_agent", "AGENTS_FILE",
-    "emit", "SWARM_DIR",
+    "emit", "swarm_dir",
 ]

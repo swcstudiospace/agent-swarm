@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 HEAD_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
@@ -132,8 +132,8 @@ def run(args, ctx) -> dict:
         f["id"] = f"DF-{i+1:03d}"
     log = changelog(ctx.root, args.since) if args.changelog else None
     index = {"root": str(ctx.root), "docs": docs, "coverage": cov, "findings": findings, "changelog_md": log}
-    SWARM_DIR.mkdir(parents=True, exist_ok=True)
-    (SWARM_DIR / "docs_index.json").write_text(json.dumps(index, indent=2))
+    swarm_dir(ctx.root, create=True)
+    (swarm_dir(ctx.root) / "docs_index.json").write_text(json.dumps(index, indent=2))
     broken = sum(len(d["broken_links"]) for d in docs)
     status = "fail" if any(f["severity"] in ("major", "critical", "blocker") for f in findings) else "ok"
     return {"status": status, "index": docs, "coverage": cov, "changelog_md": log, "findings": findings,

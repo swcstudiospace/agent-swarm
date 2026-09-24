@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_verdict, make_finding, SEVERITIES  # noqa: E402
 from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
@@ -177,12 +177,12 @@ def run(args, ctx) -> dict:
                        extra={"mode": "rules+semantic" if args.findings_file else "rules-only",
                               "diff_base": base or "whole-tree", "stats": {k: v for k, v in stats.items() if k != "per_file"}})
     verdict = env["payload"]["verdict"]
-    out_dir = SWARM_DIR / "verdicts"
+    out_dir = swarm_dir(ctx.root) / "verdicts"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{task}.review.json").write_text(json.dumps(env, indent=2))
     if args.task_id:
         try:
-            TaskStore().record_verdict(args.task_id, "review", verdict, "A09", findings, expires_s=172800)
+            TaskStore(root=ctx.root).record_verdict(args.task_id, "review", verdict, "A09", findings, expires_s=172800)
         except SwarmError as e:
             if e.code is not ErrorCode.E_INPUT:
                 raise

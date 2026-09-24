@@ -14,14 +14,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR, read_events  # noqa: E402
+from swarm.runlog import read_events  # noqa: E402
+from swarm.paths import latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
-
-
-def latest_correlation() -> str | None:
-    f = SWARM_DIR / "latest_correlation"
-    return f.read_text().strip() if f.exists() else None
 
 
 def ingest(store: TaskStore, path: Path, ctx) -> dict:
@@ -49,8 +45,8 @@ def ingest(store: TaskStore, path: Path, ctx) -> dict:
 
 
 def run(args, ctx) -> dict:
-    store = TaskStore()
-    corr = ctx.correlation_id or latest_correlation()
+    store = TaskStore(root=ctx.root)
+    corr = ctx.correlation_id or latest_correlation(ctx.root)
 
     if args.history:
         return {"status": "ok", "task_id": args.history, "history": store.history(args.history),
@@ -89,7 +85,7 @@ def run(args, ctx) -> dict:
                      f"{'yes' if r['ready'] else '':<6}{gates}")
     lines.append(f"\ncounts: {counts}   escalated: {escalated or 'none'}   complete: {done}")
     return {"status": "ok", "correlation_id": corr, "tasks": rows, "counts": counts, "escalated": escalated,
-            "complete": done, "events": len(read_events(correlation_id=corr)), "summary": "\n".join(lines)}
+            "complete": done, "events": len(read_events(correlation_id=corr, root=ctx.root)), "summary": "\n".join(lines)}
 
 
 def add_args(p):

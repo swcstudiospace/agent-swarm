@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 
 SRC_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".sh", ".yaml", ".yml")
 DEBT_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b|\bdeprecated\b", re.I)
@@ -169,13 +169,13 @@ def run(args, ctx) -> dict:
                                      f"{d['name']} is {d['pin']} ({d['spec'] or 'no version'})", location=d["file"], owner_suggestion="A14"))
     out = outdated(ctx.root, deps)
     debt = debt_register(ctx.root, args.max_age_days)
-    SWARM_DIR.mkdir(parents=True, exist_ok=True)
-    (SWARM_DIR / "debt_register.json").write_text(json.dumps(debt, indent=2))
+    swarm_dir(ctx.root, create=True)
+    (swarm_dir(ctx.root) / "debt_register.json").write_text(json.dumps(debt, indent=2))
     tasks = []
     if args.cve_file:
         cves = json.loads(Path(args.cve_file).read_text())
         tasks = cve_match(cves if isinstance(cves, list) else cves.get("cves", []), deps, args.task_id or "T-unassigned", ctx.correlation_id)
-        tdir = SWARM_DIR / "patch_tasks"
+        tdir = swarm_dir(ctx.root) / "patch_tasks"
         tdir.mkdir(exist_ok=True)
         for t in tasks:
             (tdir / f"{t['payload']['task_id']}.json").write_text(json.dumps(t, indent=2))

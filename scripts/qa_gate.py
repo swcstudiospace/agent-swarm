@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
 from swarm.gates import make_verdict, make_finding  # noqa: E402
 from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
@@ -107,12 +107,12 @@ def run(args, ctx) -> dict:
     env = make_verdict(gate="quality", task_id=args.task_id or "T-unassigned", agent_id="A08@local",
                        findings=findings, runs=runs, correlation_id=ctx.correlation_id)
     verdict = env["payload"]["verdict"]
-    out_dir = SWARM_DIR / "verdicts"
+    out_dir = swarm_dir(ctx.root) / "verdicts"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{args.task_id or 'T-unassigned'}.quality.json").write_text(json.dumps(env, indent=2))
     if args.task_id:
         try:
-            TaskStore().record_verdict(args.task_id, "quality", verdict, "A08", findings)
+            TaskStore(root=ctx.root).record_verdict(args.task_id, "quality", verdict, "A08", findings)
         except SwarmError as e:
             if e.code is not ErrorCode.E_INPUT:
                 raise

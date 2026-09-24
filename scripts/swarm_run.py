@@ -29,15 +29,10 @@ from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
 from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
 
-
-
-def latest_correlation() -> str | None:
-    f = SWARM_DIR / "latest_correlation"
-    return f.read_text().strip() if f.exists() else None
 
 
 def upstream_context(store: TaskStore, task: dict) -> str:
@@ -121,7 +116,7 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
-    env = dict(os.environ, SWARM_DIR=str(SWARM_DIR.resolve()), SWARM_CHILD="1", AIO_UPLIFT="0", AIO_SWARM="0")
+    env = dict(os.environ, SWARM_DIR=str(swarm_dir(repo)), SWARM_CHILD="1", AIO_UPLIFT="0", AIO_SWARM="0")
     if runtime == "grok":
         grok_bin = getattr(args, "grok_bin", "grok")
         cmd = [grok_bin, "-p", "--agent", agent["slug"], "--output-format", "json",
@@ -193,6 +188,7 @@ def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
 
 def execute_one(store_path, task, agent, args, ctx, repo):
     store = TaskStore(store_path)  # sqlite: one connection per thread
+    sdir = store.path.parent
     tid = task["task_id"]
     if task["state"] != S.IN_PROGRESS.value:
         store.transition(tid, S.CLAIMED, reason=f"awarded to {agent['id']}")
@@ -201,14 +197,14 @@ def execute_one(store_path, task, agent, args, ctx, repo):
     try:
         task = store.get(tid)
         prompt = assignment_prompt(store, task, agent, repo)
-        (SWARM_DIR / "assignments").mkdir(parents=True, exist_ok=True)
-        (SWARM_DIR / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
+        (sdir / "assignments").mkdir(parents=True, exist_ok=True)
+        (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
             text, meta = canned_result(task, agent), {"dry_run": True}
         else:
             text, meta = run_agent_headless(agent, prompt, repo, args)
-        (SWARM_DIR / "results").mkdir(parents=True, exist_ok=True)
-        (SWARM_DIR / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        (sdir / "results").mkdir(parents=True, exist_ok=True)
+        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
         try:
@@ -229,7 +225,11 @@ def execute_one(store_path, task, agent, args, ctx, repo):
 
 
 def run(args, ctx) -> dict:
-    corr = ctx.correlation_id or latest_correlation()
+    repo = Path(args.repo).resolve()
+    sdir = swarm_dir(repo, create=True)
+    # one absolute state dir for this process and every child it spawns (D-10)
+    os.environ["SWARM_DIR"] = str(sdir)
+    corr = ctx.correlation_id or latest_correlation(repo)
     if not corr:
         raise SwarmError(ErrorCode.E_INPUT, "no plan found — run scripts/orch_plan.py first")
     ctx.correlation_id = corr
@@ -237,9 +237,8 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_DEP, f"{args.claude_bin} not on PATH (use --dry-run to simulate)")
     if not args.dry_run:
         preflight_auth(args.claude_bin)
-    repo = Path(args.repo).resolve()
-    store = TaskStore()
-    store_path = store.path
+    store_path = sdir / "tasks.db"
+    store = TaskStore(store_path)
     log, rounds = [], 0
     while True:
         rounds += 1

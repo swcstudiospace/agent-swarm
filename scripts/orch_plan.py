@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.manifest import by_capability  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 # (suffix, capability, agent, title, depends_on suffixes, gate spec)
@@ -104,7 +104,7 @@ def run(args, ctx) -> dict:
                 "tasks": [{"task_id": f"{prefix}-{r[0]}", "capability": r[1], "agent": r[2], "depends_on": r[4]} for r in rows],
                 "summary": f"dry-run: would create {len(rows)} tasks"}
 
-    store = TaskStore()
+    store = TaskStore(root=ctx.root)
     created = []
     depth = {}
     for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:
@@ -129,10 +129,11 @@ def run(args, ctx) -> dict:
     plan = {"correlation_id": corr, "pattern": args.pattern, "risk_class": args.risk_class, "brief": brief,
             "tasks": [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
                       | {"gates": store.required_gates(t["task_id"]), "notes": t["notes_json"]} for t in created]}
-    plans = SWARM_DIR / "plans"
+    sdir = swarm_dir(ctx.root, create=True)
+    plans = sdir / "plans"
     plans.mkdir(parents=True, exist_ok=True)
     (plans / f"{corr}.json").write_text(json.dumps(plan, indent=2))
-    (SWARM_DIR / "latest_correlation").write_text(corr)
+    (sdir / "latest_correlation").write_text(corr)
     ctx.correlation_id = corr
     ctx.emit("plan.updated", {"pattern": args.pattern, "task_count": len(created)})
     lines = [f"{t['task_id']:<14} {t['agent_id']:<4} d={t['dag_depth']} ← {','.join(t['depends_on']) or '-'}" for t in created]

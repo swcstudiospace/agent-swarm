@@ -6,13 +6,13 @@ which is validated and applied by the orchestrator scripts.
 """
 from __future__ import annotations
 import json
-import os
 import sqlite3
 import time
 from enum import Enum
 from pathlib import Path
 
 from .errors import SwarmError, ErrorCode
+from .paths import swarm_dir
 
 
 class TaskState(str, Enum):
@@ -55,8 +55,6 @@ DEFAULT_MAX_ATTEMPTS = 3
 GATES_BY_RISK = {"low": ["review"], "medium": ["review", "quality"],
                  "high": ["review", "quality", "security", "release"]}
 
-DEFAULT_DB = Path(os.environ.get("SWARM_DIR", ".swarm")) / "tasks.db"
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL, parent_id TEXT,
@@ -86,8 +84,8 @@ _JSON_COLS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
 
 
 class TaskStore:
-    def __init__(self, path: str | Path | None = None):
-        self.path = Path(path or DEFAULT_DB)
+    def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
+        self.path = Path(path) if path else swarm_dir(root, create=True) / "tasks.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row

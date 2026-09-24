@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.gates import make_verdict, make_finding, conjunction  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 RISK_ORDER = ["low", "medium", "high"]
@@ -27,12 +27,12 @@ GUARDRAILS = {"low": {"error_rate_max": 0.01, "p95_ms_max": 500, "slo_burn_max":
               "high": {"error_rate_max": 0.002, "p95_ms_max": 250, "slo_burn_max": 1.0, "soak_min": 30}}
 
 
-def freeze_file() -> Path:
-    return SWARM_DIR / "release.freeze"
+def freeze_file(root: Path) -> Path:
+    return swarm_dir(root) / "release.freeze"
 
 
-def read_freeze() -> dict | None:
-    f = freeze_file()
+def read_freeze(root: Path) -> dict | None:
+    f = freeze_file(root)
     if not f.exists():
         return None
     try:
@@ -55,14 +55,14 @@ def build_plan(release_id: str, risk: str, tasks: list[str], gates: list[str], a
 
 
 def run(args, ctx) -> dict:
-    SWARM_DIR.mkdir(parents=True, exist_ok=True)
+    swarm_dir(ctx.root, create=True)
     if args.freeze and not ctx.dry_run:
         rec = {"reason": args.freeze, "frozen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "by": "A12@local", "correlation_id": ctx.correlation_id}
-        freeze_file().write_text(json.dumps(rec, indent=2))
-    if args.unfreeze and not ctx.dry_run and freeze_file().exists():
-        freeze_file().unlink()
-    frozen = read_freeze() if not ctx.dry_run else None
+        freeze_file(ctx.root).write_text(json.dumps(rec, indent=2))
+    if args.unfreeze and not ctx.dry_run and freeze_file(ctx.root).exists():
+        freeze_file(ctx.root).unlink()
+    frozen = read_freeze(ctx.root) if not ctx.dry_run else None
 
     if ctx.dry_run:
         plan = build_plan("REL-dry", "medium", ["T-dry"], ["review", "quality"], [])
@@ -74,7 +74,7 @@ def run(args, ctx) -> dict:
     ids = [t for t in (args.task_ids or "").split(",") if t]
     if ctx.task_id:
         ids.insert(0, ctx.task_id)
-    store = TaskStore()
+    store = TaskStore(root=ctx.root)
     if ctx.correlation_id and not ids:
         ids = [t["task_id"] for t in store.list(correlation_id=ctx.correlation_id)]
     findings, per_task, artifacts, risk, now = [], {}, [], "low", time.time()
@@ -113,7 +113,7 @@ def run(args, ctx) -> dict:
     if frozen:
         findings.append(make_finding(f"RF-{len(findings)+1:03d}", "blocker", "freeze",
                                      f"deploy freeze active: {frozen.get('reason')} (since {frozen.get('frozen_at')})",
-                                     evidence=str(freeze_file()), owner_suggestion="A13"))
+                                     evidence=str(freeze_file(ctx.root)), owner_suggestion="A13"))
 
     primary = ids[0] if ids else "T-unassigned"
     release_id = args.release_id or f"REL-{primary}"
@@ -124,7 +124,7 @@ def run(args, ctx) -> dict:
     env = make_verdict(gate="release", task_id=primary, agent_id="A12@local", findings=findings, runs=runs,
                        correlation_id=ctx.correlation_id, extra={"release_id": release_id, "frozen": bool(frozen)})
     verdict = env["payload"]["verdict"]
-    vdir, rdir = SWARM_DIR / "verdicts", SWARM_DIR / "releases"
+    vdir, rdir = swarm_dir(ctx.root) / "verdicts", swarm_dir(ctx.root) / "releases"
     vdir.mkdir(parents=True, exist_ok=True)
     rdir.mkdir(parents=True, exist_ok=True)
     (vdir / f"{primary}.release.json").write_text(json.dumps(env, indent=2))

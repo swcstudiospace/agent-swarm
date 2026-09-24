@@ -5,17 +5,19 @@ Every agent script emits its inputs, outputs and verdicts here so the orchestrat
 """
 from __future__ import annotations
 import json
-import os
 import time
 from pathlib import Path
 
-SWARM_DIR = Path(os.environ.get("SWARM_DIR", ".swarm"))
-LOG_FILE = SWARM_DIR / "events.jsonl"
+from .paths import swarm_dir
+
+
+def _log_file(root: str | Path | None, *, create: bool) -> Path:
+    return swarm_dir(root, create=create) / "events.jsonl"
 
 
 def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | None = None,
-         task_id: str | None = None) -> dict:
-    SWARM_DIR.mkdir(parents=True, exist_ok=True)
+         task_id: str | None = None, root: str | Path | None = None) -> dict:
+    log_file = _log_file(root, create=True)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "type": event_type,
@@ -24,17 +26,18 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
         "task_id": task_id,
         "payload": payload,
     }
-    with LOG_FILE.open("a", encoding="utf-8") as fh:
+    with log_file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
 
 
 def read_events(*, correlation_id: str | None = None, task_id: str | None = None,
-                event_type: str | None = None) -> list[dict]:
-    if not LOG_FILE.exists():
+                event_type: str | None = None, root: str | Path | None = None) -> list[dict]:
+    log_file = _log_file(root, create=False)
+    if not log_file.exists():
         return []
     out = []
-    for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
+    for line in log_file.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         rec = json.loads(line)

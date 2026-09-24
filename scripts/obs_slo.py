@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 WINDOWS = {"1h": 3600, "6h": 6 * 3600, "3d": 3 * 86400}
@@ -27,14 +27,14 @@ THRESHOLDS = [("1h", 14.4, 1, "page"), ("6h", 6.0, 2, "page"), ("3d", 1.0, 3, "t
 WINDOW_S = {"7d": 7 * 86400, "28d": 28 * 86400, "30d": 30 * 86400}
 
 
-def slo_dir() -> Path:
-    d = SWARM_DIR / "slo"
+def slo_dir(root: Path) -> Path:
+    d = swarm_dir(root, create=True) / "slo"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def load_manifest(service: str) -> dict | None:
-    f = slo_dir() / f"{service}.json"
+def load_manifest(service: str, root: Path) -> dict | None:
+    f = slo_dir(root) / f"{service}.json"
     if not f.exists():
         return None
     try:
@@ -43,14 +43,14 @@ def load_manifest(service: str) -> dict | None:
         return None
 
 
-def define(args) -> dict:
+def define(args, root: Path) -> dict:
     if not 0 < args.objective < 1:
         raise SwarmError(ErrorCode.E_INPUT, "--objective must be a fraction in (0,1), e.g. 0.999")
     m = {"kind": "slo.manifest", "version": "1.0.0", "service": args.service, "sli": args.sli, "objective": args.objective,
          "window": args.window, "latency_threshold_ms": args.latency_ms if args.sli == "latency" else None,
          "alerting": [{"window": w, "burn_rate": b, "sev": s, "action": a} for w, b, s, a in THRESHOLDS],
          "runbook": args.runbook, "owner": "A13", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    path = slo_dir() / f"{args.service}.json"
+    path = slo_dir(root) / f"{args.service}.json"
     path.write_text(json.dumps(m, indent=2))
     return {"status": "ok", "manifest": m, "path": str(path),
             "summary": f"slo.manifest written for {args.service}: {args.sli} objective {args.objective:.4%} over {args.window}"}
@@ -89,7 +89,7 @@ def burn(good: int, total: int, objective: float) -> tuple[float | None, float |
 
 
 def evaluate(args, ctx) -> dict:
-    m = load_manifest(args.service) or {"service": args.service, "sli": args.sli, "objective": args.objective,
+    m = load_manifest(args.service, ctx.root) or {"service": args.service, "sli": args.sli, "objective": args.objective,
                                           "window": args.window, "latency_threshold_ms": args.latency_ms, "runbook": args.runbook}
     objective, lat = float(m["objective"]), (m.get("latency_threshold_ms") if m.get("sli") == "latency" else None)
     per_window, source = {}, "counts"
@@ -126,13 +126,13 @@ def evaluate(args, ctx) -> dict:
                                      f"{alert['slo']} burning {rate:.1f}x (>= {thr}x over {w}) -> sev{sev} {act}",
                                      evidence=json.dumps(alert["evidence"]), owner_suggestion="A12" if sev <= 2 else "A14"))
         if not ctx.dry_run:
-            inc = SWARM_DIR / "incidents"
+            inc = swarm_dir(ctx.root) / "incidents"
             inc.mkdir(parents=True, exist_ok=True)
             (inc / f"{alert['incident_id']}.json").write_text(json.dumps(alert, indent=2))
     return {"status": "fail" if alert and alert["sev"] <= 2 else "ok", "service": m["service"], "objective": objective,
             "sli": sli, "good": good, "total": total, "error_budget_remaining": budget_remaining, "windows": per_window,
             "thresholds": {w: thr for w, thr, _, _ in THRESHOLDS}, "alert": alert, "findings": findings,
-            "manifest_found": load_manifest(args.service) is not None,
+            "manifest_found": load_manifest(args.service, ctx.root) is not None,
             "summary": f"{m['service']}: SLI {sli:.4%} vs {objective:.4%}, burn {br_all:.2f}x, budget {budget_remaining:.1%} left"
                        + (f" — ALERT sev{alert['sev']} ({alert['action']})" if alert else " — within budget") if sli is not None
                        else f"{m['service']}: no data (total=0)"}
@@ -144,12 +144,12 @@ def run(args, ctx) -> dict:
                 "error_budget_remaining": 0.5, "windows": {w: {"burn_rate": 0.5} for w in WINDOWS}, "alert": None,
                 "findings": [], "summary": "dry-run: SLI 99.95% vs 99.90%, burn 0.50x, 50% budget left — within budget"}
     if args.define:
-        return define(args)
+        return define(args, ctx.root)
     if args.evaluate:
         return evaluate(args, ctx)
-    manifests = sorted(p.stem for p in slo_dir().glob("*.json"))
-    return {"status": "ok", "manifests": manifests, "dir": str(slo_dir()),
-            "summary": f"{len(manifests)} slo.manifest(s) in {slo_dir()}: {manifests or 'none (use --define)'}"}
+    manifests = sorted(p.stem for p in slo_dir(ctx.root).glob("*.json"))
+    return {"status": "ok", "manifests": manifests, "dir": str(slo_dir(ctx.root)),
+            "summary": f"{len(manifests)} slo.manifest(s) in {slo_dir(ctx.root)}: {manifests or 'none (use --define)'}"}
 
 
 def add_args(p):

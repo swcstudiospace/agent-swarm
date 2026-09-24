@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 BUILD_SYSTEMS = [("Dockerfile", "docker"), ("pyproject.toml", "python-pyproject"), ("setup.py", "python-setuptools"),
@@ -80,7 +80,7 @@ def run(args, ctx) -> dict:
                           "root": str(root)}}
     if args.version:
         rec["version"] = args.version
-    out_dir = SWARM_DIR / "artifacts"
+    out_dir = swarm_dir(ctx.root) / "artifacts"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{sha}.json"
     out.write_text(json.dumps(rec, indent=2))
@@ -88,7 +88,7 @@ def run(args, ctx) -> dict:
     registered = False
     if ctx.task_id:
         try:
-            TaskStore().add_artifact(ctx.task_id, kind="build.artifact", uri=args.image or str(out),
+            TaskStore(root=ctx.root).add_artifact(ctx.task_id, kind="build.artifact", uri=args.image or str(out),
                                      version=args.version or (g["sha"] or digest)[:12], digest=rec["tree_digest"],
                                      producer="A11")
             registered = True
