@@ -7,6 +7,8 @@ count as missing), honours a swarm-wide freeze (.swarm/release.freeze, set with 
 lifted with --unfreeze), and emits a signed `gate.verdict` with gate="release" that passes only when
 every other required gate passes and no freeze is active. Also writes a canary release.plan
 (5→25→50→100 %) with guardrails and rollback triggers to .swarm/releases/<release_id>.plan.json.
+Verdict rows are recorded only when --task-id is a release gate task: it then evaluates, and records on,
+exactly that task's notes.gate_for targets. --task-ids and correlation-wide runs are report-only.
 """
 from __future__ import annotations
 import json
@@ -16,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
-from swarm.gates import make_verdict, make_finding, conjunction  # noqa: E402
+from swarm.gates import make_finding, conjunction  # noqa: E402
+from swarm.verdicts import issue_gate, resolve_targets  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
@@ -66,15 +69,21 @@ def run(args, ctx) -> dict:
 
     if ctx.dry_run:
         plan = build_plan("REL-dry", "medium", ["T-dry"], ["review", "quality"], [])
-        env = make_verdict(gate="release", task_id="T-dry", agent_id="A12@dry", findings=[],
-                           runs={"review": "pass", "quality": "pass", "freeze": "none"}, correlation_id=ctx.correlation_id)
+        env, recorded = issue_gate(ctx, gate="release", agent_id="A12@dry", findings=[], simulate=True,
+                                   runs={"review": "pass", "quality": "pass", "freeze": "none"})
         return {"status": "ok", "verdict": "pass", "frozen": False, "plan": plan, "findings": [], "envelope": env,
+                "recorded": sorted(recorded),
                 "dry_run": True, "summary": "dry-run: canned release gate PASS with canary plan"}
 
-    ids = [t for t in (args.task_ids or "").split(",") if t]
-    if ctx.task_id:
-        ids.insert(0, ctx.task_id)
     store = TaskStore(root=ctx.root)
+    # a release gate task evaluates exactly its Task Store gate_for targets (D-13); any other mode is report-only
+    targets = resolve_targets(store, ctx.task_id, gate="release")
+    if targets is not None:
+        ids = targets
+    else:
+        ids = [t for t in (args.task_ids or "").split(",") if t]
+        if ctx.task_id:
+            ids.insert(0, ctx.task_id)
     if ctx.correlation_id and not ids:
         ids = [t["task_id"] for t in store.list(correlation_id=ctx.correlation_id)]
     findings, per_task, artifacts, risk, now = [], {}, [], "low", time.time()
@@ -121,22 +130,14 @@ def run(args, ctx) -> dict:
     plan = build_plan(release_id, risk, ids, gates, [a for a in artifacts if a])
     runs = {g: ("pass" if all(t["verdicts"].get(g) in ("pass", "waive") for t in per_task.values()) else "fail") for g in gates}
     runs["freeze"] = "active" if frozen else "none"
-    env = make_verdict(gate="release", task_id=primary, agent_id="A12@local", findings=findings, runs=runs,
-                       correlation_id=ctx.correlation_id, extra={"release_id": release_id, "frozen": bool(frozen)})
+    env, recorded = issue_gate(ctx, gate="release", agent_id="A12@local", findings=findings, runs=runs,
+                               extra={"release_id": release_id, "frozen": bool(frozen)})
     verdict = env["payload"]["verdict"]
-    vdir, rdir = swarm_dir(ctx.root) / "verdicts", swarm_dir(ctx.root) / "releases"
-    vdir.mkdir(parents=True, exist_ok=True)
+    rdir = swarm_dir(ctx.root) / "releases"
     rdir.mkdir(parents=True, exist_ok=True)
-    (vdir / f"{primary}.release.json").write_text(json.dumps(env, indent=2))
     plan["gate_verdict"] = verdict
     (rdir / f"{release_id}.plan.json").write_text(json.dumps(plan, indent=2))
-    for tid in ids:
-        try:
-            store.record_verdict(tid, "release", verdict, "A12", findings)
-        except SwarmError as e:
-            if e.code is not ErrorCode.E_INPUT:
-                raise
-    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "frozen": bool(frozen), "freeze": frozen,
+    return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "frozen": bool(frozen), "freeze": frozen,
             "release_id": release_id, "tasks": per_task, "plan": plan, "findings": findings, "envelope": env,
             "summary": f"release gate {verdict.upper()} for {release_id} ({len(ids)} task(s), risk={risk}"
                        f"{', FROZEN' if frozen else ''}) — canary {plan['steps_pct']}"}

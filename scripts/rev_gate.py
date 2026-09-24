@@ -19,9 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
-from swarm.gates import make_verdict, make_finding, SEVERITIES  # noqa: E402
-from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.paths import swarm_dir  # noqa: E402
+from swarm.gates import make_finding, SEVERITIES  # noqa: E402
+from swarm.verdicts import issue_gate  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
@@ -153,13 +152,13 @@ def load_extra(path: str | None, offset: int) -> list[dict]:
 
 
 def run(args, ctx) -> dict:
-    task = args.task_id or "T-unassigned"
     if ctx.dry_run:
         stats = {"files": 1, "added": 12, "deleted": 3, "per_file": [{"file": "src/example.py", "added": 12, "deleted": 3}]}
-        env = make_verdict(gate="review", task_id=args.task_id or "T-dry", agent_id="A09@dry", findings=[],
-                           runs={"rules": "pass", "semantic": "skipped:dry-run"}, correlation_id=ctx.correlation_id,
-                           extra={"mode": "rules-only", "diff_base": "HEAD~1", "stats": stats})
+        env, recorded = issue_gate(ctx, gate="review", agent_id="A09@dry", findings=[], expires_s=172800,
+                                   runs={"rules": "pass", "semantic": "skipped:dry-run"}, simulate=True,
+                                   extra={"mode": "rules-only", "diff_base": "HEAD~1", "stats": stats})
         return {"status": "ok", "verdict": "pass", "findings": [], "stats": stats, "dry_run": True, "envelope": env,
+                "recorded": sorted(recorded),
                 "summary": "dry-run: canned pass verdict"}
     base = resolve_base(ctx.root, args.diff_base)
     changes = collect_changes(ctx.root, base)
@@ -172,21 +171,11 @@ def run(args, ctx) -> dict:
     runs = {"rules": "pass" if not any(f["severity"] in ("major", "critical", "blocker") for f in findings[:len(findings) - len(extra)]) else "fail",
             "semantic": ("pass" if not any(f["severity"] in ("major", "critical", "blocker") for f in extra) else "fail")
             if args.findings_file else "skipped:no-llm-findings"}
-    env = make_verdict(gate="review", task_id=task, agent_id="A09@local", findings=findings, runs=runs,
-                       correlation_id=ctx.correlation_id, expires_s=172800,
-                       extra={"mode": "rules+semantic" if args.findings_file else "rules-only",
-                              "diff_base": base or "whole-tree", "stats": {k: v for k, v in stats.items() if k != "per_file"}})
+    env, recorded = issue_gate(ctx, gate="review", agent_id="A09@local", findings=findings, runs=runs, expires_s=172800,
+                               extra={"mode": "rules+semantic" if args.findings_file else "rules-only",
+                                      "diff_base": base or "whole-tree", "stats": {k: v for k, v in stats.items() if k != "per_file"}})
     verdict = env["payload"]["verdict"]
-    out_dir = swarm_dir(ctx.root) / "verdicts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{task}.review.json").write_text(json.dumps(env, indent=2))
-    if args.task_id:
-        try:
-            TaskStore(root=ctx.root).record_verdict(args.task_id, "review", verdict, "A09", findings, expires_s=172800)
-        except SwarmError as e:
-            if e.code is not ErrorCode.E_INPUT:
-                raise
-    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "stats": stats,
+    return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "stats": stats,
             "runs": runs, "diff_base": base or "whole-tree", "envelope": env,
             "summary": f"review gate {verdict.upper()} — {stats['files']} files, +{stats['added']}/-{stats['deleted']}, "
                        f"{len(findings)} findings (base: {base or 'whole-tree'})"}

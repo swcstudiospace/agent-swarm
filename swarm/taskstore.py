@@ -196,13 +196,18 @@ class TaskStore:
             "SELECT * FROM transitions WHERE task_id=? ORDER BY id", (task_id,))]
 
     # ---- gates ------------------------------------------------------------
-    def record_verdict(self, task_id: str, gate: str, verdict: str, agent_id: str,
-                       findings=None, expires_s: int = 86400) -> None:
+    def record_verdict(self, task_id: str, envelope: dict) -> None:
+        """Store a signed gate.verdict envelope as a row on task_id (the envelope's own task_id)."""
+        from .gates import validate_verdict
+        p = validate_verdict(envelope)
+        if p["task_id"] != task_id:
+            raise SwarmError(ErrorCode.E_CONTRACT, f"verdict names {p['task_id']!r}, recorded on {task_id!r}", task_id=task_id)
         self.get(task_id)
+        now = time.time()
         self.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts)"
                           " VALUES (?,?,?,?,?,?,?)",
-                          (task_id, gate, verdict, agent_id, json.dumps(findings or []),
-                           time.time() + expires_s, time.time()))
+                          (task_id, p["gate"], p["verdict"], envelope["source"], json.dumps(p["findings"]),
+                           now + p["expires_s"], now))
         self.conn.commit()
 
     def latest_verdicts(self, task_id: str, *, include_stale: bool = False) -> dict[str, dict]:

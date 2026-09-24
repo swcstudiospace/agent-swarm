@@ -39,6 +39,7 @@ def test_envelope_rejects_bad_fields(swarm_dir):
 def test_state_machine_and_fail_closed_gates(swarm_dir):
     from swarm.taskstore import TaskStore
     from swarm.errors import SwarmError
+    from swarm.gates import make_verdict
     ts = TaskStore()
     ts.create(task_id="T-1", correlation_id="c", capability="code.backend", risk_class="high")
     with pytest.raises(SwarmError):
@@ -49,18 +50,19 @@ def test_state_machine_and_fail_closed_gates(swarm_dir):
     with pytest.raises(SwarmError):
         ts.transition("T-1", "APPROVED")
     for g in ("review", "quality", "security", "release"):
-        ts.record_verdict("T-1", g, "pass", "A0x")
+        ts.record_verdict("T-1", make_verdict(gate=g, task_id="T-1", agent_id="A0x"))
     assert ts.transition("T-1", "APPROVED")["state"] == "APPROVED"
     assert len(ts.history("T-1")) == 7  # CREATED + 5 + APPROVED
 
 
 def test_rework_cap_escalates(swarm_dir):
     from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
     ts = TaskStore()
     ts.create(task_id="T-2", correlation_id="c", capability="code.backend", notes={"gates": ["review"]})
     for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
         ts.transition("T-2", s)
-    ts.record_verdict("T-2", "review", "fail", "A09")
+    ts.record_verdict("T-2", make_verdict(gate="review", task_id="T-2", agent_id="A09", verdict="fail"))
     assert ts.transition("T-2", "CHANGES_REQUESTED")["state"] == "CHANGES_REQUESTED"
     assert ts.latest_verdicts("T-2") == {}  # stale after rework
     ts.transition("T-2", "IN_PROGRESS")

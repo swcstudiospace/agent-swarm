@@ -3,8 +3,8 @@
 
 Detects pytest / npm test / go test / cargo test, runs the tiers required by the
 risk class, parses pass/fail, and writes a signed `gate.verdict` envelope to
-.swarm/verdicts/<task_id>.quality.json (also recorded in the Task Store when the
-task exists there).
+.swarm/verdicts/<task_id>.quality.json. When --task-id is a quality gate task, one verdict
+row is recorded on each target in its Task Store notes.gate_for (swarm.verdicts).
 """
 from __future__ import annotations
 import json
@@ -14,10 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
-from swarm.gates import make_verdict, make_finding  # noqa: E402
-from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.paths import swarm_dir  # noqa: E402
-from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.gates import make_finding  # noqa: E402
+from swarm.verdicts import issue_gate  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
                  "high": ["unit", "integration", "e2e", "perf"]}
@@ -60,10 +58,9 @@ def run(args, ctx) -> dict:
 
     if ctx.dry_run:
         runs.update({t: "pass" for t in tiers})
-        verdict_env = make_verdict(gate="quality", task_id=args.task_id or "T-dry", agent_id="A08@dry",
-                                   findings=[], runs=runs, correlation_id=ctx.correlation_id)
+        verdict_env, recorded = issue_gate(ctx, gate="quality", agent_id="A08@dry", findings=[], runs=runs, simulate=True)
         return {"status": "ok", "verdict": "pass", "runs": runs, "findings": [], "dry_run": True,
-                "envelope": verdict_env, "summary": "dry-run: canned pass verdict"}
+                "envelope": verdict_env, "recorded": sorted(recorded), "summary": "dry-run: canned pass verdict"}
 
     runners = detect_runners(ctx.root)
     if not runners:
@@ -104,20 +101,10 @@ def run(args, ctx) -> dict:
             findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "coverage",
                                          f"coverage {m.group(1)}% < {args.min_coverage}%", owner_suggestion="A05"))
 
-    env = make_verdict(gate="quality", task_id=args.task_id or "T-unassigned", agent_id="A08@local",
-                       findings=findings, runs=runs, correlation_id=ctx.correlation_id)
+    env, recorded = issue_gate(ctx, gate="quality", agent_id="A08@local", findings=findings, runs=runs)
     verdict = env["payload"]["verdict"]
-    out_dir = swarm_dir(ctx.root) / "verdicts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{args.task_id or 'T-unassigned'}.quality.json").write_text(json.dumps(env, indent=2))
-    if args.task_id:
-        try:
-            TaskStore(root=ctx.root).record_verdict(args.task_id, "quality", verdict, "A08", findings)
-        except SwarmError as e:
-            if e.code is not ErrorCode.E_INPUT:
-                raise
     return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "runs": runs,
-            "findings": findings, "executed": executed, "envelope": env,
+            "findings": findings, "executed": executed, "envelope": env, "recorded": sorted(recorded),
             "summary": f"quality gate {verdict.upper()} — runners: {[e['runner'] for e in executed] or 'none'}"}
 
 
