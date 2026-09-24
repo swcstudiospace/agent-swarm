@@ -131,3 +131,35 @@ def test_schema_single_source(swarm_dir):
     assert validate({"task_id": "x", "state": "DONE"}, schema)
     errs = validate({"task_id": "x", "state": "IN_REVIEW", "outputs": "nope"}, schema)
     assert errs and any("/outputs" in e for e in errs)
+
+
+def _headless(tmp_path, swarm, result, plan=ONE_TASK, once=False):
+    env = _plan(tmp_path, swarm, plan)
+    stub = stub_claude(tmp_path, result)
+    args = ["--claude-bin", str(stub), "--runtime", "claude", "--json"] + (["--once"] if once else [])
+    run_script("swarm_run.py", *args, env=env)
+    return env
+
+
+def test_invalid_result_fails_contract_and_retries(tmp_path, swarm_dir):
+    env = _headless(tmp_path, swarm_dir, {"task_id": "T-one"})
+    hist = _history(env, "T-one")
+    failed = [h for h in hist if h["to_state"] == "FAILED"]
+    assert len(failed) == 3 and all(h["reason"].startswith("E-CONTRACT") for h in failed)
+    assert hist[-1]["to_state"] == "ESCALATED"
+    ev = [e for e in _events(swarm_dir, "task.result.rejected") if e["payload"]["mode"] == "headless"]
+    assert len(ev) >= 3
+
+
+def test_headless_in_progress_is_contract_failure(tmp_path, swarm_dir):
+    env = _headless(tmp_path, swarm_dir, {"task_id": "T-one", "state": "IN_PROGRESS"}, once=True)
+    failed = [h for h in _history(env, "T-one") if h["to_state"] == "FAILED"]
+    assert failed and "session ended in IN_PROGRESS" in failed[0]["reason"]
+
+
+def test_task_id_mismatch_rejected(tmp_path, swarm_dir):
+    plan = {"tasks": [TWO_TASKS["tasks"][0], {**TWO_TASKS["tasks"][1], "depends_on": ["one"]}]}
+    env = _headless(tmp_path, swarm_dir, {"task_id": "T-two", "state": "IN_REVIEW"}, plan=plan, once=True)
+    failed = [h for h in _history(env, "T-one") if h["to_state"] == "FAILED"]
+    assert failed and failed[0]["reason"].startswith("E-CONTRACT") and "mismatch" in failed[0]["reason"]
+    assert _history(env, "T-two")[-1]["to_state"] == "PLANNED"
