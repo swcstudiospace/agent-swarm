@@ -68,3 +68,25 @@ Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then 
 ## Suggested reading order
 
 Operators: 01 → 04 → 05 → 06 · Agent developers: 02 → your agent spec in 03/ → 07 · Auditors/security: agent §7 sections + 06 §S · Integration work: 02 → 04.
+
+## Trae SOLO Agents
+
+The [Trae registration kit](.trae/README.md) contains all 15
+[XML-tagged prompts](.trae/agents/), each below 10,000 characters, a
+[registration checklist](.trae/registration.json), and the
+[/swarm command](.trae/commands/swarm.md).
+
+A01 coordinates the task flow; the built-in SOLO agent invokes the registered
+specialists and returns their results to A01 for gating and the next batch.
+The files do not automatically register agents: enable them in Trae's custom-agent
+UI and SOLO's callable-agent settings using the setup guide.
+
+```bash
+python3 scripts/build_trae_agents.py          # regenerate the Trae kit only
+python3 scripts/build_trae_agents.py --check  # read-only drift and size check
+python3 -m pytest tests/test_trae_agents.py -q
+```
+
+This native-session adapter does not invoke Claude/Grok hooks, the headless runner,
+or the signed Task Store protocol. It preserves approval gates and single-writer
+ownership without claiming that XML alone enforces runtime permissions.

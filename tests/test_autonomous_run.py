@@ -36,10 +36,26 @@ def test_autonomous_dry_run(tmp_path):
     assert "DONE" in log["run_out"] or "complete" in log["run_out"].lower() or '"complete": true' in log["run_out"]
 
 
-def test_autonomous_skips_trivia(tmp_path):
+def test_autonomous_runs_trivia(tmp_path):
+    """Auto-run for all prompts: trivia still plans + dry-runs."""
     env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
     r = subprocess.run(
         [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "what is a monad", "--swarm-root", str(ROOT), "--dry-run"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
+    assert log["plan_rc"] == 0
+    assert log["run_rc"] == 0
+
+
+def test_autonomous_skips_slash(tmp_path):
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "/uplift last", "--swarm-root", str(ROOT), "--dry-run"],
         capture_output=True,
         text=True,
         env=env,

@@ -1,0 +1,198 @@
+{
+  "registration": "manual-ui",
+  "note": "Project checklist, not an official Trae import schema. SOLO is the caller.",
+  "agents": [
+    {
+      "name": "A01 Swarm Orchestrator",
+      "english_identifier": "a01-orchestrator",
+      "callable_by_other_agents": true,
+      "when_to_call": "Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC.",
+      "prompt_file": "agents/a01-orchestrator.md",
+      "prompt_characters": 9416,
+      "tools": [
+        "Read",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A02 Requirements Engineer",
+      "english_identifier": "a02-requirements",
+      "callable_by_other_agents": true,
+      "when_to_call": "Turns briefs into a requirements spec, user stories and machine-checkable acceptance criteria (Given/When/Then). Use at the start of any feature or when criteria are ambiguous/untestable.",
+      "prompt_file": "agents/a02-requirements.md",
+      "prompt_characters": 7011,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A03 Solution Architect",
+      "english_identifier": "a03-architect",
+      "callable_by_other_agents": true,
+      "when_to_call": "Produces the C4 blueprint, API contracts (OpenAPI/AsyncAPI), ADRs and tech-stack decisions from requirements. Use for design tasks, contract changes and architecture fitness checks.",
+      "prompt_file": "agents/a03-architect.md",
+      "prompt_characters": 7199,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A04 UX Designer",
+      "english_identifier": "a04-ux-designer",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns design tokens, wireframes, UX specs and accessibility (WCAG) requirements. Use for any UI-facing feature before frontend implementation.",
+      "prompt_file": "agents/a04-ux-designer.md",
+      "prompt_characters": 6785,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A05 Backend Engineer",
+      "english_identifier": "a05-backend",
+      "callable_by_other_agents": true,
+      "when_to_call": "Implements backend services against A03 contracts and A07 data contracts, with unit tests. Use for server-side code, APIs, business logic and hotfix patches.",
+      "prompt_file": "agents/a05-backend.md",
+      "prompt_characters": 7291,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A06 Frontend Engineer",
+      "english_identifier": "a06-frontend",
+      "callable_by_other_agents": true,
+      "when_to_call": "Implements UI against A04 tokens/UX specs and A03 API contracts, with component tests and a11y checks. Use for client-side code.",
+      "prompt_file": "agents/a06-frontend.md",
+      "prompt_characters": 7025,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A07 Data Engineer",
+      "english_identifier": "a07-data",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns data models, schema migrations (expand/contract, reversible) and data contracts. Use for any persistence, migration or pipeline change.",
+      "prompt_file": "agents/a07-data.md",
+      "prompt_characters": 7382,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A08 Test Engineer",
+      "english_identifier": "a08-qa",
+      "callable_by_other_agents": true,
+      "when_to_call": "Quality gate. Translates acceptance criteria into test suites, runs them, files defects and issues the quality gate verdict. Never modifies product code.",
+      "prompt_file": "agents/a08-qa.md",
+      "prompt_characters": 6565,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A09 Code Reviewer",
+      "english_identifier": "a09-reviewer",
+      "callable_by_other_agents": true,
+      "when_to_call": "Review gate. Reviews diffs for correctness, standards and contract adherence and issues the review verdict with structured findings. Read-only on product code.",
+      "prompt_file": "agents/a09-reviewer.md",
+      "prompt_characters": 7279,
+      "tools": [
+        "Read",
+        "Terminal"
+      ]
+    },
+    {
+      "name": "A10 Security Auditor",
+      "english_identifier": "a10-security",
+      "callable_by_other_agents": true,
+      "when_to_call": "Security gate. Runs SAST/secrets/dependency/IaC checks, threat-models changes, and issues the security gate verdict. Fail-closed; can never accept risk itself.",
+      "prompt_file": "agents/a10-security.md",
+      "prompt_characters": 7232,
+      "tools": [
+        "Read",
+        "Terminal"
+      ]
+    },
+    {
+      "name": "A11 DevOps / Platform Engineer",
+      "english_identifier": "a11-devops",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns IaC, CI pipelines, build artifacts and environments. Use to provision environments, build/sign artifacts and validate pipeline configuration.",
+      "prompt_file": "agents/a11-devops.md",
+      "prompt_characters": 7154,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A12 Release Manager",
+      "english_identifier": "a12-release",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns release plans, progressive delivery (canary) and rollback. Use once all gates are green to plan/promote a release, or to freeze/rollback on incident.",
+      "prompt_file": "agents/a12-release.md",
+      "prompt_characters": 7311,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A13 Observability / SRE",
+      "english_identifier": "a13-observability",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns SLOs, dashboards, alerting and incident declaration. Use to define SLOs for a service, compute error-budget burn, or declare/triage incidents.",
+      "prompt_file": "agents/a13-observability.md",
+      "prompt_characters": 7243,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A14 Maintenance Engineer",
+      "english_identifier": "a14-maintenance",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns patch tasks, dependency bumps, tech-debt register and EOL tracking. Use for hotfix root-cause analysis, CVE-driven patching and debt triage.",
+      "prompt_file": "agents/a14-maintenance.md",
+      "prompt_characters": 7297,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    },
+    {
+      "name": "A15 Documentation Engineer",
+      "english_identifier": "a15-docs",
+      "callable_by_other_agents": true,
+      "when_to_call": "Owns docs bundles, API references, runbooks and changelogs. Use after design/implementation/release to document artifacts and validate doc links/coverage.",
+      "prompt_file": "agents/a15-docs.md",
+      "prompt_characters": 7211,
+      "tools": [
+        "Read",
+        "Terminal",
+        "Edit"
+      ]
+    }
+  ]
+}

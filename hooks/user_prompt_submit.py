@@ -8,12 +8,10 @@ import os
 import re
 import sys
 
-POSITIVE = (
-    "implement", "feature", "bug", "fix", "refactor", "release", "deploy", "hotfix",
-    "requirements", "architecture", "code review", "security audit", "run the swarm",
-    "agent-swarm", "a01-orchestrator",
-)
-NEGATIVE = ("/uplift", "/think", "what is", "explain only")
+# Auto-run for every plugin-handled prompt. Slash/ctl strings stay negative so
+# Skill dispatch and /all-in-one:* are not consumed by the swarm. Empty and
+# leading-/ prompts are skipped. "what is" is not a skip: trivia still injects.
+NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 
 CONTEXT = """## AgentSwarm orchestration (mandatory)
 
@@ -40,7 +38,12 @@ def classify(prompt: str) -> bool:
     low = prompt.lower()
     if any(n in low for n in NEGATIVE):
         return False
-    return any(p in low for p in POSITIVE)
+    trimmed = prompt.strip()
+    if not trimmed:
+        return False
+    if trimmed.startswith("/"):
+        return False
+    return True
 
 
 def main() -> int:

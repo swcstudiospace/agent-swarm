@@ -27,8 +27,16 @@ def test_injects_on_feature():
     assert "a01-orchestrator" in ctx
 
 
-def test_silent_on_explain():
+def test_injects_on_trivia():
+    """Auto-run for all prompts: trivia still injects AgentSwarm context."""
     out = run_hook("what is a monad")
+    ctx = out.get("additionalContext", "")
+    assert "agent-swarm-orchestrate" in ctx
+    assert "a01-orchestrator" in ctx
+
+
+def test_silent_on_slash():
+    out = run_hook("/uplift last")
     assert not out.get("additionalContext")
 
 

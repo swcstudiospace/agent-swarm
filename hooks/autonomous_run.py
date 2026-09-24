@@ -14,19 +14,22 @@ import sys
 import time
 from pathlib import Path
 
-POSITIVE = (
-    "implement", "feature", "bug", "fix", "refactor", "release", "deploy", "hotfix",
-    "requirements", "architecture", "code review", "security audit", "run the swarm",
-    "agent-swarm", "a01-orchestrator", "build a", "build me",
-)
-NEGATIVE = ("/uplift", "/think", "what is", "explain only", "/all-in-one:")
+# Auto-run for every plugin-handled prompt. Slash/ctl strings stay negative so
+# Skill dispatch and /all-in-one:* are not consumed by the swarm. Empty and
+# leading-/ briefs are skipped. "what is" is not a skip: trivia still kicks.
+NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 
 
 def classify(prompt: str) -> bool:
     low = prompt.lower()
     if any(n in low for n in NEGATIVE):
         return False
-    return any(p in low for p in POSITIVE)
+    trimmed = prompt.strip()
+    if not trimmed:
+        return False
+    if trimmed.startswith("/"):
+        return False
+    return True
 
 
 def pattern_for(brief: str) -> str:
