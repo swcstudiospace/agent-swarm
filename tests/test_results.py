@@ -1,7 +1,6 @@
 """CORE-01/02/03: one task.result schema, one result path for headless and ingest."""
 import ast
 import json
-from pathlib import Path
 
 from conftest import ROOT, run_script, stub_claude
 
@@ -42,7 +41,8 @@ RESULT = {"task_id": "T-one", "state": "IN_REVIEW", "outputs": [{"kind": "code.b
 
 def test_headless_and_ingest_same_transitions(tmp_path):
     d1, d2 = tmp_path / "d1", tmp_path / "d2"
-    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
     env1 = _plan(tmp_path / "a", d1)
     stub = stub_claude(tmp_path, RESULT)
     r = run_script("swarm_run.py", "--claude-bin", str(stub), "--runtime", "claude", "--once", "--json", env=env1)
@@ -119,7 +119,8 @@ def test_schema_single_source(swarm_dir):
     from swarm.schema import load_schema, validate
     import importlib.util
     spec = importlib.util.spec_from_file_location("swarm_run_mod", ROOT / "scripts" / "swarm_run.py")
-    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     from swarm.results import parse_result
     schema = load_schema("task.result.v1")
     agent = {"id": "A05"}

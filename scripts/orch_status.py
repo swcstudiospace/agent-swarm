@@ -8,7 +8,6 @@
   python3 scripts/orch_status.py --history T-be
 """
 from __future__ import annotations
-import json
 import sys
 from pathlib import Path
 
