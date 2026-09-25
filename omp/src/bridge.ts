@@ -34,6 +34,8 @@ export interface BridgeRequest {
   cwd: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The calling session's in-flight registry (set by the extension factory); the child is swept with it. */
+  inflight?: Inflight;
 }
 export interface BridgeResult {
   exitCode: 0 | 1;
@@ -52,8 +54,8 @@ const SCRIPT_NAME = /^[a-z][a-z0-9_]*$/;
 const STRIPPED_ENV = ["SWARM_TASK_ID", "SWARM_CORRELATION_ID"]; // argparse defaults (swarm/script_base.py)
 
 type StopReason = "abort" | "timeout";
-/** In-flight children by pid (each leads its own process group); swept on session_shutdown. */
-const inflight = new Map<number, (why: StopReason) => void>();
+/** Stop handles of one omp session's in-flight children (WR-01): one registry per extension factory call. */
+export type Inflight = Set<(why: StopReason) => void>;
 
 /** env SWARM_ROOT (trimmed, when it holds scripts/orch_plan.py) → realpath of the package's repo → E-DEP. */
 export function swarmRoot(): string {
@@ -80,9 +82,9 @@ function killGroup(pid: number, sig: "SIGTERM" | "SIGKILL"): void {
   } catch {} // group already gone
 }
 
-/** Group-kill every in-flight child (registered as the omp `session_shutdown` handler). */
-export function killInflight(): void {
-  for (const stop of [...inflight.values()]) stop("abort");
+/** Group-kill one session's in-flight children (that session's `session_shutdown` handler). */
+export function killInflight(inflight: Inflight): void {
+  for (const stop of [...inflight]) stop("abort");
 }
 
 function parseObject(stdout: string): Record<string, unknown> | undefined {
@@ -111,7 +113,7 @@ export function writeInputFile(cwd: string, kind: "ingest" | "findings", toolCal
 }
 
 /** Spawn `python3 <SWARM_ROOT>/scripts/<script>.py <args> --json` and map the exit contract (0/1/2) to a result or error. */
-export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT_TIMEOUT_MS }: ScriptRequest): Promise<BridgeResult> {
+export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT_TIMEOUT_MS, inflight }: ScriptRequest): Promise<BridgeResult> {
   if (signal?.aborted) throw abortError(script, signal);
   if (!SCRIPT_NAME.test(script)) throw new SwarmToolError("E-INPUT", `invalid script name ${JSON.stringify(script)}`);
   const root = swarmRoot();
@@ -143,7 +145,7 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
     killGroup(pid, "SIGTERM");
     setTimeout(() => killGroup(pid, "SIGKILL"), KILL_GRACE_MS).unref(); // escalate if SIGTERM is ignored
   };
-  inflight.set(pid, stop);
+  inflight?.add(stop);
   const onAbort = () => stop("abort");
   signal?.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => stop("timeout"), timeoutMs);
@@ -174,7 +176,7 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
-    inflight.delete(pid);
+    inflight?.delete(stop);
   }
 }
 

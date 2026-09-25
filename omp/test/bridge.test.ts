@@ -6,9 +6,9 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type * as BridgeModule from "../src/bridge.ts";
-import { runPy, runScript, SwarmToolError, swarmRoot } from "../src/bridge.ts";
+import { runScript, SwarmToolError, swarmRoot } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
-import { fakeCtx, fakePi, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
+import { callTool, fakeCtx, fakePi, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "PATH");
 
@@ -295,17 +295,26 @@ test("abort before start: rejects without spawning", async () => {
   }
 });
 
-test("sweep: the factory's session_shutdown handler group-kills in-flight children", async () => {
+test("sweep: a session's shutdown group-kills only its own in-flight children (WR-01)", async () => {
   const { cwd, root } = setup();
-  const pi = fakePi();
-  createSwarmExtension({ bridge: runPy })(pi.api);
-  const handlers = pi.handlers.get("session_shutdown") ?? [];
-  expect(handlers.length).toBe(1);
-  const file = join(root, "pids.json");
-  const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd });
-  const pids = await pidsFrom(file);
-  handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
-  const err = await rejection(p);
-  expect(err.code).toBe("E-INTERNAL");
-  await expectGroupDead(pids);
+  // two sessions (two factory calls); each tool call runs fx_sleep through the real bridge
+  const sessions = ["a", "b"].map((name) => {
+    const file = join(root, `pids-${name}.json`);
+    const pi = fakePi();
+    createSwarmExtension({ bridge: (req) => runScript({ ...req, script: "fx_sleep", args: [`--pids=${file}`] }) })(pi.api);
+    const handlers = pi.handlers.get("session_shutdown") ?? [];
+    expect(handlers.length).toBe(1);
+    return { file, handlers, call: callTool(pi.tool("swarm_status"), {}, fakeCtx(cwd)) };
+  });
+  const [a, b] = sessions;
+  const pidsA = await pidsFrom(a.file);
+  const pidsB = await pidsFrom(b.file);
+  a.handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
+  expect((await rejection(a.call)).code).toBe("E-INTERNAL");
+  await expectGroupDead(pidsA);
+  await Bun.sleep(200);
+  expect(alive(pidsB.child) && alive(pidsB.grandchild)).toBe(true); // the sibling session's child is untouched
+  b.handlers[0]({ type: "session_shutdown" }, fakeCtx(cwd));
+  expect((await rejection(b.call)).code).toBe("E-INTERNAL");
+  await expectGroupDead(pidsB);
 });
