@@ -79,9 +79,12 @@ export interface BeforeAgentStartResult {
 export interface CommandContext extends ExtensionContext {
   hasUI: boolean;
   ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
-  /** Resolves once the agent stops streaming; a `-p` run exits without it (research P4/P5). */
+  /**
+   * Resolves once the agent loop is not running. During a prompt's pre-loop window (right after `sendUserMessage`)
+   * it resolves at once (G-04-05-1), so it is a post-turn drain, not the turn signal; `/swarm` holds on `isIdle`.
+   */
   waitForIdle(): Promise<void>;
-  /** False while the agent is streaming (omp: `!session.isStreaming`; present in 18.0.6 and 18.3.1). */
+  /** False for the whole prompt, from before the agent loop until after it (omp: `!session.isStreaming`; 18.0.6 and 18.3.1): the turn signal. */
   isIdle(): boolean;
 }
 
