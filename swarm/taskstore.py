@@ -360,16 +360,20 @@ class TaskStore:
         """True when a `gate` row on `target` holds a verifying signed envelope for that gate and target that
         gate task `gate_task_id`'s script issued at or after `since` (its lease start): proof the script ran for
         this lease. Pass/fail does not matter; malformed or forged rows are skipped."""
+        return self.gate_verdict_value_since(target, gate=gate, gate_task_id=gate_task_id, since=since) is not None
+
+    def gate_verdict_value_since(self, target: str, *, gate: str, gate_task_id: str, since: float) -> str | None:
+        """The signed verdict of the latest row gate_verdict_since accepts (same filtering), else None."""
         for r in self.conn.execute("SELECT envelope_json FROM verdicts WHERE task_id=? AND gate=? ORDER BY id DESC",
                                    (target, gate)):
             try:
                 p = validate_verdict(json.loads(r["envelope_json"]))
                 if (p["gate"] == gate and p["task_id"] == target and p.get("gate_task") == gate_task_id
                         and float(p["issued_at"]) >= since):
-                    return True
+                    return p["verdict"]
             except Exception:
                 continue
-        return False
+        return None
 
     # ---- artifacts --------------------------------------------------------
     def add_artifact(self, task_id: str, *, kind: str, uri: str, version: str = "1",

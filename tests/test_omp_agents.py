@@ -355,7 +355,11 @@ def test_omp_check_clean_on_copy(omp_tree):
     assert r.stdout.startswith("up-to-date")
 
 
-@pytest.mark.parametrize("rel", ["omp/agents/a05-backend.md", "omp/skills/a05-backend/SKILL.md"], ids=["agent", "skill"])
+@pytest.mark.parametrize(
+    "rel",
+    ["omp/agents/a05-backend.md", "omp/skills/a05-backend/SKILL.md", "omp/skills/swarm-orchestrate/SKILL.md"],
+    ids=["agent", "skill", "orchestrate-skill"],
+)
 def test_omp_check_detects_drift(omp_tree, rel):
     target = omp_tree / rel
     edited = target.read_text(encoding="utf-8") + "\nhand edit: tools: task\n"

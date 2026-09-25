@@ -204,8 +204,8 @@ def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None
     (WR-14). Normalization fails closed and reports every change (WR-16/WR-17):
     - an entry fails its target unless its verdict is in results.PASS_VERDICTS (pass, A09's legacy approve;
       case-insensitive — request_changes, block, waive, unknown and missing verdicts fail); a failing entry
-      without findings gets one synthesized major finding (results.agent_findings, IN-15), reported in
-      gate.findings.synthesized;
+      without a finding of major or worse gets one synthesized major finding (results.agent_findings, IN-15),
+      reported in gate.findings.synthesized;
     - a severity outside SEVERITIES (case-insensitive) or a non-object finding counts as major;
     - a missing severity counts as major under a failing entry, else minor;
     - findings under a key that is not a gate_for id cannot be attributed, so they apply to every target.

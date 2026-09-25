@@ -13,6 +13,8 @@ The ONE intended mode difference:
     (never consumes an attempt).
 Both modes accept a gate task's IN_REVIEW only when its gate script recorded a verdict on every gate_for target
 during the current lease (WR-08); otherwise "E-CONTRACT: gate script not run" (headless FAILED, ingest exit 2).
+A review gate task's IN_REVIEW is also refused when its verdicts{} fails a target (agent_failed) whose review row from
+this lease is not `fail`: "E-CONTRACT: review verdict mismatch: ..." (headless FAILED, ingest exit 2, no transition).
 Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
 """
 from __future__ import annotations
@@ -21,6 +23,7 @@ import re
 from typing import Callable
 
 from .errors import SwarmError, ErrorCode
+from .gates import BLOCKING_SEVERITY, SEVERITIES
 from .schema import load_schema, validate
 from .taskstore import TaskStore, TaskState as S
 
@@ -65,16 +68,22 @@ def reject(store: TaskStore, task_id: str, *, reason: str, mode: str, emit: Emit
     return store.get(task_id)["state"]
 
 
+def _lease_start(store: TaskStore, task_id: str) -> float | None:
+    """ts of the task's latest CLAIMED transition (its current lease start), else None."""
+    claims = [h["ts"] for h in store.history(task_id) if h["to_state"] == S.CLAIMED.value]
+    return claims[-1] if claims else None
+
+
 def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
     """gate_for targets of a gate task lacking a verifying row that its gate script issued during the current lease
     (since the latest CLAIMED). With no CLAIMED row the lease start is unknown, so every target counts as missing."""
     notes = task["notes_json"]
     targets = list(notes.get("gate_for") or [])
-    claims = [h["ts"] for h in store.history(task["task_id"]) if h["to_state"] == S.CLAIMED.value]
-    if not claims:
+    since = _lease_start(store, task["task_id"])
+    if since is None:
         return targets
     return [t for t in targets
-            if not store.gate_verdict_since(t, gate=notes["gate"], gate_task_id=task["task_id"], since=claims[-1])]
+            if not store.gate_verdict_since(t, gate=notes["gate"], gate_task_id=task["task_id"], since=since)]
 
 
 # The only agent verdicts that pass a target (after strip/lower-case). `approve` is A09's legacy alias of `pass`;
@@ -94,15 +103,51 @@ def agent_failed(entry: dict) -> bool:
     return agent_verdict(entry) not in PASS_VERDICTS
 
 
+def _review_verdict_mismatch(store: TaskStore, task: dict, result: dict) -> list[str]:
+    """Sorted gate_for targets of a review gate task whose agent verdicts{} entry fails (agent_failed) while the review
+    row its script issued during the current lease is not `fail`. A failing entry under a key that is not a gate_for
+    id applies to every target. Targets without such a row are _gate_script_missing's concern."""
+    notes = task["notes_json"]
+    targets = list(notes.get("gate_for") or [])
+    verdicts = result.get("verdicts")
+    failing = {k for k, v in (verdicts if isinstance(verdicts, dict) else {}).items() if agent_failed(v)}
+    since = _lease_start(store, task["task_id"])
+    if not failing or since is None:
+        return []
+    accused = targets if failing - set(targets) else sorted(failing)
+    out = []
+    for t in accused:
+        recorded = store.gate_verdict_value_since(t, gate=notes["gate"], gate_task_id=task["task_id"], since=since)
+        if recorded is not None and recorded != "fail":
+            out.append(t)
+    return sorted(out)
+
+
+# Severities that fail a review target (rev_gate's blocking set).
+BLOCKING_SEVERITIES = frozenset(SEVERITIES[SEVERITIES.index(BLOCKING_SEVERITY):])
+
+
+def _counts_major(finding) -> bool:
+    """A finding under a failing entry counts as major or worse unless its severity is a known one below major
+    (case-insensitive); non-object findings and missing/unknown severities count as major, as swarm_run normalizes."""
+    if not isinstance(finding, dict):
+        return True
+    sev = finding.get("severity")
+    if isinstance(sev, str) and sev.lower() in SEVERITIES:
+        return sev.lower() in BLOCKING_SEVERITIES
+    return True
+
+
 def agent_findings(entry: dict) -> tuple[list, bool]:
-    """(findings, synthesized) of a verdicts{} entry. A failing entry without findings gets one synthesized major
-    finding (IN-15), so an agent's failure never reduces to an empty list."""
+    """(findings, synthesized) of a verdicts{} entry. A failing entry without a finding of major or worse gets one
+    synthesized major `agent-verdict` finding appended (IN-15), so an agent's failure always fails its target instead of
+    reducing to an empty list or to minor findings that rev_gate passes. Passing entries are returned unchanged."""
     items = list(entry.get("findings") or [])
-    if items or not agent_failed(entry):
+    if not agent_failed(entry) or any(_counts_major(f) for f in items):
         return items, False
     verdict = agent_verdict(entry) or "no verdict"
-    return [{"severity": "major", "kind": "agent-verdict",
-             "summary": f"gate agent reported {verdict!r} without findings"}], True
+    why = "without a major finding" if items else "without findings"
+    return items + [{"severity": "major", "kind": "agent-verdict", "summary": f"gate agent reported {verdict!r} {why}"}], True
 
 
 def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
@@ -132,6 +177,15 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
         missing = _gate_script_missing(store, task)  # D-12: only script rows satisfy a gate; checked before any transition
         if missing:
             err = SwarmError(ErrorCode.E_CONTRACT, f"gate script not run for {missing}", task_id=tid)
+            if mode == "headless":
+                return reject(store, tid, reason=str(err), mode=mode, emit=emit)
+            raise err
+        mismatch = _review_verdict_mismatch(store, task, result) if task["notes_json"]["gate"] == "review" else []
+        if mismatch:
+            err = SwarmError(ErrorCode.E_CONTRACT,
+                             f"review verdict mismatch: agent verdicts fail {mismatch} but the review rows recorded this "
+                             f"lease do not; re-run swarm_gate with a major finding for each of {mismatch}",
+                             task_id=tid, targets=mismatch)
             if mode == "headless":
                 return reject(store, tid, reason=str(err), mode=mode, emit=emit)
             raise err

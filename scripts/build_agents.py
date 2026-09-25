@@ -5,6 +5,7 @@ Claude: .claude/agents/<slug>.md  (name, description, tools, model: inherit)
 Grok:   .grok/agents/<slug>.md    (prompt_mode, permission_mode, agents_md)
 omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, output)
         omp/skills/<slug>/SKILL.md
+        omp/skills/swarm-orchestrate/SKILL.md  (with A01)
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 """
@@ -19,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
-from _write_skills import omp_skill, yaml_str  # noqa: E402
+from _write_skills import omp_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
 
 CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
@@ -271,6 +272,8 @@ def main() -> int:
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
         _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
         _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
+        if agent["id"] == "A01":
+            _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written)
     refused = []
     if not only:
         removable, refused = _omp_orphans({a["slug"] for a in agents})
