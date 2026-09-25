@@ -223,6 +223,44 @@ test("gate signed rows: one verdict per gate_for target, derived from its findin
   }
 });
 
+/** A nested JSON field, narrowed step by step instead of asserting a shape; absent anywhere on the path → undefined. */
+function jsonAt(value: unknown, ...path: string[]): unknown {
+  let cur = value;
+  for (const key of path) {
+    if (typeof cur !== "object" || cur === null || !Object.hasOwn(cur, key)) return undefined;
+    cur = Object.getOwnPropertyDescriptor(cur, key)?.value;
+  }
+  return cur;
+}
+
+test("gate dry run end to end: canned pass reaches the agent and satisfies no real gate", async () => {
+  const { ctx, sdir } = tmpStore();
+  delete process.env.SWARM_AGENT_SESSION; // in-session, swarm_gate is the recorder
+  const { tool } = swarm();
+  await callTool(tool("swarm_plan"), { brief: "add search", pattern: "feature", risk_class: "low", prefix: "F", correlation_id: "c-feat" }, ctx);
+  await lease(tool, ctx, "F-rev");
+  const reviewer = agentCtx(ctx.cwd, "a09-reviewer");
+  const targets = ["F-be", "F-data", "F-fe"];
+  const reviewOf = (target: string) => {
+    const h = runPython("orch_status.py", [`--history=${target}`], { SWARM_DIR: sdir });
+    expect(h.code, h.stderr).toBe(0);
+    return { verdict: jsonAt(h.json, "verdicts", "review"), missing: jsonAt(h.json, "missing_gate_reasons", "review") };
+  };
+
+  // a major finding would fail F-be for real; under dry_run the script's canned pass ignores it
+  const per_target_findings = { "F-be": [{ severity: "major", summary: "unparameterised SQL" }], "F-fe": [], "F-data": [] };
+  const dry = await callTool(tool("swarm_gate"), { gate: "review", task_id: "F-rev", correlation_id: "c-feat", per_target_findings, dry_run: true }, reviewer);
+  expect(dry.content[0].text).toBe("dry-run: canned pass verdict");
+  expect(jsonAt(dry.details, "recorded")).toEqual([]);
+  for (const t of targets) expect(reviewOf(t)).toEqual({ verdict: undefined, missing: "absent" });
+
+  // the same call without dry_run records a signed row on every target, so the store was writable all along
+  const real = await callTool(tool("swarm_gate"), { gate: "review", task_id: "F-rev", correlation_id: "c-feat", per_target_findings }, reviewer);
+  expect(jsonAt(real.details, "recorded")).toEqual(targets);
+  expect(reviewOf("F-be").missing).toBe("fail");
+  expect(reviewOf("F-fe").missing).toBeUndefined();
+});
+
 function statusTool() {
   const pi = fakePi();
   createSwarmExtension({ bridge: runPy })(pi.api);
