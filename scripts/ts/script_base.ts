@@ -36,8 +36,11 @@ export function parseAgentArgs(argv: string[]): AgentArgs {
 function swarmDir(root: string): string {
   // D-10: env SWARM_DIR (made absolute) → <git toplevel of root>/.swarm → <root>/.swarm
   if (process.env.SWARM_DIR) return resolve(process.env.SWARM_DIR);
-  const git = Bun.spawnSync(["git", "-C", root, "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "ignore" });
-  const top = git.exitCode === 0 ? git.stdout.toString().trim() : "";
+  let top = "";
+  try {
+    const git = Bun.spawnSync(["git", "-C", root, "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "ignore" });
+    top = git.exitCode === 0 ? git.stdout.toString().trim() : "";
+  } catch {} // git not on PATH → <root>/.swarm, like swarm/paths.py's OSError fallback
   return top ? resolve(top, ".swarm") : resolve(root, ".swarm");
 }
 

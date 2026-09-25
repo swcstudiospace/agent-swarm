@@ -31,3 +31,13 @@ def test_ts_dry_run_json(tmp_path, monkeypatch):
         data = json.loads(r.stdout)
         assert data["status"] in ("ok", "fail"), ts.name
         assert "agent" in data and "script" in data
+
+
+@pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
+def test_ts_twin_without_git_on_path(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "SWARM_DIR"} | {"PATH": "/nonexistent"}
+    r = subprocess.run([BUN, str(ROOT / "scripts" / "ts" / "req_lint.ts"), "--dry-run", "--json", "--root", str(tmp_path)],
+                       cwd=tmp_path, capture_output=True, text=True, env=env)
+    assert "Executable not found" not in r.stderr, r.stderr[-800:]
+    assert r.returncode in (0, 1), f"rc={r.returncode}\n{r.stderr[-800:]}\n{r.stdout[-400:]}"
+    assert json.loads(r.stdout)["status"] in ("ok", "fail")
