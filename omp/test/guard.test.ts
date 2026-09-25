@@ -623,6 +623,24 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(call("eval", input), facts(undefined))).toBeUndefined();
   });
 
+  test.each([
+    "xd://run_code",
+    "xd://run_code?code=1",
+    "XD://Run_Code",
+    "xd://debug",
+    "xd://debug?x=1",
+    "xd://run_code/session",
+  ])("D-08: write %s blocks inside, passes in main", (path) => {
+    const blocked = { block: true, reason: "BLOCKED needs: human-approval (eval: xd-device)" };
+    expect(guardToolCall(call("write", { path, content: "1+1" }), facts(B05))).toEqual(blocked);
+    expect(guardToolCall(call("write", { file_path: path }), facts(B05))).toEqual(blocked);
+    expect(guardToolCall(call("write", { path }), facts(undefined))).toBeUndefined();
+  });
+
+  test("D-08: write xd://lsp passes inside", () => {
+    expect(guardToolCall(call("write", { path: "xd://lsp", content: "{}" }), facts(B05))).toBeUndefined();
+  });
+
   const PROTECTED = [".swarm/tasks.db", "./.omp/config.yml", "~/.omp/agent/config.yml", `${CWD}/.swarm/x`, `${HOME}/.omp/y`, "src/../.swarm/z"];
   test.each(PROTECTED.flatMap((path) => [["write", path], ["edit", path]]))("D-08: %s %s blocks inside, passes in main", (tool, path) => {
     expect(guardToolCall(call(tool, { path, content: "x" }), facts(B05))).toEqual({

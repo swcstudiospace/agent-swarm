@@ -2,7 +2,7 @@
  * The `tool_call` guard decision (Phase 4 HOOK-03/04): a pure function of (event, facts) with no I/O, no bridge,
  * no fs and no process access — index.ts reads the facts (identity, plan mode, active tools, env) and passes them in.
  * Precedence, first match decides: HOOK-04 (A01 depth cap) → HOOK-03 (swarm-state tools) → outside a swarm
- * session nothing else applies → D-08 (eval, protected write/edit paths) → HOOK-02 (the RULES table over bash:
+ * session nothing else applies → D-08 (eval, xd://run_code and xd://debug writes, protected write/edit paths) → HOOK-02 (the RULES table over bash:
  * D-05 shell twin and gate scripts, D-08 shell writes, D-03/D-04 autonomy ceiling).
  * Reason strings are read by the A01 dispatcher (D-07) and operators: keep them and the rule ids stable.
  */
@@ -76,6 +76,9 @@ function isDepthYield(event: ToolCallEvent): boolean {
   return state === "BLOCKED" && needsDepth(needs);
 }
 
+/** P4-UF-01: write path is omp's raw-code device (`xd://run_code` / `xd://debug`), any case, optional query or subpath. */
+const RAW_CODE_DEVICE = /^xd:\/\/(?:run_code|debug)(?:[/?#]|$)/i;
+
 export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCallResult | undefined {
   // HOOK-04 (D-06): A01 without `task`, not a restricted child and not in plan mode, can only report BLOCKED/depth
   if (facts.agent === ORCHESTRATOR && !facts.hasTask && !facts.restricted && !facts.planMode && !isDepthYield(event)) {
@@ -87,8 +90,17 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   }
   // Outside a swarm session nothing else applies (D-01)
   if (!inSwarm(facts)) return undefined;
-  // D-08: eval runs raw code past tool_call, so it is closed outright; config/state paths are not writable
+  // D-08: eval and the raw-code devices run code past tool_call, so they are closed outright; config/state paths are not writable
   if (event.toolName === "eval") return { block: true, reason: reason("eval", "eval-in-swarm") };
+  if (event.toolName === "write" && typeof event.input === "object" && event.input !== null) {
+    const { path, file_path } = event.input as { path?: unknown; file_path?: unknown };
+    if (
+      (typeof path === "string" && RAW_CODE_DEVICE.test(path.trim())) ||
+      (typeof file_path === "string" && RAW_CODE_DEVICE.test(file_path.trim()))
+    ) {
+      return { block: true, reason: reason("eval", "xd-device") };
+    }
+  }
   if (event.toolName === "write" || event.toolName === "edit") {
     if (editTargets(event.input).some((p) => isProtectedPath(p, facts))) {
       return { block: true, reason: reason("protected_path", "protected-path-write") };
