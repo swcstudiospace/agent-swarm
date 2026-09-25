@@ -161,6 +161,7 @@ test("plan mode store unchanged", async () => {
   const setup = swarm();
   await callTool(setup.tool("swarm_plan"), HOTFIX, fakeCtx(repo));
   await lease(setup.tool, fakeCtx(repo), "H-patch");
+  await lease(setup.tool, fakeCtx(repo), "H-rev");
   const db = join(sdir, "tasks.db");
   const sha = () => createHash("sha256").update(readFileSync(db)).digest("hex");
   const before = sha();
@@ -171,6 +172,7 @@ test("plan mode store unchanged", async () => {
     ["swarm_plan", { ...HOTFIX, prefix: "P", correlation_id: "c-plan-mode" }],
     ["swarm_ingest", { task_id: "H-patch", result: RESULT }],
     ["swarm_transition", { task_id: "H-patch", state: "IN_REVIEW", reason: "x" }],
+    ["swarm_gate", { gate: "review", task_id: "H-rev", correlation_id: "c-hot", per_target_findings: { "H-patch": [] } }],
   ];
   for (const [name, params] of mutations) {
     for (let i = 0; i < 2; i++) {
@@ -185,6 +187,34 @@ test("plan mode store unchanged", async () => {
   const rows = await statusRows(tool, ctx, "c-hot");
   expect(calls).toHaveLength(1);
   expect(stateOf(rows, "H-patch")).toBe("IN_PROGRESS");
+});
+
+test("gate signed rows: one verdict per gate_for target, derived from its findings", async () => {
+  const { ctx, sdir } = tmpStore();
+  delete process.env.SWARM_AGENT_SESSION; // in-session, swarm_gate is the recorder
+  const { tool } = swarm();
+  await callTool(tool("swarm_plan"), { brief: "add search", pattern: "feature", risk_class: "low", prefix: "F", correlation_id: "c-feat" }, ctx);
+  await lease(tool, ctx, "F-rev");
+  const per_target_findings = {
+    "F-be": [{ severity: "major", summary: "unparameterised SQL", location: "be/db.py:12" }],
+    "F-fe": [{ severity: "minor", summary: "naming nit" }],
+    "F-data": [],
+  };
+  const res = await callTool(tool("swarm_gate"), { gate: "review", task_id: "F-rev", correlation_id: "c-feat", per_target_findings }, ctx);
+  expect(res.content[0].text.startsWith("FAIL: review gate FAIL")).toBe(true); // exit 1 is returned, not thrown
+  expect((res.details as { recorded: string[] }).recorded).toEqual(["F-be", "F-data", "F-fe"]);
+
+  const expected: Record<string, string> = { "F-be": "fail", "F-fe": "pass", "F-data": "pass" };
+  for (const [target, verdict] of Object.entries(expected)) {
+    const h = runPython("orch_status.py", [`--history=${target}`], { SWARM_DIR: sdir });
+    expect(h.code, h.stderr).toBe(0);
+    const row = (h.json.verdicts as Record<string, { verdict: string; agent_id: string; envelope_json: string }>).review;
+    expect(row.verdict).toBe(verdict);
+    const env = JSON.parse(row.envelope_json) as { sig: string; payload: { gate_task: string; task_id: string } };
+    expect(env.sig).toMatch(/^(hmac|ed25519):.+/);
+    expect(env.payload.task_id).toBe(target);
+    expect(env.payload.gate_task).toBe("F-rev");
+  }
 });
 
 function statusTool() {

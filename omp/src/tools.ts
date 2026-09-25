@@ -5,7 +5,7 @@
  * D-03: mutating tools refuse with E-POLICY in plan mode before any argv, file or bridge work.
  */
 import { gitToplevel } from "../../scripts/ts/script_base.ts";
-import { type Bridge, type BridgeResult, SwarmToolError, writeInputFile } from "./bridge.ts";
+import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInputFile } from "./bridge.ts";
 import { inPlanMode } from "./context.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 
@@ -22,6 +22,31 @@ const STATES = [
 const PATTERNS = ["feature", "hotfix", "dependency", "custom"] as const;
 const RISK_CLASSES = ["low", "medium", "high"] as const;
 const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
+
+/** Gate → script (copied from swarm/verdicts.py:17 GATE_SCRIPTS); the script derives and signs the verdict. */
+const GATE_SCRIPTS = { quality: "qa_gate", review: "rev_gate", security: "sec_gate", release: "rel_plan" } as const satisfies Record<string, Script>;
+type Gate = keyof typeof GATE_SCRIPTS;
+/** Finding severities (copied from swarm/gates.py:10 SEVERITIES); BLOCKING_SEVERITY = "major". */
+const SEVERITIES = ["info", "minor", "major", "critical", "blocker"] as const;
+/** qa_gate's own --timeout default (1800 s) plus a margin, so the bridge never kills a test run first. */
+const QA_GATE_TIMEOUT_MS = (1800 + 60) * 1000;
+
+/** A finding (swarm/gates.py make_finding fields). No verdict field anywhere: severities decide (D-09). */
+const FINDING = {
+  type: "object",
+  properties: {
+    severity: { type: "string", enum: SEVERITIES, description: "major, critical or blocker fails the target" },
+    summary: { type: "string", minLength: 1, description: "What is wrong" },
+    id: { type: "string" },
+    kind: { type: "string", description: "e.g. semantic, security, functional" },
+    evidence: { type: "string" },
+    ac_ref: { type: "string", description: "Acceptance criterion it violates" },
+    owner_suggestion: { type: "string", description: "Agent that should fix it, e.g. A05" },
+    location: { type: "string", description: "path:line" },
+  },
+  required: ["severity", "summary"],
+  additionalProperties: false,
+} as const;
 
 type Details = Record<string, unknown>;
 
@@ -40,6 +65,16 @@ export type PlanParams = {
   dry_run?: boolean;
 };
 export type IngestParams = { task_id: string; result: Record<string, unknown> };
+export type Finding = { severity: (typeof SEVERITIES)[number]; summary: string } & Partial<
+  Record<"id" | "kind" | "evidence" | "ac_ref" | "owner_suggestion" | "location", string>
+>;
+export type GateParams = {
+  gate: Gate;
+  task_id: string;
+  correlation_id: string;
+  per_target_findings?: Record<string, Finding[]>;
+  dry_run?: boolean;
+};
 export type TransitionParams = { task_id: string; state: (typeof STATES)[number]; reason: string; dry_run?: boolean };
 
 interface ToolSpec<P> {
@@ -197,5 +232,52 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
   });
 
-  return [status, plan, ingest, transition];
+  const gate = define<GateParams>({
+    name: "swarm_gate",
+    label: "Swarm gate",
+    description:
+      "Run your gate script for a leased (IN_PROGRESS) gate task: quality → qa_gate, review → rev_gate, " +
+      "security → sec_gate, release → rel_plan. The script derives the verdict from findings, signs it and records " +
+      "one verdict row per target of the gate task; you never state a verdict. Review only: per_target_findings maps " +
+      "each target task id to its findings (targets you omit get every finding). To fail a target, include at least " +
+      "one finding of severity major or higher (major, critical or blocker); minor and info findings pass. " +
+      "A failing verdict is returned as text starting `FAIL:`, not as an error. Call this before swarm_ingest of " +
+      "the gate task's result.",
+    parameters: {
+      type: "object",
+      properties: {
+        gate: { type: "string", enum: Object.keys(GATE_SCRIPTS), description: "Which gate you run" },
+        task_id: { ...ID, description: "Your leased gate task id (its notes name the targets)" },
+        correlation_id: { ...ID, description: "The gate task's correlation id" },
+        per_target_findings: {
+          type: "object",
+          additionalProperties: { type: "array", items: FINDING },
+          description:
+            "review gate only: {target task id: [finding]}. To fail a target include at least one finding of " +
+            "severity major, critical or blocker; an empty list passes it.",
+        },
+        dry_run: { type: "boolean", description: "Canned dry-run verdict (per_target_findings is ignored)" },
+      },
+      required: ["gate", "task_id", "correlation_id"],
+      additionalProperties: false,
+    },
+    mutating: true,
+    async run(toolCallId, params, signal, ctx) {
+      const script = GATE_SCRIPTS[params.gate];
+      if (!script) throw new SwarmToolError("E-INPUT", `unknown gate ${JSON.stringify(params.gate)}`);
+      if (params.per_target_findings !== undefined && params.gate !== "review") {
+        throw new SwarmToolError("E-INPUT", `per_target_findings is only accepted by the review gate, not ${params.gate}`);
+      }
+      // argv from whitelisted fields only: extra model keys (e.g. a forged verdict) never reach python (T-03-06)
+      const args = [rootArg(ctx), `--task-id=${params.task_id}`, `--correlation-id=${params.correlation_id}`];
+      if (params.per_target_findings !== undefined) {
+        args.push(`--per-target-findings=${writeInputFile(ctx.cwd, "findings", toolCallId, params.per_target_findings)}`);
+      }
+      if (params.dry_run) args.push("--dry-run");
+      const timeoutMs = params.gate === "quality" ? QA_GATE_TIMEOUT_MS : undefined;
+      return toolResult(await bridge({ script, args, cwd: ctx.cwd, signal, timeoutMs }));
+    },
+  });
+
+  return [status, plan, ingest, transition, gate];
 }
