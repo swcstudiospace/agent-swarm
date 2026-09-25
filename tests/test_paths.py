@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from conftest import ROOT
 
@@ -45,6 +46,34 @@ def test_swarm_dir_same_from_any_cwd(tmp_path):
     assert st.returncode == 0 and json.loads(st.stdout)["history"], st.stdout + st.stderr
     assert (sdir / ".gitignore").read_text() == "*"
     assert not (repo / ".gitignore").exists()
+
+
+def test_orch_status_db_same_from_any_cwd(tmp_path):
+    """D-04: orch_status --json names the absolute tasks.db, identical from any cwd (empty and list output)."""
+    repo = _git_repo(tmp_path / "repo")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    env = _env_without_swarm_dir()
+    db = str((repo / ".swarm" / "tasks.db").resolve())
+
+    def status_from_both_cwds():
+        outs = []
+        for cwd in (repo, elsewhere):
+            r = _run("orch_status.py", "--root", str(repo), "--json", cwd=cwd, env=env)
+            assert r.returncode == 0, r.stdout + r.stderr
+            outs.append(json.loads(r.stdout))
+        return outs
+
+    empty = status_from_both_cwds()
+    assert all(o["tasks"] == [] for o in empty)
+    p = _run("orch_plan.py", "--root", str(repo), "--brief-text", "fix it", "--pattern", "hotfix",
+             "--prefix", "D", "--json", cwd=elsewhere, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    listed = status_from_both_cwds()
+    assert all(o["tasks"] for o in listed)
+    for o in empty + listed:
+        assert o["db"] == db and o["swarm_dir"] == str(Path(db).parent), o
+    assert not (elsewhere / ".swarm").exists()
 
 
 def test_env_relative_made_absolute(tmp_path, monkeypatch):

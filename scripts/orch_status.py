@@ -66,8 +66,9 @@ def run(args, ctx) -> dict:
         return ingest(store, Path(args.ingest), ctx)
 
     tasks = store.list(correlation_id=corr)
+    where = {"db": str(store.path), "swarm_dir": str(store.path.parent)}  # D-04: absolute, cwd-independent
     if not tasks:
-        return {"status": "ok", "correlation_id": corr, "tasks": [], "summary": "no tasks (run orch_plan.py first)"}
+        return {"status": "ok", "correlation_id": corr, "tasks": [], **where, "summary": "no tasks (run orch_plan.py first)"}
     ready = {t["task_id"] for t in store.ready(corr)}
     rows, counts = [], {}
     for t in tasks:
@@ -87,7 +88,8 @@ def run(args, ctx) -> dict:
                      f"{'yes' if r['ready'] else '':<6}{gates}")
     lines.append(f"\ncounts: {counts}   escalated: {escalated or 'none'}   complete: {done}")
     return {"status": "ok", "correlation_id": corr, "tasks": rows, "counts": counts, "escalated": escalated,
-            "complete": done, "events": len(read_events(correlation_id=corr, root=ctx.root)), "summary": "\n".join(lines)}
+            "complete": done, "events": len(read_events(correlation_id=corr, root=ctx.root)), **where,
+            "summary": "\n".join(lines)}
 
 
 def add_args(p):

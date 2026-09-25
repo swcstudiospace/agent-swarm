@@ -34,3 +34,28 @@ test("status tracer", async () => {
   expect(details.tasks[0].task_id.startsWith("H")).toBe(true);
   expect(res.content[0].text).toContain("TASK");
 });
+
+test("status db path", async () => {
+  const repo = gitRepo("sub/deeper");
+  delete process.env.SWARM_DIR;
+  plan(repo, undefined);
+  const tool = statusTool();
+  const fromRoot = (await callTool(tool, {}, fakeCtx(repo))).details as { db: string; swarm_dir: string };
+  const fromSub = (await callTool(tool, {}, fakeCtx(`${repo}/sub/deeper`))).details as { db: string };
+  expect(fromRoot.db).toBe(`${repo}/.swarm/tasks.db`);
+  expect(fromRoot.db.endsWith("/.swarm/tasks.db")).toBe(true);
+  expect(fromSub.db).toBe(fromRoot.db);
+  expect(fromRoot.swarm_dir).toBe(`${repo}/.swarm`);
+});
+
+test("status env wins", async () => {
+  const repo = gitRepo();
+  const other = tmpDir("swarm-omp-other-");
+  process.env.SWARM_DIR = other;
+  const res = await callTool(statusTool(), {}, fakeCtx(repo));
+  const details = res.details as { db: string; swarm_dir: string; tasks: unknown[] };
+  expect(details.swarm_dir).toBe(other);
+  expect(details.db).toBe(`${other}/tasks.db`);
+  expect(details.tasks).toEqual([]);
+  expect(res.content[0].text).toContain(`db: ${other}/tasks.db`);
+});
