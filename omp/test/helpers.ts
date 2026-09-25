@@ -198,8 +198,8 @@ export interface FakeTurn {
   isIdle(): boolean;
   /** Arm the timers (call from the fake sendUserMessage). */
   start(): void;
-  /** Resolves once turn-start was logged (at once for a turn without `startMs`). */
-  started(): Promise<void>;
+  /** Resolves once `isIdle` was read while the turn was in flight, i.e. the handler has seen the turn start. */
+  observed(): Promise<void>;
   /** End the turn now (idempotent; a no-op for a turn that never started). */
   finish(): void;
   /** True once turn-end was logged (or immediately for a turn without `startMs`). */
@@ -209,8 +209,7 @@ export interface FakeTurn {
 export function fakeTurn(script: ScriptedTurn, entries: SessionEntry[], log: CallLog): FakeTurn {
   let idle = true;
   let ended = script.startMs === undefined;
-  const begun = Promise.withResolvers<void>();
-  if (script.startMs === undefined) begun.resolve();
+  const seen = Promise.withResolvers<void>();
   const finish = () => {
     if (idle) return;
     idle = true;
@@ -218,20 +217,22 @@ export function fakeTurn(script: ScriptedTurn, entries: SessionEntry[], log: Cal
     log.push({ call: "turn-end" });
   };
   return {
-    isIdle: () => idle,
+    isIdle: () => {
+      if (!idle) seen.resolve();
+      return idle;
+    },
     start() {
       if (script.startMs !== undefined) {
         setTimeout(() => {
           idle = false;
           log.push({ call: "turn-start" });
-          begun.resolve();
           if (script.durationMs !== undefined) setTimeout(finish, script.durationMs);
         }, script.startMs);
       }
       const { entry, entryMs } = script;
       if (entry !== undefined) setTimeout(() => void entries.push(entry), entryMs ?? 0);
     },
-    started: () => begun.promise,
+    observed: () => seen.promise,
     finish,
     ended: () => ended,
   };

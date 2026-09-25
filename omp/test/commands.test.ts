@@ -123,7 +123,7 @@ test("async start: waitForIdle resolves at once while the turn is in flight, yet
   let settled = false;
   const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
 
-  await turn.started(); // 30 ms in: a handler that did not hold would have settled by now
+  await turn.observed(); // the handler polled with the turn in flight; a handler that did not hold would have settled
   expect(turn.ended()).toBe(false);
   expect(settled).toBe(false);
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start"]); // waitForIdle not yet called
@@ -183,7 +183,7 @@ test("no UI, no cap: the handler holds for as long as the turn runs and reports 
   ctx.hasUI = false;
   let settled = false;
   const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
-  await turn.started();
+  await turn.observed();
   // a real wait on purpose: "unbounded" can only be shown by outliving the cap the UI rows use (the helper's
   // poll loops are async, which bun's fake timers cannot advance); the turn then ends on finish(), not the clock
   await Bun.sleep(120);
