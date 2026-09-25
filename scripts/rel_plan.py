@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """A12 — release gate + progressive-delivery plan.
 
-For --task-id / --task-ids / --correlation-id, reads each task's latest gate verdicts and required
-gates from the Task Store, applies swarm.gates.conjunction (most-restrictive wins, expired verdicts
-count as missing), honours a swarm-wide freeze (.swarm/release.freeze, set with --freeze "reason",
+For --task-id / --task-ids / --correlation-id, verifies each task's required non-release gates with
+TaskStore.missing_gate_reasons (only a verified, current, unexpired signed pass/waive counts; any other gate is
+a '<gate>:<reason>' problem: absent, unsigned, bad-sig, mismatch, stale, dry-run, fail or expired), honours a
+swarm-wide freeze (.swarm/release.freeze, set with --freeze "reason",
 lifted with --unfreeze; --dry-run reads it but never writes it), and emits a signed `gate.verdict` with gate="release" that passes only when
 every other required gate passes and no freeze is active. Also writes a canary release.plan
 (5→25→50→100 %) with guardrails and rollback triggers to .swarm/releases/<release_id>.plan.json.
@@ -18,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
-from swarm.gates import make_finding, conjunction  # noqa: E402
+from swarm.gates import make_finding  # noqa: E402
 from swarm.verdicts import issue_gate, resolve_targets  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
@@ -95,7 +96,7 @@ def run(args, ctx) -> dict:
             ids.insert(0, ctx.task_id)
     if ctx.correlation_id and not ids:
         ids = [t["task_id"] for t in store.list(correlation_id=ctx.correlation_id)]
-    findings, per_task, artifacts, risk, now = [], {}, [], "low", time.time()
+    findings, per_task, artifacts, risk = [], {}, [], "low"
     if not ids:
         findings.append(make_finding("RF-000", "major", "input", "no task identified (pass --task-id/--task-ids/--correlation-id)",
                                      owner_suggestion="A01"))
@@ -105,25 +106,24 @@ def run(args, ctx) -> dict:
         except SwarmError as e:
             if e.code is not ErrorCode.E_INPUT:
                 raise
-            per_task[tid] = {"verdicts": {}, "required": [], "overall": "fail", "problems": ["task:unknown"]}
+            per_task[tid] = {"gates": {}, "verdicts": {}, "required": [], "overall": "fail", "problems": ["task:unknown"]}
             findings.append(make_finding(f"RF-{len(findings)+1:03d}", "major", "input", f"unknown task {tid} in Task Store",
                                          owner_suggestion="A01"))
             continue
         if RISK_ORDER.index(task["risk_class"]) > RISK_ORDER.index(risk):
             risk = task["risk_class"]
         required = [g for g in store.required_gates(tid) if g != "release"]
-        latest = store.latest_verdicts(tid)
-        verdicts = {g: ("fail" if v["expires_at"] < now else v["verdict"]) for g, v in latest.items() if g != "release"}
-        overall, problems = conjunction(verdicts, required)
-        expired = [g for g, v in latest.items() if v["expires_at"] < now and g != "release"]
+        # D-14: only verified signed envelopes count; any other row reads as its verification reason
+        reasons = {g: r for g, r in store.missing_gate_reasons(tid).items() if g != "release"}
+        problems = [f"{g}:{r}" for g, r in reasons.items()]
+        status = {g: reasons.get(g, "ok") for g in required}
         per_task[tid] = {"state": task["state"], "risk_class": task["risk_class"], "required": required,
-                         "verdicts": verdicts, "overall": overall, "problems": problems, "expired": expired}
+                         "gates": status, "verdicts": status, "overall": "fail" if problems else "pass",
+                         "problems": problems, "expired": [g for g, r in reasons.items() if r == "expired"]}
         artifacts += [o.get("uri") for o in task["outputs"] if o.get("kind") == "build.artifact"]
-        for pr in problems:
-            gate, why = pr.split(":", 1)
-            sev = "major"
-            findings.append(make_finding(f"RF-{len(findings)+1:03d}", sev, "gate", f"{tid}: {gate} gate {why}"
-                                         + (" (expired)" if gate in expired else ""), owner_suggestion={"review": "A09", "quality": "A08", "security": "A10"}.get(gate, "A01")))
+        for gate, why in reasons.items():
+            findings.append(make_finding(f"RF-{len(findings)+1:03d}", "major", "gate", f"{tid}: {gate} gate {why}",
+                                         owner_suggestion={"review": "A09", "quality": "A08", "security": "A10"}.get(gate, "A01")))
         if not artifacts and task["risk_class"] != "low":
             findings.append(make_finding(f"RF-{len(findings)+1:03d}", "minor", "provenance",
                                          f"{tid}: no build.artifact registered — A11 provenance required before promote",
@@ -135,7 +135,7 @@ def run(args, ctx) -> dict:
     release_id = args.release_id or f"REL-{primary}"
     gates = sorted({g for t in per_task.values() for g in t["required"]}) or [g for g in GATES_BY_RISK[risk] if g != "release"]
     plan = build_plan(release_id, risk, ids, gates, [a for a in artifacts if a])
-    runs = {g: ("pass" if all(t["verdicts"].get(g) in ("pass", "waive") for t in per_task.values()) else "fail") for g in gates}
+    runs = {g: ("pass" if all(t["gates"].get(g, "ok") == "ok" for t in per_task.values()) else "fail") for g in gates}
     runs["freeze"] = "active" if frozen else "none"
     env, recorded = issue_gate(ctx, gate="release", agent_id="A12@local", findings=findings, runs=runs,
                                extra={"release_id": release_id, "frozen": bool(frozen)})
