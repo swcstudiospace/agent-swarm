@@ -92,7 +92,7 @@ class TaskStore:
     def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
         self.path = Path(path) if path else swarm_dir(root, create=True) / "tasks.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=30)  # contenders wait for the write lock, not "database is locked"
         self.conn.row_factory = sqlite3.Row
         self._tx_depth = 0
         self.conn.executescript(_SCHEMA)
@@ -194,46 +194,54 @@ class TaskStore:
     def transition(self, task_id: str, to_state: TaskState | str, *, actor: str = "A01",
                    reason: str = "") -> dict:
         to_state = TaskState(to_state)
-        task = self.get(task_id)
-        from_state = TaskState(task["state"])
-        if to_state not in LEGAL_TRANSITIONS[from_state]:
-            raise SwarmError(ErrorCode.E_CONTRACT,
-                             f"illegal transition {from_state.value} → {to_state.value} for {task_id}",
-                             task_id=task_id)
-        extra = {}
-        if to_state is S.CHANGES_REQUESTED:
-            loops = task["rework_loops"] + 1
-            if loops > MAX_REWORK_LOOPS:
-                to_state, reason = S.ESCALATED, f"rework loops exhausted ({loops-1}); {reason}"
-                if S.ESCALATED not in LEGAL_TRANSITIONS[from_state]:
-                    # IN_REVIEW → CHANGES_REQUESTED → ESCALATED in one audited step
-                    self._apply(task_id, from_state, S.CHANGES_REQUESTED, actor, "rework cap reached")
-                    from_state = S.CHANGES_REQUESTED
-            else:
-                extra["rework_loops"] = loops
-                notes = task["notes_json"]
-                notes["verdicts_since"] = time.time() + 0.001
-                extra["notes"] = json.dumps(notes)
-        if to_state in (S.CLAIMED,) and from_state in (S.PLANNED, S.RETRY, S.BLOCKED):
-            attempt = task["attempt"] + 1
-            if attempt > task["max_attempts"]:
-                raise SwarmError(ErrorCode.E_TIMEOUT, f"max_attempts exceeded for {task_id}", task_id=task_id)
-            extra["attempt"] = attempt
-        if to_state is S.APPROVED:
-            if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
-                raise SwarmError(ErrorCode.E_POLICY,
-                                 "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
-            missing = self.missing_gates(task_id)
-            if missing:
-                raise SwarmError(ErrorCode.E_POLICY,
-                                 f"fail-closed: {task_id} lacks passing gates {missing}", task_id=task_id)
-        self._apply(task_id, from_state, to_state, actor, reason, **extra)
+        # WR-02: read, legality/cap checks and every write run under one BEGIN IMMEDIATE write lock, so
+        # concurrent callers serialize and a state change never commits without its audit row.
+        with self.transaction():
+            task = self.get(task_id)
+            from_state = TaskState(task["state"])
+            if to_state not in LEGAL_TRANSITIONS[from_state]:
+                raise SwarmError(ErrorCode.E_CONTRACT,
+                                 f"illegal transition {from_state.value} → {to_state.value} for {task_id}",
+                                 task_id=task_id)
+            extra = {}
+            if to_state is S.CHANGES_REQUESTED:
+                loops = task["rework_loops"] + 1
+                if loops > MAX_REWORK_LOOPS:
+                    to_state, reason = S.ESCALATED, f"rework loops exhausted ({loops-1}); {reason}"
+                    if S.ESCALATED not in LEGAL_TRANSITIONS[from_state]:
+                        # IN_REVIEW → CHANGES_REQUESTED → ESCALATED in one audited step
+                        self._apply(task_id, from_state, S.CHANGES_REQUESTED, actor, "rework cap reached")
+                        from_state = S.CHANGES_REQUESTED
+                else:
+                    extra["rework_loops"] = loops
+                    notes = task["notes_json"]
+                    notes["verdicts_since"] = time.time() + 0.001
+                    extra["notes"] = json.dumps(notes)
+            if to_state in (S.CLAIMED,) and from_state in (S.PLANNED, S.RETRY, S.BLOCKED):
+                attempt = task["attempt"] + 1
+                if attempt > task["max_attempts"]:
+                    raise SwarmError(ErrorCode.E_TIMEOUT, f"max_attempts exceeded for {task_id}", task_id=task_id)
+                extra["attempt"] = attempt
+            if to_state is S.APPROVED:
+                if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
+                    raise SwarmError(ErrorCode.E_POLICY,
+                                     "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
+                missing = self.missing_gates(task_id)
+                if missing:
+                    raise SwarmError(ErrorCode.E_POLICY,
+                                     f"fail-closed: {task_id} lacks passing gates {missing}", task_id=task_id)
+            self._apply(task_id, from_state, to_state, actor, reason, **extra)
         return self.get(task_id)
 
     def _apply(self, task_id, from_state, to_state, actor, reason, **extra):
-        self.update(task_id, state=to_state.value, **extra)
+        """State write conditional on from_state plus its audit row; the caller's transaction() commits both."""
+        cols = ["state=?", *(f"{k}=?" for k in extra), "updated_at=?"]
+        args = [to_state.value, *extra.values(), time.time(), task_id, from_state.value]
+        cur = self.conn.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=? AND state=?", args)
+        if cur.rowcount != 1:
+            raise SwarmError(ErrorCode.E_CONTRACT, f"concurrent transition on {task_id}: expected {from_state.value}",
+                             task_id=task_id)
         self._log(task_id, from_state, to_state, actor, reason)
-        self._commit()
 
     def _log(self, task_id, from_state, to_state, actor, reason):
         self.conn.execute("INSERT INTO transitions (task_id, from_state, to_state, actor, reason, ts)"
