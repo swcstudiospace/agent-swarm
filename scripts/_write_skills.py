@@ -36,8 +36,8 @@ def agent_skill(a: dict) -> str:
     spawn = ""
     if a["id"] == "A01":
         spawn = """
-6. For each ready task, spawn `subagent_type` = slug (Claude Agent tool or Grok `spawn_subagent`). Do not implement domain work.
-7. Ingest child JSON with `orch_status.py --ingest`. Apply fail-closed gates (max 2 rework loops).
+6. For each ready task, lease it (`orch_status.py --repo <app> --transition <id> CLAIMED`, then `IN_PROGRESS`), then spawn `subagent_type` = slug (Claude Agent tool or Grok `spawn_subagent`). Do not implement domain work.
+7. Ingest child JSON with `orch_status.py --repo <app> --ingest`. Apply fail-closed gates (max 2 rework loops); gate scripts, not you, record verdicts.
 """
     return f"""---
 name: {a['slug']}
@@ -125,7 +125,7 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 /root/src/repos/agent-swarm/scripts/orch_plan.py --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
+2. `python3 /root/src/repos/agent-swarm/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: {slugs}.
@@ -138,7 +138,7 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 
 ## Verification
 
-- A plan JSON exists under `.swarm/plans/`.
+- A plan JSON exists under `<app>/.swarm/plans/` (the same `--repo` the run uses).
 - Child slugs match agents.json.
 - Parent transcript contains no product-code patches from the parent itself.
 """

@@ -38,21 +38,21 @@ Finish every run with a markdown status table (task, agent, state, gates) follow
 <tools>
 <script path="scripts/orch_plan.py" purpose="Decompose a brief into the task DAG (feature / hotfix / dependency / custom plan.json) in the Task Store and write a plan snapshot">
   python3 scripts/orch_plan.py
-  bun scripts/ts/orch_plan.ts --brief brief.md --pattern feature --risk-class medium --prefix T --json
+  bun scripts/ts/orch_plan.ts --repo /path/to/codebase --brief brief.md --pattern feature --risk-class medium --json
 </script>
 <script path="scripts/orch_status.py" purpose="Swarm status table, legal state transitions (A01-only), ingest task.status payloads, task history">
   python3 scripts/orch_status.py
-  bun scripts/ts/orch_status.ts --json
+  bun scripts/ts/orch_status.ts --repo /path/to/codebase --json
   python3 scripts/orch_status.py
-  bun scripts/ts/orch_status.ts --transition T7f3a-be IN_PROGRESS --reason "lease granted"
+  bun scripts/ts/orch_status.ts --repo /path/to/codebase --transition T7f3a-be IN_PROGRESS --reason "lease granted"
   python3 scripts/orch_status.py
-  bun scripts/ts/orch_status.ts --ingest status.json
+  bun scripts/ts/orch_status.ts --repo /path/to/codebase --ingest status.json
 </script>
 <script path="scripts/swarm_run.py" purpose="Autonomous runner: dispatch every ready task to its agent as a headless `claude -p --agent <slug>` session, apply gate/rework/escalation rules between rounds">
   python3 scripts/swarm_run.py
   bun scripts/ts/swarm_run.ts --repo /path/to/codebase --max-parallel 3
   python3 scripts/swarm_run.py
-  bun scripts/ts/swarm_run.ts --dry-run            # simulate with canned results
+  bun scripts/ts/swarm_run.ts --repo /path/to/codebase --dry-run            # simulate with canned results
 </script>
 <script path="scripts/build_agents.py" purpose="Regenerate .claude/agents/*.md from agents.json + prompts/ (run after any prompt change)">
   python3 scripts/build_agents.py --check
@@ -61,7 +61,7 @@ Finish every run with a markdown status table (task, agent, state, gates) follow
 
 <orchestration>
 Two execution modes; use whichever the operator asked for.
-1. **In-session (Agent tool):** after `orch_plan.py`, loop: read `orch_status.py --json`, and for every task with `"ready": true` delegate with the Agent tool using `subagent_type` = the agent's slug from agents.json (e.g. `a05-backend`, `a08-qa`). Launch independent ready tasks in parallel in one message. Pass the full `task.assign` payload (task_id, correlation_id, capability, inputs, acceptance, budget, risk_class) plus upstream artifact summaries in the prompt. When a subagent returns, apply its result: `--ingest` its task.status, record gate verdicts, then re-read status. Gate tasks (capability `gate.*`, notes.gate set) issue verdicts for their `gate_for` targets.
+1. **In-session (Agent tool):** after `orch_plan.py --repo <app>`, loop: read `orch_status.py --repo <app> --json`, and for every task with `"ready": true` lease it before delegating — `orch_status.py --repo <app> --transition <id> CLAIMED`, then `orch_status.py --repo <app> --transition <id> IN_PROGRESS` (gate scripts record verdicts only for a leased gate task) — then delegate with the Agent tool using `subagent_type` = the agent's slug from agents.json (e.g. `a05-backend`, `a08-qa`). Launch independent ready tasks in parallel in one message. Pass the full `task.assign` payload (task_id, correlation_id, capability, inputs, acceptance, budget, risk_class) plus upstream artifact summaries in the prompt. When a subagent returns, apply its result: `orch_status.py --repo <app> --ingest` its task.result, then re-read status. Gate tasks are those with capability `gate.*` and notes.gate set; gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself.
 2. **Headless (swarm_run.py):** run `scripts/swarm_run.py`, which does the same loop with `claude -p --agent`. Prefer this for unattended runs.
 Never execute domain work yourself; if no agent offers a capability, BLOCK the task and escalate.
 </orchestration>
@@ -132,12 +132,12 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 <workflow>
 1. Validate the signed task.assign / project.brief. Reject unsigned assignments.
-2. Run `python3 scripts/orch_plan.py --brief-text … --pattern feature|hotfix|dependency --json` (or `bun scripts/ts/orch_plan.ts` with the same flags) to write the DAG.
-3. Read ready tasks via `python3 scripts/orch_status.py --json`.
-4. For every task with ready=true, spawn the owner: Claude Agent tool `subagent_type=<slug>` or Grok `spawn_subagent` `subagent_type=<slug>`. Pass the full task.assign payload. Never implement domain work yourself.
-5. Ingest each child's JSON via `orch_status.py --ingest`. Record gate verdicts. Apply fail-closed gates and the max-2 rework loop.
+2. Run `python3 scripts/orch_plan.py --repo <app> --brief-text … --pattern feature|hotfix|dependency --json` (or `bun scripts/ts/orch_plan.ts` with the same flags) to write the DAG into `<app>/.swarm`.
+3. Read ready tasks via `python3 scripts/orch_status.py --repo <app> --json`.
+4. For every task with ready=true, lease it (`orch_status.py --repo <app> --transition <id> CLAIMED`, then `--transition <id> IN_PROGRESS`), then spawn the owner: Claude Agent tool `subagent_type=<slug>` or Grok `spawn_subagent` `subagent_type=<slug>`. Pass the full task.assign payload. Never implement domain work yourself.
+5. Ingest each child's JSON via `orch_status.py --repo <app> --ingest`. Gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself. Apply fail-closed gates and the max-2 rework loop.
 6. On the 3rd gate failure, escalate (ESCALATED + escalation.request). Do not retry.
-7. Unattended mode: `python3 scripts/swarm_run.py --repo <app> --runtime auto --json` (or bun twin).
+7. Unattended mode: `python3 scripts/swarm_run.py --repo <app> --runtime auto --json` (or bun twin); the plan must have been written with the same `--repo <app>`.
 8. Finish with the swarm.status markdown table and one fenced json block from <output_format>.
 </workflow>
 
