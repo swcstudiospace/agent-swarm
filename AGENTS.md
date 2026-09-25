@@ -8,7 +8,7 @@ AgentSwarm contains two things:
 - **Runnable implementation:**
   - `swarm/` — Python runtime: signed envelopes, a SQLite task state machine, and gates.
   - `scripts/` — per-agent CLI tools, each with a Bun TypeScript twin.
-  - Generated subagent definitions for Claude Code, Grok Build and Trae SOLO.
+  - Generated subagent definitions for Claude Code, Grok Build, Trae SOLO and omp.
 
 `scripts/swarm_run.py` drives headless `claude -p --agent <slug>` or `grok -p --agent <slug>` sessions against a target repo. This is not a library or a service.
 
@@ -83,9 +83,11 @@ flowchart LR
   - Overwrites `$SWARM_DIR/autonomous.log`.
 
 **Generation pipeline**
-- `prompts/` + `agents.json` → `build_agents.py` → `.claude/agents/<slug>.md` and `.grok/agents/<slug>.md`
+- `prompts/` + `agents.json` → `build_agents.py` → `.claude/agents/<slug>.md`, `.grok/agents/<slug>.md`, `omp/agents/<slug>.md` and `omp/skills/<slug>/SKILL.md`
+  - `omp/` holds only `agents/` and `skills/`. `omp/package.json`, the extension entry and `.omp` wiring arrive in Phase 3.
+  - omp `tools:` lists are not a sandbox; nothing enforces read-only yet (that arrives with the Phase 4 guard).
 - `prompts/` + `agents.json` → `build_trae_agents.py` → `.trae/`: 15 XML prompts of at most 10,000 characters each, `registration.json`, `commands/swarm.md`, `README.md`
-- `_write_skills.py` → `skills/<slug>/SKILL.md` and `skills/orchestrate/SKILL.md`
+- `_write_skills.py` → `skills/<slug>/SKILL.md`, `skills/orchestrate/SKILL.md` and `omp/skills/<slug>/SKILL.md`
 
 ## Key Directories
 
@@ -97,7 +99,7 @@ flowchart LR
 | `prompts/` | **Source of truth** for agent behaviour: XML-tagged system prompts |
 | `03-agents/` | Original 7-section agent specs (Purpose, Stack, Communication, Decision logic, Errors, Metrics, Security) |
 | `hooks/` | `user_prompt_submit.py` and `autonomous_run.py` |
-| `.claude/agents/`, `.grok/agents/`, `.trae/`, `skills/` | **Generated.** Never hand-edit |
+| `.claude/agents/`, `.grok/agents/`, `.trae/`, `skills/`, `omp/agents/`, `omp/skills/` | **Generated.** Never hand-edit |
 | `.swarm/` | Runtime state (own `.gitignore` of `*`, written on creation; the repo's `.gitignore` is never touched): `tasks.db`, `events.jsonl`, `plans/`, `assignments/`, `results/`, `verdicts/`, `kickoffs/`, `releases/`, `artifacts/`, `slo/`, `incidents/`, `patch_tasks/` |
 | `docs/superpowers/specs/` | Spec for the prompt uplift, TS twins, skills and hooks |
 
@@ -111,9 +113,9 @@ bun test                                              # tests/ts/*.test.ts (== n
 ruff check .                                          # py312, E/F/W, E501 ignored; currently 3 pre-existing errors
 
 # regenerate after editing prompts/ or agents.json (run BOTH)
-python3 scripts/build_agents.py                       # .claude/agents + .grok/agents   (--check, --only A05,a06-frontend)
+python3 scripts/build_agents.py                       # .claude/agents + .grok/agents + omp/agents + omp/skills   (--check, --only A05,a06-frontend)
 python3 scripts/build_trae_agents.py                  # .trae/                          (--check, --dry-run, --json)
-python3 scripts/_write_skills.py                      # skills/ (overwrites everything; has no --check)
+python3 scripts/_write_skills.py                      # skills/ + omp/skills/ (overwrites everything; has no --check)
 python3 scripts/build_agents.py --install-workspace /path/to/ws   # copy agents, skills and hooks into another workspace
 
 # run the swarm in isolation (SWARM_DIR otherwise defaults to <git toplevel of --root/--repo or cwd>/.swarm)

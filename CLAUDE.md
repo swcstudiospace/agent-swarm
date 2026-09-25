@@ -13,6 +13,8 @@ a Claude Code and Grok Build subagent whose Prompt-Uplift XML prompt lives in `p
 | `agents.json` | Manifest: id, code, slug, capabilities, consumes/produces, tools, model, scripts |
 | `.claude/agents/*.md` | **Generated** Claude Code subagents (`python3 scripts/build_agents.py`) |
 | `.grok/agents/*.md` | **Generated** Grok Build subagents |
+| `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). Not a sandbox: tool lists are unenforced until Phase 4 |
+| `omp/skills/<slug>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`). No `omp/package.json` or `.omp` wiring until Phase 3 |
 | `skills/<slug>/SKILL.md` | Per-agent + `orchestrate` skills (copy with `--install-workspace`) |
 | `scripts/ts/` | TypeScript twins of every `scripts/*.py` tool |
 | `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier |
