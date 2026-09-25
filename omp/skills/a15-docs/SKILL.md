@@ -1,5 +1,5 @@
 ---
-name: a15-docs
+name: "a15-docs"
 description: "A15 DOC Documentation Engineer — Owns docs bundles, API references, runbooks and changelogs. Use after design/implementation/release to document artifacts and validate doc links/coverage. Use when the swarm assigns capability docs.bundle, docs.api, docs.runbook."
 ---
 

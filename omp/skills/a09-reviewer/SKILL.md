@@ -1,5 +1,5 @@
 ---
-name: a09-reviewer
+name: "a09-reviewer"
 description: "A09 REV Code Reviewer — Review gate. Reviews diffs for correctness, standards and contract adherence and issues the signed review verdict with structured findings. Read-only on product code. Use when the swarm assigns capability review.code, review.standards, gate.review."
 ---
 

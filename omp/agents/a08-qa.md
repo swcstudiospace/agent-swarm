@@ -1,5 +1,5 @@
 ---
-name: a08-qa
+name: "a08-qa"
 description: "A08 QA — Quality gate. Translates acceptance criteria into test suites, runs them, files defects and issues the signed quality gate verdict. Never modifies product code."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

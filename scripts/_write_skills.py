@@ -144,11 +144,19 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 """
 
 
+def yaml_str(text: str) -> str:
+    """Encode text as a YAML double-quoted scalar (a JSON string literal is one)."""
+    return json.dumps(text, ensure_ascii=False)
+
+
 def omp_skill(a: dict) -> str:
-    desc = a["description"].replace('"', "'")
+    desc = yaml_str(
+        f"{a['id']} {a['code']} {a['name']} — {a['description']} "
+        f"Use when the swarm assigns capability {', '.join(a['capabilities'][:3])}."
+    )
     return f"""---
-name: {a['slug']}
-description: "{a['id']} {a['code']} {a['name']} — {desc} Use when the swarm assigns capability {', '.join(a['capabilities'][:3])}."
+name: {yaml_str(a['slug'])}
+description: {desc}
 ---
 
 # {a['name']} ({a['id']} {a['code']}) — omp

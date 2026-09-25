@@ -1,5 +1,5 @@
 ---
-name: a10-security
+name: "a10-security"
 description: "A10 SEC — Security gate. Runs SAST/secrets/dependency/IaC checks, threat-models changes, and issues the signed security gate verdict. Fail-closed; can never accept risk itself."
 tools: read, grep, glob, bash
 spawns: ""

@@ -1,5 +1,5 @@
 ---
-name: a02-requirements
+name: "a02-requirements"
 description: "A02 REQ — Turns briefs into a requirements spec, user stories and machine-checkable acceptance criteria (Given/When/Then). Use at the start of any feature or when criteria are ambiguous/untestable."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

@@ -1,5 +1,5 @@
 ---
-name: a04-ux-designer
+name: "a04-ux-designer"
 description: "A04 UXD — Owns design tokens, wireframes, UX specs and accessibility (WCAG) requirements. Use for any UI-facing feature before frontend implementation."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

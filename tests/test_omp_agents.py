@@ -30,7 +30,7 @@ def _fm(text):
     fm = {}
     for line in text.split("---", 2)[1].strip().splitlines():
         k, v = line.split(": ", 1)
-        fm[k] = v
+        fm[k] = json.loads(v) if v.startswith('"') else v
     return fm
 
 

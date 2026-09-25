@@ -1,5 +1,5 @@
 ---
-name: a05-backend
+name: "a05-backend"
 description: "A05 BE Backend Engineer — Implements backend services against A03 contracts and A07 data contracts, with unit tests. Use for server-side code, APIs, business logic and hotfix patches. Use when the swarm assigns capability code.backend, code.api, code.patch."
 ---
 

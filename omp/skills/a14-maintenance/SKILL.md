@@ -1,5 +1,5 @@
 ---
-name: a14-maintenance
+name: "a14-maintenance"
 description: "A14 MAINT Maintenance Engineer — Owns patch tasks, dependency bumps, tech-debt register and EOL tracking. Use for hotfix root-cause analysis, CVE-driven patching and debt triage. Use when the swarm assigns capability maint.patch, maint.deps, maint.debt."
 ---
 

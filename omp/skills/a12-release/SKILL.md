@@ -1,5 +1,5 @@
 ---
-name: a12-release
+name: "a12-release"
 description: "A12 REL Release Manager — Owns release plans, progressive delivery (canary) and rollback. Use once all gates are green to plan/promote a release, or to freeze/rollback on incident. Use when the swarm assigns capability release.plan, release.promote, release.rollback."
 ---
 

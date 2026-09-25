@@ -1,5 +1,5 @@
 ---
-name: a04-ux-designer
+name: "a04-ux-designer"
 description: "A04 UXD UX Designer — Owns design tokens, wireframes, UX specs and accessibility (WCAG) requirements. Use for any UI-facing feature before frontend implementation. Use when the swarm assigns capability ux.tokens, ux.spec, ux.a11y."
 ---
 

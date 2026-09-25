@@ -1,5 +1,5 @@
 ---
-name: a06-frontend
+name: "a06-frontend"
 description: "A06 FE Frontend Engineer — Implements UI against A04 tokens/UX specs and A03 API contracts, with component tests and a11y checks. Use for client-side code. Use when the swarm assigns capability code.frontend, code.ui, code.patch."
 ---
 

@@ -1,5 +1,5 @@
 ---
-name: a11-devops
+name: "a11-devops"
 description: "A11 DEVOPS DevOps / Platform Engineer — Owns IaC, CI pipelines, build artifacts and environments. Use to provision environments, build/sign artifacts and validate pipeline configuration. Use when the swarm assigns capability deploy.env, ci.pipeline, build.artifact."
 ---
 

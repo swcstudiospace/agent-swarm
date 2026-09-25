@@ -1,5 +1,5 @@
 ---
-name: a01-orchestrator
+name: "a01-orchestrator"
 description: "A01 ORCH Swarm Orchestrator — Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC. Use when the swarm assigns capability plan.decompose, plan.schedule, plan.arbitrate."
 ---
 

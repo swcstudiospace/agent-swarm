@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
-from _write_skills import omp_skill  # noqa: E402
+from _write_skills import omp_skill, yaml_str  # noqa: E402
 
 CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
@@ -132,8 +132,8 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
     spawns = ", ".join(a["slug"] for a in agents if a["id"] != "A01") if is_orch else '""'
     fm = [
         "---",
-        f"name: {agent['slug']}",
-        f'description: "{agent["id"]} {agent["code"]} — {_desc(agent)}"',
+        f"name: {yaml_str(agent['slug'])}",
+        f'description: {yaml_str(agent["id"] + " " + agent["code"] + " — " + agent["description"])}',
         f"tools: {tools}",
         f"spawns: {spawns}",
     ]

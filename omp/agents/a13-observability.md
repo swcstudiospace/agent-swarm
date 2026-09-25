@@ -1,5 +1,5 @@
 ---
-name: a13-observability
+name: "a13-observability"
 description: "A13 OBS — Owns SLOs, dashboards, alerting and incident declaration. Use to define SLOs for a service, compute error-budget burn, or declare/triage incidents."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

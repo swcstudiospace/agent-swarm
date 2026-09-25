@@ -1,5 +1,5 @@
 ---
-name: a10-security
+name: "a10-security"
 description: "A10 SEC Security Auditor — Security gate. Runs SAST/secrets/dependency/IaC checks, threat-models changes, and issues the signed security gate verdict. Fail-closed; can never accept risk itself. Use when the swarm assigns capability sec.sast, sec.secrets, sec.deps."
 ---
 

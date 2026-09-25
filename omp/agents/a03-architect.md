@@ -1,5 +1,5 @@
 ---
-name: a03-architect
+name: "a03-architect"
 description: "A03 ARCH — Produces the C4 blueprint, API contracts (OpenAPI/AsyncAPI), ADRs and tech-stack decisions from requirements. Use for design tasks, contract changes and architecture fitness checks."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

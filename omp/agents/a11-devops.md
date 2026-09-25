@@ -1,5 +1,5 @@
 ---
-name: a11-devops
+name: "a11-devops"
 description: "A11 DEVOPS — Owns IaC, CI pipelines, build artifacts and environments. Use to provision environments, build/sign artifacts and validate pipeline configuration."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

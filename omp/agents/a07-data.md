@@ -1,5 +1,5 @@
 ---
-name: a07-data
+name: "a07-data"
 description: "A07 DATA — Owns data models, schema migrations (expand/contract, reversible) and data contracts. Use for any persistence, migration or pipeline change."
 tools: read, grep, glob, bash, write, edit
 spawns: ""

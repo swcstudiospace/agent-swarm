@@ -1,5 +1,5 @@
 ---
-name: a01-orchestrator
+name: "a01-orchestrator"
 description: "A01 ORCH — Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC."
 tools: read, grep, glob, bash, task, write
 spawns: a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa, a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs
