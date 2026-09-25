@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
-"""A01 — autonomous swarm runner: executes a planned task DAG with Claude Code subagents.
+"""A01 — autonomous swarm runner: executes a planned task DAG with headless agent sessions.
 
-Each ready task is dispatched to its agent as a headless session
-    claude -p --agent <slug> --output-format json --permission-mode <mode> "<task.assign prompt>"
-run from --repo (the codebase being worked on
-defaults to cwd). Agent sessions run without signing keys (SWARM_AGENT_SESSION=1), so a gate script they run
-records nothing. For each gate task the runner itself runs the gate script on the gate task's own id after the
-session, while the task is still leased; the script records signed verdicts on the gate task's Task Store
-gate_for targets (the runner writes no rows itself).
+Each ready task is dispatched to its agent as a headless session, run with the task.assign prompt on stdin:
+    claude -p --agent <slug> --output-format json --permission-mode <mode> …                (--runtime claude)
+    grok -p --agent <slug> --output-format json --yolo --cwd <repo>                          (--runtime grok)
+    omp -p --mode json --no-session --no-title --no-extensions -e <agent-swarm>/omp --cwd <repo>
+        --approval-mode yolo --tools <frontmatter tools>,yield
+        --append-system-prompt $SWARM_DIR/agents/<slug>.md --max-time <n>s                   (--runtime omp)
+--runtime auto picks grok when SWARM_RUNTIME=grok or grok is on PATH and claude is not, else claude; it never
+picks omp (use --runtime omp or SWARM_RUNTIME=omp). Preflight checks only the selected runtime's binary (and
+`claude auth status` for claude). The omp result is the `yield` payload of the terminal agent_end, falling back
+to the last fenced json block in the final assistant text.
+
+Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>), so a gate
+script they run records nothing. For each gate task the runner itself runs the gate script on the gate task's own
+id after the session, while the task is still leased; the script records signed verdicts on the gate task's Task
+Store gate_for targets (the runner writes no rows itself).
 A01 rules (fail-closed gates, bounded rework, escalation) are
 applied between rounds by the Task Store.
 
   python3 scripts/swarm_run.py                          # run latest plan to completion
-  python3 scripts/swarm_run.py --dry-run                # simulate with canned agent results (no claude)
+  python3 scripts/swarm_run.py --runtime omp            # run it on omp (needs only `omp` on PATH)
+  python3 scripts/swarm_run.py --dry-run                # canned agent results; prints each task's invocation to stderr
   python3 scripts/swarm_run.py --once --max-parallel 3  # a single scheduling round
 """
 from __future__ import annotations
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -114,43 +126,134 @@ def preflight_auth(claude_bin: str) -> None:
                                           "or export ANTHROPIC_API_KEY; use --dry-run to simulate without credentials")
 
 
+RUNTIMES = ("claude", "grok", "omp")
+# the child-env deltas every runtime gets; --dry-run prints exactly these (never key material)
+CHILD_ENV_KEYS = ("SWARM_DIR", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_AGENT", "AIO_UPLIFT", "AIO_SWARM")
+FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n?", re.S)
+FRONTMATTER_TOOLS = re.compile(r"^tools:[ \t]*(.*?)[ \t]*$", re.M)
+
+
 def resolve_runtime(explicit: str) -> str:
-    """auto: grok when SWARM_RUNTIME=grok or (grok on PATH and claude is not)."""
-    if explicit in ("claude", "grok"):
+    """claude|grok|omp as given; auto: SWARM_RUNTIME=grok|omp, else grok when grok is on PATH and claude is not,
+    else claude. auto never picks omp from PATH (OPEN-3)."""
+    if explicit in RUNTIMES:
         return explicit
-    if os.environ.get("SWARM_RUNTIME") == "grok":
-        return "grok"
+    if os.environ.get("SWARM_RUNTIME") in ("grok", "omp"):
+        return os.environ["SWARM_RUNTIME"]
     if shutil.which("grok") and not shutil.which("claude"):
         return "grok"
     return "claude"
 
 
-def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
-    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+def runtime_bin(runtime: str, args) -> str:
+    return {"claude": getattr(args, "claude_bin", "claude"), "grok": getattr(args, "grok_bin", "grok"),
+            "omp": getattr(args, "omp_bin", "omp")}[runtime]
+
+
+def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
+    """(--tools CSV incl. yield, body file): omp/agents/<slug>.md's frontmatter tools, and its body with the
+    frontmatter stripped, written to $SWARM_DIR/agents/<slug>.md (a missing file would be appended as literal text)."""
+    src = ROOT / "omp" / "agents" / f"{slug}.md"
+    try:
+        raw = src.read_text()
+    except OSError as e:
+        raise SwarmError(ErrorCode.E_DEP, f"omp agent body {src} unreadable ({e.strerror}); run scripts/build_agents.py") from e
+    fm = FRONTMATTER.match(raw)
+    tools_m = FRONTMATTER_TOOLS.search(fm.group(1)) if fm else None
+    if fm is None or tools_m is None:
+        raise SwarmError(ErrorCode.E_DEP, f"omp agent body {src} has no frontmatter tools: line")
+    tools = [t.strip() for t in tools_m.group(1).strip("\"'").split(",") if t.strip()]
+    if "yield" not in tools:
+        tools.append("yield")
+    body = sdir / "agents" / f"{slug}.md"
+    body.parent.mkdir(parents=True, exist_ok=True)
+    # atomic: parallel tasks of one agent rewrite the same file while an earlier child may be reading it
+    tmp = body.with_name(f".{slug}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(raw[fm.end():])
+    os.replace(tmp, body)
+    return ",".join(tools), body
+
+
+def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) -> tuple[list[str], dict, Path]:
+    """(argv, env, cwd) of one agent session; the prompt goes on stdin. Shared by the live path and --dry-run."""
+    slug = agent["slug"]
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
     env = {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}
     # SWARM_AGENT: the session's agent identity; the omp swarm_gate tool runs only that agent's gate (WR-03)
-    env.update(SWARM_DIR=str(swarm_dir(repo)), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=agent["slug"],
+    env.update(SWARM_DIR=str(sdir), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=slug,
                AIO_UPLIFT="0", AIO_SWARM="0")
+    model = ["--model", args.model] if args.model else []
+    binary = runtime_bin(runtime, args)
     if runtime == "grok":
-        grok_bin = getattr(args, "grok_bin", "grok")
-        cmd = [grok_bin, "-p", "--agent", agent["slug"], "--output-format", "json",
-               "--yolo", "--cwd", str(repo)]
-        if args.model:
-            cmd += ["--model", args.model]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=args.task_timeout, cwd=str(repo), env=env)
-    else:
-        cmd = [args.claude_bin, "-p", "--agent", agent["slug"], "--output-format", "json",
-               "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns),
-               "--add-dir", str(ROOT)]
-        if args.model:
-            cmd += ["--model", args.model]
-        if args.allowed_tools:
-            cmd += ["--allowedTools", *[t.strip() for t in args.allowed_tools.split(",") if t.strip()]]
-        cmd += ["--add-dir", str(repo)]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=args.task_timeout, cwd=ROOT, env=env)
-    text, meta = proc.stdout, {"returncode": proc.returncode, "stderr": proc.stderr[-2000:]}
+        return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", "--cwd", str(repo), *model], env, repo
+    if runtime == "omp":
+        tools, body = omp_agent(slug, sdir)
+        # -e spelled as omp's absolute root path: omp dedups extension roots by that string, not realpath (D-01)
+        return [binary, "-p", "--mode", "json", "--no-session", "--no-title", "--no-extensions",
+                "-e", str((ROOT / "omp").resolve()), "--cwd", str(repo), "--approval-mode", "yolo",
+                "--tools", tools, "--append-system-prompt", str(body),
+                "--max-time", f"{max(60, args.task_timeout - 60)}s", *model], env, repo
+    cmd = [binary, "-p", "--agent", slug, "--output-format", "json",
+           "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns),
+           "--add-dir", str(ROOT), *model]
+    if args.allowed_tools:
+        cmd += ["--allowedTools", *[t.strip() for t in args.allowed_tools.split(",") if t.strip()]]
+    return cmd + ["--add-dir", str(repo)], env, ROOT  # cwd ROOT: .claude/agents resolves
+
+
+def omp_stream_text(stdout: str) -> tuple[str, dict]:
+    """Normalise an `omp -p --mode json` stream to (final text, meta). The text is the last assistant message's
+    text parts from the last terminal agent_end, plus — when the session yielded successfully — a trailing fenced
+    json block of the yield data, so parse_result (last block wins) takes the yield payload first."""
+    session_id, turns, end = None, 0, None
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "session":
+            session_id = ev.get("id")
+        elif ev.get("type") == "turn_end":
+            turns += 1
+        elif ev.get("type") == "agent_end" and ev.get("isTerminal") is not False:
+            end = ev
+    meta = {"session_id": session_id, "total_cost_usd": None, "num_turns": turns, "is_error": True}
+    if end is None:
+        return "", meta
+    messages = [m for m in end.get("messages") or [] if isinstance(m, dict)]
+    assistants = [m for m in messages if m.get("role") == "assistant"]
+    last = assistants[-1] if assistants else {}
+    content = last.get("content") or []
+    text = content if isinstance(content, str) else "\n".join(
+        p.get("text") or "" for p in content if isinstance(p, dict) and p.get("type") == "text")
+    meta["total_cost_usd"] = sum(((m.get("usage") or {}).get("cost") or {}).get("total") or 0 for m in assistants)
+    meta["is_error"] = last.get("stopReason") in ("error", "aborted")
+    for m in reversed(messages):
+        if m.get("role") != "toolResult" or m.get("toolName") != "yield":
+            continue
+        details = m.get("details")
+        details = details if isinstance(details, dict) else {}
+        if m.get("isError") is False and details.get("status") == "success":
+            if isinstance(details.get("data"), dict):
+                text += f"\n```json\n{json.dumps(details['data'])}\n```"
+        else:
+            meta["yield_error"] = details.get("error") or f"yield status={details.get('status')} isError={m.get('isError')}"
+        break
+    return text, meta
+
+
+def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
+    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+    cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
+    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=args.task_timeout, cwd=cwd, env=env)
+    meta = {"returncode": proc.returncode, "stderr": proc.stderr[-2000:]}
+    if runtime == "omp":
+        text, stream_meta = omp_stream_text(proc.stdout)
+        return text, {**meta, **stream_meta}
+    text = proc.stdout
     try:
         data = json.loads(text)
         meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
@@ -158,6 +261,19 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     except json.JSONDecodeError:
         pass
     return text, meta
+
+
+def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) -> dict:
+    """--dry-run: print the exact session invocation (env deltas, argv, stdin file) to stderr; spawn nothing."""
+    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+    cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
+    deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in CHILD_ENV_KEYS)
+    stdin = sdir / "assignments" / f"{task['task_id']}.a{task['attempt']}.md"
+    print(f"dry-run {task['task_id']} [{agent['id']}]: {deltas} {shlex.join(cmd)} < {shlex.quote(str(stdin))}",
+          file=sys.stderr, flush=True)
+    return {"dry_run": True, "runtime": runtime, "argv": cmd}
+
+
 
 
 def canned_result(task: dict, agent: dict) -> str:
@@ -301,9 +417,10 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
         (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
+            meta = dry_run_invocation(task, agent, repo, sdir, args)
             if task["notes_json"].get("gate"):
                 run_gate_script(task, repo, sdir, dry_run=True)
-            text, meta = canned_result(task, agent), {"dry_run": True}
+            text = canned_result(task, agent)
         else:
             text, meta = run_agent_headless(agent, prompt, repo, args)
         (sdir / "results").mkdir(parents=True, exist_ok=True)
@@ -357,10 +474,13 @@ def run(args, ctx) -> dict:
     if not store.list(correlation_id=corr):
         raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
                          "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
-    if not args.dry_run and not shutil.which(args.claude_bin):
-        raise SwarmError(ErrorCode.E_DEP, f"{args.claude_bin} not on PATH (use --dry-run to simulate)")
+    args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
     if not args.dry_run:
-        preflight_auth(args.claude_bin)
+        binary = runtime_bin(args.runtime, args)
+        if not shutil.which(binary):
+            raise SwarmError(ErrorCode.E_DEP, f"{binary} not on PATH (--runtime {args.runtime}; use --dry-run to simulate)")
+        if args.runtime == "claude":
+            preflight_auth(binary)
     log, rounds = [], 0
     while True:
         rounds += 1
@@ -410,8 +530,10 @@ def add_args(p):
     p.add_argument("--model", help="override model for all agents")
     p.add_argument("--claude-bin", default="claude")
     p.add_argument("--grok-bin", default="grok")
-    p.add_argument("--runtime", choices=["auto", "claude", "grok"], default="auto",
-                   help="headless runner: claude -p --agent, grok -p --agent --yolo, or auto")
+    p.add_argument("--omp-bin", default="omp")
+    p.add_argument("--runtime", choices=["auto", *RUNTIMES], default="auto",
+                   help="headless runner: claude -p --agent, grok -p --agent --yolo, omp -p --mode json, or auto "
+                        "(claude/grok; omp only when explicit or SWARM_RUNTIME=omp)")
     p.add_argument("--allowed-tools", default="Bash(python3:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Read,Grep,Glob",
                    help="comma list passed to claude --allowedTools so headless agents can run their scripts unattended")
 

@@ -10,7 +10,7 @@ AgentSwarm contains two things:
   - `scripts/` — per-agent CLI tools, each with a Bun TypeScript twin.
   - Generated subagent definitions for Claude Code, Grok Build, Trae SOLO and omp.
 
-`scripts/swarm_run.py` drives headless `claude -p --agent <slug>` or `grok -p --agent <slug>` sessions against a target repo. This is not a library or a service.
+`scripts/swarm_run.py` drives headless `claude -p --agent <slug>`, `grok -p --agent <slug>` or `omp -p` sessions against a target repo. This is not a library or a service.
 
 ## Architecture & Data Flow
 
@@ -18,7 +18,7 @@ AgentSwarm contains two things:
 flowchart LR
   B[brief] --> P[orch_plan.py] --> DB[(SQLite tasks.db)]
   DB --> R[swarm_run.py rounds]
-  R -->|signed task.assign| A[claude/grok -p --agent slug]
+  R -->|signed task.assign| A[claude/grok/omp -p, agent slug]
   A -->|last json block| AR[apply_result] --> DB
   A --> G[gate scripts] -->|signed verdict| DB
   R -->|reconcile| DB
@@ -33,6 +33,8 @@ flowchart LR
 - For each task it writes a signed `task.assign` to `assignments/` and saves output to `results/<tid>.a<N>.md`.
 - Claude runs with cwd set to this repo and `--add-dir <repo>`.
 - Grok runs with `--cwd <repo> --yolo`.
+- omp runs `omp -p --mode json --no-session --no-title --no-extensions -e <ROOT>/omp --cwd <repo> --approval-mode yolo --tools <frontmatter tools>,yield --append-system-prompt $SWARM_DIR/agents/<slug>.md --max-time <n>s [--model M]`, prompt on stdin. `-e` loads the package while `--no-extensions` skips every other extension; the generated agent body is appended from `$SWARM_DIR/agents/<slug>.md`. The result is the `yield` payload of the terminal `agent_end` (else the last json block of the assistant text), appended as the last json block, so `swarm/results.py` parses it unchanged.
+- `--dry-run` prints each task's exact runtime invocation to stderr.
 
 **3. Result protocol**
 - The agent's **last** ```json block is parsed: `{state: IN_REVIEW|BLOCKED|FAILED, outputs[], verdicts{target:{verdict,findings}}}`.
@@ -91,7 +93,7 @@ flowchart LR
   - Self-containment: `omp/src/bridge.ts` and `omp/src/tools.ts` import `../../scripts/ts/script_base.ts`, so a copied `omp/` package breaks; Phase 4 added no new import outside `omp/`, and Phase 7 (install) owns the fix.
 - `hooks/autonomous_run.py`
   - Started by an external plugin (`src/swarm/kickoff.ts`, not in this repo).
-  - Runs plan and run, with a 120 s dedupe lock at `$SWARM_DIR/kickoffs/<sha16>.lock`.
+  - Runs plan and run, with a 120 s dedupe lock at `$SWARM_DIR/kickoffs/<sha16>.lock`. `--runtime auto|claude|grok|omp` is forwarded verbatim to `swarm_run.py`.
   - Overwrites `$SWARM_DIR/autonomous.log`.
 
 **Generation pipeline**
@@ -154,7 +156,7 @@ python3 scripts/orch_status.py [--history T7f3a-be] [--transition T7f3a-be STATE
 
 # no SWARM_DIR: pass the same --repo to plan, run and status (state lives in <repo>/.swarm; --repo is an alias of --root)
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature --risk-class medium
-python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3 --runtime auto|claude|grok
+python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3 --runtime auto|claude|grok|omp
 python3 scripts/orch_status.py --repo /path/to/codebase
 ```
 
@@ -230,7 +232,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
   - PyYAML is optional, with a regex fallback, in `arch_contract_check`, `be_contract_conformance` and `devops_ci_check`.
 - **Bun** runs the TS twins (`#!/usr/bin/env bun`). There are no npm dependencies, no lockfile and no `node_modules`.
 - **Python is canonical.** Put logic in the Python script; TS twins pass through, and the TS generators call the Python ones.
-- **`claude` must be on PATH** for real runs, even with `--runtime grok`: `swarm_run.py` calls `claude auth status`.
+- **Runtime binaries.** Preflight checks only the selected runtime's binary (`--claude-bin`/`--grok-bin`/`--omp-bin`); the `claude auth status` preflight runs for claude only. `auto` never picks omp: select it with `--runtime omp` or `SWARM_RUNTIME=omp`.
 - **State dir resolution (`swarm/paths.py`).** Resolved per call, never at import: env `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. `swarm_run.py` and `hooks/autonomous_run.py` pass the absolute path to children. Creating the dir writes `.swarm/.gitignore` = `*` (never overwritten). Tests still set `SWARM_DIR` explicitly.
 - **Other env vars:**
   - `SWARM_AGENTS_FILE`, `SWARM_RUNTIME`, `SWARM_DRYRUN_FAIL`, `SWARM_CHILD`, `SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY`, `SWARM_DISPATCH_HOLD_MS` (omp `/swarm` hold cap in ms; a positive integer).

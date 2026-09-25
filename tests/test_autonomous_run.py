@@ -107,3 +107,33 @@ def test_autonomous_skips_run_on_plan_failure(tmp_path):
     assert log["plan_rc"] == 2 and log["skipped_run"] is True
     assert log["error"]["code"] == "E-CONTRACT"
     assert "run_rc" not in log
+
+
+def test_autonomous_forwards_runtime_omp(tmp_path):
+    import shutil
+    root = tmp_path / "swarm-root"
+    shutil.copytree(ROOT / "swarm", root / "swarm")
+    (root / "scripts").mkdir()
+    events = tmp_path / "events.jsonl"
+    (root / "scripts" / "orch_plan.py").write_text(
+        "import json, sys\n"
+        f"open({str(events)!r}, 'a').write(json.dumps(['plan', sys.argv[1:]]) + '\\n')\n"
+        "print(json.dumps({'status': 'ok', 'correlation_id': 'corr-omp-1'}))\n")
+    (root / "scripts" / "swarm_run.py").write_text(
+        "import json, sys\n"
+        f"open({str(events)!r}, 'a').write(json.dumps(['run', sys.argv[1:]]) + '\\n')\n")
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement a billing feature",
+         "--swarm-root", str(root), "--runtime", "omp", "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    calls = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [name for name, _ in calls] == ["plan", "run"]
+    run_argv = calls[1][1]
+    assert run_argv[run_argv.index("--runtime") + 1] == "omp"
+    assert run_argv[run_argv.index("--correlation-id") + 1] == "corr-omp-1"
+    assert "--dry-run" in run_argv
+    log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
+    assert log["plan_rc"] == 0 and log["run_rc"] == 0

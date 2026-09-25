@@ -1,4 +1,4 @@
-"""Shared fixtures: isolated SWARM_DIR, script runner, stub claude CLI."""
+"""Shared fixtures: isolated SWARM_DIR, script runner, stub claude and omp CLIs."""
 import json
 import os
 import stat
@@ -40,3 +40,44 @@ elif "-p" in sys.argv:
 """)
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return p
+
+
+_OMP_STUB = r'''#!@PY@
+import json, os, re, sys
+prompt = sys.stdin.read()
+with open(@CALLS@, "a") as fh:
+    fh.write(json.dumps({"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd()}) + "\n")
+res = dict(@RESULT@)
+m = re.search(r'"task_id": "([^"]+)"', prompt)
+if "task_id" not in res and m:
+    res["task_id"] = m.group(1)
+call = {"type": "toolCall", "id": "toolu_1", "name": "yield", "arguments": {"data": res}}
+asst = {"role": "assistant", "content": [{"type": "text", "text": "done"}, call], "stopReason": "toolUse",
+        "usage": {"cost": {"total": 0.01}}}
+tres = {"role": "toolResult", "toolCallId": "toolu_1", "toolName": "yield", "isError": False,
+        "details": {"data": res, "status": "success"}}
+print("omp: stub banner (not json)")
+for ev in ({"type": "session", "version": 3, "id": "stub-session", "cwd": os.getcwd()}, {"type": "agent_start"},
+           {"type": "turn_end", "message": asst, "toolResults": [tres]},
+           {"type": "agent_end", "messages": [{"role": "user", "content": prompt}, asst, tres],
+            "isTerminal": True, "yielded": True}):
+    print(json.dumps(ev))
+'''
+
+
+def stub_omp(tmp_path, result: dict, name: str = "omp") -> Path:
+    """Executable `<tmp>/omp-bin/<name>` standing in for `omp -p --mode json`: appends {argv, env, cwd} to
+    omp_calls(stub), then prints a JSONL stream whose terminal agent_end yields `result` (task_id taken from the
+    prompt when `result` has none). Its directory holds no claude, so it can be the whole PATH."""
+    d = tmp_path / "omp-bin"
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_text(_OMP_STUB.replace("@PY@", sys.executable).replace("@CALLS@", repr(str(d / "calls.jsonl")))
+                 .replace("@RESULT@", repr(result)))
+    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return p
+
+
+def omp_calls(stub: Path) -> list[dict]:
+    f = stub.parent / "calls.jsonl"
+    return [json.loads(ln) for ln in f.read_text().splitlines()] if f.exists() else []

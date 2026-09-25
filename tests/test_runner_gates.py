@@ -62,28 +62,33 @@ def _events(swarm, etype):
 
 
 # ---------------------------------------------------------------- WR-12: no key material in agent sessions
-@pytest.mark.parametrize("runtime", ["claude", "grok"])
+@pytest.mark.parametrize("runtime", ["claude", "grok", "omp"])
 def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     monkeypatch.setenv("SWARM_SIGNING_KEY", "s")
     monkeypatch.setenv("SWARM_ED25519_KEY", "11" * 32)
     monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
     mod = _load_swarm_run(tmp_path, monkeypatch)
     seen = {}
+    # each runtime's own stdout shape: omp streams JSONL, claude/grok print one JSON object
+    stdout = (ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl").read_text() if runtime == "omp" else '{"result":"ok"}'
 
     def fake_run(cmd, **kw):
-        seen["env"] = kw["env"]
-        return SimpleNamespace(stdout='{"result":"ok"}', stderr="", returncode=0)
+        seen["cmd"], seen["env"] = cmd, kw["env"]
+        return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
-    args = SimpleNamespace(runtime=runtime, claude_bin="claude", grok_bin="grok", permission_mode="bypassPermissions",
-                           max_turns=5, model="", allowed_tools="", task_timeout=10)
+    args = SimpleNamespace(runtime=runtime, claude_bin="claude", grok_bin="grok", omp_bin="omp",
+                           permission_mode="bypassPermissions", max_turns=5, model="", allowed_tools="", task_timeout=10)
     mod.run_agent_headless({"slug": "a09-reviewer", "id": "A09"}, "review the thing", tmp_path, args)
     env = seen["env"]
+    assert seen["cmd"][0] == runtime
     assert not set(KEY_VARS) & set(env)
     assert env["SWARM_AGENT_SESSION"] == "1"
     assert env["SWARM_AGENT"] == "a09-reviewer"  # the session identity swarm_gate binds the gate to
     assert env["SWARM_CHILD"] == "1"
     assert os.environ["SWARM_SIGNING_KEY"] == "s"  # the runner keeps its own key
+    if runtime == "omp":  # the gate agent's hidden swarm_gate tool is only active when named
+        assert seen["cmd"][seen["cmd"].index("--tools") + 1].split(",")[-2:] == ["swarm_gate", "yield"]
 
 
 _STUB = r'''#!@PY@

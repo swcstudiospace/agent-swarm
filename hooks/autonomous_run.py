@@ -55,7 +55,7 @@ def main() -> int:
     ap.add_argument("--cwd", default=".", help="target application repo")
     ap.add_argument("--brief", required=True, help="the user's original prompt (classification + dedupe key)")
     ap.add_argument("--spec", default="", help="uplifted XML spec file; when readable, A01 plans from it instead of --brief")
-    ap.add_argument("--runtime", default="auto", choices=["auto", "claude", "grok"])
+    ap.add_argument("--runtime", default="auto", choices=["auto", "claude", "grok", "omp"])
     ap.add_argument("--swarm-root", default=os.environ.get("SWARM_ROOT", str(Path(__file__).resolve().parent.parent)))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--wait", action="store_true", help="run in-process (tests); default is already in-process for this script")
