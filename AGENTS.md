@@ -60,13 +60,15 @@ flowchart LR
 - `notes.gates` overrides the list; `[]` means no gates.
 - Within one gate, the **latest** verdict wins (`latest_verdicts`). Across gates, the results are ANDed.
 - A verdict expires after 86400 s; review verdicts after 172800 s.
+- Gate scripts record verdict rows only for a leased (IN_PROGRESS) gate task, one per `notes.gate_for` target, each signed with the target's correlation. A `--correlation-id` of another plan exits 2 E-POLICY with no rows.
+- `--dry-run` verdicts are signed `dry_run: true`. They are recorded only for a gate task that `swarm_run --dry-run` dispatched (`notes.dry_run`, written by A01 only) and count only on targets it dispatched the same way.
 
 **Signing** (`swarm/envelope.py`)
 - Ed25519 when `SWARM_ED25519_KEY` (hex seed) is set and `cryptography` imports.
 - Otherwise HMAC-SHA256 with `SWARM_SIGNING_KEY`, defaulting to `dev-insecure-key`. Every dev-key signing emits a `security.dev_key` event into the caller's resolved state dir.
 - Signatures are prefixed `ed25519:` or `hmac:`.
 - Envelope schema is `swarm.v1.<type>`.
-- `missing_gates()` verifies each required verdict's signed envelope before APPROVED; malformed or forged rows read as `bad-sig`.
+- `missing_gates()` verifies each required verdict's signed envelope before APPROVED. `missing_gate_reasons` (`orch_status --history`) names why a gate is missing: `absent`, `unsigned`, `bad-sig` (malformed or forged), `mismatch` (row, task or correlation disagree), `stale` (signed before the last rework, even if re-inserted), `dry-run`, `fail`, `expired`.
 - A dev-key `hmac:` signature never verifies while `SWARM_ED25519_KEY` is set (even if unloadable) or `SWARM_REQUIRE_KEY=1`.
 - `SWARM_REQUIRE_KEY=1` without a real key fails APPROVED closed (E-POLICY). Gate scripts exit 2 with an explicit key-configuration error under a missing or unloadable key.
 
