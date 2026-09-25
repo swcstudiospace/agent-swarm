@@ -15,7 +15,7 @@ def _plan(tmp_path, swarm, plan=ONE_TASK):
     env = {"SWARM_DIR": str(swarm)}
     f = tmp_path / "plan.json"
     f.write_text(json.dumps(plan))
-    r = run_script("orch_plan.py", "--plan", str(f), "--json", env=env)
+    r = run_script("orch_plan.py", "--plan", str(f), "--prefix", "T", "--json", env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     return env
 

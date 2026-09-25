@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 
@@ -93,6 +94,7 @@ class TaskStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        self._tx_depth = 0
         self.conn.executescript(_SCHEMA)
         self._migrate_verdicts()
 
@@ -109,7 +111,32 @@ class TaskStore:
             except sqlite3.OperationalError as e:  # concurrent opener added it first
                 if "duplicate column" not in str(e):
                     raise
-        self.conn.commit()
+        self._commit()
+
+    def _commit(self) -> None:
+        """Commit unless inside transaction(); the outermost transaction() commits."""
+        if self._tx_depth == 0:
+            self.conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        """All-or-nothing block: BEGIN IMMEDIATE (write lock) on outermost entry,
+        commit on success, rollback on exception. Nested entries join the outer one."""
+        if self._tx_depth == 0:
+            if self.conn.in_transaction:
+                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+        self._tx_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                self.conn.rollback()
+            raise
+        self._tx_depth -= 1
+        if self._tx_depth == 0:
+            self.conn.commit()
 
     # ---- CRUD -------------------------------------------------------------
     def create(self, *, task_id: str, correlation_id: str, capability: str, title: str = "",
@@ -128,7 +155,7 @@ class TaskStore:
              risk_class, priority, S.CREATED.value, json.dumps(depends_on or []), max_attempts,
              json.dumps(notes or {}), now, now))
         self._log(task_id, None, S.CREATED, "system", "created")
-        self.conn.commit()
+        self._commit()
         return self.get(task_id)
 
     def get(self, task_id: str) -> dict:
@@ -160,7 +187,7 @@ class TaskStore:
         args.append(time.time())
         args.append(task_id)
         self.conn.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=?", args)
-        self.conn.commit()
+        self._commit()
         return self.get(task_id)
 
     # ---- state machine (A01 only) ----------------------------------------
@@ -206,7 +233,7 @@ class TaskStore:
     def _apply(self, task_id, from_state, to_state, actor, reason, **extra):
         self.update(task_id, state=to_state.value, **extra)
         self._log(task_id, from_state, to_state, actor, reason)
-        self.conn.commit()
+        self._commit()
 
     def _log(self, task_id, from_state, to_state, actor, reason):
         self.conn.execute("INSERT INTO transitions (task_id, from_state, to_state, actor, reason, ts)"
@@ -230,7 +257,7 @@ class TaskStore:
                           " envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
                           (task_id, p["gate"], p["verdict"], envelope["source"], json.dumps(p["findings"]),
                            now + p["expires_s"], now, json.dumps(envelope), envelope["sig"]))
-        self.conn.commit()
+        self._commit()
 
     def latest_verdicts(self, task_id: str, *, include_stale: bool = False,
                         verified_only: bool = False) -> dict[str, dict]:

@@ -10,7 +10,9 @@ Patterns encode the reference event flows of 04-integration-plan.md §3:
 Writes a plan snapshot to .swarm/plans/<correlation_id>.json and emits plan.updated.
 """
 from __future__ import annotations
+import hashlib
 import json
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -85,6 +87,50 @@ def load_custom(path: Path) -> list[tuple]:
     return rows
 
 
+def _derived_prefix(corr: str, n: int) -> str:
+    return "T" + corr.replace("-", "")[:n]
+
+
+def _existing(store: TaskStore, prefix: str, rows: list[tuple]) -> list[dict]:
+    found = []
+    for r in rows:
+        try:
+            found.append(store.get(f"{prefix}-{r[0]}"))
+        except SwarmError:
+            continue
+    return found
+
+
+def _reusable(existing, rows, pattern, brief, brief_sha, want_corr) -> str | None:
+    """Correlation id to reuse when the prefix already holds this exact plan, else None."""
+    owners = {t["correlation_id"] for t in existing}
+    if len(existing) != len(rows) or len(owners) != 1:
+        return None
+    corr = owners.pop()
+    if want_corr and want_corr != corr:
+        return None
+    for t in existing:
+        n = t["notes_json"]
+        same_brief = n.get("brief_sha256") == brief_sha if "brief_sha256" in n else n.get("brief_excerpt") == brief[:2000]
+        if n.get("pattern") != pattern or not same_brief:
+            return None
+    return corr
+
+
+def _reuse_result(store: TaskStore, ctx, corr: str, pattern: str) -> dict:
+    plan_file = swarm_dir(ctx.root, create=True) / "plans" / f"{corr}.json"
+    if plan_file.exists():
+        tasks = json.loads(plan_file.read_text())["tasks"]
+    else:
+        tasks = [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
+                 | {"gates": store.required_gates(t["task_id"]), "notes": t["notes_json"]}
+                 for t in store.list(correlation_id=corr)]
+    ctx.correlation_id = corr
+    return {"status": "ok", "correlation_id": corr, "pattern": pattern, "reused": True, "tasks": tasks,
+            "plan_file": str(plan_file) if plan_file.exists() else None,
+            "summary": f"reused existing plan for correlation {corr} ({len(tasks)} tasks, no changes)"}
+
+
 def run(args, ctx) -> dict:
     brief = ""
     if args.brief and Path(args.brief).exists():
@@ -97,9 +143,10 @@ def run(args, ctx) -> dict:
         brief = "(dry-run placeholder brief)"
 
     corr = ctx.correlation_id or str(uuid.uuid4())
-    prefix = args.prefix
     rows = load_custom(Path(args.plan)) if args.plan else [r + (None, []) for r in PATTERNS[args.pattern]]
+    brief_sha = hashlib.sha256(brief.encode("utf-8")).hexdigest()
     if ctx.dry_run:
+        prefix = args.prefix or _derived_prefix(corr, 4)
         return {"status": "ok", "correlation_id": corr, "pattern": args.pattern, "dry_run": True,
                 "tasks": [{"task_id": f"{prefix}-{r[0]}", "capability": r[1], "agent": r[2], "depends_on": r[4]} for r in rows],
                 "summary": f"dry-run: would create {len(rows)} tasks"}
@@ -107,24 +154,46 @@ def run(args, ctx) -> dict:
     store = TaskStore(root=ctx.root)
     created = []
     depth = {}
-    for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:
-        tid = f"{prefix}-{suffix}"
-        risk = risk_override or args.risk_class
-        depth[suffix] = 1 + max((depth[d] for d in deps), default=-1)
-        notes = {"pattern": args.pattern, "brief_excerpt": brief[:2000]}
-        if isinstance(gates, dict):
-            notes["gate"] = gates["gate"]
-            notes["gate_for"] = [f"{prefix}-{s}" for s in gates["for"]]
-            notes["gates"] = []
-        elif gates is not None:
-            notes["gates"] = gates
-        store.create(task_id=tid, correlation_id=corr, capability=cap, title=title, agent_id=agent,
-                     dag_depth=depth[suffix], depends_on=[f"{prefix}-{d}" for d in deps],
-                     acceptance=acceptance or args.acceptance, budget=_budget(risk), risk_class=risk,
-                     priority=args.priority, notes=notes)
-        store.transition(tid, "VALIDATED", reason="brief validated by A01")
-        store.transition(tid, "PLANNED", reason=f"pattern={args.pattern}")
-        created.append(store.get(tid))
+    prefix = args.prefix
+    try:
+        with store.transaction():
+            if prefix is None:
+                prefix = _derived_prefix(corr, 4)
+                if _existing(store, prefix, rows):
+                    prefix = _derived_prefix(corr, 6)
+            existing = _existing(store, prefix, rows)
+            if existing:
+                reused = _reusable(existing, rows, args.pattern, brief, brief_sha, ctx.correlation_id)
+                if reused is None:
+                    owners = sorted({t["correlation_id"] for t in existing})
+                    raise SwarmError(ErrorCode.E_CONTRACT,
+                                     f"prefix {prefix} already used by correlation {','.join(owners)} with a "
+                                     "different brief/pattern; pass a new --prefix")
+            else:
+                reused = None
+                for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:
+                    tid = f"{prefix}-{suffix}"
+                    risk = risk_override or args.risk_class
+                    depth[suffix] = 1 + max((depth[d] for d in deps), default=-1)
+                    notes = {"pattern": args.pattern, "brief_excerpt": brief[:2000], "brief_sha256": brief_sha}
+                    if isinstance(gates, dict):
+                        notes["gate"] = gates["gate"]
+                        notes["gate_for"] = [f"{prefix}-{s}" for s in gates["for"]]
+                        notes["gates"] = []
+                    elif gates is not None:
+                        notes["gates"] = gates
+                    store.create(task_id=tid, correlation_id=corr, capability=cap, title=title, agent_id=agent,
+                                 dag_depth=depth[suffix], depends_on=[f"{prefix}-{d}" for d in deps],
+                                 acceptance=acceptance or args.acceptance, budget=_budget(risk), risk_class=risk,
+                                 priority=args.priority, notes=notes)
+                    store.transition(tid, "VALIDATED", reason="brief validated by A01")
+                    store.transition(tid, "PLANNED", reason=f"pattern={args.pattern}")
+                    created.append(store.get(tid))
+    except sqlite3.IntegrityError as e:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"prefix {prefix} already in use; pass a new --prefix") from e
+
+    if reused is not None:
+        return _reuse_result(store, ctx, reused, args.pattern)
 
     plan = {"correlation_id": corr, "pattern": args.pattern, "risk_class": args.risk_class, "brief": brief,
             "tasks": [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
@@ -149,7 +218,7 @@ def add_args(p):
     p.add_argument("--plan", help="custom DAG json (implies --pattern custom)")
     p.add_argument("--risk-class", choices=list(GATES_BY_RISK), default="medium")
     p.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
-    p.add_argument("--prefix", default="T", help="task id prefix")
+    p.add_argument("--prefix", default=None, help="task id prefix (default: T + first 4 hex of the correlation id)")
     p.add_argument("--acceptance", action="append", default=[], help="acceptance criterion (repeatable)")
 
 
