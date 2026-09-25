@@ -63,10 +63,12 @@ flowchart LR
 
 **Signing** (`swarm/envelope.py`)
 - Ed25519 when `SWARM_ED25519_KEY` (hex seed) is set and `cryptography` imports.
-- Otherwise HMAC-SHA256 with `SWARM_SIGNING_KEY`, defaulting to `dev-insecure-key`. It falls back silently.
+- Otherwise HMAC-SHA256 with `SWARM_SIGNING_KEY`, defaulting to `dev-insecure-key`. Every dev-key signing emits a `security.dev_key` event into the caller's resolved state dir.
 - Signatures are prefixed `ed25519:` or `hmac:`.
 - Envelope schema is `swarm.v1.<type>`.
-- Signatures are verified only in tests; the runtime never checks them.
+- `missing_gates()` verifies each required verdict's signed envelope before APPROVED; malformed or forged rows read as `bad-sig`.
+- A dev-key `hmac:` signature never verifies while `SWARM_ED25519_KEY` is set (even if unloadable) or `SWARM_REQUIRE_KEY=1`.
+- `SWARM_REQUIRE_KEY=1` without a real key fails APPROVED closed (E-POLICY). Gate scripts exit 2 with an explicit key-configuration error under a missing or unloadable key.
 
 **Hooks**
 - `hooks/user_prompt_submit.py`
