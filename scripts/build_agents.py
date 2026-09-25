@@ -155,7 +155,10 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
     ]
     if agent["id"] in BLOCKING:
         fm.append("blocking: true")
-    fm += [f"autoloadSkills: {agent['slug']}", f"output: {output}", "---"]
+    if is_orch:
+        fm += ["autoloadSkills: a01-orchestrator,swarm-orchestrate", f"output: {output}", "---"]
+    else:
+        fm += [f"autoloadSkills: {agent['slug']}", f"output: {output}", "---"]
     preamble = OMP_ORCH_PREAMBLE if is_orch else OMP_PREAMBLE
     return "\n".join(fm) + "\n\n" + preamble + "\n" + _body(agent) + "\n"
 
@@ -186,12 +189,14 @@ def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
     Unsafe entries are symlinks or resolve outside omp/agents or omp/skills; they are
     reported but never followed or deleted.
     """
-    removable, unsafe = [], []
+    removable: list[Path] = []
+    unsafe: list[Path] = []
     for p in OMP_AGENTS_DIR.glob("*.md"):
         if p.stem not in slugs:
             (removable if _contained(p, OMP_AGENTS_DIR) else unsafe).append(p)
-    for d in OMP_SKILLS_DIR.iterdir() if OMP_SKILLS_DIR.is_dir() else ():
-        if d.name in slugs:
+    known_skills = slugs | {"swarm-orchestrate"}
+    for d in (OMP_SKILLS_DIR.iterdir() if OMP_SKILLS_DIR.is_dir() else []):
+        if d.name in known_skills:
             continue
         if not _contained(d, OMP_SKILLS_DIR):
             unsafe.append(d)
@@ -200,7 +205,6 @@ def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
         if skill.is_symlink() or skill.exists():
             (removable if _contained(skill, OMP_SKILLS_DIR) else unsafe).append(skill)
     return sorted(removable), sorted(unsafe)
-
 
 def _copy_file(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)

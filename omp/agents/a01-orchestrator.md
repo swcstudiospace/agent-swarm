@@ -4,7 +4,7 @@ description: "A01 ORCH — Swarm control plane. Use to decompose a brief into a 
 tools: read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition
 spawns: a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa, a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs
 blocking: true
-autoloadSkills: a01-orchestrator
+autoloadSkills: a01-orchestrator,swarm-orchestrate
 output: {"$schema":"https://json-schema.org/draft/2020-12/schema","title":"task.result v1","description":"Single result contract for every agent session (headless stdout block or orch_status --ingest file).","type":"object","required":["task_id","state"],"properties":{"task_id":{"type":"string"},"state":{"enum":["IN_PROGRESS","IN_REVIEW","FAILED","BLOCKED"]},"outputs":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"uri":{"type":"string"},"version":{"type":"string"},"digest":{"type":"string"}}}},"metrics":{"type":"object"},"summary_md":{"type":"string"},"needs":{"type":["string","array","object"]},"error":{"type":"object","properties":{"code":{"type":"string"},"message":{"type":"string"}}},"verdicts":{"type":"object","additionalProperties":{"type":"object","properties":{"verdict":{"type":"string"},"findings":{"type":"array"}}}},"gate":{"type":"string"}},"additionalProperties":true}
 ---
 
