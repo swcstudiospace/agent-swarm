@@ -2,7 +2,7 @@
  * `/swarm <brief>` (ORCH-03, D-11): the ordered plan → dispatch → wait → report log through the registered command,
  * with a recording bridge; usage / plan-mode / conflict paths never dispatch.
  */
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { type Bridge, type BridgeRequest, type BridgeResult, runPy, SwarmToolError } from "../src/bridge.ts";
 import { parseSwarmArgs, swarmCommand, swarmCorrelationId } from "../src/commands.ts";
 import { DISPATCH_MARKER } from "../src/hooks.ts";
@@ -282,6 +282,56 @@ test("reused plan: an identical brief dispatches normally", async () => {
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log }));
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
   expect(payload(dispatchText(log) ?? "").ready_tasks).toEqual(["Tc0ff-req"]);
+});
+
+/** stdout/stderr writes during `run`, with the streams restored afterwards. */
+async function capturedStreams(run: () => Promise<void>): Promise<{ out: string[]; err: string[] }> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const outSpy = spyOn(process.stdout, "write").mockImplementation((chunk) => (out.push(String(chunk)), true));
+  const errSpy = spyOn(process.stderr, "write").mockImplementation((chunk) => (err.push(String(chunk)), true));
+  try {
+    await run();
+  } finally {
+    outSpy.mockRestore();
+    errSpy.mockRestore();
+  }
+  return { out, err };
+}
+
+/** WR-11: without a UI every failing path still reports on stderr (never stdout); the success path stays silent. */
+test.each<[string, string, BridgeResult | Error, SessionEntry[], string]>([
+  ["usage", "--pattern=bogus x", PLAN, [], "usage:"],
+  ["plan mode", BRIEF, PLAN, PLAN_MODE, "E-POLICY"],
+  ["conflict", BRIEF, new SwarmToolError("E-CONTRACT", HINT), [], "pass a new --correlation-id"],
+  ["E-DEP", BRIEF, new SwarmToolError("E-DEP", "python3 not found"), [], "python3 not found"],
+  ["exit 1", BRIEF, { exitCode: 1, json: { status: "fail", summary: "store locked" }, swarmDir: "" }, [], "orch_plan exit 1: store locked"],
+])("no UI (%s): the message goes to stderr as [/swarm] …, nothing to stdout", async (_name, args, outcome, entries, needle) => {
+  const { log, swarm } = session(outcome);
+  const { out, err } = await capturedStreams(() => swarm.handler(args, commandCtx(gitRepo(), entries, { log, hasUI: false })));
+  expect(calls(log)).not.toContain("notify");
+  expect(calls(log)).not.toContain("sendUserMessage");
+  expect(out).toEqual([]);
+  expect(err).toHaveLength(1);
+  expect(err[0].startsWith("[/swarm] ")).toBe(true);
+  expect(err[0]).toContain(needle);
+  expect(err[0].endsWith("\n")).toBe(true);
+});
+
+test("no UI: a dispatch that never starts reports on stderr; a dispatched plan writes nothing", async () => {
+  const never = turnSession({}, { startTimeoutMs: 50 });
+  never.ctx.hasUI = false;
+  const failed = await capturedStreams(() => never.swarm.handler(BRIEF, never.ctx));
+  expect(failed.out).toEqual([]);
+  expect(failed.err).toHaveLength(1);
+  expect(failed.err[0]).toContain("dispatch did not start");
+  expect(failed.err[0]).toContain(CORR);
+
+  const { log, swarm } = session();
+  const ok = await capturedStreams(() => swarm.handler(BRIEF, commandCtx(gitRepo(), [], { log, hasUI: false })));
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle"]);
+  expect(ok.out).toEqual([]);
+  expect(ok.err).toEqual([]);
 });
 
 test("ready ids: exactly the tasks whose depends_on is empty, in result order", async () => {

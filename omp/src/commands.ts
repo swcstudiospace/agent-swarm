@@ -84,8 +84,14 @@ function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs): string {
   ].join("\n");
 }
 
+/**
+ * `ui.notify` when there is a UI; without one (`-p`, rpc) a warning or error still goes to stderr as `[/swarm] …`
+ * (never stdout, which `--mode json` owns), so a run that planned nothing is distinguishable from a silent dispatch.
+ * The success line travels in the dispatch prompt and is UI-only.
+ */
 function notify(ctx: CommandContext, message: string, level: "info" | "warning" | "error"): void {
   if (ctx.hasUI) ctx.ui?.notify(message, level);
+  else if (level !== "info") process.stderr.write(`[/swarm] ${message}\n`);
 }
 
 export interface SwarmCommandOptions {
