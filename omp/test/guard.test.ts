@@ -467,6 +467,34 @@ describe("HOOK-02", () => {
     expect(guardToolCall(bash(command), inside())).toBeUndefined();
   });
 
+  /** WR-08: read-only kubectl/helm forms and markers that only occur in file or resource names pass for A11. */
+  test.each([
+    "kubectl rollout status deploy/api -n production",
+    "kubectl rollout history deploy/api -n prod",
+    "kubectl apply --dry-run=server -f x.yaml -n production",
+    "kubectl apply --dry-run -f x.yaml --context=prod",
+    "kubectl apply -f deploy/main-app.yaml",
+    "kubectl delete -f main.yaml",
+    "kubectl apply -k overlays/production",
+    "kubectl apply -f x -l app=main",
+    "kubectl rollout restart deploy/main-app -n staging",
+    "kubectl get pods -n production",
+    "helm upgrade --dry-run app ./chart",
+    "helm install --dry-run --debug app ./chart",
+  ])("WR-08 negative for a11: %s → undefined", (command) => {
+    expect(guardToolCall(bash(command), inside("a11-devops"))).toBeUndefined();
+  });
+
+  test.each([
+    "kubectl -n prod apply -f x",
+    "kubectl scale deploy/api --replicas=0 --namespace=prod",
+    "kubectl delete pod x -n staging --context=dev-cluster-main",
+    "kubectl delete ns production",
+    "kubectl rollout restart deploy/api --kubeconfig ~/.kube/prod",
+  ])("WR-08 positive for a11: %s → kubectl-prod-change", (command) => {
+    expect(guardToolCall(bash(command), inside("a11-devops"))?.reason).toEndWith(": kubectl-prod-change)");
+  });
+
   test("top-level session with SWARM_TASK_ID and no session_init is in the swarm", () => {
     const facts: GuardFacts = { ...main, env: { SWARM_TASK_ID: "T-1" } };
     blockedWith(guardToolCall(bash("git reset --hard"), facts), "destructive");

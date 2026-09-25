@@ -157,6 +157,39 @@ function isProdMarker(token: string): boolean {
   return t.split(/[=:/,_-]+/).some((part) => part !== "" && (PROD_MARKERS.includes(part) || RELEASE_TAG.test(part)));
 }
 
+/** `--dry-run`, `--dry-run=client|server|none`: the command renders and never changes the cluster. */
+const isDryRun = (w: string) => /^--dry-run(?:=(?:client|server|none))?$/.test(w);
+/** kubectl flags whose value names where the change lands (D-04 markers apply to these values). */
+const KUBECTL_TARGET_FLAG = /^(?:-n|--namespace|--context|--cluster|--kubeconfig)$/;
+/** kubectl flags whose value is a file, selector or format, never a prod marker. */
+const KUBECTL_VALUE_FLAG = /^(?:-f|--filename|-k|--kustomize|-l|--selector|-o|--output|-p|--patch|--field-selector|--template)$/;
+
+/**
+ * `kubectl apply|delete|rollout|scale` that lands in prod (D-04): a marker in the value of `-n`/`--namespace`/
+ * `--context`/`--cluster`/`--kubeconfig`, or — when no such flag names the destination — in a positional word
+ * (resource, name). File, selector and output values never count, and read-only forms (`--dry-run`,
+ * `rollout status|history`) never match (WR-08).
+ */
+function kubectlProdChange({ words }: Segment): boolean {
+  if (words[0] !== "kubectl" || words.some(isDryRun)) return false;
+  const verb = words.findIndex((w, i) => i > 0 && ["apply", "delete", "rollout", "scale"].includes(w));
+  if (verb === -1 || (words[verb] === "rollout" && (words[verb + 1] === "status" || words[verb + 1] === "history"))) return false;
+  const targets: string[] = [];
+  const positional: string[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    const eq = w.indexOf("=");
+    if (w.startsWith("-")) {
+      const flag = eq === -1 ? w : w.slice(0, eq);
+      if (KUBECTL_TARGET_FLAG.test(flag)) {
+        if (eq !== -1) targets.push(w.slice(eq + 1));
+        else if (words[i + 1] !== undefined) targets.push(words[++i]);
+      } else if (KUBECTL_VALUE_FLAG.test(flag) && eq === -1) i++;
+    } else positional.push(w);
+  }
+  return (targets.length > 0 ? targets : positional).some(isProdMarker);
+}
+
 /** One shell segment after normalize(): its text and whitespace words (quotes stripped, argv[0] basename). */
 export interface Segment {
   text: string;
@@ -674,16 +707,16 @@ export const RULES: readonly Rule[] = [
     id: "helm-release-change",
     capability: "prod_infra",
     agents: ["a11-devops"],
-    pattern: ({ words }) => words[0] === "helm" && words.some((w) => ["install", "upgrade", "uninstall", "delete", "rollback"].includes(w)),
+    pattern: ({ words }) =>
+      words[0] === "helm" && !words.some(isDryRun) && words.some((w) => ["install", "upgrade", "uninstall", "delete", "rollback"].includes(w)),
     samples: ["helm upgrade app ./chart", "helm install app ./chart"],
   },
   {
     id: "kubectl-prod-change",
     capability: "prod_infra",
     agents: ["a11-devops"],
-    pattern: ({ words }) =>
-      words[0] === "kubectl" && words.some((w) => ["apply", "delete", "rollout", "scale"].includes(w)) && words.slice(1).some(isProdMarker),
-    samples: ["kubectl apply -n production -f k.yaml", "kubectl --context=prod rollout restart deploy/api"],
+    pattern: kubectlProdChange,
+    samples: ["kubectl apply -n production -f k.yaml", "kubectl --context=prod rollout restart deploy/api", "kubectl scale deploy/api --replicas=0 --namespace=prod"],
   },
   {
     id: "cloud-destructive",
