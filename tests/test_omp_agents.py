@@ -328,3 +328,19 @@ def test_omp_description_round_trips(render):
     assert desc.startswith(f"{a['id']} {a['code']} ")
     yaml = pytest.importorskip("yaml")
     assert yaml.safe_load("\n".join(_fm_lines(text)))["description"] == desc
+
+
+def test_omp_orphan_symlink_never_followed(omp_tree, tmp_path_factory):
+    victim = tmp_path_factory.mktemp("victim")
+    (victim / "SKILL.md").write_text("keep", encoding="utf-8")
+    link = omp_tree / "omp" / "skills" / "zz-link"
+    link.symlink_to(victim, target_is_directory=True)
+    r = _check(omp_tree)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "omp/skills/zz-link" in r.stdout
+    env = {k: v for k, v in os.environ.items() if k != "SWARM_AGENTS_FILE"}
+    w = subprocess.run([sys.executable, str(omp_tree / "scripts" / "build_agents.py")], cwd=omp_tree, env=env, capture_output=True, text=True)
+    assert w.returncode == 1, w.stdout + w.stderr
+    assert "refused" in w.stderr and "Traceback" not in w.stderr
+    assert (victim / "SKILL.md").read_text(encoding="utf-8") == "keep"
+    assert link.is_symlink()

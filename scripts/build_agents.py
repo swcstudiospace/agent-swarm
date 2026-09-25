@@ -159,11 +159,31 @@ def _write_or_check(target: Path, content: str, check: bool, changed: list, writ
         written.append(str(target.relative_to(ROOT)))
 
 
-def _omp_orphans(slugs: set[str]) -> list[Path]:
-    """Generated omp files on disk that the manifest no longer produces."""
-    orphans = [p for p in OMP_AGENTS_DIR.glob("*.md") if p.stem not in slugs]
-    orphans += [p for p in OMP_SKILLS_DIR.glob("*/SKILL.md") if p.parent.name not in slugs]
-    return sorted(orphans)
+def _contained(p: Path, base: Path) -> bool:
+    """True if p is a real (non-symlink) entry whose resolved path stays under base."""
+    return not p.is_symlink() and p.resolve().is_relative_to(base.resolve())
+
+
+def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
+    """(removable, unsafe) generated omp entries the manifest no longer produces.
+
+    Unsafe entries are symlinks or resolve outside omp/agents or omp/skills; they are
+    reported but never followed or deleted.
+    """
+    removable, unsafe = [], []
+    for p in OMP_AGENTS_DIR.glob("*.md"):
+        if p.stem not in slugs:
+            (removable if _contained(p, OMP_AGENTS_DIR) else unsafe).append(p)
+    for d in OMP_SKILLS_DIR.iterdir() if OMP_SKILLS_DIR.is_dir() else ():
+        if d.name in slugs:
+            continue
+        if not _contained(d, OMP_SKILLS_DIR):
+            unsafe.append(d)
+            continue
+        skill = d / "SKILL.md"
+        if skill.is_symlink() or skill.exists():
+            (removable if _contained(skill, OMP_SKILLS_DIR) else unsafe).append(skill)
+    return sorted(removable), sorted(unsafe)
 
 
 def _copy_file(src: Path, dest: Path) -> None:
@@ -231,18 +251,25 @@ def main() -> int:
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
         _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
         _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
+    refused = []
     if not only:
-        for orphan in _omp_orphans({a["slug"] for a in agents}):
+        removable, refused = _omp_orphans({a["slug"] for a in agents})
+        for orphan in removable:
             changed.append(str(orphan.relative_to(ROOT)))
             if not args.check:
                 orphan.unlink()
                 if orphan.name == "SKILL.md" and not any(orphan.parent.iterdir()):
                     orphan.parent.rmdir()
                 written.append(f"removed {orphan.relative_to(ROOT)}")
+        changed += [str(p.relative_to(ROOT)) for p in refused]
     if args.check:
         print("stale:" if changed else "up-to-date", ", ".join(changed))
         return 1 if changed else 0
     print(f"wrote {len(written)} agent file(s): {', '.join(written) or '(none changed)'}")
+    if refused:
+        # Symlinked or out-of-tree orphans are never deleted; fail so a human removes them.
+        print("refused to remove (symlink or outside omp/): " + ", ".join(str(p.relative_to(ROOT)) for p in refused), file=sys.stderr)
+        return 1
     if args.install_workspace:
         install_workspace(Path(args.install_workspace).resolve())
         print(f"installed into {args.install_workspace}")
