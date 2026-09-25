@@ -5,7 +5,7 @@
  * D-03: mutating tools refuse with E-POLICY in plan mode before any argv, file or bridge work.
  */
 import { gitToplevel } from "../../scripts/ts/script_base.ts";
-import { type Bridge, type BridgeResult, SwarmToolError } from "./bridge.ts";
+import { type Bridge, type BridgeResult, SwarmToolError, writeInputFile } from "./bridge.ts";
 import { inPlanMode } from "./context.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 
@@ -18,12 +18,28 @@ const STATES = [
   "APPROVED", "DONE", "BLOCKED", "FAILED", "RETRY", "ESCALATED", "CANCELLED",
 ] as const;
 
+/** orch_plan.py choices: --pattern (PATTERNS + custom), --risk-class (taskstore.py GATES_BY_RISK), --priority. */
+const PATTERNS = ["feature", "hotfix", "dependency", "custom"] as const;
+const RISK_CLASSES = ["low", "medium", "high"] as const;
+const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
+
 type Details = Record<string, unknown>;
 
 /** A registered swarm tool as omp sees it (params are the model's JSON, shaped by `parameters`). */
 export type SwarmTool = ToolDefinition<Record<string, unknown>, Details>;
 
 export type StatusParams = { correlation_id?: string };
+export type PlanParams = {
+  brief: string;
+  pattern: (typeof PATTERNS)[number];
+  risk_class: (typeof RISK_CLASSES)[number];
+  prefix?: string;
+  correlation_id?: string;
+  priority?: (typeof PRIORITIES)[number];
+  acceptance?: string[];
+  dry_run?: boolean;
+};
+export type IngestParams = { task_id: string; result: Record<string, unknown> };
 export type TransitionParams = { task_id: string; state: (typeof STATES)[number]; reason: string; dry_run?: boolean };
 
 interface ToolSpec<P> {
@@ -91,6 +107,69 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
   });
 
+  const plan = define<PlanParams>({
+    name: "swarm_plan",
+    label: "Swarm plan",
+    description:
+      "Plan a swarm run from a brief (A01): creates the pattern's task DAG in the Task Store (PLANNED, gates " +
+      "derived from the risk class) under one correlation id. Re-running with the same brief, pattern, risk class, " +
+      "priority, acceptance and correlation_id reuses the existing plan (`reused: true`) instead of duplicating it. " +
+      "dry_run lists the tasks that would be created without writing. `custom` needs a custom DAG, which this tool " +
+      "does not accept (python rejects it).",
+    parameters: {
+      type: "object",
+      properties: {
+        brief: { type: "string", minLength: 1, description: "The brief text (not a path)" },
+        pattern: { type: "string", enum: PATTERNS, description: "DAG pattern: feature (13 tasks), hotfix (8), dependency (8)" },
+        risk_class: { type: "string", enum: RISK_CLASSES, description: "Decides the required gates per task" },
+        prefix: { ...ID, description: "Task id prefix (default: T + 4 hex of the correlation id)" },
+        correlation_id: { ...ID, description: "Correlation id (default: a new uuid); reuse it to make a re-run idempotent" },
+        priority: { type: "string", enum: PRIORITIES, description: "Task priority (default P2)" },
+        acceptance: { type: "array", items: { type: "string", minLength: 1 }, description: "Acceptance criteria" },
+        dry_run: { type: "boolean", description: "List the tasks that would be created without writing" },
+      },
+      required: ["brief", "pattern", "risk_class"],
+      additionalProperties: false,
+    },
+    mutating: true,
+    async run(_toolCallId, params, signal, ctx) {
+      // --brief-text= only: --brief <path> would read any file, and --plan takes a model path (T-03-08)
+      const args = [rootArg(ctx), `--brief-text=${params.brief}`, `--pattern=${params.pattern}`, `--risk-class=${params.risk_class}`];
+      if (params.prefix) args.push(`--prefix=${params.prefix}`);
+      if (params.correlation_id) args.push(`--correlation-id=${params.correlation_id}`);
+      if (params.priority) args.push(`--priority=${params.priority}`);
+      for (const item of params.acceptance ?? []) args.push(`--acceptance=${item}`);
+      if (params.dry_run) args.push("--dry-run");
+      return toolResult(await bridge({ script: "orch_plan", args, cwd: ctx.cwd, signal }));
+    },
+  });
+
+  const ingest = define<IngestParams>({
+    name: "swarm_ingest",
+    label: "Swarm ingest",
+    description:
+      "Ingest an agent's task.result v1 object for a leased task (A01): the same result path the headless runner " +
+      "uses, so the task moves to the result's state (e.g. IN_REVIEW) and the DAG is reconciled. The result is " +
+      "validated by python against the task.result v1 contract: required task_id and state " +
+      "(IN_PROGRESS | IN_REVIEW | FAILED | BLOCKED), optional outputs, metrics, summary_md, needs, error, verdicts, gate.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { ...ID, description: "Task the result belongs to" },
+        result: { type: "object", description: "A task.result v1 object (validated by python, not here)" },
+      },
+      required: ["task_id", "result"],
+      additionalProperties: false,
+    },
+    mutating: true,
+    async run(toolCallId, params, signal, ctx) {
+      // D-05: --ingest takes a path, so the bridge writes the object under SWARM_DIR/results (never a model path)
+      const file = writeInputFile(ctx.cwd, "ingest", toolCallId, params.result);
+      const args = [rootArg(ctx), `--task-id=${params.task_id}`, `--ingest=${file}`];
+      return toolResult(await bridge({ script: "orch_status", args, cwd: ctx.cwd, signal }));
+    },
+  });
+
   const transition = define<TransitionParams>({
     name: "swarm_transition",
     label: "Swarm transition",
@@ -118,5 +197,5 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
   });
 
-  return [status, transition];
+  return [status, plan, ingest, transition];
 }

@@ -9,7 +9,7 @@
  *
  * Nothing here runs at import: the root and SWARM_DIR are resolved inside each call.
  */
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { swarmDir } from "../../scripts/ts/script_base.ts";
 
@@ -92,6 +92,22 @@ function parseObject(stdout: string): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Bridge-owned input file for script flags that take a path (`--ingest`, `--per-target-findings`); the model
+ * never supplies a path (T-03-08). Writes `<SWARM_DIR>/results/<kind>-<sanitised toolCallId>.json` under the
+ * same SWARM_DIR that `runScript` hands to python for `cwd` (D-08), and returns the absolute path.
+ */
+export function writeInputFile(cwd: string, kind: "ingest" | "findings", toolCallId: string, value: unknown): string {
+  const dir = swarmDir(cwd);
+  mkdirSync(resolve(dir, "results"), { recursive: true });
+  try {
+    writeFileSync(resolve(dir, ".gitignore"), "*", { flag: "wx" }); // D-11 (as swarm/paths.py): never overwrite
+  } catch {}
+  const path = resolve(dir, "results", `${kind}-${toolCallId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120)}.json`);
+  writeFileSync(path, JSON.stringify(value, null, 2));
+  return path;
 }
 
 /** Spawn `python3 <SWARM_ROOT>/scripts/<script>.py <args> --json` and map the exit contract (0/1/2) to a result or error. */
