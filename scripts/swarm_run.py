@@ -4,8 +4,10 @@
 Each ready task is dispatched to its agent as a headless session
     claude -p --agent <slug> --output-format json --permission-mode <mode> "<task.assign prompt>"
 run from --repo (the codebase being worked on
-defaults to cwd). Gate agents run their gate script once with their own gate task id; the script
-records signed verdicts on the gate task's Task Store gate_for targets (the runner writes none).
+defaults to cwd). Agent sessions run without signing keys (SWARM_AGENT_SESSION=1), so a gate script they run
+records nothing. For each gate task the runner itself runs the gate script on the gate task's own id after the
+session, while the task is still leased; the script records signed verdicts on the gate task's Task Store
+gate_for targets (the runner writes no rows itself).
 A01 rules (fail-closed gates, bounded rework, escalation) are
 applied between rounds by the Task Store.
 
@@ -31,9 +33,14 @@ from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
 from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
 
+# WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
+# nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
+# three; it performs every APPROVED transition and the recorded gate run.
+AGENT_SESSION_STRIPPED = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
 
 
 def upstream_context(store: TaskStore, task: dict) -> str:
@@ -67,10 +74,12 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path) -> 
     gate_note = ""
     if notes.get("gate"):
         gate_note = (f"\n## Gate instructions\nYou are issuing the **{notes['gate']}** gate for tasks {notes['gate_for']}. "
-                     f"Run your gate script ONCE with `--task-id {task['task_id']}` (this gate task's own id); the script "
-                     f"records the signed verdict on each gate_for target itself. Then report one JSON with "
+                     f"Run your gate script with `--task-id {task['task_id']}` (this gate task's own id) to see its findings; "
+                     f"in this headless session it records nothing. After the session the runner re-runs it with the "
+                     f"signing key and records the verdict on each gate_for target. Then report one JSON with "
                      f"`\"gate\": \"{notes['gate']}\"` and `\"verdicts\": {{\"<target_task_id>\": {{\"verdict\": \"pass|fail\", \"findings\": [...]}}}}` "
-                     f"(advisory: fail findings become rework feedback; only script-written verdicts count).")
+                     f"(advisory: fail findings become rework feedback, review findings are passed to the review gate "
+                     f"script; only script-written verdicts count).")
     return f"""# task.assign (signed envelope)
 ```json
 {json.dumps(env, indent=2)}
@@ -119,7 +128,8 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
-    env = dict(os.environ, SWARM_DIR=str(swarm_dir(repo)), SWARM_CHILD="1", AIO_UPLIFT="0", AIO_SWARM="0")
+    env = {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}
+    env.update(SWARM_DIR=str(swarm_dir(repo)), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", AIO_UPLIFT="0", AIO_SWARM="0")
     if runtime == "grok":
         grok_bin = getattr(args, "grok_bin", "grok")
         cmd = [grok_bin, "-p", "--agent", agent["slug"], "--output-format", "json",
@@ -167,16 +177,49 @@ def canned_result(task: dict, agent: dict) -> str:
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
 
 
-def run_gate_script(task: dict, repo: Path, sdir: Path) -> None:
-    """Dry-run stand-in for the gate agent's tool call: the real gate script, --dry-run, on the gate task's own id."""
+def run_gate_script(task, repo, sdir, *, dry_run, findings_file=None, timeout=300) -> None:
+    """Run the gate task's real gate script on its own id with the runner's keys (D-12/D-13): with --dry-run in a
+    runner dry-run, otherwise after the agent session while the gate task is still leased. The script derives and
+    records the verdict; findings_file (review gate) only adds the agent's findings as rev_gate input."""
     script = ROOT / "scripts" / f"{GATE_SCRIPTS[task['notes_json']['gate']]}.py"
-    cmd = [sys.executable, str(script), "--dry-run", "--task-id", task["task_id"],
+    cmd = [sys.executable, str(script), *(["--dry-run"] if dry_run else []), "--task-id", task["task_id"],
            "--correlation-id", task["correlation_id"], "--root", str(repo), "--json"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
-                          env=dict(os.environ, SWARM_DIR=str(Path(sdir).resolve())))
+    if findings_file is not None:
+        cmd += ["--findings-file", str(findings_file)]
+    # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record
+    env = {k: v for k, v in os.environ.items() if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD")}
+    env["SWARM_DIR"] = str(Path(sdir).resolve())
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     if proc.returncode == 2:
         raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed: {(proc.stdout or proc.stderr)[-400:]}",
                          task_id=task["task_id"])
+
+
+def review_findings_file(task: dict, text: str, sdir: Path) -> Path | None:
+    """Review gate: write the findings the agent reported under verdicts{} for its gate_for targets (valid severities
+    only; rev_gate rejects others with E-INPUT) to results/<tid>.a<N>.findings.json. None for other gates or when
+    the session left no parseable result. The agent's verdicts never count: rev_gate still derives the verdict."""
+    notes = task["notes_json"]
+    if notes.get("gate") != "review":
+        return None
+    result = parse_result(text or "")
+    if result is None:
+        return None
+    verdicts = result.get("verdicts")
+    verdicts = verdicts if isinstance(verdicts, dict) else {}
+    findings, seen = [], set()
+    for target in notes.get("gate_for", []):
+        v = verdicts.get(target)
+        for f in (v.get("findings") if isinstance(v, dict) else None) or []:
+            if not isinstance(f, dict) or f.get("severity") not in SEVERITIES:
+                continue
+            key = json.dumps(f, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                findings.append(f)
+    path = Path(sdir) / "results" / f"{task['task_id']}.a{task['attempt']}.findings.json"
+    path.write_text(json.dumps(findings, indent=2))
+    return path
 
 
 def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
@@ -213,12 +256,16 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
             if task["notes_json"].get("gate"):
-                run_gate_script(task, repo, sdir)
+                run_gate_script(task, repo, sdir, dry_run=True)
             text, meta = canned_result(task, agent), {"dry_run": True}
         else:
             text, meta = run_agent_headless(agent, prompt, repo, args)
         (sdir / "results").mkdir(parents=True, exist_ok=True)
         (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        if not args.dry_run and task["notes_json"].get("gate"):
+            # WR-12: the key-holding runner, not the agent, records this gate — once per dispatch, still leased
+            run_gate_script(task, repo, sdir, dry_run=False, timeout=args.task_timeout,
+                            findings_file=review_findings_file(task, text, sdir))
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
         try:

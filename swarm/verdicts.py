@@ -4,6 +4,8 @@ A gate script invoked with a leased (IN_PROGRESS) gate task's id (notes.gate) re
 target in that task's Task Store notes.gate_for, signed with the target's correlation — agents cannot choose
 or spoof targets. Any other --task-id writes only the envelope file and emits gate.verdict.unrecorded.
 --dry-run verdicts are signed dry_run: true and recorded only for gate tasks A01 flagged as a runner dry-run.
+Inside a headless agent session (SWARM_AGENT_SESSION=1, no signing keys) nothing is recorded: the runner re-runs
+the gate script with its keys after the session (WR-12).
 """
 from __future__ import annotations
 import os
@@ -111,6 +113,10 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
+    if os.environ.get("SWARM_AGENT_SESSION") == "1":
+        ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,
+                                             "reason": "agent session: the runner records this gate after the session"})
+        return env, {}
     if store is None:
         ctx.emit("gate.verdict.unrecorded", {"task_id": None, "gate": gate, "reason": "no --task-id"})
         return env, {}

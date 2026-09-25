@@ -1,0 +1,155 @@
+"""WR-12 / WR-08: headless agent sessions get no signing keys, the key-holding runner runs each gate script,
+and a gate task cannot finish without its script's verdicts."""
+import importlib.util
+import json
+import os
+import sqlite3
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from conftest import run_script
+
+ROOT = Path(__file__).resolve().parent.parent
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+# inherited vars that would change what the runner or its gate scripts do
+_ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+              "SWARM_DRYRUN_FAIL", "SWARM_RUNTIME", "ANTHROPIC_API_KEY")
+
+
+def _clean_env(**extra) -> dict:
+    return {**{k: v for k, v in os.environ.items() if k not in _ENV_NOISE}, **extra}
+
+
+def _load_swarm_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    spec = importlib.util.spec_from_file_location("swarm_run_under_test", ROOT / "scripts" / "swarm_run.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(ROOT))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _plan(env, prefix="X"):
+    r = run_script("orch_plan.py", "--brief-text", "x", "--pattern", "feature", "--prefix", prefix, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def _lease(ts, tid, **notes):
+    for s in ("CLAIMED", "IN_PROGRESS"):
+        ts.transition(tid, s)
+    if notes:
+        ts.set_notes(tid, **notes)
+
+
+def _rows(swarm, task_id=None):
+    con = sqlite3.connect(swarm / "tasks.db")
+    con.row_factory = sqlite3.Row
+    q, a = ("SELECT * FROM verdicts WHERE task_id=? ORDER BY id", (task_id,)) if task_id else ("SELECT * FROM verdicts ORDER BY id", ())
+    rows = [dict(r) for r in con.execute(q, a)]
+    con.close()
+    return rows
+
+
+def _events(swarm, etype):
+    p = swarm / "events.jsonl"
+    return [json.loads(ln) for ln in p.read_text().splitlines() if f'"{etype}"' in ln] if p.exists() else []
+
+
+# ---------------------------------------------------------------- WR-12: no key material in agent sessions
+@pytest.mark.parametrize("runtime", ["claude", "grok"])
+def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "s")
+    monkeypatch.setenv("SWARM_ED25519_KEY", "11" * 32)
+    monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    mod = _load_swarm_run(tmp_path, monkeypatch)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["env"] = kw["env"]
+        return SimpleNamespace(stdout='{"result":"ok"}', stderr="", returncode=0)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    args = SimpleNamespace(runtime=runtime, claude_bin="claude", grok_bin="grok", permission_mode="bypassPermissions",
+                           max_turns=5, model="", allowed_tools="", task_timeout=10)
+    mod.run_agent_headless({"slug": "a09-reviewer", "id": "A09"}, "review the thing", tmp_path, args)
+    env = seen["env"]
+    assert not set(KEY_VARS) & set(env)
+    assert env["SWARM_AGENT_SESSION"] == "1"
+    assert env["SWARM_CHILD"] == "1"
+    assert os.environ["SWARM_SIGNING_KEY"] == "s"  # the runner keeps its own key
+
+
+_STUB = r'''#!@PY@
+import json, os, re, sys
+if sys.argv[1:3] == ["auth", "status"]:
+    print('{"loggedIn": true}')
+    sys.exit(0)
+prompt = sys.stdin.read()
+tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
+with open(@DUMP@, "a") as fh:
+    fh.write(json.dumps({"task_id": tid, "has_hmac": "SWARM_SIGNING_KEY" in os.environ,
+                         "has_ed": "SWARM_ED25519_KEY" in os.environ,
+                         "agent_session": os.environ.get("SWARM_AGENT_SESSION")}) + "\n")
+res = {"task_id": tid, "state": "IN_REVIEW", "summary_md": "stub session: ran no script"}
+if '"gate": "quality"' in prompt:
+    res.update(gate="quality", verdicts={"T-be": {"verdict": "pass", "findings": []}})
+print(json.dumps({"result": "done\n```json\n" + json.dumps(res) + "\n```"}))
+'''
+
+
+def test_runner_records_gate_after_session(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    (work / "tests").mkdir(parents=True)
+    (work / "tests" / "test_ok.py").write_text("def test_ok():\n    assert 1 + 1 == 2\n")
+    dump = tmp_path / "env-dump.jsonl"
+    stub = tmp_path / "claude-stub"
+    stub.write_text(_STUB.replace("@PY@", sys.executable).replace("@DUMP@", repr(str(dump))))
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"tasks": [
+        {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["quality"]},
+        {"id": "qa", "capability": "gate.quality", "agent": "A08", "depends_on": ["be"],
+         "gates": {"gate": "quality", "for": ["be"]}},
+    ]}))
+    swarm = tmp_path / ".swarm"
+    env = _clean_env(SWARM_DIR=str(swarm), SWARM_SIGNING_KEY="runner-secret")
+    p = subprocess.run([sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--plan", str(plan), "--prefix", "T",
+                        "--repo", str(work), "--json"], capture_output=True, text=True, env=env, cwd=ROOT)
+    assert p.returncode == 0, p.stdout + p.stderr
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--claude-bin", str(stub),
+                        "--runtime", "claude", "--repo", str(work), "--json"],
+                       capture_output=True, text=True, env=env, cwd=ROOT, timeout=600)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-1500:]
+    assert json.loads(r.stdout)["complete"] is True
+    sessions = [json.loads(ln) for ln in dump.read_text().splitlines()]
+    assert {s["task_id"] for s in sessions} == {"T-be", "T-qa"}
+    assert all(not s["has_hmac"] and not s["has_ed"] and s["agent_session"] == "1" for s in sessions)
+    rows = [x for x in _rows(swarm, "T-be") if x["gate"] == "quality"]
+    assert rows, "the runner recorded no quality verdict on T-be"
+    row = rows[-1]
+    assert row["agent_id"] == "A08@local"
+    envelope = json.loads(row["envelope_json"])
+    assert envelope["payload"]["gate_task"] == "T-qa"
+    for k in KEY_VARS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "runner-secret")
+    from swarm.gates import validate_verdict
+    assert validate_verdict(envelope)["verdict"] == "pass"
+
+
+def test_agent_session_gate_script_records_nothing(swarm_dir):
+    from swarm.taskstore import TaskStore
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    _lease(TaskStore(), "X-qa", dry_run=True)  # leased and flagged exactly as a runner dry-run would
+    r = run_script("qa_gate.py", "--dry-run", "--task-id", "X-qa", "--json", env={**env, "SWARM_AGENT_SESSION": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (swarm_dir / "verdicts" / "X-qa.quality.json").exists()
+    assert _rows(swarm_dir) == []
+    assert any("agent session" in e["payload"]["reason"] for e in _events(swarm_dir, "gate.verdict.unrecorded"))
