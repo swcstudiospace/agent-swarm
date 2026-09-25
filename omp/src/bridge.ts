@@ -3,15 +3,14 @@
  * `scripts/<script>.py` through `runPy`; Python stays the only authority for state and validation.
  *
  * D-06 scope note: "exactly one spawner" covers the python script children, and `runPy` is the only
- * Bun.spawn/Bun.spawnSync call under omp/src. The git toplevel lookup (`gitToplevel`/`swarmDir` in
- * scripts/ts/script_base.ts) is a read-only Bun.spawnSync of git, called only at execute time; it is
- * not a second python spawner.
+ * Bun.spawn call under omp/src. The git toplevel lookup (`gitToplevel`/`swarmDir` in ./paths.ts) is a
+ * read-only Bun.spawnSync of git, called only at execute time; it is not a second python spawner.
  *
  * Nothing here runs at import: the root and SWARM_DIR are resolved inside each call.
  */
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { swarmDir } from "../../scripts/ts/script_base.ts";
+import { swarmDir } from "./paths.ts";
 
 export type Script = "orch_plan" | "orch_status" | "qa_gate" | "rev_gate" | "sec_gate" | "rel_plan";
 export type ErrorCode = "E-INPUT" | "E-TIMEOUT" | "E-DEP" | "E-CAPACITY" | "E-CONTRACT" | "E-POLICY" | "E-INTERNAL";

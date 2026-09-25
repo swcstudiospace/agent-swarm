@@ -1,8 +1,13 @@
 /**
- * HOOK-01 context hook (D-09): a pure classifier plus the before_agent_start transform. No bridge, no fs, no spawn.
- * hooks/user_prompt_submit.py mirrors classifyPrompt (D-10); tests/fixtures/classifier_prompts.json pins both.
+ * before_agent_start parts.
+ * - HOOK-01 context hook (D-09): a pure classifier plus the transform. No bridge, no fs, no spawn.
+ *   hooks/user_prompt_submit.py mirrors classifyPrompt (D-10); tests/fixtures/classifier_prompts.json pins both.
+ * - Runtime part (Phase 7 OPEN-3 R1): swarm-slug sessions get the absolute runtime root, resolved in the handler
+ *   with swarmRoot() (an fs existence check, never a spawn), so specialists find `scripts/` from any workspace.
  */
-import { sessionAgent } from "./context.ts";
+import { swarmRoot } from "./bridge.ts";
+import { callingAgent, sessionAgent } from "./context.ts";
+import { SWARM_SLUGS } from "./guard.ts";
 import type { BeforeAgentStartEvent, BeforeAgentStartResult, ExtensionContext } from "./omp-api.ts";
 
 /** Prompts containing these (case-insensitive) are owned by other plugins or explicitly opt out. */
@@ -52,4 +57,36 @@ export function swarmContext(
     return undefined;
   }
   return { systemPrompt: [...prior, SWARM_CONTEXT] };
+}
+
+export const RUNTIME_HEADING = "## AgentSwarm runtime";
+
+/** The runtime part for an absolute runtime root; the omp preamble reads its `Runtime root:` line. */
+export function runtimePart(root: string): string {
+  return `${RUNTIME_HEADING}
+
+Runtime root: ${root}
+Run swarm scripts as \`python3 ${root}/scripts/<script>.py … --root <repo> --json\`, where \`<repo>\` is the git toplevel of your working directory.
+`;
+}
+
+/**
+ * The systemPrompt with the runtime part appended, for sessions whose calling agent is a swarm slug (session_init
+ * agent, else SWARM_AGENT in a headless `-p` session, SWARM_CHILD included). Undefined for every other session,
+ * when a runtime part is already present, and on any error (fail-open: the prompt stays untouched).
+ */
+export function runtimeContext(
+  event: BeforeAgentStartEvent,
+  ctx: Pick<ExtensionContext, "sessionManager">,
+  root: () => string = swarmRoot,
+): BeforeAgentStartResult | undefined {
+  try {
+    const agent = callingAgent(ctx);
+    if (agent === undefined || !SWARM_SLUGS.includes(agent)) return undefined;
+    const prior = event.systemPrompt ?? [];
+    if (prior.some((p) => p.startsWith(`${RUNTIME_HEADING}\n`))) return undefined;
+    return { systemPrompt: [...prior, runtimePart(root())] };
+  } catch {
+    return undefined;
+  }
 }

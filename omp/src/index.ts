@@ -9,7 +9,7 @@ import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
 import { swarmCommand } from "./commands.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR } from "./guard.ts";
-import { swarmContext } from "./hooks.ts";
+import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionFactory } from "./omp-api.ts";
 import { buildTools } from "./tools.ts";
 
@@ -25,9 +25,10 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
     // D-07: group-kill this session's in-flight python children when it ends (registration only, no I/O)
     pi.on("session_shutdown", () => killInflight(inflight));
     // HOOK-01 (D-09): SDLC prompts in a top-level session get the AgentSwarm context; fail-open on any error.
+    // OPEN-3 R1: swarm-slug sessions get the runtime part instead (the two never apply to the same session).
     pi.on("before_agent_start", (event, ctx) => {
       try {
-        return swarmContext(event, ctx, process.env);
+        return swarmContext(event, ctx, process.env) ?? runtimeContext(event, ctx);
       } catch {
         return undefined;
       }

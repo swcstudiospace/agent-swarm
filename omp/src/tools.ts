@@ -5,10 +5,10 @@
  * D-03: mutating tools refuse with E-POLICY in plan mode before any argv, file or bridge work.
  * WR-03: swarm_gate runs only the calling gate agent's own gate (GATE_AGENTS), E-POLICY otherwise.
  */
-import { gitToplevel } from "../../scripts/ts/script_base.ts";
 import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInputFile } from "./bridge.ts";
 import { callingAgent, GATE_AGENTS, inPlanMode } from "./context.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
+import { gitToplevel } from "./paths.ts";
 
 /**
  * Schema pattern for ids that become argv values and (task ids) file names: mirrors swarm/script_base.py

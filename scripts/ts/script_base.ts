@@ -6,6 +6,10 @@
  */
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { swarmDir } from "../../omp/src/paths.ts";
+
+// Phase 7 D-09: the one TS copy of the path helpers lives in the omp package; re-exported for script consumers.
+export { gitToplevel, swarmDir } from "../../omp/src/paths.ts";
 
 export const EXIT = { OK: 0, FAIL: 1, ERROR: 2 } as const;
 
@@ -31,24 +35,6 @@ export function parseAgentArgs(argv: string[]): AgentArgs {
     else out.rest.push(tok);
   }
   return out;
-}
-
-/** Git toplevel of `dir`, or undefined when `dir` is not in a repo or git is not on PATH. */
-export function gitToplevel(dir: string): string | undefined {
-  try {
-    const git = Bun.spawnSync(["git", "-C", dir, "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "ignore" });
-    const top = git.exitCode === 0 ? git.stdout.toString().trim() : "";
-    return top || undefined;
-  } catch {
-    return undefined; // git not on PATH → caller falls back, like swarm/paths.py's OSError fallback
-  }
-}
-
-export function swarmDir(root: string): string {
-  // D-10: env SWARM_DIR (made absolute) → <git toplevel of root>/.swarm → <root>/.swarm
-  if (process.env.SWARM_DIR) return resolve(process.env.SWARM_DIR);
-  const top = gitToplevel(root);
-  return top ? resolve(top, ".swarm") : resolve(root, ".swarm");
 }
 
 function emitEvent(root: string, payload: Record<string, unknown>): void {

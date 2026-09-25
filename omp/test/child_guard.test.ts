@@ -3,6 +3,7 @@ import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
+import { SWARM_CONTEXT } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import { agentCtx, fakeCtx, fakePi, isolateEnv, REPO_ROOT } from "./helpers.ts";
 
@@ -45,7 +46,9 @@ describe("test_child_guard port", () => {
   });
 
   test("hook silent inside an in-process subagent (session_init)", () => {
-    expect(hook()({ prompt: PROMPT }, agentCtx("/x", "a05-backend"))).toBeUndefined();
+    // HOOK-01 stays silent; the OPEN-3 R1 runtime part is the only part a swarm subagent gets
+    const out = hook()({ prompt: PROMPT }, agentCtx("/x", "a05-backend")) as { systemPrompt?: string[] } | undefined;
+    expect(out?.systemPrompt ?? []).not.toContain(SWARM_CONTEXT);
   });
 
   test("hook silent with AIO_SWARM=0 and SWARM_CHILD=1 (the Python test's env)", () => {

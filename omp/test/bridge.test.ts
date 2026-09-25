@@ -3,7 +3,7 @@
  * Fixtures are written at test time; nothing is added to the repo's scripts/ or .swarm/.
  */
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type * as BridgeModule from "../src/bridge.ts";
 import { runScript, SwarmToolError, swarmRoot } from "../src/bridge.ts";
@@ -167,17 +167,34 @@ test("root: SWARM_ROOT without scripts/orch_plan.py falls back to the package ro
   expect(swarmRoot()).toBe(realpathSync(REPO_ROOT));
 });
 
+/** A relocated copy of the whole omp/ package (D-09) under a tmp dir whose ../.. holds no scripts/orch_plan.py. */
+function relocatedOmp(): string {
+  const pkg = join(tmpDir("swarm-omp-pkg-"), "omp");
+  cpSync(join(REPO_ROOT, "omp", "src"), join(pkg, "src"), { recursive: true });
+  cpSync(join(REPO_ROOT, "omp", "package.json"), join(pkg, "package.json"));
+  return pkg;
+}
+
 test("root: no SWARM_ROOT and no package root → E-DEP", async () => {
-  const fake = tmpDir("swarm-omp-pkg-");
-  mkdirSync(join(fake, "omp", "src"), { recursive: true });
-  mkdirSync(join(fake, "scripts", "ts"), { recursive: true });
-  copyFileSync(join(REPO_ROOT, "omp", "src", "bridge.ts"), join(fake, "omp", "src", "bridge.ts"));
-  copyFileSync(join(REPO_ROOT, "scripts", "ts", "script_base.ts"), join(fake, "scripts", "ts", "script_base.ts"));
+  const pkg = relocatedOmp();
   delete process.env.SWARM_ROOT;
   // runtime-selected path: a copy of the module whose ../.. has no scripts/orch_plan.py
-  const mod = (await import(join(fake, "omp", "src", "bridge.ts"))) as typeof BridgeModule;
-  const err = await mod.runPy({ script: "orch_status", args: [], cwd: fake }).catch((e: { code: string }) => e);
+  const mod = (await import(join(pkg, "src", "bridge.ts"))) as typeof BridgeModule;
+  const err = await mod.runPy({ script: "orch_status", args: [], cwd: pkg }).catch((e: { code: string }) => e);
   expect(err.code).toBe("E-DEP");
+});
+
+test("root: a relocated omp/ package loads on its own and runs the runtime named by SWARM_ROOT (D-09)", async () => {
+  const pkg = relocatedOmp();
+  const { root, cwd } = setup();
+  // runtime-selected path (the tmp copy); the whole import graph resolves inside it: no omp/src file reaches outside omp/
+  const entry = (await import(join(pkg, "src", "index.ts"))) as { default: unknown };
+  expect(typeof entry.default).toBe("function");
+  const mod = (await import(join(pkg, "src", "bridge.ts"))) as typeof BridgeModule;
+  expect(mod.swarmRoot()).toBe(root);
+  const res = await mod.runScript({ script: "fx_env", args: [], cwd });
+  expect(res.json.cwd).toBe(root);
+  expect(res.swarmDir).toBe(process.env.SWARM_DIR);
 });
 
 // ── exit/stdout → outcome map ──────────────────────────────────────────────
