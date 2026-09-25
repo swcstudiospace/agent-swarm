@@ -6,6 +6,7 @@
  */
 import { homedir } from "node:os";
 import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
+import { swarmCommand } from "./commands.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR } from "./guard.ts";
 import { swarmContext } from "./hooks.ts";
@@ -19,6 +20,8 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
     const inflight: Inflight = new Set();
     const scoped: Bridge = (req) => bridge({ ...req, inflight });
     for (const tool of buildTools(scoped)) pi.registerTool(tool);
+    // ORCH-03 (D-11): the same scoped bridge, so session_shutdown also sweeps the command's python child
+    pi.registerCommand("swarm", swarmCommand(pi, scoped));
     // D-07: group-kill this session's in-flight python children when it ends (registration only, no I/O)
     pi.on("session_shutdown", () => killInflight(inflight));
     // HOOK-01 (D-09): SDLC prompts in a top-level session get the AgentSwarm context; fail-open on any error.

@@ -1,7 +1,7 @@
 /**
  * SC5 / TOOL-01 / TOOL-06: the extension entry does no I/O at load, registers exactly the five hidden essential
- * swarm tools plus the session_shutdown and tool_call handlers, routes every tool through the single injected
- * bridge, and its tool_call guard does no I/O when it runs.
+ * swarm tools, the `/swarm` command and the session_shutdown / before_agent_start / tool_call handlers, routes every
+ * tool through the single injected bridge, and its tool_call guard does no I/O when it runs.
  *
  * mock.module("node:fs") is process-wide and mock.restore cannot undo it, so this file runs in its own `bun test`
  * process (omp/package.json scripts.test runs it first, then the rest with it ignored).
@@ -72,6 +72,7 @@ test("registers five with no io: evaluation and factory do no fs, spawn or spawn
   expect(spawnSync).toHaveBeenCalledTimes(0);
   // registration order is not part of the contract
   expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
+  expect([...pi.commands.keys()]).toEqual(["swarm"]);
   expect(pi.tools.map((t) => t.name).sort()).toEqual(NAMES);
   for (const tool of pi.tools) {
     expect(tool.hidden).toBe(true);
@@ -86,6 +87,7 @@ test("no action at load: the factory never calls a runtime pi action", async () 
   factory(pi.api);
   expect(pi.actionCalls).toEqual([]);
   expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
+  expect([...pi.commands.keys()]).toEqual(["swarm"]);
 });
 
 test("guard with no io: the tool_call handler decides without fs, spawn, spawnSync or the bridge", async () => {

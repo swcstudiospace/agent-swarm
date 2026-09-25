@@ -25,8 +25,8 @@ const STATES = [
 
 /** orch_plan.py choices: --pattern (PATTERNS only: `custom` needs --plan <path>, which no tool exposes), --risk-class
  * (taskstore.py GATES_BY_RISK), --priority. */
-const PATTERNS = ["feature", "hotfix", "dependency"] as const;
-const RISK_CLASSES = ["low", "medium", "high"] as const;
+export const PATTERNS = ["feature", "hotfix", "dependency"] as const;
+export const RISK_CLASSES = ["low", "medium", "high"] as const;
 const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 
 /** Gate → script (copied from swarm/verdicts.py:17 GATE_SCRIPTS); the script derives and signs the verdict. */
@@ -122,6 +122,20 @@ function rootArg(ctx: ExtensionContext): string {
   return `--root=${gitToplevel(ctx.cwd) ?? ctx.cwd}`;
 }
 
+/**
+ * The orch_plan argv (shared by swarm_plan and `/swarm`, D-11: one convention). `--brief-text=` only: `--brief <path>`
+ * would read any file, and `--plan` takes a model path (T-03-08).
+ */
+export function planArgs(ctx: ExtensionContext, params: PlanParams): string[] {
+  const args = [rootArg(ctx), `--brief-text=${params.brief}`, `--pattern=${params.pattern}`, `--risk-class=${params.risk_class}`];
+  if (params.prefix) args.push(`--prefix=${params.prefix}`);
+  if (params.correlation_id) args.push(`--correlation-id=${params.correlation_id}`);
+  if (params.priority) args.push(`--priority=${params.priority}`);
+  for (const item of params.acceptance ?? []) args.push(`--acceptance=${item}`);
+  if (params.dry_run) args.push("--dry-run");
+  return args;
+}
+
 /** Exit 1 (status fail: a failing verdict, a release freeze) is data the agent must read, so it is returned with `FAIL:`. */
 function toolResult(res: BridgeResult, extra: string[] = []): ToolResult<Details> {
   const summary = typeof res.json.summary === "string" ? res.json.summary : JSON.stringify(res.json);
@@ -178,14 +192,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
     mutating: true,
     async run(_toolCallId, params, signal, ctx) {
-      // --brief-text= only: --brief <path> would read any file, and --plan takes a model path (T-03-08)
-      const args = [rootArg(ctx), `--brief-text=${params.brief}`, `--pattern=${params.pattern}`, `--risk-class=${params.risk_class}`];
-      if (params.prefix) args.push(`--prefix=${params.prefix}`);
-      if (params.correlation_id) args.push(`--correlation-id=${params.correlation_id}`);
-      if (params.priority) args.push(`--priority=${params.priority}`);
-      for (const item of params.acceptance ?? []) args.push(`--acceptance=${item}`);
-      if (params.dry_run) args.push("--dry-run");
-      return toolResult(await bridge({ script: "orch_plan", args, cwd: ctx.cwd, signal }));
+      return toolResult(await bridge({ script: "orch_plan", args: planArgs(ctx, params), cwd: ctx.cwd, signal }));
     },
   });
 

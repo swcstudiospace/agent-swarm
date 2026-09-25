@@ -75,6 +75,20 @@ export interface BeforeAgentStartResult {
   systemPrompt?: string[];
 }
 
+/** omp's extension command context: `hasUI` is false in print/RPC mode, where `ui.notify` is a no-op. */
+export interface CommandContext extends ExtensionContext {
+  hasUI: boolean;
+  ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
+  /** Resolves once the agent stops streaming; a `-p` run exits without it (research P4/P5). */
+  waitForIdle(): Promise<void>;
+}
+
+/** A `registerCommand` definition: `/name <args>` calls `handler(args, ctx)` in every mode, `-p` included. */
+export interface CommandDefinition {
+  description: string;
+  handler(args: string, ctx: CommandContext): Promise<void>;
+}
+
 export interface ExtensionAPI {
   registerTool<P, D>(tool: ToolDefinition<P, D>): void;
   on(event: "tool_call", handler: (event: ToolCallEvent, ctx: ExtensionContext) => ToolCallResult | undefined): void;
@@ -85,6 +99,10 @@ export interface ExtensionAPI {
   on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown): void;
   /** Canonical names of the session's active tools. A load-time stub that throws: call it only inside handlers. */
   getActiveTools(): string[];
+  /** Legal at load (registration only). */
+  registerCommand(name: string, command: CommandDefinition): void;
+  /** Starts a turn when idle, queues a steer while streaming. A load-time stub that throws: call it only inside handlers. */
+  sendUserMessage(text: string): void;
 }
 
 export type ExtensionFactory = (pi: ExtensionAPI) => void;

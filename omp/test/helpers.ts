@@ -3,7 +3,16 @@ import { afterEach, beforeEach } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ExtensionFactory, SessionEntry, ToolDefinition, ToolResult } from "../src/omp-api.ts";
+import type {
+  CommandContext,
+  CommandDefinition,
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionFactory,
+  SessionEntry,
+  ToolDefinition,
+  ToolResult,
+} from "../src/omp-api.ts";
 
 /** agent-swarm repo root, from this file's location (omp/test → ../..), so tests run from any cwd. */
 export const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -72,26 +81,33 @@ export type AnyTool = ToolDefinition<Record<string, unknown>, unknown>;
 export interface FakePi {
   api: ExtensionAPI;
   tools: AnyTool[];
+  /** Commands recorded by registerCommand (legal at load). */
+  commands: Map<string, CommandDefinition>;
   handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>;
   /** Names of runtime action methods that were called during load (each call also throws). */
   actionCalls: string[];
   /** Names of runtime actions called after load() installed them (e.g. getActiveTools from a handler). */
   runtimeCalls: string[];
   tool(name: string): AnyTool;
+  /** The registered command `name`. */
+  command(name: string): CommandDefinition;
   /** The single handler registered for `event`. */
   handler(event: string): (event: unknown, ctx: ExtensionContext) => unknown;
-  /** Run the factory (load time: actions throw), then install the runtime getActiveTools, if configured. */
+  /** Run the factory (load time: actions throw), then install the configured runtime actions. */
   load(factory: ExtensionFactory): void;
 }
 
 export interface FakePiOptions {
   /** The runtime getActiveTools result, or a function called per invocation (e.g. one that throws). */
   activeTools?: string[] | (() => string[]);
+  /** The runtime sendUserMessage (e.g. one that records to a call log); absent = still throws after load. */
+  sendUserMessage?: (text: string) => void;
 }
 
 /** Records registerTool/on; runtime actions record their name and throw like omp's load-time stubs. */
 export function fakePi(opts: FakePiOptions = {}): FakePi {
   const tools: AnyTool[] = [];
+  const commands: FakePi["commands"] = new Map();
   const handlers: FakePi["handlers"] = new Map();
   const actionCalls: string[] = [];
   const runtimeCalls: string[] = [];
@@ -105,6 +121,8 @@ export function fakePi(opts: FakePiOptions = {}): FakePi {
     on: ((event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     }) as ExtensionAPI["on"],
+    registerCommand: (name: string, command: CommandDefinition) => void commands.set(name, command),
+    sendUserMessage: notAtLoad("sendUserMessage"),
     exec: notAtLoad("exec"),
     getActiveTools: notAtLoad("getActiveTools"),
     getAllTools: notAtLoad("getAllTools"),
@@ -115,12 +133,18 @@ export function fakePi(opts: FakePiOptions = {}): FakePi {
   return {
     api,
     tools,
+    commands,
     handlers,
     actionCalls,
     runtimeCalls,
     tool(name) {
       const found = tools.find((t) => t.name === name);
       if (!found) throw new Error(`tool ${name} not registered`);
+      return found;
+    },
+    command(name) {
+      const found = commands.get(name);
+      if (!found) throw new Error(`command ${name} not registered`);
       return found;
     },
     handler(event) {
@@ -131,17 +155,42 @@ export function fakePi(opts: FakePiOptions = {}): FakePi {
     load(factory) {
       factory(api);
       const active = opts.activeTools;
-      if (active === undefined) return;
-      api.getActiveTools = () => {
-        runtimeCalls.push("getActiveTools");
-        return typeof active === "function" ? active() : [...active];
-      };
+      if (active !== undefined) {
+        api.getActiveTools = () => {
+          runtimeCalls.push("getActiveTools");
+          return typeof active === "function" ? active() : [...active];
+        };
+      }
+      const send = opts.sendUserMessage;
+      if (send !== undefined) {
+        api.sendUserMessage = (text) => {
+          runtimeCalls.push("sendUserMessage");
+          send(text);
+        };
+      }
     },
   };
 }
 
 export function fakeCtx(cwd: string, entries: SessionEntry[] = []): ExtensionContext {
   return { cwd, sessionManager: { getEntries: () => entries, getBranch: () => entries } };
+}
+
+/** One ordered record of what a command did: `call` names the seam (bridge, sendUserMessage, waitForIdle, notify). */
+export type CallLog = Array<{ call: string } & Record<string, unknown>>;
+
+/** A command ctx whose notify / waitForIdle push to `log` (shared with the recording bridge and sendUserMessage). */
+export function commandCtx(
+  cwd: string,
+  entries: SessionEntry[] = [],
+  { hasUI = true, log = [] as CallLog }: { hasUI?: boolean; log?: CallLog } = {},
+): CommandContext {
+  return {
+    ...fakeCtx(cwd, entries),
+    hasUI,
+    ui: { notify: (message, level) => void log.push({ call: "notify", message, level }) },
+    waitForIdle: async () => void log.push({ call: "waitForIdle" }),
+  };
 }
 
 /**
