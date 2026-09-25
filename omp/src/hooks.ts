@@ -45,7 +45,7 @@ export function swarmContext(
   if (agent !== undefined || restricted) return undefined;
   if (env.SWARM_CHILD === "1" || env.SWARM_AGENT?.trim()) return undefined;
   const prior = event.systemPrompt ?? [];
-  if (prior.some((p) => p.includes("## AgentSwarm"))) return undefined;
+  if (prior.includes(SWARM_CONTEXT)) return undefined;
   try {
     if (!classify(event.prompt)) return undefined;
   } catch {

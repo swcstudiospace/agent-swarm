@@ -3,7 +3,7 @@ import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
-import { swarmContext } from "../src/hooks.ts";
+import { SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, isolateEnv, REPO_ROOT } from "./helpers.ts";
@@ -85,9 +85,42 @@ describe("silence outside a fresh top-level session", () => {
   });
 });
 
-test("idempotent: an existing ## AgentSwarm part is not duplicated", () => {
+/** The repo's own context files as omp loads them into the base system prompt (G-04-05-2). */
+const REPO_CONTEXT = ["AGENTS.md", "CLAUDE.md"].map((f) => readFileSync(join(REPO_ROOT, f), "utf8"));
+const LIVE_POSITIVE = FIXTURE.positive[1];
+const LIVE_NEGATIVE = FIXTURE.negative[0];
+/** The SWARM_CONTEXT sentence the live prompts ask the model to continue, and its continuation. */
+const SENTENCE_START = "This is SDLC work";
+const CONTINUATION = "route it through the AgentSwarm";
+
+test("repo base prompt: AGENTS.md and CLAUDE.md mention the hook's heading, yet an SDLC prompt still gets SWARM_CONTEXT", () => {
+  expect(REPO_CONTEXT.some((p) => p.includes("## AgentSwarm"))).toBe(true);
+  const out = hook()({ prompt: LIVE_POSITIVE, systemPrompt: REPO_CONTEXT }, top()) as { systemPrompt: string[] };
+  expect(out.systemPrompt).toEqual([...REPO_CONTEXT, SWARM_CONTEXT]);
+});
+
+test("neutral base prompt that merely mentions the heading still gets the context", () => {
+  const prior = ["see ## AgentSwarm below"];
+  const out = hook()({ prompt: LIVE_POSITIVE, systemPrompt: prior }, top()) as { systemPrompt: string[] };
+  expect(out.systemPrompt).toEqual([...prior, SWARM_CONTEXT]);
+});
+
+test("idempotent: an existing SWARM_CONTEXT part is not duplicated", () => {
   const first = hook()({ prompt: SDLC, systemPrompt: PRIOR }, top()) as { systemPrompt: string[] };
   expect(hook()({ prompt: SDLC, systemPrompt: first.systemPrompt }, top())).toBeUndefined();
+  expect(hook()({ prompt: SDLC, systemPrompt: [...REPO_CONTEXT, SWARM_CONTEXT] }, top())).toBeUndefined();
+});
+
+test("discriminator: the live prompts can only continue the SWARM_CONTEXT sentence if the hook injected it", () => {
+  const sentence = SWARM_CONTEXT.split("\n").find((l) => l.startsWith(SENTENCE_START)) ?? "";
+  const rest = sentence.slice(SENTENCE_START.length);
+  expect(rest).toContain(CONTINUATION);
+  for (const source of REPO_CONTEXT) expect(source).not.toContain(CONTINUATION);
+  for (const prompt of [LIVE_POSITIVE, LIVE_NEGATIVE]) {
+    expect(prompt).toContain(SENTENCE_START);
+    expect(prompt).not.toContain(CONTINUATION);
+    expect(prompt).not.toContain(rest.trim());
+  }
 });
 
 test("fail-open: a throwing classifier leaves the prompt untouched", () => {
