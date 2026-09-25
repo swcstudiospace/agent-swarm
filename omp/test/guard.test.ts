@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { callingAgent } from "../src/context.ts";
-import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, SWARM_SLUGS } from "../src/guard.ts";
+import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, RULES, SWARM_SLUGS } from "../src/guard.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
@@ -20,13 +20,14 @@ beforeEach(() => {
 
 const A01 = "a01-orchestrator";
 const CWD = "/nonexistent-guard-cwd";
+const HOME = "/nonexistent-guard-home";
 const DEPTH_PREFIX = "BLOCKED needs: depth";
 
 const call = (toolName: string, input: unknown = {}): ToolCallEvent => ({ toolName, toolCallId: "tc-1", input });
 const yieldData = (data: unknown) => call("yield", { data });
 
 /** A01 at the depth cap: no `task`, not a restricted child, not in plan mode. */
-const capped: GuardFacts = { agent: A01, restricted: false, planMode: false, hasTask: false, topLevel: false, env: {} };
+const capped: GuardFacts = { agent: A01, restricted: false, planMode: false, hasTask: false, topLevel: false, env: {}, cwd: CWD, home: HOME };
 
 /** The tool_call handler the real factory registers, with a runtime getActiveTools (a bridge call would throw). */
 function guardHandler(opts: FakePiOptions = {}) {
@@ -240,7 +241,7 @@ describe("HOOK-03", () => {
   });
 
   test.each([["a05-backend"], ["task"], [undefined]])("pure: agent %p is blocked on both state tools", (agent) => {
-    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {} };
+    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME };
     for (const toolName of STATE_TOOLS) expect(guardToolCall(call(toolName), facts)).toEqual({ block: true, reason: SWARM_STATE });
   });
 
@@ -277,4 +278,136 @@ describe("HOOK-03", () => {
     expect(run(call(toolName, { brief: "x" }), specialist)).toBeUndefined();
     expect(run(call(toolName, { brief: "x" }), fakeCtx(CWD))).toBeUndefined();
   });
+});
+
+describe("HOOK-02", () => {
+  const B05 = "a05-backend";
+  const inside = (agent = B05): GuardFacts => ({ agent, restricted: false, planMode: false, hasTask: true, topLevel: false, env: {}, cwd: CWD, home: HOME });
+  const main: GuardFacts = { ...inside(), agent: undefined, topLevel: true };
+  const bash = (command: string) => call("bash", { command });
+  const blockedWith = (res: ReturnType<typeof guardToolCall>, capability: string) => {
+    expect(res?.block).toBe(true);
+    expect(res?.reason?.startsWith(`BLOCKED needs: human-approval (${capability}: `)).toBe(true);
+  };
+
+  test("every RULES row carries at least one positive sample", () => {
+    for (const rule of RULES) expect(rule.samples.length).toBeGreaterThan(0);
+  });
+
+  const rows = RULES.flatMap((rule) => rule.samples.map((sample) => [rule.id, sample, rule] as const));
+  test.each(rows)("row %s: %s blocks in a swarm session (handler) and passes in main", (id, sample, rule) => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const agent = rule.agents?.[0] ?? B05;
+    const res = run(bash(sample), agentCtx(CWD, agent, [], false)) as { block?: boolean; reason?: string };
+    expect(res).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${rule.capability}: ${id})` });
+    expect(run(bash(sample), fakeCtx(CWD))).toBeUndefined();
+  });
+
+  /** Independent of RULES: one command per D-03/D-04 item and the capability it must name. */
+  const D03_CASES: [string, string][] = [
+    ["git push --force", "destructive"],
+    ["git push -f", "destructive"],
+    ["git push --force-with-lease", "destructive"],
+    ["git reset --hard", "destructive"],
+    ["git clean -fd", "destructive"],
+    ["git clean -fx", "destructive"],
+    ["git branch -D x", "destructive"],
+    ["git checkout -- .", "destructive"],
+    ["git restore .", "destructive"],
+    ["rm -rf /", "destructive"],
+    ["rm -rf ~", "destructive"],
+    ["rm -rf ..", "destructive"],
+    ["rm -rf .git", "destructive"],
+    ["rm -rf .swarm", "destructive"],
+    ["rm -rf /etc/x", "destructive"],
+    ["chmod -R 777 .", "destructive"],
+    ['psql -c "DROP TABLE t"', "destructive_ddl"],
+    ['mysql -e "ALTER TABLE t DROP COLUMN c"', "destructive_ddl"],
+    ['sqlite3 db "DROP DATABASE d"', "destructive_ddl"],
+    ['psql -c "DROP SCHEMA s"', "destructive_ddl"],
+    ['psql -c "TRUNCATE t"', "destructive_ddl"],
+    ['prisma db execute --stdin <<< "DROP TABLE t"', "destructive_ddl"],
+    ["prisma migrate reset", "destructive_ddl"],
+    ["prisma db push --accept-data-loss", "destructive_ddl"],
+    ["terraform apply", "prod_infra"],
+    ["terraform destroy", "prod_infra"],
+    ["pulumi up", "prod_infra"],
+    ["pulumi destroy", "prod_infra"],
+    ["helm install app ./c", "prod_infra"],
+    ["helm upgrade app ./c", "prod_infra"],
+    ["helm uninstall app", "prod_infra"],
+    ["aws ec2 terminate-instances --instance-ids i-1", "prod_infra"],
+    ["gcloud app deploy", "prod_infra"],
+    ["kubectl apply -n production -f k.yaml", "prod_infra"],
+    ["kubectl delete pod x -n production", "prod_infra"],
+    ["kubectl rollout restart deploy/api -n production", "prod_infra"],
+    ["kubectl scale deploy/api --replicas=3 -n production", "prod_infra"],
+    ["vercel --prod", "prod_high_risk"],
+    ["fly deploy", "prod_high_risk"],
+    ["gh release create v1", "prod_high_risk"],
+    ["npm publish", "prod_high_risk"],
+    ["pnpm publish", "prod_high_risk"],
+    ["bun publish", "prod_high_risk"],
+    ["docker push img", "prod_high_risk"],
+    ["git push --tags", "prod_high_risk"],
+    ["git push origin main", "prod_high_risk"],
+    ["git push origin master", "prod_high_risk"],
+  ];
+  test.each(D03_CASES)("D-03: %s blocks naming %s inside, nothing in main", (command, capability) => {
+    blockedWith(guardToolCall(bash(command), inside()), capability);
+    expect(guardToolCall(bash(command), main)).toBeUndefined();
+  });
+
+  test.each([
+    ["sudo git reset --hard", "git-reset-hard"],
+    ["env A=1 git clean -fdx", "git-clean-force"],
+    ["command rm -rf /", "rm-rf-protected"],
+    ["git status && git push -f", "git-force-push"],
+    ["cd x && sudo git push -f", "git-force-push"],
+    ["ls | xargs echo ; git branch -D x", "git-branch-force-delete"],
+    ["echo $(git reset --hard)", "git-reset-hard"],
+    ["A=1 B=2 env C=3 sudo -E command git -C sub reset --hard", "git-reset-hard"],
+    ["/usr/bin/git push --force", "git-force-push"],
+  ])("normalization: %s → %s", (command, id) => {
+    expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
+  });
+
+  test("normalize splits segments and strips prefixes", () => {
+    expect(normalize("env A=1 sudo git status && echo $(git reset --hard) || x | y; z")).toEqual([
+      "git reset --hard", "git status", "echo", "x", "y", "z",
+    ]);
+    expect(normalize('psql -c "SELECT 1; DROP TABLE t" | cat')).toEqual(['psql -c "SELECT 1; DROP TABLE t"', "cat"]);
+  });
+
+  test.each([
+    "git status", "git commit -m x", "git push origin feat/x", "git push -u origin feat/main-menu", "rm -rf ./build",
+    "rm -rf node_modules dist", `rm -rf ${CWD}/tmp`, "bun test", "kubectl get pods", "kubectl apply -f k.yaml",
+    "kubectl apply -n staging -f k.yaml", "git checkout -b feat", "git restore src/a.ts", "git branch -d merged",
+    "git clean -n", "chmod 755 x", "npm test", "docker build .", "psql -c 'SELECT 1'", "terraform plan", "helm template x",
+    "gh release view", "echo main", "aws s3 ls",
+  ])("negative inside swarm: %s → undefined", (command) => {
+    expect(guardToolCall(bash(command), inside())).toBeUndefined();
+  });
+
+  test("top-level session with SWARM_TASK_ID and no session_init is in the swarm", () => {
+    const facts: GuardFacts = { ...main, env: { SWARM_TASK_ID: "T-1" } };
+    blockedWith(guardToolCall(bash("git reset --hard"), facts), "destructive");
+    const { run } = guardHandler({ activeTools: ["task"] });
+    process.env.SWARM_TASK_ID = "T-1";
+    expect((run(bash("npm publish"), fakeCtx(CWD)) as { reason?: string }).reason).toBe(
+      "BLOCKED needs: human-approval (prod_high_risk: package-publish)",
+    );
+  });
+
+  test("a generic task child (not a swarm slug) is outside", () => {
+    expect(guardToolCall(bash("git reset --hard"), inside("task"))).toBeUndefined();
+  });
+
+  test.each([undefined, null, {}, { command: "" }, { command: "   \n" }, { command: 42 }, { command: ["rm", "-rf", "/"] }, "rm -rf /"])(
+    "bash input %p has nothing to classify",
+    (input) => {
+      expect(guardToolCall(call("bash", input), inside())).toBeUndefined();
+      expect(guardToolCall(call("bash", input), main)).toBeUndefined();
+    },
+  );
 });

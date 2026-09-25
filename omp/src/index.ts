@@ -4,6 +4,7 @@
  * no fs calls, no spawns, no `pi` action calls, no module-scope state (TOOL-01). Runtime actions such as
  * getActiveTools run only inside handlers.
  */
+import { homedir } from "node:os";
 import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR } from "./guard.ts";
@@ -29,7 +30,7 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         known = { agent: callingAgent(ctx), topLevel: initAgent === undefined };
         // getActiveTools only for A01: the depth-cap check is the only reader (D-06)
         const hasTask = known.agent === ORCHESTRATOR ? pi.getActiveTools().includes("task") : true;
-        return guardToolCall(event, { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env });
+        return guardToolCall(event, { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir() });
       } catch (err) {
         if (!inSwarm({ ...known, env })) return undefined;
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };
