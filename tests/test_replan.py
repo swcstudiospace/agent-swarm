@@ -164,6 +164,49 @@ def test_insert_integrityerror_mapped(tmp_path):
     assert _counts(tmp_path)[0] == 1
 
 
+def _write_plan(path, capability, agent):
+    path.write_text(json.dumps({"tasks": [{"id": "a", "capability": capability, "agent": agent}]}))
+
+
+def _task_row(tmp_path, task_id):
+    con = sqlite3.connect(tmp_path / ".swarm" / "tasks.db")
+    con.row_factory = sqlite3.Row
+    try:
+        return dict(con.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
+    finally:
+        con.close()
+
+
+def test_edited_custom_plan_rejected(tmp_path):
+    env = _env(tmp_path)
+    plan = tmp_path / "plan.json"
+    _write_plan(plan, "code.backend", "A05")
+    first = _plan(env, "--plan", str(plan), "--prefix", "C")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert json.loads(first.stdout)["pattern"] == "custom"
+    again = _plan(env, "--plan", str(plan), "--prefix", "C")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert json.loads(again.stdout)["reused"] is True
+    before = _counts(tmp_path)
+    _write_plan(plan, "code.frontend", "A06")
+    r = _plan(env, "--plan", str(plan), "--prefix", "C")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "E-CONTRACT" in r.stdout
+    assert _counts(tmp_path) == before
+    row = _task_row(tmp_path, "C-a")
+    assert (row["agent_id"], row["capability"]) == ("A05", "code.backend")
+
+
+def test_plan_records_custom_pattern(tmp_path):
+    env = _env(tmp_path)
+    plan = tmp_path / "plan.json"
+    _write_plan(plan, "code.backend", "A05")
+    assert _plan(env, "--plan", str(plan), "--prefix", "C").returncode == 0
+    notes = json.loads(_task_row(tmp_path, "C-a")["notes"])
+    assert notes["pattern"] == "custom"
+    assert re.fullmatch(r"[0-9a-f]{64}", notes.get("plan_sha256", ""))
+
+
 def test_run_ambiguous_correlation_exit2(tmp_path):
     env = _env(tmp_path)
     corrs = [json.loads(_plan(env, "--brief-text", "billing", "--prefix", p).stdout)["correlation_id"] for p in ("A", "B")]

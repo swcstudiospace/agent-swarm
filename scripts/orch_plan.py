@@ -102,7 +102,7 @@ def _existing(store: TaskStore, prefix: str, rows: list[tuple]) -> list[dict]:
     return found
 
 
-def _reusable(existing, rows, pattern, brief, brief_sha, want_corr) -> str | None:
+def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr) -> str | None:
     """Correlation id to reuse when the prefix already holds this exact plan, else None."""
     owners = {t["correlation_id"] for t in existing}
     if len(existing) != len(rows) or len(owners) != 1:
@@ -113,7 +113,9 @@ def _reusable(existing, rows, pattern, brief, brief_sha, want_corr) -> str | Non
     for t in existing:
         n = t["notes_json"]
         same_brief = n.get("brief_sha256") == brief_sha if "brief_sha256" in n else n.get("brief_excerpt") == brief[:2000]
-        if n.get("pattern") != pattern or not same_brief:
+        # Legacy rows without plan_sha256: pattern rows are fixed by the pattern; custom rows fail closed.
+        same_plan = n["plan_sha256"] == plan_sha if "plan_sha256" in n else pattern != "custom"
+        if n.get("pattern") != pattern or not same_brief or not same_plan:
             return None
     return corr
 
@@ -144,8 +146,11 @@ def run(args, ctx) -> dict:
         brief = "(dry-run placeholder brief)"
 
     corr = ctx.correlation_id or str(uuid.uuid4())
+    if args.plan:
+        args.pattern = "custom"
     rows = load_custom(Path(args.plan)) if args.plan else [r + (None, []) for r in PATTERNS[args.pattern]]
     brief_sha = hashlib.sha256(brief.encode("utf-8")).hexdigest()
+    plan_sha = hashlib.sha256(json.dumps([list(r) for r in rows], sort_keys=True).encode("utf-8")).hexdigest()
     if ctx.dry_run:
         prefix = args.prefix or _derived_prefix(corr, 4)
         return {"status": "ok", "correlation_id": corr, "pattern": args.pattern, "dry_run": True,
@@ -166,20 +171,21 @@ def run(args, ctx) -> dict:
                     prefix = _derived_prefix(corr, 6)
             existing = _existing(store, prefix, rows)
             if existing:
-                reused = _reusable(existing, rows, args.pattern, brief, brief_sha, ctx.correlation_id)
+                reused = _reusable(existing, rows, args.pattern, brief, brief_sha, plan_sha, ctx.correlation_id)
                 if reused is None:
                     owners = sorted({t["correlation_id"] for t in existing})
                     hint = "pass a new --prefix" if args.prefix else "pass a new --correlation-id or --prefix for this brief"
                     raise SwarmError(ErrorCode.E_CONTRACT,
                                      f"prefix {prefix} already used by correlation {','.join(owners)} with a "
-                                     f"different brief/pattern; {hint}")
+                                     f"different brief/pattern/plan; {hint}")
             else:
                 reused = None
                 for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:
                     tid = f"{prefix}-{suffix}"
                     risk = risk_override or args.risk_class
                     depth[suffix] = 1 + max((depth[d] for d in deps), default=-1)
-                    notes = {"pattern": args.pattern, "brief_excerpt": brief[:2000], "brief_sha256": brief_sha}
+                    notes = {"pattern": args.pattern, "brief_excerpt": brief[:2000], "brief_sha256": brief_sha,
+                             "plan_sha256": plan_sha}
                     if isinstance(gates, dict):
                         notes["gate"] = gates["gate"]
                         notes["gate_for"] = [f"{prefix}-{s}" for s in gates["for"]]
