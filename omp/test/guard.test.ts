@@ -369,6 +369,15 @@ describe("HOOK-02", () => {
     ["echo $(git reset --hard)", "git-reset-hard"],
     ["A=1 B=2 env C=3 sudo -E command git -C sub reset --hard", "git-reset-hard"],
     ["/usr/bin/git push --force", "git-force-push"],
+    // WR-01: a quoted assignment value with spaces, and sudo/env flags that take a value
+    ['GIT_SSH_COMMAND="ssh -i k" git push --force', "git-force-push"],
+    ["DATABASE_URL='postgres://u p@h/db' prisma migrate reset", "prisma-migrate-reset"],
+    ['X="a b" Y=\'c d\' git push -f', "git-force-push"],
+    ["X=a\\ b git push -f", "git-force-push"],
+    ["sudo -u root git reset --hard", "git-reset-hard"],
+    ["sudo --user root -E git push -f", "git-force-push"],
+    ["env -u HOME -i git clean -fdx", "git-clean-force"],
+    ["doas -u root git reset --hard", "git-reset-hard"],
   ])("normalization: %s → %s", (command, id) => {
     expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
   });
@@ -378,6 +387,7 @@ describe("HOOK-02", () => {
       "git reset --hard", "git status", "echo", "x", "y", "z",
     ]);
     expect(normalize('psql -c "SELECT 1; DROP TABLE t" | cat')).toEqual(['psql -c "SELECT 1; DROP TABLE t"', "cat"]);
+    expect(normalize('A="b c" B=1 env -u X sudo -u root command -p git status')).toEqual(["git status"]);
   });
 
   test.each([

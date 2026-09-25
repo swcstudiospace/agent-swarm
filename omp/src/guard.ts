@@ -178,7 +178,17 @@ export interface Rule {
   samples: readonly string[];
 }
 
-const PREFIX = /^(?:env(?:\s+-\S+)*\s+|sudo(?:\s+-\S+)*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=\S*\s+)/;
+/** A shell word as an assignment value: quoted runs (with spaces), escapes and bare characters, up to whitespace. */
+const VALUE = String.raw`(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])*`;
+/** sudo/doas flags that take the next word (`-u root`, `-g wheel`, `-C 3`, `-D dir`, `-h host`, `-p prompt`, `-r role`, `-t type`, `-U user`, `-T secs`). */
+const SUDO_VALUE_FLAG = String.raw`-[ugCDhprtUT]\s+\S+|--(?:user|group|host|prompt|role|type|chdir|close-from|other-user|command-timeout)\s+\S+`;
+/**
+ * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …`, `sudo`/`doas` with their flags,
+ * `command [-pvV]`, and `NAME=value` assignments (quoted values may hold spaces).
+ */
+const PREFIX = new RegExp(
+  String.raw`^(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+)`,
+);
 
 /** Split on `;`, `&&`, `||`, `|` and newlines outside quotes. */
 function splitTopLevel(text: string): string[] {
