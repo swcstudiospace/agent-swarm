@@ -492,3 +492,14 @@ def test_generated_correlation_ids_pass_the_id_rule(swarm_dir):
     assert r.returncode == 0 and json.loads(r.stdout)["reused"] is True, r.stdout + r.stderr
     r = run_script("orch_status.py", f"--correlation-id={corr}", "--json")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_empty_id_env_means_unset_but_empty_flag_is_rejected(swarm_dir):
+    """WR-06: an exported-but-empty SWARM_TASK_ID / SWARM_CORRELATION_ID behaves as unset."""
+    _plan({}, prefix="E")
+    r = run_script("orch_status.py", "--json", env={"SWARM_CORRELATION_ID": "", "SWARM_TASK_ID": ""})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert {t["task_id"] for t in json.loads(r.stdout)["tasks"]} >= {"E-rev"}
+    for flag in ("--correlation-id=", "--task-id="):
+        r = run_script("orch_status.py", flag, "--json")
+        assert r.returncode == 2 and json.loads(r.stdout)["error"]["code"] == "E-INPUT", r.stdout + r.stderr

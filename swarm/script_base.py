@@ -66,8 +66,9 @@ class AgentScript:
 
     def parser(self) -> argparse.ArgumentParser:
         p = argparse.ArgumentParser(prog=self.name, description=self.description)
-        p.add_argument("--task-id", default=os.environ.get("SWARM_TASK_ID"))
-        p.add_argument("--correlation-id", default=os.environ.get("SWARM_CORRELATION_ID"))
+        # an exported-but-empty env var means unset (WR-06); an explicit empty flag still fails check_task_id
+        p.add_argument("--task-id", default=os.environ.get("SWARM_TASK_ID") or None)
+        p.add_argument("--correlation-id", default=os.environ.get("SWARM_CORRELATION_ID") or None)
         p.add_argument("--json", action="store_true", help="print machine-readable JSON only")
         p.add_argument("--dry-run", action="store_true", help="deterministic canned output, no side effects")
         p.add_argument("--root", default=".", help="repository root to operate on")
