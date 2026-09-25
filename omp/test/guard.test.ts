@@ -526,13 +526,41 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["python3 scripts/sec_gate.py", "a10-security", false],
     ["python3 scripts/rel_plan.py", "a12-release", false],
     ["python3 scripts/rel_plan.py", B05, true],
-    ["python3 scripts/unknown_gate.py", "a09-reviewer", true],
+    ["python3 scripts/unknown_gate.py", "a09-reviewer", false],
+    ["bun run scripts/ts/sec_gate.ts", "a08-qa", true],
+    ["uv run python scripts/rel_plan.py", B05, true],
+    ["/usr/bin/python3 -X dev /repo/scripts/qa_gate.py", "a09-reviewer", true],
+    ["./scripts/rev_gate.py --task T-1", B05, true],
   ])("gate script: %s from %s blocks=%p", (command, agent, blocks) => {
     const res = guardToolCall(bash(command), facts(agent));
     if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-foreign)" });
     else expect(res).toBeUndefined();
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
   });
+
+  /** WR-07: reading, testing or linting the scripts is not running them; only an execution under scripts/ counts. */
+  test.each([
+    "cat scripts/orch_plan.py",
+    "grep -n foo scripts/ts/orch_status.ts",
+    "python3 -m pytest tests/test_release_gate.py",
+    "python3 -m pytest tests/test_hook.py scripts/rev_gate.py",
+    "cat scripts/qa_gate.py",
+    "ruff check scripts/rev_gate.py",
+    "git diff scripts/qa_gate.py",
+    "bun test tests/ts/orch_plan.test.ts",
+    "python3 other/orch_plan.py",
+    "python3 scripts/orch_status.py --history",
+    "bun scripts/ts/orch_status.ts --history",
+  ])("WR-07: %s passes for a05, a08 and a09", (command) => {
+    for (const agent of [B05, "a08-qa", "a09-reviewer"]) expect(guardToolCall(bash(command), facts(agent))).toBeUndefined();
+  });
+
+  test.each(["bun run scripts/ts/orch_status.ts --transition T-1 DONE", "uv run python scripts/orch_plan.py", "/usr/bin/python3 -X dev /repo/scripts/orch_plan.py"])(
+    "WR-07: %s is a run and blocks for a05",
+    (command) => {
+      expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
+    },
+  );
 
   test.each([{}, { code: "1+1" }, null])("D-08: eval %p blocks inside, passes in main", (input) => {
     expect(guardToolCall(call("eval", input), facts(B05))).toEqual({ block: true, reason: "BLOCKED needs: human-approval (eval: eval-in-swarm)" });

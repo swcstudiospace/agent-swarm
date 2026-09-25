@@ -161,6 +161,8 @@ function isProdMarker(token: string): boolean {
 export interface Segment {
   text: string;
   words: string[];
+  /** The first word as written (path kept): `./scripts/orch_plan.py` where words[0] is `orch_plan.py`. */
+  argv0: string;
 }
 type Matcher = (seg: Segment, facts: GuardFacts, command: string) => boolean;
 
@@ -351,8 +353,9 @@ export function normalize(command: string, depth = 0): string[] {
 
 function parseSegment(text: string): Segment {
   const words = text.split(/\s+/).filter((w) => w !== "").map((w) => w.replace(/^(['"])(.*)\1$/, "$2"));
+  const argv0 = words[0] ?? "";
   if (words.length > 0) words[0] = posix.basename(words[0]);
-  return { text, words };
+  return { text, words, argv0 };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -487,17 +490,37 @@ const GATE_STEMS: Record<string, keyof typeof GATE_AGENTS> = {
   sec_gate: "security", security_gate: "security", rel_plan: "release", release_gate: "release",
 };
 
-/** A direct run of a gate script (`*_gate.py|ts`, rel_plan) by anyone but that gate's GATE_AGENTS owner (D-05). */
-function foreignGateScript({ words }: Segment, facts: GuardFacts): boolean {
-  return words.some((w) => {
-    const m = /^(\w+_gate|rel_plan)\.(?:py|ts)$/.exec(posix.basename(w));
-    if (m === null) return false;
-    const gate = Object.hasOwn(GATE_STEMS, m[1]) ? GATE_STEMS[m[1]] : undefined;
-    return gate === undefined || facts.agent !== GATE_AGENTS[gate];
-  });
+const INTERPRETER = /^(?:python3?|bun|node|deno|uv|pipx)$/;
+
+/**
+ * The repo script a segment executes (WR-07): argv[0] itself, or the first word after `python`/`python3`/`bun`/
+ * `node`/`deno`/`uv`/`pipx` and their `run`/flags, when it lives under `scripts/` or `scripts/ts/`. A script named
+ * anywhere else (`cat scripts/x.py`, `grep … scripts/ts/x.ts`, `pytest tests/test_x_gate.py`) is not a run.
+ */
+function executedScript({ words, argv0 }: Segment): { stem: string; args: string[] } | undefined {
+  let i = 0;
+  while (i < words.length && (INTERPRETER.test(words[i]) || words[i] === "run" || (i > 0 && words[i].startsWith("-")))) {
+    if (/^-[XW]$/.test(words[i])) i++; // `python -X dev`, `-W error` take a value
+    i++;
+  }
+  const word = i === 0 ? argv0 : words[i];
+  const m = /(?:^|\/)scripts\/(?:ts\/)?([A-Za-z0-9_-]+)\.(?:py|ts)$/.exec(word ?? "");
+  return m === null ? undefined : { stem: m[1], args: words.slice(i + 1) };
 }
 
-const ORCH_STATE_SHELL = [/\borch_status\.py\b.*\s--(?:ingest|transition)\b/, /\borch_plan\.py\b/, /(?:^|[\s/])orch_\w+\.ts\b/];
+/** A direct run of a gate script (qa/quality/rev/review/sec/security/release_gate, rel_plan) by anyone but that gate's owner (D-05). */
+function foreignGateScript(seg: Segment, facts: GuardFacts): boolean {
+  const run = executedScript(seg);
+  if (run === undefined || !Object.hasOwn(GATE_STEMS, run.stem)) return false;
+  return facts.agent !== GATE_AGENTS[GATE_STEMS[run.stem]];
+}
+
+/** A run of `scripts/orch_plan.py|ts`, or of `scripts/orch_status.py|ts` with `--ingest`/`--transition`. */
+function orchStateScript(seg: Segment): boolean {
+  const run = executedScript(seg);
+  if (run === undefined) return false;
+  return run.stem === "orch_plan" || (run.stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a)));
+}
 
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
@@ -506,7 +529,7 @@ export const RULES: readonly Rule[] = [
     id: "orch-state-shell",
     capability: "swarm-state",
     reason: SWARM_STATE_REASON,
-    pattern: (seg, facts) => facts.agent !== ORCHESTRATOR && (ORCH_STATE_SHELL.some((re) => re.test(seg.text)) || sqliteOnSwarm(seg, facts)),
+    pattern: (seg, facts) => facts.agent !== ORCHESTRATOR && (orchStateScript(seg) || sqliteOnSwarm(seg, facts)),
     samples: [
       "python3 scripts/orch_status.py --ingest r.json",
       "python3 scripts/orch_status.py --transition T-1 DONE",
