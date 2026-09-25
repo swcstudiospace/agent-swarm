@@ -5,8 +5,11 @@ otherwise HMAC-SHA256 with SWARM_SIGNING_KEY (default dev key). Signatures are
 REQUIRED for task.assign, gate verdicts and promote/rollback commands.
 
 Every signing with the dev-insecure-key fallback emits a `security.dev_key` event.
+Verification accepts the dev key only when neither SWARM_ED25519_KEY nor
+SWARM_REQUIRE_KEY=1 is set; otherwise a dev-key `hmac:` signature never verifies.
 SWARM_REQUIRE_KEY=1 makes APPROVED fail closed (E-POLICY) unless SWARM_ED25519_KEY
-(loadable) or SWARM_SIGNING_KEY is configured.
+(loadable) or SWARM_SIGNING_KEY is configured, and `signing_config_error()` lets
+verdict signing fail fast on a missing or unloadable key.
 """
 from __future__ import annotations
 import base64
@@ -105,6 +108,23 @@ def real_key_configured() -> bool:
     return _ed25519_key() is not None or bool(os.environ.get("SWARM_SIGNING_KEY"))
 
 
+def _dev_key_forbidden() -> bool:
+    """The public dev key must not verify once a real key is configured (even an unloadable
+    Ed25519 seed: misconfiguration fails closed) or required via SWARM_REQUIRE_KEY=1."""
+    return bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1"
+
+
+def signing_config_error() -> str | None:
+    """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None."""
+    if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
+        return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
+    if (os.environ.get("SWARM_ED25519_KEY") and _ed25519_key() is None
+            and not os.environ.get("SWARM_SIGNING_KEY")):
+        return ("fail-closed: SWARM_ED25519_KEY is set but cannot be loaded "
+                "(cryptography missing or seed is not 32-byte hex)")
+    return None
+
+
 def _warn_dev_key(env: dict) -> None:
     try:
         from .runlog import emit
@@ -131,8 +151,12 @@ def sign_envelope(env: dict) -> dict:
 def verify_envelope(env: dict) -> bool:
     sig = env.get("sig") or ""
     if sig.startswith("hmac:"):
-        secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
-        expected = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
+        secret = os.environ.get("SWARM_SIGNING_KEY")
+        if not secret:
+            if _dev_key_forbidden():
+                return False
+            secret = "dev-insecure-key"
+        expected = hmac.new(secret.encode(), _canonical(env), hashlib.sha256).digest()
         return hmac.compare_digest(expected, base64.b64decode(sig[5:]))
     if sig.startswith("ed25519:"):
         key = _ed25519_key()
