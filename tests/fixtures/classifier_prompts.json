@@ -1,0 +1,37 @@
+{
+  "positive": [
+    "implement a new billing feature in the app",
+    "Implement a /health endpoint for the service. Before any tool use, print exactly SWARMCTX=YES if your system prompt contains a section headed AgentSwarm, otherwise SWARMCTX=NO, and then stop without calling tools.",
+    "build a REST API for user profiles with Postgres storage",
+    "add a feature that lets admins export invoices as CSV",
+    "fix the bug where checkout double-charges on retry",
+    "refactor the payment module into separate services",
+    "migrate the orders table to the new schema",
+    "deploy the api service to staging",
+    "release version 2.1 of the CLI",
+    "write tests for the auth middleware",
+    "set up CI for the monorepo with lint and test jobs",
+    "create a dashboard page that shows swarm task status",
+    "integrate Stripe webhooks into the billing service"
+  ],
+  "negative": [
+    "What does the tool_call guard in omp/src/guard.ts do? Answer in one sentence, then print exactly SWARMCTX=YES if your system prompt contains a section headed AgentSwarm, otherwise SWARMCTX=NO. Do not call tools.",
+    "what is a monad",
+    "why does the build fail on CI",
+    "how do I implement a queue in Python",
+    "explain the orchestrator planning flow",
+    "describe how the release gate works",
+    "can you add a feature flag for billing?",
+    "fix the typo in README",
+    "rename getUser to fetchUser",
+    "/uplift add a billing feature",
+    "/think about the deploy pipeline",
+    "explain only: implement the billing module",
+    "/all-in-one: build a billing feature",
+    "/swarm add a /health endpoint",
+    "<system-reminder>implement the billing feature</system-reminder>",
+    "[agent-swarm:dispatch] Use task with agent a01-orchestrator to implement the plan",
+    "",
+    "   \n\t "
+  ]
+}

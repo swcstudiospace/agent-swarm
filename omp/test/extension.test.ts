@@ -71,7 +71,7 @@ test("registers five with no io: evaluation and factory do no fs, spawn or spawn
   expect(spawn).toHaveBeenCalledTimes(0);
   expect(spawnSync).toHaveBeenCalledTimes(0);
   // registration order is not part of the contract
-  expect([...pi.handlers.keys()].sort()).toEqual(["session_shutdown", "tool_call"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
   expect(pi.tools.map((t) => t.name).sort()).toEqual(NAMES);
   for (const tool of pi.tools) {
     expect(tool.hidden).toBe(true);
@@ -85,7 +85,7 @@ test("no action at load: the factory never calls a runtime pi action", async () 
   const pi = fakePi();
   factory(pi.api);
   expect(pi.actionCalls).toEqual([]);
-  expect([...pi.handlers.keys()].sort()).toEqual(["session_shutdown", "tool_call"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
 });
 
 test("guard with no io: the tool_call handler decides without fs, spawn, spawnSync or the bridge", async () => {

@@ -64,9 +64,24 @@ export interface ToolCallResult {
   reason?: string;
 }
 
+/** omp `before_agent_start` event: fired once per user prompt, before the agent loop starts. */
+export interface BeforeAgentStartEvent {
+  prompt: string;
+  systemPrompt?: string[];
+}
+
+/** A `before_agent_start` result: `systemPrompt` replaces the system prompt parts for this turn. */
+export interface BeforeAgentStartResult {
+  systemPrompt?: string[];
+}
+
 export interface ExtensionAPI {
   registerTool<P, D>(tool: ToolDefinition<P, D>): void;
   on(event: "tool_call", handler: (event: ToolCallEvent, ctx: ExtensionContext) => ToolCallResult | undefined): void;
+  on(
+    event: "before_agent_start",
+    handler: (event: BeforeAgentStartEvent, ctx: ExtensionContext) => BeforeAgentStartResult | undefined,
+  ): void;
   on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown): void;
   /** Canonical names of the session's active tools. A load-time stub that throws: call it only inside handlers. */
   getActiveTools(): string[];

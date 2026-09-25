@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR } from "./guard.ts";
+import { swarmContext } from "./hooks.ts";
 import type { ExtensionFactory } from "./omp-api.ts";
 import { buildTools } from "./tools.ts";
 
@@ -20,6 +21,14 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
     for (const tool of buildTools(scoped)) pi.registerTool(tool);
     // D-07: group-kill this session's in-flight python children when it ends (registration only, no I/O)
     pi.on("session_shutdown", () => killInflight(inflight));
+    // HOOK-01 (D-09): SDLC prompts in a top-level session get the AgentSwarm context; fail-open on any error.
+    pi.on("before_agent_start", (event, ctx) => {
+      try {
+        return swarmContext(event, ctx, process.env);
+      } catch {
+        return undefined;
+      }
+    });
     // HOOK-03/04 guard. omp turns a throwing handler into a block (D-02): an error blocks inside a swarm
     // session and returns undefined outside one, so the operator's own tools never break.
     pi.on("tool_call", (event, ctx) => {
