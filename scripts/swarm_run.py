@@ -253,6 +253,9 @@ def run(args, ctx) -> dict:
     if not corr:
         raise SwarmError(ErrorCode.E_INPUT, "no plan found — run scripts/orch_plan.py first")
     ctx.correlation_id = corr
+    if not store.list(correlation_id=corr):
+        raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
+                         "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
     if not args.dry_run and not shutil.which(args.claude_bin):
         raise SwarmError(ErrorCode.E_DEP, f"{args.claude_bin} not on PATH (use --dry-run to simulate)")
     if not args.dry_run:

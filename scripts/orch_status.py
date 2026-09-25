@@ -8,6 +8,7 @@
   python3 scripts/orch_status.py --history T7f3a-be
 """
 from __future__ import annotations
+import argparse
 import sys
 from pathlib import Path
 
@@ -90,6 +91,8 @@ def run(args, ctx) -> dict:
 
 
 def add_args(p):
+    p.add_argument("--repo", dest="root", default=argparse.SUPPRESS,
+                   help="alias of --root (same flag as swarm_run.py --repo)")
     p.add_argument("--transition", nargs=2, metavar=("TASK_ID", "STATE"), help="A01-only legal transition")
     p.add_argument("--reason", default="")
     p.add_argument("--ingest", help="path to a task.result JSON (swarm/schemas/task.result.v1.json) from an agent")

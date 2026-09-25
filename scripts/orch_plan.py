@@ -10,6 +10,7 @@ Patterns encode the reference event flows of 04-integration-plan.md §3:
 Writes a plan snapshot to .swarm/plans/<correlation_id>.json and emits plan.updated.
 """
 from __future__ import annotations
+import argparse
 import hashlib
 import json
 import sqlite3
@@ -212,6 +213,8 @@ def run(args, ctx) -> dict:
 
 
 def add_args(p):
+    p.add_argument("--repo", dest="root", default=argparse.SUPPRESS,
+                   help="alias of --root (same flag as swarm_run.py --repo)")
     p.add_argument("--brief", help="path to brief markdown")
     p.add_argument("--brief-text", help="inline brief text")
     p.add_argument("--pattern", choices=list(PATTERNS) + ["custom"], default="feature")
