@@ -179,13 +179,49 @@ def test_a01_strict_dispatch():
     assert _omp(_a("A01")).count(rule) == 1
 
 
-def test_a01_plan_mode_before_depth():
-    text = builder.OMP_ORCH_PREAMBLE
-    plan = next(line for line in text.splitlines() if "plan mode" in line)
-    depth = next(line for line in text.splitlines() if '"depth"' in line)
+def _a01_runtime_lines():
+    text = _omp(_a("A01"))
+    block = text[text.index("<swarm_runtime>\n") : text.index("</swarm_runtime>")]
+    return [line for line in block.splitlines()[1:] if line.strip()]
+
+
+def _rule(lines, needle):
+    hits = [i for i, line in enumerate(lines) if needle in line]
+    assert len(hits) == 1, (needle, hits)
+    return hits[0]
+
+
+def test_a01_gate_is_first():
+    lines = _a01_runtime_lines()
+    assert "Step 0" in lines[0]
+    assert _omp(_a("A01")).count("Step 0") == 1
+    plan = _rule(lines, "plan mode")
+    depth = _rule(lines, '"depth"')
+    common = lines.index(builder._OMP_COMMON.splitlines()[0])
+    strict = _rule(lines, 'schemaMode: "strict"')
+    assert 0 < plan < depth < common < strict
+
+
+def test_a01_plan_mode_discriminator():
+    lines = _a01_runtime_lines()
+    plan = lines[_rule(lines, "plan mode")]
+    assert "`bash`" in plan and "`_bash`" in plan
+    assert "`write`" not in plan and "`_write`" not in plan
     assert "IN_REVIEW" in plan and "summary_md" in plan and "spawn nothing" in plan
-    assert "BLOCKED" in depth and "needs" in depth
-    assert text.index(plan) < text.index(depth)
+
+
+def test_a01_depth_rule_blocked_not_in_review():
+    lines = _a01_runtime_lines()
+    depth = lines[_rule(lines, '"depth"')]
+    for token in ("`task`", "`_task`", '"BLOCKED"', "never IN_REVIEW"):
+        assert token in depth, token
+    assert "without reading, running or writing anything first" in depth
+
+
+def test_specialist_preamble_unchanged():
+    for a in _agents():
+        if a["id"] != "A01":
+            assert "Step 0" not in _omp(a), a["id"]
 
 
 def test_omp_yield_delivery():

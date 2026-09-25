@@ -108,9 +108,11 @@ _OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see
 
 OMP_PREAMBLE = "<swarm_runtime>\n" + _OMP_COMMON + "</swarm_runtime>\n"
 
-OMP_ORCH_PREAMBLE = "<swarm_runtime>\n" + _OMP_COMMON + """- Plan mode first: if your system prompt says you are in plan mode, yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
-- Depth: otherwise, if no `task` tool is available to you, do no specialist work and yield state BLOCKED with needs "depth".
-- Dispatch: spawn specialists via the omp `task` tool with `agent: <slug>` (a02-requirements … a15-docs), batching independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
+OMP_ORCH_PREAMBLE = """<swarm_runtime>
+- Step 0 (mandatory, before reading any file, running any script or writing anything): check your tool definitions and apply the first matching rule below; only then continue with the assignment.
+  - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
+  - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first.
+""" + _OMP_COMMON + """- Dispatch: spawn specialists via the omp `task` tool with `agent: <slug>` (a02-requirements … a15-docs), batching independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
 </swarm_runtime>
 """
 
