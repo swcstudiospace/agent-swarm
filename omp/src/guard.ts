@@ -192,7 +192,8 @@ const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|nice(?:\s+(
  * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces) and the WRAPPER set.
  */
 const PREFIX = new RegExp(
-  String.raw`^(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+|${WRAPPER})`,
+  String.raw`(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+|${WRAPPER})`,
+  "y",
 );
 /** `sh -c`, `bash -ec`, `/bin/zsh -x -c` …: the next word is a command line of its own. */
 const SHELL_C = /^(?:\S*\/)?(?:ba|z|da|k|a)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c\s+/;
@@ -332,10 +333,10 @@ export function normalize(command: string, depth = 0): string[] {
   for (const part of parts) {
     for (let seg of splitTopLevel(part)) {
       seg = seg.trim();
-      for (let prev = ""; prev !== seg; ) {
-        prev = seg;
-        seg = seg.replace(PREFIX, "").trim();
-      }
+      // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
+      let at = 0;
+      for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
+      seg = seg.slice(at);
       if (seg === "") continue;
       segments.push(seg);
       if (depth < MAX_LITERAL_DEPTH) {

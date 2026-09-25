@@ -426,6 +426,26 @@ describe("HOOK-02", () => {
     expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
+  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups normalizes well under a second (WR-09)", () => {
+    const big: [string, string[]][] = [
+      [`${"A=1 ".repeat(250_000)}git status`, ["git status"]],
+      [`${"sudo ".repeat(200_000)}git status`, ["git status"]],
+      [`${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
+      [`sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
+      [`A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+    ];
+    for (const [command, expected] of big) {
+      const t0 = performance.now();
+      expect(normalize(command)).toEqual(expected);
+      expect(performance.now() - t0).toBeLessThan(1000);
+    }
+    for (const command of ["'a b' ".repeat(150_000), "x { ".repeat(200_000), `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`]) {
+      const t0 = performance.now();
+      normalize(command);
+      expect(performance.now() - t0).toBeLessThan(1000);
+    }
+  });
+
   test.each([
     "git status", "git commit -m x", "git push origin feat/x", "git push -u origin feat/main-menu", "rm -rf ./build",
     "rm -rf node_modules dist", `rm -rf ${CWD}/tmp`, "bun test", "kubectl get pods", "kubectl apply -f k.yaml",
