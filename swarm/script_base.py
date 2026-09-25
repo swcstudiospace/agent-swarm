@@ -29,7 +29,8 @@ from .runlog import emit
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Canonical task-id shape (CR-01): ids become file names (verdicts/<id>.<gate>.json, releases/<id>.plan.json),
+# Canonical id shape (CR-01, WR-05) for task and correlation ids, which become file names
+# (verdicts/<id>.<gate>.json, releases/<id>.plan.json, plans/<corr>.json),
 # so no path separator, no "..", no leading dash or dot, no NUL. omp/src/tools.ts mirrors it as a schema pattern.
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -80,6 +81,8 @@ class AgentScript:
         try:
             if ctx.task_id is not None:
                 check_task_id(ctx.task_id)
+            if ctx.correlation_id is not None:  # plans/<corr>.json (WR-05)
+                check_task_id(ctx.correlation_id, "correlation id")
             result = self.run(args, ctx)
             result.setdefault("agent", self.agent_id)
             result.setdefault("script", self.name)

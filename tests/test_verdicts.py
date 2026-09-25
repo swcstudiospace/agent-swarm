@@ -463,3 +463,32 @@ def test_release_id_is_not_a_path(swarm_dir, tmp_path):
     r = run_script("rel_plan.py", "--task-ids=T-x", "--release-id=../../esc", "--json")
     assert r.returncode == 2 and json.loads(r.stdout)["error"]["code"] == "E-INPUT"
     assert not list(tmp_path.glob("**/esc.plan.json"))
+
+
+@pytest.mark.parametrize("script", ["orch_plan.py", "rev_gate.py", "rel_plan.py"])
+def test_path_correlation_id_rejected_without_writing(swarm_dir, tmp_path, script):
+    """WR-05: a correlation id names plans/<corr>.json, so a traversal or absolute id (flag or env) is E-INPUT."""
+    (tmp_path / "out").mkdir()
+    args = ["--brief-text=x", "--pattern=hotfix"] if script == "orch_plan.py" else ["--dry-run"]
+    for bad in ["../../pwn", str(tmp_path / "out" / "pwn"), "a/b", "-x"]:
+        for flag, env in [([f"--correlation-id={bad}"], None), ([], {"SWARM_CORRELATION_ID": bad})]:
+            r = run_script(script, *args, *flag, "--json", env=env)
+            assert r.returncode == 2, r.stdout + r.stderr
+            assert json.loads(r.stdout)["error"]["code"] == "E-INPUT"
+    assert not [p for p in tmp_path.rglob("*") if p.is_file() and p.suffix == ".json"]
+
+
+def test_generated_correlation_ids_pass_the_id_rule(swarm_dir):
+    """uuid4 (orch_plan's default) and an explicit uuid round-trip: plan, then gate and status by that correlation."""
+    import uuid
+    from swarm.script_base import check_task_id
+    for _ in range(50):
+        check_task_id(str(uuid.uuid4()), "correlation id")
+    r = run_script("orch_plan.py", "--brief-text=x", "--pattern=hotfix", "--prefix=U", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    corr = json.loads(r.stdout)["correlation_id"]
+    assert (swarm_dir / "plans" / f"{corr}.json").exists()
+    r = run_script("orch_plan.py", "--brief-text=x", "--pattern=hotfix", "--prefix=U", f"--correlation-id={corr}", "--json")
+    assert r.returncode == 0 and json.loads(r.stdout)["reused"] is True, r.stdout + r.stderr
+    r = run_script("orch_status.py", f"--correlation-id={corr}", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr

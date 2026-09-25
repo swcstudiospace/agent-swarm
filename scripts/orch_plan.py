@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from swarm.script_base import AgentScript  # noqa: E402
+from swarm.script_base import AgentScript, check_task_id  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.manifest import by_capability  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
@@ -124,7 +124,8 @@ def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr, ar
 
 
 def _reuse_result(store: TaskStore, ctx, corr: str, pattern: str) -> dict:
-    plan_file = swarm_dir(ctx.root, create=True) / "plans" / f"{corr}.json"
+    # corr comes from the Task Store here, not argv: re-check it before it names a file (WR-05)
+    plan_file = swarm_dir(ctx.root, create=True) / "plans" / f"{check_task_id(corr, 'correlation id')}.json"
     if plan_file.exists():
         tasks = json.loads(plan_file.read_text())["tasks"]
     else:
