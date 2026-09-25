@@ -470,6 +470,37 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(call(tool, { path, content: "x" }), facts(undefined))).toBeUndefined();
   });
 
+  /** omp's hashline (default), apply_patch and sloppy edit modes name the file inside `input`; write can drive xd://ast_edit. */
+  const INPUT_SHAPED: [string, string, unknown][] = [
+    ["edit", "hashline header with tag", { input: "[.omp/config.yml#AB12]\nPUT 1.=1:\n+extensions: []\n" }],
+    ["edit", "hashline header without tag", { input: "*** Begin Patch\n[.swarm/tasks.db]\nPUT >$:\n+x\n*** End Patch\n" }],
+    ["edit", "hashline header after a clean section", { input: "[src/app.ts#1A2B]\nPUT 1.=1:\n+a\n[~/.omp/agent/config.yml#C3D4]\nPUT 1.=1:\n+b\n" }],
+    ["edit", "hashline MV into .swarm", { input: "[src/app.ts#1A2B]\nMV .swarm/app.ts\n" }],
+    ["edit", "apply_patch Update File", { input: "*** Begin Patch\n*** Update File: .swarm/tasks.db\n@@\n-a\n+b\n*** End Patch\n" }],
+    ["edit", "apply_patch Add File", { input: "*** Begin Patch\n*** Add File: .omp/config.yml\n+x\n*** End Patch\n" }],
+    ["edit", "apply_patch Move to", { input: `*** Begin Patch\n*** Update File: src/a.ts\n*** Move to: ${CWD}/.omp/a.ts\n@@\n-a\n+b\n*** End Patch\n` }],
+    ["edit", "apply_patch Delete File", { input: "*** Begin Patch\n*** Delete File: ~/.omp/x\n*** End Patch\n" }],
+    ["write", "xd://ast_edit paths", { path: "xd://ast_edit", content: JSON.stringify({ ops: [{ pat: "a", out: "b" }], paths: ["src/x.ts", ".omp/config.yml"] }) }],
+  ];
+  test.each(INPUT_SHAPED)("D-08: %s %s blocks inside, passes in main", (tool, _shape, input) => {
+    expect(guardToolCall(call(tool, input), facts(B05))).toEqual({
+      block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-write)",
+    });
+    expect(guardToolCall(call(tool, input), facts(undefined))).toBeUndefined();
+  });
+
+  test.each<[string, unknown]>([
+    ["hashline into src", { input: "[src/app.ts#1A2B]\nPUT 1.=1:\n+x\n" }],
+    ["hashline body row that looks like a header", { input: "[src/app.ts#1A2B]\nPUT 1.=1:\n+[.omp/config.yml#AB12]\n" }],
+    ["apply_patch into src", { input: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n-a\n+b\n*** End Patch\n" }],
+    ["apply_patch body mentioning .swarm", { input: "*** Begin Patch\n*** Update File: docs/x.md\n@@\n-a\n+see .swarm/tasks.db\n*** End Patch\n" }],
+    ["ast_edit on src", { path: "xd://ast_edit", content: JSON.stringify({ ops: [], paths: ["src"] }) }],
+    ["ast_edit with unparsable content", { path: "xd://ast_edit", content: "{not json" }],
+    ["input that is not a string", { input: 42 }],
+  ])("D-08: edit %s passes inside", (_shape, input) => {
+    expect(guardToolCall(call("edit", input), facts(B05))).toBeUndefined();
+  });
+
   test.each(["src/app.ts", "docs/omp.md", ".swarmish/x", `${CWD}/a.omp`])("D-08: write %s passes", (path) => {
     expect(guardToolCall(call("write", { path }), facts(B05))).toBeUndefined();
   });

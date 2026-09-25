@@ -88,9 +88,7 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   // D-08: eval runs raw code past tool_call, so it is closed outright; config/state paths are not writable
   if (event.toolName === "eval") return { block: true, reason: reason("eval", "eval-in-swarm") };
   if (event.toolName === "write" || event.toolName === "edit") {
-    const input = typeof event.input === "object" && event.input !== null ? (event.input as { path?: unknown; file_path?: unknown }) : {};
-    const path = typeof input.path === "string" ? input.path : input.file_path;
-    if (typeof path === "string" && path.trim() !== "" && isProtectedPath(path.trim(), facts)) {
+    if (editTargets(event.input).some((p) => isProtectedPath(p, facts))) {
       return { block: true, reason: reason("protected_path", "protected-path-write") };
     }
     return undefined;
@@ -101,6 +99,42 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   if (typeof command !== "string" || command.trim() === "") return undefined;
   const hit = matchRule(command, facts);
   return hit === undefined ? undefined : { block: true, reason: ruleReason(hit) };
+}
+
+/** A hashline section header `[path]` / `[path#TAG]` (the path may hold spaces; the trailing tag is 4 hex digits). */
+const HASHLINE_HEADER = /^\[([^\]\n#]+?)(?:#[0-9A-Fa-f]{4})?\]\s*$/gm;
+/** A hashline `MV DEST` file op and the apply_patch file directives. */
+const HASHLINE_MOVE = /^\s*MV\s+(\S.*?)\s*$/gm;
+const APPLY_PATCH_FILE = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$/gm;
+
+/**
+ * Every file a write/edit call names, over omp's parameter shapes: `path`/`file_path` (write, edit replace/patch),
+ * the hashline / apply_patch / sloppy `{input}` text (section headers, `MV`, `*** Update File:` …), and the
+ * `xd://ast_edit` device (a write whose content is JSON with `paths`).
+ */
+export function editTargets(input: unknown): string[] {
+  if (typeof input !== "object" || input === null) return [];
+  const { path, file_path, input: text, content } = input as { path?: unknown; file_path?: unknown; input?: unknown; content?: unknown };
+  const out: string[] = [];
+  const add = (p: unknown) => {
+    if (typeof p === "string" && p.trim() !== "") out.push(p.replace(/^(['"])(.*)\1$/, "$2").trim());
+  };
+  add(path);
+  add(file_path);
+  if (typeof text === "string") {
+    for (const re of [HASHLINE_HEADER, HASHLINE_MOVE, APPLY_PATCH_FILE]) for (const m of text.matchAll(re)) add(m[1]);
+  }
+  if (typeof path === "string" && /^xd:\/\/ast_edit(?:[/?#]|$)/.test(path.trim()) && typeof content === "string") {
+    let args: unknown;
+    try {
+      args = JSON.parse(content);
+    } catch {
+      return out;
+    }
+    const paths = (args as { paths?: unknown } | null)?.paths;
+    if (Array.isArray(paths)) for (const p of paths) add(p);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
