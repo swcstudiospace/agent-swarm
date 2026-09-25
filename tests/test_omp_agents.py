@@ -65,7 +65,9 @@ def test_omp_skill_matches_renderer():
 
 builder = _load("build_agents")
 SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
-OMP_TOOLS = {"read", "grep", "glob", "bash", "write", "edit", "task"}
+SWARM_NAMES = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"}
+OMP_TOOLS = {"read", "grep", "glob", "bash", "write", "edit", "task"} | SWARM_NAMES
+GATE_AGENTS = {"A08", "A09", "A10", "A12"}
 KEY_ORDER = ["name", "description", "tools", "spawns", "blocking", "autoloadSkills", "output"]
 
 
@@ -84,10 +86,39 @@ def _keys(text):
 def test_omp_tools_exact():
     for a in _agents():
         tools = _fm(_omp(a))["tools"].split(", ")
-        assert tools == [builder.TOOL_MAP[t] for t in a["tools"]], a["id"]
+        assert tools == [builder.TOOL_MAP[t] for t in a["tools"]] + builder.SWARM_TOOLS.get(a["id"], []), a["id"]
         assert set(tools) <= OMP_TOOLS
     a01 = next(a for a in _agents() if a["id"] == "A01")
-    assert _fm(_omp(a01))["tools"] == "read, grep, glob, bash, task, write"
+    assert _fm(_omp(a01))["tools"] == (
+        "read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition"
+    )
+
+
+def test_swarm_tool_grants():
+    """D-01: only A01 moves task state and only the four gate agents record verdicts; nobody does both."""
+    for a in _agents():
+        swarm = [t for t in _fm(_omp(a))["tools"].split(", ") if t.startswith("swarm_")]
+        if a["id"] == "A01":
+            assert swarm == ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"]
+        elif a["id"] in GATE_AGENTS:
+            assert swarm == ["swarm_gate"], a["id"]
+        else:
+            assert swarm == [], a["id"]
+
+
+@pytest.mark.parametrize(
+    ("aid", "grant"),
+    [
+        ("A01", ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"]),
+        ("A05", ["swarm_status"]),
+        ("A09", ["swarm_gate", "swarm_transition"]),
+        ("A08", ["swarm_nope"]),
+    ],
+)
+def test_swarm_tools_guard(monkeypatch, aid, grant):
+    monkeypatch.setitem(builder.SWARM_TOOLS, aid, grant)
+    with pytest.raises(ValueError, match=aid):
+        builder.render_omp(_a(aid), _agents())
 
 
 def test_omp_no_model_key():

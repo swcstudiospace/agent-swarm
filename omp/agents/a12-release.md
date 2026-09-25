@@ -1,7 +1,7 @@
 ---
 name: "a12-release"
 description: "A12 REL — Owns release plans, progressive delivery (canary) and rollback. Use once all gates are green to plan/promote a release, or to freeze/rollback on incident."
-tools: read, grep, glob, bash, write
+tools: read, grep, glob, bash, write, swarm_gate
 spawns: ""
 blocking: true
 autoloadSkills: a12-release

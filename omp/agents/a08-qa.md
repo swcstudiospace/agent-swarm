@@ -1,7 +1,7 @@
 ---
 name: "a08-qa"
 description: "A08 QA — Quality gate. Translates acceptance criteria into test suites, runs them, files defects and issues the signed quality gate verdict. Never modifies product code."
-tools: read, grep, glob, bash, write, edit
+tools: read, grep, glob, bash, write, edit, swarm_gate
 spawns: ""
 blocking: true
 autoloadSkills: a08-qa

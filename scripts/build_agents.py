@@ -28,6 +28,17 @@ OMP_SKILLS_DIR = ROOT / "omp" / "skills"
 SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
 TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
 BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
+# D-01: the omp package's hidden swarm_* tools reach only the agents granted here (omp frontmatter only).
+SWARM_TOOLS = {
+    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"],
+    "A08": ["swarm_gate"],
+    "A09": ["swarm_gate"],
+    "A10": ["swarm_gate"],
+    "A12": ["swarm_gate"],
+}
+# Fail-closed ceiling for SWARM_TOOLS: A01 moves task state, the gate agents record verdicts, no agent does both.
+ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"}
+GATE_AGENTS = {"A08", "A09", "A10", "A12"}
 
 CLAUDE_PREAMBLE = """<swarm_runtime>
 You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
@@ -128,7 +139,12 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
     mapped = [TOOL_MAP[t] for t in agent["tools"]]
     if not is_orch and "task" in mapped:
         raise ValueError(f"{agent['id']}: specialists must not get the omp task tool")
-    tools = ", ".join(mapped)
+    grants = SWARM_TOOLS.get(agent["id"], [])
+    allowed = ORCH_SWARM_TOOLS if is_orch else {"swarm_gate"} if agent["id"] in GATE_AGENTS else set()
+    denied = [t for t in grants if t not in allowed]
+    if denied:
+        raise ValueError(f"{agent['id']}: swarm tool(s) not allowed for this agent: {', '.join(denied)}")
+    tools = ", ".join(mapped + grants)
     spawns = ", ".join(a["slug"] for a in agents if a["id"] != "A01") if is_orch else '""'
     fm = [
         "---",

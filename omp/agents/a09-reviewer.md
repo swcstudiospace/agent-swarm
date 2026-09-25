@@ -1,7 +1,7 @@
 ---
 name: "a09-reviewer"
 description: "A09 REV — Review gate. Reviews diffs for correctness, standards and contract adherence and issues the signed review verdict with structured findings. Read-only on product code."
-tools: read, grep, glob, bash
+tools: read, grep, glob, bash, swarm_gate
 spawns: ""
 blocking: true
 autoloadSkills: a09-reviewer
