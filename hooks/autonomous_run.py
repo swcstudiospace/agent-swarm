@@ -85,6 +85,24 @@ def main() -> int:
         run.append("--dry-run")
     try:
         p1 = subprocess.run(plan, cwd=str(root), env=env, capture_output=True, text=True, timeout=120)
+        try:
+            plan_json = json.loads(p1.stdout)
+        except ValueError:
+            plan_json = {}
+        if p1.returncode != 0 or plan_json.get("status") != "ok" or not plan_json.get("correlation_id"):
+            err = plan_json.get("error") if isinstance(plan_json.get("error"), dict) else {}
+            log.write_text(json.dumps({
+                "brief": args.brief[:500],
+                "repo": str(repo),
+                "spec": str(spec) if spec else None,
+                "plan_rc": p1.returncode,
+                "plan_out": p1.stdout[-4000:],
+                "plan_err": p1.stderr[-2000:],
+                "skipped_run": True,
+                "error": {"code": err.get("code"), "message": err.get("message")},
+            }, indent=2))
+            return 0
+        run += ["--correlation-id", plan_json["correlation_id"]]
         p2 = subprocess.run(run, cwd=str(root), env=env, capture_output=True, text=True, timeout=3600)
         log.write_text(
             json.dumps({

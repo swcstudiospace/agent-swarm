@@ -3,9 +3,9 @@
 
   python3 scripts/orch_status.py                              # table for latest correlation
   python3 scripts/orch_status.py --correlation-id <id> --json
-  python3 scripts/orch_status.py --transition T-be IN_PROGRESS --reason "lease granted"
+  python3 scripts/orch_status.py --transition T7f3a-be IN_PROGRESS --reason "lease granted"
   python3 scripts/orch_status.py --ingest result.json         # task.result payload from an agent
-  python3 scripts/orch_status.py --history T-be
+  python3 scripts/orch_status.py --history T7f3a-be
 """
 from __future__ import annotations
 import sys

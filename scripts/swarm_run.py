@@ -241,7 +241,15 @@ def run(args, ctx) -> dict:
     sdir = swarm_dir(repo, create=True)
     # one absolute state dir for this process and every child it spawns (D-10)
     os.environ["SWARM_DIR"] = str(sdir)
-    corr = ctx.correlation_id or latest_correlation(repo)
+    store_path = sdir / "tasks.db"
+    store = TaskStore(store_path)
+    corr = ctx.correlation_id
+    if corr is None:
+        terminal = {"DONE", "CANCELLED", "ESCALATED"}
+        live = sorted({t["correlation_id"] for t in store.list() if t["state"] not in terminal})
+        if len(live) > 1:
+            raise SwarmError(ErrorCode.E_INPUT, f"{len(live)} non-terminal plans {live}; pass --correlation-id")
+        corr = live[0] if live else latest_correlation(repo)
     if not corr:
         raise SwarmError(ErrorCode.E_INPUT, "no plan found — run scripts/orch_plan.py first")
     ctx.correlation_id = corr
@@ -249,8 +257,6 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_DEP, f"{args.claude_bin} not on PATH (use --dry-run to simulate)")
     if not args.dry_run:
         preflight_auth(args.claude_bin)
-    store_path = sdir / "tasks.db"
-    store = TaskStore(store_path)
     log, rounds = [], 0
     while True:
         rounds += 1

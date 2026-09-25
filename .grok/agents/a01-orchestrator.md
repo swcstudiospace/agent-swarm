@@ -65,7 +65,7 @@ Finish every run with a markdown status table (task, agent, state, gates) follow
   python3 scripts/orch_status.py
   bun scripts/ts/orch_status.ts --json
   python3 scripts/orch_status.py
-  bun scripts/ts/orch_status.ts --transition T-be IN_PROGRESS --reason "lease granted"
+  bun scripts/ts/orch_status.ts --transition T7f3a-be IN_PROGRESS --reason "lease granted"
   python3 scripts/orch_status.py
   bun scripts/ts/orch_status.ts --ingest status.json
 </script>

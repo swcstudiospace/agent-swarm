@@ -59,7 +59,7 @@ python3 scripts/swarm_run.py --dry-run
 
 # 3. inspect
 python3 scripts/orch_status.py
-python3 scripts/orch_status.py --history T-be
+python3 scripts/orch_status.py --history T7f3a-be
 ```
 
 In-session alternative: ask for the `a01-orchestrator` subagent (or say "run the swarm on …");

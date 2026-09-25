@@ -114,11 +114,11 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws   # copy agents,
 
 # run the swarm in isolation (SWARM_DIR otherwise defaults to <git toplevel of --root or cwd>/.swarm)
 export SWARM_DIR=/tmp/sw/.swarm
-python3 scripts/orch_plan.py --brief-text "Add /health" --pattern feature --risk-class medium
+python3 scripts/orch_plan.py --brief-text "Add /health" --pattern feature --risk-class medium   # task ids T<4 hex of correlation>-*, e.g. T7f3a-be
 python3 scripts/swarm_run.py --dry-run --json         # no model calls; canned results
-SWARM_DRYRUN_FAIL=T-be:quality python3 scripts/swarm_run.py --dry-run   # inject a gate failure
+SWARM_DRYRUN_FAIL=T7f3a-be:quality python3 scripts/swarm_run.py --dry-run   # inject a gate failure
 python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3 --runtime auto|claude|grok
-python3 scripts/orch_status.py [--history T-be] [--transition T-be STATE --reason ..] [--ingest status.json]
+python3 scripts/orch_status.py [--history T7f3a-be] [--transition T7f3a-be STATE --reason ..] [--ingest result.json]   # --ingest takes a full task.result (task_id, state, outputs, metrics, summary_md)
 ```
 
 ## Code Conventions & Common Patterns

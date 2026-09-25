@@ -126,3 +126,20 @@ def test_insert_integrityerror_mapped(tmp_path):
     assert json.loads(r.stdout)["error"]["code"] == "E-CONTRACT"
     assert "IntegrityError" not in r.stdout + r.stderr
     assert _counts(tmp_path)[0] == 1
+
+
+def test_run_ambiguous_correlation_exit2(tmp_path):
+    env = _env(tmp_path)
+    corrs = [json.loads(_plan(env, "--brief-text", "billing", "--prefix", p).stdout)["correlation_id"] for p in ("A", "B")]
+    r = run_script("swarm_run.py", "--dry-run", "--json", env=env)
+    assert r.returncode == 2, r.stdout + r.stderr
+    err = json.loads(r.stdout)["error"]
+    assert err["code"] == "E-INPUT"
+    assert all(c in err["message"] for c in corrs)
+    r = run_script("swarm_run.py", "--dry-run", "--json", "--correlation-id", corrs[0], env=env)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert json.loads(r.stdout)["correlation_id"] == corrs[0]
+    con = sqlite3.connect(tmp_path / ".swarm" / "tasks.db")
+    states = {s for (s,) in con.execute("SELECT DISTINCT state FROM tasks WHERE task_id LIKE 'B-%'")}
+    con.close()
+    assert states == {"PLANNED"}
