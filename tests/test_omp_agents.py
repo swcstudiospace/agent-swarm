@@ -181,7 +181,12 @@ def test_omp_output_equals_schema():
 def test_omp_autoload_own_slug():
     for a in _agents():
         val = _fm(_omp(a))["autoloadSkills"]
-        assert val == a["slug"] and "," not in val
+        if a["slug"] == "a01-orchestrator":
+            parts = [x.strip() for x in val.split(",")]
+            assert "a01-orchestrator" in parts
+            assert "swarm-orchestrate" in parts
+        else:
+            assert val == a["slug"] and "," not in val
 
 
 def test_omp_blocking_set():
