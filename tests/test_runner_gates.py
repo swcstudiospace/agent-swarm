@@ -269,11 +269,14 @@ def test_review_finding_without_severity_fails_closed(tmp_path, agent_verdict):
     assert [e for e in _feedback(swarm, "S-fe") if e["source"] == "agent"] == []
 
 
-@pytest.mark.parametrize("entry", [{"verdict": "fail", "findings": []}, {"verdict": "Rejected"}, {"findings": []}],
-                         ids=["fail-empty", "unknown-no-findings", "missing-verdict"])
+@pytest.mark.parametrize("entry", [{"verdict": "fail", "findings": []}, {"verdict": "Rejected"}, {"findings": []},
+                                   {"verdict": "request_changes", "findings": []}, {"verdict": "block", "findings": []},
+                                   {"verdict": "waive", "findings": []}],
+                         ids=["fail-empty", "unknown-no-findings", "missing-verdict", "request_changes", "block", "waive"])
 def test_failing_agent_verdict_without_findings_fails_target(tmp_path, entry):
-    """IN-15: an agent entry that is not "pass" but carries no findings gets one synthesized major finding on its
-    target (gate.findings.synthesized) instead of recording a silent PASS; an explicit pass is untouched."""
+    """IN-15/WR-18: an agent entry outside the pass set (A09's legacy request_changes/block and the human-only waive
+    included) that carries no findings gets one synthesized major finding on its target (gate.findings.synthesized)
+    instead of recording a silent PASS; an explicit pass is untouched."""
     verdicts = {"S-be": entry, "S-fe": {"verdict": "pass", "findings": []}}
     swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
     be, fe = _review_rows(swarm, "S-be"), _review_rows(swarm, "S-fe")
@@ -287,6 +290,23 @@ def test_failing_agent_verdict_without_findings_fails_target(tmp_path, entry):
     assert [(s["key"], s["applied_to"]) for s in ev[0]["payload"]["synthesized"]] == [("S-be", ["S-be"])]
     agent_fb = [e for e in _feedback(swarm, "S-be") if e["source"] == "agent"]
     assert agent_fb and agent_fb[0]["findings"][0]["summary"] == synth[0]["summary"]
+
+
+@pytest.mark.parametrize("entry, severities", [
+    ({"verdict": "approve", "findings": []}, []),
+    ({"verdict": " Approve ", "findings": [{"kind": "style", "summary": "naming nit"}]}, ["minor"]),
+], ids=["approve-empty", "approve-nit-without-severity"])
+def test_approving_agent_verdict_is_a_pass(tmp_path, entry, severities):
+    """WR-18: A09's legacy `approve` is a pass like `pass`: a clean approval reaches DONE with no synthesized finding,
+    and a severity-less nit under it stays minor."""
+    verdicts = {"S-be": entry, "S-fe": {"verdict": "pass", "findings": []}}
+    swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
+    be = _review_rows(swarm, "S-be")
+    assert be and be[0]["verdict"] == "pass", [x["findings"] for x in be]
+    assert [f["severity"] for f in json.loads(be[0]["findings"])] == severities
+    assert _states(swarm)["S-be"] == "DONE"
+    assert _events(swarm, "gate.findings.synthesized") == []
+    assert [e for e in _feedback(swarm, "S-be") if e["source"] == "agent"] == []
 
 
 def test_review_finding_under_unknown_key_fails_every_target(tmp_path):

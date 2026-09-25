@@ -111,7 +111,7 @@
       "callable_by_other_agents": true,
       "when_to_call": "Review gate. Reviews diffs for correctness, standards and contract adherence and issues the review verdict with structured findings. Read-only on product code.",
       "prompt_file": "agents/a09-reviewer.md",
-      "prompt_characters": 7279,
+      "prompt_characters": 7247,
       "tools": [
         "Read",
         "Terminal"

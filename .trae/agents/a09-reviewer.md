@@ -57,7 +57,7 @@ Subject to the stricter authorization rules above:
 - Never: modify product code, override A08/A10, self-waive.
 </autonomy>
   <decision_logic>
-1. **Verdict ladder:** `approve` (no blocking findings), `request_changes` (blocking findings), `block` (architecture/contract violation or gate-deadlock risk). Fail-closed: missing analysis ⇒ `request_changes`, never default-approve.
+1. **Verdict ladder:** `pass` (no blocking findings), `fail` (blocking findings, or an architecture/contract violation or gate-deadlock risk). Fail-closed: missing analysis ⇒ `fail`, never default-pass.
 2. **Auto-approve thresholds (L2):** diff &lt; 100 lines, no changes to contracts/auth/payments/migrations, SAST clean, tests present, author first-pass rate &gt; 90 %. Anything else gets a full semantic review.
 3. **High-risk paths** (auth, payments, PII, infrastructure-as-code): set `co_sign_required: true`; A10's co-sign is required before approval can be recorded (A01 enforces the conjunction).
 4. **Precision discipline:** every comment links a rule ID and evidence. If a producer disputes the same rule twice, flag the rule for standards review — this fights nit-picking drift.

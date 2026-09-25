@@ -77,22 +77,27 @@ def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
             if not store.gate_verdict_since(t, gate=notes["gate"], gate_task_id=task["task_id"], since=claims[-1])]
 
 
-def agent_verdict(entry) -> str:
-    """A gate agent's verdicts{} entry's verdict string, normalized (stripped, lower-case; "" when missing)."""
-    return str((entry.get("verdict") if isinstance(entry, dict) else entry) or "").strip().lower()
+# The only agent verdicts that pass a target (after strip/lower-case). `approve` is A09's legacy alias of `pass`;
+# request_changes, block, fail, the human-only waive, unknown and missing verdicts all fail (WR-17/WR-18).
+PASS_VERDICTS = frozenset({"pass", "approve"})
 
 
-def agent_failed(entry) -> bool:
-    """Fail closed (WR-17): an entry fails its target unless its verdict is an explicit "pass" — "FAIL", "failed",
-    an unknown string and a missing verdict all fail. Only for entries present in verdicts{}."""
-    return agent_verdict(entry) != "pass"
+def agent_verdict(entry: dict) -> str:
+    """A gate agent's verdicts{} entry's verdict string, normalized (stripped, lower-case; "" when missing).
+    validate_result guarantees the entry is an object and its verdict a string."""
+    return str(entry.get("verdict") or "").strip().lower()
 
 
-def agent_findings(entry) -> tuple[list, bool]:
+def agent_failed(entry: dict) -> bool:
+    """Fail closed: an entry fails its target unless its verdict is in PASS_VERDICTS. Only for entries present in
+    verdicts{}."""
+    return agent_verdict(entry) not in PASS_VERDICTS
+
+
+def agent_findings(entry: dict) -> tuple[list, bool]:
     """(findings, synthesized) of a verdicts{} entry. A failing entry without findings gets one synthesized major
     finding (IN-15), so an agent's failure never reduces to an empty list."""
-    items = entry.get("findings") if isinstance(entry, dict) else None
-    items = list(items) if isinstance(items, list) else []
+    items = list(entry.get("findings") or [])
     if items or not agent_failed(entry):
         return items, False
     verdict = agent_verdict(entry) or "no verdict"
