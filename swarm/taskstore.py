@@ -292,7 +292,7 @@ class TaskStore:
             return "unsigned"
         try:
             p = validate_verdict(json.loads(row["envelope_json"]))
-        except (SwarmError, ValueError, TypeError, KeyError):
+        except Exception:  # any corrupt/forged envelope is untrusted, never an abort of missing_gates/reconcile
             return "bad-sig"
         if p["gate"] != gate or p["task_id"] != task_id or p["verdict"] != row["verdict"]:
             return "mismatch"

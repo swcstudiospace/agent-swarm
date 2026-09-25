@@ -106,3 +106,46 @@ def test_gate_script_key_config_error(swarm_dir, monkeypatch, extra, rc, needle)
         err = json.loads(r.stdout)["error"]
         assert err["code"] == "E-POLICY"
         assert needle in err["message"]
+
+
+# ---------------------------------------------------------------- WR-07: malformed envelopes read as bad-sig
+def _raw_row(ts, tid, gate, verdict, envelope_json):
+    import time
+    ts.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json)"
+                    " VALUES (?,?,?,?,?,?,?,?)", (tid, gate, verdict, "A09", "[]", time.time() + 999, time.time(), envelope_json))
+    ts.conn.commit()
+
+
+def _tampered(env, **changes):
+    return json.dumps({**env, **changes})
+
+
+def test_malformed_envelope_rows_are_bad_sig(swarm_dir, monkeypatch):
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    from swarm.results import reconcile
+    _clear_keys(monkeypatch)
+    ts = TaskStore()
+    _in_review(ts, "W-1")
+    env = make_verdict(gate="review", task_id="W-1", agent_id="A09", correlation_id="c")
+    rows = {"int-sig": _tampered(env, sig=123), "null-schema": _tampered(env, schema=None),
+            "bad-base64": _tampered(env, sig="hmac:!!!not-base64"), "non-object": "[]"}
+    for name, envelope_json in rows.items():
+        _raw_row(ts, "W-1", "review", "pass", envelope_json)
+        assert ts.missing_gate_reasons("W-1") == {"review": "bad-sig"}, name
+        reconcile(ts, "c", lambda *a, **k: None)
+        assert ts.get("W-1")["state"] == "IN_REVIEW", name
+
+
+@pytest.mark.parametrize("sig", ["hmac:!!!", "hmac:abc", "hmac:!!!not-base64", 123])
+def test_record_verdict_bad_base64_is_taxonomy_error(swarm_dir, monkeypatch, sig):
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    from swarm.errors import SwarmError, ErrorCode
+    _clear_keys(monkeypatch)
+    ts = TaskStore()
+    _in_review(ts, "W-2")
+    env = {**make_verdict(gate="review", task_id="W-2", agent_id="A09", correlation_id="c"), "sig": sig}
+    with pytest.raises(SwarmError) as ei:
+        ts.record_verdict("W-2", env)
+    assert ei.value.code in (ErrorCode.E_POLICY, ErrorCode.E_CONTRACT)
