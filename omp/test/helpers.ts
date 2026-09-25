@@ -73,15 +73,19 @@ export interface FakePi {
   api: ExtensionAPI;
   tools: AnyTool[];
   handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>;
+  /** Names of runtime action methods that were called (each call also throws). */
+  actionCalls: string[];
   tool(name: string): AnyTool;
 }
 
-/** Records registerTool/on; runtime actions throw like omp's load-time stubs. */
+/** Records registerTool/on; runtime actions record their name and throw like omp's load-time stubs. */
 export function fakePi(): FakePi {
   const tools: AnyTool[] = [];
   const handlers: FakePi["handlers"] = new Map();
-  const notAtLoad = () => {
-    throw new Error("runtime action called during load");
+  const actionCalls: string[] = [];
+  const notAtLoad = (name: string) => () => {
+    actionCalls.push(name);
+    throw new Error(`runtime action ${name} called during load`);
   };
   const api = {
     // heterogeneous tools stored for loosely-typed test calls
@@ -89,17 +93,18 @@ export function fakePi(): FakePi {
     on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
-    exec: notAtLoad,
-    getActiveTools: notAtLoad,
-    getAllTools: notAtLoad,
-    setActiveTools: notAtLoad,
-    sendMessage: notAtLoad,
-    appendEntry: notAtLoad,
+    exec: notAtLoad("exec"),
+    getActiveTools: notAtLoad("getActiveTools"),
+    getAllTools: notAtLoad("getAllTools"),
+    setActiveTools: notAtLoad("setActiveTools"),
+    sendMessage: notAtLoad("sendMessage"),
+    appendEntry: notAtLoad("appendEntry"),
   } satisfies ExtensionAPI & Record<string, unknown>;
   return {
     api,
     tools,
     handlers,
+    actionCalls,
     tool(name) {
       const found = tools.find((t) => t.name === name);
       if (!found) throw new Error(`tool ${name} not registered`);

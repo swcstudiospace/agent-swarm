@@ -6,6 +6,6 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test ./test/extension.test.ts && bun test --path-ignore-patterns='**/extension.test.ts'"
   }
 }

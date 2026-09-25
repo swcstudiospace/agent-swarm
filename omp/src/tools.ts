@@ -92,6 +92,8 @@ interface ToolSpec<P> {
 function define<P>({ mutating, run, ...meta }: ToolSpec<P>): ToolDefinition<P, Details> {
   return {
     ...meta,
+    // schemas reuse module constants (enums, FINDING); each session gets its own copy, so no mutable state is shared
+    parameters: structuredClone(meta.parameters),
     hidden: true,
     loadMode: "essential",
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
