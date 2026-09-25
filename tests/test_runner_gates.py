@@ -203,7 +203,7 @@ def test_failed_gate_session_records_no_verdict(tmp_path, mode):
     assert states["S-rev"] == ("ESCALATED" if mode == "crash" else "BLOCKED")
 
 
-_PER_TARGET_STUB = r'''#!@PY@
+_VERDICTS_STUB = r'''#!@PY@
 import json, re, sys
 if sys.argv[1:3] == ["auth", "status"]:
     print('{"loggedIn": true}')
@@ -212,30 +212,64 @@ prompt = sys.stdin.read()
 tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
 res = {"task_id": tid, "state": "IN_REVIEW", "summary_md": "done"}
 if '"gate": "review"' in prompt:
-    bad = {"severity": @SEV@, "kind": "security", "summary": "SQL built by string concat", "location": "be/db.py:3"}
-    res.update(gate="review", verdicts={"S-be": {"verdict": "fail", "findings": [bad]},
-                                        "S-fe": {"verdict": "pass", "findings": []}})
+    res.update(gate="review", verdicts=@VERDICTS@)
 print(json.dumps({"result": "done\n```json\n" + json.dumps(res) + "\n```"}))
 '''
+_BE_FE_REVIEW = [
+    {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
+    {"id": "fe", "capability": "code.frontend", "agent": "A06", "gates": ["review"]},
+    {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be", "fe"],
+     "gates": {"gate": "review", "for": ["be", "fe"]}},
+]
+
+
+def _review_rows(swarm, tid):
+    return [x for x in _rows(swarm, tid) if x["gate"] == "review"]
 
 
 @pytest.mark.parametrize("severity", ["major", "high"])
 def test_review_findings_stay_on_their_target(tmp_path, severity):
     """WR-14: the agent's finding on S-be fails only S-be; an unknown severity counts as major instead of vanishing."""
-    swarm = _run_stub_swarm(tmp_path, _PER_TARGET_STUB.replace("@SEV@", repr(severity)), [
-        {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
-        {"id": "fe", "capability": "code.frontend", "agent": "A06", "gates": ["review"]},
-        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be", "fe"],
-         "gates": {"gate": "review", "for": ["be", "fe"]}},
-    ])
-    be = [x for x in _rows(swarm, "S-be") if x["gate"] == "review"]
-    fe = [x for x in _rows(swarm, "S-fe") if x["gate"] == "review"]
+    bad = {"severity": severity, "kind": "security", "summary": "SQL built by string concat", "location": "be/db.py:3"}
+    verdicts = {"S-be": {"verdict": "fail", "findings": [bad]}, "S-fe": {"verdict": "pass", "findings": []}}
+    swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
+    be, fe = _review_rows(swarm, "S-be"), _review_rows(swarm, "S-fe")
     assert be and be[0]["verdict"] == "fail"
     assert "SQL built by string concat" in be[0]["findings"]
     assert fe and all(x["verdict"] == "pass" for x in fe), [x["findings"] for x in fe]
     assert _states(swarm)["S-fe"] == "DONE"
     coerced = _events(swarm, "gate.findings.coerced")
-    assert [e["payload"]["severities"] for e in coerced][:1] == ([] if severity == "major" else [["high"]])
+    assert [e["payload"]["coerced"] for e in coerced][:1] == ([] if severity == "major" else [[{"from": "high", "to": "major"}]])
+
+
+def test_review_finding_without_severity_fails_closed(tmp_path):
+    """WR-16: a finding with no severity under the agent's "fail" entry counts as major (not minor), and is reported."""
+    verdicts = {"S-be": {"verdict": "fail", "findings": [{"kind": "security", "summary": "migration drops users.email"}]},
+                "S-fe": {"verdict": "pass", "findings": [{"kind": "style", "summary": "naming nit", "severity": None}]}}
+    swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
+    be, fe = _review_rows(swarm, "S-be"), _review_rows(swarm, "S-fe")
+    assert be and be[0]["verdict"] == "fail", [x["findings"] for x in be]
+    assert [f["severity"] for f in json.loads(be[0]["findings"])] == ["major"]
+    assert fe and fe[0]["verdict"] == "pass" and [f["severity"] for f in json.loads(fe[0]["findings"])] == ["minor"]
+    states = _states(swarm)
+    assert states["S-be"] != "DONE" and states["S-fe"] == "DONE"
+    assert _events(swarm, "gate.findings.coerced")[0]["payload"]["coerced"] == [
+        {"from": "missing", "to": "major"}, {"from": "missing", "to": "minor"}]
+
+
+def test_review_finding_under_unknown_key_fails_every_target(tmp_path):
+    """WR-16: findings filed under a key that is not a gate_for id ("be" for S-be) apply to every target instead of
+    vanishing, and the unattributed key is reported."""
+    verdicts = {"be": {"verdict": "fail", "findings": [{"severity": "critical", "kind": "security", "summary": "SQL concat"}]},
+                "S-fe": {"verdict": "pass", "findings": []}}
+    swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
+    for tid in ("S-be", "S-fe"):
+        rows = _review_rows(swarm, tid)
+        assert rows and rows[0]["verdict"] == "fail" and "SQL concat" in rows[0]["findings"], (tid, rows)
+    states = _states(swarm)
+    assert states["S-be"] != "DONE" and states["S-fe"] != "DONE"
+    ev = _events(swarm, "gate.findings.unattributed")
+    assert ev and ev[0]["payload"]["keys"] == ["be"] and ev[0]["payload"]["applied_to"] == ["S-be", "S-fe"]
 
 
 def test_agent_session_gate_script_records_nothing(swarm_dir):

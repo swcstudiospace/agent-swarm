@@ -198,9 +198,13 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
 def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     """Review gate: write {target: [findings]} — what the agent reported under verdicts{} for each gate_for target —
     to results/<tid>.a<N>.findings.json for rev_gate --per-target-findings, so a finding fails only its own target
-    (WR-14). A severity outside SEVERITIES (case-insensitive) or a non-object finding counts as major and is
-    reported in one gate.findings.coerced event. None for other gates or when the session left no parseable result.
-    The agent's verdicts never count: rev_gate still derives each verdict."""
+    (WR-14). Normalization fails closed and reports every change (WR-16):
+    - a severity outside SEVERITIES (case-insensitive) or a non-object finding counts as major;
+    - a missing severity counts as major under the agent's "fail" entry, else minor;
+    - findings under a key that is not a gate_for id cannot be attributed, so they apply to every target.
+    Changes emit one gate.findings.coerced event; unattributed keys emit gate.findings.unattributed.
+    None for other gates or when the session left no parseable result. The agent's verdicts never count:
+    rev_gate still derives each verdict."""
     notes = task["notes_json"]
     if notes.get("gate") != "review":
         return None
@@ -209,27 +213,41 @@ def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None
         return None
     verdicts = result.get("verdicts")
     verdicts = verdicts if isinstance(verdicts, dict) else {}
-    per_target, coerced = {}, []
-    for target in notes.get("gate_for", []):
-        v = verdicts.get(target)
+    gate_for = list(notes.get("gate_for", []))
+    coerced: list[dict] = []
+
+    def entries(v) -> list[tuple[object, bool]]:
+        items = v.get("findings") if isinstance(v, dict) else None
+        failed = isinstance(v, dict) and v.get("verdict") == "fail"
+        return [(f, failed) for f in items] if isinstance(items, list) else []
+
+    def normalize(f, failed: bool) -> dict:
+        if not isinstance(f, dict):
+            coerced.append({"from": "non-object", "to": "major"})
+            return {"severity": "major", "kind": "semantic", "summary": str(f)[:300]}
+        sev = f.get("severity")
+        if isinstance(sev, str) and sev.lower() in SEVERITIES:
+            return {**f, "severity": sev.lower()}
+        to = "major" if sev is not None or failed else "minor"
+        coerced.append({"from": "missing" if sev is None else str(sev), "to": to})
+        return {**f, "severity": to, "evidence": f"{f.get('evidence') or ''} [agent severity {sev!r}]".strip()}
+
+    stray = sorted(k for k in verdicts if k not in gate_for)
+    unattributed = [normalize(f, failed) for k in stray for f, failed in entries(verdicts[k])]
+    per_target = {}
+    for target in gate_for:
         findings, seen = [], set()
-        for f in (v.get("findings") if isinstance(v, dict) else None) or []:
-            if not isinstance(f, dict):
-                coerced.append("non-object")
-                f = {"severity": "major", "kind": "semantic", "summary": str(f)[:300]}
-            sev = f.get("severity", "minor")
-            if isinstance(sev, str) and sev.lower() in SEVERITIES:
-                f = {**f, "severity": sev.lower()}
-            else:
-                coerced.append(str(sev))
-                f = {**f, "severity": "major", "evidence": f"{f.get('evidence') or ''} [agent severity {sev!r}]".strip()}
+        for f in [normalize(f, failed) for f, failed in entries(verdicts.get(target))] + unattributed:
             key = json.dumps(f, sort_keys=True, default=str)
             if key not in seen:
                 seen.add(key)
                 findings.append(f)
         per_target[target] = findings
     if coerced:
-        emit("gate.findings.coerced", {"task_id": task["task_id"], "severities": coerced, "as": "major"})
+        emit("gate.findings.coerced", {"task_id": task["task_id"], "coerced": coerced})
+    if stray:
+        emit("gate.findings.unattributed", {"task_id": task["task_id"], "keys": stray, "applied_to": gate_for,
+                                            "findings": len(unattributed)})
     path = Path(sdir) / "results" / f"{task['task_id']}.a{task['attempt']}.findings.json"
     path.write_text(json.dumps(per_target, indent=2))
     return path
