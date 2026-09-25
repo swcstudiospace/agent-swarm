@@ -7,7 +7,8 @@ untracked files always count as
 added), produces per-file diff stats, runs rules-only checks (oversized files,
 TODO/FIXME/XXX, debug prints, commented-out code, missing tests, secret-looking
 strings, invisible/bidi control characters), merges optional LLM findings from
---findings-file, and writes a signed `gate.verdict` (gate=review) envelope to
+--findings-file (every target) and --per-target-findings (each gate target only its
+own), and writes a signed `gate.verdict` (gate=review) envelope to
 .swarm/verdicts/<task_id>.review.json (recorded in the Task Store when the task exists).
 """
 from __future__ import annotations
@@ -135,19 +136,36 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
     return findings
 
 
+def _finding(f, i: int, path: str) -> dict:
+    if not isinstance(f, dict):
+        raise SwarmError(ErrorCode.E_INPUT, f"finding {i} in {path} is not an object")
+    sev = f.get("severity", "minor")
+    if sev not in SEVERITIES:
+        raise SwarmError(ErrorCode.E_INPUT, f"bad severity {sev!r} in {path}")
+    return make_finding(f.get("id") or f"RF-{i:03d}", sev, f.get("kind", "semantic"), f.get("summary", ""),
+                        evidence=f.get("evidence", ""), ac_ref=f.get("ac_ref"),
+                        owner_suggestion=f.get("owner_suggestion", "A05"), location=f.get("location"))
+
+
 def load_extra(path: str | None, offset: int) -> list[dict]:
     if not path:
         return []
     raw = json.loads(Path(path).read_text())
     raw = raw.get("findings", raw) if isinstance(raw, dict) else raw
-    out = []
-    for i, f in enumerate(raw, offset + 1):
-        sev = f.get("severity", "minor")
-        if sev not in SEVERITIES:
-            raise SwarmError(ErrorCode.E_INPUT, f"bad severity {sev!r} in {path}")
-        out.append(make_finding(f.get("id") or f"RF-{i:03d}", sev, f.get("kind", "semantic"), f.get("summary", ""),
-                                evidence=f.get("evidence", ""), ac_ref=f.get("ac_ref"),
-                                owner_suggestion=f.get("owner_suggestion", "A05"), location=f.get("location")))
+    return [_finding(f, i, path) for i, f in enumerate(raw, offset + 1)]
+
+
+def load_per_target(path: str | None, offset: int) -> dict[str, list[dict]]:
+    """--per-target-findings {target task id: [findings]}: each target's verdict gets only its own list (D-13)."""
+    if not path:
+        return {}
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict) or not all(isinstance(v, list) for v in raw.values()):
+        raise SwarmError(ErrorCode.E_INPUT, f"{path}: expected an object {{target task id: [findings]}}")
+    out: dict[str, list[dict]] = {}
+    for target, items in raw.items():
+        out[target] = [_finding(f, i, path) for i, f in enumerate(items, offset + 1)]
+        offset += len(items)
     return out
 
 
@@ -165,14 +183,21 @@ def run(args, ctx) -> dict:
     per_file = [{"file": f, "added": c["added"], "deleted": c["deleted"]} for f, c in sorted(changes.items())]
     stats = {"files": len(changes), "added": sum(c["added"] for c in changes.values()),
              "deleted": sum(c["deleted"] for c in changes.values()), "per_file": per_file}
-    findings = mechanical_checks(changes, args.max_lines, Path(__file__).resolve(), ctx.root)
-    extra = load_extra(args.findings_file, len(findings))
-    findings += extra
-    runs = {"rules": "pass" if not any(f["severity"] in ("major", "critical", "blocker") for f in findings[:len(findings) - len(extra)]) else "fail",
-            "semantic": ("pass" if not any(f["severity"] in ("major", "critical", "blocker") for f in extra) else "fail")
-            if args.findings_file else "skipped:no-llm-findings"}
+    mechanical = mechanical_checks(changes, args.max_lines, Path(__file__).resolve(), ctx.root)
+    extra = load_extra(args.findings_file, len(mechanical))
+    own = load_per_target(args.per_target_findings, len(mechanical) + len(extra))
+    semantic = extra + [f for items in own.values() for f in items]
+    findings = mechanical + semantic
+    llm = bool(args.findings_file or args.per_target_findings)
+    blocking = ("major", "critical", "blocker")
+    runs = {"rules": "fail" if any(f["severity"] in blocking for f in mechanical) else "pass",
+            "semantic": ("fail" if any(f["severity"] in blocking for f in semantic) else "pass")
+            if llm else "skipped:no-llm-findings"}
+    # WR-14: a gate task's target gets the shared findings plus only the findings attributed to it
+    per_target = {t: mechanical + extra + items for t, items in own.items()} if args.per_target_findings else None
     env, recorded = issue_gate(ctx, gate="review", agent_id="A09@local", findings=findings, runs=runs, expires_s=172800,
-                               extra={"mode": "rules+semantic" if args.findings_file else "rules-only",
+                               per_target=per_target,
+                               extra={"mode": "rules+semantic" if llm else "rules-only",
                                       "diff_base": base or "whole-tree", "stats": {k: v for k, v in stats.items() if k != "per_file"}})
     verdict = env["payload"]["verdict"]
     return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "stats": stats,
@@ -183,7 +208,10 @@ def run(args, ctx) -> dict:
 
 def add_args(p):
     p.add_argument("--diff-base", help="git ref to diff against (default: HEAD~1, then origin/main, else whole tree)")
-    p.add_argument("--findings-file", help="JSON list of additional (LLM semantic) findings to merge into the verdict")
+    p.add_argument("--findings-file", help="JSON list of additional (LLM semantic) findings to merge into every target's verdict")
+    p.add_argument("--per-target-findings",
+                   help="JSON object {target task id: [findings]}: each gate target's verdict gets only its own findings "
+                        "(targets it omits get every finding)")
     p.add_argument("--max-lines", type=int, default=800, help="changed-lines threshold per file for a major 'size' finding")
 
 

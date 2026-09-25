@@ -177,15 +177,15 @@ def canned_result(task: dict, agent: dict) -> str:
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
 
 
-def run_gate_script(task, repo, sdir, *, dry_run, findings_file=None, timeout=300) -> None:
+def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, timeout=300) -> None:
     """Run the gate task's real gate script on its own id with the runner's keys (D-12/D-13): with --dry-run in a
     runner dry-run, otherwise after the agent session while the gate task is still leased. The script derives and
-    records the verdict; findings_file (review gate) only adds the agent's findings as rev_gate input."""
+    records the verdict; per_target_findings (review gate) only adds the agent's findings as rev_gate input."""
     script = ROOT / "scripts" / f"{GATE_SCRIPTS[task['notes_json']['gate']]}.py"
     cmd = [sys.executable, str(script), *(["--dry-run"] if dry_run else []), "--task-id", task["task_id"],
            "--correlation-id", task["correlation_id"], "--root", str(repo), "--json"]
-    if findings_file is not None:
-        cmd += ["--findings-file", str(findings_file)]
+    if per_target_findings is not None:
+        cmd += ["--per-target-findings", str(per_target_findings)]
     # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record
     env = {k: v for k, v in os.environ.items() if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD")}
     env["SWARM_DIR"] = str(Path(sdir).resolve())
@@ -195,10 +195,12 @@ def run_gate_script(task, repo, sdir, *, dry_run, findings_file=None, timeout=30
                          task_id=task["task_id"])
 
 
-def review_findings_file(task: dict, text: str, sdir: Path) -> Path | None:
-    """Review gate: write the findings the agent reported under verdicts{} for its gate_for targets (valid severities
-    only; rev_gate rejects others with E-INPUT) to results/<tid>.a<N>.findings.json. None for other gates or when
-    the session left no parseable result. The agent's verdicts never count: rev_gate still derives the verdict."""
+def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
+    """Review gate: write {target: [findings]} — what the agent reported under verdicts{} for each gate_for target —
+    to results/<tid>.a<N>.findings.json for rev_gate --per-target-findings, so a finding fails only its own target
+    (WR-14). A severity outside SEVERITIES (case-insensitive) or a non-object finding counts as major and is
+    reported in one gate.findings.coerced event. None for other gates or when the session left no parseable result.
+    The agent's verdicts never count: rev_gate still derives each verdict."""
     notes = task["notes_json"]
     if notes.get("gate") != "review":
         return None
@@ -207,18 +209,29 @@ def review_findings_file(task: dict, text: str, sdir: Path) -> Path | None:
         return None
     verdicts = result.get("verdicts")
     verdicts = verdicts if isinstance(verdicts, dict) else {}
-    findings, seen = [], set()
+    per_target, coerced = {}, []
     for target in notes.get("gate_for", []):
         v = verdicts.get(target)
+        findings, seen = [], set()
         for f in (v.get("findings") if isinstance(v, dict) else None) or []:
-            if not isinstance(f, dict) or f.get("severity") not in SEVERITIES:
-                continue
+            if not isinstance(f, dict):
+                coerced.append("non-object")
+                f = {"severity": "major", "kind": "semantic", "summary": str(f)[:300]}
+            sev = f.get("severity", "minor")
+            if isinstance(sev, str) and sev.lower() in SEVERITIES:
+                f = {**f, "severity": sev.lower()}
+            else:
+                coerced.append(str(sev))
+                f = {**f, "severity": "major", "evidence": f"{f.get('evidence') or ''} [agent severity {sev!r}]".strip()}
             key = json.dumps(f, sort_keys=True, default=str)
             if key not in seen:
                 seen.add(key)
                 findings.append(f)
+        per_target[target] = findings
+    if coerced:
+        emit("gate.findings.coerced", {"task_id": task["task_id"], "severities": coerced, "as": "major"})
     path = Path(sdir) / "results" / f"{task['task_id']}.a{task['attempt']}.findings.json"
-    path.write_text(json.dumps(findings, indent=2))
+    path.write_text(json.dumps(per_target, indent=2))
     return path
 
 
@@ -273,7 +286,7 @@ def execute_one(store_path, task, agent, args, ctx, repo):
                 and result["state"] == S.IN_REVIEW.value and not meta.get("is_error") and not meta.get("returncode")):
             # WR-12: the key-holding runner, not the agent, records this gate — once per dispatch, still leased
             run_gate_script(task, repo, sdir, dry_run=False, timeout=args.task_timeout,
-                            findings_file=review_findings_file(task, text, sdir))
+                            per_target_findings=review_findings_file(task, text, sdir, ctx.emit))
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
         if result is None:

@@ -161,20 +161,15 @@ print(json.dumps({"result": "done\n```json\n" + json.dumps(res) + "\n```"}))
 '''
 
 
-@pytest.mark.parametrize("mode", ["crash", "blocked"])
-def test_failed_gate_session_records_no_verdict(tmp_path, mode):
-    """CR-04: a review session that crashed or reported BLOCKED must not satisfy the target's review gate."""
+def _run_stub_swarm(tmp_path, stub_src: str, tasks: list[dict]) -> Path:
+    """Plan `tasks` (prefix S, low risk) on an empty repo and run the swarm with `stub_src` as `claude`; the state dir."""
     work = tmp_path / "work"
     work.mkdir()
     stub = tmp_path / "claude-stub"
-    stub.write_text(_REV_STUB.replace("@PY@", sys.executable).replace("@MODE@", repr(mode)))
+    stub.write_text(stub_src.replace("@PY@", sys.executable))
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     plan = tmp_path / "plan.json"
-    plan.write_text(json.dumps({"tasks": [
-        {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
-        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
-         "gates": {"gate": "review", "for": ["be"]}},
-    ]}))
+    plan.write_text(json.dumps({"tasks": tasks}))
     swarm = tmp_path / ".swarm"
     env = _clean_env(SWARM_DIR=str(swarm), SWARM_SIGNING_KEY="runner-secret")
     p = subprocess.run([sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--plan", str(plan), "--prefix", "S",
@@ -184,12 +179,63 @@ def test_failed_gate_session_records_no_verdict(tmp_path, mode):
                         "--runtime", "claude", "--repo", str(work), "--json"],
                        capture_output=True, text=True, env=env, cwd=ROOT, timeout=600)
     assert r.returncode in (0, 1), r.stdout[-2000:] + r.stderr[-1500:]
-    assert [x for x in _rows(swarm, "S-be") if x["gate"] == "review"] == []
+    return swarm
+
+
+def _states(swarm) -> dict:
     con = sqlite3.connect(swarm / "tasks.db")
     states = dict(con.execute("SELECT task_id, state FROM tasks"))
     con.close()
+    return states
+
+
+@pytest.mark.parametrize("mode", ["crash", "blocked"])
+def test_failed_gate_session_records_no_verdict(tmp_path, mode):
+    """CR-04: a review session that crashed or reported BLOCKED must not satisfy the target's review gate."""
+    swarm = _run_stub_swarm(tmp_path, _REV_STUB.replace("@MODE@", repr(mode)), [
+        {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
+        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
+         "gates": {"gate": "review", "for": ["be"]}},
+    ])
+    assert [x for x in _rows(swarm, "S-be") if x["gate"] == "review"] == []
+    states = _states(swarm)
     assert states["S-be"] == "IN_REVIEW"
     assert states["S-rev"] == ("ESCALATED" if mode == "crash" else "BLOCKED")
+
+
+_PER_TARGET_STUB = r'''#!@PY@
+import json, re, sys
+if sys.argv[1:3] == ["auth", "status"]:
+    print('{"loggedIn": true}')
+    sys.exit(0)
+prompt = sys.stdin.read()
+tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
+res = {"task_id": tid, "state": "IN_REVIEW", "summary_md": "done"}
+if '"gate": "review"' in prompt:
+    bad = {"severity": @SEV@, "kind": "security", "summary": "SQL built by string concat", "location": "be/db.py:3"}
+    res.update(gate="review", verdicts={"S-be": {"verdict": "fail", "findings": [bad]},
+                                        "S-fe": {"verdict": "pass", "findings": []}})
+print(json.dumps({"result": "done\n```json\n" + json.dumps(res) + "\n```"}))
+'''
+
+
+@pytest.mark.parametrize("severity", ["major", "high"])
+def test_review_findings_stay_on_their_target(tmp_path, severity):
+    """WR-14: the agent's finding on S-be fails only S-be; an unknown severity counts as major instead of vanishing."""
+    swarm = _run_stub_swarm(tmp_path, _PER_TARGET_STUB.replace("@SEV@", repr(severity)), [
+        {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
+        {"id": "fe", "capability": "code.frontend", "agent": "A06", "gates": ["review"]},
+        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be", "fe"],
+         "gates": {"gate": "review", "for": ["be", "fe"]}},
+    ])
+    be = [x for x in _rows(swarm, "S-be") if x["gate"] == "review"]
+    fe = [x for x in _rows(swarm, "S-fe") if x["gate"] == "review"]
+    assert be and be[0]["verdict"] == "fail"
+    assert "SQL built by string concat" in be[0]["findings"]
+    assert fe and all(x["verdict"] == "pass" for x in fe), [x["findings"] for x in fe]
+    assert _states(swarm)["S-fe"] == "DONE"
+    coerced = _events(swarm, "gate.findings.coerced")
+    assert [e["payload"]["severities"] for e in coerced][:1] == ([] if severity == "major" else [["high"]])
 
 
 def test_agent_session_gate_script_records_nothing(swarm_dir):
