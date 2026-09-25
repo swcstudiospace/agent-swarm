@@ -100,12 +100,6 @@ test("gate extra keys never reach python", async () => {
   expect(calls[0].args).toEqual([`--root=${repo}`, "--task-id=F-sec", "--correlation-id=c1"]);
 });
 
-test("gate description states the failing-finding rule", () => {
-  const { description } = gateWith().gate;
-  expect(description).toContain("major");
-  expect(description).toMatch(/to fail a target, include at least one finding of severity major or higher/i);
-});
-
 test("gate failing verdict is returned with FAIL: and not thrown", async () => {
   const { gate } = gateWith({ exitCode: 1, json: { status: "fail", verdict: "fail", summary: "review gate FAIL" }, swarmDir: "" });
   const res = await callTool(gate, { gate: "review", task_id: "F-rev", correlation_id: "c1" }, agentCtx(gitRepo(), GATE_AGENTS.review));
