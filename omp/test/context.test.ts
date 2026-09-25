@@ -55,16 +55,16 @@ test("plan mode reads the branch, not every entry", () => {
 
 test("sessionAgent: session_init names the agent and the restriction", () => {
   const init: SessionEntry = { type: "session_init", agent: "a01-orchestrator", restrictToolNames: true, tools: [] };
-  expect(sessionAgent(fakeCtx("/tmp", [model, init, user]))).toEqual({ agent: "a01-orchestrator", restricted: true });
+  expect(sessionAgent(fakeCtx("/tmp", [model, init, user]))).toEqual({ agent: "a01-orchestrator", restricted: true, topLevel: false });
 });
 
 test("sessionAgent: no session_init is the unrestricted main session", () => {
-  expect(sessionAgent(fakeCtx("/tmp", [model, user]))).toEqual({ agent: undefined, restricted: false });
+  expect(sessionAgent(fakeCtx("/tmp", [model, user]))).toEqual({ agent: undefined, restricted: false, topLevel: true });
 });
 
 test("sessionAgent: restrictToolNames must be exactly true", () => {
   const init: SessionEntry = { type: "session_init", agent: "a08-qa", restrictToolNames: "yes" };
-  expect(sessionAgent(fakeCtx("/tmp", [init]))).toEqual({ agent: "a08-qa", restricted: false });
+  expect(sessionAgent(fakeCtx("/tmp", [init]))).toEqual({ agent: "a08-qa", restricted: false, topLevel: false });
 });
 
 function recordingTools() {

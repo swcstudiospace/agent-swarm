@@ -13,10 +13,14 @@ type SessionCtx = Pick<ExtensionContext, "sessionManager">;
  */
 export const GATE_AGENTS = { quality: "a08-qa", review: "a09-reviewer", security: "a10-security", release: "a12-release" } as const;
 
-/** The calling agent (session_init.agent; undefined = the top-level "main" session) and whether its tools are restricted. */
-export function sessionAgent(ctx: SessionCtx): { agent: string | undefined; restricted: boolean } {
+/**
+ * The calling agent (session_init.agent; undefined = no agent named), whether its tools are restricted, and whether
+ * a session_init entry exists at all (`topLevel: false`) — an agent-less session_init is still a child, not the
+ * top-level session (IN-05).
+ */
+export function sessionAgent(ctx: SessionCtx): { agent: string | undefined; restricted: boolean; topLevel: boolean } {
   const init = ctx.sessionManager.getEntries().find((e) => e.type === "session_init");
-  return { agent: typeof init?.agent === "string" ? init.agent : undefined, restricted: init?.restrictToolNames === true };
+  return { agent: typeof init?.agent === "string" ? init.agent : undefined, restricted: init?.restrictToolNames === true, topLevel: init === undefined };
 }
 
 /**
@@ -24,7 +28,8 @@ export function sessionAgent(ctx: SessionCtx): { agent: string | undefined; rest
  * process.env is shared by in-process sessions, so the env is consulted only when no session_init exists (D-01).
  */
 export function callingAgent(ctx: SessionCtx): string | undefined {
-  return sessionAgent(ctx).agent ?? (process.env.SWARM_AGENT?.trim() || undefined);
+  const { agent, topLevel } = sessionAgent(ctx);
+  return agent ?? (topLevel ? process.env.SWARM_AGENT?.trim() || undefined : undefined);
 }
 
 /**

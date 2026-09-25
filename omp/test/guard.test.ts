@@ -520,6 +520,19 @@ describe("HOOK-02", () => {
     );
   });
 
+  test("IN-05: an agent-less session_init is a child, not the top level: the SWARM_TASK_ID/SWARM_AGENT fallback never applies", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const agentless = fakeCtx(CWD, [{ type: "session_init", restrictToolNames: false, tools: [] }]);
+    process.env.SWARM_TASK_ID = "T-1";
+    expect(run(bash("git reset --hard"), agentless)).toBeUndefined();
+    process.env.SWARM_AGENT = "a05-backend";
+    expect(run(bash("git reset --hard"), agentless)).toBeUndefined();
+    expect(callingAgent(agentless)).toBeUndefined();
+    // the same env in a session without any session_init is the headless swarm session it names
+    expect(callingAgent(fakeCtx(CWD))).toBe("a05-backend");
+    expect((run(bash("git reset --hard"), fakeCtx(CWD)) as { reason?: string }).reason).toEndWith(": git-reset-hard)");
+  });
+
   test("a generic task child (not a swarm slug) is outside", () => {
     expect(guardToolCall(bash("git reset --hard"), inside("task"))).toBeUndefined();
   });

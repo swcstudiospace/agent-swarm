@@ -38,8 +38,8 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
       const env = process.env;
       let known: Pick<GuardFacts, "agent" | "topLevel"> = { agent: undefined, topLevel: false };
       try {
-        const { agent: initAgent, restricted } = sessionAgent(ctx);
-        known = { agent: callingAgent(ctx), topLevel: initAgent === undefined };
+        const { restricted, topLevel } = sessionAgent(ctx);
+        known = { agent: callingAgent(ctx), topLevel };
         // getActiveTools only for A01: the depth-cap check is the only reader (D-06)
         const hasTask = known.agent === ORCHESTRATOR ? pi.getActiveTools().includes("task") : true;
         return guardToolCall(event, { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir() });
