@@ -118,14 +118,14 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 
 ## Prerequisites
 
-- Agent-swarm checkout at `/root/src/repos/agent-swarm` (or `$SWARM_ROOT`).
+- Agent-swarm checkout at `$SWARM_ROOT` (the installer fills in the absolute path of the agent-swarm checkout).
 - Target application repo (`--repo` / cwd).
 - python3; bun optional; claude or grok CLI for unattended `swarm_run`.
 
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 /root/src/repos/agent-swarm/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: {slugs}.

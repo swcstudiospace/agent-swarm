@@ -292,9 +292,9 @@ def test_omp_size_bound():
 
 
 def test_omp_no_host_paths():
-    for p in (ROOT / "omp").rglob("*"):
-        if p.is_file():
-            assert "/root/" not in p.read_text(encoding="utf-8"), p
+    files = [p for p in (ROOT / "omp").rglob("*") if p.is_file()] + [ROOT / ".grok" / "hooks" / "agent-swarm.json"]
+    for p in files:
+        assert "/root/" not in p.read_text(encoding="utf-8"), p
 
 
 def _yaml_lists(text):

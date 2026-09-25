@@ -8,6 +8,7 @@ omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, outp
         omp/skills/swarm-orchestrate/SKILL.md  (with A01)
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
+Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
 """
 from __future__ import annotations
 import argparse
@@ -21,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
 from _write_skills import omp_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
+import _install_omp  # noqa: E402
 
 CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
@@ -111,10 +113,10 @@ def render_grok(agent: dict, defaults: dict) -> str:
     return "\n".join(fm) + "\n\n" + GROK_PREAMBLE + "\n" + _body(agent) + "\n"
 
 
-_OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
-- Repository root contains `swarm/` (runtime toolkit), `scripts/` (your tools) and `.swarm/` (task store, verdicts, event log).
+_OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md in the runtime root).
+- Runtime root: the absolute path on the `Runtime root:` line of the `## AgentSwarm runtime` section of your system prompt; when that section is absent, the repository root is the runtime root. It contains `swarm/` (runtime toolkit) and `scripts/` (your tools). The repository you work on (`<repo>`, the git toplevel of your working directory) holds `.swarm/` (task store, verdicts, event log).
 - The assignment you receive is a `task.assign` payload: task_id, correlation_id, capability, inputs[], acceptance[], budget, risk_class. Echo task_id and correlation_id in every script call (`--task-id`, `--correlation-id`) and in your final JSON.
-- Run your scripts with `python3 scripts/<script>.py … --json` or `bun scripts/ts/<script>.ts … --json`, read the JSON, then act. Never fabricate script output.
+- Run your scripts with `python3 <runtime root>/scripts/<script>.py … --root <repo> --json` or `bun <runtime root>/scripts/ts/<script>.ts … --root <repo> --json`, read the JSON, then act; every `scripts/` path in the body below lives under the runtime root. Never fabricate script output.
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Finish by calling the `yield` tool with your `task.result` (or gate verdict) payload as defined in <output_format> as `data`; under omp this replaces any fenced-json finish instruction in the body below. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
@@ -128,8 +130,8 @@ def _omp_gate_preamble(agent_id: str) -> str:
     gate, script = GATES[agent_id]
     line = (
         f"- Gate recording (omp): record your {gate} gate only with the `swarm_gate` tool (`gate: \"{gate}\"`); it runs "
-        f"`{script}` against this session's workspace and signs the verdict. Never run `scripts/{script}.py` or "
-        f"`scripts/ts/{script}.ts` through bash (the guard blocks it), even where the body below says to run the script."
+        f"`{script}` against this session's workspace and signs the verdict. Never run `<runtime root>/scripts/{script}.py` or "
+        f"`<runtime root>/scripts/ts/{script}.ts` through bash (the guard blocks it), even where the body below says to run the script."
     )
     if gate == "review":
         line += (
@@ -258,30 +260,78 @@ def write_grok_hooks(path: Path, hook_cmd: str) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def install_workspace(workspace: Path) -> None:
-    hook_py = ROOT / "hooks" / "user_prompt_submit.py"
-    hook_cmd = f"python3 {hook_py}"
+def _workspace_copies(workspace: Path) -> list[tuple[Path, Path]]:
+    """(source, destination) pairs of the Claude/Grok workspace copy."""
+    pairs = []
     for agent in load_manifest():
         slug = agent["slug"]
-        _copy_file(CLAUDE_DIR / f"{slug}.md", workspace / ".claude" / "agents" / f"{slug}.md")
-        _copy_file(GROK_DIR / f"{slug}.md", workspace / ".grok" / "agents" / f"{slug}.md")
+        pairs.append((CLAUDE_DIR / f"{slug}.md", workspace / ".claude" / "agents" / f"{slug}.md"))
+        pairs.append((GROK_DIR / f"{slug}.md", workspace / ".grok" / "agents" / f"{slug}.md"))
         skill_src = ROOT / "skills" / slug / "SKILL.md"
         if skill_src.exists():
-            _copy_file(skill_src, workspace / ".claude" / "skills" / "agent-swarm" / slug / "SKILL.md")
+            pairs.append((skill_src, workspace / ".claude" / "skills" / "agent-swarm" / slug / "SKILL.md"))
     orch = ROOT / "skills" / "orchestrate" / "SKILL.md"
     if orch.exists():
-        _copy_file(orch, workspace / ".claude" / "skills" / "agent-swarm" / "orchestrate" / "SKILL.md")
-    merge_claude_settings(workspace / ".claude" / "settings.json", hook_cmd)
-    write_grok_hooks(workspace / ".grok" / "hooks" / "agent-swarm.json", hook_cmd)
-    write_grok_hooks(ROOT / ".grok" / "hooks" / "agent-swarm.json", hook_cmd)
+        pairs.append((orch, workspace / ".claude" / "skills" / "agent-swarm" / "orchestrate" / "SKILL.md"))
+    return pairs
+
+
+def install_workspace(workspace: Path, dry_run: bool = False) -> None:
+    """Copy the Claude/Grok agents, skills and hooks into `workspace`; never writes into this repo (D-08).
+
+    Skill copies get the literal `$SWARM_ROOT` replaced by this checkout's realpath, and the workspace hooks call
+    the hook script by absolute path; the tracked repo files stay path-free (OPEN-4)."""
+    root = ROOT.resolve()
+    hook_cmd = f"python3 {root / 'hooks' / 'user_prompt_submit.py'}"
+    settings = workspace / ".claude" / "settings.json"
+    grok_hook = workspace / ".grok" / "hooks" / "agent-swarm.json"
+    pairs = _workspace_copies(workspace)
+    if dry_run:
+        for src, dest in pairs:
+            print(f"dry-run: would copy {src.relative_to(ROOT)} -> {dest}")
+        print(f"dry-run: would set the UserPromptSubmit hook in {settings} (replacing existing ones): {hook_cmd}")
+        print(f"dry-run: would write {grok_hook}: {hook_cmd}")
+        return
+    skills_src = ROOT / "skills"
+    for src, dest in pairs:
+        if src.is_relative_to(skills_src):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(src.read_text(encoding="utf-8").replace("$SWARM_ROOT", str(root)), encoding="utf-8")
+        else:
+            _copy_file(src, dest)
+    merge_claude_settings(settings, hook_cmd)
+    write_grok_hooks(grok_hook, hook_cmd)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="fail if generated output differs from disk")
     ap.add_argument("--only", help="comma list of agent ids/slugs")
-    ap.add_argument("--install-workspace", help="copy generated agents, skills, and hooks into this workspace root")
+    ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, plus the omp package")
+    ap.add_argument("--omp-mode", choices=("link", "copy"), help="omp step of --install-workspace: link the package (default) or copy agents and skills only (no tools, no guard)")
+    ap.add_argument("--dry-run", action="store_true", help="with --install-workspace: print the plan and the config diff, write nothing")
     args = ap.parse_args()
+    if (args.omp_mode or args.dry_run) and not args.install_workspace:
+        ap.error("--omp-mode and --dry-run need --install-workspace")
+    workspace = Path(args.install_workspace).expanduser().resolve() if args.install_workspace else None
+    mode = args.omp_mode or "link"
+    if workspace:
+        if args.check:
+            ap.error("--check cannot be combined with --install-workspace")
+        if not workspace.is_dir():
+            print(f"error: workspace {workspace} is not an existing directory", file=sys.stderr)
+            return 2
+        if workspace == ROOT.resolve():
+            print("error: the agent-swarm checkout wires itself (.omp/config.yml); install into another workspace", file=sys.stderr)
+            return 2
+        problem = _install_omp.preflight(workspace, mode)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
+        if args.dry_run:
+            print("dry-run: skipping generation; the files below are copied as they are on disk")
+            install_workspace(workspace, dry_run=True)
+            return _install_omp.install_omp(workspace, mode, True, sys.stdout)
     manifest_raw = json.loads((ROOT / "agents.json").read_text())
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
@@ -317,9 +367,10 @@ def main() -> int:
         # Symlinked or out-of-tree orphans are never deleted; fail so a human removes them.
         print("refused to remove (symlink or outside omp/): " + ", ".join(str(p.relative_to(ROOT)) for p in refused), file=sys.stderr)
         return 1
-    if args.install_workspace:
-        install_workspace(Path(args.install_workspace).resolve())
-        print(f"installed into {args.install_workspace}")
+    if workspace:
+        install_workspace(workspace)
+        print(f"installed Claude/Grok agents, skills and hook into {workspace}")
+        return _install_omp.install_omp(workspace, mode, False, sys.stdout)
     return 0
 
 
