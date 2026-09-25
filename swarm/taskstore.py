@@ -6,11 +6,13 @@ which is validated and applied by the orchestrator scripts.
 """
 from __future__ import annotations
 import json
+import os
 import sqlite3
 import time
 from enum import Enum
 from pathlib import Path
 
+from .envelope import real_key_configured
 from .errors import SwarmError, ErrorCode
 from .paths import swarm_dir
 from .gates import validate_verdict
@@ -191,6 +193,9 @@ class TaskStore:
                 raise SwarmError(ErrorCode.E_TIMEOUT, f"max_attempts exceeded for {task_id}", task_id=task_id)
             extra["attempt"] = attempt
         if to_state is S.APPROVED:
+            if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
+                raise SwarmError(ErrorCode.E_POLICY,
+                                 "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
             missing = self.missing_gates(task_id)
             if missing:
                 raise SwarmError(ErrorCode.E_POLICY,

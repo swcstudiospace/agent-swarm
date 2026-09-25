@@ -3,6 +3,10 @@
 Signing: ed25519 via `cryptography` when SWARM_ED25519_KEY (hex seed) is set;
 otherwise HMAC-SHA256 with SWARM_SIGNING_KEY (default dev key). Signatures are
 REQUIRED for task.assign, gate verdicts and promote/rollback commands.
+
+Every signing with the dev-insecure-key fallback emits a `security.dev_key` event.
+SWARM_REQUIRE_KEY=1 makes APPROVED fail closed (E-POLICY) unless SWARM_ED25519_KEY
+(loadable) or SWARM_SIGNING_KEY is configured.
 """
 from __future__ import annotations
 import base64
@@ -96,6 +100,20 @@ def _ed25519_key():
         return None
 
 
+def real_key_configured() -> bool:
+    """True when a non-dev signing key is configured (loadable Ed25519 seed or HMAC secret)."""
+    return _ed25519_key() is not None or bool(os.environ.get("SWARM_SIGNING_KEY"))
+
+
+def _warn_dev_key(env: dict) -> None:
+    try:
+        from .runlog import emit
+        emit("security.dev_key", {"msg_type": env["type"], "source": env["source"]},
+             source="swarm.envelope", correlation_id=env.get("correlation_id"))
+    except Exception:  # signing never fails on logging
+        pass
+
+
 def sign_envelope(env: dict) -> dict:
     key = _ed25519_key()
     if key is not None:
@@ -103,6 +121,8 @@ def sign_envelope(env: dict) -> dict:
         env["sig"] = "ed25519:" + base64.b64encode(sig).decode()
     else:
         secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
+        if not os.environ.get("SWARM_SIGNING_KEY"):
+            _warn_dev_key(env)
         mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
         env["sig"] = "hmac:" + base64.b64encode(mac).decode()
     return env

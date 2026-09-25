@@ -286,3 +286,24 @@ def test_forged_fail_does_not_force_rework(swarm_dir):
     _raw_row(ts, "R-1", "review", "fail")
     reconcile(ts, "c", lambda *a, **k: None)
     assert ts.get("R-1")["state"] == "IN_REVIEW"
+
+
+def test_dev_key_event_and_require_key(swarm_dir, monkeypatch):
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    from swarm.errors import SwarmError
+    monkeypatch.delenv("SWARM_SIGNING_KEY", raising=False)
+    monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    ts = TaskStore()
+    _in_review(ts, "K-1")
+    ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09"))
+    ev = _events(swarm_dir, "security.dev_key")
+    assert ev and ev[-1]["payload"] == {"msg_type": "gate.verdict", "source": "A09"}
+    monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    with pytest.raises(SwarmError, match="SWARM_REQUIRE_KEY=1 but no signing key configured"):
+        ts.transition("K-1", "APPROVED")
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "real")
+    n = len(_events(swarm_dir, "security.dev_key"))
+    ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09"))
+    assert len(_events(swarm_dir, "security.dev_key")) == n
+    assert ts.transition("K-1", "APPROVED")["state"] == "APPROVED"
