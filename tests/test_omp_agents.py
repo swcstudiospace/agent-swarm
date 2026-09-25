@@ -161,3 +161,53 @@ def test_omp_frontmatter_key_order():
 def test_omp_no_bundled_name_collision():
     slugs = {a["slug"] for a in _agents()}
     assert not slugs & {"scout", "reviewer", "security-reviewer", "task", "sonic", "main", "sub"}
+
+
+GATES = ("a08-qa", "a09-reviewer", "a10-security", "a12-release")
+
+
+def test_a01_strict_dispatch():
+    text = builder.OMP_ORCH_PREAMBLE
+    assert 'schemaMode: "strict"' in text
+    rule = next(line for line in text.splitlines() if 'schemaMode: "strict"' in line)
+    for gate in GATES:
+        assert gate in rule, gate
+    assert _omp(_a("A01")).count(rule) == 1
+
+
+def test_a01_plan_mode_before_depth():
+    text = builder.OMP_ORCH_PREAMBLE
+    plan = next(line for line in text.splitlines() if "plan mode" in line)
+    depth = next(line for line in text.splitlines() if '"depth"' in line)
+    assert "IN_REVIEW" in plan and "summary_md" in plan and "spawn nothing" in plan
+    assert "BLOCKED" in depth and "needs" in depth
+    assert text.index(plan) < text.index(depth)
+
+
+def test_omp_yield_delivery():
+    for a in _agents():
+        text = _omp(a)
+        assert "`yield` tool with your `task.result`" in text, a["id"]
+        assert "replaces any fenced-json finish instruction" in text, a["id"]
+
+
+def test_specialist_preamble_no_spawn():
+    assert "`task`" not in builder.OMP_PREAMBLE
+    assert "spawn" not in builder.OMP_PREAMBLE.lower()
+
+
+def test_omp_preamble_keeps_autonomy_ceiling():
+    for a in _agents():
+        assert 'L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`' in _omp(a), a["id"]
+
+
+def test_omp_size_bound():
+    sizes = {p.stem: p.stat().st_size for p in OMP_AGENTS.glob("*.md")}
+    assert max(sizes.values()) <= 24 * 1024
+    assert max(sizes, key=sizes.get) == "a01-orchestrator"
+
+
+def test_omp_no_host_paths():
+    for p in (ROOT / "omp").rglob("*"):
+        if p.is_file():
+            assert "/root/" not in p.read_text(encoding="utf-8"), p
