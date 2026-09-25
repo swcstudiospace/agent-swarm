@@ -84,6 +84,42 @@ def test_default_prefix_unique(tmp_path):
     assert _counts(tmp_path)[0] == 26
 
 
+SAME_CORR = "aaaa1111-0000-4000-8000-000000000000"
+
+
+def _task_count(tmp_path, corr):
+    con = sqlite3.connect(tmp_path / ".swarm" / "tasks.db")
+    try:
+        return con.execute("SELECT COUNT(*) FROM tasks WHERE correlation_id=?", (corr,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_same_correlation_rerun_reuses(tmp_path):
+    env = _env(tmp_path)
+    outs = []
+    for _ in range(3):
+        r = _plan(env, "--brief-text", "billing", "--pattern", "feature", "--correlation-id", SAME_CORR)
+        assert r.returncode == 0, r.stdout + r.stderr
+        outs.append(json.loads(r.stdout))
+    for o in outs:
+        assert o["correlation_id"] == SAME_CORR
+        assert all(t["task_id"].startswith("Taaaa-") for t in o["tasks"]), [t["task_id"] for t in o["tasks"]]
+    assert [o.get("reused") is True for o in outs] == [False, True, True]
+    assert _task_count(tmp_path, SAME_CORR) == 13
+
+
+def test_same_correlation_other_brief_exit2(tmp_path):
+    env = _env(tmp_path)
+    assert _plan(env, "--brief-text", "billing", "--correlation-id", SAME_CORR).returncode == 0
+    before = _counts(tmp_path)
+    r = _plan(env, "--brief-text", "other", "--correlation-id", SAME_CORR)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "E-CONTRACT" in r.stdout
+    assert _counts(tmp_path) == before
+    assert _task_count(tmp_path, SAME_CORR) == 13
+
+
 def test_plan_atomic_rollback(tmp_path):
     env = _env(tmp_path)
     plan = tmp_path / "plan.json"

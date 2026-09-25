@@ -160,16 +160,19 @@ def run(args, ctx) -> dict:
         with store.transaction():
             if prefix is None:
                 prefix = _derived_prefix(corr, 4)
-                if _existing(store, prefix, rows):
+                # D-05/D-06: the 4-hex prefix is this correlation's own plan when it already holds those
+                # tasks, so reuse or reject it below; fall back to 6 hex only for another correlation's tasks.
+                if (ex4 := _existing(store, prefix, rows)) and corr not in {t["correlation_id"] for t in ex4}:
                     prefix = _derived_prefix(corr, 6)
             existing = _existing(store, prefix, rows)
             if existing:
                 reused = _reusable(existing, rows, args.pattern, brief, brief_sha, ctx.correlation_id)
                 if reused is None:
                     owners = sorted({t["correlation_id"] for t in existing})
+                    hint = "pass a new --prefix" if args.prefix else "pass a new --correlation-id or --prefix for this brief"
                     raise SwarmError(ErrorCode.E_CONTRACT,
                                      f"prefix {prefix} already used by correlation {','.join(owners)} with a "
-                                     "different brief/pattern; pass a new --prefix")
+                                     f"different brief/pattern; {hint}")
             else:
                 reused = None
                 for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:
