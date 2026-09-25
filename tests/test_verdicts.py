@@ -130,7 +130,7 @@ def test_record_verdict_binds_envelope_task(swarm_dir):
     ts = TaskStore()
     ts.create(task_id="T-a", correlation_id="c", capability="code.backend")
     ts.create(task_id="T-b", correlation_id="c", capability="code.backend")
-    env = make_verdict(gate="review", task_id="T-a", agent_id="A09@local")
+    env = make_verdict(gate="review", task_id="T-a", agent_id="A09@local", correlation_id="c")
     with pytest.raises(SwarmError) as e:
         ts.record_verdict("T-b", env)
     assert e.value.code.value == "E-CONTRACT"
@@ -224,7 +224,7 @@ def test_forged_or_unsigned_verdict_never_approves(swarm_dir, monkeypatch):
     _raw_row(ts, "F-a", "review", "pass")
     # (b) payload.verdict flipped fail→pass after signing, row edited to match
     _in_review(ts, "F-b")
-    ts.record_verdict("F-b", make_verdict(gate="review", task_id="F-b", agent_id="A09", verdict="fail"))
+    ts.record_verdict("F-b", make_verdict(gate="review", task_id="F-b", agent_id="A09", verdict="fail", correlation_id="c"))
     (eid, ej) = ts.conn.execute("SELECT id, envelope_json FROM verdicts WHERE task_id='F-b'").fetchone()
     env = json.loads(ej)
     env["payload"]["verdict"] = "pass"
@@ -233,7 +233,7 @@ def test_forged_or_unsigned_verdict_never_approves(swarm_dir, monkeypatch):
     # (c) signed with k1, verified with k2
     _in_review(ts, "F-c")
     monkeypatch.setenv("SWARM_SIGNING_KEY", "k1")
-    ts.record_verdict("F-c", make_verdict(gate="review", task_id="F-c", agent_id="A09"))
+    ts.record_verdict("F-c", make_verdict(gate="review", task_id="F-c", agent_id="A09", correlation_id="c"))
     monkeypatch.setenv("SWARM_SIGNING_KEY", "k2")
     for tid in ("F-a", "F-b", "F-c"):
         with pytest.raises(SwarmError) as e:
@@ -253,7 +253,7 @@ def test_row_verdict_mismatch(swarm_dir):
     from swarm.gates import make_verdict
     ts = TaskStore()
     _in_review(ts, "M-1")
-    ts.record_verdict("M-1", make_verdict(gate="review", task_id="M-1", agent_id="A09", verdict="fail"))
+    ts.record_verdict("M-1", make_verdict(gate="review", task_id="M-1", agent_id="A09", verdict="fail", correlation_id="c"))
     ts.conn.execute("UPDATE verdicts SET verdict='pass' WHERE task_id='M-1'")
     ts.conn.commit()
     assert ts.missing_gate_reasons("M-1") == {"review": "mismatch"}
@@ -265,7 +265,7 @@ def test_expiry_boundary(swarm_dir, monkeypatch):
     from swarm.gates import make_verdict
     ts = TaskStore()
     _in_review(ts, "E-1")
-    env = make_verdict(gate="review", task_id="E-1", agent_id="A09", expires_s=10)
+    env = make_verdict(gate="review", task_id="E-1", agent_id="A09", expires_s=10, correlation_id="c")
     ts.record_verdict("E-1", env)
     assert ts.missing_gate_reasons("E-1") == {}
     boundary = env["payload"]["issued_at"] + 10
@@ -300,7 +300,7 @@ def test_dev_key_event_and_require_key(swarm_dir, monkeypatch):
     monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
     ts = TaskStore()
     _in_review(ts, "K-1")
-    ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09"))
+    ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09", correlation_id="c"))
     ev = _events(swarm_dir, "security.dev_key")
     assert ev and ev[-1]["payload"] == {"msg_type": "gate.verdict", "source": "A09"}
     monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
@@ -308,6 +308,77 @@ def test_dev_key_event_and_require_key(swarm_dir, monkeypatch):
         ts.transition("K-1", "APPROVED")
     monkeypatch.setenv("SWARM_SIGNING_KEY", "real")
     n = len(_events(swarm_dir, "security.dev_key"))
-    ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09"))
+    ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09", correlation_id="c"))
     assert len(_events(swarm_dir, "security.dev_key")) == n
     assert ts.transition("K-1", "APPROVED")["state"] == "APPROVED"
+
+
+# ---------------------------------------------------------------- WR-04 / D-14: verdicts bound to time and correlation
+def _lease(ts, tid, **notes):
+    """A01 lease (CLAIMED → IN_PROGRESS), plus any notes A01 writes at dispatch."""
+    for s in ("CLAIMED", "IN_PROGRESS"):
+        ts.transition(tid, s)
+    if notes:
+        ts.set_notes(tid, **notes)
+
+
+def test_pre_rework_verdict_replay_is_stale(swarm_dir):
+    import time
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict, make_finding
+    from swarm.errors import SwarmError
+    ts = TaskStore()
+    _in_review(ts, "P-1", gates=("review", "quality"))
+    env_r = make_verdict(gate="review", task_id="P-1", agent_id="A09", correlation_id="c")
+    ts.record_verdict("P-1", env_r)
+    ts.record_verdict("P-1", make_verdict(gate="quality", task_id="P-1", agent_id="A08", correlation_id="c",
+                                          findings=[make_finding("Q-1", "major", "functional", "broken")]))
+    for s in ("CHANGES_REQUESTED", "IN_PROGRESS", "IN_REVIEW"):
+        ts.transition("P-1", s)
+    time.sleep(0.01)  # verdicts_since is rework time + 1 ms; the fresh quality pass is issued after it
+    ts.record_verdict("P-1", env_r)  # the pre-rework pass, re-inserted after the rework
+    ts.record_verdict("P-1", make_verdict(gate="quality", task_id="P-1", agent_id="A08", correlation_id="c"))
+    assert ts.missing_gate_reasons("P-1") == {"review": "stale"}
+    with pytest.raises(SwarmError) as e:
+        ts.transition("P-1", "APPROVED")
+    assert e.value.code.value == "E-POLICY"
+
+
+def test_cross_correlation_envelope_mismatch(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    ts = TaskStore()
+    _in_review(ts, "Q-1")
+    ts.record_verdict("Q-1", make_verdict(gate="review", task_id="Q-1", agent_id="A09", correlation_id="other"))
+    assert ts.missing_gate_reasons("Q-1") == {"review": "mismatch"}
+
+
+def test_gate_script_signs_target_correlation(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.verdicts import record_gate_verdicts
+    _plan({"SWARM_DIR": str(swarm_dir)})
+    ts = TaskStore()
+    _lease(ts, "X-qa")
+    corr = ts.get("X-be")["correlation_id"]
+    recorded = record_gate_verdicts(ts, gate_task_id="X-qa", gate="quality", agent_id="A08@local", findings=[],
+                                    runs={}, correlation_id=None, expires_s=60, emit=lambda *a, **k: None)
+    assert set(recorded) == {"X-be", "X-fe", "X-data"}
+    for t in recorded:
+        (row,) = _rows(swarm_dir, t)
+        assert json.loads(row["envelope_json"])["correlation_id"] == corr
+    assert "quality" not in ts.missing_gate_reasons("X-be")
+
+
+@pytest.mark.parametrize("source", ["flag", "env"])
+def test_gate_script_foreign_correlation_e_policy(swarm_dir, source):
+    from swarm.taskstore import TaskStore
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    _lease(TaskStore(), "X-qa", dry_run=True)  # leased and runner-flagged: only the correlation can refuse it
+    if source == "env":  # a stale export, no --correlation-id flag
+        env["SWARM_CORRELATION_ID"] = "not-this-plan"
+    flag = ["--correlation-id", "not-this-plan"] if source == "flag" else []
+    r = run_script("qa_gate.py", "--dry-run", "--task-id", "X-qa", *flag, "--json", env=env)
+    assert r.returncode == 2 and "E-POLICY" in r.stdout, r.stdout + r.stderr
+    assert "SWARM_CORRELATION_ID" in r.stdout
+    assert _rows(swarm_dir) == []

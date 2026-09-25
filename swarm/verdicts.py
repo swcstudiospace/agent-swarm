@@ -27,8 +27,9 @@ def simulated_per_target(targets: list[str] | None, gate: str) -> dict[str, list
     return {t: ([dict(SIM_FINDING)] if f"{t}:{gate}" in fails else []) for t in targets or []}
 
 
-def resolve_targets(store, task_id: str | None, *, gate: str) -> list[str] | None:
-    """gate_for of a gate task; None when task_id is not a gate task; E-POLICY when its gate differs."""
+def resolve_targets(store, task_id: str | None, *, gate: str, correlation_id: str | None = None) -> list[str] | None:
+    """gate_for of a gate task; None when task_id is not a gate task. E-POLICY when its gate differs, or when
+    correlation_id is given and is not the gate task's own correlation."""
     if not task_id:
         return None
     try:
@@ -43,6 +44,12 @@ def resolve_targets(store, task_id: str | None, *, gate: str) -> list[str] | Non
     if notes["gate"] != gate:
         raise SwarmError(ErrorCode.E_POLICY, f"{task_id} is a {notes['gate']} gate task; this script issues {gate}",
                          task_id=task_id)
+    own = task["correlation_id"]
+    if correlation_id and correlation_id != own:
+        raise SwarmError(ErrorCode.E_POLICY,
+                         f"gate task {task_id} belongs to correlation {own!r}, not {correlation_id!r}; --correlation-id "
+                         "defaults to the SWARM_CORRELATION_ID env var: unset a stale SWARM_CORRELATION_ID export or "
+                         f"pass --correlation-id {own}", task_id=task_id)
     return list(notes.get("gate_for") or [])
 
 
@@ -51,9 +58,10 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
                          verdict: str | None = None, per_target: dict[str, list[dict]] | None = None,
                          emit: Callable[..., object], root=None) -> dict[str, dict]:
     """Record one signed verdict row per gate_for target of `gate_task_id`; return {target: envelope}.
-    All rows (and fail feedback) of one run commit together or not at all (D-13).
+    Each target verdict is signed with the target's own correlation; a given `correlation_id` must be the
+    gate task's (E-POLICY otherwise). All rows (and fail feedback) of one run commit together or not at all (D-13).
     `root` is the caller's --root, so dev-key signing events land in the same state dir."""
-    targets = resolve_targets(store, gate_task_id, gate=gate)
+    targets = resolve_targets(store, gate_task_id, gate=gate, correlation_id=correlation_id)
     if not targets:
         emit("gate.verdict.unrecorded", {"task_id": gate_task_id, "gate": gate,
                                          "reason": "not a gate task" if targets is None else "empty gate_for"})
@@ -64,7 +72,7 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
             tf = (per_target or {}).get(target, findings)
             env = make_verdict(gate=gate, task_id=target, agent_id=agent_id, findings=tf, runs=runs,
                                verdict=None if per_target and target in per_target else verdict,
-                               expires_s=expires_s, correlation_id=correlation_id,
+                               expires_s=expires_s, correlation_id=store.get(target)["correlation_id"],
                                extra={**(extra or {}), "gate_task": gate_task_id}, root=root)
             store.record_verdict(target, env)
             if env["payload"]["verdict"] == "fail":
@@ -82,10 +90,13 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     from .paths import swarm_dir
     from .taskstore import TaskStore
     store = TaskStore(root=ctx.root) if ctx.task_id else None
-    targets = resolve_targets(store, ctx.task_id, gate=gate) if store else None  # E-POLICY before any write
+    targets = (resolve_targets(store, ctx.task_id, gate=gate, correlation_id=ctx.correlation_id)
+               if store else None)  # E-POLICY before any write
+    # file envelope: the caller's correlation, else the gate task's; a non-gate/unknown id keeps a minted one
+    corr = ctx.correlation_id or (store.get(ctx.task_id)["correlation_id"] if store and targets is not None else None)
     task = ctx.task_id or ("T-dry" if simulate else "T-unassigned")
     env = make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
-                       correlation_id=ctx.correlation_id, extra=extra, root=ctx.root)
+                       correlation_id=corr, extra=extra, root=ctx.root)
     out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))

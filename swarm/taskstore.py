@@ -84,8 +84,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 """
 
-_VERIFIED = {"ok", "fail", "expired"}
+_VERIFIED = {"ok", "fail", "expired"}  # a verified, current envelope; reconcile acts only on these
 _JSON_COLS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
+
+
+def _verdicts_since(task: dict) -> float:
+    """Rework cut-off that transition(CHANGES_REQUESTED) writes to notes.verdicts_since; 0 before any rework."""
+    return float(task["notes_json"].get("verdicts_since") or 0)
+
+
+def _gates_of(task: dict) -> list[str]:
+    override = (task.get("notes_json") or {}).get("gates")
+    return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
 
 
 class TaskStore:
@@ -271,38 +281,53 @@ class TaskStore:
                         verified_only: bool = False) -> dict[str, dict]:
         """Latest verdict per gate. Verdicts issued before the task's last rework loop are stale
         (the producer changed the artifact) and are ignored unless include_stale=True.
-        verified_only=True drops rows whose signed envelope does not verify or disagrees with the row."""
-        since = 0.0 if include_stale else float(self.get(task_id)["notes_json"].get("verdicts_since", 0))
+        verified_only=True drops rows whose signed envelope does not verify or disagrees with the row or task."""
+        task = self.get(task_id)
+        out = self._latest_rows(task, include_stale=include_stale)
+        if verified_only:
+            now = time.time()
+            out = {g: d for g, d in out.items() if self._check_row(task, g, d, now) in _VERIFIED}
+        return out
+
+    def _latest_rows(self, task: dict, *, include_stale: bool = False) -> dict[str, dict]:
+        """Highest-id row per gate of `task`, inserted at or after its last rework unless include_stale."""
+        since = 0.0 if include_stale else _verdicts_since(task)
         out: dict[str, dict] = {}
-        for r in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id", (task_id, since)):
+        for r in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id",
+                                   (task["task_id"], since)):
             d = dict(r)
             d["findings"] = json.loads(d["findings"])
             out[d["gate"]] = d
-        if verified_only:
-            now = time.time()
-            out = {g: d for g, d in out.items() if self._check_row(task_id, g, d, now) in _VERIFIED}
         return out
 
     def required_gates(self, task_id: str) -> list[str]:
         """Gates from risk class, unless the plan overrides them via notes.gates (e.g. [] for
         non-code tasks such as requirements or docs, or gate tasks themselves)."""
-        task = self.get(task_id)
-        override = (task.get("notes_json") or {}).get("gates")
-        return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
+        return _gates_of(self.get(task_id))
 
-    @staticmethod
-    def _check_row(task_id: str, gate: str, row: dict | None, now: float) -> str:
-        """Verify one verdict row against its signed envelope. Returns ok | fail | expired
-        (signature verified) or absent | unsigned | bad-sig | mismatch (not trustworthy)."""
+    def _check_row(self, task: dict, gate: str, row: dict | None, now: float) -> str:
+        """Verify one verdict row of `task` against its signed envelope. Returns ok | fail | expired
+        (signature verified and current) or absent | unsigned | bad-sig | mismatch | stale (not trustworthy).
+        mismatch: the signed gate/task_id/verdict disagree with the row, or the envelope's correlation_id
+        is not the task's. stale: the signed issued_at precedes the task's last rework (notes.verdicts_since),
+        even when the row itself was re-inserted after it."""
         if row is None:
             return "absent"
         if not row.get("envelope_json"):
             return "unsigned"
         try:
-            p = validate_verdict(json.loads(row["envelope_json"]))
+            env = json.loads(row["envelope_json"])
+            p = validate_verdict(env)
         except Exception:  # any corrupt/forged envelope is untrusted, never an abort of missing_gates/reconcile
             return "bad-sig"
-        if p["gate"] != gate or p["task_id"] != task_id or p["verdict"] != row["verdict"]:
+        if p["gate"] != gate or p["task_id"] != task["task_id"] or p["verdict"] != row["verdict"]:
+            return "mismatch"
+        if env["correlation_id"] != task["correlation_id"]:
+            return "mismatch"
+        try:
+            if float(p["issued_at"]) < _verdicts_since(task):
+                return "stale"
+        except (KeyError, TypeError, ValueError):
             return "mismatch"
         if p["verdict"] not in ("pass", "waive"):
             return "fail"
@@ -314,12 +339,13 @@ class TaskStore:
         return "ok"
 
     def missing_gate_reasons(self, task_id: str) -> dict[str, str]:
-        """Required gates lacking a verified, unexpired pass/waive verdict → reason, in required order."""
-        latest = self.latest_verdicts(task_id)
+        """Required gates lacking a verified, current, unexpired pass/waive verdict → reason, in required order."""
+        task = self.get(task_id)
+        latest = self._latest_rows(task)
         now = time.time()
         out = {}
-        for g in self.required_gates(task_id):
-            reason = self._check_row(task_id, g, latest.get(g), now)
+        for g in _gates_of(task):
+            reason = self._check_row(task, g, latest.get(g), now)
             if reason != "ok":
                 out[g] = reason
         return out
