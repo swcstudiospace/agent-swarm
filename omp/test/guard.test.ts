@@ -4,6 +4,7 @@
  */
 import { beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { callingAgent } from "../src/context.ts";
@@ -21,13 +22,14 @@ beforeEach(() => {
 const A01 = "a01-orchestrator";
 const CWD = "/nonexistent-guard-cwd";
 const HOME = "/nonexistent-guard-home";
+const TMP = "/nonexistent-guard-tmp";
 const DEPTH_PREFIX = "BLOCKED needs: depth";
 
 const call = (toolName: string, input: unknown = {}): ToolCallEvent => ({ toolName, toolCallId: "tc-1", input });
 const yieldData = (data: unknown) => call("yield", { data });
 
 /** A01 at the depth cap: no `task`, not a restricted child, not in plan mode. */
-const capped: GuardFacts = { agent: A01, restricted: false, planMode: false, hasTask: false, topLevel: false, env: {}, cwd: CWD, home: HOME };
+const capped: GuardFacts = { agent: A01, restricted: false, planMode: false, hasTask: false, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP };
 
 /** The tool_call handler the real factory registers, with a runtime getActiveTools (a bridge call would throw). */
 function guardHandler(opts: FakePiOptions = {}) {
@@ -241,7 +243,7 @@ describe("HOOK-03", () => {
   });
 
   test.each([["a05-backend"], ["task"], [undefined]])("pure: agent %p is blocked on both state tools", (agent) => {
-    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME };
+    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, tmp: TMP };
     for (const toolName of STATE_TOOLS) expect(guardToolCall(call(toolName), facts)).toEqual({ block: true, reason: SWARM_STATE });
   });
 
@@ -282,7 +284,7 @@ describe("HOOK-03", () => {
 
 describe("HOOK-02", () => {
   const B05 = "a05-backend";
-  const inside = (agent = B05): GuardFacts => ({ agent, restricted: false, planMode: false, hasTask: true, topLevel: false, env: {}, cwd: CWD, home: HOME });
+  const inside = (agent = B05): GuardFacts => ({ agent, restricted: false, planMode: false, hasTask: true, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP });
   const main: GuardFacts = { ...inside(), agent: undefined, topLevel: true };
   const bash = (command: string) => call("bash", { command });
   const blockedWith = (res: ReturnType<typeof guardToolCall>, capability: string) => {
@@ -463,8 +465,21 @@ describe("HOOK-02", () => {
     "gh release view", "echo main", "aws s3 ls",
     // WR-05 negatives: plain refspecs, --delete without force, a value-taking global option before a safe subcommand
     "git push origin feat/x:feat/x", "git branch --delete merged", "git --work-tree /x status", "git -c core.x=1 push origin feat",
+    // IN-01: the tmp dir subtree is scratch space
+    `rm -rf ${TMP}/build-cache`, `rm -rf ${TMP}/swarm-omp-abc/x ${TMP}/y`,
   ])("negative inside swarm: %s → undefined", (command) => {
     expect(guardToolCall(bash(command), inside())).toBeUndefined();
+  });
+
+  test.each([`rm -rf ${TMP}`, `rm -rf ${TMP}/`, `rm -rf ${TMP}/../etc`, `rm -rf ${TMP}/.swarm`])("IN-01: %s still blocks", (command) => {
+    blockedWith(guardToolCall(bash(command), inside()), "destructive");
+  });
+
+  test("IN-01: through the handler the real os.tmpdir() subtree is inside", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const a05 = agentCtx(CWD, B05, [], false);
+    expect(run(bash(`rm -rf ${tmpdir()}/build-cache`), a05)).toBeUndefined();
+    expect((run(bash(`rm -rf ${tmpdir()}`), a05) as { reason?: string }).reason).toEndWith(": rm-rf-protected)");
   });
 
   /** WR-08: read-only kubectl/helm forms and markers that only occur in file or resource names pass for A11. */
@@ -521,7 +536,7 @@ describe("HOOK-02", () => {
 describe("HOOK-03 shell twin and D-08", () => {
   const B05 = "a05-backend";
   const facts = (agent: string | undefined, extra: Partial<GuardFacts> = {}): GuardFacts => ({
-    agent, restricted: false, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, ...extra,
+    agent, restricted: false, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, tmp: TMP, ...extra,
   });
   const bash = (command: string) => call("bash", { command });
   const SWARM_STATE = "BLOCKED needs: human-approval (swarm-state)";
@@ -712,7 +727,7 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["edit", { path: null }], ["edit", "path"], ["read", undefined], ["yield", null], ["eval", undefined], ["write", { path: "" }],
   ];
   test.each(MALFORMED)("malformed %s %p never throws inside or outside", (tool, input) => {
-    for (const f of [facts(B05), facts(undefined), facts(A01), facts(undefined, { env: { SWARM_TASK_ID: "T" } }), facts(B05, { cwd: "", home: "" })]) {
+    for (const f of [facts(B05), facts(undefined), facts(A01), facts(undefined, { env: { SWARM_TASK_ID: "T" } }), facts(B05, { cwd: "", home: "", tmp: "" })]) {
       expect(() => guardToolCall(call(tool, input), f)).not.toThrow();
     }
     expect(guardToolCall(call(tool, input), facts(undefined))).toBeUndefined();

@@ -45,6 +45,8 @@ export interface GuardFacts {
   cwd: string;
   /** os.homedir() at call time: expands `~` / `$HOME`. */
   home: string;
+  /** os.tmpdir() at call time ($TMPDIR honoured): its subtree is the specialists' scratch space, inside like cwd (IN-01). */
+  tmp: string;
 }
 
 /**
@@ -415,14 +417,16 @@ const within = (path: string, dir: string) => dir !== "" && dir !== "/" && path.
 /** A repo-state segment (`.git`, `.swarm`, `.omp`) anywhere in the target path, before any resolution. */
 const repoStateSegment = (target: string) => target.split("/").some((s) => s === ".git" || s === ".swarm" || s === ".omp");
 
-/** An `rm -rf` target that is `/`, `~`, outside cwd (incl. `..`) or cwd itself. */
+/** An `rm -rf` target that is `/`, `~`, cwd or the tmp dir itself, or outside both subtrees (incl. `..`). */
 function outsideCwd(target: string, facts: GuardFacts): boolean {
-  return !within(resolvePath(target, facts), posix.resolve(facts.cwd || "/"));
+  const path = resolvePath(target, facts);
+  return !within(path, posix.resolve(facts.cwd || "/")) && !within(path, facts.tmp === "" ? "" : posix.resolve(facts.tmp));
 }
 
 /**
- * `rm` that is universal-destructive: `-r -f` of `/`, `~`, cwd or anything outside it; `-r` alone of a `.git`,
- * `.swarm` or `.omp` path; and any `rm` of a `.swarm`/`.omp` path (the D-08 state dirs), whatever the flags.
+ * `rm` that is universal-destructive: `-r -f` of `/`, `~`, cwd, the tmp dir or anything outside those two subtrees;
+ * `-r` alone of a `.git`, `.swarm` or `.omp` path; and any `rm` of a `.swarm`/`.omp` path (the D-08 state dirs),
+ * whatever the flags.
  */
 function rmProtected({ words }: Segment, facts: GuardFacts): boolean {
   if (words[0] !== "rm") return false;
