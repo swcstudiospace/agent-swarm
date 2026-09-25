@@ -49,8 +49,9 @@ def resolve_targets(store, task_id: str | None, *, gate: str) -> list[str] | Non
 def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id: str, findings: list[dict],
                          runs: dict, correlation_id: str | None, expires_s: int, extra: dict | None = None,
                          verdict: str | None = None, per_target: dict[str, list[dict]] | None = None,
-                         emit: Callable[..., object]) -> dict[str, dict]:
-    """Record one signed verdict row per gate_for target of `gate_task_id`; return {target: envelope}."""
+                         emit: Callable[..., object], root=None) -> dict[str, dict]:
+    """Record one signed verdict row per gate_for target of `gate_task_id`; return {target: envelope}.
+    `root` is the caller's --root, so dev-key signing events land in the same state dir."""
     targets = resolve_targets(store, gate_task_id, gate=gate)
     if not targets:
         emit("gate.verdict.unrecorded", {"task_id": gate_task_id, "gate": gate,
@@ -62,7 +63,7 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
         env = make_verdict(gate=gate, task_id=target, agent_id=agent_id, findings=tf, runs=runs,
                            verdict=None if per_target and target in per_target else verdict,
                            expires_s=expires_s, correlation_id=correlation_id,
-                           extra={**(extra or {}), "gate_task": gate_task_id})
+                           extra={**(extra or {}), "gate_task": gate_task_id}, root=root)
         store.record_verdict(target, env)
         if env["payload"]["verdict"] == "fail":
             fb = store.get(target)["notes_json"].get("feedback", [])
@@ -84,7 +85,7 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     targets = resolve_targets(store, ctx.task_id, gate=gate) if store else None  # E-POLICY before any write
     task = ctx.task_id or ("T-dry" if simulate else "T-unassigned")
     env = make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
-                       correlation_id=ctx.correlation_id, extra=extra)
+                       correlation_id=ctx.correlation_id, extra=extra, root=ctx.root)
     out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
@@ -93,5 +94,6 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
         return env, {}
     recorded = record_gate_verdicts(store, gate_task_id=ctx.task_id, gate=gate, agent_id=agent_id, findings=findings,
                                     runs=runs, correlation_id=ctx.correlation_id, expires_s=expires_s, extra=extra,
-                                    per_target=simulated_per_target(targets, gate) if simulate else None, emit=ctx.emit)
+                                    per_target=simulated_per_target(targets, gate) if simulate else None, emit=ctx.emit,
+                                    root=ctx.root)
     return env, recorded

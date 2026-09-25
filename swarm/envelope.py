@@ -20,6 +20,7 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 
 from .errors import SwarmError, ErrorCode
 
@@ -131,16 +132,17 @@ def signing_config_error() -> str | None:
     return None
 
 
-def _warn_dev_key(env: dict) -> None:
+def _warn_dev_key(env: dict, root: str | Path | None) -> None:
     try:
         from .runlog import emit
         emit("security.dev_key", {"msg_type": env["type"], "source": env["source"]},
-             source="swarm.envelope", correlation_id=env.get("correlation_id"))
+             source="swarm.envelope", correlation_id=env.get("correlation_id"), root=root)
     except Exception:  # signing never fails on logging
         pass
 
 
-def sign_envelope(env: dict) -> dict:
+def sign_envelope(env: dict, *, root: str | Path | None = None) -> dict:
+    """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10)."""
     key = _ed25519_key()
     if key is not None:
         sig = key.sign(_canonical(env))
@@ -148,7 +150,7 @@ def sign_envelope(env: dict) -> dict:
     else:
         secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
         if not os.environ.get("SWARM_SIGNING_KEY"):
-            _warn_dev_key(env)
+            _warn_dev_key(env, root)
         mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
         env["sig"] = "hmac:" + base64.b64encode(mac).decode()
     return env

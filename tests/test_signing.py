@@ -1,9 +1,12 @@
 """CORE-07 / D-15 signing trust: the public dev key never verifies under a configured or required real key."""
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
-from conftest import run_script
+from conftest import ROOT, run_script
 
 KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
 ED_SEED = "11" * 32
@@ -149,3 +152,18 @@ def test_record_verdict_bad_base64_is_taxonomy_error(swarm_dir, monkeypatch, sig
     with pytest.raises(SwarmError) as ei:
         ts.record_verdict("W-2", env)
     assert ei.value.code in (ErrorCode.E_POLICY, ErrorCode.E_CONTRACT)
+
+
+# ---------------------------------------------------------------- IN-02 / D-10: dev_key event follows --root
+def test_dev_key_event_follows_root(tmp_path):
+    app, other = tmp_path / "app", tmp_path / "other"
+    app.mkdir()
+    other.mkdir()
+    env = {k: v for k, v in os.environ.items() if k not in ("SWARM_DIR", *KEY_VARS)}
+    # cwd=other on purpose (not conftest.run_script, whose cwd is the repo and its real .swarm)
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "rev_gate.py"), "--root", str(app), "--dry-run",
+                        "--task-id", "R-rev", "--json"], capture_output=True, text=True, cwd=other, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    events = app / ".swarm" / "events.jsonl"
+    assert events.exists() and '"security.dev_key"' in events.read_text()
+    assert not (other / ".swarm").exists()

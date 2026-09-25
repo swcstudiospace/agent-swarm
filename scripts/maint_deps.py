@@ -134,7 +134,7 @@ def debt_register(root: Path, max_age_days: int) -> dict:
             "files": by_file, "items": items, "git": "ok" if git else "skipped:tool-missing"}
 
 
-def cve_match(cves: list[dict], deps: list[dict], task_id: str, corr) -> list[dict]:
+def cve_match(cves: list[dict], deps: list[dict], task_id: str, corr, root: Path) -> list[dict]:
     norm = lambda n: n.lower().replace("_", "-")  # noqa: E731
     tasks = []
     for c in cves:
@@ -152,7 +152,8 @@ def cve_match(cves: list[dict], deps: list[dict], task_id: str, corr) -> list[di
                        "risk_class": "high" if urgent else "medium", "owner_class": "A05+A14",
                        "confidence": "high" if d["pin"] == "pinned" else "needs-triage"}
             tasks.append(sign_envelope(build_envelope(source="A14@local", target="A01", msg_type="patch.task", payload=payload,
-                                                      correlation_id=corr, priority="P0" if urgent else "P1", risk_class=payload["risk_class"])))
+                                                      correlation_id=corr, priority="P0" if urgent else "P1", risk_class=payload["risk_class"]),
+                                       root=root))
     return tasks
 
 
@@ -174,7 +175,8 @@ def run(args, ctx) -> dict:
     tasks = []
     if args.cve_file:
         cves = json.loads(Path(args.cve_file).read_text())
-        tasks = cve_match(cves if isinstance(cves, list) else cves.get("cves", []), deps, args.task_id or "T-unassigned", ctx.correlation_id)
+        tasks = cve_match(cves if isinstance(cves, list) else cves.get("cves", []), deps, args.task_id or "T-unassigned",
+                          ctx.correlation_id, ctx.root)
         tdir = swarm_dir(ctx.root) / "patch_tasks"
         tdir.mkdir(exist_ok=True)
         for t in tasks:
