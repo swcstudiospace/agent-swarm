@@ -206,7 +206,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 - `scripts/swarm_run.py` — runner. It also has `--once`, `--max-rounds`, `--task-timeout`, `--max-turns`, `--model`, `--allowed-tools` and `--permission-mode`.
 - `scripts/orch_plan.py` — `PATTERNS`, the custom plan schema, and `--repo` (alias of `--root`). Task IDs default to `T<4 hex of the correlation id>` (6 hex on collision), e.g. `T7f3a-be`; an explicit `--prefix` is optional.
 - `pyproject.toml` — ruff and pytest config only; it has no `[project]` table.
-- `package.json` — `bun test` and `build-agents`, which calls the Python generator.
+- `package.json` — `test` (`bun test tests/ts`) and `build-agents`, which calls the Python generator.
 - `tsconfig.json` — strict, noEmit, `bun-types`.
 - `CLAUDE.md` — older summary. It is stale in places: it omits `.trae/`, `autonomous_run.py` and `--runtime`, and it lists `build_agents.py` as an A01 script, which `agents.json` does not.
 
