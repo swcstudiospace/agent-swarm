@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .errors import SwarmError, ErrorCode
 from .paths import swarm_dir
+from .gates import validate_verdict
 
 
 class TaskState(str, Enum):
@@ -72,7 +73,7 @@ CREATE TABLE IF NOT EXISTS transitions (
 );
 CREATE TABLE IF NOT EXISTS verdicts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, gate TEXT, verdict TEXT,
-  agent_id TEXT, findings TEXT, expires_at REAL, ts REAL
+  agent_id TEXT, findings TEXT, expires_at REAL, ts REAL, envelope_json TEXT, sig TEXT
 );
 CREATE TABLE IF NOT EXISTS artifacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, uri TEXT,
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 """
 
+_VERIFIED = {"ok", "fail", "expired"}
 _JSON_COLS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
 
 
@@ -90,6 +92,22 @@ class TaskStore:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate_verdicts()
+
+    def _migrate_verdicts(self) -> None:
+        """D-14: in-place, idempotent add of the signed-envelope columns to a v1 verdicts table.
+        No backup is taken; legacy rows keep NULL envelope_json and count as missing."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(verdicts)")}
+        for col, ddl in (("envelope_json", "ALTER TABLE verdicts ADD COLUMN envelope_json TEXT"),
+                         ("sig", "ALTER TABLE verdicts ADD COLUMN sig TEXT")):
+            if col in cols:
+                continue
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError as e:  # concurrent opener added it first
+                if "duplicate column" not in str(e):
+                    raise
+        self.conn.commit()
 
     # ---- CRUD -------------------------------------------------------------
     def create(self, *, task_id: str, correlation_id: str, capability: str, title: str = "",
@@ -198,27 +216,31 @@ class TaskStore:
     # ---- gates ------------------------------------------------------------
     def record_verdict(self, task_id: str, envelope: dict) -> None:
         """Store a signed gate.verdict envelope as a row on task_id (the envelope's own task_id)."""
-        from .gates import validate_verdict
         p = validate_verdict(envelope)
         if p["task_id"] != task_id:
             raise SwarmError(ErrorCode.E_CONTRACT, f"verdict names {p['task_id']!r}, recorded on {task_id!r}", task_id=task_id)
         self.get(task_id)
         now = time.time()
-        self.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts)"
-                          " VALUES (?,?,?,?,?,?,?)",
+        self.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts,"
+                          " envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
                           (task_id, p["gate"], p["verdict"], envelope["source"], json.dumps(p["findings"]),
-                           now + p["expires_s"], now))
+                           now + p["expires_s"], now, json.dumps(envelope), envelope["sig"]))
         self.conn.commit()
 
-    def latest_verdicts(self, task_id: str, *, include_stale: bool = False) -> dict[str, dict]:
+    def latest_verdicts(self, task_id: str, *, include_stale: bool = False,
+                        verified_only: bool = False) -> dict[str, dict]:
         """Latest verdict per gate. Verdicts issued before the task's last rework loop are stale
-        (the producer changed the artifact) and are ignored unless include_stale=True."""
+        (the producer changed the artifact) and are ignored unless include_stale=True.
+        verified_only=True drops rows whose signed envelope does not verify or disagrees with the row."""
         since = 0.0 if include_stale else float(self.get(task_id)["notes_json"].get("verdicts_since", 0))
         out: dict[str, dict] = {}
         for r in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id", (task_id, since)):
             d = dict(r)
             d["findings"] = json.loads(d["findings"])
             out[d["gate"]] = d
+        if verified_only:
+            now = time.time()
+            out = {g: d for g, d in out.items() if self._check_row(task_id, g, d, now) in _VERIFIED}
         return out
 
     def required_gates(self, task_id: str) -> list[str]:
@@ -228,15 +250,42 @@ class TaskStore:
         override = (task.get("notes_json") or {}).get("gates")
         return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
 
-    def missing_gates(self, task_id: str) -> list[str]:
+    @staticmethod
+    def _check_row(task_id: str, gate: str, row: dict | None, now: float) -> str:
+        """Verify one verdict row against its signed envelope. Returns ok | fail | expired
+        (signature verified) or absent | unsigned | bad-sig | mismatch (not trustworthy)."""
+        if row is None:
+            return "absent"
+        if not row.get("envelope_json"):
+            return "unsigned"
+        try:
+            p = validate_verdict(json.loads(row["envelope_json"]))
+        except (SwarmError, ValueError, TypeError, KeyError):
+            return "bad-sig"
+        if p["gate"] != gate or p["task_id"] != task_id or p["verdict"] != row["verdict"]:
+            return "mismatch"
+        if p["verdict"] not in ("pass", "waive"):
+            return "fail"
+        try:
+            if not float(p["issued_at"]) + float(p["expires_s"]) > now:
+                return "expired"
+        except (KeyError, TypeError, ValueError):
+            return "mismatch"
+        return "ok"
+
+    def missing_gate_reasons(self, task_id: str) -> dict[str, str]:
+        """Required gates lacking a verified, unexpired pass/waive verdict → reason, in required order."""
         latest = self.latest_verdicts(task_id)
         now = time.time()
-        missing = []
+        out = {}
         for g in self.required_gates(task_id):
-            v = latest.get(g)
-            if not v or v["verdict"] not in ("pass", "waive") or v["expires_at"] < now:
-                missing.append(g)
-        return missing
+            reason = self._check_row(task_id, g, latest.get(g), now)
+            if reason != "ok":
+                out[g] = reason
+        return out
+
+    def missing_gates(self, task_id: str) -> list[str]:
+        return list(self.missing_gate_reasons(task_id))
 
     # ---- artifacts --------------------------------------------------------
     def add_artifact(self, task_id: str, *, kind: str, uri: str, version: str = "1",

@@ -113,7 +113,7 @@ def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
     notes_log = []
     for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
         tid = t["task_id"]
-        latest = store.latest_verdicts(tid)
+        latest = store.latest_verdicts(tid, verified_only=True)
         failing = [g for g in store.required_gates(tid) if latest.get(g, {}).get("verdict") == "fail"]
         if failing:
             before = t["rework_loops"]

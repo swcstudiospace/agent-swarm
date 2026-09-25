@@ -50,7 +50,8 @@ def run(args, ctx) -> dict:
 
     if args.history:
         return {"status": "ok", "task_id": args.history, "history": store.history(args.history),
-                "verdicts": store.latest_verdicts(args.history), "summary": f"history for {args.history}"}
+                "verdicts": store.latest_verdicts(args.history),
+                "missing_gate_reasons": store.missing_gate_reasons(args.history), "summary": f"history for {args.history}"}
 
     if args.transition:
         tid, state = args.transition

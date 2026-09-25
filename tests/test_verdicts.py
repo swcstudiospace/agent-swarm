@@ -171,3 +171,118 @@ def test_ingest_gate_result_no_rows(tmp_path, swarm_dir):
     assert _notes(swarm_dir, targets[0])["feedback"] == [{"gate": "quality", "source": "agent", "findings": fnd}]
     assert "feedback" not in _notes(swarm_dir, targets[1])
     assert _notes(swarm_dir, "X-qa")["result"]["verdicts"] == res["verdicts"]
+
+
+# ---------------------------------------------------------------- CORE-07 / D-14: verified verdict rows
+def _in_review(ts, tid, gates=("review",)):
+    ts.create(task_id=tid, correlation_id="c", capability="code.backend", notes={"gates": list(gates)})
+    for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        ts.transition(tid, s)
+
+
+def _raw_row(ts, tid, gate, verdict, envelope_json=None):
+    import time
+    ts.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts, envelope_json)"
+                    " VALUES (?,?,?,?,?,?,?,?)", (tid, gate, verdict, "A09", "[]", time.time() + 999, time.time(), envelope_json))
+    ts.conn.commit()
+
+
+def test_migration_idempotent_legacy_rows_missing(swarm_dir):
+    from swarm.taskstore import TaskStore
+    swarm_dir.mkdir(parents=True, exist_ok=True)
+    db = swarm_dir / "tasks.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE verdicts (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, gate TEXT, verdict TEXT,"
+                " agent_id TEXT, findings TEXT, expires_at REAL, ts REAL)")
+    con.commit()
+    con.close()
+    ts = TaskStore(db)
+    ts.conn.close()
+    ts = TaskStore(db)
+    cols = [r[1] for r in ts.conn.execute("PRAGMA table_info(verdicts)")]
+    assert "envelope_json" in cols and "sig" in cols
+    assert not (swarm_dir / "tasks.db.pre-v2").exists()  # option-a: no backup
+    _in_review(ts, "L-1")
+    ts.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts)"
+                    " VALUES ('L-1','review','pass','A09','[]',9e12,9e9)")
+    ts.conn.commit()
+    assert ts.missing_gates("L-1") == ["review"]
+    assert ts.missing_gate_reasons("L-1") == {"review": "unsigned"}
+
+
+def test_forged_or_unsigned_verdict_never_approves(swarm_dir, monkeypatch):
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    from swarm.errors import SwarmError
+    ts = TaskStore()
+    # (a) unsigned legacy-style row
+    _in_review(ts, "F-a")
+    _raw_row(ts, "F-a", "review", "pass")
+    # (b) payload.verdict flipped fail→pass after signing, row edited to match
+    _in_review(ts, "F-b")
+    ts.record_verdict("F-b", make_verdict(gate="review", task_id="F-b", agent_id="A09", verdict="fail"))
+    (eid, ej) = ts.conn.execute("SELECT id, envelope_json FROM verdicts WHERE task_id='F-b'").fetchone()
+    env = json.loads(ej)
+    env["payload"]["verdict"] = "pass"
+    ts.conn.execute("UPDATE verdicts SET verdict='pass', envelope_json=? WHERE id=?", (json.dumps(env), eid))
+    ts.conn.commit()
+    # (c) signed with k1, verified with k2
+    _in_review(ts, "F-c")
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k1")
+    ts.record_verdict("F-c", make_verdict(gate="review", task_id="F-c", agent_id="A09"))
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "k2")
+    for tid in ("F-a", "F-b", "F-c"):
+        with pytest.raises(SwarmError) as e:
+            ts.transition(tid, "APPROVED")
+        assert e.value.code.value == "E-POLICY"
+    reasons = []
+    for tid in ("F-a", "F-b", "F-c"):
+        r = run_script("orch_status.py", "--history", tid, "--json",
+                       env={"SWARM_DIR": str(swarm_dir), "SWARM_SIGNING_KEY": "k2"})
+        assert r.returncode == 0, r.stdout + r.stderr
+        reasons.append(json.loads(r.stdout)["missing_gate_reasons"]["review"])
+    assert reasons == ["unsigned", "bad-sig", "bad-sig"]
+
+
+def test_row_verdict_mismatch(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    ts = TaskStore()
+    _in_review(ts, "M-1")
+    ts.record_verdict("M-1", make_verdict(gate="review", task_id="M-1", agent_id="A09", verdict="fail"))
+    ts.conn.execute("UPDATE verdicts SET verdict='pass' WHERE task_id='M-1'")
+    ts.conn.commit()
+    assert ts.missing_gate_reasons("M-1") == {"review": "mismatch"}
+
+
+def test_expiry_boundary(swarm_dir, monkeypatch):
+    import time
+    from swarm.taskstore import TaskStore
+    from swarm.gates import make_verdict
+    ts = TaskStore()
+    _in_review(ts, "E-1")
+    env = make_verdict(gate="review", task_id="E-1", agent_id="A09", expires_s=10)
+    ts.record_verdict("E-1", env)
+    assert ts.missing_gate_reasons("E-1") == {}
+    boundary = env["payload"]["issued_at"] + 10
+    monkeypatch.setattr(time, "time", lambda: boundary)
+    assert ts.missing_gate_reasons("E-1") == {"review": "expired"}
+
+
+def test_absent_and_no_required_gates(swarm_dir):
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    _in_review(ts, "N-1")
+    assert ts.missing_gate_reasons("N-1") == {"review": "absent"}
+    _in_review(ts, "N-2", gates=())
+    assert ts.missing_gate_reasons("N-2") == {}
+
+
+def test_forged_fail_does_not_force_rework(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.results import reconcile
+    ts = TaskStore()
+    _in_review(ts, "R-1")
+    _raw_row(ts, "R-1", "review", "fail")
+    reconcile(ts, "c", lambda *a, **k: None)
+    assert ts.get("R-1")["state"] == "IN_REVIEW"
