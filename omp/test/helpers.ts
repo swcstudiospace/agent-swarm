@@ -3,7 +3,7 @@ import { afterEach, beforeEach } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResult } from "../src/omp-api.ts";
+import type { ExtensionAPI, ExtensionContext, ExtensionFactory, SessionEntry, ToolDefinition, ToolResult } from "../src/omp-api.ts";
 
 /** agent-swarm repo root, from this file's location (omp/test → ../..), so tests run from any cwd. */
 export const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -73,42 +73,69 @@ export interface FakePi {
   api: ExtensionAPI;
   tools: AnyTool[];
   handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>;
-  /** Names of runtime action methods that were called (each call also throws). */
+  /** Names of runtime action methods that were called during load (each call also throws). */
   actionCalls: string[];
+  /** Names of runtime actions called after load() installed them (e.g. getActiveTools from a handler). */
+  runtimeCalls: string[];
   tool(name: string): AnyTool;
+  /** The single handler registered for `event`. */
+  handler(event: string): (event: unknown, ctx: ExtensionContext) => unknown;
+  /** Run the factory (load time: actions throw), then install the runtime getActiveTools, if configured. */
+  load(factory: ExtensionFactory): void;
+}
+
+export interface FakePiOptions {
+  /** The runtime getActiveTools result, or a function called per invocation (e.g. one that throws). */
+  activeTools?: string[] | (() => string[]);
 }
 
 /** Records registerTool/on; runtime actions record their name and throw like omp's load-time stubs. */
-export function fakePi(): FakePi {
+export function fakePi(opts: FakePiOptions = {}): FakePi {
   const tools: AnyTool[] = [];
   const handlers: FakePi["handlers"] = new Map();
   const actionCalls: string[] = [];
+  const runtimeCalls: string[] = [];
   const notAtLoad = (name: string) => () => {
     actionCalls.push(name);
     throw new Error(`runtime action ${name} called during load`);
   };
-  const api = {
+  const api: ExtensionAPI & Record<string, unknown> = {
     // heterogeneous tools stored for loosely-typed test calls
     registerTool: <P, D>(t: ToolDefinition<P, D>) => void tools.push(t as unknown as AnyTool),
-    on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
+    on: ((event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
-    },
+    }) as ExtensionAPI["on"],
     exec: notAtLoad("exec"),
     getActiveTools: notAtLoad("getActiveTools"),
     getAllTools: notAtLoad("getAllTools"),
     setActiveTools: notAtLoad("setActiveTools"),
     sendMessage: notAtLoad("sendMessage"),
     appendEntry: notAtLoad("appendEntry"),
-  } satisfies ExtensionAPI & Record<string, unknown>;
+  };
   return {
     api,
     tools,
     handlers,
     actionCalls,
+    runtimeCalls,
     tool(name) {
       const found = tools.find((t) => t.name === name);
       if (!found) throw new Error(`tool ${name} not registered`);
       return found;
+    },
+    handler(event) {
+      const found = handlers.get(event) ?? [];
+      if (found.length !== 1) throw new Error(`expected one ${event} handler, got ${found.length}`);
+      return found[0];
+    },
+    load(factory) {
+      factory(api);
+      const active = opts.activeTools;
+      if (active === undefined) return;
+      api.getActiveTools = () => {
+        runtimeCalls.push("getActiveTools");
+        return typeof active === "function" ? active() : [...active];
+      };
     },
   };
 }
@@ -117,9 +144,12 @@ export function fakeCtx(cwd: string, entries: SessionEntry[] = []): ExtensionCon
   return { cwd, sessionManager: { getEntries: () => entries, getBranch: () => entries } };
 }
 
-/** A ctx whose session_init names `agent` (e.g. the gate agent a swarm_gate call must come from). */
-export function agentCtx(cwd: string, agent: string, entries: SessionEntry[] = []): ExtensionContext {
-  return fakeCtx(cwd, [{ type: "session_init", agent, restrictToolNames: true, tools: [] }, ...entries]);
+/**
+ * A ctx whose session_init names `agent` (e.g. the gate agent a swarm_gate call must come from). `restricted`
+ * is session_init.restrictToolNames: true (the default) is a plan-mode child, which HOOK-04 never caps.
+ */
+export function agentCtx(cwd: string, agent: string, entries: SessionEntry[] = [], restricted = true): ExtensionContext {
+  return fakeCtx(cwd, [{ type: "session_init", agent, restrictToolNames: restricted, tools: [] }, ...entries]);
 }
 
 /** Call a registered tool's execute with omp's argument order (signal 3rd). */

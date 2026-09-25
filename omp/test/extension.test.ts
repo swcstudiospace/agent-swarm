@@ -1,6 +1,7 @@
 /**
  * SC5 / TOOL-01 / TOOL-06: the extension entry does no I/O at load, registers exactly the five hidden essential
- * swarm tools, and routes every tool through the single injected bridge.
+ * swarm tools plus the session_shutdown and tool_call handlers, routes every tool through the single injected
+ * bridge, and its tool_call guard does no I/O when it runs.
  *
  * mock.module("node:fs") is process-wide and mock.restore cannot undo it, so this file runs in its own `bun test`
  * process (omp/package.json scripts.test runs it first, then the rest with it ignored).
@@ -69,8 +70,8 @@ test("registers five with no io: evaluation and factory do no fs, spawn or spawn
   expect(fsCalls).toBe(0); // factory call
   expect(spawn).toHaveBeenCalledTimes(0);
   expect(spawnSync).toHaveBeenCalledTimes(0);
-
   // registration order is not part of the contract
+  expect([...pi.handlers.keys()].sort()).toEqual(["session_shutdown", "tool_call"]);
   expect(pi.tools.map((t) => t.name).sort()).toEqual(NAMES);
   for (const tool of pi.tools) {
     expect(tool.hidden).toBe(true);
@@ -84,7 +85,39 @@ test("no action at load: the factory never calls a runtime pi action", async () 
   const pi = fakePi();
   factory(pi.api);
   expect(pi.actionCalls).toEqual([]);
-  expect([...pi.handlers.keys()]).toEqual(["session_shutdown"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(["session_shutdown", "tool_call"]);
+});
+
+test("guard with no io: the tool_call handler decides without fs, spawn, spawnSync or the bridge", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const bridged: BridgeRequest[] = [];
+  const pi = fakePi({ activeTools: ["read", "yield"] });
+  pi.load(
+    createSwarmExtension({
+      bridge: async (req) => {
+        bridged.push(req);
+        return { exitCode: 0, json: {}, swarmDir: "" };
+      },
+    }),
+  );
+  const guard = pi.handler("tool_call");
+  const a01 = agentCtx("/nonexistent-guard-cwd", "a01-orchestrator", [], false);
+  fsCalls = 0;
+  spawn.mockClear();
+  spawnSync.mockClear();
+
+  const blocked = guard({ toolName: "bash", toolCallId: "tc-1", input: { command: "ls" } }, a01) as { reason?: string };
+  expect(blocked.reason?.startsWith("BLOCKED needs: depth")).toBe(true);
+  const depthYield = { toolName: "yield", toolCallId: "tc-2", input: { data: { state: "BLOCKED", needs: "depth" } } };
+  expect(guard(depthYield, a01)).toBeUndefined();
+  expect(guard({ toolName: "bash", toolCallId: "tc-3", input: { command: "ls" } }, fakeCtx("/nonexistent-guard-cwd"))).toBeUndefined();
+
+  expect(fsCalls).toBe(0);
+  expect(spawn).toHaveBeenCalledTimes(0);
+  expect(spawnSync).toHaveBeenCalledTimes(0);
+  expect(bridged).toEqual([]);
+  expect(pi.actionCalls).toEqual([]);
+  expect(pi.runtimeCalls).toEqual(["getActiveTools", "getActiveTools"]);
 });
 
 test("factory twice: two sessions each get five unique tools and share no mutable object", async () => {

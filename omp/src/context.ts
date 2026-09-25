@@ -1,6 +1,7 @@
 /**
- * Pure session-log readers (D-03, research FA-2): omp's ExtensionContext has no agent or plan-mode field,
+ * Session-log readers (D-03, research FA-2): omp's ExtensionContext has no agent or plan-mode field,
  * so identity and plan mode come from ctx.sessionManager entries. Reused by the Phase 4 guard (HOOK-03/04).
+ * callingAgent is the single identity resolver (Phase 4 D-01); it alone also reads env SWARM_AGENT.
  */
 import type { ExtensionContext } from "./omp-api.ts";
 
@@ -10,6 +11,14 @@ type SessionCtx = Pick<ExtensionContext, "sessionManager">;
 export function sessionAgent(ctx: SessionCtx): { agent: string | undefined; restricted: boolean } {
   const init = ctx.sessionManager.getEntries().find((e) => e.type === "session_init");
   return { agent: typeof init?.agent === "string" ? init.agent : undefined, restricted: init?.restrictToolNames === true };
+}
+
+/**
+ * The calling agent: the session's session_init agent, else env SWARM_AGENT (headless `-p` sessions).
+ * process.env is shared by in-process sessions, so the env is consulted only when no session_init exists (D-01).
+ */
+export function callingAgent(ctx: SessionCtx): string | undefined {
+  return sessionAgent(ctx).agent ?? (process.env.SWARM_AGENT?.trim() || undefined);
 }
 
 /**

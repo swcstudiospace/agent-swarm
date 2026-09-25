@@ -51,9 +51,25 @@ export interface ToolDefinition<P = Record<string, unknown>, D = unknown> {
   ): Promise<ToolResult<D>>;
 }
 
+/** omp `tool_call` event: fired before every tool runs (model loop, eval bridge, xd:// dispatch). Names are canonical (`task`, never `_task`). */
+export interface ToolCallEvent {
+  toolName: string;
+  toolCallId: string;
+  input: unknown;
+}
+
+/** A `tool_call` handler result: `{block: true, reason}` becomes the error tool result the model sees, verbatim. */
+export interface ToolCallResult {
+  block?: boolean;
+  reason?: string;
+}
+
 export interface ExtensionAPI {
   registerTool<P, D>(tool: ToolDefinition<P, D>): void;
+  on(event: "tool_call", handler: (event: ToolCallEvent, ctx: ExtensionContext) => ToolCallResult | undefined): void;
   on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown): void;
+  /** Canonical names of the session's active tools. A load-time stub that throws: call it only inside handlers. */
+  getActiveTools(): string[];
 }
 
 export type ExtensionFactory = (pi: ExtensionAPI) => void;

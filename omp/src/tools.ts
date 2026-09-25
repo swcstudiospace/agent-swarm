@@ -7,7 +7,7 @@
  */
 import { gitToplevel } from "../../scripts/ts/script_base.ts";
 import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInputFile } from "./bridge.ts";
-import { inPlanMode, sessionAgent } from "./context.ts";
+import { callingAgent, inPlanMode } from "./context.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 
 /**
@@ -35,10 +35,6 @@ type Gate = keyof typeof GATE_SCRIPTS;
 /** Gate → the only agent (omp slug, agents.json) allowed to run it (D-12 separation of gate duties). */
 export const GATE_AGENTS = { quality: "a08-qa", review: "a09-reviewer", security: "a10-security", release: "a12-release" } as const satisfies Record<Gate, string>;
 
-/** The calling agent: the session's session_init agent, else env SWARM_AGENT (headless `-p` sessions). */
-function callingAgent(ctx: ExtensionContext): string | undefined {
-  return sessionAgent(ctx).agent ?? (process.env.SWARM_AGENT?.trim() || undefined);
-}
 /** Finding severities (copied from swarm/gates.py:10 SEVERITIES); BLOCKING_SEVERITY = "major". */
 const SEVERITIES = ["info", "minor", "major", "critical", "blocker"] as const;
 /** qa_gate's own --timeout default (1800 s) plus a margin, so the bridge never kills a test run first. */
