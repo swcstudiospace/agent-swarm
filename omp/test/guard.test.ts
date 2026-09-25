@@ -405,6 +405,15 @@ describe("HOOK-02", () => {
     ['eval "git push -f"', "git-force-push"],
     ["eval git push -f", "git-force-push"],
     ["stdbuf -oL exec git reset --hard", "git-reset-hard"],
+    // WR-05: +refspec force pushes, --delete --force, value-taking git global options
+    ["git push origin +feat/x", "git-force-push"],
+    ["git push origin feat/x +HEAD:refs/heads/feat", "git-force-push"],
+    ["git branch --delete --force feat", "git-branch-force-delete"],
+    ["git branch -d -f feat", "git-branch-force-delete"],
+    ["git branch -df feat", "git-branch-force-delete"],
+    ["git --work-tree /x push --force", "git-force-push"],
+    ["git --git-dir /x/.git --namespace n reset --hard", "git-reset-hard"],
+    ["git -c core.x=1 --no-pager push origin +feat", "git-force-push"],
   ])("normalization: %s → %s", (command, id) => {
     expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
   });
@@ -452,6 +461,8 @@ describe("HOOK-02", () => {
     "kubectl apply -n staging -f k.yaml", "git checkout -b feat", "git restore src/a.ts", "git branch -d merged",
     "git clean -n", "chmod 755 x", "npm test", "docker build .", "psql -c 'SELECT 1'", "terraform plan", "helm template x",
     "gh release view", "echo main", "aws s3 ls",
+    // WR-05 negatives: plain refspecs, --delete without force, a value-taking global option before a safe subcommand
+    "git push origin feat/x:feat/x", "git branch --delete merged", "git --work-tree /x status", "git -c core.x=1 push origin feat",
   ])("negative inside swarm: %s → undefined", (command) => {
     expect(guardToolCall(bash(command), inside())).toBeUndefined();
   });

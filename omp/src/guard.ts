@@ -355,11 +355,14 @@ function parseSegment(text: string): Segment {
   return { text, words };
 }
 
-/** The git subcommand and its arguments, skipping global options (`-C dir`, `-c k=v`, `--no-pager`). */
+/** git global options that take the next word as their value when written without `=`. */
+const GIT_VALUE_OPTION = /^(?:-C|-c|--work-tree|--git-dir|--namespace|--exec-path|--super-prefix|--config-env|--list-cmds|--attr-source)$/;
+
+/** The git subcommand and its arguments, skipping global options (`-C dir`, `-c k=v`, `--work-tree x`, `--no-pager`). */
 function git(words: string[]): { sub: string | undefined; args: string[] } {
   if (words[0] !== "git") return { sub: undefined, args: [] };
   let i = 1;
-  while (i < words.length && words[i].startsWith("-")) i += words[i] === "-C" || words[i] === "-c" ? 2 : 1;
+  while (i < words.length && words[i].startsWith("-")) i += GIT_VALUE_OPTION.test(words[i]) ? 2 : 1;
   return { sub: words[i], args: words.slice(i + 1) };
 }
 const gitIs = (seg: Segment, sub: string) => git(seg.words).sub === sub;
@@ -490,8 +493,12 @@ export const RULES: readonly Rule[] = [
   {
     id: "git-force-push",
     capability: "destructive",
-    pattern: (seg) => gitIs(seg, "push") && git(seg.words).args.some((a) => a.startsWith("--force") || shortFlag(a, /f/)),
-    samples: ["git push --force", "git push -f origin feat/x", "git push --force-with-lease"],
+    pattern: (seg) => {
+      const { sub, args } = git(seg.words);
+      // `+refspec` forces that ref exactly like --force (the first operand is the remote)
+      return sub === "push" && (args.some((a) => a.startsWith("--force") || shortFlag(a, /f/)) || operands(args).slice(1).some((r) => r.startsWith("+")));
+    },
+    samples: ["git push --force", "git push -f origin feat/x", "git push --force-with-lease", "git push origin +feat/x", "git --work-tree /x push --force"],
   },
   {
     id: "git-reset-hard",
@@ -508,8 +515,13 @@ export const RULES: readonly Rule[] = [
   {
     id: "git-branch-force-delete",
     capability: "destructive",
-    pattern: (seg) => gitIs(seg, "branch") && git(seg.words).args.some((a) => shortFlag(a, /D/)),
-    samples: ["git branch -D feature"],
+    pattern: (seg) => {
+      const { sub, args } = git(seg.words);
+      if (sub !== "branch") return false;
+      if (args.some((a) => shortFlag(a, /D/))) return true;
+      return args.some((a) => a === "--delete" || shortFlag(a, /d/)) && args.some((a) => a === "--force" || shortFlag(a, /f/));
+    },
+    samples: ["git branch -D feature", "git branch --delete --force feature", "git branch -d -f feature", "git branch -df feature"],
   },
   {
     id: "git-discard-repo",
