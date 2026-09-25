@@ -1,6 +1,10 @@
-"""omp agent + skill generation contract (AGENT-01..06, ORCH-01)."""
+"""omp agent + skill generation contract (AGENT-01..07, ORCH-01)."""
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -211,3 +215,42 @@ def test_omp_no_host_paths():
     for p in (ROOT / "omp").rglob("*"):
         if p.is_file():
             assert "/root/" not in p.read_text(encoding="utf-8"), p
+
+
+_TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", "omp")
+
+
+@pytest.fixture()
+def omp_tree(tmp_path):
+    """Copy of the generator inputs/outputs; build_agents.py resolves ROOT from its own path."""
+    ignore = shutil.ignore_patterns("__pycache__")
+    for name in _TREE:
+        src = ROOT / name
+        if src.is_dir():
+            shutil.copytree(src, tmp_path / name, ignore=ignore)
+        else:
+            shutil.copy2(src, tmp_path / name)
+    return tmp_path
+
+
+def _check(tree):
+    env = {k: v for k, v in os.environ.items() if k != "SWARM_AGENTS_FILE"}
+    cmd = [sys.executable, str(tree / "scripts" / "build_agents.py"), "--check"]
+    return subprocess.run(cmd, cwd=tree, capture_output=True, text=True, env=env)
+
+
+def test_omp_check_clean_on_copy(omp_tree):
+    r = _check(omp_tree)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.startswith("up-to-date")
+
+
+@pytest.mark.parametrize("rel", ["omp/agents/a05-backend.md", "omp/skills/a05-backend/SKILL.md"], ids=["agent", "skill"])
+def test_omp_check_detects_drift(omp_tree, rel):
+    target = omp_tree / rel
+    edited = target.read_text(encoding="utf-8") + "\nhand edit: tools: task\n"
+    target.write_text(edited, encoding="utf-8")
+    r = _check(omp_tree)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert r.stdout.startswith("stale:") and rel in r.stdout
+    assert target.read_text(encoding="utf-8") == edited
