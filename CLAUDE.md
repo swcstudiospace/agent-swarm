@@ -2,7 +2,7 @@
 
 This repo is both the **design spec** (`01-*.md` … `07-*.md`, `03-agents/`) and a **runnable
 Claude Code subagent swarm** built from it. Fifteen agents (A01–A15) cover the SDLC; each one is
-a Claude Code and Grok Build subagent whose Prompt-Uplift XML prompt lives in `prompts/` and whose tools are Python plus TypeScript twins (`scripts/ts/`). Skills: `skills/<slug>/SKILL.md`. Orchestration: `skills/orchestrate/SKILL.md` + `hooks/user_prompt_submit.py`.
+a Claude Code and Grok Build subagent whose Prompt-Uplift XML prompt lives in `prompts/` and whose tools are Python plus TypeScript twins (`scripts/ts/`). Skills: `skills/<slug>/SKILL.md`. Orchestration: `skills/orchestrate/SKILL.md` + `hooks/user_prompt_submit.py` (Claude Code), or `/swarm <brief>` + the `before_agent_start` context hook (omp).
 
 ## Layout
 
@@ -13,14 +13,14 @@ a Claude Code and Grok Build subagent whose Prompt-Uplift XML prompt lives in `p
 | `agents.json` | Manifest: id, code, slug, capabilities, consumes/produces, tools, model, scripts |
 | `.claude/agents/*.md` | **Generated** Claude Code subagents (`python3 scripts/build_agents.py`) |
 | `.grok/agents/*.md` | **Generated** Grok Build subagents |
-| `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). `tools:` adds the hidden swarm tools per agent (`SWARM_TOOLS`). Not a sandbox: tool lists are unenforced until Phase 4 |
+| `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). `tools:` adds the hidden swarm tools per agent (`SWARM_TOOLS`). Not a sandbox: the `tool_call` guard (`omp/src/guard.ts`) enforces the autonomy ceiling, swarm-state and depth rules in swarm sessions; read-only is unenforced |
 | `omp/skills/<slug>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`) |
-| `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: five typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`) |
+| `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: five typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`), the `tool_call` guard (`guard.ts`), the `before_agent_start` context hook (`hooks.ts`) and the `/swarm` command (`commands.ts`) |
 | `omp/test/` | **Hand-written** `bun:test` suite for the package (`cd omp && bun run test`) |
 | `.omp/config.yml` | Committed omp project wiring: `extensions:` → `- omp` (the only file in `.omp/`) |
 | `skills/<slug>/SKILL.md` | Per-agent + `orchestrate` skills (copy with `--install-workspace`) |
 | `scripts/ts/` | TypeScript twins of every `scripts/*.py` tool |
-| `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier |
+| `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier: injects swarm context only on SDLC-shaped prompts (`tests/fixtures/classifier_prompts.json` pins it together with the omp hook) |
 | `swarm/` | Runtime toolkit: envelope (signed `swarm.v1`), Task Store (SQLite state machine), gates, manifest, run log |
 | `scripts/` | Per-agent tools (see table below) + orchestration (`orch_plan.py`, `orch_status.py`, `swarm_run.py`) |
 | `.swarm/` | Runtime state (task DB, plans, verdicts, assignments, results, `events.jsonl`). Resolved per call: `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. Created with its own `.gitignore` of `*`. |
@@ -90,8 +90,14 @@ The five tools are `hidden` + `essential`; an agent only gets the ones its gener
 | `swarm_transition` | A01 | `orch_status.py --transition` |
 | `swarm_gate` | A08, A09, A10, A12 | `qa_gate` / `rev_gate` / `sec_gate` / `rel_plan` (findings in, signed verdict out) |
 
-Mutating tools refuse with E-POLICY in omp plan mode. Tests: `cd omp && bun run test` (package suite;
+Mutating tools and `/swarm` refuse with E-POLICY in omp plan mode. Tests: `cd omp && bun run test` (package suite;
 `extension.test.ts` runs in its own process) and `bun test tests/ts` (root TS suite).
+
+Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `AGENTS.md` **Hooks**):
+
+- `before_agent_start`: SDLC-shaped prompts in a top-level session get a `## AgentSwarm` part pointing at `/swarm` and `task` with `a01-orchestrator`; subagents, `SWARM_CHILD=1`/`SWARM_AGENT` sessions and non-SDLC prompts get nothing.
+- `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)`; `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval` and writes into `.swarm/`, `.omp/`, `~/.omp` block.
+- `/swarm <brief> [--pattern=feature|hotfix|dependency] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and awaits idle so `-p` runs finish. Usage, plan mode and `E-CONTRACT` conflicts never dispatch.
 
 ## Rules the runtime enforces (mirrors the spec)
 
