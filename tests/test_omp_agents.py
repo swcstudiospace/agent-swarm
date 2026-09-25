@@ -26,9 +26,17 @@ def _load(name):
 skills_mod = _load("_write_skills")
 
 
+def _fm_lines(text):
+    """Frontmatter lines: between the opening `---` line and the next line that is exactly `---`."""
+    lines = text.split("\n")
+    assert lines[0] == "---"
+    return lines[1:lines.index("---", 1)]
+
+
 def _fm(text):
+    """Decode frontmatter; double-quoted values are JSON string literals (valid YAML double-quoted scalars)."""
     fm = {}
-    for line in text.split("---", 2)[1].strip().splitlines():
+    for line in _fm_lines(text):
         k, v = line.split(": ", 1)
         fm[k] = json.loads(v) if v.startswith('"') else v
     return fm
@@ -70,7 +78,7 @@ def _omp(a):
 
 
 def _keys(text):
-    return [line.split(": ", 1)[0] for line in text.split("---", 2)[1].strip().splitlines()]
+    return [line.split(": ", 1)[0] for line in _fm_lines(text)]
 
 
 def test_omp_tools_exact():
@@ -305,3 +313,18 @@ def test_omp_check_detects_orphan(omp_tree, rel):
     subprocess.run([sys.executable, str(omp_tree / "scripts" / "build_agents.py")], cwd=omp_tree, check=True, env=env, capture_output=True)
     assert not orphan.exists()
     assert _check(omp_tree).returncode == 0
+
+
+TRICKY = 'path C:\\new dir "quoted": a\n---\nb — end'
+
+
+@pytest.mark.parametrize("render", ["agent", "skill"])
+def test_omp_description_round_trips(render):
+    agents = _agents()
+    a = dict(agents[4], description=TRICKY)
+    text = builder.render_omp(a, agents) if render == "agent" else skills_mod.omp_skill(a)
+    desc = _fm(text)["description"]
+    assert TRICKY in desc
+    assert desc.startswith(f"{a['id']} {a['code']} ")
+    yaml = pytest.importorskip("yaml")
+    assert yaml.safe_load("\n".join(_fm_lines(text)))["description"] == desc
