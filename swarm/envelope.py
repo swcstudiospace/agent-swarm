@@ -4,7 +4,8 @@ Signing: ed25519 via `cryptography` when SWARM_ED25519_KEY (hex seed) is set;
 otherwise HMAC-SHA256 with SWARM_SIGNING_KEY (default dev key). Signatures are
 REQUIRED for task.assign, gate verdicts and promote/rollback commands.
 
-Every signing with the dev-insecure-key fallback emits a `security.dev_key` event.
+Every signing with the dev-insecure-key fallback emits a `security.dev_key` event, except a gate-script
+preview inside a key-less agent session (SWARM_AGENT_SESSION=1), which never records (WR-15).
 Verification accepts the dev key only when neither SWARM_ED25519_KEY nor
 SWARM_REQUIRE_KEY=1 is set; otherwise a dev-key `hmac:` signature never verifies.
 SWARM_REQUIRE_KEY=1 makes APPROVED fail closed (E-POLICY) unless SWARM_ED25519_KEY
@@ -141,15 +142,16 @@ def _warn_dev_key(env: dict, root: str | Path | None) -> None:
         pass
 
 
-def sign_envelope(env: dict, *, root: str | Path | None = None) -> dict:
-    """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10)."""
+def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = True) -> dict:
+    """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10).
+    audit=False skips that event for a key-less agent-session preview that can never record (WR-15)."""
     key = _ed25519_key()
     if key is not None:
         sig = key.sign(_canonical(env))
         env["sig"] = "ed25519:" + base64.b64encode(sig).decode()
     else:
         secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
-        if not os.environ.get("SWARM_SIGNING_KEY"):
+        if audit and not os.environ.get("SWARM_SIGNING_KEY"):
             _warn_dev_key(env, root)
         mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
         env["sig"] = "hmac:" + base64.b64encode(mac).decode()

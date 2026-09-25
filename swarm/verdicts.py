@@ -111,12 +111,15 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     if simulate:
         extra = {**(extra or {}), "dry_run": True}
     task = ctx.task_id or ("T-dry" if simulate else "T-unassigned")
+    session = os.environ.get("SWARM_AGENT_SESSION") == "1"
+    # WR-15: a key-less agent-session preview never records, so it must not raise the security.dev_key
+    # misconfiguration signal; gate.verdict.unrecorded below marks it instead
     env = make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
-                       correlation_id=corr, extra=extra, root=ctx.root)
+                       correlation_id=corr, extra=extra, root=ctx.root, audit=not session)
     out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
-    if os.environ.get("SWARM_AGENT_SESSION") == "1":
+    if session:
         ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,
                                              "reason": "agent session: the runner records this gate after the session"})
         return env, {}

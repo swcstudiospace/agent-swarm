@@ -250,6 +250,23 @@ def test_agent_session_gate_script_records_nothing(swarm_dir):
     assert any("agent session" in e["payload"]["reason"] for e in _events(swarm_dir, "gate.verdict.unrecorded"))
 
 
+def test_agent_session_preview_emits_no_dev_key_event(swarm_dir):
+    """WR-15: an agent session's key-less gate preview must not raise the security.dev_key misconfiguration signal;
+    a gate script signing with the dev key outside a session still does."""
+    from swarm.taskstore import TaskStore
+    env = _clean_env(SWARM_DIR=str(swarm_dir))
+    _plan(env)
+    _lease(TaskStore(), "X-qa", dry_run=True)
+    gate = [sys.executable, str(ROOT / "scripts" / "qa_gate.py"), "--dry-run", "--task-id", "X-qa", "--json"]
+    r = subprocess.run(gate, capture_output=True, text=True, env={**env, "SWARM_AGENT_SESSION": "1"}, cwd=ROOT)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _events(swarm_dir, "gate.verdict.unrecorded")
+    assert _events(swarm_dir, "security.dev_key") == []
+    r = subprocess.run(gate, capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert {e["payload"]["source"] for e in _events(swarm_dir, "security.dev_key")} == {"A08@dry"}
+
+
 # ---------------------------------------------------------------- WR-08: a gate task cannot finish without its script
 _GATE_RESULT = {"gate": "quality", "state": "IN_REVIEW"}
 

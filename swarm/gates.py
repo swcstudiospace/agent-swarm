@@ -30,9 +30,9 @@ def derive_verdict(findings: list[dict]) -> str:
 def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict] | None = None,
                  verdict: str | None = None, runs: dict | None = None, expires_s: int = 86400,
                  correlation_id: str | None = None, extra: dict | None = None,
-                 root: str | Path | None = None) -> dict:
+                 root: str | Path | None = None, audit: bool = True) -> dict:
     """Return a signed envelope carrying a gate verdict. Waive requires explicit verdict.
-    `root` routes the dev-key audit event to the caller's state dir."""
+    `root` routes the dev-key audit event to the caller's state dir; audit=False skips it (agent-session preview)."""
     if gate not in GATES:
         raise SwarmError(ErrorCode.E_CONTRACT, f"unknown gate {gate}")
     findings = findings or []
@@ -48,7 +48,7 @@ def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict]
         raise SwarmError(ErrorCode.E_POLICY, config_error, task_id=task_id)
     env = build_envelope(source=agent_id, target="A01", msg_type="gate.verdict", payload=payload,
                          correlation_id=correlation_id, priority="P1")
-    return sign_envelope(env, root=root)
+    return sign_envelope(env, root=root, audit=audit)
 
 
 def validate_verdict(env: dict) -> dict:
