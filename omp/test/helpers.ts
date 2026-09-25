@@ -180,10 +180,11 @@ export function fakeCtx(cwd: string, entries: SessionEntry[] = []): ExtensionCon
 export type CallLog = Array<{ call: string } & Record<string, unknown>>;
 
 /**
- * A fake turn driven by timers, started by the fake sendUserMessage: `isIdle` reads false from `startMs` for
- * `durationMs` (logged as turn-start / turn-end), and `entry` is appended to `entries` at `entryMs`. Rows with no
- * `startMs` never flip `isIdle`; rows with no `entry` never append. Real timers on purpose: the handler's start
- * poll is an async loop and bun 1.4 has no advanceTimersByTimeAsync, so fake timers cannot drive it; rows stay ≤150 ms.
+ * A fake turn driven by timers, started by the fake sendUserMessage: `isIdle` reads false from `startMs` until the
+ * turn ends `durationMs` later (logged as turn-start / turn-end), like omp's in-flight count and independent of the
+ * fake `waitForIdle`; `entry` is appended to `entries` at `entryMs`. Rows with no `startMs` never flip `isIdle`;
+ * rows with no `entry` never append. Real timers on purpose: the handler's polls are async loops and bun 1.4 has
+ * no advanceTimersByTimeAsync, so fake timers cannot drive them; rows stay ≤150 ms.
  */
 export interface ScriptedTurn {
   startMs?: number;
@@ -225,24 +226,30 @@ export function fakeTurn(script: ScriptedTurn, entries: SessionEntry[], log: Cal
 }
 
 /**
+ * The default fake turn, once per dispatch: the handler polls twice per dispatch — the first read (not idle) is the
+ * synchronous start, the second (idle) the end — so the toggle serves a ctx reused across several handler calls.
+ */
+function syncTurn(): () => boolean {
+  let polls = 0;
+  return () => polls++ % 2 === 1;
+}
+
+/**
  * A command ctx whose notify / waitForIdle push to `log` (shared with the recording bridge and sendUserMessage).
- * Without `isIdle` the ctx models a turn that started synchronously and is over by the time waitForIdle is called
- * (isIdle false, waitForIdle resolves at once); with a scripted `isIdle`, waitForIdle polls it until the turn ends.
+ * `waitForIdle` always resolves at once, like omp's during a prompt's pre-loop window: it is not a turn signal.
+ * `isIdle` is the only turn signal (omp holds it false for the whole prompt); the default is `syncTurn`.
  */
 export function commandCtx(
   cwd: string,
   entries: SessionEntry[] = [],
-  { hasUI = true, log = [] as CallLog, isIdle }: { hasUI?: boolean; log?: CallLog; isIdle?: () => boolean } = {},
+  { hasUI = true, log = [] as CallLog, isIdle = syncTurn() }: { hasUI?: boolean; log?: CallLog; isIdle?: () => boolean } = {},
 ): CommandContext {
   return {
     ...fakeCtx(cwd, entries),
     hasUI,
     ui: { notify: (message, level) => void log.push({ call: "notify", message, level }) },
-    isIdle: isIdle ?? (() => false),
-    async waitForIdle() {
-      log.push({ call: "waitForIdle" });
-      if (isIdle) while (!isIdle()) await Bun.sleep(5);
-    },
+    isIdle,
+    waitForIdle: async () => void log.push({ call: "waitForIdle" }),
   };
 }
 

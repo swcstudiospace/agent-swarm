@@ -118,20 +118,21 @@ function turnSession(script: ScriptedTurn, opts?: Parameters<typeof swarmCommand
   return { log, turn, swarm, ctx };
 }
 
-test("async start: the handler resolves only after the turn that sendUserMessage started asynchronously has ended", async () => {
+test("async start: waitForIdle resolves at once while the turn is in flight, yet the handler holds until isIdle flips true", async () => {
   const { log, turn, swarm, ctx } = turnSession({ startMs: 30, durationMs: 50 });
   const t0 = Date.now();
   let settled = false;
   const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
 
-  await Bun.sleep(60); // the fake turn is streaming (30 ms → 80 ms)
+  await Bun.sleep(60); // the fake turn is in flight (30 ms → 80 ms)
   expect(turn.ended()).toBe(false);
   expect(settled).toBe(false);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start"]); // waitForIdle not yet called
 
   await run;
   expect(Date.now() - t0).toBeGreaterThanOrEqual(80);
   expect(turn.ended()).toBe(true);
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "waitForIdle", "turn-end", "notify"]);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "turn-end", "waitForIdle", "notify"]);
   expect(log.at(-1)?.message).toContain(`plan ${CORR} dispatched`);
 });
 
@@ -163,22 +164,35 @@ test("never starts: after the start cap the handler reports the failure at level
   expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);
 });
 
-test("sync start: isIdle already false on the first poll goes straight to waitForIdle", async () => {
+test("hold cap: a turn that never ends is reported at level error after holdTimeoutMs, never as dispatched", async () => {
+  const { log, swarm, ctx } = turnSession({ startMs: 0, durationMs: 10_000 }, { holdTimeoutMs: 100 });
+  const t0 = Date.now();
+  await swarm.handler(BRIEF, ctx);
+  expect(Date.now() - t0).toBeLessThan(1000);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "notify"]);
+  const last = log.at(-1);
+  expect(last?.level).toBe("error");
+  expect(String(last?.message)).toContain("still running");
+  expect(String(last?.message)).toContain(CORR);
+  expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);
+});
+
+test("sync start: isIdle already false on the first poll counts as started; the hold ends on the next idle poll", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
-  let startPolls = 0;
+  const reads: boolean[] = [];
   const ctx = commandCtx(repo, [], {
     log,
-    // streaming until waitForIdle is called, which ends the turn on its first poll
+    // in flight on the first poll, over on the second
     isIdle: () => {
-      if (log.some((e) => e.call === "waitForIdle")) return true;
-      startPolls++;
-      return false;
+      const idle = reads.length > 0;
+      reads.push(idle);
+      return idle;
     },
   });
   await swarm.handler(BRIEF, ctx);
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
-  expect(startPolls).toBe(1);
+  expect(reads).toEqual([false, true]);
 });
 
 test.each([

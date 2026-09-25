@@ -89,10 +89,21 @@ function notify(ctx: CommandContext, message: string, level: "info" | "warning" 
 }
 
 export interface SwarmCommandOptions {
-  /** Poll interval of the dispatch-start wait (default 10 ms). */
+  /** Poll interval of the dispatch-start and turn-end waits (default 10 ms). */
   intervalMs?: number;
   /** How long the dispatch turn may take to start before /swarm reports failure (default 10 s). */
   startTimeoutMs?: number;
+  /** How long the started turn may run before /swarm gives up holding the session (default 30 min). */
+  holdTimeoutMs?: number;
+}
+
+const DEFAULT_START_TIMEOUT_MS = 10_000;
+const DEFAULT_HOLD_TIMEOUT_MS = 30 * 60_000;
+
+function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
 }
 
 /** The text of a user message entry (string content or text blocks); "" for any other entry. */
@@ -115,7 +126,7 @@ async function awaitDispatchStart(
   ctx: CommandContext,
   corr: string,
   from: number,
-  { intervalMs = 10, startTimeoutMs = 10_000 }: SwarmCommandOptions,
+  { intervalMs = 10, startTimeoutMs = DEFAULT_START_TIMEOUT_MS }: SwarmCommandOptions,
 ): Promise<boolean> {
   const deadline = Date.now() + startTimeoutMs;
   for (;;) {
@@ -126,10 +137,23 @@ async function awaitDispatchStart(
     };
     if (ctx.sessionManager.getBranch().slice(from).some(dispatched)) return true;
     if (Date.now() >= deadline) return false;
-    const { promise, resolve } = Promise.withResolvers<void>();
-    setTimeout(resolve, intervalMs);
-    await promise;
+    await sleep(intervalMs);
   }
+}
+
+/**
+ * True once `ctx.isIdle()` reads true again, i.e. the started turn has ended. omp's `isIdle` covers the whole
+ * prompt (its in-flight count is held from before the agent loop until after it), while `ctx.waitForIdle()` only
+ * waits on the loop and resolves during the pre-loop window (G-04-05-1), so this poll is the hold, not waitForIdle.
+ * False once `holdTimeoutMs` elapsed with the turn still running.
+ */
+async function awaitTurnEnd(ctx: CommandContext, { intervalMs = 10, holdTimeoutMs = DEFAULT_HOLD_TIMEOUT_MS }: SwarmCommandOptions): Promise<boolean> {
+  const deadline = Date.now() + holdTimeoutMs;
+  while (!ctx.isIdle()) {
+    if (Date.now() >= deadline) return false;
+    await sleep(intervalMs);
+  }
+  return true;
 }
 
 export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions = {}): CommandDefinition {
@@ -160,11 +184,16 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
       const corr = typeof res.json.correlation_id === "string" ? res.json.correlation_id : "?";
       const from = ctx.sessionManager.getBranch().length;
       pi.sendUserMessage(dispatchPrompt(res, parsed));
-      // sendUserMessage starts the turn asynchronously; waitForIdle alone resolves before it streams (G-04-05-1)
+      // sendUserMessage starts the turn asynchronously: wait for it to start, then hold until it ends (G-04-05-1)
       if (!(await awaitDispatchStart(ctx, corr, from, opts))) {
-        const seconds = (opts.startTimeoutMs ?? 10_000) / 1000;
+        const seconds = (opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS) / 1000;
         return notify(ctx, `/swarm: dispatch did not start within ${seconds} s (plan ${corr})`, "error");
       }
+      if (!(await awaitTurnEnd(ctx, opts))) {
+        const seconds = (opts.holdTimeoutMs ?? DEFAULT_HOLD_TIMEOUT_MS) / 1000;
+        return notify(ctx, `/swarm: dispatch turn still running after ${seconds} s (plan ${corr})`, "error");
+      }
+      // the turn is over; waitForIdle only drains the session's event handlers now
       await ctx.waitForIdle();
       notify(ctx, `/swarm: plan ${corr} dispatched to a01-orchestrator (${readyTaskIds(res.json).length} ready tasks)`, "info");
     },
