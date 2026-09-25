@@ -9,7 +9,8 @@ lifted with --unfreeze; --dry-run reads it but never writes it), and emits a sig
 every other required gate passes and no freeze is active. Also writes a canary release.plan
 (5→25→50→100 %) with guardrails and rollback triggers to .swarm/releases/<release_id>.plan.json.
 Verdict rows are recorded only when --task-id is a release gate task: it then evaluates, and records on,
-exactly that task's notes.gate_for targets. --task-ids and correlation-wide runs are report-only.
+exactly that task's notes.gate_for targets, each row from that target's own findings plus any freeze finding
+(the overall verdict still fails when any target fails). --task-ids and correlation-wide runs are report-only.
 """
 from __future__ import annotations
 import json
@@ -96,19 +97,24 @@ def run(args, ctx) -> dict:
             ids.insert(0, ctx.task_id)
     if ctx.correlation_id and not ids:
         ids = [t["task_id"] for t in store.list(correlation_id=ctx.correlation_id)]
-    findings, per_task, artifacts, risk = [], {}, [], "low"
+    findings, own, per_task, artifacts, risk = [], {}, {}, [], "low"  # own: target → its own findings (D-13)
+
+    def add(tid: str, severity: str, kind: str, summary: str, owner: str) -> None:
+        findings.append(make_finding(f"RF-{len(findings)+1:03d}", severity, kind, summary, owner_suggestion=owner))
+        own[tid].append(findings[-1])
+
     if not ids:
         findings.append(make_finding("RF-000", "major", "input", "no task identified (pass --task-id/--task-ids/--correlation-id)",
                                      owner_suggestion="A01"))
     for tid in ids:
+        own.setdefault(tid, [])
         try:
             task = store.get(tid)
         except SwarmError as e:
             if e.code is not ErrorCode.E_INPUT:
                 raise
             per_task[tid] = {"gates": {}, "verdicts": {}, "required": [], "overall": "fail", "problems": ["task:unknown"]}
-            findings.append(make_finding(f"RF-{len(findings)+1:03d}", "major", "input", f"unknown task {tid} in Task Store",
-                                         owner_suggestion="A01"))
+            add(tid, "major", "input", f"unknown task {tid} in Task Store", "A01")
             continue
         if RISK_ORDER.index(task["risk_class"]) > RISK_ORDER.index(risk):
             risk = task["risk_class"]
@@ -122,14 +128,15 @@ def run(args, ctx) -> dict:
                          "problems": problems, "expired": [g for g, r in reasons.items() if r == "expired"]}
         artifacts += [o.get("uri") for o in task["outputs"] if o.get("kind") == "build.artifact"]
         for gate, why in reasons.items():
-            findings.append(make_finding(f"RF-{len(findings)+1:03d}", "major", "gate", f"{tid}: {gate} gate {why}",
-                                         owner_suggestion={"review": "A09", "quality": "A08", "security": "A10"}.get(gate, "A01")))
+            add(tid, "major", "gate", f"{tid}: {gate} gate {why}",
+                {"review": "A09", "quality": "A08", "security": "A10"}.get(gate, "A01"))
         if not artifacts and task["risk_class"] != "low":
-            findings.append(make_finding(f"RF-{len(findings)+1:03d}", "minor", "provenance",
-                                         f"{tid}: no build.artifact registered — A11 provenance required before promote",
-                                         owner_suggestion="A11"))
-    if frozen:
+            add(tid, "minor", "provenance", f"{tid}: no build.artifact registered — A11 provenance required before promote",
+                "A11")
+    if frozen:  # a freeze fails every target
         findings.append(freeze_finding(ctx.root, frozen, f"RF-{len(findings)+1:03d}"))
+        for mine in own.values():
+            mine.append(findings[-1])
 
     primary = ids[0] if ids else "T-unassigned"
     release_id = args.release_id or f"REL-{primary}"
@@ -137,8 +144,10 @@ def run(args, ctx) -> dict:
     plan = build_plan(release_id, risk, ids, gates, [a for a in artifacts if a])
     runs = {g: ("pass" if all(t["gates"].get(g, "ok") == "ok" for t in per_task.values()) else "fail") for g in gates}
     runs["freeze"] = "active" if frozen else "none"
+    # a release gate task records each target's verdict from that target's own findings plus any freeze (D-13)
     env, recorded = issue_gate(ctx, gate="release", agent_id="A12@local", findings=findings, runs=runs,
-                               extra={"release_id": release_id, "frozen": bool(frozen)})
+                               extra={"release_id": release_id, "frozen": bool(frozen)},
+                               per_target=own if targets is not None else None)
     verdict = env["payload"]["verdict"]
     rdir = swarm_dir(ctx.root) / "releases"
     rdir.mkdir(parents=True, exist_ok=True)

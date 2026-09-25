@@ -91,9 +91,12 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
 
 
 def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dict, expires_s: int = 86400,
-               extra: dict | None = None, simulate: bool = False) -> tuple[dict, dict[str, dict]]:
+               extra: dict | None = None, simulate: bool = False,
+               per_target: dict[str, list[dict]] | None = None) -> tuple[dict, dict[str, dict]]:
     """Gate-script tail: sign the verdict for ctx.task_id, write verdicts/<id>.<gate>.json, and record rows on
-    the gate task's targets. simulate (--dry-run): canned pass, SIM-1 fail for SWARM_DRYRUN_FAIL targets, plus
+    the gate task's targets. per_target ({target: findings}) gives each target a verdict derived from its own
+    findings (D-13); targets it omits get `findings`. The file envelope always carries `findings`.
+    simulate (--dry-run): canned pass, SIM-1 fail for SWARM_DRYRUN_FAIL targets, plus
     the caller's findings; every envelope carries a signed dry_run: true, and rows are recorded only when A01
     flagged the gate task as a runner dry-run (notes.dry_run), where they also count only on flagged targets."""
     import json
@@ -120,7 +123,6 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     if store is None:
         ctx.emit("gate.verdict.unrecorded", {"task_id": None, "gate": gate, "reason": "no --task-id"})
         return env, {}
-    per_target = None
     if simulate:
         if targets and not (gate_task and gate_task["notes_json"].get("dry_run")):
             ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,

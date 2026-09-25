@@ -76,3 +76,35 @@ def test_release_gate_passes_on_verified_rows(swarm_dir):
     assert out["verdict"] == "pass", out["tasks"]
     assert out["tasks"]["H-be"]["problems"] == []
     assert _release_row(swarm_dir, "H-be")["verdict"] == "pass"
+
+
+def _two_targets(swarm_dir):
+    """H-be: verified review+quality passes; H-fe: no gate rows. One leased release gate task over both."""
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    _in_review(ts, "H-be")
+    _signed_passes(ts, "H-be")
+    _in_review(ts, "H-fe")
+    _release_task(ts, "H-rel", ["H-be", "H-fe"])
+
+
+def test_release_gate_per_target_findings(swarm_dir):
+    _two_targets(swarm_dir)
+    out = _rel_plan(swarm_dir)
+    assert out["verdict"] == "fail"
+    be, fe = _release_row(swarm_dir, "H-be"), _release_row(swarm_dir, "H-fe")
+    assert be["verdict"] == "pass", be["findings"]
+    assert not [f for f in be["findings"] if "H-fe" in f["summary"]]
+    assert fe["verdict"] == "fail"
+    assert {"H-fe: review gate absent", "H-fe: quality gate absent"} <= {f["summary"] for f in fe["findings"]}
+
+
+def test_release_freeze_fails_every_target(swarm_dir):
+    _two_targets(swarm_dir)
+    (swarm_dir / "release.freeze").write_text(json.dumps({"reason": "INC-7", "frozen_at": "2026-09-25T00:00:00Z"}))
+    out = _rel_plan(swarm_dir)
+    assert out["verdict"] == "fail" and out["frozen"] is True
+    for tid in ("H-be", "H-fe"):
+        row = _release_row(swarm_dir, tid)
+        assert row["verdict"] == "fail"
+        assert [f["severity"] for f in row["findings"] if f["kind"] == "freeze"] == ["blocker"]
