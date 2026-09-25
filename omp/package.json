@@ -1,0 +1,11 @@
+{
+  "name": "agent-swarm-omp",
+  "private": true,
+  "type": "module",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test"
+  }
+}
