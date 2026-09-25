@@ -3,16 +3,18 @@
  * with a recording bridge; usage / plan-mode / conflict paths never dispatch.
  */
 import { expect, test } from "bun:test";
-import { type Bridge, type BridgeRequest, type BridgeResult, SwarmToolError } from "../src/bridge.ts";
-import { parseSwarmArgs } from "../src/commands.ts";
+import { type Bridge, type BridgeRequest, type BridgeResult, runPy, SwarmToolError } from "../src/bridge.ts";
+import { parseSwarmArgs, swarmCorrelationId } from "../src/commands.ts";
 import { DISPATCH_MARKER } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
-import { type CallLog, callTool, commandCtx, fakeCtx, fakePi, gitRepo, isolateEnv } from "./helpers.ts";
+import { type CallLog, callTool, commandCtx, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_DIR", "SWARM_AGENT");
 
 const CORR = "c0ffee01-2222-4333-8444-555555555555";
+const BRIEF = "add a /health endpoint";
+const BRIEF_CORR = swarmCorrelationId({ brief: BRIEF, pattern: "feature", risk_class: "medium" });
 const PLAN: BridgeResult = {
   exitCode: 0,
   json: {
@@ -53,6 +55,14 @@ function payload(text: string): Record<string, unknown> {
   if (!line) throw new Error(`no payload line in:\n${text}`);
   return JSON.parse(line);
 }
+/** The task ids in a swarm_status result. */
+function statusTaskIds(details: unknown): string[] {
+  if (!details || typeof details !== "object" || !("tasks" in details) || !Array.isArray(details.tasks)) throw new Error("no tasks in status");
+  return details.tasks.map((t: unknown) => {
+    if (!t || typeof t !== "object" || !("task_id" in t) || typeof t.task_id !== "string") throw new Error("task without task_id");
+    return t.task_id;
+  });
+}
 
 test("dispatch order: bridge orch_plan with the shared argv, then sendUserMessage, then waitForIdle, then notify", async () => {
   const repo = gitRepo();
@@ -63,7 +73,7 @@ test("dispatch order: bridge orch_plan with the shared argv, then sendUserMessag
   const req = bridgeReq(log);
   expect(req?.script).toBe("orch_plan");
   expect(req?.cwd).toBe(repo);
-  expect(req?.args).toEqual([`--root=${repo}`, "--brief-text=add a /health endpoint", "--pattern=feature", "--risk-class=medium"]);
+  expect(req?.args).toEqual([`--root=${repo}`, `--brief-text=${BRIEF}`, "--pattern=feature", "--risk-class=medium", `--correlation-id=${BRIEF_CORR}`]);
 
   const text = dispatchText(log) ?? "";
   expect(text.startsWith(DISPATCH_MARKER)).toBe(true);
@@ -89,8 +99,26 @@ test.each([
   const repo = gitRepo();
   const { log, swarm } = session();
   await swarm.handler(args, commandCtx(repo, [], { log }));
-  expect(bridgeReq(log)?.args).toEqual([`--root=${repo}`, `--brief-text=${brief}`, `--pattern=${pattern}`, `--risk-class=${risk}`]);
+  const corr = swarmCorrelationId({ brief, pattern: pattern as "feature", risk_class: risk as "low" });
+  expect(bridgeReq(log)?.args).toEqual([`--root=${repo}`, `--brief-text=${brief}`, `--pattern=${pattern}`, `--risk-class=${risk}`, `--correlation-id=${corr}`]);
   expect(calls(log)).toContain("sendUserMessage");
+});
+
+test("correlation id: a uuid5 fixed by (pattern, risk, brief); any input change re-keys it", () => {
+  const base = { brief: BRIEF, pattern: "feature", risk_class: "medium" } as const;
+  expect(BRIEF_CORR).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(swarmCorrelationId({ ...base })).toBe(BRIEF_CORR);
+  const variants = [
+    swarmCorrelationId({ ...base, brief: `${BRIEF}!` }),
+    swarmCorrelationId({ ...base, pattern: "hotfix" }),
+    swarmCorrelationId({ ...base, risk_class: "high" }),
+  ];
+  expect(new Set([BRIEF_CORR, ...variants]).size).toBe(4);
+  // flags never change the normalized brief, so their placement never changes the id
+  const a = parseSwarmArgs(`--risk=high ${BRIEF}`);
+  const b = parseSwarmArgs(`${BRIEF} --risk=high`);
+  if ("error" in a || "error" in b) throw new Error("usage error");
+  expect(swarmCorrelationId(a)).toBe(swarmCorrelationId(b));
 });
 
 test.each(["--pattern=bogus x", "--risk=urgent x", "--pattern= x", "", "   ", "--risk=low", "--pattern=hotfix --risk=high"])(
@@ -178,7 +206,7 @@ test("scoped bridge: the command and swarm_plan share one session's inflight set
   two.load(createSwarmExtension({ bridge }));
 
   await one.command("swarm").handler("add a /health endpoint", commandCtx(repo));
-  await callTool(one.tool("swarm_plan"), { brief: "add a /health endpoint", pattern: "feature", risk_class: "medium" }, fakeCtx(repo));
+  await callTool(one.tool("swarm_plan"), { brief: BRIEF, pattern: "feature", risk_class: "medium", correlation_id: BRIEF_CORR }, fakeCtx(repo));
   await two.command("swarm").handler("add a /health endpoint", commandCtx(repo));
 
   expect(reqs).toHaveLength(3);
@@ -187,4 +215,36 @@ test("scoped bridge: the command and swarm_plan share one session's inflight set
   expect(reqs[2].inflight).toBeInstanceOf(Set);
   expect(reqs[2].inflight).not.toBe(reqs[0].inflight);
   expect(reqs[0].args).toEqual(reqs[1].args);
+});
+
+test("real orch_plan: the same brief reuses one plan; a different brief gets its own correlation", async () => {
+  const repo = gitRepo();
+  process.env.SWARM_DIR = tmpDir("swarm-omp-dir-");
+  const log: CallLog = [];
+  const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
+  pi.load(createSwarmExtension({ bridge: runPy }));
+  const swarm = pi.command("swarm");
+  const ctx = commandCtx(repo, [], { log, hasUI: false });
+
+  await swarm.handler(BRIEF, ctx);
+  await swarm.handler(`  ${BRIEF} --risk=medium `, ctx);
+  await swarm.handler("fix the login bug --pattern=hotfix", ctx);
+  const texts = log.filter((e) => e.call === "sendUserMessage").map((e) => String(e.text));
+  expect(texts).toHaveLength(3);
+
+  const [first, again, other] = texts.map(payload);
+  expect(first.correlation_id).toBe(BRIEF_CORR);
+  expect(again).toEqual(first);
+  expect(texts[0]).toContain(`is ready: 13 tasks`);
+  expect(texts[1]).toContain(`is reused: 13 tasks`);
+  expect(other.correlation_id).not.toBe(BRIEF_CORR);
+  expect(other.ready_tasks).toHaveLength(1);
+
+  // one plan for the brief in the store: the second run created nothing
+  const mine = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: BRIEF_CORR }, fakeCtx(repo))).details);
+  expect(mine).toHaveLength(13);
+  expect(mine).toContain(first.ready_tasks[0]);
+  const others = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: other.correlation_id }, fakeCtx(repo))).details);
+  expect(others).toHaveLength(8);
+  expect(others).toContain(other.ready_tasks[0]);
 });

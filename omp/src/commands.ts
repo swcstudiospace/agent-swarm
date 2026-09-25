@@ -4,6 +4,7 @@
  * for it, so a `-p` run does not exit before the dispatch. The brief reaches python as one argv element built by
  * planArgs (no shell, T-04-15). Nothing is dispatched without a successful plan result.
  */
+import { createHash } from "node:crypto";
 import type { Bridge, BridgeResult } from "./bridge.ts";
 import { inPlanMode } from "./context.ts";
 import { DISPATCH_MARKER } from "./hooks.ts";
@@ -32,6 +33,24 @@ export function parseSwarmArgs(args: string): SwarmArgs | { error: string } {
   if (!RISK_CLASSES.includes(risk as SwarmArgs["risk_class"])) return { error: `unknown --risk=${risk}\n${USAGE}` };
   if (!brief) return { error: USAGE };
   return { brief, pattern: pattern as SwarmArgs["pattern"], risk_class: risk as SwarmArgs["risk_class"] };
+}
+
+/** A fixed RFC 4122 namespace for /swarm correlation ids (any change re-keys every plan). */
+const CORRELATION_NAMESPACE = "6f4d2e8a-3c1b-4e7f-9a5d-0b2c4e6f8a1d";
+
+/**
+ * A uuid5 of (pattern, risk class, brief), so an identical brief re-runs `orch_plan` under the same correlation id
+ * and derived prefix and gets `reused: true` (D-11), while any other brief, pattern or risk class plans afresh.
+ */
+export function swarmCorrelationId({ brief, pattern, risk_class }: SwarmArgs): string {
+  const hash = createHash("sha1")
+    .update(Buffer.from(CORRELATION_NAMESPACE.replaceAll("-", ""), "hex"))
+    .update(`${pattern}\n${risk_class}\n${brief}`, "utf8")
+    .digest();
+  hash[6] = (hash[6] & 0x0f) | 0x50; // version 5
+  hash[8] = (hash[8] & 0x3f) | 0x80; // RFC 4122 variant
+  const hex = hash.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /** Ready = the plan's tasks with an empty depends_on list (the only definition; no Task Store re-read). */
@@ -81,7 +100,9 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
       }
       let res: BridgeResult;
       try {
-        res = await bridge({ script: "orch_plan", args: planArgs(ctx, parsed), cwd: ctx.cwd });
+        // the same brief → the same correlation id and prefix → orch_plan reuses instead of duplicating (D-11)
+        const args = planArgs(ctx, { ...parsed, correlation_id: swarmCorrelationId(parsed) });
+        res = await bridge({ script: "orch_plan", args, cwd: ctx.cwd });
       } catch (err) {
         // a conflicting brief arrives here as E-CONTRACT with the orch_plan hint (D-11 step 3)
         return notify(ctx, err instanceof Error ? err.message : String(err), "error");

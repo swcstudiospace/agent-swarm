@@ -97,7 +97,7 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 
 - `before_agent_start`: SDLC-shaped prompts in a top-level session get a `## AgentSwarm` part pointing at `/swarm` and `task` with `a01-orchestrator`; subagents, `SWARM_CHILD=1`/`SWARM_AGENT` sessions and non-SDLC prompts get nothing.
 - `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)`; `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval` and writes into `.swarm/`, `.omp/`, `~/.omp` block.
-- `/swarm <brief> [--pattern=feature|hotfix|dependency] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and awaits idle so `-p` runs finish. Usage, plan mode and `E-CONTRACT` conflicts never dispatch.
+- `/swarm <brief> [--pattern=feature|hotfix|dependency] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`, correlation id = uuid5 of pattern, risk and brief, so an identical brief reuses its plan), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and awaits idle so `-p` runs finish. Usage, plan mode and `E-CONTRACT` conflicts never dispatch.
 
 ## Rules the runtime enforces (mirrors the spec)
 
