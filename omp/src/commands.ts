@@ -99,12 +99,25 @@ export interface SwarmCommandOptions {
   intervalMs?: number;
   /** How long the dispatch turn may take to start before /swarm reports failure (default 10 s). */
   startTimeoutMs?: number;
-  /** How long the started turn may run before /swarm gives up holding the session (default 30 min). */
+  /**
+   * How long the started turn may run before /swarm stops holding the session. Default: env `SWARM_DISPATCH_HOLD_MS`
+   * (a positive integer), else 30 min with a UI and unbounded without one (`-p`/rpc, where the handler's return ends
+   * the run and would tear the A01 turn down mid-orchestration).
+   */
   holdTimeoutMs?: number;
 }
 
 const DEFAULT_START_TIMEOUT_MS = 10_000;
-const DEFAULT_HOLD_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_UI_HOLD_TIMEOUT_MS = 30 * 60_000;
+export const HOLD_ENV = "SWARM_DISPATCH_HOLD_MS";
+
+/** The hold cap in ms: DI option, else `SWARM_DISPATCH_HOLD_MS` when a positive integer, else 30 min with a UI, else Infinity. */
+export function holdTimeoutMs(ctx: Pick<CommandContext, "hasUI">, opts: SwarmCommandOptions, env: Record<string, string | undefined>): number {
+  if (opts.holdTimeoutMs !== undefined) return opts.holdTimeoutMs;
+  const raw = env[HOLD_ENV]?.trim();
+  if (raw !== undefined && /^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
+  return ctx.hasUI ? DEFAULT_UI_HOLD_TIMEOUT_MS : Number.POSITIVE_INFINITY;
+}
 
 function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
@@ -151,10 +164,10 @@ async function awaitDispatchStart(
  * True once `ctx.isIdle()` reads true again, i.e. the started turn has ended. omp's `isIdle` covers the whole
  * prompt (its in-flight count is held from before the agent loop until after it), while `ctx.waitForIdle()` only
  * waits on the loop and resolves during the pre-loop window (G-04-05-1), so this poll is the hold, not waitForIdle.
- * False once `holdTimeoutMs` elapsed with the turn still running.
+ * False once `capMs` elapsed with the turn still running (never, when the cap is Infinity).
  */
-async function awaitTurnEnd(ctx: CommandContext, { intervalMs = 10, holdTimeoutMs = DEFAULT_HOLD_TIMEOUT_MS }: SwarmCommandOptions): Promise<boolean> {
-  const deadline = Date.now() + holdTimeoutMs;
+async function awaitTurnEnd(ctx: CommandContext, capMs: number, { intervalMs = 10 }: SwarmCommandOptions): Promise<boolean> {
+  const deadline = Date.now() + capMs;
   while (!ctx.isIdle()) {
     if (Date.now() >= deadline) return false;
     await sleep(intervalMs);
@@ -195,9 +208,14 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
         const seconds = (opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS) / 1000;
         return notify(ctx, `/swarm: dispatch did not start within ${seconds} s (plan ${corr})`, "error");
       }
-      if (!(await awaitTurnEnd(ctx, opts))) {
-        const seconds = (opts.holdTimeoutMs ?? DEFAULT_HOLD_TIMEOUT_MS) / 1000;
-        return notify(ctx, `/swarm: dispatch turn still running after ${seconds} s (plan ${corr})`, "error");
+      const capMs = holdTimeoutMs(ctx, opts, process.env);
+      if (!(await awaitTurnEnd(ctx, capMs, opts))) {
+        // the dispatch happened; only the hold gave up (a cap the operator set, or the interactive default)
+        return notify(
+          ctx,
+          `/swarm: plan ${corr} dispatched to a01-orchestrator; its turn is still running after ${capMs / 1000} s, so /swarm stopped holding the session (${HOLD_ENV} raises the cap)`,
+          "warning",
+        );
       }
       // the turn is over; waitForIdle only drains the session's event handlers now
       await ctx.waitForIdle();

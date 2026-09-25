@@ -180,14 +180,15 @@ export function fakeCtx(cwd: string, entries: SessionEntry[] = []): ExtensionCon
 export type CallLog = Array<{ call: string } & Record<string, unknown>>;
 
 /**
- * A fake turn driven by timers, started by the fake sendUserMessage: `isIdle` reads false from `startMs` until the
- * turn ends `durationMs` later (logged as turn-start / turn-end), like omp's in-flight count and independent of the
- * fake `waitForIdle`; `entry` is appended to `entries` at `entryMs`. Rows with no `startMs` never flip `isIdle`;
- * rows with no `entry` never append. Real timers on purpose: the handler's polls are async loops and bun 1.4 has
- * no advanceTimersByTimeAsync, so fake timers cannot drive them; rows stay ≤150 ms.
+ * A fake turn started by the fake sendUserMessage: `isIdle` reads false from `startMs` (logged as turn-start) until
+ * `finish()` is called — or, with `durationMs`, until that many ms later — (logged as turn-end), like omp's in-flight
+ * count and independent of the fake `waitForIdle`; `entry` is appended to `entries` at `entryMs`. Rows with no
+ * `startMs` never flip `isIdle`; rows with no `entry` never append. Real timers on purpose: the handler's polls are
+ * async loops and bun 1.4 has no advanceTimersByTimeAsync, so fake timers cannot drive them; rows stay ≤150 ms.
  */
 export interface ScriptedTurn {
   startMs?: number;
+  /** Self-end after this many ms; omit to end only on `finish()`. */
   durationMs?: number;
   entryMs?: number;
   entry?: SessionEntry;
@@ -197,6 +198,10 @@ export interface FakeTurn {
   isIdle(): boolean;
   /** Arm the timers (call from the fake sendUserMessage). */
   start(): void;
+  /** Resolves once turn-start was logged (at once for a turn without `startMs`). */
+  started(): Promise<void>;
+  /** End the turn now (idempotent; a no-op for a turn that never started). */
+  finish(): void;
   /** True once turn-end was logged (or immediately for a turn without `startMs`). */
   ended(): boolean;
 }
@@ -204,6 +209,14 @@ export interface FakeTurn {
 export function fakeTurn(script: ScriptedTurn, entries: SessionEntry[], log: CallLog): FakeTurn {
   let idle = true;
   let ended = script.startMs === undefined;
+  const begun = Promise.withResolvers<void>();
+  if (script.startMs === undefined) begun.resolve();
+  const finish = () => {
+    if (idle) return;
+    idle = true;
+    ended = true;
+    log.push({ call: "turn-end" });
+  };
   return {
     isIdle: () => idle,
     start() {
@@ -211,16 +224,15 @@ export function fakeTurn(script: ScriptedTurn, entries: SessionEntry[], log: Cal
         setTimeout(() => {
           idle = false;
           log.push({ call: "turn-start" });
-          setTimeout(() => {
-            idle = true;
-            ended = true;
-            log.push({ call: "turn-end" });
-          }, script.durationMs ?? 50);
+          begun.resolve();
+          if (script.durationMs !== undefined) setTimeout(finish, script.durationMs);
         }, script.startMs);
       }
       const { entry, entryMs } = script;
       if (entry !== undefined) setTimeout(() => void entries.push(entry), entryMs ?? 0);
     },
+    started: () => begun.promise,
+    finish,
     ended: () => ended,
   };
 }

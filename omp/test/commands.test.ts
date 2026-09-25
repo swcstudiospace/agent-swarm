@@ -4,13 +4,13 @@
  */
 import { expect, spyOn, test } from "bun:test";
 import { type Bridge, type BridgeRequest, type BridgeResult, runPy, SwarmToolError } from "../src/bridge.ts";
-import { parseSwarmArgs, swarmCommand, swarmCorrelationId } from "../src/commands.ts";
+import { HOLD_ENV, holdTimeoutMs, parseSwarmArgs, swarmCommand, swarmCorrelationId } from "../src/commands.ts";
 import { DISPATCH_MARKER } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
 import { type CallLog, callTool, commandCtx, fakeCtx, fakePi, fakeTurn, gitRepo, isolateEnv, type ScriptedTurn, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_AGENT");
+isolateEnv("SWARM_DIR", "SWARM_AGENT", HOLD_ENV);
 
 const CORR = "c0ffee01-2222-4333-8444-555555555555";
 const BRIEF = "add a /health endpoint";
@@ -164,17 +164,56 @@ test("never starts: after the start cap the handler reports the failure at level
   expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);
 });
 
-test("hold cap: a turn that never ends is reported at level error after holdTimeoutMs, never as dispatched", async () => {
-  const { log, swarm, ctx } = turnSession({ startMs: 0, durationMs: 10_000 }, { holdTimeoutMs: 100 });
+test("hold cap: a turn still running at the cap is reported at level warning as dispatched, never at level info", async () => {
+  const { log, turn, swarm, ctx } = turnSession({ startMs: 0 }, { holdTimeoutMs: 100 });
   const t0 = Date.now();
   await swarm.handler(BRIEF, ctx);
   expect(Date.now() - t0).toBeLessThan(1000);
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "notify"]);
   const last = log.at(-1);
-  expect(last?.level).toBe("error");
-  expect(String(last?.message)).toContain("still running");
-  expect(String(last?.message)).toContain(CORR);
-  expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);
+  expect(last?.level).toBe("warning");
+  expect(String(last?.message)).toContain(`plan ${CORR} dispatched`);
+  expect(String(last?.message)).toContain("still running after 0.1 s");
+  expect(String(last?.message)).toContain(HOLD_ENV);
+  expect(log.some((e) => e.call === "notify" && e.level === "info")).toBe(false);
+  turn.finish();
+});
+
+test("no UI, no cap: the handler holds for as long as the turn runs and reports nothing when it ends", async () => {
+  const { log, turn, swarm, ctx } = turnSession({ startMs: 0 }, {});
+  ctx.hasUI = false;
+  let settled = false;
+  const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
+  await turn.started();
+  // a real wait on purpose: "unbounded" can only be shown by outliving the cap the UI rows use (the helper's
+  // poll loops are async, which bun's fake timers cannot advance); the turn then ends on finish(), not the clock
+  await Bun.sleep(120);
+  expect(settled).toBe(false);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start"]);
+  turn.finish();
+  await run;
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "turn-end", "waitForIdle"]);
+});
+
+test("SWARM_DISPATCH_HOLD_MS: a positive integer caps the hold without a UI; anything else is ignored", async () => {
+  process.env[HOLD_ENV] = "80";
+  const capped = turnSession({ startMs: 0 });
+  capped.ctx.hasUI = false;
+  const t0 = Date.now();
+  const { err } = await capturedStreams(() => capped.swarm.handler(BRIEF, capped.ctx));
+  expect(Date.now() - t0).toBeLessThan(1000);
+  expect(err).toHaveLength(1);
+  expect(err[0]).toContain("still running after 0.08 s");
+  capped.turn.finish();
+
+  for (const bad of ["", "  ", "0", "-5", "soon", "1.5"]) {
+    process.env[HOLD_ENV] = bad;
+    expect(holdTimeoutMs({ hasUI: false }, {}, process.env)).toBe(Number.POSITIVE_INFINITY);
+    expect(holdTimeoutMs({ hasUI: true }, {}, process.env)).toBe(30 * 60_000);
+  }
+  process.env[HOLD_ENV] = "5000";
+  expect(holdTimeoutMs({ hasUI: true }, {}, process.env)).toBe(5000);
+  expect(holdTimeoutMs({ hasUI: true }, { holdTimeoutMs: 7 }, process.env)).toBe(7);
 });
 
 test("sync start: isIdle already false on the first poll counts as started; the hold ends on the next idle poll", async () => {
