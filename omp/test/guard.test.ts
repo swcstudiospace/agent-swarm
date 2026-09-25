@@ -3,11 +3,14 @@
  * and fail modes (D-02), over the pure guardToolCall and through the handler the factory registers.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
-import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall } from "../src/guard.ts";
+import { callingAgent } from "../src/context.ts";
+import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, SWARM_SLUGS } from "../src/guard.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
-import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv } from "./helpers.ts";
+import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
 
 isolateEnv("SWARM_AGENT", "SWARM_TASK_ID");
 beforeEach(() => {
@@ -210,5 +213,68 @@ describe("fail", () => {
     expect(res.block).toBe(true);
     expect(res.reason?.startsWith(GUARD_ERROR_PREFIX)).toBe(true);
     expect(res.reason).toContain("branch unreadable");
+  });
+});
+
+describe("HOOK-03", () => {
+  const SWARM_STATE = "BLOCKED needs: human-approval (swarm-state)";
+  const STATE_TOOLS = ["swarm_transition", "swarm_ingest"];
+  const specialist = agentCtx(CWD, "a05-backend", [], false);
+
+  test("SWARM_SLUGS is exactly the agents.json slug list", () => {
+    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "agents.json"), "utf8")) as { agents: { slug: string }[] };
+    expect([...SWARM_SLUGS].sort()).toEqual(manifest.agents.map((a) => a.slug).sort());
+  });
+
+  test.each([
+    ["a05-backend (restricted)", agentCtx(CWD, "a05-backend")],
+    ["a05-backend", specialist],
+    ["a12-release", agentCtx(CWD, "a12-release", [], false)],
+    ["a generic task child", agentCtx(CWD, "task", [], false)],
+    ["the unidentified main session", fakeCtx(CWD)],
+  ])("from %s, swarm_transition and swarm_ingest are blocked", (_name, ctx) => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    for (const toolName of STATE_TOOLS) {
+      expect(run(call(toolName, { task_id: "T-1", to: "DONE" }), ctx)).toEqual({ block: true, reason: SWARM_STATE });
+    }
+  });
+
+  test.each([["a05-backend"], ["task"], [undefined]])("pure: agent %p is blocked on both state tools", (agent) => {
+    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {} };
+    for (const toolName of STATE_TOOLS) expect(guardToolCall(call(toolName), facts)).toEqual({ block: true, reason: SWARM_STATE });
+  });
+
+  test("from a01-orchestrator with task active, both state tools pass", () => {
+    const { run } = guardHandler({ activeTools: ["read", "task", "swarm_transition", "swarm_ingest"] });
+    for (const toolName of STATE_TOOLS) {
+      expect(run(call(toolName, { task_id: "T-1" }), a01Ctx())).toBeUndefined();
+      expect(guardToolCall(call(toolName), { ...capped, hasTask: true })).toBeUndefined();
+    }
+  });
+
+  test("env bleed: session_init a05-backend with SWARM_AGENT=a01-orchestrator is still blocked", () => {
+    process.env.SWARM_AGENT = A01;
+    expect(callingAgent(specialist)).toBe("a05-backend");
+    const { pi, run } = guardHandler({ activeTools: ["task"] });
+    for (const toolName of STATE_TOOLS) expect(run(call(toolName), specialist)).toEqual({ block: true, reason: SWARM_STATE });
+    expect(pi.runtimeCalls).toEqual([]); // not resolved as A01, so the A01-only read never happens
+  });
+
+  test("top-level session with SWARM_AGENT=a01-orchestrator and no session_init is allowed", () => {
+    process.env.SWARM_AGENT = ` ${A01} `;
+    const { run } = guardHandler({ activeTools: ["task"] });
+    for (const toolName of STATE_TOOLS) expect(run(call(toolName), fakeCtx(CWD))).toBeUndefined();
+  });
+
+  test("top-level session with a blank SWARM_AGENT stays unidentified and blocked", () => {
+    process.env.SWARM_AGENT = "  ";
+    const { run } = guardHandler({ activeTools: ["task"] });
+    for (const toolName of STATE_TOOLS) expect(run(call(toolName), fakeCtx(CWD))).toEqual({ block: true, reason: SWARM_STATE });
+  });
+
+  test.each([["swarm_plan"], ["swarm_status"]])("%s from a05-backend is not a swarm-state call", (toolName) => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    expect(run(call(toolName, { brief: "x" }), specialist)).toBeUndefined();
+    expect(run(call(toolName, { brief: "x" }), fakeCtx(CWD))).toBeUndefined();
   });
 });
