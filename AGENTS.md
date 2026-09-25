@@ -114,13 +114,17 @@ python3 scripts/build_trae_agents.py                  # .trae/                  
 python3 scripts/_write_skills.py                      # skills/ (overwrites everything; has no --check)
 python3 scripts/build_agents.py --install-workspace /path/to/ws   # copy agents, skills and hooks into another workspace
 
-# run the swarm in isolation (SWARM_DIR otherwise defaults to <git toplevel of --root or cwd>/.swarm)
-export SWARM_DIR=/tmp/sw/.swarm
+# run the swarm in isolation (SWARM_DIR otherwise defaults to <git toplevel of --root/--repo or cwd>/.swarm)
+export SWARM_DIR=/tmp/sw/.swarm                        # this one exported dir is what keeps plan, run and status on the same Task Store
 python3 scripts/orch_plan.py --brief-text "Add /health" --pattern feature --risk-class medium   # task ids T<4 hex of correlation>-*, e.g. T7f3a-be
 python3 scripts/swarm_run.py --dry-run --json         # no model calls; canned results
 SWARM_DRYRUN_FAIL=T7f3a-be:quality python3 scripts/swarm_run.py --dry-run   # inject a gate failure
-python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3 --runtime auto|claude|grok
 python3 scripts/orch_status.py [--history T7f3a-be] [--transition T7f3a-be STATE --reason ..] [--ingest result.json]   # --ingest takes a full task.result (task_id, state, outputs, metrics, summary_md)
+
+# no SWARM_DIR: pass the same --repo to plan, run and status (state lives in <repo>/.swarm; --repo is an alias of --root)
+python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature --risk-class medium
+python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3 --runtime auto|claude|grok
+python3 scripts/orch_status.py --repo /path/to/codebase
 ```
 
 ## Code Conventions & Common Patterns
@@ -180,7 +184,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 - `swarm/taskstore.py` — states, transitions, rework and attempt limits, gates, DAG readiness.
 - `swarm/envelope.py` — the envelope schema, `SIGNATURE_REQUIRED` types, sign and verify.
 - `scripts/swarm_run.py` — runner. It also has `--once`, `--max-rounds`, `--task-timeout`, `--max-turns`, `--model`, `--allowed-tools` and `--permission-mode`.
-- `scripts/orch_plan.py` — `PATTERNS`, the custom plan schema, and the `--prefix` for task IDs (default `T`).
+- `scripts/orch_plan.py` — `PATTERNS`, the custom plan schema, and `--repo` (alias of `--root`). Task IDs default to `T<4 hex of the correlation id>` (6 hex on collision), e.g. `T7f3a-be`; an explicit `--prefix` is optional.
 - `pyproject.toml` — ruff and pytest config only; it has no `[project]` table.
 - `package.json` — `bun test` and `build-agents`, which calls the Python generator.
 - `tsconfig.json` — strict, noEmit, `bun-types`.
@@ -219,7 +223,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 - **Generated agent frontmatter.** `.claude/agents` has `model: inherit`. `.grok/agents` has `prompt_mode: full`, `agents_md: true` and `permission_mode: default`.
 
 **Gotchas**
-- **Plan re-runs.** Re-running `orch_plan.py` with the same `--prefix` in the same `SWARM_DIR` fails with exit 2 (UNIQUE constraint). Use a fresh `SWARM_DIR` or a new `--prefix`.
+- **Plan re-runs.** Re-running `orch_plan.py` with the same prefix, brief and pattern returns the existing plan (`reused: true`, same `correlation_id`, no writes, exit 0). The same prefix with a different brief or pattern exits 2 with `E-CONTRACT` and a hint to pass a new `--prefix` (or omit it for a derived one). It never raises an `IntegrityError`.
 - **Tests without bun.** `test_ts_scripts.py` is skipped when bun is missing. `test_uplift_harness.py` passes silently without it.
 - **Smoke-check after changes:**
   - Script changes: `--dry-run --json` in a temp `SWARM_DIR`.

@@ -49,18 +49,21 @@ Every script shares one CLI contract (`swarm/script_base.py`): `--task-id`, `--c
 
 ```bash
 # 1. plan: brief → task DAG (patterns: feature | hotfix | dependency | custom --plan plan.json)
-python3 scripts/orch_plan.py --brief brief.md --pattern feature --risk-class medium
+python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature --risk-class medium
 
 # 2. run autonomously (headless claude -p --agent <slug> per task, parallel where the DAG allows)
 python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3
 
-# simulate without calling Claude
-python3 scripts/swarm_run.py --dry-run
+# simulate without calling Claude (a bare --dry-run with no --repo runs the plan in the cwd's .swarm)
+python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run
 
 # 3. inspect
-python3 scripts/orch_status.py
-python3 scripts/orch_status.py --history T7f3a-be
+python3 scripts/orch_status.py --repo /path/to/codebase
+python3 scripts/orch_status.py --repo /path/to/codebase --history T7f3a-be
 ```
+
+Pass the same `--repo` to all three (or export one `SWARM_DIR` first): state lives in `<repo>/.swarm`,
+so a plan written to one repo's store is invisible to a run against another.
 
 In-session alternative: ask for the `a01-orchestrator` subagent (or say "run the swarm on …");
 it plans with `orch_plan.py` and delegates each ready task via the Agent tool using the slugs above.

@@ -53,12 +53,12 @@ built on the stdlib-only runtime in [swarm/](swarm/) (signed `swarm.v1` envelope
 lifecycle state machine, fail-closed gates, manifest registry). [agents.json](agents.json) is the manifest.
 
 ```bash
-python3 scripts/orch_plan.py --brief brief.md --pattern feature     # brief → task DAG
+python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature   # brief → task DAG in <repo>/.swarm
 python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>
-python3 scripts/swarm_run.py --dry-run --runtime grok                 # simulate the whole DAG offline
+python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
 python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook
-python3 scripts/orch_status.py                                      # status, gates, escalations
+python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
 
