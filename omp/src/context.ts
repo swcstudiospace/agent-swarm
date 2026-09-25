@@ -1,9 +1,10 @@
 /**
  * Session-log readers (D-03, research FA-2): omp's ExtensionContext has no agent or plan-mode field,
- * so identity and plan mode come from ctx.sessionManager entries. Reused by the Phase 4 guard (HOOK-03/04).
+ * so identity and plan mode come from ctx.sessionManager entries (plus omp's own argv for `--plan-yolo`, see
+ * planYoloPending). Reused by the Phase 4 guard (HOOK-03/04).
  * callingAgent is the single identity resolver (Phase 4 D-01); it alone also reads env SWARM_AGENT.
  */
-import type { ExtensionContext } from "./omp-api.ts";
+import type { ExtensionContext, SessionEntry } from "./omp-api.ts";
 
 type SessionCtx = Pick<ExtensionContext, "sessionManager">;
 
@@ -33,16 +34,36 @@ export function callingAgent(ctx: SessionCtx): string | undefined {
 }
 
 /**
- * Top-level plan mode, walking the current branch backwards:
+ * `omp --plan-yolo` (flag or `--plan-yolo=…`, before a `--` end-of-options) is in plan mode from process start
+ * until this process's plan-yolo handoff: the handoff is the only way plan-yolo leaves plan mode, and one persisted
+ * by an earlier process (a resumed session) does not count. An entry without a parseable timestamp never counts.
+ */
+function planYoloPending(branch: SessionEntry[]): boolean {
+  const argv = process.argv.slice(2); // omp's own args: cli.ts:620 runCli(process.argv.slice(2))
+  const end = argv.indexOf("--");
+  const flags = end === -1 ? argv : argv.slice(0, end);
+  if (!flags.some((a) => a === "--plan-yolo" || a.startsWith("--plan-yolo="))) return false;
+  return !branch.some(
+    (e) => e.type === "custom_message" && e.customType === "plan-yolo-handoff" && Date.parse(String(e.timestamp)) >= performance.timeOrigin,
+  );
+}
+
+/**
+ * Top-level plan mode. A top-level `--plan-yolo` session is in plan mode while planYolo is pending: omp runs an
+ * extension command (/swarm) before it arms plan-yolo, with nothing extension-visible yet (argv is the only signal).
+ * Otherwise walk the current branch backwards:
  * 1. a `mode_change` entry decides (`mode === "plan"`);
  * 2. a `plan-mode-context` custom_message before the latest user message (a mid-turn steer), or inside the
  *    contiguous custom_message run just before it (the per-prompt batch), means plan mode;
  * 3. any other entry once that user message has been crossed means not plan mode.
  * Fail-closed: after a mid-turn plan approval the rest of that turn may still read as plan mode (research A1).
- * Plan-mode subagents never see extension tools at all (omp-native restrictToolNames).
+ * Plan-mode subagents never see extension tools at all (omp-native restrictToolNames); in-process children share
+ * argv, so only the top-level session reads it (like SWARM_AGENT in callingAgent).
  */
 export function inPlanMode(ctx: SessionCtx): boolean {
   const branch = ctx.sessionManager.getBranch();
+  // omp 18.3.1 session/agent-session.ts:6652 runs extension commands; :7156 arms plan-yolo later (prewalk.ts:311)
+  if (sessionAgent(ctx).topLevel && planYoloPending(branch)) return true;
   let crossedUser = false;
   for (let i = branch.length - 1; i >= 0; i--) {
     const e = branch[i];

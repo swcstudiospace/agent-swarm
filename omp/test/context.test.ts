@@ -4,7 +4,7 @@ import { type Bridge, SwarmToolError } from "../src/bridge.ts";
 import { inPlanMode, sessionAgent } from "../src/context.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
 import { buildTools } from "../src/tools.ts";
-import { callTool, fakeCtx } from "./helpers.ts";
+import { callTool, fakeCtx, withOmpArgv } from "./helpers.ts";
 
 const model: SessionEntry = { type: "model_change", model: "m" };
 const thinking: SessionEntry = { type: "thinking_level_change", level: "low" };
@@ -51,6 +51,45 @@ test("plan mode: empty branch", () => {
 test("plan mode reads the branch, not every entry", () => {
   const ctx = { cwd: "/tmp", sessionManager: { getEntries: () => [planCtx, user], getBranch: () => [user, assistant] } };
   expect(inPlanMode(ctx)).toBe(false);
+});
+
+/** plan-yolo's handoff entry, persisted `ms` after (negative: before) this process started. */
+const handoff = (ms: number): SessionEntry => ({
+  type: "custom_message",
+  customType: "plan-yolo-handoff",
+  content: "implement",
+  timestamp: new Date(performance.timeOrigin + ms).toISOString(),
+});
+
+test.each<[string[], boolean]>([
+  [["-p", "--plan-yolo", "/swarm x"], true],
+  [["--plan-yolo=1", "-p", "/swarm x"], true],
+  [["-p", "--plan-yolo-into", "@smol", "/swarm x"], false],
+  [["-p", "--", "--plan-yolo"], false],
+  [["-p", "/swarm x"], false],
+])("plan-yolo pre-armed: argv %j on an empty branch → %p", async (argv, expected) => {
+  expect(await withOmpArgv(argv, () => planned([]))).toBe(expected);
+});
+
+test("plan-yolo pre-armed: overrides a resumed session's mode_change none", async () => {
+  expect(await withOmpArgv(["--plan-yolo"], () => planned([model, { type: "mode_change", mode: "none" }, user, assistant]))).toBe(true);
+});
+
+test("plan-yolo: this process's handoff hands the decision back to the branch walk", async () => {
+  const later = [model, planCtx, user, assistant, handoff(1000), assistant, user, assistant];
+  expect(await withOmpArgv(["--plan-yolo"], () => planned(later))).toBe(false);
+});
+
+test.each<[string, SessionEntry]>([
+  ["an earlier process's", handoff(-60_000)],
+  ["a timestamp-less", { type: "custom_message", customType: "plan-yolo-handoff", content: "implement" }],
+])("plan-yolo: %s handoff does not end plan mode", async (_name, entry) => {
+  expect(await withOmpArgv(["--plan-yolo"], () => planned([model, user, assistant, entry, assistant, user]))).toBe(true);
+});
+
+test("plan-yolo: argv is ignored in a child session (session_init), which shares the process", async () => {
+  const init: SessionEntry = { type: "session_init", agent: "a05-backend", restrictToolNames: false, tools: [] };
+  expect(await withOmpArgv(["--plan-yolo"], () => planned([init, user, assistant]))).toBe(false);
 });
 
 test("sessionAgent: session_init names the agent and the restriction", () => {

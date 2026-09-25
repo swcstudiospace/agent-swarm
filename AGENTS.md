@@ -45,7 +45,7 @@ flowchart LR
 - Each writes `verdicts/<task>.<gate>.json` and calls `TaskStore.record_verdict`.
 
 **5. Reconcile**
-- If any required gate fails: CHANGES_REQUESTED, then a rework back to IN_PROGRESS. Gate tasks are re-created as `<gate-id>.r<N>`.
+- If any required gate fails: CHANGES_REQUESTED, then a rework back to IN_PROGRESS. Each gate lineage is re-created once per rework as `<base>.r<N>` (base = the gate id without trailing `.rN`), from its latest member only, and added to the dependencies of anything that depended on the lineage.
 - The 3rd failure (`MAX_REWORK_LOOPS=2`) moves the task to ESCALATED and emits an `escalation.request` event.
 - All required gates pass or waive (unexpired, issued after the last rework): APPROVED, then DONE.
 
@@ -112,7 +112,7 @@ flowchart LR
   - A08, A09, A10 and A12 only: `swarm_gate` (qa_gate, rev_gate, sec_gate or rel_plan). It takes findings, never a verdict; the gate script derives and signs one verdict row per target. Each agent runs only its own gate (A08 quality, A09 review, A10 security, A12 release; `GATE_AGENTS` in `omp/src/context.ts`), identified by the session's `session_init` agent or, in headless `-p` sessions, `SWARM_AGENT` (set by `swarm_run.py`); any other caller gets E-POLICY.
   - The grants come from `SWARM_TOOLS` in `build_agents.py` and appear only in `omp/agents/` frontmatter. `render_omp` raises `ValueError` if A01 would get `swarm_gate`, a gate agent anything but `swarm_gate`, or any other agent a `swarm_*` tool.
 - Single bridge: every tool call and `/swarm` makes exactly one `runPy` call in `omp/src/bridge.ts`, which spawns `python3 scripts/<script>.py … --json` detached and group-kills it on abort or `session_shutdown` (the command shares the session's in-flight set with the tools). Python holds all logic; TS only builds `--flag=value` argv.
-- The four mutating tools and `/swarm` refuse with E-POLICY in omp plan mode, before any spawn or file write. `swarm_status` still works.
+- The four mutating tools and `/swarm` refuse with E-POLICY in omp plan mode, before any spawn or file write. `swarm_status` still works. A top-level session started with `omp --plan-yolo` counts as plan mode from process start until its own `plan-yolo-handoff` entry, because omp runs a first-input `/swarm` before arming plan-yolo and exposes nothing about that to extensions (`inPlanMode` in `omp/src/context.ts` reads argv for it).
 - Wiring: the committed `.omp/config.yml` (`extensions: [omp]`) makes `omp/` an extension root, so its tools, agents and skills load into omp sessions **started at the repo root**. omp reads project config from the cwd only and resolves the relative entry against the cwd, so a session started in a subdirectory loads nothing. `.omp/` holds only that file; never also add `.omp/extensions/` or a symlink, which would load the factory twice.
 - Swarm runs expect `task.isolation` off: the Task Store resolves from `SWARM_DIR` or the git toplevel of the session cwd, and isolated worktrees would split it.
 

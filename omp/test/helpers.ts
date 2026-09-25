@@ -50,6 +50,17 @@ export function isolateEnv(...keys: string[]): void {
   });
 }
 
+/** Run `fn` as if omp had been started with `args` (process.argv after the runtime and script), then restore argv. */
+export async function withOmpArgv<T>(args: string[], fn: () => T | Promise<T>): Promise<T> {
+  const saved = process.argv;
+  process.argv = [...saved.slice(0, 2), ...args];
+  try {
+    return await fn();
+  } finally {
+    process.argv = saved;
+  }
+}
+
 export interface PyRun {
   code: number;
   json: Record<string, unknown>;

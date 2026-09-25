@@ -8,7 +8,19 @@ import { HOLD_ENV, holdTimeoutMs, parseSwarmArgs, swarmCommand, swarmCorrelation
 import { DISPATCH_MARKER } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
-import { type CallLog, callTool, commandCtx, fakeCtx, fakePi, fakeTurn, gitRepo, isolateEnv, type ScriptedTurn, tmpDir } from "./helpers.ts";
+import {
+  type CallLog,
+  callTool,
+  commandCtx,
+  fakeCtx,
+  fakePi,
+  fakeTurn,
+  gitRepo,
+  isolateEnv,
+  type ScriptedTurn,
+  tmpDir,
+  withOmpArgv,
+} from "./helpers.ts";
 
 isolateEnv("SWARM_DIR", "SWARM_AGENT", HOLD_ENV);
 
@@ -289,6 +301,15 @@ test("plan mode: E-POLICY refusal, no bridge call, no dispatch", async () => {
   expect(calls(log)).toEqual(["notify"]);
   expect(String(log[0].message)).toContain("E-POLICY");
   expect(String(log[0].message)).toContain("plan mode");
+});
+
+test("plan-yolo pre-armed: `omp -p --plan-yolo '/swarm …'` refuses with E-POLICY before any bridge call", async () => {
+  const repo = gitRepo();
+  const { log, swarm } = session();
+  // omp runs the first input's slash command before it arms plan-yolo: the branch holds no plan entry yet
+  await withOmpArgv(["-p", "--plan-yolo", `/swarm ${BRIEF}`], () => swarm.handler(BRIEF, commandCtx(repo, [], { log })));
+  expect(calls(log)).toEqual(["notify"]);
+  expect(String(log[0].message)).toContain("E-POLICY");
 });
 
 test.each<[string, BridgeResult | Error]>([
