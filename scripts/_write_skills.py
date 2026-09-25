@@ -144,6 +144,31 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 """
 
 
+def omp_skill(a: dict) -> str:
+    desc = a["description"].replace('"', "'")
+    return f"""---
+name: {a['slug']}
+description: "{a['id']} {a['code']} {a['name']} — {desc} Use when the swarm assigns capability {', '.join(a['capabilities'][:3])}."
+---
+
+# {a['name']} ({a['id']} {a['code']}) — omp
+
+## When to Use
+
+- The assignment capability is one of: {', '.join(a['capabilities'])}.
+- The user names this agent, slug `{a['slug']}`, or code `{a['code']}`.
+
+Don't use for: {DONT[a['id']]}
+
+## Procedure
+
+1. Dispatch via the omp `task` tool with `agent: {a['slug']}` (definition: `omp/agents/{a['slug']}.md`), passing the signed `task.assign` payload.
+2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.
+3. Don't use it for: {DONT[a['id']]}
+"""
+
+
+
 def main() -> None:
     for a in AGENTS:
         d = ROOT / "skills" / a["slug"]
@@ -154,6 +179,11 @@ def main() -> None:
     od.mkdir(parents=True, exist_ok=True)
     (od / "SKILL.md").write_text(orch_skill())
     print("wrote", od / "SKILL.md")
+    for a in AGENTS:
+        d = ROOT / "omp" / "skills" / a["slug"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(omp_skill(a), encoding="utf-8")
+        print("wrote", d / "SKILL.md")
 
 
 if __name__ == "__main__":

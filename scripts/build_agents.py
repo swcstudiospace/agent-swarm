@@ -3,6 +3,8 @@
 
 Claude: .claude/agents/<slug>.md  (name, description, tools, model: inherit)
 Grok:   .grok/agents/<slug>.md    (prompt_mode, permission_mode, agents_md)
+omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, output)
+        omp/skills/<slug>/SKILL.md
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 """
@@ -15,10 +17,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
+from _write_skills import omp_skill  # noqa: E402
 
 CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
+OMP_AGENTS_DIR = ROOT / "omp" / "agents"
+OMP_SKILLS_DIR = ROOT / "omp" / "skills"
+SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
+TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
+BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
 
 CLAUDE_PREAMBLE = """<swarm_runtime>
 You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
@@ -86,6 +95,34 @@ def render_grok(agent: dict, defaults: dict) -> str:
         "---",
     ]
     return "\n".join(fm) + "\n\n" + GROK_PREAMBLE + "\n" + _body(agent) + "\n"
+
+
+OMP_PREAMBLE = """<swarm_runtime>
+You are running as an omp task agent inside the AgentSwarm.
+</swarm_runtime>
+"""
+
+OMP_ORCH_PREAMBLE = OMP_PREAMBLE
+
+
+def render_omp(agent: dict, agents: list[dict]) -> str:
+    output = json.dumps(json.loads(SCHEMA.read_text(encoding="utf-8")), separators=(",", ":"))
+    is_orch = agent["id"] == "A01"
+    tools = ", ".join(TOOL_MAP[t] for t in agent["tools"])
+    spawns = ", ".join(a["slug"] for a in agents if a["id"] != "A01") if is_orch else '""'
+    fm = [
+        "---",
+        f"name: {agent['slug']}",
+        f'description: "{agent["id"]} {agent["code"]} — {_desc(agent)}"',
+        f"tools: {tools}",
+        f"spawns: {spawns}",
+    ]
+    if agent["id"] in BLOCKING:
+        fm.append("blocking: true")
+    fm += [f"autoloadSkills: {agent['slug']}", f"output: {output}", "---"]
+    preamble = OMP_ORCH_PREAMBLE if is_orch else OMP_PREAMBLE
+    return "\n".join(fm) + "\n\n" + preamble + "\n" + _body(agent) + "\n"
+
 
 
 def install_targets() -> list[Path]:
@@ -159,11 +196,14 @@ def main() -> int:
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     GROK_DIR.mkdir(parents=True, exist_ok=True)
     changed, written = [], []
-    for agent in load_manifest():
+    agents = list(load_manifest())
+    for agent in agents:
         if only and agent["id"].lower() not in only and agent["slug"] not in only:
             continue
         _write_or_check(CLAUDE_DIR / f"{agent['slug']}.md", render_claude(agent, defaults), args.check, changed, written)
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
+        _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
+        _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
     if args.check:
         print("stale:" if changed else "up-to-date", ", ".join(changed))
         return 1 if changed else 0
