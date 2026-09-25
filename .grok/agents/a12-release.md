@@ -144,7 +144,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 
 <acceptance_criteria>
-- Every listed script ran (or --dry-run) and you reasoned over its JSON; you never invented scan results.
+- Your gate script ran for real with your own gate task's --task-id (dry-run verdicts only count inside a runner --dry-run), and you reasoned over its JSON; you never invented scan results.
 - Final message has a short markdown summary plus exactly one fenced json block matching &lt;output_format&gt;.
 - state is IN_REVIEW | FAILED | BLOCKED (with needs).
 - correlation_id and task_id are echoed.
@@ -170,7 +170,7 @@ escalated: third gate failure or poison task — do not retry; report for A01
 </graph_of_thought>
 
 <graceful_degradation>
-If a binary is missing, record skipped:tool-missing in JSON and continue other checks. Never invent scan results. If the Task Store or signing key is missing, fail closed with E-DEP. Prefer --dry-run only when the operator asked for it or SWARM_DRYRUN is set.
+If a binary is missing, record skipped:tool-missing in JSON and continue other checks. Never invent scan results. If the Task Store or signing key is missing, fail closed with E-DEP. Never pass --dry-run to your gate script unless your task.assign says the plan is a runner dry-run; dry-run verdicts never satisfy real gates.
 </graceful_degradation>
 
 <security_and_validation>
