@@ -102,7 +102,7 @@ def _existing(store: TaskStore, prefix: str, rows: list[tuple]) -> list[dict]:
     return found
 
 
-def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr) -> str | None:
+def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr, args) -> str | None:
     """Correlation id to reuse when the prefix already holds this exact plan, else None."""
     owners = {t["correlation_id"] for t in existing}
     if len(existing) != len(rows) or len(owners) != 1:
@@ -110,12 +110,15 @@ def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr) ->
     corr = owners.pop()
     if want_corr and want_corr != corr:
         return None
-    for t in existing:
+    for t, r in zip(existing, rows):  # _existing keeps row order, and every row is present here
         n = t["notes_json"]
         same_brief = n.get("brief_sha256") == brief_sha if "brief_sha256" in n else n.get("brief_excerpt") == brief[:2000]
         # Legacy rows without plan_sha256: pattern rows are fixed by the pattern; custom rows fail closed.
         same_plan = n["plan_sha256"] == plan_sha if "plan_sha256" in n else pattern != "custom"
         if n.get("pattern") != pattern or not same_brief or not same_plan:
+            return None
+        # WR-13: the per-task inputs this run would create (risk class decides the required gates)
+        if (t["risk_class"], t["priority"], t["acceptance"]) != (r[6] or args.risk_class, args.priority, r[7] or args.acceptance):
             return None
     return corr
 
@@ -171,13 +174,13 @@ def run(args, ctx) -> dict:
                     prefix = _derived_prefix(corr, 6)
             existing = _existing(store, prefix, rows)
             if existing:
-                reused = _reusable(existing, rows, args.pattern, brief, brief_sha, plan_sha, ctx.correlation_id)
+                reused = _reusable(existing, rows, args.pattern, brief, brief_sha, plan_sha, ctx.correlation_id, args)
                 if reused is None:
                     owners = sorted({t["correlation_id"] for t in existing})
                     hint = "pass a new --prefix" if args.prefix else "pass a new --correlation-id or --prefix for this brief"
                     raise SwarmError(ErrorCode.E_CONTRACT,
-                                     f"prefix {prefix} already used by correlation {','.join(owners)} with a "
-                                     f"different brief/pattern/plan; {hint}")
+                                     f"prefix {prefix} already used by correlation {','.join(owners)} with a different "
+                                     f"brief/pattern/plan/risk-class/priority/acceptance; {hint}")
             else:
                 reused = None
                 for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:

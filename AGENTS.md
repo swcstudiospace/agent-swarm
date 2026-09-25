@@ -230,7 +230,7 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 - **Generated agent frontmatter.** `.claude/agents` has `model: inherit`. `.grok/agents` has `prompt_mode: full`, `agents_md: true` and `permission_mode: default`.
 
 **Gotchas**
-- **Plan re-runs.** Re-running `orch_plan.py` with the same prefix, brief and pattern returns the existing plan (`reused: true`, same `correlation_id`, no writes, exit 0). The same prefix with a different brief or pattern exits 2 with `E-CONTRACT` and a hint to pass a new `--prefix` (or omit it for a derived one). It never raises an `IntegrityError`.
+- **Plan re-runs.** Re-running `orch_plan.py` with the same prefix, brief, pattern, `--risk-class`, `--priority` and `--acceptance` returns the existing plan (`reused: true`, same `correlation_id`, no writes, exit 0). The same prefix with a different brief, pattern, risk class, priority or acceptance exits 2 with `E-CONTRACT` and a hint to pass a new `--prefix` (or omit it for a derived one). It never raises an `IntegrityError`.
 - **Tests without bun.** `test_ts_scripts.py` is skipped when bun is missing. `test_uplift_harness.py` passes silently without it.
 - **Smoke-check after changes:**
   - Script changes: `--dry-run --json` in a temp `SWARM_DIR`.

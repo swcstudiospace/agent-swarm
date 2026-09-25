@@ -6,6 +6,8 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
+
 from conftest import ROOT, run_script
 
 
@@ -58,6 +60,21 @@ def test_same_prefix_other_brief_exit2(tmp_path):
     assert json.loads(r.stdout)["error"]["code"] == "E-CONTRACT"
     assert "--prefix" in r.stdout
     assert "IntegrityError" not in r.stdout + r.stderr
+    assert _counts(tmp_path) == before
+
+
+@pytest.mark.parametrize("change", [["--risk-class", "high"], ["--priority", "P0"], ["--acceptance", "p99 < 200ms"]])
+def test_same_prefix_other_task_inputs_exit2(tmp_path, change):
+    """WR-13: a re-plan asking for another risk class/priority/acceptance must not reuse the old (lower-gated) plan."""
+    env = _env(tmp_path)
+    base = ["--brief-text", "billing", "--prefix", "R", "--risk-class", "low"]
+    assert _plan(env, *base).returncode == 0
+    before = _counts(tmp_path)
+    same = _plan(env, *base)
+    assert same.returncode == 0 and json.loads(same.stdout)["reused"] is True, same.stdout + same.stderr
+    r = _plan(env, *base, *change)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert json.loads(r.stdout)["error"]["code"] == "E-CONTRACT"
     assert _counts(tmp_path) == before
 
 
