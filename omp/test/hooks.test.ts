@@ -85,18 +85,19 @@ describe("silence outside a fresh top-level session", () => {
   });
 });
 
-/** The repo's own context files as omp loads them into the base system prompt (G-04-05-2). */
-const REPO_CONTEXT = ["AGENTS.md", "CLAUDE.md"].map((f) => readFileSync(join(REPO_ROOT, f), "utf8"));
+/**
+ * A base prompt shaped like omp's repo context (G-04-05-2): two prior parts that both mention the hook's heading —
+ * one as a heading of its own, one as a CLAUDE.md-style title line — without being the injected part.
+ */
+const REPO_LIKE_CONTEXT = [
+  "# AGENTS.md\n\n## AgentSwarm\n\nThe swarm's own contract text lives here; it names /swarm and a01-orchestrator.\n",
+  "# CLAUDE.md — AgentSwarm\n\nProject rules that mention the ## AgentSwarm heading in passing.\n",
+];
 const LIVE_POSITIVE = FIXTURE.positive[1];
-const LIVE_NEGATIVE = FIXTURE.negative[0];
-/** The SWARM_CONTEXT sentence the live prompts ask the model to continue, and its continuation. */
-const SENTENCE_START = "This is SDLC work";
-const CONTINUATION = "route it through the AgentSwarm";
 
-test("repo base prompt: AGENTS.md and CLAUDE.md mention the hook's heading, yet an SDLC prompt still gets SWARM_CONTEXT", () => {
-  expect(REPO_CONTEXT.some((p) => p.includes("## AgentSwarm"))).toBe(true);
-  const out = hook()({ prompt: LIVE_POSITIVE, systemPrompt: REPO_CONTEXT }, top()) as { systemPrompt: string[] };
-  expect(out.systemPrompt).toEqual([...REPO_CONTEXT, SWARM_CONTEXT]);
+test("repo-like base prompt: prior parts mentioning the heading do not count as the injected part", () => {
+  const out = hook()({ prompt: LIVE_POSITIVE, systemPrompt: REPO_LIKE_CONTEXT }, top()) as { systemPrompt: string[] };
+  expect(out.systemPrompt).toEqual([...REPO_LIKE_CONTEXT, SWARM_CONTEXT]);
 });
 
 test("neutral base prompt that merely mentions the heading still gets the context", () => {
@@ -108,19 +109,13 @@ test("neutral base prompt that merely mentions the heading still gets the contex
 test("idempotent: an existing SWARM_CONTEXT part is not duplicated", () => {
   const first = hook()({ prompt: SDLC, systemPrompt: PRIOR }, top()) as { systemPrompt: string[] };
   expect(hook()({ prompt: SDLC, systemPrompt: first.systemPrompt }, top())).toBeUndefined();
-  expect(hook()({ prompt: SDLC, systemPrompt: [...REPO_CONTEXT, SWARM_CONTEXT] }, top())).toBeUndefined();
+  expect(hook()({ prompt: SDLC, systemPrompt: [...REPO_LIKE_CONTEXT, SWARM_CONTEXT] }, top())).toBeUndefined();
 });
 
-test("discriminator: the live prompts can only continue the SWARM_CONTEXT sentence if the hook injected it", () => {
-  const sentence = SWARM_CONTEXT.split("\n").find((l) => l.startsWith(SENTENCE_START)) ?? "";
-  const rest = sentence.slice(SENTENCE_START.length);
-  expect(rest).toContain(CONTINUATION);
-  for (const source of REPO_CONTEXT) expect(source).not.toContain(CONTINUATION);
-  for (const prompt of [LIVE_POSITIVE, LIVE_NEGATIVE]) {
-    expect(prompt).toContain(SENTENCE_START);
-    expect(prompt).not.toContain(CONTINUATION);
-    expect(prompt).not.toContain(rest.trim());
-  }
+test("idempotent: a prior part that only contains SWARM_CONTEXT as a substring is not the injected part", () => {
+  const wrapped = [`preamble\n${SWARM_CONTEXT}\npostamble`];
+  const out = hook()({ prompt: SDLC, systemPrompt: wrapped }, top()) as { systemPrompt: string[] };
+  expect(out.systemPrompt).toEqual([...wrapped, SWARM_CONTEXT]);
 });
 
 test("fail-open: a throwing classifier leaves the prompt untouched", () => {

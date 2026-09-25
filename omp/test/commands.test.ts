@@ -119,18 +119,17 @@ function turnSession(script: ScriptedTurn, opts?: Parameters<typeof swarmCommand
 }
 
 test("async start: waitForIdle resolves at once while the turn is in flight, yet the handler holds until isIdle flips true", async () => {
-  const { log, turn, swarm, ctx } = turnSession({ startMs: 30, durationMs: 50 });
-  const t0 = Date.now();
+  const { log, turn, swarm, ctx } = turnSession({ startMs: 30 });
   let settled = false;
   const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
 
-  await Bun.sleep(60); // the fake turn is in flight (30 ms → 80 ms)
+  await turn.started(); // 30 ms in: a handler that did not hold would have settled by now
   expect(turn.ended()).toBe(false);
   expect(settled).toBe(false);
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start"]); // waitForIdle not yet called
 
+  turn.finish(); // the turn ends on this call, not on a timer racing the assertions above
   await run;
-  expect(Date.now() - t0).toBeGreaterThanOrEqual(80);
   expect(turn.ended()).toBe(true);
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "turn-end", "waitForIdle", "notify"]);
   expect(log.at(-1)?.message).toContain(`plan ${CORR} dispatched`);
