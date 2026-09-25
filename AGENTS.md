@@ -84,10 +84,21 @@ flowchart LR
 
 **Generation pipeline**
 - `prompts/` + `agents.json` → `build_agents.py` → `.claude/agents/<slug>.md`, `.grok/agents/<slug>.md`, `omp/agents/<slug>.md` and `omp/skills/<slug>/SKILL.md`
-  - `omp/` holds only `agents/` and `skills/`. `omp/package.json`, the extension entry and `.omp` wiring arrive in Phase 3.
+  - `omp/agents/` and `omp/skills/` are generated; `omp/package.json`, `omp/src/` and `omp/test/` are hand-written (see **omp extension package** below).
   - omp `tools:` lists are not a sandbox; nothing enforces read-only yet (that arrives with the Phase 4 guard).
 - `prompts/` + `agents.json` → `build_trae_agents.py` → `.trae/`: 15 XML prompts of at most 10,000 characters each, `registration.json`, `commands/swarm.md`, `README.md`
 - `_write_skills.py` → `skills/<slug>/SKILL.md`, `skills/orchestrate/SKILL.md` and `omp/skills/<slug>/SKILL.md`
+
+**omp extension package** (`omp/`, name `agent-swarm-omp`, no npm dependencies)
+- `omp/package.json` declares `omp.extensions: ["./src/index.ts"]`. The entry's factory only registers: no fs calls, spawns or `pi` actions at load (pinned by `omp/test/extension.test.ts`).
+- Five typed tools, each `hidden: true` and `loadMode: "essential"`, so a session only gets the ones its agent's `tools:` frontmatter names:
+  - A01 only: `swarm_status` (read-only, `orch_status.py`), `swarm_plan` (`orch_plan.py`; patterns feature, hotfix and dependency, no custom DAG), `swarm_ingest` (`orch_status.py --ingest`, the result object is written by the bridge under `$SWARM_DIR/results/`) and `swarm_transition` (`orch_status.py --transition`).
+  - A08, A09, A10 and A12 only: `swarm_gate` (qa_gate, rev_gate, sec_gate or rel_plan). It takes findings, never a verdict; the gate script derives and signs one verdict row per target.
+  - The grants come from `SWARM_TOOLS` in `build_agents.py` and appear only in `omp/agents/` frontmatter. `render_omp` raises `ValueError` if A01 would get `swarm_gate`, a gate agent anything but `swarm_gate`, or any other agent a `swarm_*` tool.
+- Single bridge: every tool call makes exactly one `runPy` call in `omp/src/bridge.ts`, which spawns `python3 scripts/<script>.py … --json` detached and group-kills it on abort or `session_shutdown`. Python holds all logic; TS only builds `--flag=value` argv.
+- The four mutating tools refuse with E-POLICY in omp plan mode, before any spawn or file write. `swarm_status` still works.
+- Wiring: the committed `.omp/config.yml` (`extensions: [omp]`) makes `omp/` an extension root, so its tools, agents and skills load into omp sessions **started at the repo root**. omp reads project config from the cwd only and resolves the relative entry against the cwd, so a session started in a subdirectory loads nothing. `.omp/` holds only that file; never also add `.omp/extensions/` or a symlink, which would load the factory twice.
+- Swarm runs expect `task.isolation` off: the Task Store resolves from `SWARM_DIR` or the git toplevel of the session cwd, and isolated worktrees would split it.
 
 ## Key Directories
 
@@ -100,6 +111,8 @@ flowchart LR
 | `03-agents/` | Original 7-section agent specs (Purpose, Stack, Communication, Decision logic, Errors, Metrics, Security) |
 | `hooks/` | `user_prompt_submit.py` and `autonomous_run.py` |
 | `.claude/agents/`, `.grok/agents/`, `.trae/`, `skills/`, `omp/agents/`, `omp/skills/` | **Generated.** Never hand-edit |
+| `omp/package.json`, `omp/src/`, `omp/test/` | Hand-written omp extension package (tools, single python bridge) and its `bun:test` suite |
+| `.omp/config.yml` | Committed omp project wiring (`extensions: [omp]`); the only file in `.omp/` |
 | `.swarm/` | Runtime state (own `.gitignore` of `*`, written on creation; the repo's `.gitignore` is never touched): `tasks.db`, `events.jsonl`, `plans/`, `assignments/`, `results/`, `verdicts/`, `kickoffs/`, `releases/`, `artifacts/`, `slo/`, `incidents/`, `patch_tasks/` |
 | `docs/superpowers/specs/` | Spec for the prompt uplift, TS twins, skills and hooks |
 
@@ -109,7 +122,8 @@ flowchart LR
 # tests
 python3 -m pytest                                     # all Python tests (pyproject adds -q)
 python3 -m pytest tests/test_swarm.py::test_plan_and_run_dry
-bun test                                              # tests/ts/*.test.ts (== npm test; runs no Python tests)
+bun test tests/ts                                     # root TS suite: tests/ts/*.test.ts (runs no Python tests)
+cd omp && bun run test                               # omp package suite: extension.test.ts in its own process, then the rest
 ruff check .                                          # py312, E/F/W, E501 ignored; currently 3 pre-existing errors
 
 # regenerate after editing prompts/ or agents.json (run BOTH)
@@ -209,14 +223,15 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
   - `SWARM_AGENTS_FILE`, `SWARM_RUNTIME`, `SWARM_DRYRUN_FAIL`, `SWARM_CHILD`, `SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY`.
   - `SWARM_AGENT_SESSION=1` is set by `swarm_run.py` for agent sessions, which run without signing keys or `SWARM_REQUIRE_KEY`. Gate scripts record nothing there; they write the envelope file and emit `gate.verdict.unrecorded`.
   - `SWARM_TASK_ID` and `SWARM_CORRELATION_ID` are the defaults for `--task-id` and `--correlation-id` in every script. A stale exported `SWARM_CORRELATION_ID` makes gate scripts exit 2 E-POLICY on a gate task of another correlation; the message names both correlations and the env var. Unset it or pass `--correlation-id` explicitly.
-- **No git repo of its own.** This directory has no `.git`; it is untracked under `/root/src/repos`.
+- **Git.** The repo is tracked in git (remote `swcstudiospace/agent-swarm`).
 - **Host-specific absolute paths.** `.mcp.json`, `skills/orchestrate/SKILL.md` and `.grok/hooks/agent-swarm.json` hard-code `/root/src/repos/agent-swarm`.
 
 ## Testing & QA
 
 **Frameworks**
-- pytest runs 41 tests in `tests/`. There is no conftest, CI or coverage config.
-- `bun:test` covers `tests/ts/script_base.test.ts`.
+- pytest runs the tests in `tests/` (`tests/conftest.py` holds the `swarm_dir` fixture). There is no coverage config.
+- `bun:test` covers the root TS suite `bun test tests/ts` (`tests/ts/script_base.test.ts`) and the omp package suite `cd omp && bun run test` (`omp/test/`). Run the omp suite through `bun run test`, not a bare `bun test`: `extension.test.ts` mocks `node:fs` process-wide, so it runs in its own process.
+- CI: `.github/workflows/ci.yml` runs `python3 -m pytest`, both generator `--check`s, `bun test tests/ts` and `cd omp && bun run test`.
 
 **Isolation**
 - Tests run scripts as subprocesses (`[sys.executable, ...]`, `cwd=ROOT`).

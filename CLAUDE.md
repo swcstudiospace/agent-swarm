@@ -13,8 +13,11 @@ a Claude Code and Grok Build subagent whose Prompt-Uplift XML prompt lives in `p
 | `agents.json` | Manifest: id, code, slug, capabilities, consumes/produces, tools, model, scripts |
 | `.claude/agents/*.md` | **Generated** Claude Code subagents (`python3 scripts/build_agents.py`) |
 | `.grok/agents/*.md` | **Generated** Grok Build subagents |
-| `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). Not a sandbox: tool lists are unenforced until Phase 4 |
-| `omp/skills/<slug>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`). No `omp/package.json` or `.omp` wiring until Phase 3 |
+| `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). `tools:` adds the hidden swarm tools per agent (`SWARM_TOOLS`). Not a sandbox: tool lists are unenforced until Phase 4 |
+| `omp/skills/<slug>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`) |
+| `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: five typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`) |
+| `omp/test/` | **Hand-written** `bun:test` suite for the package (`cd omp && bun run test`) |
+| `.omp/config.yml` | Committed omp project wiring: `extensions:` → `- omp` (the only file in `.omp/`) |
 | `skills/<slug>/SKILL.md` | Per-agent + `orchestrate` skills (copy with `--install-workspace`) |
 | `scripts/ts/` | TypeScript twins of every `scripts/*.py` tool |
 | `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier |
@@ -69,6 +72,26 @@ so a plan written to one repo's store is invisible to a run against another.
 
 In-session alternative: ask for the `a01-orchestrator` subagent (or say "run the swarm on …");
 it plans with `orch_plan.py` and delegates each ready task via the Agent tool using the slugs above.
+
+## omp extension package
+
+Start omp **at the repo root**: `.omp/config.yml` is project config, which omp reads from the cwd only,
+and its `omp` entry resolves against the cwd. That makes `omp/` an extension root, so its tools, agents and
+skills load together. Never also add `.omp/extensions/` or a symlink (the factory would load twice).
+Swarm runs expect `task.isolation` off, so every session resolves the same Task Store.
+
+The five tools are `hidden` + `essential`; an agent only gets the ones its generated `tools:` names:
+
+| Tool | Granted to | Runs |
+|---|---|---|
+| `swarm_plan` | A01 | `orch_plan.py` (feature / hotfix / dependency) |
+| `swarm_status` | A01 | `orch_status.py` (read-only) |
+| `swarm_ingest` | A01 | `orch_status.py --ingest` (task.result v1 object) |
+| `swarm_transition` | A01 | `orch_status.py --transition` |
+| `swarm_gate` | A08, A09, A10, A12 | `qa_gate` / `rev_gate` / `sec_gate` / `rel_plan` (findings in, signed verdict out) |
+
+Mutating tools refuse with E-POLICY in omp plan mode. Tests: `cd omp && bun run test` (package suite;
+`extension.test.ts` runs in its own process) and `bun test tests/ts` (root TS suite).
 
 ## Rules the runtime enforces (mirrors the spec)
 

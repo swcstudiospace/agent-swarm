@@ -292,6 +292,36 @@ def test_omp_no_host_paths():
             assert "/root/" not in p.read_text(encoding="utf-8"), p
 
 
+def _yaml_lists(text):
+    """Minimal reader for a YAML mapping of block lists (`key:` then `  - item` lines); stdlib only."""
+    out, key = {}, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            assert line.endswith(":"), line
+            key = line[:-1]
+            out[key] = []
+        else:
+            item = line.strip()
+            assert key is not None and item.startswith("- "), line
+            out[key].append(item[2:].strip())
+    return out
+
+
+def test_omp_wiring():
+    """D-11 / PKG-04: the repo loads its own package through `.omp/config.yml` only, never a symlink or copies."""
+    config = ROOT / ".omp" / "config.yml"
+    assert _yaml_lists(config.read_text(encoding="utf-8")) == {"extensions": ["omp"]}
+    for name in ("agents", "skills", "extensions"):
+        assert not os.path.lexists(ROOT / ".omp" / name), name
+    ignored = subprocess.run(["git", "check-ignore", "-q", ".omp/config.yml"], cwd=ROOT)
+    assert ignored.returncode == 1  # 1 = not ignored (0 would mean .gitignore hides the wiring)
+    pkg = json.loads((ROOT / "omp" / "package.json").read_text(encoding="utf-8"))
+    assert pkg["omp"]["extensions"] == ["./src/index.ts"]
+
+
 _TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", "omp")
 
 
