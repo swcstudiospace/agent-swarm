@@ -18,8 +18,9 @@ const STATES = [
   "APPROVED", "DONE", "BLOCKED", "FAILED", "RETRY", "ESCALATED", "CANCELLED",
 ] as const;
 
-/** orch_plan.py choices: --pattern (PATTERNS + custom), --risk-class (taskstore.py GATES_BY_RISK), --priority. */
-const PATTERNS = ["feature", "hotfix", "dependency", "custom"] as const;
+/** orch_plan.py choices: --pattern (PATTERNS only: `custom` needs --plan <path>, which no tool exposes), --risk-class
+ * (taskstore.py GATES_BY_RISK), --priority. */
+const PATTERNS = ["feature", "hotfix", "dependency"] as const;
 const RISK_CLASSES = ["low", "medium", "high"] as const;
 const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 
@@ -149,8 +150,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       "Plan a swarm run from a brief (A01): creates the pattern's task DAG in the Task Store (PLANNED, gates " +
       "derived from the risk class) under one correlation id. Re-running with the same brief, pattern, risk class, " +
       "priority, acceptance and correlation_id reuses the existing plan (`reused: true`) instead of duplicating it. " +
-      "dry_run lists the tasks that would be created without writing. `custom` needs a custom DAG, which this tool " +
-      "does not accept (python rejects it).",
+      "dry_run lists the tasks that would be created without writing.",
     parameters: {
       type: "object",
       properties: {

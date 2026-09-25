@@ -66,14 +66,20 @@ const RESULT = {
   summary_md: "patched",
 };
 
-test("plan dry: 13/8/8 tasks per pattern", async () => {
+test("plan dry: every advertised pattern plans (feature 13, hotfix 8, dependency 8)", async () => {
   const { ctx } = tmpStore();
   const { tool } = swarm();
-  for (const [pattern, n] of [["feature", 13], ["hotfix", 8], ["dependency", 8]] as const) {
-    const res = await callTool(tool("swarm_plan"), { brief: "b", pattern, risk_class: "medium", dry_run: true }, ctx);
+  const expected: Record<string, number> = { feature: 13, hotfix: 8, dependency: 8 };
+  // the schema must not advertise a pattern (e.g. `custom`) that python always rejects through this tool
+  const props = tool("swarm_plan").parameters.properties;
+  const pattern = props && typeof props === "object" && "pattern" in props ? props.pattern : undefined;
+  const advertised = pattern && typeof pattern === "object" && "enum" in pattern && Array.isArray(pattern.enum) ? pattern.enum.map(String) : [];
+  expect([...advertised].sort()).toEqual(Object.keys(expected).sort());
+  for (const name of advertised) {
+    const res = await callTool(tool("swarm_plan"), { brief: "b", pattern: name, risk_class: "medium", dry_run: true }, ctx);
     const details = res.details as { dry_run: boolean; tasks: unknown[] };
     expect(details.dry_run).toBe(true);
-    expect(details.tasks).toHaveLength(n);
+    expect(details.tasks).toHaveLength(expected[name]);
   }
 });
 
