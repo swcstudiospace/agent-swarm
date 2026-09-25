@@ -376,13 +376,19 @@ export function resolvePath(p: string, facts: Pick<GuardFacts, "cwd" | "home">):
 }
 const within = (path: string, dir: string) => dir !== "" && dir !== "/" && path.startsWith(`${dir}/`);
 
-/** An `rm -rf` target that is `/`, `~`, outside cwd (incl. `..`), cwd itself, or any `.git`/`.swarm` path. */
-function dangerousRmTarget(target: string, facts: GuardFacts): boolean {
-  if (target.split("/").some((s) => s === ".git" || s === ".swarm")) return true;
+/** A repo-state segment (`.git`, `.swarm`, `.omp`) anywhere in the target path, before any resolution. */
+const repoStateSegment = (target: string) => target.split("/").some((s) => s === ".git" || s === ".swarm" || s === ".omp");
+
+/** An `rm -rf` target that is `/`, `~`, outside cwd (incl. `..`) or cwd itself. */
+function outsideCwd(target: string, facts: GuardFacts): boolean {
   return !within(resolvePath(target, facts), posix.resolve(facts.cwd || "/"));
 }
 
-function rmRecursiveForce({ words }: Segment, facts: GuardFacts): boolean {
+/**
+ * `rm` that is universal-destructive: `-r -f` of `/`, `~`, cwd or anything outside it; `-r` alone of a `.git`,
+ * `.swarm` or `.omp` path; and any `rm` of a `.swarm`/`.omp` path (the D-08 state dirs), whatever the flags.
+ */
+function rmProtected({ words }: Segment, facts: GuardFacts): boolean {
   if (words[0] !== "rm") return false;
   let recursive = false;
   let force = false;
@@ -398,7 +404,7 @@ function rmRecursiveForce({ words }: Segment, facts: GuardFacts): boolean {
       force ||= w.includes("f");
     } else targets.push(w);
   }
-  return recursive && force && targets.some((t) => dangerousRmTarget(t, facts));
+  return targets.some((t) => isProtectedPath(t, facts) || (recursive && (repoStateSegment(t) || (force && outsideCwd(t, facts)))));
 }
 
 /** `git push` of tags, or to main/master or a release tag (refspec destination). */
@@ -440,6 +446,41 @@ function shellWriteTargets({ text, words }: Segment): string[] {
   return targets;
 }
 
+/**
+ * Files a segment mutates in place, as far as detectable: the operands of rmdir/unlink/shred/truncate/sqlite3/chmod/
+ * chown/chgrp/touch/mkdir, the destination of ln/rsync, `sed -i` file operands, `dd of=`, `tar -C`/`--directory`,
+ * `unzip -d`. `$SWARM_DIR`/symlink spellings stay the documented residual.
+ */
+function shellMutateTargets({ words }: Segment): string[] {
+  const cmd = words[0] ?? "";
+  const args = operands(words.slice(1));
+  if (/^(?:rmdir|unlink|shred|truncate|sqlite3|chmod|chown|chgrp|touch|mkdir|mkfifo)$/.test(cmd)) return args;
+  // ln and rsync read their sources and write the last operand
+  if (cmd === "ln" || cmd === "rsync") return args.length > 1 ? [args[args.length - 1]] : [];
+  if (cmd === "sed") {
+    if (!words.some((w) => /^-[A-Za-z]*i|^--in-place/.test(w))) return [];
+    // the first operand is the script unless one was given with -e/-f
+    const scripted = words.some((w) => /^(?:-[A-Za-z]*[ef]|--expression|--file)/.test(w));
+    return scripted ? args : args.slice(1);
+  }
+  if (cmd === "dd") return words.flatMap((w) => (w.startsWith("of=") ? [w.slice(3)] : []));
+  const valueOf = (flags: string[], long?: string): string[] => {
+    const out: string[] = [];
+    for (let i = 1; i < words.length; i++) {
+      if (flags.includes(words[i]) && words[i + 1] !== undefined) out.push(words[i + 1]);
+      else if (long !== undefined && words[i].startsWith(`${long}=`)) out.push(words[i].slice(long.length + 1));
+    }
+    return out;
+  };
+  if (cmd === "tar") return valueOf(["-C", "--directory"], "--directory");
+  if (cmd === "unzip") return valueOf(["-d"]);
+  return [];
+}
+
+/** `sqlite3` opened on a path under `.swarm/` (the Task Store): a swarm-state write for anyone but A01 (WR-06). */
+const sqliteOnSwarm = ({ words }: Segment, facts: GuardFacts) =>
+  words[0] === "sqlite3" && operands(words.slice(1)).some((t) => resolvePath(t, facts).split("/").includes(".swarm"));
+
 /** Gate script stem → its gate (swarm_gate's GATE_SCRIPTS, plus the gate names themselves). */
 const GATE_STEMS: Record<string, keyof typeof GATE_AGENTS> = {
   qa_gate: "quality", quality_gate: "quality", rev_gate: "review", review_gate: "review",
@@ -465,13 +506,14 @@ export const RULES: readonly Rule[] = [
     id: "orch-state-shell",
     capability: "swarm-state",
     reason: SWARM_STATE_REASON,
-    pattern: ({ text }, facts) => facts.agent !== ORCHESTRATOR && ORCH_STATE_SHELL.some((re) => re.test(text)),
+    pattern: (seg, facts) => facts.agent !== ORCHESTRATOR && (ORCH_STATE_SHELL.some((re) => re.test(seg.text)) || sqliteOnSwarm(seg, facts)),
     samples: [
       "python3 scripts/orch_status.py --ingest r.json",
       "python3 scripts/orch_status.py --transition T-1 DONE",
       "python3 scripts/orch_plan.py --brief-text x",
       "bun scripts/ts/orch_plan.ts",
       "scripts/ts/orch_status.ts --ingest x",
+      "sqlite3 .swarm/tasks.db \"UPDATE tasks SET state='DONE'\"",
     ],
   },
   // gate scripts are identity-bound in bash as in swarm_gate (Phase 3 WR-03)
@@ -488,6 +530,28 @@ export const RULES: readonly Rule[] = [
     capability: "protected_path",
     pattern: (seg, facts) => shellWriteTargets(seg).some((t) => isProtectedPath(t, facts)),
     samples: ["echo x > .swarm/a", "tee -a .omp/config.yml", "cp f ~/.omp/x", "mv a .swarm/b", "echo x >>~/.omp/agent/config.yml"],
+  },
+  // D-08: in-place mutation of .swarm/, .omp/ or ~/.omp through other tools (rm is the destructive row below)
+  {
+    id: "protected-path-mutate",
+    capability: "protected_path",
+    pattern: (seg, facts) => shellMutateTargets(seg).some((t) => isProtectedPath(t, facts)),
+    samples: [
+      "truncate -s0 .swarm/tasks.db",
+      "sed -i 's/a/b/' .omp/config.yml",
+      "sqlite3 ~/.omp/x.db 'DELETE FROM t'",
+      "chmod 600 .swarm/keys",
+      "rmdir .swarm/plans",
+      "unlink .omp/config.yml",
+      "shred ~/.omp/agent/config.yml",
+      "ln -s /tmp/x .swarm/tasks.db",
+      "rsync -a src/ .swarm/",
+      "dd if=/dev/zero of=.swarm/tasks.db",
+      "tar -xf a.tar -C .swarm",
+      "unzip a.zip -d ~/.omp",
+      "touch .swarm/x",
+      "mkdir -p .omp/extensions",
+    ],
   },
   // universal destructive (every swarm agent, treated as L4)
   {
@@ -532,7 +596,12 @@ export const RULES: readonly Rule[] = [
     },
     samples: ["git checkout -- .", "git restore ."],
   },
-  { id: "rm-rf-protected", capability: "destructive", pattern: rmRecursiveForce, samples: ["rm -rf /", "rm -rf ~", "rm -rf .git"] },
+  {
+    id: "rm-rf-protected",
+    capability: "destructive",
+    pattern: rmProtected,
+    samples: ["rm -rf /", "rm -rf ~", "rm -rf .git", "rm -r .git", "rm .swarm/tasks.db", "rm -f .omp/config.yml", "rm -r .swarm"],
+  },
   {
     id: "chmod-777-recursive",
     capability: "destructive",

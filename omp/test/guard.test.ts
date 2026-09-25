@@ -592,8 +592,52 @@ describe("HOOK-03 shell twin and D-08", () => {
     },
   );
 
-  test.each(["cat .swarm/tasks.db", "cp .omp/config.yml /tmp/x.yml", "echo x > out.txt", "ls 2>&1 | tee log.txt"])("D-08 shell: %s passes", (command) => {
+  test.each([
+    "cat .swarm/tasks.db", "cp .omp/config.yml /tmp/x.yml", "echo x > out.txt", "ls 2>&1 | tee log.txt",
+    // WR-06 negatives: reads and mutations elsewhere
+    "sed 's/a/b/' .omp/config.yml", "sed -i 's/a/b/' README.md", "sqlite3 /tmp/x.db 'SELECT 1'", "tar -tf .swarm/a.tar", "tar -xf a.tar -C build",
+    "dd if=.swarm/tasks.db of=/tmp/x", "chmod 755 x", "mkdir -p build/out", "touch out.txt", "ln -s /a /b", "rsync -a .swarm/ /tmp/bak/",
+    "unzip a.zip -d build", "rmdir build", "truncate -s0 log.txt",
+  ])("D-08 shell: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
+  /** WR-06: in-place mutation of the state dirs through other tools; rm of them is the destructive row. */
+  test.each([
+    ["truncate -s0 .swarm/tasks.db", "protected_path: protected-path-mutate"],
+    ["sed -i 's/a/b/' .omp/config.yml", "protected_path: protected-path-mutate"],
+    ["sed -i -e 's/a/b/' .omp/config.yml", "protected_path: protected-path-mutate"],
+    ["sed --in-place=.bak 's/a/b/' ~/.omp/agent/config.yml", "protected_path: protected-path-mutate"],
+    ["sqlite3 ~/.omp/x.db 'DELETE FROM t'", "protected_path: protected-path-mutate"],
+    ["chmod 600 .swarm/keys", "protected_path: protected-path-mutate"],
+    ["chown u:g .swarm", "protected_path: protected-path-mutate"],
+    ["ln -s /tmp/x .swarm/tasks.db", "protected_path: protected-path-mutate"],
+    ["rsync -a src/ .swarm/", "protected_path: protected-path-mutate"],
+    ["dd if=/dev/zero of=.swarm/tasks.db", "protected_path: protected-path-mutate"],
+    ["tar -xf a.tar -C .swarm", "protected_path: protected-path-mutate"],
+    ["tar xf a.tar --directory=.swarm", "protected_path: protected-path-mutate"],
+    ["unzip a.zip -d ~/.omp", "protected_path: protected-path-mutate"],
+    ["touch .swarm/x", "protected_path: protected-path-mutate"],
+    ["mkdir -p .omp/extensions", "protected_path: protected-path-mutate"],
+    ["rmdir .swarm/plans", "protected_path: protected-path-mutate"],
+    ["unlink .omp/config.yml", "protected_path: protected-path-mutate"],
+    ["rm .swarm/tasks.db", "destructive: rm-rf-protected"],
+    ["rm -f .swarm/tasks.db", "destructive: rm-rf-protected"],
+    ["rm -r .swarm", "destructive: rm-rf-protected"],
+    ["rm -r .git", "destructive: rm-rf-protected"],
+    ["rm -f ~/.omp/agent/config.yml", "destructive: rm-rf-protected"],
+    [`rm ${CWD}/.omp/config.yml`, "destructive: rm-rf-protected"],
+  ])("WR-06: %s blocks inside naming %s, passes in main", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test("WR-06: sqlite3 on the Task Store is swarm-state for a05 and a protected-path mutation for A01", () => {
+    const write = bash("sqlite3 .swarm/tasks.db \"UPDATE tasks SET state='DONE'\"");
+    expect(guardToolCall(write, facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
+    expect(guardToolCall(bash(`sqlite3 ${CWD}/.swarm/tasks.db .dump`), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
+    expect(guardToolCall(write, facts(A01))).toEqual({ block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-mutate)" });
+    expect(guardToolCall(write, facts(undefined))).toBeUndefined();
   });
 
   test("through the handler: eval, protected write and orch shell block for a05; main untouched", () => {
