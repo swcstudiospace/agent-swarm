@@ -110,7 +110,8 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     corr = ctx.correlation_id or (gate_task["correlation_id"] if gate_task else None)
     if simulate:
         extra = {**(extra or {}), "dry_run": True}
-    task = ctx.task_id or ("T-dry" if simulate else "T-unassigned")
+    from .script_base import check_task_id
+    task = check_task_id(ctx.task_id or ("T-dry" if simulate else "T-unassigned"))
     session = os.environ.get("SWARM_AGENT_SESSION") == "1"
     # WR-15: a key-less agent-session preview never records, so it must not raise the security.dev_key
     # misconfiguration signal; gate.verdict.unrecorded below marks it instead

@@ -9,8 +9,12 @@ import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInput
 import { inPlanMode } from "./context.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 
-/** Schema pattern for ids that become argv values: never dash-leading (argparse would read a flag). */
-const ID = { type: "string", pattern: "^[^-]", minLength: 1 } as const;
+/**
+ * Schema pattern for ids that become argv values and (task ids) file names: mirrors swarm/script_base.py
+ * TASK_ID_RE + no "..", which python enforces (CR-01). Never dash-leading, so argparse never reads a flag.
+ */
+export const ID_PATTERN = "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
+const ID = { type: "string", pattern: ID_PATTERN, minLength: 1 } as const;
 
 /** The 14 Task Store states (swarm/taskstore.py:22-36 TaskState). */
 const STATES = [

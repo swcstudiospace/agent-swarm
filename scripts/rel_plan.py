@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from swarm.script_base import AgentScript  # noqa: E402
+from swarm.script_base import AgentScript, check_task_id  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
 from swarm.verdicts import issue_gate, resolve_targets  # noqa: E402
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
@@ -139,7 +139,7 @@ def run(args, ctx) -> dict:
             mine.append(findings[-1])
 
     primary = ids[0] if ids else "T-unassigned"
-    release_id = args.release_id or f"REL-{primary}"
+    release_id = check_task_id(args.release_id or f"REL-{primary}", "release id")  # a file name below (CR-01)
     gates = sorted({g for t in per_task.values() for g in t["required"]}) or [g for g in GATES_BY_RISK[risk] if g != "release"]
     plan = build_plan(release_id, risk, ids, gates, [a for a in artifacts if a])
     runs = {g: ("pass" if all(t["gates"].get(g, "ok") == "ok" for t in per_task.values()) else "fail") for g in gates}

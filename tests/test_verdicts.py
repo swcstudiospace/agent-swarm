@@ -441,3 +441,25 @@ def test_release_dry_run_honours_freeze(swarm_dir):
     assert row["verdict"] == "fail"
     assert [(f["kind"], f["severity"]) for f in json.loads(row["findings"])] == [("freeze", "blocker")]
     assert freeze.exists()
+
+
+@pytest.mark.parametrize("script,gate", [("qa_gate.py", "quality"), ("rev_gate.py", "review"),
+                                         ("sec_gate.py", "security"), ("rel_plan.py", "release")])
+def test_path_task_id_rejected_without_writing(swarm_dir, tmp_path, script, gate):
+    """CR-01: a task id is a file name under verdicts/, so a traversal or absolute id is E-INPUT and writes nothing."""
+    (tmp_path / "out").mkdir()
+    for bad, escaped in [("../../esc", tmp_path / f"esc.{gate}.json"),
+                         (str(tmp_path / "out" / "evil"), tmp_path / "out" / f"evil.{gate}.json"),
+                         ("a/b", swarm_dir / "verdicts" / "a" / f"b.{gate}.json"), ("-x", None), ("a\x01", None)]:
+        r = run_script(script, f"--task-id={bad}", "--dry-run", "--json")
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert json.loads(r.stdout)["error"]["code"] == "E-INPUT"
+        assert escaped is None or not escaped.exists()
+    assert not list((swarm_dir / "verdicts").glob("**/*")) if (swarm_dir / "verdicts").exists() else True
+    assert not list(tmp_path.glob(f"**/*.{gate}.json"))
+
+
+def test_release_id_is_not_a_path(swarm_dir, tmp_path):
+    r = run_script("rel_plan.py", "--task-ids=T-x", "--release-id=../../esc", "--json")
+    assert r.returncode == 2 and json.loads(r.stdout)["error"]["code"] == "E-INPUT"
+    assert not list(tmp_path.glob("**/esc.plan.json"))

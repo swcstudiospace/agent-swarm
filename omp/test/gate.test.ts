@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, type BridgeResult, SwarmToolError } from "../src/bridge.ts";
 import { buildTools } from "../src/tools.ts";
-import { type AnyTool, callTool, fakeCtx, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
+import { type AnyTool, callTool, fakeCtx, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_DIR");
 
@@ -111,4 +111,21 @@ test("gate failing verdict is returned with FAIL: and not thrown", async () => {
   const res = await callTool(gate, { gate: "review", task_id: "F-rev", correlation_id: "c1" }, fakeCtx(gitRepo()));
   expect(res.content[0].text).toBe("FAIL: review gate FAIL");
   expect((res.details as { verdict: string }).verdict).toBe("fail");
+});
+
+test("gate task_id schema pattern accepts exactly the ids python accepts (CR-01)", () => {
+  const { parameters } = gateWith().gate;
+  const pattern = new RegExp((parameters.properties as Record<string, { pattern: string }>).task_id.pattern);
+  const ids = ["T7f3a-be", "F-rev", "c-hot", "0f8e2c1a-9b7d-4e3f-8a21-1b2c3d4e5f60", "a.b_c", "../../esc", "/tmp/evil",
+    "a/b", "a\\b", "-x", ".x", "a..b", "a\u0000", "a b", "", "x".repeat(128), "x".repeat(129)];
+  const py = Bun.spawnSync(["python3", "-c",
+    "import json,sys\nfrom swarm.script_base import check_task_id\nfrom swarm.errors import SwarmError\n" +
+    "def ok(v):\n try:\n  check_task_id(v); return True\n except SwarmError:\n  return False\n" +
+    "print(json.dumps([ok(v) for v in json.load(sys.stdin)]))"],
+  { cwd: REPO_ROOT, stdin: Buffer.from(JSON.stringify(ids)), stdout: "pipe", stderr: "pipe" });
+  expect(py.exitCode).toBe(0);
+  const accepted = JSON.parse(py.stdout.toString()) as boolean[];
+  expect(ids.map((id) => pattern.test(id))).toEqual(accepted);
+  expect(accepted.slice(0, 5)).toEqual([true, true, true, true, true]);
+  expect(accepted.slice(5, 15).some(Boolean)).toBe(false);
 });

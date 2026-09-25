@@ -17,16 +17,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .errors import SwarmError, classify
+from .errors import ErrorCode, SwarmError, classify
 from .runlog import emit
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Canonical task-id shape (CR-01): ids become file names (verdicts/<id>.<gate>.json, releases/<id>.plan.json),
+# so no path separator, no "..", no leading dash or dot, no NUL. omp/src/tools.ts mirrors it as a schema pattern.
+TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def check_task_id(value: str, what: str = "task id") -> str:
+    """Return `value` if it is a safe task id, else E-INPUT."""
+    if not TASK_ID_RE.fullmatch(value) or ".." in value:
+        raise SwarmError(ErrorCode.E_INPUT, f"invalid {what} {value!r}: use [A-Za-z0-9._-], starting alphanumeric, "
+                                            "no '..', at most 128 chars")
+    return value
 
 
 @dataclass
@@ -65,6 +78,8 @@ class AgentScript:
         args = self.parser().parse_args(argv)
         ctx = Ctx(self.agent_id, self.name, args.task_id, args.correlation_id, args.dry_run, Path(args.root).resolve())
         try:
+            if ctx.task_id is not None:
+                check_task_id(ctx.task_id)
             result = self.run(args, ctx)
             result.setdefault("agent", self.agent_id)
             result.setdefault("script", self.name)
