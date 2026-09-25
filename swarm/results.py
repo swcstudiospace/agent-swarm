@@ -71,9 +71,7 @@ def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
     for target, v in (result.get("verdicts") or {}).items():
         if target not in notes.get("gate_for", []) or not isinstance(v, dict) or v.get("verdict") != "fail":
             continue
-        fb = store.get(target)["notes_json"].get("feedback", [])
-        fb.append({"gate": gate, "source": "agent", "findings": v.get("findings", [])})
-        store.set_notes(target, feedback=fb)
+        store.append_feedback(target, {"gate": gate, "source": "agent", "findings": v.get("findings", [])})
 
 
 def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, meta: dict, emit: Emit, mode: str) -> str:

@@ -365,6 +365,17 @@ class TaskStore:
         return d
 
     def set_notes(self, task_id: str, **kv) -> dict:
-        notes = self.get(task_id)["notes_json"]
-        notes.update(kv)
-        return self.update(task_id, notes=json.dumps(notes))
+        """Merge kv into notes; re-read and write under one write lock so concurrent writers keep each other's keys."""
+        with self.transaction():
+            notes = self.get(task_id)["notes_json"]
+            notes.update(kv)
+            self.update(task_id, notes=json.dumps(notes))
+        return self.get(task_id)
+
+    def append_feedback(self, task_id: str, entry: dict) -> dict:
+        """Append entry to notes.feedback in one transaction; parallel gate scripts and runner threads lose none."""
+        with self.transaction():
+            notes = self.get(task_id)["notes_json"]
+            notes.setdefault("feedback", []).append(entry)
+            self.update(task_id, notes=json.dumps(notes))
+        return self.get(task_id)

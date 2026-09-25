@@ -105,3 +105,57 @@ def test_state_change_and_audit_row_atomic(swarm_dir, monkeypatch, case):
     after = TaskStore(db).get("A-1")
     assert (after["state"], after["attempt"], after["rework_loops"]) == (row["state"], row["attempt"], row["rework_loops"])
     assert TaskStore(db).history("A-1") == before
+
+
+# ------------------------------------------------------------------ WR-03: notes read-modify-write, gate rows
+FEEDBACK = """
+for i in range(25):
+    store.append_feedback(rest[0], {"p": int(rest[1]), "n": i})
+print("ok")
+"""
+
+NOTES = """
+for i in range(25):
+    store.set_notes(rest[0], **{rest[1]: i})
+print("ok")
+"""
+
+
+def test_append_feedback_no_lost_updates(tmp_path, swarm_dir):
+    db = swarm_dir / "tasks.db"
+    store = _planned(db, "F-1")
+    assert _race(tmp_path, db, FEEDBACK, [["F-1", p] for p in range(4)]) == ["ok"] * 4
+    fb = store.get("F-1")["notes_json"]["feedback"]
+    assert len(fb) == 100
+    assert sorted((e["p"], e["n"]) for e in fb) == [(p, i) for p in range(4) for i in range(25)]
+
+
+def test_set_notes_keeps_concurrent_keys(tmp_path, swarm_dir):
+    db = swarm_dir / "tasks.db"
+    store = _planned(db, "N-1", keep="x")
+    assert _race(tmp_path, db, NOTES, [["N-1", "a"], ["N-1", "b"]]) == ["ok", "ok"]
+    notes = store.get("N-1")["notes_json"]
+    assert (notes.get("a"), notes.get("b"), notes.get("keep")) == (24, 24, "x")
+
+
+def test_record_gate_verdicts_all_or_nothing(swarm_dir):
+    import sqlite3
+    from swarm.errors import SwarmError
+    from swarm.taskstore import TaskStore
+    from swarm.verdicts import SIM_FINDING, record_gate_verdicts
+    db = swarm_dir / "tasks.db"
+    store = TaskStore(db)
+    store.create(task_id="T-be", correlation_id="c", capability="code.backend")
+    store.create(task_id="G-q", correlation_id="c", capability="qa.test",
+                 notes={"gate": "quality", "gate_for": ["T-be", "T-missing"], "gates": []})
+    for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"):  # leased gate task
+        store.transition("G-q", s)
+    with pytest.raises(SwarmError):
+        record_gate_verdicts(store, gate_task_id="G-q", gate="quality", agent_id="A08", findings=[dict(SIM_FINDING)],
+                             runs={}, correlation_id="c", expires_s=3600, emit=lambda *a, **k: None)
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM verdicts WHERE task_id='T-be'").fetchone()[0] == 0
+    finally:
+        con.close()
+    assert "feedback" not in TaskStore(db).get("T-be")["notes_json"]
