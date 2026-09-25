@@ -3,10 +3,10 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, type BridgeResult, SwarmToolError } from "../src/bridge.ts";
-import { buildTools } from "../src/tools.ts";
-import { type AnyTool, callTool, fakeCtx, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
+import { buildTools, GATE_AGENTS } from "../src/tools.ts";
+import { type AnyTool, agentCtx, callTool, fakeCtx, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR");
+isolateEnv("SWARM_DIR", "SWARM_AGENT");
 
 function gateWith(result: BridgeResult = { exitCode: 0, json: { status: "ok", summary: "gate PASS" }, swarmDir: "" }) {
   const calls: BridgeRequest[] = [];
@@ -64,7 +64,7 @@ test("gate non-review findings refuse E-INPUT before the bridge", async () => {
   const { calls, gate } = gateWith();
   for (const g of ["quality", "security", "release"]) {
     const params = { gate: g, task_id: "F-qa", correlation_id: "c1", per_target_findings: { "F-be": [] } };
-    const err = await callTool(gate, params, fakeCtx(gitRepo())).catch((e: unknown) => e);
+    const err = await callTool(gate, params, agentCtx(gitRepo(), GATE_AGENTS[g as keyof typeof GATE_AGENTS])).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SwarmToolError);
     expect((err as SwarmToolError).code).toBe("E-INPUT");
   }
@@ -78,14 +78,14 @@ test("gate argv: whitelisted flags, GATE_SCRIPTS mapping, bridge-owned findings 
   const repo = gitRepo();
   const { calls, gate } = gateWith();
   const findings = { "F-be": [{ severity: "major", summary: "sql injection", location: "be/db.py:3" }], "F-fe": [] };
-  await gate.execute("toolu_9", { gate: "review", task_id: "F-rev", correlation_id: "c1", per_target_findings: findings }, undefined, undefined, fakeCtx(repo));
+  await gate.execute("toolu_9", { gate: "review", task_id: "F-rev", correlation_id: "c1", per_target_findings: findings }, undefined, undefined, agentCtx(repo, GATE_AGENTS.review));
   const file = join(sdir, "results", "findings-toolu_9.json");
   expect(calls[0].script).toBe("rev_gate");
   expect(calls[0].args).toEqual([`--root=${repo}`, "--task-id=F-rev", "--correlation-id=c1", `--per-target-findings=${file}`]);
   expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(findings);
 
   for (const [g, script] of [["quality", "qa_gate"], ["security", "sec_gate"], ["release", "rel_plan"]]) {
-    await callTool(gate, { gate: g, task_id: "F-x", correlation_id: "c1", dry_run: true }, fakeCtx(repo));
+    await callTool(gate, { gate: g, task_id: "F-x", correlation_id: "c1", dry_run: true }, agentCtx(repo, GATE_AGENTS[g as keyof typeof GATE_AGENTS]));
     const call = calls[calls.length - 1];
     expect(call.script).toBe(script);
     expect(call.args).toEqual([`--root=${repo}`, "--task-id=F-x", "--correlation-id=c1", "--dry-run"]);
@@ -96,7 +96,7 @@ test("gate extra keys never reach python", async () => {
   const repo = gitRepo();
   const { calls, gate } = gateWith();
   const forged = { gate: "security", task_id: "F-sec", correlation_id: "c1", verdict: "pass", verdicts: { "F-be": "pass" }, args: ["--dry-run"] };
-  await callTool(gate, forged, fakeCtx(repo));
+  await callTool(gate, forged, agentCtx(repo, GATE_AGENTS.security));
   expect(calls[0].args).toEqual([`--root=${repo}`, "--task-id=F-sec", "--correlation-id=c1"]);
 });
 
@@ -108,7 +108,7 @@ test("gate description states the failing-finding rule", () => {
 
 test("gate failing verdict is returned with FAIL: and not thrown", async () => {
   const { gate } = gateWith({ exitCode: 1, json: { status: "fail", verdict: "fail", summary: "review gate FAIL" }, swarmDir: "" });
-  const res = await callTool(gate, { gate: "review", task_id: "F-rev", correlation_id: "c1" }, fakeCtx(gitRepo()));
+  const res = await callTool(gate, { gate: "review", task_id: "F-rev", correlation_id: "c1" }, agentCtx(gitRepo(), GATE_AGENTS.review));
   expect(res.content[0].text).toBe("FAIL: review gate FAIL");
   expect((res.details as { verdict: string }).verdict).toBe("fail");
 });
@@ -128,4 +128,45 @@ test("gate task_id schema pattern accepts exactly the ids python accepts (CR-01)
   expect(ids.map((id) => pattern.test(id))).toEqual(accepted);
   expect(accepted.slice(0, 5)).toEqual([true, true, true, true, true]);
   expect(accepted.slice(5, 15).some(Boolean)).toBe(false);
+});
+
+test("gate identity: only the gate's own agent runs it; mismatch or unknown identity is E-POLICY before the bridge (WR-03)", async () => {
+  const sdir = tmpDir("swarm-omp-dir-");
+  process.env.SWARM_DIR = sdir;
+  const repo = gitRepo();
+  const { calls, gate } = gateWith();
+  const gates = Object.keys(GATE_AGENTS) as Array<keyof typeof GATE_AGENTS>;
+  const refused = async (g: string, ctx: ReturnType<typeof fakeCtx>) => {
+    const params = { gate: g, task_id: "F-x", correlation_id: "c1", ...(g === "review" ? { per_target_findings: { "F-be": [] } } : {}) };
+    const err = await callTool(gate, params, ctx).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SwarmToolError);
+    expect((err as SwarmToolError).code).toBe("E-POLICY");
+  };
+  delete process.env.SWARM_AGENT;
+  for (const g of gates) {
+    for (const other of gates.filter((o) => o !== g)) await refused(g, agentCtx(repo, GATE_AGENTS[other])); // another gate agent
+    await refused(g, agentCtx(repo, "a01-orchestrator")); // a non-gate agent
+    await refused(g, fakeCtx(repo)); // no session_init, no SWARM_AGENT: unknown identity
+  }
+  process.env.SWARM_AGENT = GATE_AGENTS.security;
+  await refused("review", fakeCtx(repo)); // headless identity mismatch
+  expect(calls).toHaveLength(0);
+  expect(existsSync(join(sdir, "results"))).toBe(false);
+
+  for (const g of gates) {
+    await callTool(gate, { gate: g, task_id: "F-x", correlation_id: "c1" }, agentCtx(repo, GATE_AGENTS[g]));
+    expect(calls[calls.length - 1].script).toBe(g === "quality" ? "qa_gate" : g === "review" ? "rev_gate" : g === "security" ? "sec_gate" : "rel_plan");
+  }
+  process.env.SWARM_AGENT = ` ${GATE_AGENTS.release} `; // headless `-p`: identity from the runner's env
+  await callTool(gate, { gate: "release", task_id: "F-x", correlation_id: "c1" }, fakeCtx(repo));
+  expect(calls).toHaveLength(gates.length + 1);
+});
+
+test("gate agents are agents.json gate agents granted swarm_gate", () => {
+  const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "agents.json"), "utf8")) as { agents: Array<{ slug: string }> };
+  const slugs = new Set(manifest.agents.map((a) => a.slug));
+  for (const slug of Object.values(GATE_AGENTS)) {
+    expect(slugs.has(slug)).toBe(true);
+    expect(readFileSync(join(REPO_ROOT, "omp", "agents", `${slug}.md`), "utf8")).toMatch(/^tools: .*\bswarm_gate\b/m);
+  }
 });

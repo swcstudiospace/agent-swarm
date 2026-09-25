@@ -117,6 +117,11 @@ export function fakeCtx(cwd: string, entries: SessionEntry[] = []): ExtensionCon
   return { cwd, sessionManager: { getEntries: () => entries, getBranch: () => entries } };
 }
 
+/** A ctx whose session_init names `agent` (e.g. the gate agent a swarm_gate call must come from). */
+export function agentCtx(cwd: string, agent: string, entries: SessionEntry[] = []): ExtensionContext {
+  return fakeCtx(cwd, [{ type: "session_init", agent, restrictToolNames: true, tools: [] }, ...entries]);
+}
+
 /** Call a registered tool's execute with omp's argument order (signal 3rd). */
 export function callTool(
   tool: AnyTool,

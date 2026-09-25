@@ -9,9 +9,9 @@ import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import * as nodeFs from "node:fs";
 import type { BridgeRequest, BridgeResult } from "../src/bridge.ts";
 import type * as EntryModule from "../src/index.ts";
-import { callTool, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
+import { agentCtx, callTool, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID");
+isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT");
 
 // Capture the real functions before mocking, so the wrappers never call themselves.
 const realFs: Record<string, unknown> = { ...nodeFs };
@@ -141,7 +141,7 @@ test("bridge once per tool: one recorded bridge call each with the expected scri
   spawn.mockClear();
   for (const [name, params, script, args] of cases) {
     calls.length = 0;
-    const res = await callTool(pi.tool(name), params, ctx);
+    const res = await callTool(pi.tool(name), params, name === "swarm_gate" ? agentCtx(repo, "a09-reviewer") : ctx);
     expect(calls).toHaveLength(1);
     expect(calls[0].script).toBe(script);
     expect(calls[0].args).toEqual(args);

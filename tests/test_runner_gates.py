@@ -81,6 +81,7 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     env = seen["env"]
     assert not set(KEY_VARS) & set(env)
     assert env["SWARM_AGENT_SESSION"] == "1"
+    assert env["SWARM_AGENT"] == "a09-reviewer"  # the session identity swarm_gate binds the gate to
     assert env["SWARM_CHILD"] == "1"
     assert os.environ["SWARM_SIGNING_KEY"] == "s"  # the runner keeps its own key
 

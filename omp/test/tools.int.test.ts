@@ -6,9 +6,9 @@ import { join } from "node:path";
 import { type Bridge, type BridgeRequest, runPy, SwarmToolError } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry } from "../src/omp-api.ts";
-import { callTool, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
+import { agentCtx, callTool, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION");
+isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION", "SWARM_AGENT");
 
 /** All tools over the real bridge, counting bridge calls. */
 function swarm() {
@@ -206,7 +206,7 @@ test("gate signed rows: one verdict per gate_for target, derived from its findin
     "F-fe": [{ severity: "minor", summary: "naming nit" }],
     "F-data": [],
   };
-  const res = await callTool(tool("swarm_gate"), { gate: "review", task_id: "F-rev", correlation_id: "c-feat", per_target_findings }, ctx);
+  const res = await callTool(tool("swarm_gate"), { gate: "review", task_id: "F-rev", correlation_id: "c-feat", per_target_findings }, agentCtx(ctx.cwd, "a09-reviewer"));
   expect(res.content[0].text.startsWith("FAIL: review gate FAIL")).toBe(true); // exit 1 is returned, not thrown
   expect((res.details as { recorded: string[] }).recorded).toEqual(["F-be", "F-data", "F-fe"]);
 

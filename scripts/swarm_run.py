@@ -130,7 +130,9 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
     env = {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}
-    env.update(SWARM_DIR=str(swarm_dir(repo)), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", AIO_UPLIFT="0", AIO_SWARM="0")
+    # SWARM_AGENT: the session's agent identity; the omp swarm_gate tool runs only that agent's gate (WR-03)
+    env.update(SWARM_DIR=str(swarm_dir(repo)), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=agent["slug"],
+               AIO_UPLIFT="0", AIO_SWARM="0")
     if runtime == "grok":
         grok_bin = getattr(args, "grok_bin", "grok")
         cmd = [grok_bin, "-p", "--agent", agent["slug"], "--output-format", "json",

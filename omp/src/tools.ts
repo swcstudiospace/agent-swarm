@@ -3,10 +3,11 @@
  * Bridge exactly once; Python decides everything (TS holds no state or validation logic).
  * D-01: every tool is hidden + essential, so only sessions whose agent frontmatter names it get it.
  * D-03: mutating tools refuse with E-POLICY in plan mode before any argv, file or bridge work.
+ * WR-03: swarm_gate runs only the calling gate agent's own gate (GATE_AGENTS), E-POLICY otherwise.
  */
 import { gitToplevel } from "../../scripts/ts/script_base.ts";
 import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInputFile } from "./bridge.ts";
-import { inPlanMode } from "./context.ts";
+import { inPlanMode, sessionAgent } from "./context.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 
 /**
@@ -31,6 +32,13 @@ const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 /** Gate → script (copied from swarm/verdicts.py:17 GATE_SCRIPTS); the script derives and signs the verdict. */
 const GATE_SCRIPTS = { quality: "qa_gate", review: "rev_gate", security: "sec_gate", release: "rel_plan" } as const satisfies Record<string, Script>;
 type Gate = keyof typeof GATE_SCRIPTS;
+/** Gate → the only agent (omp slug, agents.json) allowed to run it (D-12 separation of gate duties). */
+export const GATE_AGENTS = { quality: "a08-qa", review: "a09-reviewer", security: "a10-security", release: "a12-release" } as const satisfies Record<Gate, string>;
+
+/** The calling agent: the session's session_init agent, else env SWARM_AGENT (headless `-p` sessions). */
+function callingAgent(ctx: ExtensionContext): string | undefined {
+  return sessionAgent(ctx).agent ?? (process.env.SWARM_AGENT?.trim() || undefined);
+}
 /** Finding severities (copied from swarm/gates.py:10 SEVERITIES); BLOCKING_SEVERITY = "major". */
 const SEVERITIES = ["info", "minor", "major", "critical", "blocker"] as const;
 /** qa_gate's own --timeout default (1800 s) plus a margin, so the bridge never kills a test run first. */
@@ -271,6 +279,14 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     async run(toolCallId, params, signal, ctx) {
       const script = GATE_SCRIPTS[params.gate];
       if (!script) throw new SwarmToolError("E-INPUT", `unknown gate ${JSON.stringify(params.gate)}`);
+      const agent = callingAgent(ctx);
+      if (agent !== GATE_AGENTS[params.gate]) {
+        throw new SwarmToolError(
+          "E-POLICY",
+          `swarm_gate refused: the ${params.gate} gate is run only by ${GATE_AGENTS[params.gate]}, ` +
+            `not ${agent === undefined ? "an unidentified session" : JSON.stringify(agent)}`,
+        );
+      }
       if (params.per_target_findings !== undefined && params.gate !== "review") {
         throw new SwarmToolError("E-INPUT", `per_target_findings is only accepted by the review gate, not ${params.gate}`);
       }
