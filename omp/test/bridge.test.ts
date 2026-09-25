@@ -283,6 +283,25 @@ test("abort after exit: a child that already exited 0 still rejects", async () =
   await expectGroupDead(pids);
 });
 
+test("escalation: no SIGKILL reaches the group after a SIGTERM'd child has exited (WR-02)", async () => {
+  const { cwd, root } = setup();
+  const file = join(root, "pids.json");
+  const ac = new AbortController();
+  const kill = spyOn(process, "kill");
+  try {
+    const p = runScript({ script: "fx_sleep", args: [`--pids=${file}`], cwd, signal: ac.signal });
+    const pids = await pidsFrom(file);
+    ac.abort();
+    await rejection(p);
+    await expectGroupDead(pids);
+    await Bun.sleep(3_300); // past the 3 s SIGTERM → SIGKILL grace
+    const toGroup = kill.mock.calls.filter(([target]) => target === -pids.child).map(([, sig]) => sig);
+    expect(toGroup).toEqual(["SIGTERM"]);
+  } finally {
+    kill.mockRestore();
+  }
+}, 10_000);
+
 test("abort before start: rejects without spawning", async () => {
   const { cwd } = setup();
   const spawn = spyOn(Bun, "spawn");

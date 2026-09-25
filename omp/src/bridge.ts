@@ -139,11 +139,14 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
 
   const pid = child.pid;
   let stopped: StopReason | undefined;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
   const stop = (why: StopReason) => {
     if (stopped) return;
     stopped = why;
     killGroup(pid, "SIGTERM");
-    setTimeout(() => killGroup(pid, "SIGKILL"), KILL_GRACE_MS).unref(); // escalate if SIGTERM is ignored
+    // escalate if SIGTERM is ignored; cleared once the child has exited, so it never hits a reused pgid (WR-02)
+    killTimer = setTimeout(() => killGroup(pid, "SIGKILL"), KILL_GRACE_MS);
+    killTimer.unref();
   };
   inflight?.add(stop);
   const onAbort = () => stop("abort");
@@ -175,6 +178,7 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
     throw new SwarmToolError("E-INTERNAL", `${script} unexpected exit ${code}: ${(stderr.trim() || stdout.trim()).slice(-TAIL)}`, json);
   } finally {
     clearTimeout(timer);
+    clearTimeout(killTimer);
     signal?.removeEventListener("abort", onAbort);
     inflight?.delete(stop);
   }
