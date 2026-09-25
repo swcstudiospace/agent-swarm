@@ -143,6 +143,55 @@ def test_runner_records_gate_after_session(tmp_path, monkeypatch):
     assert validate_verdict(envelope)["verdict"] == "pass"
 
 
+_REV_STUB = r'''#!@PY@
+import json, re, sys
+if sys.argv[1:3] == ["auth", "status"]:
+    print('{"loggedIn": true}')
+    sys.exit(0)
+prompt = sys.stdin.read()
+tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
+if '"gate": "review"' not in prompt:
+    res = {"task_id": tid, "state": "IN_REVIEW", "summary_md": "built"}
+elif @MODE@ == "crash":
+    print(json.dumps({"is_error": True, "result": "API Error: overloaded"}))
+    sys.exit(1)
+else:
+    res = {"task_id": tid, "state": "BLOCKED", "needs": "human-approval: diff touches prod IAM policy"}
+print(json.dumps({"result": "done\n```json\n" + json.dumps(res) + "\n```"}))
+'''
+
+
+@pytest.mark.parametrize("mode", ["crash", "blocked"])
+def test_failed_gate_session_records_no_verdict(tmp_path, mode):
+    """CR-04: a review session that crashed or reported BLOCKED must not satisfy the target's review gate."""
+    work = tmp_path / "work"
+    work.mkdir()
+    stub = tmp_path / "claude-stub"
+    stub.write_text(_REV_STUB.replace("@PY@", sys.executable).replace("@MODE@", repr(mode)))
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"tasks": [
+        {"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
+        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
+         "gates": {"gate": "review", "for": ["be"]}},
+    ]}))
+    swarm = tmp_path / ".swarm"
+    env = _clean_env(SWARM_DIR=str(swarm), SWARM_SIGNING_KEY="runner-secret")
+    p = subprocess.run([sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--plan", str(plan), "--prefix", "S",
+                        "--risk-class", "low", "--repo", str(work), "--json"], capture_output=True, text=True, env=env, cwd=ROOT)
+    assert p.returncode == 0, p.stdout + p.stderr
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--claude-bin", str(stub),
+                        "--runtime", "claude", "--repo", str(work), "--json"],
+                       capture_output=True, text=True, env=env, cwd=ROOT, timeout=600)
+    assert r.returncode in (0, 1), r.stdout[-2000:] + r.stderr[-1500:]
+    assert [x for x in _rows(swarm, "S-be") if x["gate"] == "review"] == []
+    con = sqlite3.connect(swarm / "tasks.db")
+    states = dict(con.execute("SELECT task_id, state FROM tasks"))
+    con.close()
+    assert states["S-be"] == "IN_REVIEW"
+    assert states["S-rev"] == ("ESCALATED" if mode == "crash" else "BLOCKED")
+
+
 def test_agent_session_gate_script_records_nothing(swarm_dir):
     from swarm.taskstore import TaskStore
     env = {"SWARM_DIR": str(swarm_dir)}

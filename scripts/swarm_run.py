@@ -262,16 +262,22 @@ def execute_one(store_path, task, agent, args, ctx, repo):
             text, meta = run_agent_headless(agent, prompt, repo, args)
         (sdir / "results").mkdir(parents=True, exist_ok=True)
         (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
-        if not args.dry_run and task["notes_json"].get("gate"):
+        result, err = None, None
+        try:
+            result = validate_result(parse_result(text), task_id=tid)
+        except SwarmError as e:
+            err = e
+        # CR-04: record a gate only for a session that completed and asked to finish it — a crashed, errored or
+        # BLOCKED/FAILED gate session gets no script run, so its targets keep the gate absent
+        if (not args.dry_run and task["notes_json"].get("gate") and result is not None
+                and result["state"] == S.IN_REVIEW.value and not meta.get("is_error") and not meta.get("returncode")):
             # WR-12: the key-holding runner, not the agent, records this gate — once per dispatch, still leased
             run_gate_script(task, repo, sdir, dry_run=False, timeout=args.task_timeout,
                             findings_file=review_findings_file(task, text, sdir))
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
-        try:
-            result = validate_result(parse_result(text), task_id=tid)
-        except SwarmError as e:
-            outcome = reject(store, tid, reason=str(e), mode="headless", emit=ctx.emit)
+        if result is None:
+            outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
         else:
             outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit, mode="headless")
     except subprocess.TimeoutExpired:
