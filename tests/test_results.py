@@ -164,3 +164,28 @@ def test_task_id_mismatch_rejected(tmp_path, swarm_dir):
     failed = [h for h in _history(env, "T-one") if h["to_state"] == "FAILED"]
     assert failed and failed[0]["reason"].startswith("E-CONTRACT") and "mismatch" in failed[0]["reason"]
     assert _history(env, "T-two")[-1]["to_state"] == "PLANNED"
+
+
+def test_ingest_blocked_task_rejected(tmp_path, swarm_dir):
+    env = _plan(tmp_path, swarm_dir, TWO_TASKS)
+    r = run_script("orch_status.py", "--transition", "T-one", "BLOCKED", "--reason", "needs: human-approval (L4 destructive)",
+                   "--json", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    before = _history(env, "T-one")
+    r = _ingest(tmp_path, env, {"task_id": "T-one", "state": "IN_REVIEW"})
+    assert r.returncode == 2 and "E-CONTRACT" in r.stdout, r.stdout + r.stderr
+    hist = _history(env, "T-one")
+    assert hist == before and hist[-1]["to_state"] == "BLOCKED"
+    assert any(e["payload"]["task_id"] == "T-one" for e in _events(swarm_dir, "task.result.rejected"))
+
+
+def test_ingest_unmet_dependencies_rejected(tmp_path, swarm_dir):
+    plan = {"tasks": [TWO_TASKS["tasks"][0], {**TWO_TASKS["tasks"][1], "depends_on": ["one"]}]}
+    env = _plan(tmp_path, swarm_dir, plan)
+    before = _history(env, "T-two")
+    r = _ingest(tmp_path, env, {"task_id": "T-two", "state": "IN_REVIEW"})
+    assert r.returncode == 2 and "E-CONTRACT" in r.stdout and "dependencies" in r.stdout, r.stdout + r.stderr
+    hist = _history(env, "T-two")
+    assert hist == before and hist[-1]["to_state"] == "PLANNED"
+    assert "CLAIMED" not in [h["to_state"] for h in hist]
+    assert any(e["payload"]["task_id"] == "T-two" for e in _events(swarm_dir, "task.result.rejected"))

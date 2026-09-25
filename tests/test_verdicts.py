@@ -159,6 +159,10 @@ def test_ingest_gate_result_no_rows(tmp_path, swarm_dir):
     env = {"SWARM_DIR": str(swarm_dir)}
     _plan(env)
     targets = _notes(swarm_dir, "X-qa")["gate_for"]
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    for s in ("CLAIMED", "IN_PROGRESS"):  # A01 lease; ingest no longer auto-claims a task with unmet deps
+        ts.transition("X-qa", s)
     fnd = [{"id": "Q-1", "severity": "major", "kind": "functional", "summary": "broken"}]
     res = {"task_id": "X-qa", "gate": "quality", "state": "IN_REVIEW",
            "verdicts": {targets[0]: {"verdict": "fail", "findings": fnd}, targets[1]: {"verdict": "pass", "findings": []},

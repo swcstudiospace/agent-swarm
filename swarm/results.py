@@ -6,9 +6,11 @@ The ONE intended mode difference:
   * mode="headless": the session is over, so a final state of IN_PROGRESS is a contract failure
     (FAILED "E-CONTRACT: session ended in IN_PROGRESS"); a missing/invalid result also becomes
     FAILED E-CONTRACT and counts as an attempt (retry ladder → ESCALATED at max_attempts).
-  * mode="ingest": IN_PROGRESS is a claim/heartbeat; PLANNED/RETRY/BLOCKED tasks are auto-claimed
-    (CLAIMED → IN_PROGRESS, event task.claimed) before the reported state is applied. Invalid input
-    is rejected with E-CONTRACT and no transition (never consumes an attempt).
+  * mode="ingest": IN_PROGRESS is a claim/heartbeat; PLANNED/RETRY tasks whose dependencies are satisfied are
+    auto-claimed (CLAIMED → IN_PROGRESS, event task.claimed) before the reported state is applied. A BLOCKED
+    task (e.g. needs: human-approval) or one with unmet dependencies is rejected: A01 releases BLOCKED only with
+    `orch_status.py --transition` after approval. Invalid input is rejected with E-CONTRACT and no transition
+    (never consumes an attempt).
 Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
 """
 from __future__ import annotations
@@ -80,9 +82,15 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
     state = result["state"]
     if mode == "headless" and state == S.IN_PROGRESS.value:
         return reject(store, tid, reason="E-CONTRACT: session ended in IN_PROGRESS", mode=mode, emit=emit)
-    if mode == "ingest" and task["state"] in (S.PLANNED.value, S.RETRY.value, S.BLOCKED.value):
-        store.transition(tid, S.CLAIMED, actor=agent_id, reason="claimed via task.result ingest")
-        store.transition(tid, S.IN_PROGRESS, actor=agent_id, reason="lease started")
+    if mode == "ingest" and task["state"] == S.BLOCKED.value:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"{tid} is BLOCKED; A01 releases it with orch_status --transition after approval",
+                         task_id=tid)
+    if mode == "ingest" and task["state"] in (S.PLANNED.value, S.RETRY.value):
+        with store.transaction():  # the dependency check and the claim see one snapshot
+            if not store.deps_satisfied(store.get(tid)):
+                raise SwarmError(ErrorCode.E_CONTRACT, f"{tid} has unmet dependencies", task_id=tid)
+            store.transition(tid, S.CLAIMED, actor=agent_id, reason="claimed via task.result ingest")
+            store.transition(tid, S.IN_PROGRESS, actor=agent_id, reason="lease started")
         emit("task.claimed", {"task_id": tid, "agent": agent_id, "mode": mode})
     current = store.get(tid)["state"]
     if state == S.BLOCKED.value:
