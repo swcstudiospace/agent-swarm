@@ -49,8 +49,8 @@ const FINDING = {
     id: { type: "string" },
     kind: { type: "string", description: "e.g. semantic, security, functional" },
     evidence: { type: "string" },
-    ac_ref: { type: "string", description: "Acceptance criterion it violates" },
-    owner_suggestion: { type: "string", description: "Agent that should fix it, e.g. A05" },
+    ac_ref: { type: ["string", "null"], description: "Acceptance criterion it violates" },
+    owner_suggestion: { type: ["string", "null"], description: "Agent that should fix it, e.g. A05" },
     location: { type: "string", description: "path:line" },
   },
   required: ["severity", "summary"],
@@ -75,7 +75,7 @@ export type PlanParams = {
 };
 export type IngestParams = { task_id: string; result: Record<string, unknown> };
 export type Finding = { severity: (typeof SEVERITIES)[number]; summary: string } & Partial<
-  Record<"id" | "kind" | "evidence" | "ac_ref" | "owner_suggestion" | "location", string>
+  Record<"id" | "kind" | "evidence" | "location", string> & Record<"ac_ref" | "owner_suggestion", string | null>
 >;
 export type GateParams = {
   gate: Gate;
