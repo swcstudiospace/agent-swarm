@@ -39,7 +39,9 @@ SWARM_TOOLS = {
 }
 # Fail-closed ceiling for SWARM_TOOLS: A01 moves task state, the gate agents record verdicts, no agent does both.
 ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"}
-GATE_AGENTS = {"A08", "A09", "A10", "A12"}
+# gate agent → (swarm_gate gate name, gate script stem); mirrors GATE_AGENTS in omp/src/context.ts
+GATES = {"A08": ("quality", "qa_gate"), "A09": ("review", "rev_gate"), "A10": ("security", "sec_gate"), "A12": ("release", "rel_plan")}
+GATE_AGENTS = set(GATES)
 
 CLAUDE_PREAMBLE = """<swarm_runtime>
 You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
@@ -120,6 +122,23 @@ _OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see
 
 OMP_PREAMBLE = "<swarm_runtime>\n" + _OMP_COMMON + "</swarm_runtime>\n"
 
+
+def _omp_gate_preamble(agent_id: str) -> str:
+    """A gate agent's omp preamble: the specialist one plus the swarm_gate-only rule (Phase 5 D-1)."""
+    gate, script = GATES[agent_id]
+    line = (
+        f"- Gate recording (omp): record your {gate} gate only with the `swarm_gate` tool (`gate: \"{gate}\"`); it runs "
+        f"`{script}` against this session's workspace and signs the verdict. Never run `scripts/{script}.py` or "
+        f"`scripts/ts/{script}.ts` through bash (the guard blocks it), even where the body below says to run the script."
+    )
+    if gate == "review":
+        line += (
+            " Pass every failing target in `per_target_findings` with at least one finding of severity `major` or "
+            "higher; an empty list passes a target."
+        )
+    return "<swarm_runtime>\n" + _OMP_COMMON + line + "\n</swarm_runtime>\n"
+
+
 OMP_ORCH_PREAMBLE = """<swarm_runtime>
 - Step 0 (mandatory, before reading any file, running any script or writing anything): check your tool definitions and apply the first matching rule below; only then continue with the assignment.
   - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
@@ -160,7 +179,12 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
         fm += ["autoloadSkills: a01-orchestrator,swarm-orchestrate", f"output: {output}", "---"]
     else:
         fm += [f"autoloadSkills: {agent['slug']}", f"output: {output}", "---"]
-    preamble = OMP_ORCH_PREAMBLE if is_orch else OMP_PREAMBLE
+    if is_orch:
+        preamble = OMP_ORCH_PREAMBLE
+    elif agent["id"] in GATES:
+        preamble = _omp_gate_preamble(agent["id"])
+    else:
+        preamble = OMP_PREAMBLE
     return "\n".join(fm) + "\n\n" + preamble + "\n" + _body(agent) + "\n"
 
 

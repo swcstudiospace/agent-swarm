@@ -533,10 +533,10 @@ function shellMutateTargets({ words }: Segment): string[] {
 const sqliteOnSwarm = ({ words }: Segment, facts: GuardFacts) =>
   words[0] === "sqlite3" && operands(words.slice(1)).some((t) => resolvePath(t, facts).split("/").includes(".swarm"));
 
-/** Gate script stem → its gate (swarm_gate's GATE_SCRIPTS, plus the gate names themselves). */
-const GATE_STEMS: Record<string, keyof typeof GATE_AGENTS> = {
-  qa_gate: "quality", quality_gate: "quality", rev_gate: "review", review_gate: "review",
-  sec_gate: "security", security_gate: "security", rel_plan: "release", release_gate: "release",
+/** Gate script stems (swarm_gate's GATE_SCRIPTS, plus the gate names themselves). */
+const GATE_STEMS: Record<string, true> = {
+  qa_gate: true, quality_gate: true, rev_gate: true, review_gate: true,
+  sec_gate: true, security_gate: true, rel_plan: true, release_gate: true,
 };
 
 const INTERPRETER = /^(?:python3?|bun|node|deno|uv|pipx)$/;
@@ -557,12 +557,15 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
   return m === null ? undefined : { stem: m[1], args: words.slice(i + 1) };
 }
 
-/** A direct run of a gate script (qa/quality/rev/review/sec/security/release_gate, rel_plan) by anyone but that gate's owner (D-05). */
-function foreignGateScript(seg: Segment, facts: GuardFacts): boolean {
+/**
+ * A direct run of a gate script (qa/quality/rev/review/sec/security/release_gate, rel_plan) by any swarm agent, the
+ * gate's owner included: a shell run scores whatever tree cwd points at and can overwrite its own verdict, so gates
+ * are recorded only through swarm_gate (Phase 5 D-1).
+ */
+const gateScriptRun = (seg: Segment): boolean => {
   const run = executedScript(seg);
-  if (run === undefined || !Object.hasOwn(GATE_STEMS, run.stem)) return false;
-  return facts.agent !== GATE_AGENTS[GATE_STEMS[run.stem]];
-}
+  return run !== undefined && Object.hasOwn(GATE_STEMS, run.stem);
+};
 
 /** A run of `scripts/orch_plan.py|ts`, or of `scripts/orch_status.py|ts` with `--ingest`/`--transition`. */
 function orchStateScript(seg: Segment): boolean {
@@ -588,13 +591,13 @@ export const RULES: readonly Rule[] = [
       "sqlite3 .swarm/tasks.db \"UPDATE tasks SET state='DONE'\"",
     ],
   },
-  // gate scripts are identity-bound in bash as in swarm_gate (Phase 3 WR-03)
+  // gates are recorded only through swarm_gate, never through the shell, the gate's owner included (Phase 5 D-1)
   {
-    id: "gate-script-foreign",
+    id: "gate-script-shell",
     capability: "gate",
     agents: Object.values(GATE_AGENTS),
-    pattern: foreignGateScript,
-    samples: ["python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x"],
+    pattern: gateScriptRun,
+    samples: ["python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x"],
   },
   // D-08: shell writes into .swarm/, .omp/ or ~/.omp
   {

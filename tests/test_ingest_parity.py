@@ -1,6 +1,7 @@
 """In-session parity: a review gate task's ingest (orch_status --ingest) reaches the same end states as the headless
 runner, and an agent verdicts{} that fails a target whose lease-bound review row is not `fail` is refused."""
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -43,18 +44,18 @@ def _setup(base: Path):
     return ts, swarm, work, json.loads(p.stdout)["correlation_id"]
 
 
-def _rev_gate(swarm: Path, work: Path, corr: str, per_target: dict) -> None:
+def _rev_gate(swarm: Path, work: Path, corr: str, per_target: dict, gate_id: str = "P-rev") -> None:
     f = swarm.parent / "findings.json"
     f.write_text(json.dumps(per_target))
-    g = _script(swarm, "rev_gate.py", "--task-id", "P-rev", "--correlation-id", corr, "--root", str(work),
+    g = _script(swarm, "rev_gate.py", "--task-id", gate_id, "--correlation-id", corr, "--root", str(work),
                 "--per-target-findings", str(f), "--json")
     assert g.returncode in (0, 1), g.stdout + g.stderr
     assert json.loads(g.stdout)["recorded"] == ["P-be"]
 
 
-def _ingest(swarm: Path, verdicts: dict) -> subprocess.CompletedProcess:
+def _ingest(swarm: Path, verdicts: dict, gate_id: str = "P-rev") -> subprocess.CompletedProcess:
     f = swarm.parent / "result.json"
-    f.write_text(json.dumps({"task_id": "P-rev", "state": "IN_REVIEW", "gate": "review", "verdicts": verdicts}))
+    f.write_text(json.dumps({"task_id": gate_id, "state": "IN_REVIEW", "gate": "review", "verdicts": verdicts}))
     return _script(swarm, "orch_status.py", "--ingest", str(f), "--json")
 
 
@@ -90,6 +91,39 @@ def test_consistent_fail_starts_rework(tmp_path, swarm_dir):
     assert (be["state"], be["rework_loops"]) == ("IN_PROGRESS", 1)
     assert [h["to_state"] for h in ts.history("P-be")][-2:] == ["CHANGES_REQUESTED", "IN_PROGRESS"]
     assert ts.get("P-rev.r1")["state"] == "PLANNED"
+
+
+def _fail_review(swarm: Path, work: Path, corr: str, gate_id: str) -> None:
+    _rev_gate(swarm, work, corr, {"P-be": _MAJOR}, gate_id)
+    r = _ingest(swarm, {"P-be": _REQUEST_CHANGES}, gate_id)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_repeated_rework_creates_one_rerun_per_gate_lineage(tmp_path, swarm_dir):
+    """Each rework loop adds exactly one <gate>.rN (never a rerun of a rerun); the failure past the rework limit
+    escalates the target without another rerun."""
+    ts, swarm, work, corr = _setup(tmp_path)
+
+    def reruns() -> dict:
+        return {t["task_id"]: t["state"] for t in ts.list(correlation_id=corr) if t["task_id"] not in ("P-be", "P-rev")}
+
+    _fail_review(swarm, work, corr, "P-rev")
+    assert ts.get("P-be")["rework_loops"] == 1
+    assert reruns() == {"P-rev.r1": "PLANNED"}
+
+    ts.transition("P-be", "IN_REVIEW")
+    _lease(ts, "P-rev.r1")
+    _fail_review(swarm, work, corr, "P-rev.r1")
+    assert ts.get("P-be")["rework_loops"] == 2
+    after_second = reruns()
+    assert after_second.keys() == {"P-rev.r1", "P-rev.r2"} and after_second["P-rev.r2"] == "PLANNED"
+    assert not [tid for tid in after_second if re.search(r"\.r\d+\.r\d+", tid)]
+
+    ts.transition("P-be", "IN_REVIEW")
+    _lease(ts, "P-rev.r2")
+    _fail_review(swarm, work, corr, "P-rev.r2")
+    assert ts.get("P-be")["state"] == "ESCALATED"
+    assert reruns().keys() == {"P-rev.r1", "P-rev.r2"}
 
 
 def test_consistent_pass_done(tmp_path, swarm_dir):

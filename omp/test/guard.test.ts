@@ -572,24 +572,26 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(bash("python3 scripts/orch_status.py --history"), facts(B05))).toBeUndefined();
   });
 
+  /** Phase 5 D-1: every swarm agent, the gate's owner included, records gates only through swarm_gate, never the shell. */
   test.each([
     ["python3 scripts/review_gate.py --task T-1", B05, true],
-    ["python3 scripts/review_gate.py --task T-1", "a09-reviewer", false],
+    ["python3 scripts/review_gate.py --task T-1", "a09-reviewer", true],
     ["python3 scripts/review_gate.py --task T-1", "a08-qa", true],
-    ["python3 scripts/rev_gate.py --task T-1", "a09-reviewer", false],
-    ["python3 scripts/qa_gate.py", "a08-qa", false],
+    ["python3 scripts/rev_gate.py --task T-1", "a09-reviewer", true],
+    ["cd /tmp/ws && python3 scripts/rev_gate.py --task T-1 --json", "a09-reviewer", true],
+    ["python3 scripts/qa_gate.py", "a08-qa", true],
     ["bun scripts/ts/qa_gate.ts", "a09-reviewer", true],
-    ["python3 scripts/sec_gate.py", "a10-security", false],
-    ["python3 scripts/rel_plan.py", "a12-release", false],
+    ["python3 scripts/sec_gate.py", "a10-security", true],
+    ["python3 scripts/rel_plan.py", "a12-release", true],
     ["python3 scripts/rel_plan.py", B05, true],
     ["python3 scripts/unknown_gate.py", "a09-reviewer", false],
-    ["bun run scripts/ts/sec_gate.ts", "a08-qa", true],
+    ["bun run scripts/ts/sec_gate.ts", "a10-security", true],
     ["uv run python scripts/rel_plan.py", B05, true],
-    ["/usr/bin/python3 -X dev /repo/scripts/qa_gate.py", "a09-reviewer", true],
-    ["./scripts/rev_gate.py --task T-1", B05, true],
+    ["/usr/bin/python3 -X dev /repo/scripts/qa_gate.py", "a08-qa", true],
+    ["./scripts/rev_gate.py --task T-1", "a09-reviewer", true],
   ])("gate script: %s from %s blocks=%p", (command, agent, blocks) => {
     const res = guardToolCall(bash(command), facts(agent));
-    if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-foreign)" });
+    if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-shell)" });
     else expect(res).toBeUndefined();
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
   });
