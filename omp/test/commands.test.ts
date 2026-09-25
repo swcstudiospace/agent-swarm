@@ -4,11 +4,11 @@
  */
 import { expect, test } from "bun:test";
 import { type Bridge, type BridgeRequest, type BridgeResult, runPy, SwarmToolError } from "../src/bridge.ts";
-import { parseSwarmArgs, swarmCorrelationId } from "../src/commands.ts";
+import { parseSwarmArgs, swarmCommand, swarmCorrelationId } from "../src/commands.ts";
 import { DISPATCH_MARKER } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
-import { type CallLog, callTool, commandCtx, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
+import { type CallLog, callTool, commandCtx, fakeCtx, fakePi, fakeTurn, gitRepo, isolateEnv, type ScriptedTurn, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_DIR", "SWARM_AGENT");
 
@@ -89,6 +89,96 @@ test("no UI: same order without notify; the plan summary travels in the dispatch
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log, hasUI: false }));
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle"]);
   expect(dispatchText(log)).toContain(`created 3 tasks for correlation ${CORR}`);
+});
+
+/** The dispatch user message as omp records it on the branch once the turn starts. */
+const DISPATCH_ENTRY: SessionEntry = {
+  type: "message",
+  message: { role: "user", content: [{ type: "text", text: `${DISPATCH_MARKER} AgentSwarm plan ${CORR} is ready` }] },
+};
+
+/** A session whose fake sendUserMessage starts a scripted turn; `opts` reach swarmCommand's DI options directly. */
+function turnSession(script: ScriptedTurn, opts?: Parameters<typeof swarmCommand>[2]) {
+  const log: CallLog = [];
+  const entries: SessionEntry[] = [];
+  const turn = fakeTurn(script, entries, log);
+  const bridge: Bridge = async (req) => {
+    log.push({ call: "bridge", req });
+    return PLAN;
+  };
+  const pi = fakePi({
+    sendUserMessage: (text) => {
+      log.push({ call: "sendUserMessage", text });
+      turn.start();
+    },
+  });
+  pi.load(createSwarmExtension({ bridge }));
+  const swarm = opts ? swarmCommand(pi.api, bridge, opts) : pi.command("swarm");
+  const ctx = commandCtx(gitRepo(), entries, { log, isIdle: turn.isIdle });
+  return { log, turn, swarm, ctx };
+}
+
+test("async start: the handler resolves only after the turn that sendUserMessage started asynchronously has ended", async () => {
+  const { log, turn, swarm, ctx } = turnSession({ startMs: 30, durationMs: 50 });
+  const t0 = Date.now();
+  let settled = false;
+  const run = swarm.handler(BRIEF, ctx).then(() => void (settled = true));
+
+  await Bun.sleep(60); // the fake turn is streaming (30 ms → 80 ms)
+  expect(turn.ended()).toBe(false);
+  expect(settled).toBe(false);
+
+  await run;
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(80);
+  expect(turn.ended()).toBe(true);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "turn-start", "waitForIdle", "turn-end", "notify"]);
+  expect(log.at(-1)?.message).toContain(`plan ${CORR} dispatched`);
+});
+
+test("branch entry only: a turn that runs between two polls is seen through the dispatch message on the branch", async () => {
+  const { log, swarm, ctx } = turnSession({ entryMs: 20, entry: DISPATCH_ENTRY });
+  await swarm.handler(BRIEF, ctx);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
+  expect(log.at(-1)?.level).toBe("info");
+});
+
+test("branch entry: a dispatch message that was already on the branch does not count as this turn's start", async () => {
+  const { log, swarm, ctx } = turnSession({}, { startTimeoutMs: 100 });
+  ctx.sessionManager.getBranch().push(DISPATCH_ENTRY); // an earlier /swarm of the same brief
+  await swarm.handler(BRIEF, ctx);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "notify"]);
+  expect(log.at(-1)?.level).toBe("error");
+});
+
+test("never starts: after the start cap the handler reports the failure at level error and never reports success", async () => {
+  const { log, swarm, ctx } = turnSession({}, { startTimeoutMs: 100 });
+  const t0 = Date.now();
+  await swarm.handler(BRIEF, ctx);
+  expect(Date.now() - t0).toBeLessThan(1000);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "notify"]);
+  const last = log.at(-1);
+  expect(last?.level).toBe("error");
+  expect(String(last?.message)).toContain("dispatch did not start");
+  expect(String(last?.message)).toContain(CORR);
+  expect(log.some((e) => String(e.message ?? "").includes("dispatched"))).toBe(false);
+});
+
+test("sync start: isIdle already false on the first poll goes straight to waitForIdle", async () => {
+  const repo = gitRepo();
+  const { log, swarm } = session();
+  let startPolls = 0;
+  const ctx = commandCtx(repo, [], {
+    log,
+    // streaming until waitForIdle is called, which ends the turn on its first poll
+    isIdle: () => {
+      if (log.some((e) => e.call === "waitForIdle")) return true;
+      startPolls++;
+      return false;
+    },
+  });
+  await swarm.handler(BRIEF, ctx);
+  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
+  expect(startPolls).toBe(1);
 });
 
 test.each([

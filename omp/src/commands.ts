@@ -1,14 +1,14 @@
 /**
  * `/swarm <brief> [--pattern=…] [--risk=…]` (ORCH-03, D-11): plan the brief through the session's bridge (the same
- * orch_plan argv as swarm_plan), then start an in-session A01 turn with a DISPATCH_MARKER-tagged prompt and wait
- * for it, so a `-p` run does not exit before the dispatch. The brief reaches python as one argv element built by
- * planArgs (no shell, T-04-15). Nothing is dispatched without a successful plan result.
+ * orch_plan argv as swarm_plan), then start an in-session A01 turn with a DISPATCH_MARKER-tagged prompt, wait for
+ * that turn to start and then to finish, so a `-p` run does not exit before the dispatch. The brief reaches python
+ * as one argv element built by planArgs (no shell, T-04-15). Nothing is dispatched without a successful plan result.
  */
 import { createHash } from "node:crypto";
 import type { Bridge, BridgeResult } from "./bridge.ts";
 import { inPlanMode } from "./context.ts";
 import { DISPATCH_MARKER } from "./hooks.ts";
-import type { CommandContext, CommandDefinition, ExtensionAPI } from "./omp-api.ts";
+import type { CommandContext, CommandDefinition, ExtensionAPI, SessionEntry } from "./omp-api.ts";
 import { PATTERNS, type PlanParams, planArgs, RISK_CLASSES } from "./tools.ts";
 
 export const USAGE = `usage: /swarm <brief> [--pattern=${PATTERNS.join("|")}] [--risk=${RISK_CLASSES.join("|")}]`;
@@ -88,7 +88,51 @@ function notify(ctx: CommandContext, message: string, level: "info" | "warning" 
   if (ctx.hasUI) ctx.ui?.notify(message, level);
 }
 
-export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge): CommandDefinition {
+export interface SwarmCommandOptions {
+  /** Poll interval of the dispatch-start wait (default 10 ms). */
+  intervalMs?: number;
+  /** How long the dispatch turn may take to start before /swarm reports failure (default 10 s). */
+  startTimeoutMs?: number;
+}
+
+/** The text of a user message entry (string content or text blocks); "" for any other entry. */
+function userMessageText(entry: SessionEntry): string {
+  if (entry.type !== "message") return "";
+  const message = entry.message as { role?: unknown; content?: unknown } | undefined;
+  if (message?.role !== "user") return "";
+  const { content } = message;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((block: { text?: unknown }) => (typeof block?.text === "string" ? block.text : "")).join("\n");
+}
+
+/**
+ * True once the dispatch turn has started (D-11 step 5, T-04-23): `ctx.isIdle()` reads false, or a user message
+ * carrying DISPATCH_MARKER and `corr` was appended to the branch after `sendUserMessage` (entries from index `from`
+ * on, so an earlier dispatch of the same brief never counts). False once `startTimeoutMs` elapsed without either.
+ */
+async function awaitDispatchStart(
+  ctx: CommandContext,
+  corr: string,
+  from: number,
+  { intervalMs = 10, startTimeoutMs = 10_000 }: SwarmCommandOptions,
+): Promise<boolean> {
+  const deadline = Date.now() + startTimeoutMs;
+  for (;;) {
+    if (!ctx.isIdle()) return true;
+    const dispatched = (e: SessionEntry) => {
+      const text = userMessageText(e);
+      return text.includes(DISPATCH_MARKER) && text.includes(corr);
+    };
+    if (ctx.sessionManager.getBranch().slice(from).some(dispatched)) return true;
+    if (Date.now() >= deadline) return false;
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, intervalMs);
+    await promise;
+  }
+}
+
+export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions = {}): CommandDefinition {
   return {
     description: "Plan a brief with the AgentSwarm and dispatch a01-orchestrator in this session",
     async handler(args, ctx) {
@@ -113,10 +157,15 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
           typeof err?.message === "string" ? err.message : typeof res.json.summary === "string" ? res.json.summary : JSON.stringify(res.json);
         return notify(ctx, `/swarm: orch_plan exit ${res.exitCode}: ${detail}`, "error");
       }
-      pi.sendUserMessage(dispatchPrompt(res, parsed));
-      // T-04-17: a `-p` run exits before the A01 turn without this
-      await ctx.waitForIdle();
       const corr = typeof res.json.correlation_id === "string" ? res.json.correlation_id : "?";
+      const from = ctx.sessionManager.getBranch().length;
+      pi.sendUserMessage(dispatchPrompt(res, parsed));
+      // sendUserMessage starts the turn asynchronously; waitForIdle alone resolves before it streams (G-04-05-1)
+      if (!(await awaitDispatchStart(ctx, corr, from, opts))) {
+        const seconds = (opts.startTimeoutMs ?? 10_000) / 1000;
+        return notify(ctx, `/swarm: dispatch did not start within ${seconds} s (plan ${corr})`, "error");
+      }
+      await ctx.waitForIdle();
       notify(ctx, `/swarm: plan ${corr} dispatched to a01-orchestrator (${readyTaskIds(res.json).length} ready tasks)`, "info");
     },
   };

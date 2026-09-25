@@ -81,6 +81,8 @@ export interface CommandContext extends ExtensionContext {
   ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
   /** Resolves once the agent stops streaming; a `-p` run exits without it (research P4/P5). */
   waitForIdle(): Promise<void>;
+  /** False while the agent is streaming (omp: `!session.isStreaming`; present in 18.0.6 and 18.3.1). */
+  isIdle(): boolean;
 }
 
 /** A `registerCommand` definition: `/name <args>` calls `handler(args, ctx)` in every mode, `-p` included. */

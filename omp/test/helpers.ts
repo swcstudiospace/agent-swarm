@@ -179,17 +179,70 @@ export function fakeCtx(cwd: string, entries: SessionEntry[] = []): ExtensionCon
 /** One ordered record of what a command did: `call` names the seam (bridge, sendUserMessage, waitForIdle, notify). */
 export type CallLog = Array<{ call: string } & Record<string, unknown>>;
 
-/** A command ctx whose notify / waitForIdle push to `log` (shared with the recording bridge and sendUserMessage). */
+/**
+ * A fake turn driven by timers, started by the fake sendUserMessage: `isIdle` reads false from `startMs` for
+ * `durationMs` (logged as turn-start / turn-end), and `entry` is appended to `entries` at `entryMs`. Rows with no
+ * `startMs` never flip `isIdle`; rows with no `entry` never append. Real timers on purpose: the handler's start
+ * poll is an async loop and bun 1.4 has no advanceTimersByTimeAsync, so fake timers cannot drive it; rows stay ≤150 ms.
+ */
+export interface ScriptedTurn {
+  startMs?: number;
+  durationMs?: number;
+  entryMs?: number;
+  entry?: SessionEntry;
+}
+
+export interface FakeTurn {
+  isIdle(): boolean;
+  /** Arm the timers (call from the fake sendUserMessage). */
+  start(): void;
+  /** True once turn-end was logged (or immediately for a turn without `startMs`). */
+  ended(): boolean;
+}
+
+export function fakeTurn(script: ScriptedTurn, entries: SessionEntry[], log: CallLog): FakeTurn {
+  let idle = true;
+  let ended = script.startMs === undefined;
+  return {
+    isIdle: () => idle,
+    start() {
+      if (script.startMs !== undefined) {
+        setTimeout(() => {
+          idle = false;
+          log.push({ call: "turn-start" });
+          setTimeout(() => {
+            idle = true;
+            ended = true;
+            log.push({ call: "turn-end" });
+          }, script.durationMs ?? 50);
+        }, script.startMs);
+      }
+      const { entry, entryMs } = script;
+      if (entry !== undefined) setTimeout(() => void entries.push(entry), entryMs ?? 0);
+    },
+    ended: () => ended,
+  };
+}
+
+/**
+ * A command ctx whose notify / waitForIdle push to `log` (shared with the recording bridge and sendUserMessage).
+ * Without `isIdle` the ctx models a turn that started synchronously and is over by the time waitForIdle is called
+ * (isIdle false, waitForIdle resolves at once); with a scripted `isIdle`, waitForIdle polls it until the turn ends.
+ */
 export function commandCtx(
   cwd: string,
   entries: SessionEntry[] = [],
-  { hasUI = true, log = [] as CallLog }: { hasUI?: boolean; log?: CallLog } = {},
+  { hasUI = true, log = [] as CallLog, isIdle }: { hasUI?: boolean; log?: CallLog; isIdle?: () => boolean } = {},
 ): CommandContext {
   return {
     ...fakeCtx(cwd, entries),
     hasUI,
     ui: { notify: (message, level) => void log.push({ call: "notify", message, level }) },
-    waitForIdle: async () => void log.push({ call: "waitForIdle" }),
+    isIdle: isIdle ?? (() => false),
+    async waitForIdle() {
+      log.push({ call: "waitForIdle" });
+      if (isIdle) while (!isIdle()) await Bun.sleep(5);
+    },
   };
 }
 
