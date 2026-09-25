@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail-open UserPromptSubmit hook: inject AgentSwarm orchestration on SDLC-shaped prompts.
 
+classify() mirrors omp/src/hooks.ts classifyPrompt (D-10); tests/fixtures/classifier_prompts.json pins both.
 Skips entirely inside headless swarm agent sessions (SWARM_CHILD=1)."""
 from __future__ import annotations
 import json
@@ -8,10 +9,18 @@ import os
 import re
 import sys
 
-# Auto-run for every plugin-handled prompt. Slash/ctl strings stay negative so
-# Skill dispatch and /all-in-one:* are not consumed by the swarm. Empty and
-# leading-/ prompts are skipped. "what is" is not a skip: trivia still injects.
+# Prompts containing these (case-insensitive) are owned by other plugins or explicitly opt out.
 NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
+
+# Tags the /swarm dispatch prompt so the hook never re-steers the swarm's own dispatch.
+DISPATCH_MARKER = "[agent-swarm:dispatch]"
+
+QUESTION = re.compile(r"^(what|why|how|when|where|who|which|is|are|can|could|does|do|should|explain|describe)\b", re.I)
+TRIVIAL = re.compile(r"\btypos?\b|^rename\b", re.I)
+SDLC = re.compile(
+    r"\b(build|implement|add|create|fix|refactor|migrate|deploy|release|ship|write tests?|set up|setup|integrate|scaffold|upgrade)\b",
+    re.I,
+)
 
 CONTEXT = """## AgentSwarm orchestration (mandatory)
 
@@ -35,15 +44,17 @@ def extract_prompt(payload: object) -> str:
 
 
 def classify(prompt: str) -> bool:
-    low = prompt.lower()
-    if any(n in low for n in NEGATIVE):
-        return False
+    """True only for SDLC-shaped prompts (D-09): silent on empty, slash, system-reminder, opt-out tokens,
+    the dispatch marker, questions/explanations and trivial edits."""
     trimmed = prompt.strip()
-    if not trimmed:
+    if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
         return False
-    if trimmed.startswith("/"):
+    low = trimmed.lower()
+    if DISPATCH_MARKER in low or any(n in low for n in NEGATIVE):
         return False
-    return True
+    if trimmed.endswith("?") or QUESTION.search(trimmed) or TRIVIAL.search(trimmed):
+        return False
+    return SDLC.search(trimmed) is not None
 
 
 def main() -> int:

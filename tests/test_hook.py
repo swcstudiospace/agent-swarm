@@ -3,8 +3,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 HOOK = ROOT / "hooks" / "user_prompt_submit.py"
+# D-10: the one prompt list both the TS and the Python classifier suites read.
+FIXTURE = json.loads((ROOT / "tests" / "fixtures" / "classifier_prompts.json").read_text())
 
 
 def run_hook(prompt: str) -> dict:
@@ -27,12 +31,17 @@ def test_injects_on_feature():
     assert "a01-orchestrator" in ctx
 
 
-def test_injects_on_trivia():
-    """Auto-run for all prompts: trivia still injects AgentSwarm context."""
-    out = run_hook("what is a monad")
-    ctx = out.get("additionalContext", "")
+@pytest.mark.parametrize("prompt", FIXTURE["positive"])
+def test_fixture_positive_injects(prompt):
+    ctx = run_hook(prompt).get("additionalContext", "")
     assert "agent-swarm-orchestrate" in ctx
     assert "a01-orchestrator" in ctx
+
+
+@pytest.mark.parametrize("prompt", FIXTURE["negative"])
+def test_fixture_negative_silent(prompt):
+    """D-09 narrowed classifier: questions, trivial edits, slash/marker prompts and blanks get nothing."""
+    assert not run_hook(prompt).get("additionalContext")
 
 
 def test_silent_on_slash():
