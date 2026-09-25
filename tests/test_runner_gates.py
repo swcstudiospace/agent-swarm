@@ -153,3 +153,100 @@ def test_agent_session_gate_script_records_nothing(swarm_dir):
     assert (swarm_dir / "verdicts" / "X-qa.quality.json").exists()
     assert _rows(swarm_dir) == []
     assert any("agent session" in e["payload"]["reason"] for e in _events(swarm_dir, "gate.verdict.unrecorded"))
+
+
+# ---------------------------------------------------------------- WR-08: a gate task cannot finish without its script
+_GATE_RESULT = {"gate": "quality", "state": "IN_REVIEW"}
+
+
+def _gate_pair(ts, prefix, *, lease=True):
+    """Target <prefix>-be plus quality gate task <prefix>-qa (gate_for [<prefix>-be]), the gate task leased by A01."""
+    ts.create(task_id=f"{prefix}-be", correlation_id="c", capability="code.backend", notes={"gates": ["quality"]})
+    ts.create(task_id=f"{prefix}-qa", correlation_id="c", capability="gate.quality",
+              notes={"gate": "quality", "gate_for": [f"{prefix}-be"], "gates": []})
+    if lease:
+        for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"):
+            ts.transition(f"{prefix}-qa", s)
+    return {**_GATE_RESULT, "task_id": f"{prefix}-qa", "verdicts": {f"{prefix}-be": {"verdict": "pass", "findings": []}}}
+
+
+def test_ingest_gate_result_without_script_rejected(tmp_path, swarm_dir):
+    from swarm.taskstore import TaskStore
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    ts = TaskStore()
+    _lease(ts, "X-qa")
+    f = tmp_path / "r.json"
+    f.write_text(json.dumps({**_GATE_RESULT, "task_id": "X-qa", "verdicts": {"X-be": {"verdict": "pass", "findings": []}}}))
+    r = run_script("orch_status.py", "--ingest", str(f), "--json", env=env)
+    assert r.returncode == 2 and "gate script not run" in r.stdout, r.stdout + r.stderr
+    assert ts.get("X-qa")["state"] == "IN_PROGRESS"
+    ts.set_notes("X-qa", dry_run=True)
+    g = run_script("qa_gate.py", "--dry-run", "--task-id", "X-qa", "--json", env=env)
+    assert g.returncode == 0, g.stdout + g.stderr
+    r = run_script("orch_status.py", "--ingest", str(f), "--json", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert ts.get("X-qa")["state"] in ("IN_REVIEW", "DONE")
+
+
+def test_headless_gate_without_rows_fails_attempt(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.results import apply_result
+    ts = TaskStore()
+    res = _gate_pair(ts, "H")
+    events = []
+    out = apply_result(ts, ts.get("H-qa"), agent_id="A08", result=res, meta={}, mode="headless",
+                       emit=lambda t, p: events.append((t, p)))
+    assert out == "FAILED"
+    assert ts.history("H-qa")[-1]["reason"].startswith("E-CONTRACT: gate script not run")
+    assert [p["mode"] for t, p in events if t == "task.result.rejected"] == ["headless"]
+
+
+def test_gate_task_without_claimed_row_rejected(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.results import apply_result
+    from swarm.verdicts import record_gate_verdicts
+    from swarm.errors import SwarmError, ErrorCode
+    ts = TaskStore()
+    res = _gate_pair(ts, "N", lease=False)
+    ts.conn.execute("UPDATE tasks SET state='IN_PROGRESS' WHERE task_id='N-qa'")  # no CLAIMED row in its history
+    ts.conn.commit()
+    record_gate_verdicts(ts, gate_task_id="N-qa", gate="quality", agent_id="A08@local", findings=[], runs={},
+                         correlation_id="c", expires_s=60, emit=lambda *a, **k: None)
+    assert ts.latest_verdicts("N-be", verified_only=True)["quality"]["verdict"] == "pass"
+    with pytest.raises(SwarmError) as e:
+        apply_result(ts, ts.get("N-qa"), agent_id="A08", result=res, meta={}, mode="ingest", emit=lambda *a: None)
+    assert e.value.code is ErrorCode.E_CONTRACT and "gate script not run" in str(e.value)
+    assert ts.get("N-qa")["state"] == "IN_PROGRESS"
+
+
+def test_reconcile_escalates_stalled_gate(swarm_dir):
+    from swarm.taskstore import TaskStore
+    from swarm.results import reconcile
+    ts = TaskStore()
+    steps = ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW")
+    ts.create(task_id="S-be", correlation_id="c", capability="code.backend", notes={"gates": ["review"]})
+    for s in steps:
+        ts.transition("S-be", s)
+    events = []
+
+    def emit(t, p):
+        events.append((t, p))
+
+    reconcile(ts, "c", emit)
+    reconcile(ts, "c", emit)
+    esc = [p for t, p in events if t == "escalation.request"]
+    assert len(esc) == 1
+    assert esc[0]["task_id"] == "S-be" and esc[0]["evidence"] == ["review:absent"]
+    assert ts.get("S-be")["state"] == "IN_REVIEW"  # A01 or a human decides
+    # a live gate task that will issue the gate: waiting, not a stall
+    ts.create(task_id="D-be", correlation_id="d", capability="code.backend", notes={"gates": ["review"]})
+    for s in steps:
+        ts.transition("D-be", s)
+    ts.create(task_id="D-rev", correlation_id="d", capability="gate.review",
+              notes={"gate": "review", "gate_for": ["D-be"], "gates": []})
+    for s in ("VALIDATED", "PLANNED"):
+        ts.transition("D-rev", s)
+    events.clear()
+    reconcile(ts, "d", emit)
+    assert [p for t, p in events if t == "escalation.request"] == []

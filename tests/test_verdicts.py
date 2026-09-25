@@ -179,17 +179,19 @@ def test_ingest_gate_result_no_rows(tmp_path, swarm_dir):
     targets = _notes(swarm_dir, "X-qa")["gate_for"]
     from swarm.taskstore import TaskStore
     ts = TaskStore()
-    for s in ("CLAIMED", "IN_PROGRESS"):  # A01 lease; ingest no longer auto-claims a task with unmet deps
-        ts.transition("X-qa", s)
+    _lease(ts, "X-qa", dry_run=True)  # A01 lease; ingest no longer auto-claims a task with unmet deps
+    g = run_script("qa_gate.py", "--dry-run", "--task-id", "X-qa", "--json", env=env)  # the script ran in the lease
+    assert g.returncode == 0, g.stdout + g.stderr
     fnd = [{"id": "Q-1", "severity": "major", "kind": "functional", "summary": "broken"}]
     res = {"task_id": "X-qa", "gate": "quality", "state": "IN_REVIEW",
            "verdicts": {targets[0]: {"verdict": "fail", "findings": fnd}, targets[1]: {"verdict": "pass", "findings": []},
                         "X-rel": {"verdict": "pass", "findings": []}}}
     f = tmp_path / "r.json"
     f.write_text(json.dumps(res))
+    before = _rows(swarm_dir)
     r = run_script("orch_status.py", "--ingest", str(f), "--json", env=env)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert _rows(swarm_dir) == []
+    assert _rows(swarm_dir) == before  # the agent's verdicts{} adds no rows
     assert _notes(swarm_dir, targets[0])["feedback"] == [{"gate": "quality", "source": "agent", "findings": fnd}]
     assert "feedback" not in _notes(swarm_dir, targets[1])
     assert _notes(swarm_dir, "X-qa")["result"]["verdicts"] == res["verdicts"]

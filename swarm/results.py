@@ -11,6 +11,8 @@ The ONE intended mode difference:
     task (e.g. needs: human-approval) or one with unmet dependencies is rejected: A01 releases BLOCKED only with
     `orch_status.py --transition` after approval. Invalid input is rejected with E-CONTRACT and no transition
     (never consumes an attempt).
+Both modes accept a gate task's IN_REVIEW only when its gate script recorded a verdict on every gate_for target
+during the current lease (WR-08); otherwise "E-CONTRACT: gate script not run" (headless FAILED, ingest exit 2).
 Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
 """
 from __future__ import annotations
@@ -63,6 +65,18 @@ def reject(store: TaskStore, task_id: str, *, reason: str, mode: str, emit: Emit
     return store.get(task_id)["state"]
 
 
+def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
+    """gate_for targets of a gate task lacking a verifying row that its gate script issued during the current lease
+    (since the latest CLAIMED). With no CLAIMED row the lease start is unknown, so every target counts as missing."""
+    notes = task["notes_json"]
+    targets = list(notes.get("gate_for") or [])
+    claims = [h["ts"] for h in store.history(task["task_id"]) if h["to_state"] == S.CLAIMED.value]
+    if not claims:
+        return targets
+    return [t for t in targets
+            if not store.gate_verdict_since(t, gate=notes["gate"], gate_task_id=task["task_id"], since=claims[-1])]
+
+
 def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
     """A gate agent's verdicts{} is advisory text only (D-12): fail entries become feedback on the gate task's own
     gate_for targets. Verdict rows are written solely by the gate scripts (swarm.verdicts)."""
@@ -85,6 +99,13 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
     if mode == "ingest" and task["state"] == S.BLOCKED.value:
         raise SwarmError(ErrorCode.E_CONTRACT, f"{tid} is BLOCKED; A01 releases it with orch_status --transition after approval",
                          task_id=tid)
+    if state == S.IN_REVIEW.value and task["notes_json"].get("gate"):
+        missing = _gate_script_missing(store, task)  # D-12: only script rows satisfy a gate; checked before any transition
+        if missing:
+            err = SwarmError(ErrorCode.E_CONTRACT, f"gate script not run for {missing}", task_id=tid)
+            if mode == "headless":
+                return reject(store, tid, reason=str(err), mode=mode, emit=emit)
+            raise err
     if mode == "ingest" and task["state"] in (S.PLANNED.value, S.RETRY.value):
         with store.transaction():  # the dependency check and the claim see one snapshot
             if not store.deps_satisfied(store.get(tid)):
@@ -114,8 +135,18 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
     return store.get(tid)["state"]
 
 
+def _stalled_gates(store: TaskStore, task: dict, reasons: dict[str, str], corr: str) -> list[str]:
+    """Sorted "gate:reason" for required gates missing for a reason other than fail that no live gate task (state
+    outside DONE/CANCELLED/ESCALATED) of that gate covers: nothing is left to issue them, so the task would stall."""
+    tid = task["task_id"]
+    live = {g["notes_json"].get("gate") for g in store.list(correlation_id=corr)
+            if tid in (g["notes_json"].get("gate_for") or [])
+            and g["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)}
+    return sorted(f"{g}:{r}" for g, r in reasons.items() if r != "fail" and g not in live)
+
+
 def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
-    """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework."""
+    """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates."""
     notes_log = []
     for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
         tid = t["task_id"]
@@ -149,8 +180,19 @@ def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
                                 if g["task_id"] in d["depends_on"] and new_id not in d["depends_on"] and d["state"] not in (S.DONE.value,):
                                     store.update(d["task_id"], depends_on=d["depends_on"] + [new_id])
             continue
-        if not store.missing_gates(tid):
+        reasons = store.missing_gate_reasons(tid)
+        if not reasons:
             store.transition(tid, S.APPROVED, reason="all required gates pass")
             store.transition(tid, S.DONE, reason="approved")
             notes_log.append(f"{tid}: DONE")
+            continue
+        # WR-08: a gate absent/expired/... with no gate task left to issue it would stall silently. Escalate once per
+        # distinct stall (notes.gate_stall); no transition — A01 or a human decides.
+        stall = _stalled_gates(store, t, reasons, corr)
+        if stall != (t["notes_json"].get("gate_stall") or []):
+            store.set_notes(tid, gate_stall=stall)
+            if stall:
+                emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": stall,
+                                            "options": ["re-run gate", "human review", "cancel"]})
+                notes_log.append(f"{tid}: gate stall {stall} → escalation.request")
     return notes_log
