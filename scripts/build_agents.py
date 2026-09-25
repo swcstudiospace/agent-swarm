@@ -108,7 +108,15 @@ OMP_ORCH_PREAMBLE = OMP_PREAMBLE
 def render_omp(agent: dict, agents: list[dict]) -> str:
     output = json.dumps(json.loads(SCHEMA.read_text(encoding="utf-8")), separators=(",", ":"))
     is_orch = agent["id"] == "A01"
-    tools = ", ".join(TOOL_MAP[t] for t in agent["tools"])
+    if not agent["tools"]:
+        raise ValueError(f"{agent['id']}: empty tools list")
+    unmapped = [t for t in agent["tools"] if t not in TOOL_MAP]
+    if unmapped:
+        raise ValueError(f"{agent['id']}: unmapped tool(s) for omp: {', '.join(unmapped)}")
+    mapped = [TOOL_MAP[t] for t in agent["tools"]]
+    if not is_orch and "task" in mapped:
+        raise ValueError(f"{agent['id']}: specialists must not get the omp task tool")
+    tools = ", ".join(mapped)
     spawns = ", ".join(a["slug"] for a in agents if a["id"] != "A01") if is_orch else '""'
     fm = [
         "---",

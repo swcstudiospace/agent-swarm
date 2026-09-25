@@ -1,6 +1,9 @@
 """omp agent + skill generation contract (AGENT-01..06, ORCH-01)."""
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 from swarm.manifest import load_manifest
 
@@ -46,3 +49,115 @@ def test_omp_skill_matches_renderer():
     for a in load_manifest():
         p = OMP_SKILLS / a["slug"] / "SKILL.md"
         assert skills_mod.omp_skill(a) == p.read_text(encoding="utf-8"), a["slug"]
+
+
+builder = _load("build_agents")
+SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
+OMP_TOOLS = {"read", "grep", "glob", "bash", "write", "edit", "task"}
+KEY_ORDER = ["name", "description", "tools", "spawns", "blocking", "autoloadSkills", "output"]
+
+
+def _agents():
+    return list(load_manifest())
+
+
+def _omp(a):
+    return (OMP_AGENTS / f"{a['slug']}.md").read_text(encoding="utf-8")
+
+
+def _keys(text):
+    return [line.split(": ", 1)[0] for line in text.split("---", 2)[1].strip().splitlines()]
+
+
+def test_omp_tools_exact():
+    for a in _agents():
+        tools = _fm(_omp(a))["tools"].split(", ")
+        assert tools == [builder.TOOL_MAP[t] for t in a["tools"]], a["id"]
+        assert set(tools) <= OMP_TOOLS
+    a01 = next(a for a in _agents() if a["id"] == "A01")
+    assert _fm(_omp(a01))["tools"] == "read, grep, glob, bash, task, write"
+
+
+def test_omp_no_model_key():
+    for a in _agents():
+        text = _omp(a)
+        assert "model" not in _keys(text)
+        head = text.split("---", 2)[1]
+        for bad in ("opus", "sonnet", "haiku", "inherit"):
+            assert bad not in head.split("output:")[0].lower(), (a["id"], bad)
+
+
+def _a(aid):
+    return next(a for a in _agents() if a["id"] == aid)
+
+
+def test_render_omp_unmapped_tool_raises():
+    with pytest.raises(ValueError, match="A05"):
+        builder.render_omp({**_a("A05"), "tools": ["Read", "WebFetch"]}, _agents())
+
+
+def test_render_omp_empty_tools_raises():
+    with pytest.raises(ValueError, match="A05"):
+        builder.render_omp({**_a("A05"), "tools": []}, _agents())
+
+
+def test_render_omp_specialist_task_raises():
+    with pytest.raises(ValueError, match="A09"):
+        builder.render_omp({**_a("A09"), "tools": ["Read", "Agent"]}, _agents())
+
+
+def test_omp_spawn_topology():
+    agents = _agents()
+    for a in agents:
+        text = _omp(a)
+        fm = _fm(text)
+        if a["id"] == "A01":
+            assert fm["spawns"].split(", ") == [x["slug"] for x in agents if x["id"] != "A01"]
+            assert a["slug"] not in fm["spawns"]
+            assert "task" in fm["tools"].split(", ")
+        else:
+            assert "\nspawns: \"\"\n" in text, a["id"]
+            assert "task" not in fm["tools"].split(", ")
+
+
+def test_omp_spawns_full_under_only():
+    from conftest import run_script
+    r = run_script("build_agents.py", "--check", "--only", "a01-orchestrator")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_omp_output_equals_schema():
+    schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+    for a in _agents():
+        text = _omp(a)
+        fm = _fm(text)
+        assert json.loads(fm["output"]) == schema
+        assert "schemaMode" not in _keys(text)
+
+
+def test_omp_autoload_own_slug():
+    for a in _agents():
+        val = _fm(_omp(a))["autoloadSkills"]
+        assert val == a["slug"] and "," not in val
+
+
+def test_omp_blocking_set():
+    blocking = set()
+    for a in _agents():
+        fm = _fm(_omp(a))
+        if "blocking" in fm:
+            assert fm["blocking"] == "true", a["id"]
+            blocking.add(a["id"])
+    assert blocking == {"A01", "A08", "A09", "A10", "A12"}
+
+
+def test_omp_frontmatter_key_order():
+    for a in _agents():
+        keys = _keys(_omp(a))
+        assert keys == [k for k in KEY_ORDER if k in keys] and len(keys) == len(set(keys))
+        assert set(KEY_ORDER) - {"blocking"} <= set(keys)
+
+
+def test_omp_no_bundled_name_collision():
+    slugs = {a["slug"] for a in _agents()}
+    assert not slugs & {"scout", "reviewer", "security-reviewer", "task", "sonic", "main", "sub"}
