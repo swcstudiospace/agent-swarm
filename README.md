@@ -54,16 +54,52 @@ lifecycle state machine, fail-closed gates, manifest registry). [agents.json](ag
 
 ```bash
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature   # brief → task DAG in <repo>/.swarm
-python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>
+python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>; --runtime omp [--omp-bin omp] for headless omp -p
 python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
-python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook
+python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, omp/agents, omp/skills (--check)
+python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, plus the omp package (see below)
 python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
 
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
 `a02-requirements` … `a15-docs` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
+
+## Install into a workspace
+
+`build_agents.py --install-workspace` regenerates the agents, copies the Claude/Grok agents, skills and
+UserPromptSubmit hook into the workspace, then installs the omp targets (`omp/agents/`, `omp/skills/` and the
+`omp/` extension package). It never writes into this repo or `~/.omp`.
+
+```bash
+python3 scripts/build_agents.py --install-workspace /path/to/ws                  # omp link mode (default)
+python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # omp agents + skills only
+python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print the plan and config diff, write nothing
+```
+
+- **Link** (default) adds this checkout's `omp/` realpath to `extensions:` in `<ws>/.omp/config.yml`, so that file
+  holds a host path by design. omp reads it from the cwd only: start omp at `<ws>`. When the file has no
+  `extensions` key, the installer carries over your inherited user list, because a project list replaces it.
+- **Copy** (`--omp-mode copy`) copies the agents and skills into `<ws>/.omp/agents` and `<ws>/.omp/skills`:
+  no tools, no guard, no `/swarm` command and no context hook. Re-run it after every regeneration.
+- Both modes print `WARNING shadow:` for each agent or skill with the same frontmatter `name` that omp would load
+  first: project `.omp/agents|skills` in `<ws>` or its ancestors, `~/.omp/agent/agents|skills`, earlier
+  `extensions:` entries and `skills.customDirectories`. `.claude/*` and `.agents/skills` do not shadow.
+- Start a fresh omp session after every install or `build_agents.py` regeneration: extensions and agents load at
+  session start.
+- `task.maxRecursionDepth`: omp's default of 2 is enough (main session → `a01-orchestrator` → specialists, which
+  never get `task`). Set 3 only when A01 is itself spawned by another subagent; otherwise A01 stops with
+  `BLOCKED needs: depth`. Never set a negative (unlimited) value.
+
+  ```yaml
+  # <ws>/.omp/config.yml or ~/.omp/agent/config.yml
+  task:
+    maxRecursionDepth: 3
+  ```
+
+A relocated `omp/` package needs `SWARM_ROOT` pointing at an agent-swarm checkout, since its tools run the
+Python scripts there.
 
 ## Suggested reading order
 
