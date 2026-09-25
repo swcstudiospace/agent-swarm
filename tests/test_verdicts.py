@@ -40,19 +40,32 @@ def _store_task(swarm, tid, **notes):
     return ts
 
 
+def _lease(ts, tid, **notes):
+    """A01 lease (up to CLAIMED → IN_PROGRESS from CREATED or PLANNED), plus notes A01 writes at dispatch."""
+    steps = ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS")
+    state = ts.get(tid)["state"]
+    for s in steps[steps.index(state) + 1 if state in steps else 0:]:
+        ts.transition(tid, s)
+    if notes:
+        ts.set_notes(tid, **notes)
+
+
 def test_gate_script_records_on_gate_for(swarm_dir):
+    from swarm.taskstore import TaskStore
     env = {"SWARM_DIR": str(swarm_dir)}
     _plan(env)
     targets = _notes(swarm_dir, "X-qa")["gate_for"]
     assert set(targets) == {"X-be", "X-fe", "X-data"}
+    _lease(TaskStore(), "X-qa", dry_run=True)  # leased by the runner under --dry-run
     r = run_script("qa_gate.py", "--dry-run", "--task-id", "X-qa", "--json", env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     for t in targets:
         rows = _rows(swarm_dir, t)
         assert [(x["gate"], x["verdict"]) for x in rows] == [("quality", "pass")]
+        assert json.loads(rows[0]["envelope_json"])["payload"]["dry_run"] is True
     assert _rows(swarm_dir, "X-qa") == []
     env_file = json.loads((swarm_dir / "verdicts" / "X-qa.quality.json").read_text())
-    assert env_file["type"] == "gate.verdict"
+    assert env_file["type"] == "gate.verdict" and env_file["payload"]["dry_run"] is True
 
 
 def test_non_gate_task_id_records_nothing(swarm_dir):
@@ -74,8 +87,10 @@ def test_gate_mismatch_e_policy(swarm_dir):
 
 
 def test_dryrun_fail_inside_script(swarm_dir):
+    from swarm.taskstore import TaskStore
     env = {"SWARM_DIR": str(swarm_dir), "SWARM_DRYRUN_FAIL": "X-be:quality"}
     _plan(env)
+    _lease(TaskStore(), "X-qa", dry_run=True)
     run_script("qa_gate.py", "--dry-run", "--task-id", "X-qa", "--json", env=env)
     (row,) = _rows(swarm_dir, "X-be")
     assert row["verdict"] == "fail" and [f["id"] for f in json.loads(row["findings"])] == ["SIM-1"]
@@ -93,6 +108,8 @@ def test_two_gates_same_target_separate_rows(swarm_dir):
     ts.create(task_id="G-q", correlation_id="c", capability="qa.test", notes={"gate": "quality", "gate_for": ["T-be"], "gates": []})
     ts.create(task_id="G-r", correlation_id="c", capability="review.code", notes={"gate": "review", "gate_for": ["T-be"], "gates": []})
     kw = dict(findings=[], runs={}, correlation_id="c", expires_s=60, emit=lambda *a, **k: None)
+    _lease(ts, "G-q")
+    _lease(ts, "G-r")
     record_gate_verdicts(ts, gate_task_id="G-q", gate="quality", agent_id="A08@local", **kw)
     record_gate_verdicts(ts, gate_task_id="G-r", gate="review", agent_id="A09@local", **kw)
     latest = ts.latest_verdicts("T-be")
@@ -109,6 +126,7 @@ def test_rerun_supersedes_by_id(swarm_dir):
     ts.create(task_id="G-q", correlation_id="c", capability="qa.test", notes={"gate": "quality", "gate_for": ["T-be"], "gates": []})
     kw = dict(gate_task_id="G-q", gate="quality", agent_id="A08@local", runs={}, correlation_id="c", expires_s=60,
               emit=lambda *a, **k: None)
+    _lease(ts, "G-q")
     record_gate_verdicts(ts, findings=[make_finding("F", "major", "functional", "x")], **kw)
     record_gate_verdicts(ts, findings=[], **kw)
     assert ts.latest_verdicts("T-be")["quality"]["verdict"] == "pass"
@@ -314,14 +332,6 @@ def test_dev_key_event_and_require_key(swarm_dir, monkeypatch):
 
 
 # ---------------------------------------------------------------- WR-04 / D-14: verdicts bound to time and correlation
-def _lease(ts, tid, **notes):
-    """A01 lease (CLAIMED → IN_PROGRESS), plus any notes A01 writes at dispatch."""
-    for s in ("CLAIMED", "IN_PROGRESS"):
-        ts.transition(tid, s)
-    if notes:
-        ts.set_notes(tid, **notes)
-
-
 def test_pre_rework_verdict_replay_is_stale(swarm_dir):
     import time
     from swarm.taskstore import TaskStore
@@ -382,3 +392,50 @@ def test_gate_script_foreign_correlation_e_policy(swarm_dir, source):
     assert r.returncode == 2 and "E-POLICY" in r.stdout, r.stdout + r.stderr
     assert "SWARM_CORRELATION_ID" in r.stdout
     assert _rows(swarm_dir) == []
+
+
+# ---------------------------------------------------------------- CR-02: dry-run verdicts count only inside a runner dry-run
+def test_dry_run_gate_requires_leased_runner_task(swarm_dir):
+    from swarm.taskstore import TaskStore
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    cmd = ("qa_gate.py", "--dry-run", "--task-id", "X-qa", "--json")
+    # (a) X-qa is PLANNED, not leased: refused before any write
+    r = run_script(*cmd, env=env)
+    assert r.returncode == 2 and "E-POLICY" in r.stdout, r.stdout + r.stderr
+    assert _rows(swarm_dir) == []
+    # (b) leased, but the runner did not flag it as a dry-run: envelope file only
+    ts = TaskStore()
+    _lease(ts, "X-qa")
+    r = run_script(*cmd, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _rows(swarm_dir) == []
+    assert any("dry-run" in e["payload"]["reason"] for e in _events(swarm_dir, "gate.verdict.unrecorded"))
+    # (c) runner-flagged gate task: rows are signed dry-run and do not count on a target outside the dry-run
+    ts.set_notes("X-qa", dry_run=True)
+    r = run_script(*cmd, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for t in ("X-be", "X-fe", "X-data"):
+        (row,) = _rows(swarm_dir, t)
+        assert json.loads(row["envelope_json"])["payload"]["dry_run"] is True
+    assert ts.missing_gate_reasons("X-be")["quality"] == "dry-run"
+    # (d) the target is part of the runner dry-run too: the dry-run row counts
+    ts.set_notes("X-be", dry_run=True)
+    assert "quality" not in ts.missing_gate_reasons("X-be")
+
+
+def test_release_dry_run_honours_freeze(swarm_dir):
+    from swarm.taskstore import TaskStore
+    env = {"SWARM_DIR": str(swarm_dir)}
+    _plan(env)
+    freeze = swarm_dir / "release.freeze"
+    freeze.write_text(json.dumps({"reason": "INC-1"}))
+    _lease(TaskStore(), "X-rel", dry_run=True)
+    r = run_script("rel_plan.py", "--dry-run", "--task-id", "X-rel", "--json", env=env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["verdict"] == "fail" and out["status"] == "fail" and out["frozen"] is True
+    (row,) = _rows(swarm_dir, "X-be")
+    assert row["verdict"] == "fail"
+    assert [(f["kind"], f["severity"]) for f in json.loads(row["findings"])] == [("freeze", "blocker")]
+    assert freeze.exists()

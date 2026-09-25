@@ -203,7 +203,9 @@ def execute_one(store_path, task, agent, args, ctx, repo):
     if task["state"] != S.IN_PROGRESS.value:
         store.transition(tid, S.CLAIMED, reason=f"awarded to {agent['id']}")
         store.transition(tid, S.IN_PROGRESS, reason="lease started")
-    store.set_notes(tid, running=time.time())
+    # A01 is the only writer of notes.dry_run: dry-run gate rows record and count only on flagged tasks,
+    # and a real dispatch clears a flag left by an earlier dry-run
+    store.set_notes(tid, running=time.time(), dry_run=bool(args.dry_run))
     try:
         task = store.get(tid)
         prompt = assignment_prompt(store, task, agent, repo)

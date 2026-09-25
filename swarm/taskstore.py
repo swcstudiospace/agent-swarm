@@ -307,10 +307,11 @@ class TaskStore:
 
     def _check_row(self, task: dict, gate: str, row: dict | None, now: float) -> str:
         """Verify one verdict row of `task` against its signed envelope. Returns ok | fail | expired
-        (signature verified and current) or absent | unsigned | bad-sig | mismatch | stale (not trustworthy).
-        mismatch: the signed gate/task_id/verdict disagree with the row, or the envelope's correlation_id
-        is not the task's. stale: the signed issued_at precedes the task's last rework (notes.verdicts_since),
-        even when the row itself was re-inserted after it."""
+        (signature verified and current) or absent | unsigned | bad-sig | mismatch | stale | dry-run (not
+        trustworthy for this task). mismatch: the signed gate/task_id/verdict disagree with the row, or the
+        envelope's correlation_id is not the task's. stale: the signed issued_at precedes the task's last rework
+        (notes.verdicts_since), even when the row itself was re-inserted after it. dry-run: a signed dry_run
+        verdict on a task that A01 did not dispatch in a runner dry-run (notes.dry_run)."""
         if row is None:
             return "absent"
         if not row.get("envelope_json"):
@@ -329,6 +330,8 @@ class TaskStore:
                 return "stale"
         except (KeyError, TypeError, ValueError):
             return "mismatch"
+        if p.get("dry_run") and not task["notes_json"].get("dry_run"):
+            return "dry-run"
         if p["verdict"] not in ("pass", "waive"):
             return "fail"
         try:

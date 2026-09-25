@@ -4,7 +4,7 @@
 For --task-id / --task-ids / --correlation-id, reads each task's latest gate verdicts and required
 gates from the Task Store, applies swarm.gates.conjunction (most-restrictive wins, expired verdicts
 count as missing), honours a swarm-wide freeze (.swarm/release.freeze, set with --freeze "reason",
-lifted with --unfreeze), and emits a signed `gate.verdict` with gate="release" that passes only when
+lifted with --unfreeze; --dry-run reads it but never writes it), and emits a signed `gate.verdict` with gate="release" that passes only when
 every other required gate passes and no freeze is active. Also writes a canary release.plan
 (5→25→50→100 %) with guardrails and rollback triggers to .swarm/releases/<release_id>.plan.json.
 Verdict rows are recorded only when --task-id is a release gate task: it then evaluates, and records on,
@@ -44,6 +44,11 @@ def read_freeze(root: Path) -> dict | None:
         return {"reason": "unreadable freeze file", "frozen_at": None, "by": "unknown"}
 
 
+def freeze_finding(root: Path, frozen: dict, fid: str) -> dict:
+    return make_finding(fid, "blocker", "freeze", f"deploy freeze active: {frozen.get('reason')} (since {frozen.get('frozen_at')})",
+                        evidence=str(freeze_file(root)), owner_suggestion="A13")
+
+
 def build_plan(release_id: str, risk: str, tasks: list[str], gates: list[str], artifacts: list[str]) -> dict:
     g = GUARDRAILS[risk]
     return {"kind": "release.plan", "release_id": release_id, "strategy": "canary", "steps_pct": [5, 25, 50, 100],
@@ -65,15 +70,19 @@ def run(args, ctx) -> dict:
         freeze_file(ctx.root).write_text(json.dumps(rec, indent=2))
     if args.unfreeze and not ctx.dry_run and freeze_file(ctx.root).exists():
         freeze_file(ctx.root).unlink()
-    frozen = read_freeze(ctx.root) if not ctx.dry_run else None
+    frozen = read_freeze(ctx.root)  # read only; the dry-run honours an active freeze too (T-01-35)
 
     if ctx.dry_run:
         plan = build_plan("REL-dry", "medium", ["T-dry"], ["review", "quality"], [])
-        env, recorded = issue_gate(ctx, gate="release", agent_id="A12@dry", findings=[], simulate=True,
-                                   runs={"review": "pass", "quality": "pass", "freeze": "none"})
-        return {"status": "ok", "verdict": "pass", "frozen": False, "plan": plan, "findings": [], "envelope": env,
-                "recorded": sorted(recorded),
-                "dry_run": True, "summary": "dry-run: canned release gate PASS with canary plan"}
+        findings = [freeze_finding(ctx.root, frozen, "RF-001")] if frozen else []
+        env, recorded = issue_gate(ctx, gate="release", agent_id="A12@dry", findings=findings, simulate=True,
+                                   runs={"review": "pass", "quality": "pass", "freeze": "active" if frozen else "none"})
+        verdict = env["payload"]["verdict"]
+        summary = (f"dry-run: release gate FAIL, deploy freeze active ({frozen.get('reason')})" if frozen
+                   else "dry-run: canned release gate PASS with canary plan")
+        return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "frozen": bool(frozen),
+                "freeze": frozen, "plan": plan, "findings": findings, "envelope": env, "recorded": sorted(recorded),
+                "dry_run": True, "summary": summary}
 
     store = TaskStore(root=ctx.root)
     # a release gate task evaluates exactly its Task Store gate_for targets (D-13); any other mode is report-only
@@ -120,9 +129,7 @@ def run(args, ctx) -> dict:
                                          f"{tid}: no build.artifact registered — A11 provenance required before promote",
                                          owner_suggestion="A11"))
     if frozen:
-        findings.append(make_finding(f"RF-{len(findings)+1:03d}", "blocker", "freeze",
-                                     f"deploy freeze active: {frozen.get('reason')} (since {frozen.get('frozen_at')})",
-                                     evidence=str(freeze_file(ctx.root)), owner_suggestion="A13"))
+        findings.append(freeze_finding(ctx.root, frozen, f"RF-{len(findings)+1:03d}"))
 
     primary = ids[0] if ids else "T-unassigned"
     release_id = args.release_id or f"REL-{primary}"
