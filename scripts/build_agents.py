@@ -159,6 +159,13 @@ def _write_or_check(target: Path, content: str, check: bool, changed: list, writ
         written.append(str(target.relative_to(ROOT)))
 
 
+def _omp_orphans(slugs: set[str]) -> list[Path]:
+    """Generated omp files on disk that the manifest no longer produces."""
+    orphans = [p for p in OMP_AGENTS_DIR.glob("*.md") if p.stem not in slugs]
+    orphans += [p for p in OMP_SKILLS_DIR.glob("*/SKILL.md") if p.parent.name not in slugs]
+    return sorted(orphans)
+
+
 def _copy_file(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
@@ -224,6 +231,14 @@ def main() -> int:
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
         _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
         _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
+    if not only:
+        for orphan in _omp_orphans({a["slug"] for a in agents}):
+            changed.append(str(orphan.relative_to(ROOT)))
+            if not args.check:
+                orphan.unlink()
+                if orphan.name == "SKILL.md" and not any(orphan.parent.iterdir()):
+                    orphan.parent.rmdir()
+                written.append(f"removed {orphan.relative_to(ROOT)}")
     if args.check:
         print("stale:" if changed else "up-to-date", ", ".join(changed))
         return 1 if changed else 0

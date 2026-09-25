@@ -290,3 +290,18 @@ def test_omp_check_detects_drift(omp_tree, rel):
     assert r.returncode == 1, r.stdout + r.stderr
     assert r.stdout.startswith("stale:") and rel in r.stdout
     assert target.read_text(encoding="utf-8") == edited
+
+
+@pytest.mark.parametrize("rel", ["omp/agents/zz-orphan.md", "omp/skills/zz-orphan/SKILL.md"], ids=["agent", "skill"])
+def test_omp_check_detects_orphan(omp_tree, rel):
+    orphan = omp_tree / rel
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_text("---\nname: zz-orphan\n---\n", encoding="utf-8")
+    r = _check(omp_tree)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert r.stdout.startswith("stale:") and rel in r.stdout
+    assert orphan.exists()
+    env = {k: v for k, v in os.environ.items() if k != "SWARM_AGENTS_FILE"}
+    subprocess.run([sys.executable, str(omp_tree / "scripts" / "build_agents.py")], cwd=omp_tree, check=True, env=env, capture_output=True)
+    assert not orphan.exists()
+    assert _check(omp_tree).returncode == 0
