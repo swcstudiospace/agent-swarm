@@ -15,11 +15,13 @@ NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 # Tags the /swarm dispatch prompt so the hook never re-steers the swarm's own dispatch.
 DISPATCH_MARKER = "[agent-swarm:dispatch]"
 
-QUESTION = re.compile(r"^(what|why|how|when|where|who|which|is|are|can|could|does|do|should|explain|describe)\b", re.I)
-TRIVIAL = re.compile(r"\btypos?\b|^rename\b", re.I)
+# re.ASCII: JavaScript's \b and \w are ASCII-only, so the omp classifier sees "fixé" as "fix" + "é"; without the
+# flag Python's Unicode \b would not, and the two runtimes would disagree on accented prompts (D-10 parity).
+QUESTION = re.compile(r"^(what|why|how|when|where|who|which|is|are|can|could|does|do|should|explain|describe)\b", re.I | re.A)
+TRIVIAL = re.compile(r"\btypos?\b|^rename\b", re.I | re.A)
 SDLC = re.compile(
     r"\b(build|implement|add|create|fix|refactor|migrate|deploy|release|ship|write tests?|set up|setup|integrate|scaffold|upgrade)\b",
-    re.I,
+    re.I | re.A,
 )
 
 CONTEXT = """## AgentSwarm orchestration (mandatory)
