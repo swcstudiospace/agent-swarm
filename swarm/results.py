@@ -77,17 +77,41 @@ def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
             if not store.gate_verdict_since(t, gate=notes["gate"], gate_task_id=task["task_id"], since=claims[-1])]
 
 
+def agent_verdict(entry) -> str:
+    """A gate agent's verdicts{} entry's verdict string, normalized (stripped, lower-case; "" when missing)."""
+    return str((entry.get("verdict") if isinstance(entry, dict) else entry) or "").strip().lower()
+
+
+def agent_failed(entry) -> bool:
+    """Fail closed (WR-17): an entry fails its target unless its verdict is an explicit "pass" — "FAIL", "failed",
+    an unknown string and a missing verdict all fail. Only for entries present in verdicts{}."""
+    return agent_verdict(entry) != "pass"
+
+
+def agent_findings(entry) -> tuple[list, bool]:
+    """(findings, synthesized) of a verdicts{} entry. A failing entry without findings gets one synthesized major
+    finding (IN-15), so an agent's failure never reduces to an empty list."""
+    items = entry.get("findings") if isinstance(entry, dict) else None
+    items = list(items) if isinstance(items, list) else []
+    if items or not agent_failed(entry):
+        return items, False
+    verdict = agent_verdict(entry) or "no verdict"
+    return [{"severity": "major", "kind": "agent-verdict",
+             "summary": f"gate agent reported {verdict!r} without findings"}], True
+
+
 def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
-    """A gate agent's verdicts{} is advisory text only (D-12): fail entries become feedback on the gate task's own
-    gate_for targets. Verdict rows are written solely by the gate scripts (swarm.verdicts)."""
+    """A gate agent's verdicts{} is advisory text only (D-12): failing entries (agent_failed) become feedback on the
+    gate task's own gate_for targets. Verdict rows are written solely by the gate scripts (swarm.verdicts)."""
     notes = task["notes_json"]
     gate = notes.get("gate")
     if not gate:
         return
-    for target, v in (result.get("verdicts") or {}).items():
-        if target not in notes.get("gate_for", []) or not isinstance(v, dict) or v.get("verdict") != "fail":
+    verdicts = result.get("verdicts")
+    for target, v in (verdicts if isinstance(verdicts, dict) else {}).items():
+        if target not in notes.get("gate_for", []) or not agent_failed(v):
             continue
-        store.append_feedback(target, {"gate": gate, "source": "agent", "findings": v.get("findings", [])})
+        store.append_feedback(target, {"gate": gate, "source": "agent", "findings": agent_findings(v)[0]})
 
 
 def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, meta: dict, emit: Emit, mode: str) -> str:

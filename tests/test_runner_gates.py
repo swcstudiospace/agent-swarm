@@ -242,10 +242,19 @@ def test_review_findings_stay_on_their_target(tmp_path, severity):
     assert [e["payload"]["coerced"] for e in coerced][:1] == ([] if severity == "major" else [[{"from": "high", "to": "major"}]])
 
 
-def test_review_finding_without_severity_fails_closed(tmp_path):
-    """WR-16: a finding with no severity under the agent's "fail" entry counts as major (not minor), and is reported."""
-    verdicts = {"S-be": {"verdict": "fail", "findings": [{"kind": "security", "summary": "migration drops users.email"}]},
-                "S-fe": {"verdict": "pass", "findings": [{"kind": "style", "summary": "naming nit", "severity": None}]}}
+def _feedback(swarm, tid) -> list[dict]:
+    con = sqlite3.connect(swarm / "tasks.db")
+    (notes,) = con.execute("SELECT notes FROM tasks WHERE task_id=?", (tid,)).fetchone()
+    con.close()
+    return json.loads(notes).get("feedback") or []
+
+
+@pytest.mark.parametrize("agent_verdict", ["fail", "FAIL", " Failed "])
+def test_review_finding_without_severity_fails_closed(tmp_path, agent_verdict):
+    """WR-16/WR-17: a finding with no severity under the agent's failing entry (any spelling other than "pass")
+    counts as major (not minor), is reported, and becomes agent feedback."""
+    verdicts = {"S-be": {"verdict": agent_verdict, "findings": [{"kind": "security", "summary": "migration drops users.email"}]},
+                "S-fe": {"verdict": "PASS", "findings": [{"kind": "style", "summary": "naming nit", "severity": None}]}}
     swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
     be, fe = _review_rows(swarm, "S-be"), _review_rows(swarm, "S-fe")
     assert be and be[0]["verdict"] == "fail", [x["findings"] for x in be]
@@ -255,6 +264,29 @@ def test_review_finding_without_severity_fails_closed(tmp_path):
     assert states["S-be"] != "DONE" and states["S-fe"] == "DONE"
     assert _events(swarm, "gate.findings.coerced")[0]["payload"]["coerced"] == [
         {"from": "missing", "to": "major"}, {"from": "missing", "to": "minor"}]
+    agent_fb = [e for e in _feedback(swarm, "S-be") if e["source"] == "agent"]
+    assert agent_fb and agent_fb[0]["findings"][0]["summary"] == "migration drops users.email"
+    assert [e for e in _feedback(swarm, "S-fe") if e["source"] == "agent"] == []
+
+
+@pytest.mark.parametrize("entry", [{"verdict": "fail", "findings": []}, {"verdict": "Rejected"}, {"findings": []}],
+                         ids=["fail-empty", "unknown-no-findings", "missing-verdict"])
+def test_failing_agent_verdict_without_findings_fails_target(tmp_path, entry):
+    """IN-15: an agent entry that is not "pass" but carries no findings gets one synthesized major finding on its
+    target (gate.findings.synthesized) instead of recording a silent PASS; an explicit pass is untouched."""
+    verdicts = {"S-be": entry, "S-fe": {"verdict": "pass", "findings": []}}
+    swarm = _run_stub_swarm(tmp_path, _VERDICTS_STUB.replace("@VERDICTS@", repr(verdicts)), _BE_FE_REVIEW)
+    be, fe = _review_rows(swarm, "S-be"), _review_rows(swarm, "S-fe")
+    assert be and be[0]["verdict"] == "fail", [x["findings"] for x in be]
+    synth = json.loads(be[0]["findings"])
+    assert [(f["severity"], f["kind"]) for f in synth] == [("major", "agent-verdict")]
+    assert fe and fe[0]["verdict"] == "pass" and fe[0]["findings"] == "[]"
+    states = _states(swarm)
+    assert states["S-be"] != "DONE" and states["S-fe"] == "DONE"
+    ev = _events(swarm, "gate.findings.synthesized")
+    assert [(s["key"], s["applied_to"]) for s in ev[0]["payload"]["synthesized"]] == [("S-be", ["S-be"])]
+    agent_fb = [e for e in _feedback(swarm, "S-be") if e["source"] == "agent"]
+    assert agent_fb and agent_fb[0]["findings"][0]["summary"] == synth[0]["summary"]
 
 
 def test_review_finding_under_unknown_key_fails_every_target(tmp_path):

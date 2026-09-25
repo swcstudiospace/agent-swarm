@@ -35,7 +35,8 @@ from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
-from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
+from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
+                           agent_failed, agent_findings, agent_verdict)
 
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
@@ -198,9 +199,12 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
 def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     """Review gate: write {target: [findings]} — what the agent reported under verdicts{} for each gate_for target —
     to results/<tid>.a<N>.findings.json for rev_gate --per-target-findings, so a finding fails only its own target
-    (WR-14). Normalization fails closed and reports every change (WR-16):
+    (WR-14). Normalization fails closed and reports every change (WR-16/WR-17):
+    - an entry fails its target unless its verdict is an explicit "pass" (results.agent_failed: case-insensitive;
+      "FAIL", unknown and missing verdicts fail); a failing entry without findings gets one synthesized major
+      finding (results.agent_findings, IN-15), reported in gate.findings.synthesized;
     - a severity outside SEVERITIES (case-insensitive) or a non-object finding counts as major;
-    - a missing severity counts as major under the agent's "fail" entry, else minor;
+    - a missing severity counts as major under a failing entry, else minor;
     - findings under a key that is not a gate_for id cannot be attributed, so they apply to every target.
     Changes emit one gate.findings.coerced event; unattributed keys emit gate.findings.unattributed.
     None for other gates or when the session left no parseable result. The agent's verdicts never count:
@@ -215,11 +219,17 @@ def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None
     verdicts = verdicts if isinstance(verdicts, dict) else {}
     gate_for = list(notes.get("gate_for", []))
     coerced: list[dict] = []
+    synthesized: list[dict] = []
 
-    def entries(v) -> list[tuple[object, bool]]:
-        items = v.get("findings") if isinstance(v, dict) else None
-        failed = isinstance(v, dict) and v.get("verdict") == "fail"
-        return [(f, failed) for f in items] if isinstance(items, list) else []
+    def entries(key: str, applied_to: list[str]) -> list[tuple[object, bool]]:
+        if key not in verdicts:
+            return []
+        v = verdicts[key]
+        items, synth = agent_findings(v)
+        if synth:
+            synthesized.append({"key": key, "verdict": agent_verdict(v), "applied_to": applied_to})
+        failed = agent_failed(v)
+        return [(f, failed) for f in items]
 
     def normalize(f, failed: bool) -> dict:
         if not isinstance(f, dict):
@@ -233,11 +243,11 @@ def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None
         return {**f, "severity": to, "evidence": f"{f.get('evidence') or ''} [agent severity {sev!r}]".strip()}
 
     stray = sorted(k for k in verdicts if k not in gate_for)
-    unattributed = [normalize(f, failed) for k in stray for f, failed in entries(verdicts[k])]
+    unattributed = [normalize(f, failed) for k in stray for f, failed in entries(k, gate_for)]
     per_target = {}
     for target in gate_for:
         findings, seen = [], set()
-        for f in [normalize(f, failed) for f, failed in entries(verdicts.get(target))] + unattributed:
+        for f in [normalize(f, failed) for f, failed in entries(target, [target])] + unattributed:
             key = json.dumps(f, sort_keys=True, default=str)
             if key not in seen:
                 seen.add(key)
@@ -245,6 +255,8 @@ def review_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None
         per_target[target] = findings
     if coerced:
         emit("gate.findings.coerced", {"task_id": task["task_id"], "coerced": coerced})
+    if synthesized:
+        emit("gate.findings.synthesized", {"task_id": task["task_id"], "synthesized": synthesized})
     if stray:
         emit("gate.findings.unattributed", {"task_id": task["task_id"], "keys": stray, "applied_to": gate_for,
                                             "findings": len(unattributed)})
