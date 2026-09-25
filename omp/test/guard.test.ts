@@ -385,6 +385,12 @@ describe("HOOK-02", () => {
     ["f() { git clean -fdx; }", "git-clean-force"],
     ["git \\\npush --force", "git-force-push"],
     ["git push \\\r\n  --force origin x", "git-force-push"],
+    // WR-03: an apostrophe in a heredoc body or a comment must not swallow the commands after it
+    ["cat <<EOF > notes.md\nDon't panic\nEOF\ngit push --force", "git-force-push"],
+    ["cat <<-'EOF' > n.md\n\tDon't\n\tEOF\ngit reset --hard", "git-reset-hard"],
+    ["# don't\ngit push -f", "git-force-push"],
+    ["echo a #don't\ngit reset --hard", "git-reset-hard"],
+    ["echo don't ; git push -f", "git-force-push"],
   ])("normalization: %s → %s", (command, id) => {
     expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
   });
@@ -397,6 +403,9 @@ describe("HOOK-02", () => {
     expect(normalize('A="b c" B=1 env -u X sudo -u root command -p git status')).toEqual(["git status"]);
     expect(normalize("(cd x && git status) | { read a; echo ${a} {1,2}; }")).toEqual(["cd x", "git status", "read a", "echo ${a} {1,2}"]);
     expect(normalize('echo "(x)" && find . \\( -name x \\)')).toEqual(['echo "(x)"', "find . \\( -name x \\)"]);
+    expect(normalize("cat <<EOF > notes.md\nDon't panic; git push -f\nEOF\necho done")).toEqual(["cat <<EOF > notes.md", "echo done"]);
+    expect(normalize("echo a#b 'c;d' \"e|f\" x && psql <<< 'SELECT 1; DROP TABLE t'")).toEqual(["echo a#b 'c;d' \"e|f\" x", "psql <<< 'SELECT 1; DROP TABLE t'"]);
+    expect(normalize("cat <<EOF\nno delimiter\ngit push -f")).toEqual(["cat <<EOF"]);
   });
 
   test.each([

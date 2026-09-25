@@ -190,15 +190,43 @@ const PREFIX = new RegExp(
   String.raw`^(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+)`,
 );
 
-/** Split on `;`, `&&`, `||`, `|`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes. */
-function splitTopLevel(text: string): string[] {
+/** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
+const HEREDOC = /<<-?[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s<>|&;()]+))/y;
+
+/**
+ * Split on `;`, `&&`, `||`, `|`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes. Heredoc bodies and `#`
+ * comments are data, not commands: they are skipped without quote tracking (an apostrophe in them must not
+ * swallow the commands after them). An unbalanced quote at the end re-splits its tail with quotes off.
+ */
+function splitTopLevel(text: string, quotesOn = true): string[] {
   const out: string[] = [];
   let cur = "";
+  let blank = true; // cur holds only whitespace
   let quote: string | undefined;
+  let quoteAt = 0;
+  let quoteOut = 0;
+  let quoteCur = "";
+  let heredoc: string | undefined;
   const boundary = () => {
     out.push(cur);
     cur = "";
+    blank = true;
   };
+  /** The index of the newline that ends the heredoc delimiter line at or after `from` (text.length when absent). */
+  const heredocEnd = (from: number): number => {
+    for (let j = from; j < text.length; ) {
+      const nl = text.indexOf("\n", j);
+      const end = nl === -1 ? text.length : nl;
+      if (text.slice(j, end).replace(/^\t+/, "") === heredoc) return end;
+      j = end + 1;
+    }
+    return text.length;
+  };
+  const heredocAt = (at: number): RegExpExecArray | null => {
+    HEREDOC.lastIndex = at;
+    return HEREDOC.exec(text);
+  };
+  let m: RegExpExecArray | null;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (quote !== undefined) {
@@ -207,25 +235,54 @@ function splitTopLevel(text: string): string[] {
       cur += c;
       continue;
     }
-    if (c === "'" || c === '"') {
+    if (quotesOn && (c === "'" || c === '"')) {
       quote = c;
+      quoteAt = i;
+      quoteOut = out.length;
+      quoteCur = cur;
       cur += c;
     } else if (c === "\\" && i + 1 < text.length) {
       cur += c + text[++i];
-    } else if (c === ";" || c === "\n" || c === "|" || (c === "&" && text[i + 1] === "&")) {
-      if (c !== ";" && c !== "\n" && text[i + 1] === c) i++;
+      blank = false;
+    } else if (c === "#" && (blank || /\s/.test(text[i - 1]))) {
+      // a comment runs to the end of the line; the newline itself is the segment boundary
+      const nl = text.indexOf("\n", i);
+      i = (nl === -1 ? text.length : nl) - 1;
+    } else if (c === "<" && text[i + 1] === "<" && text[i + 2] !== "<" && (m = heredocAt(i)) !== null) {
+      heredoc = m[1] ?? m[2] ?? m[3];
+      cur += m[0];
+      blank = false;
+      i += m[0].length - 1;
+    } else if (c === "\n") {
+      boundary();
+      if (heredoc !== undefined) {
+        i = heredocEnd(i + 1);
+        heredoc = undefined;
+      }
+    } else if (c === ";" || c === "|" || (c === "&" && text[i + 1] === "&")) {
+      if (c !== ";" && text[i + 1] === c) i++;
       boundary();
     } else if (c === "(" || c === ")") {
       // a subshell `( … )`: its body is its own segment list (`$(…)` was cut out before the split)
       boundary();
-    } else if (c === "{" && cur.trim() === "" && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
+    } else if (c === "{" && blank && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
       // a brace group `{ …; }` opener as a word of its own (`${VAR}` and `{a,b}` are glued, never split)
       boundary();
     } else if (c === "}" && (i === 0 || /[\s;]/.test(text[i - 1])) && (i + 1 === text.length || /[\s;&|)]/.test(text[i + 1]))) {
       boundary();
-    } else cur += c;
+    } else {
+      cur += c;
+      if (blank && !/\s/.test(c)) blank = false;
+    }
   }
   out.push(cur);
+  if (quote !== undefined) {
+    // bash would reject an unterminated quote; a heredoc or comment the scan missed is the likelier reading
+    const tail = splitTopLevel(text.slice(quoteAt + 1), false);
+    out.length = quoteOut;
+    tail[0] = `${quoteCur}${quote}${tail[0]}`;
+    out.push(...tail);
+  }
   return out;
 }
 
