@@ -183,12 +183,38 @@ const VALUE = String.raw`(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])*`;
 /** sudo/doas flags that take the next word (`-u root`, `-g wheel`, `-C 3`, `-D dir`, `-h host`, `-p prompt`, `-r role`, `-t type`, `-U user`, `-T secs`). */
 const SUDO_VALUE_FLAG = String.raw`-[ugCDhprtUT]\s+\S+|--(?:user|group|host|prompt|role|type|chdir|close-from|other-user|command-timeout)\s+\S+`;
 /**
+ * Wrappers that run the rest of the line unchanged; a flag that takes a value takes it along (`nice -n 5`,
+ * `timeout -s KILL 5m`, `xargs -n 1`), and `timeout` also drops its duration.
+ */
+const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|nice(?:\s+(?:-n\s+\S+|-\S+))*|ionice(?:\s+(?:-[cn]\s+\S+|-\S+))*|stdbuf(?:\s+-\S+)+|timeout(?:\s+(?:-[sk]\s+\S+|-\S+))*\s+\S+|xargs(?:\s+(?:-[nIPdaLsE]\s+\S+|-\S+))*)\s+`;
+/**
  * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …`, `sudo`/`doas` with their flags,
- * `command [-pvV]`, and `NAME=value` assignments (quoted values may hold spaces).
+ * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces) and the WRAPPER set.
  */
 const PREFIX = new RegExp(
-  String.raw`^(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+)`,
+  String.raw`^(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+|${WRAPPER})`,
 );
+/** `sh -c`, `bash -ec`, `/bin/zsh -x -c` …: the next word is a command line of its own. */
+const SHELL_C = /^(?:\S*\/)?(?:ba|z|da|k|a)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c\s+/;
+/** Nesting cap for `sh -c "sh -c '…'"` recursion. */
+const MAX_LITERAL_DEPTH = 3;
+
+/** The content of the quoted string starting at `text[at]` (bash unescaping inside `"…"`); undefined when unterminated. */
+function quotedLiteral(text: string, at: number): string | undefined {
+  const q = text[at];
+  if (q !== '"' && q !== "'") return undefined;
+  let out = "";
+  for (let i = at + 1; i < text.length; i++) {
+    const c = text[i];
+    if (c === q) return out;
+    if (c === "\\" && q === '"' && i + 1 < text.length && /["\\$`\n]/.test(text[i + 1])) {
+      out += text[++i];
+      continue;
+    }
+    out += c;
+  }
+  return undefined;
+}
 
 /** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
 const HEREDOC = /<<-?[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s<>|&;()]+))/y;
@@ -288,9 +314,11 @@ function splitTopLevel(text: string, quotesOn = true): string[] {
 
 /**
  * D-03 normalization: the inner text of every `$(…)` / backtick substitution becomes its own command, the rest is
- * split on `;`, `&&`, `||`, `|` (outside quotes), and each segment loses leading `env X=…`, `X=…`, `sudo`, `command`.
+ * split on `;`, `&&`, `||`, `|` (outside quotes), and each segment loses leading `env X=…`, `X=…`, `sudo`, `command`
+ * and wrapper words. A literal `sh -c "…"` / `eval "…"` argument is normalized in turn and its segments appended
+ * (the outer segment stays too); `bash -c "$VAR"` is opaque by design (the documented residual).
  */
-export function normalize(command: string): string[] {
+export function normalize(command: string, depth = 0): string[] {
   const parts: string[] = [];
   // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
   let rest = command.replace(/\\\r?\n/g, " ");
@@ -308,7 +336,13 @@ export function normalize(command: string): string[] {
         prev = seg;
         seg = seg.replace(PREFIX, "").trim();
       }
-      if (seg !== "") segments.push(seg);
+      if (seg === "") continue;
+      segments.push(seg);
+      if (depth < MAX_LITERAL_DEPTH) {
+        // `sh -c "<literal>"`, or the quoted line left behind by a stripped `eval`
+        const literal = quotedLiteral(seg, SHELL_C.exec(seg)?.[0].length ?? 0);
+        if (literal !== undefined) segments.push(...normalize(literal, depth + 1));
+      }
     }
   }
   return segments;

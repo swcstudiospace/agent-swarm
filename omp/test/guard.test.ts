@@ -391,6 +391,20 @@ describe("HOOK-02", () => {
     ["# don't\ngit push -f", "git-force-push"],
     ["echo a #don't\ngit reset --hard", "git-reset-hard"],
     ["echo don't ; git push -f", "git-force-push"],
+    // WR-04: wrappers and a literal sh -c / eval argument
+    ['bash -c "git push --force"', "git-force-push"],
+    ["sh -c 'git reset --hard'", "git-reset-hard"],
+    ["/bin/bash -x -ec \"cd x && sh -c 'git clean -fdx'\" arg0", "git-clean-force"],
+    ['bash -c "echo don\\"t; git push -f"', "git-force-push"],
+    ["timeout 60 git push --force", "git-force-push"],
+    ["timeout -s KILL 5m nice -n 5 git push -f", "git-force-push"],
+    ["time git push -f", "git-force-push"],
+    ["nohup git push -f &", "git-force-push"],
+    ["echo origin | xargs git push -f", "git-force-push"],
+    ["xargs -n 1 -I{} git push -f {}", "git-force-push"],
+    ['eval "git push -f"', "git-force-push"],
+    ["eval git push -f", "git-force-push"],
+    ["stdbuf -oL exec git reset --hard", "git-reset-hard"],
   ])("normalization: %s → %s", (command, id) => {
     expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
   });
@@ -406,6 +420,10 @@ describe("HOOK-02", () => {
     expect(normalize("cat <<EOF > notes.md\nDon't panic; git push -f\nEOF\necho done")).toEqual(["cat <<EOF > notes.md", "echo done"]);
     expect(normalize("echo a#b 'c;d' \"e|f\" x && psql <<< 'SELECT 1; DROP TABLE t'")).toEqual(["echo a#b 'c;d' \"e|f\" x", "psql <<< 'SELECT 1; DROP TABLE t'"]);
     expect(normalize("cat <<EOF\nno delimiter\ngit push -f")).toEqual(["cat <<EOF"]);
+    expect(normalize("/bin/bash -x -ec \"cd x && sh -c 'git clean -fdx'\" arg0")).toEqual([
+      "/bin/bash -x -ec \"cd x && sh -c 'git clean -fdx'\" arg0", "cd x", "sh -c 'git clean -fdx'", "git clean -fdx",
+    ]);
+    expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
   test.each([
