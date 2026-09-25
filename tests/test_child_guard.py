@@ -46,6 +46,29 @@ def test_hook_silent_inside_swarm_child():
     assert not json.loads(p.stdout or "{}").get("additionalContext")
 
 
+_SPAWN_TRAP = r"""
+import os, runpy, subprocess, sys
+
+def trap(name):
+    def _boom(*a, **kw):
+        sys.stderr.write(f"SPAWN:{name}\n")
+        raise RuntimeError(name)
+    return _boom
+
+subprocess.Popen = trap("Popen")
+for fn in ("fork", "posix_spawn", "posix_spawnp", "system", "execv", "execve", "execvp", "execvpe", "spawnv", "spawnve"):
+    if hasattr(os, fn):
+        setattr(os, fn, trap(fn))
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
+
+
 def test_hook_does_not_spawn_runner():
-    src = HOOK.read_text()
-    assert "Popen" not in src and "autonomous_run" not in src
+    """The hook only writes context: with every process-creation primitive trapped, a positive prompt still
+    gets its additionalContext and no primitive is reached (a spawn attempt would trip fail-open to `{}`)."""
+    env = {**os.environ, "SWARM_CHILD": "0"}
+    p = subprocess.run([sys.executable, "-c", _SPAWN_TRAP, str(HOOK)], input=json.dumps({"prompt": "implement a billing feature"}),
+                       capture_output=True, text=True, env=env)
+    assert p.returncode == 0
+    assert "SPAWN:" not in p.stderr
+    assert "agent-swarm-orchestrate" in json.loads(p.stdout).get("additionalContext", "")
