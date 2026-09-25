@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { callingAgent } from "../src/context.ts";
-import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, RULES, SWARM_SLUGS } from "../src/guard.ts";
+import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, RULES, ruleReason, SWARM_SLUGS } from "../src/guard.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
@@ -299,7 +299,8 @@ describe("HOOK-02", () => {
     const { run } = guardHandler({ activeTools: ["task"] });
     const agent = rule.agents?.[0] ?? B05;
     const res = run(bash(sample), agentCtx(CWD, agent, [], false)) as { block?: boolean; reason?: string };
-    expect(res).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${rule.capability}: ${id})` });
+    expect(res).toEqual({ block: true, reason: ruleReason(rule) });
+    if (rule.reason === undefined) expect(ruleReason(rule)).toBe(`BLOCKED needs: human-approval (${rule.capability}: ${id})`);
     expect(run(bash(sample), fakeCtx(CWD))).toBeUndefined();
   });
 
@@ -410,4 +411,102 @@ describe("HOOK-02", () => {
       expect(guardToolCall(call("bash", input), main)).toBeUndefined();
     },
   );
+});
+
+describe("HOOK-03 shell twin and D-08", () => {
+  const B05 = "a05-backend";
+  const facts = (agent: string | undefined, extra: Partial<GuardFacts> = {}): GuardFacts => ({
+    agent, restricted: false, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, ...extra,
+  });
+  const bash = (command: string) => call("bash", { command });
+  const SWARM_STATE = "BLOCKED needs: human-approval (swarm-state)";
+  const ORCH = [
+    "python3 scripts/orch_status.py --ingest r.json",
+    "python3 scripts/orch_status.py --transition T-1 DONE",
+    "python3 scripts/orch_plan.py --brief-text x",
+    "bun scripts/ts/orch_plan.ts",
+    "scripts/ts/orch_status.ts --ingest x",
+    "cd /repo && SWARM_DIR=/tmp python3 ./scripts/orch_status.py --ingest=r.json",
+  ];
+
+  test.each(ORCH)("HOOK-03 shell: %s blocks for a05, passes for A01 with task and for main", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
+    expect(guardToolCall(bash(command), facts(A01))).toBeUndefined();
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test("HOOK-03 shell: read-only orch_status from a05 passes", () => {
+    expect(guardToolCall(bash("python3 scripts/orch_status.py --history"), facts(B05))).toBeUndefined();
+  });
+
+  test.each([
+    ["python3 scripts/review_gate.py --task T-1", B05, true],
+    ["python3 scripts/review_gate.py --task T-1", "a09-reviewer", false],
+    ["python3 scripts/review_gate.py --task T-1", "a08-qa", true],
+    ["python3 scripts/rev_gate.py --task T-1", "a09-reviewer", false],
+    ["python3 scripts/qa_gate.py", "a08-qa", false],
+    ["bun scripts/ts/qa_gate.ts", "a09-reviewer", true],
+    ["python3 scripts/sec_gate.py", "a10-security", false],
+    ["python3 scripts/rel_plan.py", "a12-release", false],
+    ["python3 scripts/rel_plan.py", B05, true],
+    ["python3 scripts/unknown_gate.py", "a09-reviewer", true],
+  ])("gate script: %s from %s blocks=%p", (command, agent, blocks) => {
+    const res = guardToolCall(bash(command), facts(agent));
+    if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-foreign)" });
+    else expect(res).toBeUndefined();
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([{}, { code: "1+1" }, null])("D-08: eval %p blocks inside, passes in main", (input) => {
+    expect(guardToolCall(call("eval", input), facts(B05))).toEqual({ block: true, reason: "BLOCKED needs: human-approval (eval: eval-in-swarm)" });
+    expect(guardToolCall(call("eval", input), facts(undefined))).toBeUndefined();
+  });
+
+  const PROTECTED = [".swarm/tasks.db", "./.omp/config.yml", "~/.omp/agent/config.yml", `${CWD}/.swarm/x`, `${HOME}/.omp/y`, "src/../.swarm/z"];
+  test.each(PROTECTED.flatMap((path) => [["write", path], ["edit", path]]))("D-08: %s %s blocks inside, passes in main", (tool, path) => {
+    expect(guardToolCall(call(tool, { path, content: "x" }), facts(B05))).toEqual({
+      block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-write)",
+    });
+    expect(guardToolCall(call(tool, { path, content: "x" }), facts(undefined))).toBeUndefined();
+  });
+
+  test.each(["src/app.ts", "docs/omp.md", ".swarmish/x", `${CWD}/a.omp`])("D-08: write %s passes", (path) => {
+    expect(guardToolCall(call("write", { path }), facts(B05))).toBeUndefined();
+  });
+
+  test.each(["echo x > .swarm/a", "tee -a .omp/config.yml", "cp f ~/.omp/x", "mv a .swarm/b", "cat a >> ~/.omp/b", "install -t .swarm f"])(
+    "D-08 shell: %s blocks inside, passes in main",
+    (command) => {
+      expect(guardToolCall(bash(command), facts(B05))).toEqual({
+        block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-shell)",
+      });
+      expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+    },
+  );
+
+  test.each(["cat .swarm/tasks.db", "cp .omp/config.yml /tmp/x.yml", "echo x > out.txt", "ls 2>&1 | tee log.txt"])("D-08 shell: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
+  test("through the handler: eval, protected write and orch shell block for a05; main untouched", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const a05 = agentCtx(CWD, B05, [], false);
+    expect((run(call("eval", { code: "x" }), a05) as { block?: boolean }).block).toBe(true);
+    expect((run(call("write", { path: ".omp/config.yml" }), a05) as { block?: boolean }).block).toBe(true);
+    expect((run(bash(ORCH[0]), a05) as { reason?: string }).reason).toBe(SWARM_STATE);
+    for (const ev of [call("eval", { code: "x" }), call("write", { path: ".omp/config.yml" }), bash(ORCH[0])]) {
+      expect(run(ev, fakeCtx(CWD))).toBeUndefined();
+    }
+  });
+
+  const MALFORMED: [string, unknown][] = [
+    ["bash", null], ["bash", { command: 7 }], ["bash", { command: { x: 1 } }], ["write", null], ["write", {}], ["write", { path: 3 }],
+    ["edit", { path: null }], ["edit", "path"], ["read", undefined], ["yield", null], ["eval", undefined], ["write", { path: "" }],
+  ];
+  test.each(MALFORMED)("malformed %s %p never throws inside or outside", (tool, input) => {
+    for (const f of [facts(B05), facts(undefined), facts(A01), facts(undefined, { env: { SWARM_TASK_ID: "T" } }), facts(B05, { cwd: "", home: "" })]) {
+      expect(() => guardToolCall(call(tool, input), f)).not.toThrow();
+    }
+    expect(guardToolCall(call(tool, input), facts(undefined))).toBeUndefined();
+  });
 });

@@ -7,6 +7,12 @@ import type { ExtensionContext } from "./omp-api.ts";
 
 type SessionCtx = Pick<ExtensionContext, "sessionManager">;
 
+/**
+ * Gate → the only agent (omp slug, agents.json) allowed to run it (D-12 separation of gate duties). Read by swarm_gate
+ * (tools.ts) and by the guard's gate-script shell rule (guard.ts), which must not import tools.ts or the bridge.
+ */
+export const GATE_AGENTS = { quality: "a08-qa", review: "a09-reviewer", security: "a10-security", release: "a12-release" } as const;
+
 /** The calling agent (session_init.agent; undefined = the top-level "main" session) and whether its tools are restricted. */
 export function sessionAgent(ctx: SessionCtx): { agent: string | undefined; restricted: boolean } {
   const init = ctx.sessionManager.getEntries().find((e) => e.type === "session_init");

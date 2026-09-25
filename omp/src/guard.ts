@@ -2,10 +2,12 @@
  * The `tool_call` guard decision (Phase 4 HOOK-03/04): a pure function of (event, facts) with no I/O, no bridge,
  * no fs and no process access — index.ts reads the facts (identity, plan mode, active tools, env) and passes them in.
  * Precedence, first match decides: HOOK-04 (A01 depth cap) → HOOK-03 (swarm-state tools) → outside a swarm
- * session nothing else applies → HOOK-02 (the autonomy-ceiling RULES table over bash, D-03/D-04).
+ * session nothing else applies → D-08 (eval, protected write/edit paths) → HOOK-02 (the RULES table over bash:
+ * D-05 shell twin and gate scripts, D-08 shell writes, D-03/D-04 autonomy ceiling).
  * Reason strings are read by the A01 dispatcher (D-07) and operators: keep them and the rule ids stable.
  */
 import { posix } from "node:path";
+import { GATE_AGENTS } from "./context.ts";
 import type { ToolCallEvent, ToolCallResult } from "./omp-api.ts";
 
 export const ORCHESTRATOR = "a01-orchestrator";
@@ -83,6 +85,16 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   }
   // Outside a swarm session nothing else applies (D-01)
   if (!inSwarm(facts)) return undefined;
+  // D-08: eval runs raw code past tool_call, so it is closed outright; config/state paths are not writable
+  if (event.toolName === "eval") return { block: true, reason: reason("eval", "eval-in-swarm") };
+  if (event.toolName === "write" || event.toolName === "edit") {
+    const input = typeof event.input === "object" && event.input !== null ? (event.input as { path?: unknown; file_path?: unknown }) : {};
+    const path = typeof input.path === "string" ? input.path : input.file_path;
+    if (typeof path === "string" && path.trim() !== "" && isProtectedPath(path.trim(), facts)) {
+      return { block: true, reason: reason("protected_path", "protected-path-write") };
+    }
+    return undefined;
+  }
   // HOOK-02 (D-03): bash only; normalize, then the first matching row in table order decides
   if (event.toolName !== "bash") return undefined;
   const command = typeof event.input === "object" && event.input !== null ? (event.input as { command?: unknown }).command : undefined;
@@ -126,6 +138,8 @@ export interface Rule {
   pattern: RegExp | Matcher;
   /** Agents the capability is scoped to in agents.json (messaging only, never an allow list). */
   agents?: readonly string[];
+  /** The block reason when it is not the `(<capability>: <id>)` form (the swarm-state shell twin). */
+  reason?: string;
   /** Positive example commands: guard.test.ts requires ≥1 and asserts each blocks inside a swarm session. */
   samples: readonly string[];
 }
@@ -253,8 +267,77 @@ const DDL = /\b(?:DROP\s+(?:TABLE|COLUMN|DATABASE|SCHEMA)|TRUNCATE)\b/i;
 
 const reason = (capability: string, id: string) => `BLOCKED needs: human-approval (${capability}: ${id})`;
 
+/** D-08: a path inside `.swarm/` or `.omp/` (cwd's, ~/.omp, or any other) after `~` expansion and cwd resolution. */
+export function isProtectedPath(path: string, facts: Pick<GuardFacts, "cwd" | "home">): boolean {
+  return resolvePath(path, facts).split("/").some((s) => s === ".swarm" || s === ".omp");
+}
+
+/** Files a segment writes, as far as detectable: `>`/`>>` targets, tee operands, cp/mv/install destinations. */
+function shellWriteTargets({ text, words }: Segment): string[] {
+  const targets: string[] = [];
+  for (const m of text.matchAll(/(?:^|[^<>])\d*&?>>?\|?\s*("[^"]*"|'[^']*'|[^\s<>|&;]+)/g)) {
+    targets.push(m[1].replace(/^(['"])(.*)\1$/, "$2"));
+  }
+  const args = operands(words.slice(1));
+  if (words[0] === "tee") targets.push(...args);
+  if (words[0] === "cp" || words[0] === "mv" || words[0] === "install") {
+    const t = words.findIndex((w) => w === "-t" || w === "--target-directory");
+    if (t > 0 && words[t + 1] !== undefined) targets.push(words[t + 1]);
+    for (const w of words) if (w.startsWith("--target-directory=")) targets.push(w.slice("--target-directory=".length));
+    if (args.length > 1) targets.push(args[args.length - 1]);
+  }
+  return targets;
+}
+
+/** Gate script stem → its gate (swarm_gate's GATE_SCRIPTS, plus the gate names themselves). */
+const GATE_STEMS: Record<string, keyof typeof GATE_AGENTS> = {
+  qa_gate: "quality", quality_gate: "quality", rev_gate: "review", review_gate: "review",
+  sec_gate: "security", security_gate: "security", rel_plan: "release", release_gate: "release",
+};
+
+/** A direct run of a gate script (`*_gate.py|ts`, rel_plan) by anyone but that gate's GATE_AGENTS owner (D-05). */
+function foreignGateScript({ words }: Segment, facts: GuardFacts): boolean {
+  return words.some((w) => {
+    const m = /^(\w+_gate|rel_plan)\.(?:py|ts)$/.exec(posix.basename(w));
+    if (m === null) return false;
+    const gate = Object.hasOwn(GATE_STEMS, m[1]) ? GATE_STEMS[m[1]] : undefined;
+    return gate === undefined || facts.agent !== GATE_AGENTS[gate];
+  });
+}
+
+const ORCH_STATE_SHELL = [/\borch_status\.py\b.*\s--(?:ingest|transition)\b/, /\borch_plan\.py\b/, /(?:^|[\s/])orch_\w+\.ts\b/];
+
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
+  // HOOK-03 shell twin (D-05): Task Store mutation through the scripts is A01's alone, like the swarm-state tools
+  {
+    id: "orch-state-shell",
+    capability: "swarm-state",
+    reason: SWARM_STATE_REASON,
+    pattern: ({ text }, facts) => facts.agent !== ORCHESTRATOR && ORCH_STATE_SHELL.some((re) => re.test(text)),
+    samples: [
+      "python3 scripts/orch_status.py --ingest r.json",
+      "python3 scripts/orch_status.py --transition T-1 DONE",
+      "python3 scripts/orch_plan.py --brief-text x",
+      "bun scripts/ts/orch_plan.ts",
+      "scripts/ts/orch_status.ts --ingest x",
+    ],
+  },
+  // gate scripts are identity-bound in bash as in swarm_gate (Phase 3 WR-03)
+  {
+    id: "gate-script-foreign",
+    capability: "gate",
+    agents: Object.values(GATE_AGENTS),
+    pattern: foreignGateScript,
+    samples: ["python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x"],
+  },
+  // D-08: shell writes into .swarm/, .omp/ or ~/.omp
+  {
+    id: "protected-path-shell",
+    capability: "protected_path",
+    pattern: (seg, facts) => shellWriteTargets(seg).some((t) => isProtectedPath(t, facts)),
+    samples: ["echo x > .swarm/a", "tee -a .omp/config.yml", "cp f ~/.omp/x", "mv a .swarm/b", "echo x >>~/.omp/agent/config.yml"],
+  },
   // universal destructive (every swarm agent, treated as L4)
   {
     id: "git-force-push",
@@ -412,4 +495,4 @@ export function matchRule(command: string, facts: GuardFacts): Rule | undefined 
   );
 }
 
-export const ruleReason = (rule: Rule): string => reason(rule.capability, rule.id);
+export const ruleReason = (rule: Rule): string => rule.reason ?? reason(rule.capability, rule.id);

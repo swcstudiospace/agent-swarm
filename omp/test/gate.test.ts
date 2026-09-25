@@ -3,7 +3,8 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, type BridgeResult, SwarmToolError } from "../src/bridge.ts";
-import { buildTools, GATE_AGENTS } from "../src/tools.ts";
+import { GATE_AGENTS } from "../src/context.ts";
+import { buildTools } from "../src/tools.ts";
 import { type AnyTool, agentCtx, callTool, fakeCtx, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_DIR", "SWARM_AGENT");
