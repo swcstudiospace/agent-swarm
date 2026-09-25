@@ -190,11 +190,15 @@ const PREFIX = new RegExp(
   String.raw`^(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|[A-Za-z_]\w*=${VALUE}\s+)`,
 );
 
-/** Split on `;`, `&&`, `||`, `|` and newlines outside quotes. */
+/** Split on `;`, `&&`, `||`, `|`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes. */
 function splitTopLevel(text: string): string[] {
   const out: string[] = [];
   let cur = "";
   let quote: string | undefined;
+  const boundary = () => {
+    out.push(cur);
+    cur = "";
+  };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (quote !== undefined) {
@@ -210,8 +214,15 @@ function splitTopLevel(text: string): string[] {
       cur += c + text[++i];
     } else if (c === ";" || c === "\n" || c === "|" || (c === "&" && text[i + 1] === "&")) {
       if (c !== ";" && c !== "\n" && text[i + 1] === c) i++;
-      out.push(cur);
-      cur = "";
+      boundary();
+    } else if (c === "(" || c === ")") {
+      // a subshell `( … )`: its body is its own segment list (`$(…)` was cut out before the split)
+      boundary();
+    } else if (c === "{" && cur.trim() === "" && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
+      // a brace group `{ …; }` opener as a word of its own (`${VAR}` and `{a,b}` are glued, never split)
+      boundary();
+    } else if (c === "}" && (i === 0 || /[\s;]/.test(text[i - 1])) && (i + 1 === text.length || /[\s;&|)]/.test(text[i + 1]))) {
+      boundary();
     } else cur += c;
   }
   out.push(cur);
@@ -224,7 +235,8 @@ function splitTopLevel(text: string): string[] {
  */
 export function normalize(command: string): string[] {
   const parts: string[] = [];
-  let rest = command;
+  // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
+  let rest = command.replace(/\\\r?\n/g, " ");
   const sub = /\$\(([^()]*)\)|`([^`]*)`/;
   for (let m = sub.exec(rest), n = 0; m !== null && n < 256; m = sub.exec(rest), n++) {
     parts.push(m[1] ?? m[2] ?? "");

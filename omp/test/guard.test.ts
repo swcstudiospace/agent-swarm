@@ -378,6 +378,13 @@ describe("HOOK-02", () => {
     ["sudo --user root -E git push -f", "git-force-push"],
     ["env -u HOME -i git clean -fdx", "git-clean-force"],
     ["doas -u root git reset --hard", "git-reset-hard"],
+    // WR-02: subshell and brace grouping, backslash-newline continuation
+    ["(git push -f)", "git-force-push"],
+    ["{ git push -f; }", "git-force-push"],
+    ["(cd sub && git reset --hard)", "git-reset-hard"],
+    ["f() { git clean -fdx; }", "git-clean-force"],
+    ["git \\\npush --force", "git-force-push"],
+    ["git push \\\r\n  --force origin x", "git-force-push"],
   ])("normalization: %s → %s", (command, id) => {
     expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
   });
@@ -388,6 +395,8 @@ describe("HOOK-02", () => {
     ]);
     expect(normalize('psql -c "SELECT 1; DROP TABLE t" | cat')).toEqual(['psql -c "SELECT 1; DROP TABLE t"', "cat"]);
     expect(normalize('A="b c" B=1 env -u X sudo -u root command -p git status')).toEqual(["git status"]);
+    expect(normalize("(cd x && git status) | { read a; echo ${a} {1,2}; }")).toEqual(["cd x", "git status", "read a", "echo ${a} {1,2}"]);
+    expect(normalize('echo "(x)" && find . \\( -name x \\)')).toEqual(['echo "(x)"', "find . \\( -name x \\)"]);
   });
 
   test.each([
