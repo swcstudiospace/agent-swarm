@@ -177,6 +177,82 @@ def test_refused_review_holds_target_until_review_accepted(tmp_path, swarm_dir):
     assert (be["state"], be["rework_loops"]) == ("IN_PROGRESS", 1)
 
 
+_LEAVE_LEASE = {"FAILED": {"error": {"code": "E-CONTRACT", "message": "missing yield"}}, "BLOCKED": {"needs": "human-approval"}}
+
+
+def _ingest_state(swarm: Path, gate_id: str, state: str) -> subprocess.CompletedProcess:
+    """Ingest a FAILED or BLOCKED task.result for `gate_id` (skill step 5: a missing yield or a stated need)."""
+    f = swarm.parent / "result.json"
+    f.write_text(json.dumps({"task_id": gate_id, "state": state, **_LEAVE_LEASE[state]}))
+    return _script(swarm, "orch_status.py", "--ingest", str(f), "--json")
+
+
+def _escalations(swarm: Path, task_id: str) -> list[dict]:
+    events = [json.loads(ln) for ln in (swarm / "events.jsonl").read_text().splitlines()]
+    return [e for e in events if e["type"] == "escalation.request" and e["payload"]["task_id"] == task_id]
+
+
+@pytest.mark.parametrize("state", ["FAILED", "BLOCKED"])
+def test_refused_review_holds_target_after_gate_task_leaves_lease(tmp_path, swarm_dir, state):
+    """T-05-11: the refused review's pass row never approves the target, also once its gate task leaves the lease
+    through a FAILED or BLOCKED ingest; that gate task is still live (step 7 retries it, A01 releases it), so no
+    escalation either."""
+    ts, swarm, work, corr = _setup(tmp_path, _PLAN_MEDIUM, "medium", leased=("P-rev", "P-qa"))
+    _rev_gate(swarm, work, corr, {"P-be": []})
+    _assert_mismatch_refused(ts, _ingest(swarm, {"P-be": _REQUEST_CHANGES}))
+    _qa_pass(swarm, work, corr, "P-qa", ["P-be"])
+    r = _ingest_state(swarm, "P-rev", state)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert ts.get("P-rev")["state"] == state
+    assert ts.get("P-be")["state"] == "IN_REVIEW"
+    assert _escalations(swarm, "P-be") == []
+
+
+def test_refused_review_holds_target_after_failed_retry(tmp_path, swarm_dir):
+    """T-05-11: a refused review ingested FAILED and moved FAILED → RETRY by A01 (skill step 7) still holds the
+    target when the quality pass is ingested afterwards; the retried review's accepted failure then reworks it."""
+    ts, swarm, work, corr = _setup(tmp_path, _PLAN_MEDIUM, "medium", leased=("P-rev", "P-qa"))
+    _rev_gate(swarm, work, corr, {"P-be": []})
+    _assert_mismatch_refused(ts, _ingest(swarm, {"P-be": _REQUEST_CHANGES}))
+    assert _ingest_state(swarm, "P-rev", "FAILED").returncode == 0
+    t = _script(swarm, "orch_status.py", "--transition", "P-rev", "RETRY", "--reason", "retry", "--json")
+    assert t.returncode == 0, t.stdout + t.stderr
+    _qa_pass(swarm, work, corr, "P-qa", ["P-be"])
+    assert (ts.get("P-rev")["state"], ts.get("P-be")["state"]) == ("RETRY", "IN_REVIEW")
+    assert _escalations(swarm, "P-be") == []
+    _lease(ts, "P-rev")
+    _fail_review(swarm, work, corr, "P-rev")
+    be = ts.get("P-be")
+    assert (be["state"], be["rework_loops"]) == ("IN_PROGRESS", 1)
+
+
+def test_leased_review_fail_reworks_with_review_rerun(tmp_path, swarm_dir):
+    """WR-04: the review records a fail while leased and the quality result is ingested first, so reconcile reworks
+    the target before the review is ingested: the leased review lineage still gets its rerun, and the reworked
+    target waits for it (no review:absent stall or escalation) until it passes."""
+    ts, swarm, work, corr = _setup(tmp_path, _PLAN_MEDIUM, "medium", leased=("P-rev", "P-qa"))
+    _rev_gate(swarm, work, corr, {"P-be": _MAJOR})
+    _qa_pass(swarm, work, corr, "P-qa", ["P-be"])
+    be = ts.get("P-be")
+    assert (be["state"], be["rework_loops"]) == ("IN_PROGRESS", 1)
+    assert ts.get("P-rev.r1")["state"] == "PLANNED"
+    assert _ingest(swarm, {"P-be": _REQUEST_CHANGES}).returncode == 0
+    assert ts.get("P-rev")["state"] == "DONE"
+
+    ts.transition("P-be", "IN_REVIEW")
+    _lease(ts, "P-qa.r1")
+    _qa_pass(swarm, work, corr, "P-qa.r1", ["P-be"])
+    be = ts.get("P-be")
+    assert (be["state"], be["rework_loops"]) == ("IN_REVIEW", 1)
+    assert not be["notes_json"].get("gate_stall")
+    assert _escalations(swarm, "P-be") == []
+
+    _lease(ts, "P-rev.r1")
+    _rev_gate(swarm, work, corr, {"P-be": []}, "P-rev.r1")
+    assert _ingest(swarm, {"P-be": _PASS}, "P-rev.r1").returncode == 0
+    assert ts.get("P-be")["state"] == "DONE"
+
+
 _PLAN_TWO_TARGETS = [
     {"id": "be", "capability": "code.backend", "agent": "A05"},
     {"id": "fe", "capability": "code.frontend", "agent": "A06"},

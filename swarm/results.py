@@ -15,6 +15,8 @@ Both modes accept a gate task's IN_REVIEW only when its gate script recorded a v
 during the current lease (WR-08); otherwise "E-CONTRACT: gate script not run" (headless FAILED, ingest exit 2).
 A review gate task's IN_REVIEW is also refused when its verdicts{} fails a target (agent_failed) whose review row from
 this lease is not `fail`: "E-CONTRACT: review verdict mismatch: ..." (headless FAILED, ingest exit 2, no transition).
+reconcile approves a target only from rows whose gate task (the signed gate_task) has an accepted result (IN_REVIEW,
+APPROVED or DONE), so a refused gate task's rows hold its targets even after it leaves the lease FAILED or BLOCKED.
 Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
 """
 from __future__ import annotations
@@ -23,7 +25,7 @@ import re
 from typing import Callable
 
 from .errors import SwarmError, ErrorCode
-from .gates import BLOCKING_SEVERITY, SEVERITIES
+from .gates import BLOCKING_SEVERITY, SEVERITIES, validate_verdict
 from .schema import load_schema, validate
 from .taskstore import TaskStore, TaskState as S
 
@@ -237,6 +239,30 @@ def _rerun_index(task: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
+# A gate task in one of these states had its result accepted by apply_result (never refused, FAILED or BLOCKED).
+ACCEPTED_ISSUER_STATES = frozenset({S.IN_REVIEW.value, S.APPROVED.value, S.DONE.value})
+
+
+def _unaccepted_gates(store: TaskStore, tid: str, reasons: dict[str, str]) -> dict[str, str]:
+    """T-05-11: required gates of `tid` whose current row passes (not in `reasons`) but was recorded by a gate task
+    (the signed `gate_task`) whose result has not been accepted — leased, refused (review verdict mismatch), FAILED,
+    BLOCKED, RETRY, ESCALATED or CANCELLED — → "unaccepted". Such a row may be contradicted by its own gate agent, so
+    it never approves the target. Fails closed on an unreadable envelope or unknown gate task."""
+    latest = store.latest_verdicts(tid)
+    out = {}
+    for g in store.required_gates(tid):
+        if g in reasons or g not in latest:
+            continue
+        try:
+            issuer = validate_verdict(json.loads(latest[g]["envelope_json"])).get("gate_task")
+            accepted = issuer is None or store.get(issuer)["state"] in ACCEPTED_ISSUER_STATES
+        except Exception:
+            accepted = False
+        if not accepted:
+            out[g] = "unaccepted"
+    return out
+
+
 def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates."""
     notes_log = []
@@ -256,7 +282,9 @@ def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
                 notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
                 # reopen gate tasks that target this task so they re-run after rework: one rerun per gate lineage
                 # (<base>, <base>.r1, <base>.r2, ...), cloned from its latest member, never from a superseded one, and
-                # numbered by the lineage (a multi-target gate's members are triggered by different targets)
+                # numbered by the lineage (a multi-target gate's members are triggered by different targets). A leased
+                # latest member runs against the pre-rework artifact, so it gets a rerun too (WR-04); a member that has
+                # not started (PLANNED/RETRY) or is left to A01 (FAILED/BLOCKED/ESCALATED/CANCELLED) gets none
                 lineages: dict[str, list[dict]] = {}
                 for g in store.list(correlation_id=corr):
                     if tid in g["notes_json"].get("gate_for", []):
@@ -264,7 +292,8 @@ def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
                 created: dict[str, tuple[str, set[str]]] = {}  # new rerun id → (its gate, its lineage's member ids)
                 for base, members in lineages.items():
                     g = max(members, key=_rerun_index)
-                    if g["state"] not in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value):
+                    if g["state"] not in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value,
+                                          S.CLAIMED.value, S.IN_PROGRESS.value):
                         continue
                     new_id = f"{base}.r{_rerun_index(g) + 1}"
                     store.create(task_id=new_id, correlation_id=corr, capability=g["capability"],
@@ -295,7 +324,11 @@ def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
                   and g["state"] in (S.CLAIMED.value, S.IN_PROGRESS.value)}
         if leased.intersection(store.required_gates(tid)):
             continue
+        # T-05-11: the hold outlives the lease. A passing row counts only once the gate task that recorded it has an
+        # accepted result, so a refused gate task ingested FAILED/BLOCKED, or moved FAILED → RETRY, never approves
+        # its targets; its live lineage waits (no stall), an ESCALATED/CANCELLED issuer escalates below
         reasons = store.missing_gate_reasons(tid)
+        reasons.update(_unaccepted_gates(store, tid, reasons))
         if not reasons:
             store.transition(tid, S.APPROVED, reason="all required gates pass")
             store.transition(tid, S.DONE, reason="approved")
