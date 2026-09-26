@@ -434,8 +434,9 @@ describe("HOOK-02", () => {
   });
 
   test("normalize splits segments and strips prefixes", () => {
+    // a substitution body follows the segment that holds it (it runs as that segment's subshell)
     expect(normalize("env A=1 sudo git status && echo $(git reset --hard) || x | y; z")).toEqual([
-      "git reset --hard", "git status", "echo", "x", "y", "z",
+      "git status", "echo", "git reset --hard", "x", "y", "z",
     ]);
     expect(normalize('psql -c "SELECT 1; DROP TABLE t" | cat')).toEqual(['psql -c "SELECT 1; DROP TABLE t"', "cat"]);
     expect(normalize('A="b c" B=1 env -u X sudo -u root command -p git status')).toEqual(["git status"]);
@@ -525,8 +526,15 @@ describe("HOOK-02", () => {
     "kubectl delete pod x -n staging --context=dev-cluster-main",
     "kubectl delete ns production",
     "kubectl rollout restart deploy/api --kubeconfig ~/.kube/prod",
+    // only `--dry-run`, `=client`, `=server` (and legacy `=true`) render; `=none`/`=false` apply for real
+    "kubectl apply -n production --dry-run=none -f k.yaml",
+    "kubectl apply -n production --dry-run=false -f k.yaml",
   ])("WR-08 positive for a11: %s → kubectl-prod-change", (command) => {
     expect(guardToolCall(bash(command), inside("a11-devops"))?.reason).toEndWith(": kubectl-prod-change)");
+  });
+
+  test.each(["helm upgrade app ./chart --dry-run=none", "helm install app ./chart --dry-run=false"])("WR-08: %s is a live helm change", (command) => {
+    expect(guardToolCall(bash(command), inside("a11-devops"))?.reason).toEndWith(": helm-release-change)");
   });
 
   test("top-level session with SWARM_TASK_ID and no session_init is in the swarm", () => {
@@ -1080,6 +1088,41 @@ describe("HOOK-03 shell twin and D-08", () => {
     "gzip -c .swarm/tasks.db > /tmp/x.gz", "tar -czf out.tgz src", "git checkout main", "kubectl get pods -o json",
     "curl -sSL https://example.com -o /tmp/x.html", "cat <<EOF > notes.md\ntouch .swarm/x\nEOF", 'git commit -m "fix: a -> b"',
   ])("lexical: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
+  /** Output-file options are per command; a substitution body runs in its holder's directory as a subshell. */
+  test.each([
+    ["curl -o .swarm/x https://x", SHELL],
+    ["curl -sSLo .swarm/x https://x", SHELL],
+    ["wget -qO.swarm/x https://x", SHELL],
+    ["sort -o .swarm/x in", SHELL],
+    ["gcc -o .omp/x a.c", SHELL],
+    ["go test -coverprofile=.swarm/c.out ./...", SHELL],
+    ['cd .swarm && echo "$(date)" > tasks.db', SHELL],
+    ['echo "$(cd .swarm && touch x)"', MUTATE],
+    ['cd "$(pwd)/.swarm" && touch x', MUTATE],
+    ["$(touch .swarm/x)", MUTATE],
+    ["cd .swarm && cat <<EOF\n$(touch x)\nEOF", MUTATE],
+    ['cd .swarm && bash -c "echo $(touch x)"', MUTATE],
+  ])("scoped: %s blocks inside naming %s", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  /** Everyday development commands a specialist runs must never need approval. */
+  test.each([
+    "grep -o .swarm/tasks.db log.txt", "rg -o foo .swarm", 'cd build && echo "$(date)" > out.txt',
+    'cd src && cat "$(git rev-parse --show-toplevel)/README.md" > /tmp/r', "echo $(git rev-parse HEAD) > VERSION",
+    "npm install", "npm ci", "npm run build", "npm test -- --watch=false", "npx prettier --check .", "bun install", "bun run test",
+    "bun test test/x.test.ts", "bunx tsc --noEmit", "pip install -r requirements.txt", "python3 -m pytest -q", "pytest -x tests/test_a.py",
+    "git add -A", 'git commit -m "feat: x"', "git status --short", "git diff HEAD~1 -- src/", "git checkout -b feat/x", "git switch main",
+    "git stash", "git pull --rebase", "git push -u origin feat/x", "make -j8 test", "cargo build --release", "cargo test", "go test ./...",
+    "go build -o bin/app ./cmd/app", "docker build -t app .", "docker compose up -d", "ls -la > files.txt", "echo done | tee -a log.txt",
+    "mkdir -p dist && cp -r src/* dist/", "rm -rf node_modules dist", "find . -name '*.ts' | xargs grep -l foo", "tar -czf dist.tgz dist",
+    "curl -o /tmp/x.json https://x", "uvicorn app:app --reload &", "export NODE_ENV=test && bun test", "ruff check . --fix", "tsc -p tsconfig.json",
+    "cd omp && bun run test 2>&1 | tail -20", "for f in src/*.ts; do echo $f; done", "wc -l $(git ls-files '*.py')", "date > build/stamp.txt",
+  ])("common: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
 

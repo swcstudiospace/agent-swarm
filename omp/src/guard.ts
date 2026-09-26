@@ -197,8 +197,11 @@ function isProdMarker(token: string): boolean {
   return t.split(/[=:/,_-]+/).some((part) => part !== "" && (PROD_MARKERS.includes(part) || RELEASE_TAG.test(part)));
 }
 
-/** `--dry-run`, `--dry-run=client|server|none`: the command renders and never changes the cluster. */
-const isDryRun = (w: string) => /^--dry-run(?:=(?:client|server|none))?$/.test(w);
+/**
+ * `--dry-run`, `--dry-run=client|server|true`: the command renders and never changes the cluster or release.
+ * `--dry-run=none`/`=false` (and any other value) run for real.
+ */
+const isDryRun = (w: string) => /^--dry-run(?:=(?:client|server|true))?$/.test(w);
 /** kubectl flags whose value names where the change lands (D-04 markers apply to these values). */
 const KUBECTL_TARGET_FLAG = /^(?:-n|--namespace|--context|--cluster|--kubeconfig)$/;
 /** kubectl flags whose value is a file, selector or format, never a prod marker. */
@@ -298,7 +301,7 @@ const LEAD_REDIRECT = String.raw`${REDIRECT_OP}\s*(?:"[^"]*"|'[^']*'|\\.|[^\s<>|
 const PREFIX = new RegExp(
   // the assignment value is matched atomically (lookahead + backreference): giving characters back can never reach
   // the whitespace after it, and backtracking through a 1 MB value would cost seconds (WR-09)
-  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?!-[A-Za-z]*S|--split-string)(?:-[A-Za-z]*[uC]\s+\S+|--(?:unset|chdir)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|pkexec(?:\s+(?:--user\s+\S+|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|(?:if|then|else|elif|do|while|until|!|coproc)\s+|${CUT}+(?:\s+|$)|${LEAD_REDIRECT}|(?!GLOBIGNORE=)[A-Za-z_]\w*=(?=(?<value>${VALUE}))\k<value>\s+)`,
+  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?!-[A-Za-z]*S|--split-string)(?:-[A-Za-z]*[uC]\s+\S+|--(?:unset|chdir)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|pkexec(?:\s+(?:--user\s+\S+|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|(?:if|then|else|elif|do|while|until|!|coproc)\s+|(?:${CUT}[\uE000-\uF8FF])+(?:\s+|$)|${LEAD_REDIRECT}|(?!GLOBIGNORE=)[A-Za-z_]\w*=(?=(?<value>${VALUE}))\k<value>\s+)`,
   "y",
 );
 /** `sh -c`, `bash -ec`, `/bin/zsh -x -o pipefail -c`, `fish -c` …: the next word is a command line of its own. */
@@ -604,64 +607,87 @@ export function normalize(command: string): string[] {
   const texts: string[] = [];
   const collect = (items: Normalized[]) => {
     for (const item of items) {
-      const text = item.text.replaceAll(CUT, " ").trim();
+      const text = item.text.replace(CUT_TOKEN, " ").trim();
       if (text !== "") texts.push(text);
       collect(item.payload);
     }
   };
-  collect(normalizeSegments(command, 0));
+  collect(normalizeSegments(command, 0, []));
   return texts;
 }
 
-function normalizeSegments(command: string, depth: number): Normalized[] {
-  const parts: string[] = [];
+/** A cut substitution in normalized text: CUT and a private-use character naming its body in the command's cut table. */
+const CUT_TOKEN = /\u0001([\uE000-\uF8FF])/g;
+/** Substitutions cut per command (the private-use range holds 6400). */
+const MAX_CUTS = 4096;
+
+/**
+ * Normalize `command` (see normalize). A `$(…)`/backtick substitution is cut out into `cuts` and leaves CUT plus the
+ * index of its body in its place; the body becomes a payload (a subshell) of the piece that holds it, so it runs in
+ * the directory of that piece and a `cd` inside it moves nothing outside. A body whose place no piece holds (a
+ * heredoc body is its piece's; a comment is none) runs in an unknown directory.
+ */
+function normalizeSegments(command: string, depth: number, cuts: string[]): Normalized[] {
   // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
   // `${IFS}` / `$IFS` separate words exactly like a blank
   let rest = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
+  const first = cuts.length;
   const sub = /\$\(([^()]*)\)|`([^`]*)`/;
-  for (let m = sub.exec(rest), n = 0; m !== null && n < 256; m = sub.exec(rest), n++) {
-    parts.push(m[1] ?? m[2] ?? "");
-    rest = `${rest.slice(0, m.index)}${CUT}${rest.slice(m.index + m[0].length)}`;
+  for (let m = sub.exec(rest), n = 0; m !== null && n < 256 && cuts.length < MAX_CUTS; m = sub.exec(rest), n++) {
+    const marker = `${CUT}${String.fromCharCode(0xe000 + cuts.length)}`;
+    cuts.push(m[1] ?? m[2] ?? "");
+    rest = `${rest.slice(0, m.index)}${marker}${rest.slice(m.index + m[0].length)}`;
   }
-  parts.push(rest);
   const items: Normalized[] = [];
-  for (const part of parts) {
-    const built: { item: Normalized; body: string | undefined }[] = [];
-    for (const piece of splitTopLevel(part)) {
-      let seg = simplifyWords(piece.text.trim());
-      const keyword = COMPOUND_WORD.exec(seg);
-      const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
-      // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
-      let at = 0;
-      for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
-      const prefix = seg.slice(0, at);
-      const info = at === 0 ? undefined : prefixInfo(prefix);
-      seg = seg.slice(at);
-      // `sudo -e FILE` edits FILE
-      if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
-      let payload: Normalized[] = [];
-      if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
-        const line = commandLine(seg);
-        if (line !== undefined) payload.push(...normalizeSegments(line, depth + 1));
-        if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth));
-      }
-      const runtime = info?.runtime;
-      if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
-      const opaque = /(?:^|\s)\u0001+(?:\s|$)/.test(prefix);
-      const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque };
-      items.push(item);
-      built.push({ item, body: piece.body });
+  const attached = new Set<number>();
+  /** The bodies of the substitutions `text` holds, normalized, as payload of `item`. */
+  const attach = (item: Normalized, text: string) => {
+    for (const m of text.matchAll(CUT_TOKEN)) {
+      const n = m[1].charCodeAt(0) - 0xe000;
+      attached.add(n);
+      if (n < cuts.length) item.payload.push(...normalizeSegments(cuts[n], depth, cuts));
     }
-    // a script fed to a shell's stdin (`bash <<EOF`, `sh <<< '…'`, `echo … | sh`) runs like `sh -c`
-    if (depth < MAX_LITERAL_DEPTH && built.some(({ item }) => readsStdinScript(item.text))) {
-      for (const { item, body } of built) {
-        const hereString = /<<<\s*((?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+)/.exec(`${item.prefix} ${item.text}`)?.[1];
-        const echoed = /^(?:echo|printf)(?:\s|$)/.test(item.text) ? shellWords(item.text).slice(1).map(unquote).join(" ") : undefined;
-        for (const fed of [body, hereString === undefined ? undefined : unquote(hereString), echoed]) {
-          if (fed !== undefined) item.payload.push(...normalizeSegments(fed, depth + 1));
-        }
+  };
+  const built: { item: Normalized; body: string | undefined }[] = [];
+  for (const piece of splitTopLevel(rest)) {
+    let seg = simplifyWords(piece.text.trim());
+    const keyword = COMPOUND_WORD.exec(seg);
+    const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
+    // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
+    let at = 0;
+    for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
+    const prefix = seg.slice(0, at);
+    const info = at === 0 ? undefined : prefixInfo(prefix);
+    seg = seg.slice(at);
+    // `sudo -e FILE` edits FILE
+    if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
+    let payload: Normalized[] = [];
+    if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
+      const line = commandLine(seg);
+      if (line !== undefined) payload.push(...normalizeSegments(line, depth + 1, cuts));
+      if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth, cuts));
+    }
+    const runtime = info?.runtime;
+    if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
+    const opaque = /(?:^|\s)(?:\u0001[\uE000-\uF8FF])+(?:\s|$)/.test(prefix);
+    const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque };
+    attach(item, `${prefix} ${seg} ${piece.body ?? ""}`);
+    items.push(item);
+    built.push({ item, body: piece.body });
+  }
+  // a script fed to a shell's stdin (`bash <<EOF`, `sh <<< '…'`, `echo … | sh`) runs like `sh -c`
+  if (depth < MAX_LITERAL_DEPTH && built.some(({ item }) => readsStdinScript(item.text))) {
+    for (const { item, body } of built) {
+      const hereString = /<<<\s*((?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+)/.exec(`${item.prefix} ${item.text}`)?.[1];
+      const echoed = /^(?:echo|printf)(?:\s|$)/.test(item.text) ? shellWords(item.text).slice(1).map(unquote).join(" ") : undefined;
+      for (const fed of [body, hereString === undefined ? undefined : unquote(hereString), echoed]) {
+        if (fed !== undefined) item.payload.push(...normalizeSegments(fed, depth + 1, cuts));
       }
     }
+  }
+  for (let n = first; n < cuts.length; n++) {
+    if (attached.has(n) || cuts.slice(first).some((body) => body.includes(`${CUT}${String.fromCharCode(0xe000 + n)}`))) continue;
+    for (const item of normalizeSegments(cuts[n], depth, cuts)) items.unshift({ ...item, chdirs: [CUT, ...item.chdirs] });
   }
   return items;
 }
@@ -700,7 +726,7 @@ function withReplace(items: Normalized[], replace: string[]): Normalized[] {
  * The commands `find … -exec|-execdir|-ok|-okdir CMD … ;|+` runs, each found path (`{}`) a run-time operand;
  * `-execdir`/`-okdir` run them in directories that cannot be known here.
  */
-function findCommands(seg: string, depth: number): Normalized[] {
+function findCommands(seg: string, depth: number, cuts: string[]): Normalized[] {
   const words = shellWords(seg);
   const out: Normalized[] = [];
   for (let i = 1; i < words.length; i++) {
@@ -708,7 +734,7 @@ function findCommands(seg: string, depth: number): Normalized[] {
     if (!/^-(?:exec|execdir|ok|okdir)$/.test(action)) continue;
     let j = i + 1;
     while (j < words.length && !/^[;+]$/.test(unquote(words[j]))) j++;
-    for (const item of withReplace(normalizeSegments(words.slice(i + 1, j).join(" "), depth + 1), ["{}"])) {
+    for (const item of withReplace(normalizeSegments(words.slice(i + 1, j).join(" "), depth + 1, cuts), ["{}"])) {
       out.push(action.endsWith("dir") ? { ...item, chdirs: [CUT, ...item.chdirs] } : item);
     }
     i = j;
@@ -787,10 +813,10 @@ function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "op
     runtime === undefined
       ? all
       : [...all.map((w, i) => (i > 0 && runtime.replace.some((r) => w.includes(r)) ? CUT : w)), ...(runtime.append ? [CUT] : [])];
-  const words = all.filter((w, i) => i === 0 || !/^\u0001+$/.test(w));
+  const words = all.filter((w, i) => i === 0 || !/^(?:\u0001[\uE000-\uF8FF]?)+$/.test(w));
   // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
   const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
-  const text = item.text.replaceAll(CUT, " ").trim();
+  const text = item.text.replace(CUT_TOKEN, " ").trim();
   return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, cwd: undefined };
 }
 
@@ -1036,14 +1062,51 @@ function optionValues(words: string[], flags: string[], long?: string): string[]
  * `>&`, group 5 the target (quoted runs and escapes included).
  */
 const REDIRECT = /(?:^|[^<>&\d])(\d*|&)(>>?|<>)(\|?)(&?)\s*((?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+)/g;
-/** Options whose value is a file the command writes (`sort -o`, `curl -o`, `gcc -o`, `--output=…`). */
-const OUTPUT_OPTION = /^(?:-o|--output|--output-file|--outfile|--out-file|--output-document|--log-file|--output-dir)$/;
-const OUTPUT_OPTION_EQ = /^(?:--output|--output-file|--outfile|--out-file|--output-document|--log-file|--output-dir)=(.*)$/;
+/** Per command, the options whose value is a file or directory it writes; any other command's `-o` writes nothing (`grep -o`). */
+const OUTPUT_FLAGS: Record<string, readonly string[]> = Object.fromEntries([
+  ...["gcc", "cc", "c++", "g++", "clang", "clang++", "tcc", "ld", "ld.lld", "as", "nasm", "rustc", "zstd", "lz4"].map((c) => [c, ["-o"]]),
+  ...["sort", "shuf", "pandoc", "strace", "ltrace", "gpg"].map((c) => [c, ["-o", "--output"]]),
+  ["curl", ["-o", "--output", "--output-dir", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii", "--stderr"]],
+  ["wget", ["-O", "--output-document", "-o", "--output-file", "-a", "--append-output", "-P", "--directory-prefix", "--save-cookies"]],
+  ["go", ["-o", "-coverprofile", "-cpuprofile", "-memprofile"]],
+  ["tcpdump", ["-w"]],
+  ["openssl", ["-out", "-keyout"]],
+  ["ssh-keygen", ["-f"]],
+  ["tsc", ["--outFile", "--outDir", "--out"]],
+  ["esbuild", ["--outfile", "--outdir"]],
+  ["bun", ["--outfile", "--outdir"]],
+  ["javac", ["-d"]],
+  ["pg_dump", ["-f", "--file"]],
+  ["pg_dumpall", ["-f", "--file"]],
+  ["mysqldump", ["-r", "--result-file"]],
+  ["rsync", ["--log-file", "--write-batch", "--only-write-batch"]],
+  ["pytest", ["--junitxml", "--junit-xml", "--basetemp"]],
+  ["docker", ["-o", "--output", "--iidfile", "--cidfile", "--metadata-file"]],
+  ["podman", ["-o", "--output", "--iidfile", "--cidfile"]],
+]);
+
+/**
+ * The value `word` (and the word after it) gives `flag`: `--flag VALUE` / `--flag=VALUE`, `-flag VALUE` /
+ * `-flag=VALUE` for a one-dash long option (`go -coverprofile`), and for a one-letter flag also a cluster ending in
+ * it (`-sSLo FILE`) or an attached value (`-oFILE`, `-qO-`). `consumed` says whether the next word was the value.
+ */
+function flagValue(word: string, next: string | undefined, flag: string): { value: string; consumed: boolean } | undefined {
+  if (word === flag) return next === undefined ? undefined : { value: next, consumed: true };
+  if (flag.length > 2) return word.startsWith(`${flag}=`) ? { value: word.slice(flag.length + 1), consumed: false } : undefined;
+  if (word.startsWith("--")) return undefined;
+  const letter = flag[1];
+  // `-oFILE`; a letter cluster ending in the flag (`-sSLo FILE`); a cluster with a value that cannot be a flag (`-qO./x`)
+  if (word.startsWith(flag) && word.length > 2) return { value: word.slice(2), consumed: false };
+  if (/^-[A-Za-z]+$/.test(word) && word.endsWith(letter)) return next === undefined ? undefined : { value: next, consumed: true };
+  const attached = new RegExp(`^-[A-Za-z]*${letter}([^A-Za-z-].*)$`).exec(word);
+  if (attached !== null) return { value: attached[1], consumed: false };
+  return undefined;
+}
 
 /**
  * Files a segment writes, as far as detectable: redirection targets (fd duplications like `2>&1` aside), tee operands,
- * cp/mv/install destinations, output-file options (`-o FILE`, `--output=FILE`, wget `-O`/`-P`), and the file a
- * `curl -O`/`wget` download names after its URL.
+ * cp/mv/install destinations, the OUTPUT_FLAGS values of the command, `uniq`/`xxd`'s output operand, the last operand of
+ * `ffmpeg`/`convert`/`docker cp`, and the file a `curl -O`/`wget` download names after its URL.
  */
 function shellWriteTargets({ marked, targetWords: words }: Segment): string[] {
   const targets: string[] = [];
@@ -1063,11 +1126,20 @@ function shellWriteTargets({ marked, targetWords: words }: Segment): string[] {
     // with a target directory every operand is a source
     if (t <= 0 && long.length === 0 && args.length > 1) targets.push(args[args.length - 1]);
   }
-  for (let i = 1; i < words.length; i++) {
-    const eq = OUTPUT_OPTION_EQ.exec(words[i]);
-    if (eq !== null) targets.push(eq[1]);
-    else if ((OUTPUT_OPTION.test(words[i]) || (cmd === "wget" && /^-[OP]$/.test(words[i]))) && words[i + 1] !== undefined) targets.push(words[++i]);
-    else if (/^-o./.test(words[i])) targets.push(words[i].slice(2));
+  // long options first, so `-coverprofile=x` is never read as a `-o` cluster
+  const flags = Object.hasOwn(OUTPUT_FLAGS, cmd) ? [...OUTPUT_FLAGS[cmd]].sort((a, b) => b.length - a.length) : [];
+  for (let i = 1; i < words.length && flags.length > 0; i++) {
+    for (const flag of flags) {
+      const hit = flagValue(words[i], words[i + 1], flag);
+      if (hit === undefined) continue;
+      targets.push(hit.value);
+      if (hit.consumed) i++;
+      break;
+    }
+  }
+  if (cmd === "uniq" || cmd === "xxd") targets.push(...args.slice(1, 2));
+  if (cmd === "ffmpeg" || cmd === "convert" || cmd === "magick" || ((cmd === "docker" || cmd === "podman") && words[1] === "cp")) {
+    targets.push(...args.slice(-1));
   }
   const remoteName =
     (cmd === "curl" && words.some((w) => /^(?:-[A-Za-z]*O[A-Za-z]*|--remote-name(?:-all)?)$/.test(w))) ||
@@ -1548,12 +1620,13 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
     const level = levels[levels.length - 1];
     if (item.compound === "close") level.compounds.pop();
     else if (item.compound !== undefined) level.compounds.push(item.compound);
+    let runIn = cur;
+    for (const dir of item.chdirs) runIn = distinct(runIn.map((w) => ({ dir: chdirTo([dir], w.dir, facts), stack: w.stack })));
+    // a payload (a substitution body, an `sh -c` line) runs even when nothing is left of the command itself (`$(…)`)
+    walk(item.payload, runIn.map((w) => ({ dir: w.dir, stack: [] })), facts, out);
     if (item.text !== "") {
       const seg = parseSegment(item);
-      let runIn = cur;
-      for (const dir of item.chdirs) runIn = distinct(runIn.map((w) => ({ dir: chdirTo([dir], w.dir, facts), stack: w.stack })));
       for (const cwd of new Set(runIn.map((w) => w.dir))) out.push({ ...seg, cwd });
-      walk(item.payload, runIn.map((w) => ({ dir: w.dir, stack: [] })), facts, out);
       if (item.chdirs.length === 0 && /^(?:cd|pushd|popd)$/.test(seg.words[0] ?? "")) {
         const conditional = item.prefixed || level.cond || level.inherited || level.compounds.length > 0;
         const loop = levels.some((l) => l.compounds.includes("loop"));
@@ -1595,9 +1668,8 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
 /**
  * The first row (table order) matching any normalized segment of `command`, each segment tried in every directory it
  * may run in from `start` (the session cwd, or the bash tool's `cwd`; undefined: unknown) (D-08, walk). An unknown
- * directory (`cwd` undefined) makes every relative write target protected. `$(…)`/backtick bodies are cut out and
- * listed first, so the order of directory changes is lost: in a command holding one, any directory change makes
- * every segment run in the start directory and an unknown one.
+ * directory (`cwd` undefined) makes every relative write target protected. A `$(…)`/backtick body runs as a
+ * subshell of the piece that holds it (normalizeSegments), so it sees that piece's directory and moves no other.
  */
 export function matchRule(command: string, facts: GuardFacts, start: string | undefined): Rule | undefined {
   // a command that assigns HOME, TMPDIR or CDPATH itself changes what `~`, `$TMPDIR` and a relative `cd` mean
@@ -1608,21 +1680,8 @@ export function matchRule(command: string, facts: GuardFacts, start: string | un
     tmp: assigns("TMPDIR") ? "" : facts.tmp,
     env: assigns("CDPATH") ? { ...facts.env, CDPATH: CUT } : facts.env,
   };
-  const items = normalizeSegments(command, 0);
   const segments: Segment[] = [];
-  if (/\$\(|`/.test(command)) {
-    const flat: Normalized[] = [];
-    const collect = (list: Normalized[]) => {
-      for (const item of list) {
-        flat.push(item);
-        collect(item.payload);
-      }
-    };
-    collect(items);
-    const parsed = flat.filter((item) => item.text !== "").map((item) => ({ item, seg: parseSegment(item) }));
-    const moves = parsed.some(({ item, seg }) => item.chdirs.length > 0 || /^(?:cd|pushd|popd)$/.test(seg.words[0] ?? ""));
-    for (const { seg } of parsed) for (const cwd of moves ? [start, undefined] : [start]) segments.push({ ...seg, cwd });
-  } else walk(items, [{ dir: start, stack: [] }], shellFacts, segments);
+  walk(normalizeSegments(command, 0, []), [{ dir: start, stack: [] }], shellFacts, segments);
   return RULES.find((rule) =>
     segments.some((seg) => (typeof rule.pattern === "function" ? rule.pattern(seg, shellFacts, command) : rule.pattern.test(seg.text))),
   );
