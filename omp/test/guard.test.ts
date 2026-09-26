@@ -936,12 +936,25 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["while false; do :; done; until true; do rm -rf /; done", "destructive: rm-rf-protected"],
     ["if false; then :; elif true; then git reset --hard; else :; fi", "destructive: git-reset-hard"],
     ["make |& git push -f", "destructive: git-force-push"],
+    // `>|` forms are redirections, not pipes
+    ["echo x >| .swarm/tasks.db", "protected_path: protected-path-shell"],
+    ["echo x 2>| .omp/config.yml", "protected_path: protected-path-shell"],
+    ["echo x &>| .swarm/tasks.db", "protected_path: protected-path-shell"],
+    // busybox/toybox run the applet named next
+    ["busybox tee .swarm/tasks.db", "protected_path: protected-path-shell"],
+    ["busybox cp /tmp/x .swarm/tasks.db", "protected_path: protected-path-shell"],
+    ["toybox mv .swarm/tasks.db /tmp/x", "protected_path: protected-path-mutate"],
+    ["/bin/busybox rm -rf .swarm", "destructive: rm-rf-protected"],
+    ["sudo busybox sed -i s/a/b/ .omp/config.yml", "protected_path: protected-path-mutate"],
   ])("keywords: %s blocks inside naming %s", (command, tail) => {
     expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
   });
 
-  test.each(["if [ -f x ]; then echo ok; fi", "make &> build.log", "ls 2>&1 | tee log.txt", "sleep 1 & wait; echo x > out.txt", "cat a >&2"])(
+  test.each([
+    "if [ -f x ]; then echo ok; fi", "make &> build.log", "ls 2>&1 | tee log.txt", "sleep 1 & wait; echo x > out.txt", "cat a >&2",
+    "ls | tee out.txt", "false || echo x > out.txt", "echo x >| out.txt", "busybox ls .swarm", "busybox --list", "toybox cat .omp/config.yml",
+  ])(
     "keywords: %s passes",
     (command) => {
       expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
@@ -973,6 +986,8 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["bash", { command: `cd ${ROOT}/scripts && touch qa_gate.py` }, "protected-path-mutate"],
     ["bash", { command: `sed -i s/a/b/ ${ROOT}/hooks/autonomous_run.py` }, "protected-path-mutate"],
     ["bash", { command: `mv ${ROOT}/scripts/qa_gate.py /tmp/x` }, "protected-path-mutate"],
+    ["bash", { command: `echo x &>| ${ROOT}/swarm/envelope.py` }, "protected-path-shell"],
+    ["bash", { command: `busybox cp /tmp/x ${ROOT}/scripts/qa_gate.py` }, "protected-path-shell"],
     ["bash", { command: `cd ../nonexistent-swarm-root && echo x >> omp/src/guard.ts` }, "protected-path-shell"],
   ];
   test.each(RUNTIME_WRITES)("runtime root: %s %p blocks from another workspace naming %s", (tool, input, id) => {

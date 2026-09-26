@@ -252,9 +252,10 @@ const VALUE = String.raw`(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\]+)*`;
 const SUDO_VALUE_FLAG = String.raw`-[ugCDhprtUT]\s+\S+|--(?:user|group|host|prompt|role|type|chdir|close-from|other-user|command-timeout)\s+\S+`;
 /**
  * Wrappers that run the rest of the line unchanged; a flag that takes a value takes it along (`nice -n 5`,
- * `timeout -s KILL 5m`, `xargs -n 1`), and `timeout` also drops its duration.
+ * `timeout -s KILL 5m`, `xargs -n 1`), and `timeout` also drops its duration. `busybox`/`toybox` followed by an
+ * applet name run that applet.
  */
-const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|nice(?:\s+(?:-n\s+\S+|-\S+))*|ionice(?:\s+(?:-[cn]\s+\S+|-\S+))*|stdbuf(?:\s+-\S+)+|timeout(?:\s+(?:-[sk]\s+\S+|-\S+))*\s+\S+|xargs(?:\s+(?:-[nIPdaLsE]\s+\S+|-\S+))*)\s+`;
+const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|(?:busybox|toybox)(?=\s+[A-Za-z_])|nice(?:\s+(?:-n\s+\S+|-\S+))*|ionice(?:\s+(?:-[cn]\s+\S+|-\S+))*|stdbuf(?:\s+-\S+)+|timeout(?:\s+(?:-[sk]\s+\S+|-\S+))*\s+\S+|xargs(?:\s+(?:-[nIPdaLsE]\s+\S+|-\S+))*)\s+`;
 /**
  * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …`, `sudo`/`doas` with their flags,
  * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces), the WRAPPER set and the shell keywords
@@ -363,6 +364,9 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
         i = heredocEnd(i + 1);
         heredoc = undefined;
       }
+    } else if (c === "|" && text[i - 1] === ">") {
+      // `>|`, `2>|`, `&>|`: a noclobber-override redirection, not a pipe
+      cur += c;
     } else if (c === ";" || c === "|" || (c === "&" && text[i + 1] === "&")) {
       const double = c !== ";" && text[i + 1] === c;
       if (double) i++;
