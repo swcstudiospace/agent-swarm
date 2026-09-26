@@ -258,9 +258,11 @@ class AgentTimeout(subprocess.TimeoutExpired):
         self.text, self.meta = text, meta
 
 
-# process groups of the running sessions: they run in their own session, so a Ctrl-C no longer reaches them
+# process groups of the running sessions: they run in their own session, so a signal to the runner's group misses them
 _SESSIONS: set[int] = set()
 _SESSIONS_LOCK = threading.Lock()
+_STOPPING = threading.Event()  # the runner is ending its sessions: a session that registers now is killed at once
+_FORWARDED = (signal.SIGTERM, signal.SIGHUP)
 
 
 def kill_group(pgid: int, sig: int) -> None:
@@ -270,10 +272,40 @@ def kill_group(pgid: int, sig: int) -> None:
         pass
 
 
-def kill_sessions() -> None:
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def kill_sessions(grace: float = 5) -> None:
+    """SIGTERM every session group, so omp disposes its session and tool processes; SIGKILL what outlives `grace` s
+    (WR-09). The workers still reap their sessions and record the killed tasks as rejected results, clearing
+    notes.running, so the next run retries them."""
     with _SESSIONS_LOCK:
-        for pgid in _SESSIONS:
-            kill_group(pgid, signal.SIGKILL)
+        _STOPPING.set()
+        groups = list(_SESSIONS)
+    for pgid in groups:
+        kill_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while groups and time.monotonic() < deadline:
+        time.sleep(0.1)
+        groups = [g for g in groups if _group_alive(g)]
+    for pgid in groups:
+        kill_group(pgid, signal.SIGKILL)
+
+
+def _terminate(signum, _frame) -> None:
+    """SIGTERM/SIGHUP (GNU timeout, a terminal hangup, `kill -- -PGID`): raise into run()'s BaseException path, which
+    ends the sessions (T-06-12). A repeat while that teardown runs is ignored, so it cannot cut kill_sessions short."""
+    if _STOPPING.is_set():
+        return
+    _STOPPING.set()
+    raise SystemExit(128 + signum)
 
 
 def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
@@ -289,11 +321,20 @@ def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
     return "", ""
 
 
+# omp 18.3.1 `-e`: a package that fails to load is only this stderr line (main.ts formatExtensionLoadNotifications),
+# rc 0, and the session runs on without it — for ours, without the swarm guard, in yolo (T-06-06)
+OMP_EXTENSION_LOAD_ERROR = re.compile(r"^(?:\x1b\[[0-9;]*m)*(Failed to load extension .*?)(?:\x1b\[[0-9;]*m)*$", re.M)
+
+
 def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
     meta = {"returncode": returncode, "stderr": (stderr or "")[-2000:]}
     if runtime == "omp":
         text, stream_meta = omp_stream_text(stdout or "")
-        return text, {**meta, **stream_meta}
+        meta.update(stream_meta)
+        load_error = OMP_EXTENSION_LOAD_ERROR.search(stderr or "")
+        if load_error:
+            meta.update(extension_error=load_error.group(1)[:500], is_error=True)
+        return text, meta
     text = stdout or ""
     try:
         data = json.loads(text)
@@ -315,6 +356,9 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
         raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
     with _SESSIONS_LOCK:
         _SESSIONS.add(proc.pid)
+        stopping = _STOPPING.is_set()
+    if stopping:  # spawned after kill_sessions took its snapshot (WR-09)
+        kill_group(proc.pid, signal.SIGKILL)
     try:
         try:
             out, err = proc.communicate(prompt, timeout=args.task_timeout)
@@ -498,6 +542,9 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         if meta.get("yield_error"):  # D-02: an error yield is E-CONTRACT, whatever json the text carries (WR-02)
             result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent yielded an error: {meta['yield_error']}"[:500],
                                            task_id=tid)
+        if meta.get("extension_error"):  # T-06-06: an unguarded session's result is never applied, nor its gate recorded
+            result, err = None, SwarmError(ErrorCode.E_DEP, "omp ran the session without the swarm guard: "
+                                           f"{meta['extension_error']}"[:500], task_id=tid)
         # CR-04: record a gate only for a session that completed and asked to finish it — a crashed, errored or
         # BLOCKED/FAILED gate session gets no script run, so its targets keep the gate absent
         if (not args.dry_run and task["notes_json"].get("gate") and result is not None
@@ -562,35 +609,43 @@ def run(args, ctx) -> dict:
         if args.runtime == "claude":
             preflight_auth(binary)
     log, rounds = [], 0
-    while True:
-        rounds += 1
-        log += reconcile(store, corr, ctx.emit)
-        ready = dispatchable(store, corr, ctx.emit)
-        if not ready:
-            remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
-            if remaining:
-                log.append(f"stalled: {[(t['task_id'], t['state']) for t in remaining]}")
-            break
-        batch = []
-        for t in ready[: args.max_parallel]:
-            try:
-                agent = get_agent(t["agent_id"]) if t["agent_id"] else by_capability(t["capability"])[0]
-            except (KeyError, IndexError):
-                store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
-                continue
-            batch.append((t, agent))
-        with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
-            futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo) for t, a in batch]
-            try:
-                for f in as_completed(futs):
-                    tid, aid, outcome = f.result()
-                    log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
-                    print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
-            except BaseException:  # e.g. Ctrl-C: sessions run in their own session, so the signal missed them
-                kill_sessions()
-                raise
-        if args.once or rounds >= args.max_rounds:
-            break
+    # T-06-12: a SIGTERM/SIGHUP to the runner's group ends the sessions too, then the previous handlers come back
+    _STOPPING.clear()
+    previous = ({s: signal.signal(s, _terminate) for s in _FORWARDED}
+                if threading.current_thread() is threading.main_thread() else {})
+    try:
+        while True:
+            rounds += 1
+            log += reconcile(store, corr, ctx.emit)
+            ready = dispatchable(store, corr, ctx.emit)
+            if not ready:
+                remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
+                if remaining:
+                    log.append(f"stalled: {[(t['task_id'], t['state']) for t in remaining]}")
+                break
+            batch = []
+            for t in ready[: args.max_parallel]:
+                try:
+                    agent = get_agent(t["agent_id"]) if t["agent_id"] else by_capability(t["capability"])[0]
+                except (KeyError, IndexError):
+                    store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
+                    continue
+                batch.append((t, agent))
+            with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
+                try:
+                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo) for t, a in batch]
+                    for f in as_completed(futs):
+                        tid, aid, outcome = f.result()
+                        log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
+                        print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
+                except BaseException:  # Ctrl-C, SIGTERM, SIGHUP: sessions run in their own session, so it missed them
+                    kill_sessions()
+                    raise
+            if args.once or rounds >= args.max_rounds:
+                break
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
     log += reconcile(store, corr, ctx.emit)
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}

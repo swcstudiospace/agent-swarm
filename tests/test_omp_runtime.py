@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -386,6 +387,78 @@ def test_timeout_kills_the_session_process_group(tmp_path):
     raw = [json.loads(ln) for ln in (swarm / "events.jsonl").read_text().splitlines() if '"task.result.raw"' in ln]
     meta = raw[-1]["payload"]["meta"]
     assert meta["timed_out"] is True and meta["session_id"] == "stub-session" and meta["is_error"] is True
+
+
+def test_extension_load_failure_fails_gate_session_and_records_no_gate(tmp_path):
+    """T-06-06: omp only warns on stderr when the -e guard package fails to load, and runs the session unguarded;
+    the runner fails that task closed (E-DEP), applies none of its result and records no gate."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm, SWARM_SIGNING_KEY="runner-secret")
+    plan = {"tasks": [{"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
+                      {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
+                       "gates": {"gate": "review", "for": ["be"]}}]}
+    work = _plan(tmp_path, env, plan, "--risk-class", "low")
+    stub = stub_omp(tmp_path, {"state": "IN_REVIEW", "outputs": [], "summary_md": "stub omp session"},
+                    load_error_on='"gate": "review"')
+    r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(stub), "--repo", str(work), "--json", env=env)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    con = sqlite3.connect(swarm / "tasks.db")
+    rows = list(con.execute("SELECT gate FROM verdicts WHERE task_id = 'T-be'"))
+    con.close()
+    assert rows == []
+    states = _states(swarm)
+    assert states["T-be"] == "IN_REVIEW" and states["T-rev"] == "ESCALATED"
+    reasons = _failed_reasons(swarm, "T-rev")
+    assert reasons and all(x.startswith("E-DEP") and "Failed to load extension" in x for x in reasons)
+
+
+def _grandchild_when_started(stub: Path, timeout: float = 30) -> int:
+    f = stub.parent / "grandchild.pid"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if f.exists() and f.read_text().strip():
+            return int(f.read_text())
+        time.sleep(0.1)
+    raise AssertionError("the stub session never started its tool process")
+
+
+def _ppid(pid: int) -> int:
+    with open(f"/proc/{pid}/stat") as fh:
+        return int(fh.read().rsplit(")", 1)[1].split()[1])
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_signal_to_runner_group_ends_sessions(tmp_path, sig):
+    """WR-09 / T-06-12: sessions sit in their own OS session, so a SIGTERM/SIGHUP sent to the runner's process group
+    (GNU timeout, a terminal hangup) misses them; the runner must end them itself and leave the task retryable."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT, hang=True)
+    runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",
+                               str(stub), "--task-timeout", "100", "--repo", str(work), "--once", "--json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=ROOT,
+                              start_new_session=True)
+    pids: list[int] = []
+    try:
+        grandchild = _grandchild_when_started(stub)
+        pids = [_ppid(grandchild), grandchild]  # the stub omp session, its tool process
+        os.killpg(runner.pid, sig)
+        out, err = runner.communicate(timeout=30)
+        deadline = time.monotonic() + 5
+        while any(_alive(p) for p in pids) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert [_alive(p) for p in pids] == [False, False], "the session outlived the runner\n" + out + err
+    finally:
+        for p in [*pids, runner.pid]:
+            if _alive(p):
+                os.kill(p, signal.SIGKILL)
+        runner.wait()
+    assert runner.returncode == 128 + sig
+    con = sqlite3.connect(swarm / "tasks.db")
+    ((state, notes),) = con.execute("SELECT state, notes FROM tasks WHERE task_id = 'T-one'")
+    con.close()
+    assert state == "FAILED" and json.loads(notes).get("running") is None
 
 
 # ---------------------------------------------------------------- (d) headless omp vs in-session ingest

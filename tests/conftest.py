@@ -95,6 +95,11 @@ import json, os, re, subprocess, sys, time
 prompt = sys.stdin.read()
 with open(@CALLS@, "a") as fh:
     fh.write(json.dumps({"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "stdin": prompt}) + "\n")
+if @LOAD_ERROR_ON@ is not None and @LOAD_ERROR_ON@ in prompt:
+    # omp 18.3.1 when the -e package fails to load: this stderr line, then the session runs on without it (rc 0)
+    ext = sys.argv[sys.argv.index("-e") + 1]
+    print(f"Failed to load extension {ext}/src/index.ts: Failed to load extension: Failed to parse extension source "
+          f"for dependency rewriting: {ext}/src/index.ts: Unexpected token (3:0)", file=sys.stderr, flush=True)
 if @HANG@:
     # a tool process of the session, then a session that outlives any --task-timeout
     gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL,
@@ -130,19 +135,21 @@ for ev in ({"type": "session", "version": 3, "id": "stub-session", "cwd": os.get
 
 
 def stub_omp(tmp_path, result: dict, name: str = "omp", *, yield_error: str | None = None, yield_error_on: str = "",
-             hang: bool = False) -> Path:
+             hang: bool = False, load_error_on: str | None = None) -> Path:
     """Executable `<tmp>/omp-bin/<name>` standing in for `omp -p --mode json`: appends {argv, env, cwd, stdin} to
     omp_calls(stub), then prints a JSONL stream whose terminal agent_end yields `result` (task_id taken from the
     prompt when `result` has none). Its directory holds no claude, so it can be the whole PATH.
     yield_error: sessions whose prompt contains `yield_error_on` put `result` in a fenced json block of the final
     text and yield {error} instead (status aborted). hang: the session starts a `sleep` grandchild (pid in
-    omp_grandchild(stub)), prints a session event and sleeps 120 s."""
+    omp_grandchild(stub)), prints a session event and sleeps 120 s. load_error_on: sessions whose prompt contains it
+    print omp's `Failed to load extension …` stderr line for the -e package, then run normally."""
     d = tmp_path / "omp-bin"
     d.mkdir(exist_ok=True)
     p = d / name
     p.write_text(_OMP_STUB.replace("@PY@", sys.executable).replace("@CALLS@", repr(str(d / "calls.jsonl")))
                  .replace("@GRANDCHILD@", repr(str(d / "grandchild.pid"))).replace("@HANG@", repr(hang))
                  .replace("@YIELD_ERROR_ON@", repr(yield_error_on)).replace("@YIELD_ERROR@", repr(yield_error))
+                 .replace("@LOAD_ERROR_ON@", repr(load_error_on))
                  .replace("@RESULT@", repr(result)))
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return p
