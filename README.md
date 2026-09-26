@@ -70,7 +70,9 @@ Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then 
 
 `build_agents.py --install-workspace` regenerates the agents, copies the Claude/Grok agents, skills and
 UserPromptSubmit hook into the workspace, then installs the omp targets (`omp/agents/`, `omp/skills/` and the
-`omp/` extension package). It never writes into this repo or `~/.omp`.
+`omp/` extension package). It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a
+workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a
+symlink (the file or a parent dir under `<ws>`).
 
 ```bash
 python3 scripts/build_agents.py --install-workspace /path/to/ws                  # omp link mode (default)
@@ -80,12 +82,17 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run       
 
 - **Link** (default) adds this checkout's `omp/` realpath to `extensions:` in `<ws>/.omp/config.yml`, so that file
   holds a host path by design. omp reads it from the cwd only: start omp at `<ws>`. When the file has no
-  `extensions` key, the installer carries over your inherited user list, because a project list replaces it.
+  `extensions` key, the installer carries over your inherited list, because a project list replaces it. The source
+  is `<ws>/.omp/settings.json`, else `config.yml|config.yaml` in your omp user agent dir (the profile dir via
+  `OMP_PROFILE`/`PI_PROFILE`, else `PI_CODING_AGENT_DIR`, else `~/.omp/agent`), else that dir's `settings.json`.
+  A user YAML without `extensions` suppresses the legacy `settings.json`.
 - **Copy** (`--omp-mode copy`) copies the agents and skills into `<ws>/.omp/agents` and `<ws>/.omp/skills`:
   no tools, no guard, no `/swarm` command and no context hook. Re-run it after every regeneration.
-- Both modes print `WARNING shadow:` for each agent or skill with the same frontmatter `name` that omp would load
-  first: project `.omp/agents|skills` in `<ws>` or its ancestors, `~/.omp/agent/agents|skills`, earlier
-  `extensions:` entries and `skills.customDirectories`. `.claude/*` and `.agents/skills` do not shadow.
+- Both modes print `WARNING shadow:` for each agent or skill with the same `name` that omp would load
+  first: project `.omp/agents|skills` in `<ws>` or its ancestors, your user `agents|skills` dirs (profile-aware),
+  earlier `extensions:` entries and `skills.customDirectories`. Only files omp would load count: agents need
+  `name` and `description`; skills need `description` and are skipped on `enabled: false`. `.claude/*` and
+  `.agents/skills` do not shadow.
 - Start a fresh omp session after every install or `build_agents.py` regeneration: extensions and agents load at
   session start.
 - `task.maxRecursionDepth`: omp's default of 2 is enough (main session → `a01-orchestrator` → specialists, which

@@ -25,12 +25,12 @@ Never use from a specialist session.
    - Add `schemaMode: "strict"` to every item for a08-qa, a09-reviewer, a10-security and a12-release.
    - Gate agents run `swarm_gate` themselves. Never pass them findings or a verdict.
 4. `swarm_ingest` every child's task.result before the next wave. Ingest applies the result and runs reconcile itself; there is no separate reconcile call. Reconcile:
-   - moves a target failing a required gate CHANGES_REQUESTED → IN_PROGRESS (rework, feedback in its notes) and creates the gate rerun task `<gate-task-id>.r<N>`;
+   - moves a target failing a required gate CHANGES_REQUESTED → IN_PROGRESS (rework, feedback in its notes) and creates one gate rerun task per gate lineage, `<base>.r<N>` (base = the gate task id without trailing `.rN`; N = the lineage's next rerun sequence, not the target's rework count). Tasks that depended on the lineage wait for its rerun, and a release-gate rerun also waits for the other gate reruns of the same rework;
    - moves a target passing every required gate APPROVED → DONE;
    - after MAX_REWORK_LOOPS=2 rework loops, moves a still-failing target to ESCALATED and emits `escalation.request`.
 5. Missing yield (D-07): a child whose output ends with `SUBAGENT_WARNING_MISSING_YIELD`, or has no parseable task.result, is ingested as FAILED with `error: {code: "E-CONTRACT", message: "missing yield"}`, or as BLOCKED with `needs` when it stated a need. Never IN_REVIEW.
 6. Refusals and blocks:
-   - Ingest refuses a gate result with E-CONTRACT `review verdict mismatch:` or `gate script not run`: nothing transitions and the gate task stays leased (IN_PROGRESS). Re-dispatch that gate agent with the error text. Never transition around it.
+   - Ingest refuses a gate result with E-CONTRACT `review verdict mismatch:` or `gate script not run`: the result is not applied and the gate task stays leased (IN_PROGRESS). While it stays leased, reconcile holds that gate's targets (never APPROVED). Re-dispatch that gate agent with the error text. Never transition around it.
    - A BLOCKED task: escalate to the human. Never self-release it.
 7. FAILED tasks: nothing in-session retries them (only the headless runner does). For each task FAILED after ingest, read `attempt` from `swarm_status` (`max_attempts` defaults to 3):
    - `attempt` < `max_attempts`: `swarm_transition` FAILED → RETRY, re-lease it RETRY → CLAIMED → IN_PROGRESS, and re-dispatch it to its agent with the error in the payload;
