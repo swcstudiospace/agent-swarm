@@ -49,7 +49,7 @@ a Claude Code and Grok Build subagent, an omp task agent and a Trae SOLO prompt,
 | A15 DOC | `a15-docs` | `docs_bundle.py` |
 
 Every script shares one CLI contract (`swarm/script_base.py`): `--task-id`, `--correlation-id`,
-`--root`, `--json`, `--dry-run`; exit 0 ok / 1 finding-fail / 2 taxonomy error; appends to
+`--root`, `--json`, `--dry-run`, exact spellings only (`allow_abbrev=False`: `--ing` exits 2); exit 0 ok / 1 finding-fail / 2 taxonomy error; appends to
 `.swarm/events.jsonl`. Gate scripts write signed verdicts to `.swarm/verdicts/` and the Task Store.
 
 ## Running the swarm
@@ -122,7 +122,7 @@ Mutating tools and `/swarm` refuse with E-POLICY in omp plan mode. Tests: `cd om
 Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `AGENTS.md` **Hooks**):
 
 - `before_agent_start`: SDLC-shaped prompts in a top-level session get a `## AgentSwarm` part pointing at `/swarm` and `task` with `a01-orchestrator`; subagents, `SWARM_CHILD=1`/`SWARM_AGENT` sessions and non-SDLC prompts get nothing. An Ultrathink/Prompt-Uplift XML prompt is classified by its unescaped `<ORIGINAL>` text (else the whole prompt), matching the plugin's headless kickoff.
-- `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)`; `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval` and writes into `.swarm/`, `.omp/`, `~/.omp` block.
+- `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)`; `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval`, MCP tools (`mcp__*` calls and `write` to `xd://mcp__*`, `(mcp: …)`) and writes into `.swarm/`, `.omp/`, `~/.omp` block.
 - `/swarm <brief> [--pattern=feature|hotfix|dependency] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`, correlation id = uuid5 of pattern, risk and brief, so an identical brief reuses its plan), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and holds the session on `isIdle()` until that turn ends (10 s start timeout; hold cap `SWARM_DISPATCH_HOLD_MS`, else 30 min with a UI and unbounded in `-p`/rpc; a cap expiry is a warning saying the plan was dispatched) before draining with `waitForIdle`. Usage, plan mode and `E-CONTRACT` conflicts never dispatch; without a UI they are reported on stderr as `[/swarm] …`.
 
 ## Rules the runtime enforces (mirrors the spec)

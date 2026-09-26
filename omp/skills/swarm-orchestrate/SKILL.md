@@ -30,7 +30,7 @@ Never use from a specialist session.
    - after MAX_REWORK_LOOPS=2 rework loops, moves a still-failing target to ESCALATED and emits `escalation.request`.
 5. Missing yield (D-07): a child whose output ends with `SUBAGENT_WARNING_MISSING_YIELD`, or has no parseable task.result, is ingested as FAILED with `error: {code: "E-CONTRACT", message: "missing yield"}`, or as BLOCKED with `needs` when it stated a need. Never IN_REVIEW.
 6. Refusals and blocks:
-   - Ingest refuses a gate result with E-CONTRACT `review verdict mismatch:` or `gate script not run`: the result is not applied and the gate task stays leased (IN_PROGRESS). While it stays leased, reconcile holds that gate's targets (never APPROVED). Re-dispatch that gate agent with the error text. Never transition around it.
+   - Ingest refuses a gate result with E-CONTRACT `review verdict mismatch:` or `gate script not run`: the result is not applied and the gate task stays leased (IN_PROGRESS). Reconcile holds that gate's targets (never APPROVED) until the gate task that recorded the row has an accepted result; a FAILED gate task holds them until step 7 retries or escalates it. Re-dispatch that gate agent with the error text. Never transition around it.
    - A BLOCKED task: escalate to the human. Never self-release it.
 7. FAILED tasks: nothing in-session retries them (only the headless runner does). For each task FAILED after ingest, read `attempt` from `swarm_status` (`max_attempts` defaults to 3):
    - `attempt` < `max_attempts`: `swarm_transition` FAILED → RETRY, re-lease it RETRY → CLAIMED → IN_PROGRESS, and re-dispatch it to its agent with the error in the payload;
