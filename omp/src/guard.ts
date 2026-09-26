@@ -203,34 +203,61 @@ function isProdMarker(token: string): boolean {
  */
 const isDryRun = (w: string) => /^--dry-run(?:=(?:client|server|true))?$/.test(w);
 /** kubectl flags whose value names where the change lands (D-04 markers apply to these values). */
-const KUBECTL_TARGET_FLAG = /^(?:-n|--namespace|--context|--cluster|--kubeconfig)$/;
-/** kubectl flags whose value is a file, selector or format, never a prod marker. */
-const KUBECTL_VALUE_FLAG = /^(?:-f|--filename|-k|--kustomize|-l|--selector|-o|--output|-p|--patch|--field-selector|--template)$/;
+const KUBECTL_TARGET_FLAG = /^(?:-n|--namespace|--context|--cluster|--kubeconfig|-s|--server)$/;
+/** kubectl flags whose value is a file, selector, format, container, identity or count, never a prod marker. */
+const KUBECTL_VALUE_FLAG =
+  /^(?:-f|--filename|-k|--kustomize|-l|--selector|-o|--output|-p|--patch|--field-selector|--template|-c|--container|--as|--as-group|--as-uid|--user|--token|--certificate-authority|--client-certificate|--client-key|--request-timeout|--tls-server-name|--cache-dir|-v|--v|--vmodule|--image|--type|--timeout|--grace-period|--replicas|--port|--target-port|--name|--overrides|--env|--from|--from-file|--from-literal|--for|--subresource|--field-manager)$/;
+/** kubectl (and `oc`) commands that change a cluster; see kubectlProdChange for the read-only subcommands. */
+const KUBECTL_CHANGE: Record<string, true> = Object.fromEntries(
+  ["create", "apply", "replace", "patch", "edit", "delete", "set", "label", "annotate", "expose", "autoscale", "scale", "drain", "cordon",
+    "uncordon", "taint", "run", "cp", "exec", "attach", "debug", "certificate", "rollout"].map((v) => [v, true]),
+);
+/** Every kubectl command word: the verb is the first positional word that is one (a flag value never is, here). */
+const KUBECTL_VERB: Record<string, true> = {
+  ...KUBECTL_CHANGE,
+  ...Object.fromEntries(
+    ["get", "describe", "logs", "top", "explain", "diff", "wait", "port-forward", "proxy", "config", "version", "api-resources",
+      "api-versions", "cluster-info", "auth", "plugin", "completion", "events", "kustomize", "alpha"].map((v) => [v, true]),
+  ),
+};
 
 /**
- * `kubectl apply|delete|rollout|scale` that lands in prod (D-04): a marker in the value of `-n`/`--namespace`/
- * `--context`/`--cluster`/`--kubeconfig`, or — when no such flag names the destination — in a positional word
- * (resource, name). File, selector and output values never count, and read-only forms (`--dry-run`,
- * `rollout status|history`) never match (WR-08).
+ * A kubectl/oc change that lands in prod (D-04): a mutating verb (create, apply, replace, patch, edit, delete, set,
+ * label, annotate, expose, autoscale, scale, drain, cordon, uncordon, taint, run, cp, exec, attach, debug,
+ * `certificate approve|deny`, `rollout` but `status|history`, `apply` but `view-last-applied`), flags before or after
+ * it, with a marker in the value of `-n`/`--namespace`/`--context`/`--cluster`/`--kubeconfig`/`--server` (`-n prod`,
+ * `-nprod`, `-n=prod`, `--namespace=prod`) or a `KUBECONFIG=` prefix, or — when nothing names the destination — in a
+ * positional word after the verb (resource, name; `k=v` words such as `set image` and label values aside). File,
+ * selector and output values never count, and `--dry-run[=client|server]` never matches (WR-08).
  */
-function kubectlProdChange({ words }: Segment): boolean {
-  if (words[0] !== "kubectl" || words.some(isDryRun)) return false;
-  const verb = words.findIndex((w, i) => i > 0 && ["apply", "delete", "rollout", "scale"].includes(w));
-  if (verb === -1 || (words[verb] === "rollout" && (words[verb + 1] === "status" || words[verb + 1] === "history"))) return false;
+function kubectlProdChange({ words, marked }: Segment): boolean {
+  const k = words.findIndex((w) => w === "kubectl" || w === "oc" || w === "kubecolor");
+  if (!(k === 0 || (k === 1 && /^(?:microk8s|k3s|minikube)$/.test(words[0]))) || words.some(isDryRun)) return false;
   const targets: string[] = [];
   const positional: string[] = [];
-  for (let i = 1; i < words.length; i++) {
+  for (let i = k + 1; i < words.length; i++) {
     const w = words[i];
-    const eq = w.indexOf("=");
-    if (w.startsWith("-")) {
-      const flag = eq === -1 ? w : w.slice(0, eq);
-      if (KUBECTL_TARGET_FLAG.test(flag)) {
-        if (eq !== -1) targets.push(w.slice(eq + 1));
-        else if (words[i + 1] !== undefined) targets.push(words[++i]);
-      } else if (KUBECTL_VALUE_FLAG.test(flag) && eq === -1) i++;
-    } else positional.push(w);
+    if (w === "--") break; // the command `exec`/`debug` run in the pod
+    if (!w.startsWith("-") || w === "-") {
+      positional.push(w);
+      continue;
+    }
+    const long = /^(--[^=]+)(?:=(.*))?$/.exec(w);
+    const flag = long === null ? w.slice(0, 2) : long[1];
+    let value = long === null ? (w.length > 2 ? w.slice(2).replace(/^=/, "") : undefined) : long[2];
+    const target = KUBECTL_TARGET_FLAG.test(flag);
+    if (value === undefined && (target || KUBECTL_VALUE_FLAG.test(flag))) value = words[++i];
+    if (target && value !== undefined) targets.push(value);
   }
-  return (targets.length > 0 ? targets : positional).some(isProdMarker);
+  const at = positional.findIndex((w) => Object.hasOwn(KUBECTL_VERB, w));
+  if (at === -1 || !Object.hasOwn(KUBECTL_CHANGE, positional[at])) return false;
+  const [verb, sub] = [positional[at], positional[at + 1]];
+  if (verb === "rollout" && (sub === "status" || sub === "history")) return false;
+  if (verb === "apply" && sub === "view-last-applied") return false;
+  if (verb === "certificate" && sub !== "approve" && sub !== "deny") return false;
+  const kubeconfig = /(?:^|\s)KUBECONFIG=(\S+)/.exec(marked)?.[1];
+  if (kubeconfig !== undefined) targets.push(unquote(kubeconfig));
+  return (targets.length > 0 ? targets : positional.slice(at + 1).filter((w) => !w.includes("="))).some(isProdMarker);
 }
 
 /**
@@ -1008,21 +1035,60 @@ function rmProtected(seg: Segment, facts: GuardFacts): boolean {
   });
 }
 
-/** `git push` of tags or of every branch (`--all`, `--mirror`), or to main/master or a release tag (refspec destination). */
+/** The index of the first word naming one of `tools` (its basename; `npx vercel@latest` counts), -1 when none. */
+function toolAt(words: string[], tools: RegExp): number {
+  return words.findIndex((w) => tools.test(posix.basename(w).replace(/@[^/]*$/, "")));
+}
+
+/** `gh`'s positional words (the values of `-R`/`--repo`/`--hostname` skipped); undefined when no `gh` runs. */
+function ghArgs(words: string[]): string[] | undefined {
+  const at = toolAt(words, /^gh$/);
+  if (at === -1) return undefined;
+  const out: string[] = [];
+  for (let i = at + 1; i < words.length; i++) {
+    if (/^(?:-R|--repo|--hostname)$/.test(words[i])) i++;
+    else if (!words[i].startsWith("-")) out.push(words[i]);
+  }
+  return out;
+}
+
+/**
+ * `git push` of tags or of every branch (`--all`, `--branches`, `--mirror`), or to main/master or a release tag (the
+ * refspec destination, any case; `+main`, `:main`, `--delete main` included); and merging a pull request (`gh pr merge`,
+ * `gh api …/merge`), which moves its base branch.
+ */
 function pushToProtected(seg: Segment): boolean {
+  const gh = ghArgs(seg.words);
+  if (gh !== undefined && ((gh[0] === "pr" && gh[1] === "merge") || (gh[0] === "api" && gh.some((a) => /\/pulls\/\d+\/merge$|\/merges$/.test(a))))) return true;
   const { sub, args } = git(seg.words);
   if (sub !== "push") return false;
-  // `--all`/`--mirror` push every branch, main and master included
-  if (args.some((a) => /^--(?:tags|follow-tags|all|mirror)$/.test(a))) return true;
-  const refs = operands(args).slice(1);
+  if (args.some((a) => /^--(?:tags|follow-tags|all|branches|mirror)$/.test(a))) return true;
+  // the first operand is the remote, unless `--repo` named it
+  const refs = operands(args).slice(args.some((a) => a.startsWith("--repo")) ? 0 : 1);
   return refs.some((ref) => {
-    const dest = (ref.split(":").pop() ?? "").replace(/^\+/, "").replace(/^refs\/(?:heads|tags)\//, "");
+    const dest = (ref.split(":").pop() ?? "").replace(/^\+/, "").replace(/^refs\/(?:heads|tags)\//, "").toLowerCase();
     return dest === "main" || dest === "master" || RELEASE_TAG.test(dest);
   });
 }
 
-const DB_CLIENT = /^(?:psql|mysql|mariadb|sqlite3|prisma)$/;
-const DDL = /\b(?:DROP\s+(?:TABLE|COLUMN|DATABASE|SCHEMA)|TRUNCATE)\b/i;
+/** Database clients a DDL statement in the command runs through. */
+const DB_CLIENT = /^(?:psql|pgcli|mysql|mariadb|mycli|sqlite3|litecli|duckdb|prisma|mongosh|mongo|redis-cli|cockroach|clickhouse(?:-client)?|usql)$/;
+/** Statements that drop or empty data: `DROP <object>`, `TRUNCATE`, Redis `FLUSHALL|FLUSHDB`, Mongo `dropDatabase()`/`.drop()`. */
+const DDL =
+  /\b(?:DROP\s+(?:TABLE|COLUMN|DATABASE|SCHEMA|INDEX|VIEW|MATERIALIZED\s+VIEW|SEQUENCE|TYPE|FUNCTION|PROCEDURE|TRIGGER|EXTENSION|ROLE|USER|OWNED)|TRUNCATE|FLUSH(?:ALL|DB)|dropDatabase)\b|\.drop\(\)/i;
+/** Registry publishing: the tool and the verb after it that uploads (`npm publish`, `twine upload`, `gem push` …). */
+const PUBLISH_VERB: Record<string, RegExp> = {
+  ...Object.fromEntries(["npm", "pnpm", "yarn", "bun", "lerna", "changeset", "jsr", "deno", "cargo", "poetry", "uv", "hatch", "flit"].map((t) => [t, /^publish$/])),
+  twine: /^upload$/,
+  gem: /^push$/,
+  dotnet: /^push$/,
+  mvn: /^deploy(?::deploy)?$/,
+  mvnw: /^deploy(?::deploy)?$/,
+  gradle: /^publish(?!ToMavenLocal)\w*$/,
+  gradlew: /^publish(?!ToMavenLocal)\w*$/,
+};
+/** A chmod mode that leaves files writable by others: octal with the write bit in its last digit, or `o`/`a`/no-who gaining `w`. */
+const worldWritable = (mode: string) => (/^[0-7]{3,4}$/.test(mode) ? /[2367]$/.test(mode) : /(?:^|,)(?:[ugo]*[oa][ugoa]*)?[+=][rwxXst]*w/.test(mode));
 
 const reason = (capability: string, id: string) => `BLOCKED needs: human-approval (${capability}: ${id})`;
 
@@ -1373,160 +1439,247 @@ export const RULES: readonly Rule[] = [
     capability: "destructive",
     pattern: (seg) => {
       const { sub, args } = git(seg.words);
-      // `+refspec` forces that ref exactly like --force (the first operand is the remote)
-      return sub === "push" && (args.some((a) => a.startsWith("--force") || shortFlag(a, /f/)) || operands(args).slice(1).some((r) => r.startsWith("+")));
+      // `+refspec` forces that ref exactly like --force; `--mirror` force-updates every ref
+      return sub === "push" && (args.some((a) => a.startsWith("--force") || a === "--mirror" || shortFlag(a, /f/)) || operands(args).some((r) => r.startsWith("+")));
     },
-    samples: ["git push --force", "git push -f origin feat/x", "git push --force-with-lease", "git push origin +feat/x", "git --work-tree /x push --force"],
+    samples: ["git push --force", "git push -f origin feat/x", "git push --force-with-lease", "git push origin +feat/x", "git --work-tree /x push --force", "git push -fu origin x", "git push --mirror"],
   },
   {
     id: "git-reset-hard",
     capability: "destructive",
     pattern: (seg) => gitIs(seg, "reset") && git(seg.words).args.includes("--hard"),
-    samples: ["git reset --hard HEAD~1"],
+    samples: ["git reset --hard HEAD~1", "git -c core.x=y reset --hard"],
   },
   {
     id: "git-clean-force",
     capability: "destructive",
-    pattern: (seg) => gitIs(seg, "clean") && git(seg.words).args.some((a) => a === "--force" || shortFlag(a, /f/)),
-    samples: ["git clean -fdx", "git clean -f"],
+    pattern: (seg) =>
+      gitIs(seg, "clean") &&
+      (git(seg.words).args.some((a) => a === "--force" || shortFlag(a, /f/)) || seg.words.some((w) => /^clean\.requireforce=(?:false|no|off|0)$/i.test(w))),
+    samples: ["git clean -fdx", "git clean -f", "git clean -xfd", "git -c clean.requireForce=false clean -d"],
   },
   {
     id: "git-branch-force-delete",
     capability: "destructive",
+    // `-D`, `--delete --force`, and the forced move/copy/reset (`-M`, `-C`, `-f`) that overwrite an existing branch
     pattern: (seg) => {
       const { sub, args } = git(seg.words);
-      if (sub !== "branch") return false;
-      if (args.some((a) => shortFlag(a, /D/))) return true;
-      return args.some((a) => a === "--delete" || shortFlag(a, /d/)) && args.some((a) => a === "--force" || shortFlag(a, /f/));
+      return sub === "branch" && args.some((a) => a === "--force" || shortFlag(a, /[DMCf]/));
     },
-    samples: ["git branch -D feature", "git branch --delete --force feature", "git branch -d -f feature", "git branch -df feature"],
+    samples: ["git branch -D feature", "git branch --delete --force feature", "git branch -d -f feature", "git branch -df feature", "git branch -M main", "git branch -f main x"],
   },
   {
     id: "git-discard-repo",
     capability: "destructive",
     pattern: (seg) => {
       const { sub, args } = git(seg.words);
-      return (sub === "checkout" || sub === "restore") && operands(args).some((a) => [".", "./", ":/", "*"].includes(a));
+      if ((sub === "checkout" || sub === "switch") && args.some((a) => a === "--force" || a === "--discard-changes" || shortFlag(a, /f/))) return true;
+      if (sub === "stash" && /^(?:drop|clear)$/.test(args[0] ?? "")) return true;
+      return (sub === "checkout" || sub === "restore") && operands(args).some((a) => [".", "./", ":/", "*", ":/*"].includes(a));
     },
-    samples: ["git checkout -- .", "git restore ."],
+    samples: ["git checkout -- .", "git restore .", "git checkout -f main", "git switch --discard-changes main", "git stash clear"],
   },
   {
     id: "rm-rf-protected",
     capability: "destructive",
     pattern: rmProtected,
-    samples: ["rm -rf /", "rm -rf ~", "rm -rf .git", "rm -r .git", "rm .swarm/tasks.db", "rm -f .omp/config.yml", "rm -r .swarm"],
+    samples: ["rm -rf /", "rm -rf ~", "rm -rf .git", "rm -r .git", "rm .swarm/tasks.db", "rm -f .omp/config.yml", "rm -r .swarm", "rm -Rf /", "rm -r -f ~"],
   },
   {
     id: "chmod-777-recursive",
     capability: "destructive",
+    // recursive and leaving files writable by others: `777`, `0777`, `1777`, `666`, `a+rwx`, `o+w`, `+w` …
     pattern: ({ words }) =>
-      words[0] === "chmod" && words.some((w) => w === "--recursive" || shortFlag(w, /R/)) &&
-      words.some((w) => w === "777" || /^(?:a|ugo)\+rwx$/.test(w)),
-    samples: ["chmod -R 777 ."],
+      words[0] === "chmod" && words.some((w) => w === "--recursive" || shortFlag(w, /R/)) && words.slice(1).some((w) => !w.startsWith("-") && worldWritable(w)),
+    samples: ["chmod -R 777 .", "chmod -R 0777 dir", "chmod --recursive a+rwx .", "chmod -R o+w src"],
   },
   // A07 destructive_ddl (L4)
   {
     id: "ddl-drop-truncate",
     capability: "destructive_ddl",
     agents: ["a07-data"],
-    pattern: ({ words }, _facts, command) => DB_CLIENT.test(words[0] ?? "") && DDL.test(command),
-    samples: ['psql -c "DROP TABLE users"', 'echo "TRUNCATE t" | psql app'],
+    pattern: ({ words }, _facts, command) =>
+      (toolAt(words, DB_CLIENT) !== -1 && DDL.test(command)) || /^(?:dropdb|dropuser)$/.test(words[0] ?? "") || (words[0] === "mysqladmin" && words.includes("drop")),
+    samples: ['psql -c "DROP TABLE users"', 'echo "TRUNCATE t" | psql app', "dropdb app", 'redis-cli FLUSHALL', 'npx prisma db execute --stdin <<< "DROP TABLE t"'],
   },
   {
     id: "prisma-migrate-reset",
     capability: "destructive_ddl",
     agents: ["a07-data"],
-    pattern: /\bprisma\s+migrate\s+reset\b/,
-    samples: ["npx prisma migrate reset --force"],
+    // resets that drop every table: prisma, supabase, rails/rake and django
+    pattern: ({ words }) => {
+      const prisma = toolAt(words, /^prisma$/);
+      const migrate = prisma === -1 ? -1 : words.indexOf("migrate", prisma);
+      if (migrate !== -1 && words.indexOf("reset", migrate) !== -1) return true;
+      if (toolAt(words, /^supabase$/) !== -1 && words.includes("db") && words.includes("reset")) return true;
+      if (toolAt(words, /^(?:rails|rake)$/) !== -1 && words.some((w) => /^db:(?:drop|reset|purge|schema:load|structure:load|migrate:reset)$/.test(w))) return true;
+      return words.some((w) => /(?:^|\/)manage\.py$/.test(w)) && words.some((w) => w === "flush" || w === "reset_db");
+    },
+    samples: ["npx prisma migrate reset --force", "prisma --schema x.prisma migrate reset", "supabase db reset", "bin/rails db:drop", "python manage.py flush --noinput"],
   },
   {
     id: "db-push-accept-data-loss",
     capability: "destructive_ddl",
     agents: ["a07-data"],
-    pattern: /\bdb\s+push\b.*--accept-data-loss\b/,
-    samples: ["prisma db push --accept-data-loss"],
+    pattern: ({ text, words }) =>
+      /\bdb\s+push\b.*--(?:accept-data-loss|force-reset)\b/.test(text) || (toolAt(words, /^drizzle-kit$/) !== -1 && words.includes("push") && words.includes("--force")),
+    samples: ["prisma db push --accept-data-loss", "prisma db push --force-reset", "npx drizzle-kit push --force"],
   },
   // A11 prod_infra (L3)
   {
     id: "terraform-apply-destroy",
     capability: "prod_infra",
     agents: ["a11-devops"],
-    pattern: ({ words }) => (words[0] === "terraform" || words[0] === "tofu") && words.some((w) => w === "apply" || w === "destroy"),
-    samples: ["terraform apply -auto-approve", "terraform destroy"],
+    // apply/destroy (also `-chdir=…` first, `apply -destroy`, terragrunt `run-all apply`) and the state-changing commands
+    pattern: ({ words }) => {
+      const at = toolAt(words, /^(?:terraform|tofu|terragrunt)$/);
+      if (at === -1) return false;
+      const rest = words.slice(at + 1);
+      const after = (w: string) => rest[rest.indexOf(w) + 1] ?? "";
+      return (
+        rest.some((w) => /^(?:apply|destroy|import|taint|untaint|force-unlock|refresh)$/.test(w)) ||
+        (rest.includes("state") && /^(?:rm|mv|push|replace-provider)$/.test(after("state"))) ||
+        (rest.includes("workspace") && after("workspace") === "delete")
+      );
+    },
+    samples: ["terraform apply -auto-approve", "terraform destroy", "terraform -chdir=infra apply", "terraform apply -destroy", "terraform state rm x", "terragrunt run-all apply"],
   },
   {
     id: "pulumi-up-destroy",
     capability: "prod_infra",
     agents: ["a11-devops"],
-    pattern: ({ words }) => words[0] === "pulumi" && words.some((w) => w === "up" || w === "destroy"),
-    samples: ["pulumi up --yes", "pulumi destroy"],
+    pattern: ({ words }) => {
+      const at = toolAt(words, /^pulumi$/);
+      if (at === -1) return false;
+      const rest = words.slice(at + 1);
+      const after = (w: string) => rest[rest.indexOf(w) + 1] ?? "";
+      return (
+        rest.some((w) => /^(?:up|update|destroy|import|refresh|cancel)$/.test(w)) ||
+        (rest.includes("stack") && after("stack") === "rm") ||
+        (rest.includes("state") && /^(?:delete|unprotect|rename|move|edit)$/.test(after("state")))
+      );
+    },
+    samples: ["pulumi up --yes", "pulumi destroy", "pulumi -C infra update", "pulumi stack rm prod"],
   },
   {
     id: "helm-release-change",
     capability: "prod_infra",
     agents: ["a11-devops"],
-    pattern: ({ words }) =>
-      words[0] === "helm" && !words.some(isDryRun) && words.some((w) => ["install", "upgrade", "uninstall", "delete", "rollback"].includes(w)),
-    samples: ["helm upgrade app ./chart", "helm install app ./chart"],
+    pattern: ({ words }) => {
+      const at = toolAt(words, /^helm$/);
+      const rest = at === -1 ? [] : words.slice(at + 1);
+      return !rest.includes("plugin") && !words.some(isDryRun) && rest.some((w) => /^(?:install|upgrade|uninstall|delete|del|un|rollback)$/.test(w));
+    },
+    samples: ["helm upgrade app ./chart", "helm install app ./chart", "helm --kube-context prod upgrade --install app ./c", "helm uninstall app", "helm rollback app 1"],
   },
   {
     id: "kubectl-prod-change",
     capability: "prod_infra",
     agents: ["a11-devops"],
     pattern: kubectlProdChange,
-    samples: ["kubectl apply -n production -f k.yaml", "kubectl --context=prod rollout restart deploy/api", "kubectl scale deploy/api --replicas=0 --namespace=prod"],
+    samples: [
+      "kubectl apply -n production -f k.yaml",
+      "kubectl --context=prod rollout restart deploy/api",
+      "kubectl scale deploy/api --replicas=0 --namespace=prod",
+      "kubectl -nprod apply -f k.yaml",
+      "kubectl --context prod set image deploy/api api=img:2",
+      "kubectl -n prod patch deploy api -p '{}'",
+    ],
   },
   {
     id: "cloud-destructive",
     capability: "prod_infra",
     agents: ["a11-devops"],
-    pattern: ({ words }) =>
-      (words[0] === "aws" && words.slice(1).some((w) => /^(?:delete|terminate|remove|deregister|destroy)-/.test(w) || w === "rb" || w === "rm")) ||
-      (words[0] === "gcloud" && words.slice(1).some((w) => w === "deploy" || w === "delete")),
-    samples: ["aws ec2 terminate-instances --instance-ids i-1", "gcloud app deploy"],
+    pattern: ({ words }) => {
+      const at = toolAt(words, /^(?:aws|gcloud|az|gsutil|doctl)$/);
+      if (at === -1) return false;
+      const tool = posix.basename(words[at]);
+      const rest = words.slice(at + 1);
+      if (tool === "aws") {
+        return rest.some((w) => /^(?:delete|terminate|remove|deregister|destroy|purge)-/.test(w) || /^(?:rb|rm|mv|deploy)$/.test(w)) || (rest.includes("sync") && rest.includes("--delete"));
+      }
+      if (tool === "gcloud") return rest.some((w) => /^(?:deploy|delete|destroy)$/.test(w));
+      if (tool === "az") return rest.some((w) => /^(?:delete|deploy|purge|up)$/.test(w));
+      if (tool === "gsutil") return rest.some((w) => w === "rm" || w === "rb") || (rest.includes("rsync") && rest.some((w) => shortFlag(w, /d/)));
+      return rest.some((w) => /^(?:delete|destroy|rm)$/.test(w));
+    },
+    samples: ["aws ec2 terminate-instances --instance-ids i-1", "gcloud app deploy", "aws --profile prod s3 rm s3://b/x", "aws s3 sync . s3://b --delete", "az group delete -n rg"],
   },
   // A12 prod_high_risk (L4)
   {
     id: "vercel-prod",
     capability: "prod_high_risk",
     agents: ["a12-release"],
-    pattern: ({ words }) => words.includes("vercel") && words.some((w) => w === "--prod" || w === "--production"),
-    samples: ["vercel --prod", "npx vercel deploy --prod"],
+    pattern: ({ words }) => {
+      const at = toolAt(words, /^(?:vercel|vc)$/);
+      const rest = at === -1 ? [] : words.slice(at + 1);
+      return rest.some((w, i) => /^(?:--prod|--production|--target=production|promote|rollback)$/.test(w) || (w === "--target" && rest[i + 1] === "production"));
+    },
+    samples: ["vercel --prod", "npx vercel deploy --prod", "vc --prod", "npx vercel@latest deploy --target production", "vercel promote https://x.vercel.app"],
   },
   {
     id: "fly-deploy",
     capability: "prod_high_risk",
     agents: ["a12-release"],
-    pattern: ({ words }) => (words[0] === "fly" || words[0] === "flyctl") && words.includes("deploy"),
-    samples: ["fly deploy"],
+    pattern: ({ words }) => {
+      const at = toolAt(words, /^(?:fly|flyctl)$/);
+      const rest = at === -1 ? [] : words.slice(at + 1);
+      return rest.some(
+        (w, i) =>
+          /^(?:deploy|destroy|scale|restart|rollback)$/.test(w) ||
+          (/^(?:secrets|machine|machines|apps|volumes|volume|postgres|pg|certs)$/.test(w) &&
+            /^(?:set|unset|import|destroy|remove|rm|delete|update|run|clone|stop|kill|restart)$/.test(rest[i + 1] ?? "")),
+      );
+    },
+    samples: ["fly deploy", "flyctl -a app deploy", "fly apps destroy app", "fly secrets set X=1"],
   },
   {
     id: "gh-release-create",
     capability: "prod_high_risk",
     agents: ["a12-release"],
-    pattern: ({ words }) => words[0] === "gh" && words[1] === "release" && words[2] === "create",
-    samples: ["gh release create v1.0.0"],
+    // release create/edit (publishes a draft)/delete/upload, also behind `-R owner/repo`, and the same through `gh api`
+    pattern: ({ words }) => {
+      const gh = ghArgs(words);
+      if (gh === undefined) return false;
+      if (gh[0] === "release" && /^(?:create|edit|delete|upload|delete-asset)$/.test(gh[1] ?? "")) return true;
+      const mutating = words.some(
+        (w, i) => (/^(?:-X|--method)$/.test(w) && /^(?:POST|PATCH|PUT|DELETE)$/i.test(words[i + 1] ?? "")) || /^(?:-X|--method=)(?:POST|PATCH|PUT|DELETE)$/i.test(w) || /^(?:-f|-F|--field|--raw-field|--input)$/.test(w),
+      );
+      return gh[0] === "api" && mutating && gh.some((a) => /\/releases(?:\/|$)/.test(a));
+    },
+    samples: ["gh release create v1.0.0", "gh -R o/r release create v1", "gh release edit v1 --draft=false", "gh api -X POST repos/o/r/releases -f tag_name=v1"],
   },
   {
     id: "package-publish",
     capability: "prod_high_risk",
     agents: ["a12-release"],
-    pattern: ({ words }) => ["npm", "pnpm", "bun", "yarn"].includes(words[0] ?? "") && words.slice(1).includes("publish"),
-    samples: ["npm publish", "pnpm publish --access public", "bun publish"],
+    pattern: ({ words }) =>
+      !words.some(isDryRun) &&
+      words.some((w, i) => {
+        const tool = posix.basename(w).replace(/@[^/]*$/, "");
+        return Object.hasOwn(PUBLISH_VERB, tool) && words.slice(i + 1).some((v) => PUBLISH_VERB[tool].test(v));
+      }),
+    samples: ["npm publish", "pnpm publish --access public", "bun publish", "npm --registry https://r publish", "cargo publish", "twine upload dist/*", "poetry publish", "gem push x.gem"],
   },
   {
     id: "docker-push",
     capability: "prod_high_risk",
     agents: ["a12-release"],
-    pattern: ({ words }) => (words[0] === "docker" || words[0] === "podman") && words.includes("push"),
-    samples: ["docker push ghcr.io/org/app:1.0"],
+    // a push to a registry: `docker|podman|nerdctl|buildah push`, `buildx build --push` / `--output type=registry`, crane/skopeo/regctl copies
+    pattern: ({ words }) => {
+      const d = toolAt(words, /^(?:docker|podman|nerdctl|buildah)$/);
+      if (d !== -1 && words.slice(d + 1).some((w) => w === "push" || w === "--push" || /type=registry|push=true/.test(w))) return true;
+      const c = toolAt(words, /^(?:crane|skopeo|regctl)$/);
+      return c !== -1 && words.slice(c + 1).some((w) => /^(?:push|copy|cp|sync|mutate|append|tag)$/.test(w));
+    },
+    samples: ["docker push ghcr.io/org/app:1.0", "docker --context x push img", "docker buildx build --push -t img .", "skopeo copy docker://a docker://b"],
   },
   {
     id: "git-push-protected",
     capability: "prod_high_risk",
     agents: ["a12-release"],
     pattern: pushToProtected,
-    samples: ["git push --tags", "git push origin main", "git push origin HEAD:master", "git push origin v1.2.0"],
+    samples: ["git push --tags", "git push origin main", "git push origin HEAD:master", "git push origin v1.2.0", "git push origin :main", "git push origin --delete main", "gh pr merge 12 --squash"],
   },
 ];
 

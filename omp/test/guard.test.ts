@@ -537,6 +537,79 @@ describe("HOOK-02", () => {
     expect(guardToolCall(bash(command), inside("a11-devops"))?.reason).toEndWith(": helm-release-change)");
   });
 
+  /** HOOK-02 spellings: attached/`=` flag values, clusters, global options before the verb, aliases and verb synonyms. */
+  const A11 = "a11-devops";
+  const A12 = "a12-release";
+  const A07 = "a07-data";
+  test.each<[string, string, string]>([
+    ...[
+      "kubectl -nprod apply -f k.yaml", "kubectl --namespace=prod apply -f k", "kubectl --namespace prod apply -f k", "kubectl -n=prod apply -f k",
+      "kubectl --context prod-cluster apply -f k", "kubectl --context=prod-cluster apply -f k", "KUBECONFIG=~/.kube/prod kubectl apply -f k",
+      "kubectl --context prod set image deploy/api api=img:2", "oc -n prod delete pod x",
+      ...["create -f x", "replace -f x", "patch deploy a -p '{}'", "edit deploy a", "set image deploy/a a=i:1", "label pod a x=y", "annotate pod a x=y",
+        "expose deploy a --port 80", "autoscale deploy a --max 3", "drain node1", "cordon node1", "uncordon node1", "taint nodes n k=v:NoSchedule",
+        "run x --image=y", "cp f a:/tmp", "exec -it a -- ls", "debug a -it --image=b", "certificate approve csr1", "rollout undo deploy/a",
+        "apply edit-last-applied deploy/a"].map((verb) => `kubectl -n prod ${verb}`),
+    ].map((c): [string, string, string] => [c, A11, "kubectl-prod-change"]),
+    ["helm --kube-context prod upgrade --install a ./c", A11, "helm-release-change"],
+    ["helm uninstall app", A11, "helm-release-change"],
+    ["terraform -chdir=infra apply -auto-approve", A11, "terraform-apply-destroy"],
+    ["terraform apply -destroy", A11, "terraform-apply-destroy"],
+    ["terraform state rm aws_instance.x", A11, "terraform-apply-destroy"],
+    ["pulumi -C infra update", A11, "pulumi-up-destroy"],
+    ["aws --profile prod s3 rm s3://b/x", A11, "cloud-destructive"],
+    ["aws s3 sync . s3://b --delete", A11, "cloud-destructive"],
+    ["git push -fu origin x", B05, "git-force-push"],
+    ["git -C x push -f", B05, "git-force-push"],
+    ["git -c k=v push --force", B05, "git-force-push"],
+    ["git push origin +main", B05, "git-force-push"],
+    ["git push --mirror", B05, "git-force-push"],
+    ["git clean -xfd", B05, "git-clean-force"],
+    ["git -c clean.requireForce=false clean -d", B05, "git-clean-force"],
+    ["git branch -M main", B05, "git-branch-force-delete"],
+    ["git checkout -f main", B05, "git-discard-repo"],
+    ["rm -Rf /", B05, "rm-rf-protected"],
+    ["rm -r -f ~", B05, "rm-rf-protected"],
+    ["chmod -R 0777 .", B05, "chmod-777-recursive"],
+    ["chmod -R o+w .", B05, "chmod-777-recursive"],
+    ['mysql -e "DROP DATABASE x"', A07, "ddl-drop-truncate"],
+    ["dropdb app", A07, "ddl-drop-truncate"],
+    ["supabase db reset", A07, "prisma-migrate-reset"],
+    ["bin/rails db:reset", A07, "prisma-migrate-reset"],
+    ["prisma db push --force-reset", A07, "db-push-accept-data-loss"],
+    ["git push origin :main", A12, "git-push-protected"],
+    ["git push origin --delete main", A12, "git-push-protected"],
+    ["gh pr merge 3", A12, "git-push-protected"],
+    ["gh -R o/r release create v1", A12, "gh-release-create"],
+    ["npm --registry x publish", A12, "package-publish"],
+    ["cargo publish", A12, "package-publish"],
+    ["twine upload dist/*", A12, "package-publish"],
+    ["docker --context x push img", A12, "docker-push"],
+    ["docker buildx build --push -t img .", A12, "docker-push"],
+    ["fly -a app deploy", A12, "fly-deploy"],
+    ["npx vercel@latest deploy --target production", A12, "vercel-prod"],
+    ["vc --prod", A12, "vercel-prod"],
+  ])("HOOK-02 spelling: %s blocks for %s as %s", (command, agent, id) => {
+    expect(guardToolCall(bash(command), inside(agent))?.reason).toEndWith(`: ${id})`);
+  });
+
+  test.each<[string, string]>([
+    ...[
+      "kubectl get pods -n production", "kubectl describe deploy -n prod x", "kubectl logs -n prod x", "kubectl apply -f k.yaml", "kubectl apply -n staging -f k.yaml",
+      "kubectl -n prod rollout status deploy/a", "kubectl -n prod apply view-last-applied deploy/a", "kubectl set image deploy/api api=img:v1.2.3",
+      "kubectl -n prod port-forward svc/a 8080", "kubectl -n prod diff -f k.yaml", "kubectl config use-context prod", "helm list", "helm template x ./c",
+      "helm plugin install https://x", "helm status app", "terraform plan", "terraform plan -destroy", "terraform init", "terraform state list", "pulumi preview",
+      "aws s3 ls", "aws s3 cp x s3://b/", "gcloud config list",
+    ].map((c): [string, string] => [c, A11]),
+    ...["git push origin feature", "git push -u origin feat/x", "git branch -d feature", "git checkout -b x", "git switch -c x", "git stash pop", "git clean -n",
+      "chmod -R 755 .", "chmod -R g+w .", "chmod 777 file"].map((c): [string, string] => [c, B05]),
+    ...["npm publish --dry-run", "cargo publish --dry-run", "docker build -t x .", "docker pull x", "vercel deploy", "fly status", "gh release view v1",
+      "gh pr create -f", "gh api repos/o/r/releases", "gradle publishToMavenLocal"].map((c): [string, string] => [c, A12]),
+    ...['psql -c "SELECT 1"', "prisma migrate dev", "prisma db push", "rails db:migrate"].map((c): [string, string] => [c, A07]),
+  ])("HOOK-02 benign: %s passes for %s", (command, agent) => {
+    expect(guardToolCall(bash(command), inside(agent))).toBeUndefined();
+  });
+
   test("top-level session with SWARM_TASK_ID and no session_init is in the swarm", () => {
     const facts: GuardFacts = { ...main, env: { SWARM_TASK_ID: "T-1" } };
     blockedWith(guardToolCall(bash("git reset --hard"), facts), "destructive");
