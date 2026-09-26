@@ -84,6 +84,28 @@ def test_link_entry_resolving_to_package_is_noop(ws, home, tmp_path, spelling):
     assert "installed" not in out
 
 
+@pytest.mark.parametrize("prefix", ["@", "file://"])
+def test_link_appends_package_after_shorthand_spelling_omp_gives_no_root(ws, home, yaml_mode, prefix):
+    # omp's extension-root discovery (`resolveAgainst`) expands only `~`, so `@<pkg>`/`file://<pkg>` load no agents or skills (WR-06)
+    items = f"  - /opt/other\n  - {json.dumps(prefix + PKG)}\n"
+    _write(_cfg(ws), f"extensions:\n{items}theme: dark\n")
+    assert _run(ws)[0] == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == f"extensions:\n{items}  - {PKG}\ntheme: dark\n"
+
+
+@pytest.mark.parametrize("spelling", ["tilde", "absolute"])
+def test_link_tilde_or_absolute_package_entry_is_noop(ws, home, yaml_mode, spelling):
+    if spelling == "tilde":
+        (home / "swarm").symlink_to(ROOT)
+        entry = "~/swarm/omp"
+    else:
+        entry = PKG
+    text = f"extensions:\n  - /opt/other\n  - {entry}\ntheme: dark\n"
+    _write(_cfg(ws), text)
+    assert _run(ws)[0] == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == text
+
+
 @pytest.mark.parametrize("value", ["extensions: [/opt/x]\n", "extensions: []\n", "extensions: /opt/x\n", "extensions:\ntheme: x\n"])
 def test_link_unsupported_value_exits_2_and_writes_nothing(ws, home, value):
     text = "theme: dark\n" + value

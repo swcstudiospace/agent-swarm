@@ -245,16 +245,17 @@ def _validate(text: str, expected: list[str] | None) -> None:
 # ---------------------------------------------------------------- paths and names
 
 def _resolve_entry(entry: str, base: Path, home: Path) -> Path:
-    """An `extensions:`/directory entry as omp resolves it: `file://`/`@/` shorthands, `~`, relative to `base`."""
-    e = entry.strip()
-    if e.startswith("file://"):
-        e = e[len("file://"):]
-    elif e.startswith("@/"):
-        e = e[1:]
-    if e == "~" or e.startswith("~/"):
+    """An `extensions:`/directory entry as omp's root discovery resolves it (`resolveAgainst`: `expandTilde`, then
+    `path.resolve(cwd, …)`). No `@`/`file://` shorthand: those spellings give omp no extension root (WR-06)."""
+    e = entry
+    if e == "~":
+        e = str(home)
+    elif e.startswith(("~/", "~\\")):
         e = str(home) + e[1:]
+    elif e.startswith("~"):
+        e = os.path.join(home, e[1:])
     p = Path(e)
-    return Path(os.path.realpath(p if p.is_absolute() else base / p))
+    return Path(os.path.realpath(os.path.normpath(p if p.is_absolute() else base / p)))
 
 
 def _frontmatter(path: Path) -> dict[str, tuple[str, list[str]]] | None:
