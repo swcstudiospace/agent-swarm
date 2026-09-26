@@ -39,7 +39,27 @@ export function classifyPrompt(prompt: string): boolean {
   return SDLC.test(t);
 }
 
-/** The systemPrompt with SWARM_CONTEXT appended, or undefined in subagents, swarm children, repeats and non-SDLC prompts. */
+/** Root elements of an Ultrathink/Prompt-Uplift XML; omp replaces the user's prompt with that XML. */
+const UPLIFT_ROOT = /^<(BUILD_PROMPT|FIX_PROMPT|RESEARCH_PROMPT|CHANGE_PROMPT|UPLIFTED_PROMPT|uplifted|ultrathink)\b/i;
+const ORIGINAL_EL = /<ORIGINAL\b[^>]*>([\s\S]*?)<\/ORIGINAL>/i;
+
+/** The user's own words: the unescaped <ORIGINAL> of an uplift XML, else the prompt unchanged. */
+export function classifiedText(prompt: string): string {
+  const t = prompt.trim();
+  const m = UPLIFT_ROOT.test(t) ? ORIGINAL_EL.exec(t) : null;
+  if (!m) return prompt;
+  return m[1]
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * The systemPrompt with SWARM_CONTEXT appended, or undefined in subagents, swarm children, repeats and non-SDLC prompts.
+ * An uplift XML prompt is classified by its <ORIGINAL>, so HOOK-01 agrees with the headless kickoff (WR-01).
+ */
 export function swarmContext(
   event: BeforeAgentStartEvent,
   ctx: Pick<ExtensionContext, "sessionManager">,
@@ -52,7 +72,7 @@ export function swarmContext(
   const prior = event.systemPrompt ?? [];
   if (prior.includes(SWARM_CONTEXT)) return undefined;
   try {
-    if (!classify(event.prompt)) return undefined;
+    if (!classify(classifiedText(event.prompt))) return undefined;
   } catch {
     return undefined;
   }
@@ -61,11 +81,14 @@ export function swarmContext(
 
 export const RUNTIME_HEADING = "## AgentSwarm runtime";
 
-/** The runtime part for an absolute runtime root; the omp preamble reads its `Runtime root:` line. */
+/** The label of the runtime part's root line; the omp preamble tells specialists to read that line. */
+export const RUNTIME_ROOT_LABEL = "Runtime root:";
+
+/** The runtime part for an absolute runtime root; the omp preamble reads its RUNTIME_ROOT_LABEL line. */
 export function runtimePart(root: string): string {
   return `${RUNTIME_HEADING}
 
-Runtime root: ${root}
+${RUNTIME_ROOT_LABEL} ${root}
 Run swarm scripts as \`python3 ${root}/scripts/<script>.py … --root <repo> --json\`, where \`<repo>\` is the git toplevel of your working directory.
 `;
 }

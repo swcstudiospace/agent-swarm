@@ -69,6 +69,55 @@ describe("fixture negatives are silent", () => {
   }
 });
 
+// ── WR-01: an Ultrathink/Prompt-Uplift XML is classified by the user's <ORIGINAL> ─────────
+
+/** The plugin escapes the user's words into <ORIGINAL> (plugin src/uplift/xml.ts escapeXml). */
+const escapeXml = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/** The plugin's fallback shape: its closing `</UPLIFTED_PROMPT>` contains the NEGATIVE token `/uplift`. */
+const fallbackUplift = (original: string) =>
+  [
+    "<UPLIFTED_PROMPT>",
+    `\t<ORIGINAL>${escapeXml(original)}</ORIGINAL>`,
+    "\t<SCOPE>Only the work required to fulfill the original request.</SCOPE>",
+    "</UPLIFTED_PROMPT>",
+  ].join("\n");
+
+/** An LLM uplift whose sections carry SDLC verbs that must not decide for the ORIGINAL. */
+const researchUplift = (original: string) =>
+  `<RESEARCH_PROMPT>\n<ORIGINAL>${escapeXml(original)}</ORIGINAL>\n<TASK>Build an answer, add sources, implement nothing.</TASK>\n</RESEARCH_PROMPT>`;
+
+describe("uplift XML: HOOK-01 classifies the user's ORIGINAL (WR-01)", () => {
+  for (const prompt of FIXTURE.positive) {
+    test(`fallback uplift of a positive injects: ${JSON.stringify(prompt.slice(0, 50))}`, () => {
+      const out = hook()({ prompt: fallbackUplift(prompt), systemPrompt: PRIOR }, top());
+      expect(parts(out)).toEqual([...PRIOR, SWARM_CONTEXT]);
+    });
+  }
+  for (const prompt of FIXTURE.negative) {
+    test(`research uplift of a negative is silent: ${JSON.stringify(prompt.slice(0, 50))}`, () => {
+      expect(hook()({ prompt: researchUplift(prompt), systemPrompt: PRIOR }, top())).toBeUndefined();
+    });
+  }
+  test("an uplift root without an ORIGINAL is classified whole", () => {
+    const build = "<BUILD_PROMPT>\n<TASK>implement the billing module</TASK>\n</BUILD_PROMPT>";
+    expect(parts(hook()({ prompt: build, systemPrompt: PRIOR }, top()))).toEqual([...PRIOR, SWARM_CONTEXT]);
+    const bare = "<UPLIFTED_PROMPT>\n<TASK>implement the billing module</TASK>\n</UPLIFTED_PROMPT>";
+    expect(hook()({ prompt: bare, systemPrompt: PRIOR }, top())).toBeUndefined();
+  });
+  test("a plain prompt that quotes an ORIGINAL element is classified whole", () => {
+    const prompt = "implement a parser for <ORIGINAL>what is a monad</ORIGINAL> tags";
+    expect(parts(hook()({ prompt, systemPrompt: PRIOR }, top()))).toEqual([...PRIOR, SWARM_CONTEXT]);
+  });
+  test("SWARM_CHILD and an existing SWARM_CONTEXT part still silence an SDLC uplift", () => {
+    const prompt = fallbackUplift(SDLC);
+    expect(hook()({ prompt, systemPrompt: [...PRIOR, SWARM_CONTEXT] }, top())).toBeUndefined();
+    process.env.SWARM_CHILD = "1";
+    expect(hook()({ prompt, systemPrompt: PRIOR }, top())).toBeUndefined();
+  });
+});
+
 describe("silence outside a fresh top-level session", () => {
   test("SWARM_CHILD=1", () => {
     process.env.SWARM_CHILD = "1";
