@@ -20,9 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
-from swarm.gates import make_finding, SEVERITIES  # noqa: E402
-from swarm.verdicts import issue_gate  # noqa: E402
-from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.gates import make_finding  # noqa: E402
+from swarm.verdicts import agent_finding, issue_gate, load_per_target  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(_test|\.test|\.spec|_spec)\.[a-z]+$|(^|/)test_[^/]+\.py$")
@@ -136,37 +135,12 @@ def mechanical_checks(changes: dict[str, dict], max_lines: int, self_path: Path,
     return findings
 
 
-def _finding(f, i: int, path: str) -> dict:
-    if not isinstance(f, dict):
-        raise SwarmError(ErrorCode.E_INPUT, f"finding {i} in {path} is not an object")
-    sev = f.get("severity", "minor")
-    if sev not in SEVERITIES:
-        raise SwarmError(ErrorCode.E_INPUT, f"bad severity {sev!r} in {path}")
-    return make_finding(f.get("id") or f"RF-{i:03d}", sev, f.get("kind", "semantic"), f.get("summary", ""),
-                        evidence=f.get("evidence", ""), ac_ref=f.get("ac_ref"),
-                        owner_suggestion=f.get("owner_suggestion", "A05"), location=f.get("location"))
-
-
 def load_extra(path: str | None, offset: int) -> list[dict]:
     if not path:
         return []
     raw = json.loads(Path(path).read_text())
     raw = raw.get("findings", raw) if isinstance(raw, dict) else raw
-    return [_finding(f, i, path) for i, f in enumerate(raw, offset + 1)]
-
-
-def load_per_target(path: str | None, offset: int) -> dict[str, list[dict]]:
-    """--per-target-findings {target task id: [findings]}: each target's verdict gets only its own list (D-13)."""
-    if not path:
-        return {}
-    raw = json.loads(Path(path).read_text())
-    if not isinstance(raw, dict) or not all(isinstance(v, list) for v in raw.values()):
-        raise SwarmError(ErrorCode.E_INPUT, f"{path}: expected an object {{target task id: [findings]}}")
-    out: dict[str, list[dict]] = {}
-    for target, items in raw.items():
-        out[target] = [_finding(f, i, path) for i, f in enumerate(items, offset + 1)]
-        offset += len(items)
-    return out
+    return [agent_finding(f, i, path) for i, f in enumerate(raw, offset + 1)]
 
 
 def run(args, ctx) -> dict:

@@ -322,7 +322,7 @@ def test_release_rerun_waits_for_other_gate_reruns(tmp_path, swarm_dir, rel_deps
 
 
 def _headless(base: Path, monkeypatch, verdicts: dict):
-    """The headless runner's gate path for P-rev: review_findings_file → run_gate_script → apply_result(headless) →
+    """The headless runner's gate path for P-rev: gate_findings_file → run_gate_script → apply_result(headless) →
     reconcile. Returns (store, apply_result outcome)."""
     monkeypatch.setenv("SWARM_SIGNING_KEY", KEY)
     for k in ("SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY", "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_TASK_ID",
@@ -339,7 +339,7 @@ def _headless(base: Path, monkeypatch, verdicts: dict):
         return None
 
     task = ts.get("P-rev")
-    sr.run_gate_script(task, work, swarm, dry_run=False, per_target_findings=sr.review_findings_file(task, text, swarm, emit))
+    sr.run_gate_script(task, work, swarm, dry_run=False, per_target_findings=sr.gate_findings_file(task, text, swarm, emit))
     result = validate_result(parse_result(text), task_id="P-rev")
     outcome = apply_result(ts, task, agent_id="A09", result=result, meta={}, emit=emit, mode="headless")
     reconcile(ts, corr, emit)
@@ -371,3 +371,41 @@ def test_headless_failing_verdict_with_only_minor_findings_reworks_target(tmp_pa
     assert ts.get("P-rev")["state"] != "FAILED"
     be = ts.get("P-be")
     assert (be["state"], be["rework_loops"]) == ("IN_PROGRESS", 1)
+
+
+def test_headless_quality_agent_failure_reaches_its_target_only(tmp_path, monkeypatch):
+    """A quality agent's failing target reaches qa_gate through --per-target-findings: that target's recorded
+    quality verdict fails although the script's own checks pass (low risk, empty repo), the other target passes."""
+    monkeypatch.setenv("SWARM_SIGNING_KEY", KEY)
+    for k in ("SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY", "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_TASK_ID",
+              "SWARM_CORRELATION_ID", "SWARM_DRYRUN_FAIL"):
+        monkeypatch.delenv(k, raising=False)
+    sr = _load_swarm_run(tmp_path, monkeypatch)
+    plan = [{"id": "be", "capability": "code.backend", "agent": "A05"},
+            {"id": "fe", "capability": "code.frontend", "agent": "A06"},
+            {"id": "qa", "capability": "gate.quality", "agent": "A08", "depends_on": ["be", "fe"],
+             "gates": {"gate": "quality", "for": ["be", "fe"]}}]
+    ts, swarm, work, _ = _setup(tmp_path, plan, targets=("P-be", "P-fe"), leased=("P-qa",))
+    (swarm / "results").mkdir(exist_ok=True)
+    text = "done\n```json\n" + json.dumps({"task_id": "P-qa", "state": "IN_REVIEW", "gate": "quality",
+                                             "verdicts": {"P-be": _REQUEST_CHANGES, "P-fe": _PASS}}) + "\n```"
+    task = ts.get("P-qa")
+    findings = sr.gate_findings_file(task, text, swarm, lambda t, p: None)
+    sr.run_gate_script(task, work, swarm, dry_run=False, per_target_findings=findings,
+                       risk_class=sr.gate_risk_class(ts, task))
+    assert ts.latest_verdicts("P-be")["quality"]["verdict"] == "fail"
+    assert ts.latest_verdicts("P-fe")["quality"]["verdict"] == "pass"
+
+
+def test_gate_risk_class_is_highest_of_gate_and_targets(tmp_path, monkeypatch):
+    """The runner runs qa_gate at the highest risk class of the gate task and its targets (high-risk tiers)."""
+    sr = _load_swarm_run(tmp_path, monkeypatch)
+    rows = {"T-be": {"risk_class": "high"}, "T-fe": {"risk_class": "low"}}
+
+    class Store:
+        def get(self, tid):
+            return rows.get(tid)
+
+    gate = {"risk_class": "low", "notes_json": {"gate": "quality", "gate_for": ["T-fe", "T-be", "T-gone"]}}
+    assert sr.gate_risk_class(Store(), gate) == "high"
+    assert sr.gate_risk_class(Store(), {**gate, "notes_json": {"gate": "quality", "gate_for": ["T-fe"]}}) == "low"

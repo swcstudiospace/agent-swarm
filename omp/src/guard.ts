@@ -124,11 +124,13 @@ const HASHLINE_HEADER = /^\[([^\]\n#]+?)(?:#[0-9A-Fa-f]{4})?\]\s*$/gm;
 /** A hashline `MV DEST` file op and the apply_patch file directives. */
 const HASHLINE_MOVE = /^\s*MV\s+(\S.*?)\s*$/gm;
 const APPLY_PATCH_FILE = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$/gm;
+/** omp's `xd://ast_edit` device, any case, optional query or subpath (like RAW_CODE_DEVICE). */
+const AST_EDIT_DEVICE = /^xd:\/\/ast_edit(?:[/?#]|$)/i;
 
 /**
  * Every file a write/edit call names, over omp's parameter shapes: `path`/`file_path` (write, edit replace/patch),
  * the hashline / apply_patch / sloppy `{input}` text (section headers, `MV`, `*** Update File:` …), and the
- * `xd://ast_edit` device (a write whose content is JSON with `paths`).
+ * `xd://ast_edit` device (a write whose `path` or `file_path` is the device and whose content is JSON with `paths`).
  */
 export function editTargets(input: unknown): string[] {
   if (typeof input !== "object" || input === null) return [];
@@ -142,7 +144,8 @@ export function editTargets(input: unknown): string[] {
   if (typeof text === "string") {
     for (const re of [HASHLINE_HEADER, HASHLINE_MOVE, APPLY_PATCH_FILE]) for (const m of text.matchAll(re)) add(m[1]);
   }
-  if (typeof path === "string" && /^xd:\/\/ast_edit(?:[/?#]|$)/.test(path.trim()) && typeof content === "string") {
+  const astEdit = [path, file_path].some((p) => typeof p === "string" && AST_EDIT_DEVICE.test(p.trim()));
+  if (astEdit && typeof content === "string") {
     let args: unknown;
     try {
       args = JSON.parse(content);
@@ -208,12 +211,16 @@ function kubectlProdChange({ words }: Segment): boolean {
   return (targets.length > 0 ? targets : positional).some(isProdMarker);
 }
 
-/** One shell segment after normalize(): its text and whitespace words (quotes stripped, argv[0] basename). */
+/**
+ * One shell segment after normalize(): its text and whitespace words (quotes stripped, argv[0] basename), and the
+ * directory its relative paths resolve in (matchRule's directory tracking; undefined when it cannot be known).
+ */
 export interface Segment {
   text: string;
   words: string[];
   /** The first word as written (path kept): `./scripts/orch_plan.py` where words[0] is `orch_plan.py`. */
   argv0: string;
+  cwd: string | undefined;
 }
 type Matcher = (seg: Segment, facts: GuardFacts, command: string) => boolean;
 
@@ -244,9 +251,10 @@ const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|nice(?:\s+(
  * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …`, `sudo`/`doas` with their flags,
  * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces) and the WRAPPER set. Every wrapper word
  * may be spelled as a path (`/usr/bin/env`, `/usr/bin/sudo`, `…/timeout`), like argv[0]'s basename (T-05-24).
+ * The directory an `env -C`/`sudo -D` prefix names is kept (prefixChdirs) for matchRule's directory tracking.
  */
 const PREFIX = new RegExp(
-  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?:-[uCS]\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|[A-Za-z_]\w*=${VALUE}\s+)`,
+  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?:-[A-Za-z]*[uCS]\s+\S+|--(?:unset|chdir|split-string)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|[A-Za-z_]\w*=${VALUE}\s+)`,
   "y",
 );
 /** `sh -c`, `bash -ec`, `/bin/zsh -x -c` …: the next word is a command line of its own. */
@@ -367,13 +375,23 @@ function splitTopLevel(text: string, quotesOn = true): string[] {
   return out;
 }
 
+/** A normalized segment and the directories its stripped `env -C`/`sudo -D` prefixes run it in, as written. */
+interface Normalized {
+  text: string;
+  chdirs: string[];
+}
+
 /**
  * D-03 normalization: the inner text of every `$(…)` / backtick substitution becomes its own command, the rest is
  * split on `;`, `&&`, `||`, `|` (outside quotes), and each segment loses leading `env X=…`, `X=…`, `sudo`, `command`
  * and wrapper words. A literal `sh -c "…"` / `eval "…"` argument is normalized in turn and its segments appended
  * (the outer segment stays too); `bash -c "$VAR"` is opaque by design (the documented residual).
  */
-export function normalize(command: string, depth = 0): string[] {
+export function normalize(command: string): string[] {
+  return normalizeSegments(command, 0).map((s) => s.text);
+}
+
+function normalizeSegments(command: string, depth: number): Normalized[] {
   const parts: string[] = [];
   // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
   let rest = command.replace(/\\\r?\n/g, " ");
@@ -383,31 +401,48 @@ export function normalize(command: string, depth = 0): string[] {
     rest = `${rest.slice(0, m.index)} ${rest.slice(m.index + m[0].length)}`;
   }
   parts.push(rest);
-  const segments: string[] = [];
+  const segments: Normalized[] = [];
   for (const part of parts) {
     for (let seg of splitTopLevel(part)) {
       seg = seg.trim();
       // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
       let at = 0;
       for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
+      const chdirs = at === 0 ? [] : prefixChdirs(seg.slice(0, at));
       seg = seg.slice(at);
       if (seg === "") continue;
-      segments.push(seg);
+      segments.push({ text: seg, chdirs });
       if (depth < MAX_LITERAL_DEPTH) {
         // `sh -c "<literal>"`, or the quoted line left behind by a stripped `eval`
         const literal = quotedLiteral(seg, SHELL_C.exec(seg)?.[0].length ?? 0);
-        if (literal !== undefined) segments.push(...normalize(literal, depth + 1));
+        if (literal !== undefined) segments.push(...normalizeSegments(literal, depth + 1));
       }
     }
   }
   return segments;
 }
 
-function parseSegment(text: string): Segment {
+/**
+ * The directories a stripped prefix runs its command in: `env -C DIR` / `-CDIR` / `-iC DIR` / `--chdir[=]DIR` and
+ * `sudo -D DIR` / `--chdir[=]DIR`, in order. sudo's `-C N` (close-from) reads as a directory too: one more
+ * candidate only over-blocks.
+ */
+function prefixChdirs(prefix: string): string[] {
+  const words = prefix.split(/\s+/).filter((w) => w !== "").map((w) => w.replace(/^(['"])(.*)\1$/, "$2"));
+  const dirs: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const attached = /^(?:--chdir=|-[A-Za-z]*[CD](?=.))(.*)$/.exec(words[i]);
+    if (attached !== null) dirs.push(attached[1]);
+    else if (/^(?:--chdir|-[A-Za-z]*[CD])$/.test(words[i]) && words[i + 1] !== undefined) dirs.push(words[++i]);
+  }
+  return dirs;
+}
+
+function parseSegment(text: string, cwd: string | undefined): Segment {
   const words = text.split(/\s+/).filter((w) => w !== "").map((w) => w.replace(/^(['"])(.*)\1$/, "$2"));
   const argv0 = words[0] ?? "";
   if (words.length > 0) words[0] = posix.basename(words[0]);
-  return { text, words, argv0 };
+  return { text, words, argv0, cwd };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -424,19 +459,33 @@ const gitIs = (seg: Segment, sub: string) => git(seg.words).sub === sub;
 const shortFlag = (w: string, letters: RegExp) => /^-[A-Za-z]+$/.test(w) && letters.test(w);
 const operands = (args: string[]) => args.filter((a) => !a.startsWith("-"));
 
+/** A target that `~`/`$HOME` expansion makes absolute. */
+const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/;
+
 /** Expand `~`/`$HOME` and resolve against cwd. */
 export function resolvePath(p: string, facts: Pick<GuardFacts, "cwd" | "home">): string {
-  const expanded = p.replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, facts.home);
+  const expanded = p.replace(HOME_PREFIX, facts.home);
   return posix.resolve(facts.cwd || "/", expanded);
 }
 const within = (path: string, dir: string) => dir !== "" && dir !== "/" && path.startsWith(`${dir}/`);
+/** Where a segment's paths resolve: its tracked directory, else the session cwd (protectedTarget fails closed first). */
+const segmentBase = (seg: Segment, facts: GuardFacts) => ({ cwd: seg.cwd ?? facts.cwd, home: facts.home });
+
+/**
+ * D-08 over a shell target: a `.swarm`/`.omp` path once resolved in the segment's directory, or any relative target
+ * while that directory is unknown (`cd "$DIR"`, `cd -`): fail closed rather than resolve it against the wrong one.
+ */
+function protectedTarget(target: string, seg: Segment, facts: GuardFacts): boolean {
+  if (seg.cwd === undefined && !target.startsWith("/") && !HOME_PREFIX.test(target)) return true;
+  return isProtectedPath(target, segmentBase(seg, facts));
+}
 
 /** A repo-state segment (`.git`, `.swarm`, `.omp`) anywhere in the target path, before any resolution. */
 const repoStateSegment = (target: string) => target.split("/").some((s) => s === ".git" || s === ".swarm" || s === ".omp");
 
-/** An `rm -rf` target that is `/`, `~`, cwd or the tmp dir itself, or outside both subtrees (incl. `..`). */
-function outsideCwd(target: string, facts: GuardFacts): boolean {
-  const path = resolvePath(target, facts);
+/** An `rm -rf` target that is `/`, `~`, the session cwd or the tmp dir itself, or outside both subtrees (incl. `..`). */
+function outsideCwd(target: string, seg: Segment, facts: GuardFacts): boolean {
+  const path = resolvePath(target, segmentBase(seg, facts));
   return !within(path, posix.resolve(facts.cwd || "/")) && !within(path, facts.tmp === "" ? "" : posix.resolve(facts.tmp));
 }
 
@@ -445,7 +494,8 @@ function outsideCwd(target: string, facts: GuardFacts): boolean {
  * `-r` alone of a `.git`, `.swarm` or `.omp` path; and any `rm` of a `.swarm`/`.omp` path (the D-08 state dirs),
  * whatever the flags.
  */
-function rmProtected({ words }: Segment, facts: GuardFacts): boolean {
+function rmProtected(seg: Segment, facts: GuardFacts): boolean {
+  const { words } = seg;
   if (words[0] !== "rm") return false;
   let recursive = false;
   let force = false;
@@ -461,7 +511,13 @@ function rmProtected({ words }: Segment, facts: GuardFacts): boolean {
       force ||= w.includes("f");
     } else targets.push(w);
   }
-  return targets.some((t) => isProtectedPath(t, facts) || (recursive && (repoStateSegment(t) || (force && outsideCwd(t, facts)))));
+  return targets.some((t) => {
+    if (protectedTarget(t, seg, facts)) return true;
+    if (!recursive) return false;
+    // a repo-state dir as written, or on the way from the session cwd once resolved (`cd .git && rm -r objects`)
+    const fromSession = posix.relative(facts.cwd || "/", resolvePath(t, segmentBase(seg, facts)));
+    return repoStateSegment(t) || repoStateSegment(fromSession) || (force && outsideCwd(t, seg, facts));
+  });
 }
 
 /** `git push` of tags, or to main/master or a release tag (refspec destination). */
@@ -534,9 +590,13 @@ function shellMutateTargets({ words }: Segment): string[] {
   return [];
 }
 
-/** `sqlite3` opened on a path under `.swarm/` (the Task Store): a swarm-state write for anyone but A01 (WR-06). */
-const sqliteOnSwarm = ({ words }: Segment, facts: GuardFacts) =>
-  words[0] === "sqlite3" && operands(words.slice(1)).some((t) => resolvePath(t, facts).split("/").includes(".swarm"));
+/**
+ * `sqlite3` opened on a path under `.swarm/` (the Task Store), resolved in the segment's directory: a swarm-state
+ * write for anyone but A01 (WR-06). A relative operand in an unknown directory is the protected-path-mutate row's.
+ */
+const sqliteOnSwarm = (seg: Segment, facts: GuardFacts) =>
+  seg.words[0] === "sqlite3" &&
+  operands(seg.words.slice(1)).some((t) => resolvePath(t, segmentBase(seg, facts)).split("/").includes(".swarm"));
 
 /** Gate script stems (swarm_gate's GATE_SCRIPTS, plus the gate names themselves). */
 const GATE_STEMS: Record<string, true> = {
@@ -619,14 +679,14 @@ export const RULES: readonly Rule[] = [
   {
     id: "protected-path-shell",
     capability: "protected_path",
-    pattern: (seg, facts) => shellWriteTargets(seg).some((t) => isProtectedPath(t, facts)),
+    pattern: (seg, facts) => shellWriteTargets(seg).some((t) => protectedTarget(t, seg, facts)),
     samples: ["echo x > .swarm/a", "tee -a .omp/config.yml", "cp f ~/.omp/x", "mv a .swarm/b", "echo x >>~/.omp/agent/config.yml"],
   },
   // D-08: in-place mutation of .swarm/, .omp/ or ~/.omp through other tools (rm is the destructive row below)
   {
     id: "protected-path-mutate",
     capability: "protected_path",
-    pattern: (seg, facts) => shellMutateTargets(seg).some((t) => isProtectedPath(t, facts)),
+    pattern: (seg, facts) => shellMutateTargets(seg).some((t) => protectedTarget(t, seg, facts)),
     samples: [
       "truncate -s0 .swarm/tasks.db",
       "sed -i 's/a/b/' .omp/config.yml",
@@ -807,9 +867,55 @@ export const RULES: readonly Rule[] = [
   },
 ];
 
-/** The first row (table order) matching any normalized segment of `command`. */
+/** More directories than this in one command make the rest unknown (bounds segments × directories). */
+const MAX_CWDS = 16;
+
+/**
+ * The directory `cd`/`pushd` with these operands (or an `env -C` prefix) moves to from `from`; undefined when it
+ * cannot be known here: `cd -`, `pushd +N`/`-N`, more than one operand, a `$VAR`/glob/brace/quoted/escaped operand,
+ * or a relative operand from an unknown directory or under a non-empty CDPATH. No operand is `~`.
+ */
+function chdirTo(dirs: string[], from: string | undefined, facts: GuardFacts): string | undefined {
+  if (dirs.length > 1) return undefined;
+  const dir = dirs[0] ?? "~";
+  if (dir === "-" || /^[+-]\d+$/.test(dir) || /[$`*?[{\\"']/.test(dir.replace(HOME_PREFIX, ""))) return undefined;
+  const absolute = dir.startsWith("/") || HOME_PREFIX.test(dir);
+  if (!absolute && (from === undefined || (Boolean(facts.env.CDPATH) && !/^\.\.?(?:\/|$)/.test(dir)))) return undefined;
+  return resolvePath(dir, { cwd: from ?? "/", home: facts.home });
+}
+
+/**
+ * The first row (table order) matching any normalized segment of `command`. D-08: every segment is tried in each
+ * directory its relative paths may resolve in — the session cwd plus every `cd`/`pushd` target and `env -C`/`sudo -D`
+ * directory before it, each resolved from the one before. Earlier directories stay candidates, so subshells, `||`
+ * branches, `popd` and the one-command scope of `env -C` need no model (that only over-blocks). A directory that
+ * cannot be resolved adds an unknown one (`cwd` undefined: every relative write target is protected) for all later
+ * segments. `$(…)`/backtick bodies are cut out and listed first, so in a command holding one every directory change
+ * is unknown and every segment is tried in every directory of the command.
+ */
 export function matchRule(command: string, facts: GuardFacts): Rule | undefined {
-  const segments = normalize(command).map(parseSegment);
+  const substituted = /\$\(|`/.test(command);
+  const cwds = new Set<string | undefined>([facts.cwd]);
+  let current: string | undefined = facts.cwd;
+  const moveTo = (dirs: string[]) => {
+    current = substituted ? undefined : chdirTo(dirs, current, facts);
+    cwds.add(cwds.size < MAX_CWDS ? current : undefined);
+  };
+  const parsed: Segment[] = [];
+  const segments: Segment[] = [];
+  for (const { text, chdirs } of normalizeSegments(command, 0)) {
+    for (const dir of chdirs) moveTo([dir]);
+    const seg = parseSegment(text, undefined);
+    parsed.push(seg);
+    if (!substituted) for (const cwd of cwds) segments.push({ ...seg, cwd });
+    const { words } = seg;
+    if (words[0] === "cd" || words[0] === "pushd") {
+      let i = 1;
+      while (/^-[LPe@n]+$/.test(words[i] ?? "")) i++;
+      moveTo(words.slice(words[i] === "--" ? i + 1 : i));
+    }
+  }
+  if (substituted) for (const seg of parsed) for (const cwd of cwds) segments.push({ ...seg, cwd });
   return RULES.find((rule) =>
     segments.some((seg) => (typeof rule.pattern === "function" ? rule.pattern(seg, facts, command) : rule.pattern.test(seg.text))),
   );

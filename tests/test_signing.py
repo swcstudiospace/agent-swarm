@@ -167,3 +167,16 @@ def test_dev_key_event_follows_root(tmp_path):
     events = app / ".swarm" / "events.jsonl"
     assert events.exists() and '"security.dev_key"' in events.read_text()
     assert not (other / ".swarm").exists()
+
+
+def test_empty_signing_key_signs_and_verifies_as_unset(swarm_dir, monkeypatch):
+    """An exported but empty SWARM_SIGNING_KEY is the dev key for signing and verifying alike, so a verdict signed
+    under it still verifies (it was signed with b"" and verified with the dev key before)."""
+    from swarm.gates import make_verdict
+    from swarm.envelope import verify_envelope
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "")
+    env = make_verdict(gate="review", task_id="K-9", agent_id="A09", correlation_id="c")
+    assert verify_envelope(env)
+    monkeypatch.delenv("SWARM_SIGNING_KEY")
+    assert verify_envelope(env)

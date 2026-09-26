@@ -12,11 +12,41 @@ import os
 from typing import Callable
 
 from .errors import SwarmError, ErrorCode
-from .gates import make_verdict
+from .gates import SEVERITIES, make_finding, make_verdict
 
 GATE_SCRIPTS = {"quality": "qa_gate", "review": "rev_gate", "security": "sec_gate", "release": "rel_plan"}
 SIM_FINDING = {"id": "SIM-1", "severity": "major", "kind": "functional", "summary": "simulated gate failure",
                "evidence": "", "ac_ref": None, "owner_suggestion": None, "location": None}
+
+
+def agent_finding(f, i: int, path: str, *, prefix: str = "RF", owner: str = "A05") -> dict:
+    """One agent-reported finding from a findings file, validated: an object with a severity in SEVERITIES
+    (default minor); a missing id becomes <prefix>-<i>."""
+    if not isinstance(f, dict):
+        raise SwarmError(ErrorCode.E_INPUT, f"finding {i} in {path} is not an object")
+    sev = f.get("severity", "minor")
+    if sev not in SEVERITIES:
+        raise SwarmError(ErrorCode.E_INPUT, f"bad severity {sev!r} in {path}")
+    return make_finding(f.get("id") or f"{prefix}-{i:03d}", sev, f.get("kind", "semantic"), f.get("summary", ""),
+                        evidence=f.get("evidence", ""), ac_ref=f.get("ac_ref"),
+                        owner_suggestion=f.get("owner_suggestion", owner), location=f.get("location"))
+
+
+def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner: str = "A05") -> dict[str, list[dict]]:
+    """--per-target-findings {target task id: [findings]} (D-13): the agent's findings for each gate target; a gate
+    gives each listed target a verdict derived from the script's own findings plus only that target's list."""
+    import json
+    from pathlib import Path
+    if not path:
+        return {}
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict) or not all(isinstance(v, list) for v in raw.values()):
+        raise SwarmError(ErrorCode.E_INPUT, f"{path}: expected an object {{target task id: [findings]}}")
+    out: dict[str, list[dict]] = {}
+    for target, items in raw.items():
+        out[target] = [agent_finding(f, i, path, prefix=prefix, owner=owner) for i, f in enumerate(items, offset + 1)]
+        offset += len(items)
+    return out
 
 
 def simulated_failures() -> set[str]:

@@ -133,7 +133,7 @@ def _omp_gate_preamble(agent_id: str) -> str:
         f"`{script}` against this session's workspace and signs the verdict. Never run `<runtime root>/scripts/{script}.py` or "
         f"`<runtime root>/scripts/ts/{script}.ts` through bash (the guard blocks it), even where the body below says to run the script."
     )
-    if gate == "review":
+    if gate in ("review", "quality", "security"):
         line += (
             " Pass every failing target in `per_target_findings` with at least one finding of severity `major` or "
             "higher; an empty list passes a target."

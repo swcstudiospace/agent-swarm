@@ -781,6 +781,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["edit", "apply_patch Move to", { input: `*** Begin Patch\n*** Update File: src/a.ts\n*** Move to: ${CWD}/.omp/a.ts\n@@\n-a\n+b\n*** End Patch\n` }],
     ["edit", "apply_patch Delete File", { input: "*** Begin Patch\n*** Delete File: ~/.omp/x\n*** End Patch\n" }],
     ["write", "xd://ast_edit paths", { path: "xd://ast_edit", content: JSON.stringify({ ops: [{ pat: "a", out: "b" }], paths: ["src/x.ts", ".omp/config.yml"] }) }],
+    ["write", "xd://ast_edit paths via file_path", { file_path: "xd://ast_edit", content: JSON.stringify({ ops: [], paths: [".swarm/tasks.db"] }) }],
+    ["write", "XD://AST_EDIT?x=1 paths (any case, query)", { path: "XD://AST_EDIT?x=1", content: JSON.stringify({ ops: [], paths: ["~/.omp/x"] }) }],
+    ["write", "xd://Ast_Edit/sub paths", { path: " xd://Ast_Edit/sub", content: JSON.stringify({ ops: [], paths: [".omp/config.yml"] }) }],
   ];
   test.each(INPUT_SHAPED)("D-08: %s %s blocks inside, passes in main", (tool, _shape, input) => {
     expect(guardToolCall(call(tool, input), facts(B05))).toEqual({
@@ -861,6 +864,47 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(bash(`sqlite3 ${CWD}/.swarm/tasks.db .dump`), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
     expect(guardToolCall(write, facts(A01))).toEqual({ block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-mutate)" });
     expect(guardToolCall(write, facts(undefined))).toBeUndefined();
+  });
+
+  /** A `cd`/`pushd`/`env -C` earlier in the command moves where later relative targets resolve (Greptile P1). */
+  test.each([
+    ["cd .swarm && touch tasks.db", "protected_path: protected-path-mutate"],
+    ["cd .omp; echo x > config.yml", "protected_path: protected-path-shell"],
+    ["cd sub && cd ../.swarm && rm tasks.db", "destructive: rm-rf-protected"],
+    ["cd .swarm/results && sed -i s/a/b/ x", "protected_path: protected-path-mutate"],
+    [`pushd ${CWD}/.omp && tee config.yml`, "protected_path: protected-path-shell"],
+    ["cd ~/.omp/agent && echo x >> config.yml", "protected_path: protected-path-shell"],
+    ["cd -P -- .swarm && truncate -s0 tasks.db", "protected_path: protected-path-mutate"],
+    ["(cd .swarm; touch tasks.db)", "protected_path: protected-path-mutate"],
+    ['bash -c "cd .swarm && touch tasks.db"', "protected_path: protected-path-mutate"],
+    ["cd .swarm && bash -c 'echo x > tasks.db'", "protected_path: protected-path-shell"],
+    ["cd .git && rm -r objects", "destructive: rm-rf-protected"],
+    ["cd .. && rm -rf nonexistent-guard-cwd", "destructive: rm-rf-protected"],
+    // env -C / sudo -D run the command (and its sh -c payload) in that directory
+    [`env -C ${CWD}/.swarm sh -c 'echo x > tasks.db'`, "protected_path: protected-path-shell"],
+    ["env --chdir=.omp touch config.yml", "protected_path: protected-path-mutate"],
+    ["env -iC .swarm touch tasks.db", "protected_path: protected-path-mutate"],
+    ["sudo -D .swarm touch tasks.db", "protected_path: protected-path-mutate"],
+    // a directory that cannot be resolved fails closed for every later relative write target
+    ['cd "$DIR" && touch x', "protected_path: protected-path-mutate"],
+    ["cd - && echo x > y", "protected_path: protected-path-shell"],
+    ["cd $(dirname .swarm/x) && touch tasks.db", "protected_path: protected-path-mutate"],
+    ['cd .swarm && echo "$(touch tasks.db)"', "protected_path: protected-path-mutate"],
+  ])("D-08 cd: %s blocks inside naming %s, passes in main", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([
+    "cd src && touch a.ts", "cd .swarm && cat tasks.db", "cd .swarm && ls; cd .. && git status", "cd /tmp && echo x > out.txt",
+    'cd "$DIR" && echo x > /tmp/out.txt', "env -C build make", "cd build && make -j$(nproc)", "pushd src && sed -i s/a/b/ x.ts && popd",
+  ])("D-08 cd: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
+  test("D-08 cd: sqlite3 opened after cd .swarm is swarm-state for a05", () => {
+    expect(guardToolCall(bash("cd .swarm && sqlite3 tasks.db \"UPDATE tasks SET state='DONE'\""), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
+    expect(guardToolCall(bash(`env -C ${CWD}/.swarm sqlite3 tasks.db .dump`), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
   });
 
   test("through the handler: eval, protected write and orch shell block for a05; main untouched", () => {

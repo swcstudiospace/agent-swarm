@@ -150,7 +150,8 @@ def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = Tr
         sig = key.sign(_canonical(env))
         env["sig"] = "ed25519:" + base64.b64encode(sig).decode()
     else:
-        secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
+        # an empty SWARM_SIGNING_KEY counts as unset, exactly as verify_envelope treats it
+        secret = (os.environ.get("SWARM_SIGNING_KEY") or "dev-insecure-key").encode()
         if audit and not os.environ.get("SWARM_SIGNING_KEY"):
             _warn_dev_key(env, root)
         mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()

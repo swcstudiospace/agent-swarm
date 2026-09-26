@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import issue_gate  # noqa: E402
+from swarm.verdicts import issue_gate, load_per_target  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".vue", ".svelte"}
@@ -189,8 +189,12 @@ def run(args, ctx) -> dict:
         hits = [f for f in findings if f["kind"] == kind and f["severity"] in blocking]
         runs[kind] = "fail" if hits else ("pass" if counts[kind] or kind != "iac" else "skipped:no-iac")
     digest = "sha256:" + hashlib.sha256(json.dumps(sorted(f["id"] for f in findings + suppressed)).encode()).hexdigest()
+    # D-13: the agent's per-target findings join the scan's findings on their target only (never allow-listed)
+    own = load_per_target(args.per_target_findings, len(findings), prefix="SF", owner="A10")
+    per_target = {t: findings + items for t, items in own.items()} if args.per_target_findings else None
+    findings = findings + [f for items in own.values() for f in items]
     env, recorded = issue_gate(ctx, gate="security", agent_id="A10@local", findings=findings, runs=runs,
-                               extra={"scan_digest": digest, "suppressed": suppressed})
+                               per_target=per_target, extra={"scan_digest": digest, "suppressed": suppressed})
     verdict = env["payload"]["verdict"]
     return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "runs": runs,
             "suppressed": suppressed, "scan_digest": digest, "envelope": env,
@@ -201,6 +205,9 @@ def add_args(p):
     p.add_argument("--allow-list", help="JSON file: [{id, justification, expires?}] of finding ids to suppress")
     p.add_argument("--strict", action="store_true", help="fail-closed: missing dependency-audit tools become major findings")
     p.add_argument("--timeout", type=int, default=600, help="per-audit-tool timeout in seconds")
+    p.add_argument("--per-target-findings",
+                   help="JSON object {target task id: [findings]}: the agent's findings; each gate target's verdict "
+                        "gets the scan's findings plus only its own (targets it omits get every finding)")
 
 
 if __name__ == "__main__":

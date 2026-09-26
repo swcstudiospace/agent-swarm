@@ -59,16 +59,14 @@ test("gate schema no verdict at any depth, every object closed", () => {
   ]);
 });
 
-test("gate non-review findings refuse E-INPUT before the bridge", async () => {
+test("gate release findings refuse E-INPUT before the bridge", async () => {
   const sdir = tmpDir("swarm-omp-dir-");
   process.env.SWARM_DIR = sdir;
   const { calls, gate } = gateWith();
-  for (const g of ["quality", "security", "release"]) {
-    const params = { gate: g, task_id: "F-qa", correlation_id: "c1", per_target_findings: { "F-be": [] } };
-    const err = await callTool(gate, params, agentCtx(gitRepo(), GATE_AGENTS[g as keyof typeof GATE_AGENTS])).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(SwarmToolError);
-    expect((err as SwarmToolError).code).toBe("E-INPUT");
-  }
+  const params = { gate: "release", task_id: "F-rel", correlation_id: "c1", per_target_findings: { "F-be": [] } };
+  const err = await callTool(gate, params, agentCtx(gitRepo(), GATE_AGENTS.release)).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(SwarmToolError);
+  expect((err as SwarmToolError).code).toBe("E-INPUT");
   expect(calls).toHaveLength(0);
   expect(existsSync(join(sdir, "results"))).toBe(false);
 });
@@ -84,6 +82,15 @@ test("gate argv: whitelisted flags, GATE_SCRIPTS mapping, bridge-owned findings 
   expect(calls[0].script).toBe("rev_gate");
   expect(calls[0].args).toEqual([`--root=${repo}`, "--task-id=F-rev", "--correlation-id=c1", `--per-target-findings=${file}`]);
   expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(findings);
+
+  // quality and security take per-target findings too, so an agent-reported failure reaches the recorded verdict
+  for (const [g, script] of [["quality", "qa_gate"], ["security", "sec_gate"]]) {
+    const id = `toolu_${g}`;
+    await gate.execute(id, { gate: g, task_id: "F-x", correlation_id: "c1", per_target_findings: findings }, undefined, undefined, agentCtx(repo, GATE_AGENTS[g as keyof typeof GATE_AGENTS]));
+    const call = calls[calls.length - 1];
+    expect(call.script).toBe(script);
+    expect(call.args).toEqual([`--root=${repo}`, "--task-id=F-x", "--correlation-id=c1", `--per-target-findings=${join(sdir, "results", `findings-${id}.json`)}`]);
+  }
 
   for (const [g, script] of [["quality", "qa_gate"], ["security", "sec_gate"], ["release", "rel_plan"]]) {
     await callTool(gate, { gate: g, task_id: "F-x", correlation_id: "c1", dry_run: true }, agentCtx(repo, GATE_AGENTS[g as keyof typeof GATE_AGENTS]));

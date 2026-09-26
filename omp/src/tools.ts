@@ -255,8 +255,9 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     description:
       "Run your gate script for a leased (IN_PROGRESS) gate task: quality → qa_gate, review → rev_gate, " +
       "security → sec_gate, release → rel_plan. The script derives the verdict from findings, signs it and records " +
-      "one verdict row per target of the gate task; you never state a verdict. Review only: per_target_findings maps " +
-      "each target task id to its findings (targets you omit get every finding). To fail a target, include at least " +
+      "one verdict row per target of the gate task; you never state a verdict. Review, quality and security: " +
+      "per_target_findings maps each target task id to your findings for it (targets you omit get every finding); " +
+      "the script's own findings are added to every target. To fail a target, include at least " +
       "one finding of severity major or higher (major, critical or blocker); minor and info findings pass. " +
       "A failing verdict is returned as text starting `FAIL:`, not as an error. Call this before swarm_ingest of " +
       "the gate task's result.",
@@ -270,8 +271,8 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
           type: "object",
           additionalProperties: { type: "array", items: FINDING },
           description:
-            "review gate only: {target task id: [finding]}. To fail a target include at least one finding of " +
-            "severity major, critical or blocker; an empty list passes it.",
+            "review, quality and security gates: {target task id: [finding]}. To fail a target include at least " +
+            "one finding of severity major, critical or blocker; an empty list adds nothing to it.",
         },
         dry_run: { type: "boolean", description: "Canned dry-run verdict (per_target_findings is ignored)" },
       },
@@ -290,8 +291,8 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
             `not ${agent === undefined ? "an unidentified session" : JSON.stringify(agent)}`,
         );
       }
-      if (params.per_target_findings !== undefined && params.gate !== "review") {
-        throw new SwarmToolError("E-INPUT", `per_target_findings is only accepted by the review gate, not ${params.gate}`);
+      if (params.per_target_findings !== undefined && params.gate === "release") {
+        throw new SwarmToolError("E-INPUT", "per_target_findings is not accepted by the release gate");
       }
       // argv from whitelisted fields only: extra model keys (e.g. a forged verdict) never reach python (T-03-06)
       const args = [rootArg(ctx), `--task-id=${params.task_id}`, `--correlation-id=${params.correlation_id}`];
