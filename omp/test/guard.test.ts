@@ -1199,6 +1199,44 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
 
+  /** eval, watch, parallel and `sudo -s|-i` join all their arguments into one command line; `env -S` splits its string and appends the rest. */
+  const FORCE = "destructive: git-force-push";
+  test.each([
+    ['eval "git push" --force', FORCE],
+    ['eval git push "--force"', FORCE],
+    ["eval 'git' 'push' '-f'", FORCE],
+    ["eval -- git push -f", FORCE],
+    ["eval $'git push \\x2df'", FORCE],
+    ['env -S "git push" --force', FORCE],
+    ["env -S'git push' -f", FORCE],
+    ['watch -n 1 "git push" --force', FORCE],
+    ['sudo -i "git push" -f', FORCE],
+    ["nice -n 5 eval 'git push' -f", FORCE],
+    ['eval "echo x" "> .swarm/y"', SHELL],
+    ["alias a=ls b='rm -rf .swarm'", RM],
+    ["trap -- 'touch .swarm/x' EXIT", MUTATE],
+    ["su -c'touch .swarm/x' root", MUTATE],
+    ["su --command='touch .swarm/x' root", MUTATE],
+    ["su - root -c 'touch .swarm/x'", MUTATE],
+    ["flock /tmp/l -c'touch .swarm/x'", MUTATE],
+    ["script -q -c 'touch .swarm/x' /dev/null", MUTATE],
+    // a command that really reassigns HOME makes `~` unknowable
+    ["HOME=.swarm; echo x > ~/tasks.db", SHELL],
+    ["export HOME=/x; echo > ~/y", SHELL],
+    ["read -r HOME; echo > ~/y", SHELL],
+    ["eval 'HOME=/x'; touch ~/y", MUTATE],
+  ])("joined lines: %s blocks inside naming %s", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([
+    "bash -c 'echo ok' 'git push -f'", 'eval "echo ok"', "watch -n 5 ls", "alias ll='ls -la'", "trap 'rm -f /tmp/lock' EXIT",
+    "echo HOME > ~/results.txt", "grep HOME .env > /tmp/x", "echo $HOME > ~/y",
+  ])("joined lines: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
   test("bash tool cwd and env: the command starts in `cwd`; HOME, CDPATH, GLOBIGNORE and BASHOPTS reach the shell", () => {
     const run = (input: Record<string, unknown>) => guardToolCall(call("bash", input), facts(B05));
     expect(run({ command: "touch tasks.db", cwd: ".swarm" })).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${MUTATE})` });

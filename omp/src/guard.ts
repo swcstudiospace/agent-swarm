@@ -333,8 +333,8 @@ const PREFIX = new RegExp(
 );
 /** `sh -c`, `bash -ec`, `/bin/zsh -x -o pipefail -c`, `fish -c` …: the next word is a command line of its own. */
 const SHELL_C = /^(?:\S*\/)?(?:[a-z]*sh|fish)(?:\s+(?:[-+][oO]\s+\S+|--(?:rcfile|init-file)\s+\S+|[-+]\S+))*\s+-[A-Za-z]*c(?:\s+--)?\s+/;
-/** Other words that hand the next word to a shell, now or later: `su|runuser|script … -c LINE`, `flock FILE -c LINE`, `alias NAME=LINE`, `trap LINE`. */
-const LINE_ARG = /^(?:(?:\S*\/)?(?:su|runuser|script)(?:\s+\S+)*?\s+(?:-c|--command)\s+|(?:-c|--command)\s+|alias\s+[^\s=]+=|trap\s+(?:--\s+)?)/;
+/** A word that runs the rest of its line through the shell again, all its arguments joined (`eval`, `watch`, `parallel`, `sudo -s|-i`). */
+const JOINS_ARGS = /^\s*(?:(?:\S*\/)?(?:eval|watch|parallel)\b|(?:\S*\/)?sudo\b.*\s(?:-[A-Za-z]*[si]|--shell|--login)(?:\s|$))/;
 /** `env -S LINE` / `--split-string=LINE` once the `env` word was stripped: the rest of the line is the command. */
 const SPLIT_STRING = /^(?:-[A-Za-z]*S\s*|--split-string(?:=|\s+))/;
 /** Nesting cap for `sh -c "sh -c '…'"` recursion. */
@@ -435,22 +435,47 @@ const simplifyWords = (text: string): string =>
     return closed && plain !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(plain) ? plain : token;
   });
 
+/** The value of a `-c LINE` / `-cLINE` / `--command[=]LINE` option among `words` (unquoted). */
+function dashC(words: string[]): string | undefined {
+  for (let i = 0; i < words.length; i++) {
+    const w = unquote(words[i]);
+    if (w === "-c" || w === "--command") return words[i + 1] === undefined ? undefined : unquote(words[i + 1]);
+    const m = /^(?:-c|--command=)(.+)$/.exec(w);
+    if (m !== null) return m[1];
+  }
+  return undefined;
+}
+
 /**
- * The command line a segment hands to a child shell or runs later: the word after `sh -c` (and kin) or LINE_ARG, the
- * rest of an `env -S` line, or the quoted line left behind by a stripped `eval`/`watch`.
+ * The command lines a segment hands to a shell, now or later: the word after `sh -c` (and kin; the words after it are
+ * `$0`, `$1` …), the `-c` value of `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE` value, the
+ * `trap` action, and an `env -S` line (its string split, the remaining words appended). eval/watch/parallel/`sudo -s`,
+ * which join all their arguments, are normalizeSegments' (JOINS_ARGS).
  */
-function commandLine(seg: string): string | undefined {
-  const at = SHELL_C.exec(seg)?.[0].length ?? LINE_ARG.exec(seg)?.[0].length;
-  if (at !== undefined) {
-    const word = shellWords(seg.slice(at))[0];
-    return word === undefined ? undefined : unquote(word);
+function commandLines(seg: string): string[] {
+  const shell = SHELL_C.exec(seg);
+  if (shell !== null) {
+    const word = shellWords(seg.slice(shell[0].length))[0];
+    return word === undefined ? [] : [unquote(word)];
   }
   const split = SPLIT_STRING.exec(seg);
   if (split !== null) {
     const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
-    return [unquote(first), ...rest].join(" ");
+    return [[unquote(first), ...rest].join(" ")];
   }
-  return seg[0] === '"' || seg[0] === "'" ? unquote(shellWords(seg)[0] ?? "") : undefined;
+  const words = shellWords(seg);
+  const first = unquote(words[0] ?? "");
+  const cmd = posix.basename(first);
+  if (first.startsWith("-c") || first.startsWith("--command") || /^(?:su|runuser|script)$/.test(cmd)) {
+    const line = dashC(first.startsWith("-") ? words : words.slice(1));
+    return line === undefined ? [] : [line];
+  }
+  if (cmd === "alias") return words.slice(1).map(unquote).filter((w) => /^[^=\s-][^=\s]*=/.test(w)).map((w) => w.slice(w.indexOf("=") + 1));
+  if (cmd === "trap") {
+    const action = words.slice(1).find((w) => w !== "--");
+    return action === undefined || /^-[lp]$/.test(action) ? [] : [unquote(action)];
+  }
+  return [];
 }
 
 /** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
@@ -682,7 +707,13 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
     // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
     let at = 0;
-    for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
+    let joinFrom = -1;
+    for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex) {
+      if (joinFrom === -1 && JOINS_ARGS.test(seg.slice(at, PREFIX.lastIndex))) joinFrom = PREFIX.lastIndex;
+    }
+    // eval (and kin) joins every argument after it, each unquoted (a leading `--` aside), and runs the result as a new command line
+    const joinedWords = joinFrom === -1 ? [] : shellWords(seg.slice(joinFrom)).map(unquote);
+    const joined = joinFrom === -1 ? undefined : (joinedWords[0] === "--" ? joinedWords.slice(1) : joinedWords).join(" ");
     const prefix = seg.slice(0, at);
     const info = at === 0 ? undefined : prefixInfo(prefix);
     seg = seg.slice(at);
@@ -690,8 +721,7 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
-      const line = commandLine(seg);
-      if (line !== undefined) payload.push(...normalizeSegments(line, depth + 1, cuts));
+      for (const line of [...commandLines(seg), ...(joined === undefined ? [] : [joined])]) payload.push(...normalizeSegments(line, depth + 1, cuts));
       if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth, cuts));
     }
     const runtime = info?.runtime;
@@ -1819,6 +1849,26 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
 }
 
 /**
+ * `command` may give `name` a new value: an assignment word (`NAME=…`, `NAME+=…`, also after `export`/`declare`/`local`/
+ * `readonly`/`env` or inside a quoted `eval` line), `unset NAME`, `read … NAME`, `for|select NAME`, `printf -v NAME`,
+ * `getopts … NAME`, or a nameref (`declare -n ref=NAME`). A bare mention (`echo HOME`, `grep HOME .env`) is none.
+ */
+function assignsVariable(command: string, name: string): boolean {
+  const start = String.raw`(?:^|[\s;&|(){}!"'\`])`;
+  return new RegExp(
+    [
+      `${start}${name}\\+?=`,
+      `${start}unset\\s+(?:-[fvn]+\\s+)*(?:[A-Za-z_]\\w*\\s+)*${name}\\b`,
+      `${start}read\\b[^;&|\\n]*\\s${name}\\b`,
+      `${start}(?:for|select)\\s+${name}\\b`,
+      `${start}printf\\s+-v\\s*${name}\\b`,
+      `${start}getopts\\s+\\S+\\s+${name}\\b`,
+      `${start}(?:declare|typeset|local)\\s+-\\w*n[^;&|\\n]*\\b${name}\\b`,
+    ].join("|"),
+  ).test(command);
+}
+
+/**
  * The first row (table order) matching any normalized segment of `command`, each segment tried in every directory it
  * may run in from `start` (the session cwd, or the bash tool's `cwd`; undefined: unknown) (D-08, walk). An unknown
  * directory (`cwd` undefined) makes every relative write target protected. A `$(…)`/backtick body runs as a
@@ -1826,12 +1876,11 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
  */
 export function matchRule(command: string, facts: GuardFacts, start: string | undefined): Rule | undefined {
   // a command that assigns HOME, TMPDIR or CDPATH itself changes what `~`, `$TMPDIR` and a relative `cd` mean
-  const assigns = (name: string) => new RegExp(`\\b${name}\\b`).test(command.replace(new RegExp(`\\$\\{?${name}\\b\\}?`, "g"), ""));
   const shellFacts: GuardFacts = {
     ...facts,
-    home: assigns("HOME") ? CUT : facts.home,
-    tmp: assigns("TMPDIR") ? "" : facts.tmp,
-    env: assigns("CDPATH") ? { ...facts.env, CDPATH: CUT } : facts.env,
+    home: assignsVariable(command, "HOME") ? CUT : facts.home,
+    tmp: assignsVariable(command, "TMPDIR") ? "" : facts.tmp,
+    env: assignsVariable(command, "CDPATH") ? { ...facts.env, CDPATH: CUT } : facts.env,
   };
   const segments: Segment[] = [];
   walk(normalizeSegments(command, 0, []), [{ dir: start, stack: [] }], shellFacts, segments);
