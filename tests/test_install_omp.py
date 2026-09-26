@@ -1,49 +1,14 @@
 """Workspace install of the omp package (PKG-01..03): link merge, carry-over, shadow scan, copy mode, dry run."""
-import importlib.util
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("_install_omp", ROOT / "scripts" / "_install_omp.py")
-inst = importlib.util.module_from_spec(_spec)
-sys.modules["_install_omp"] = inst  # dataclasses resolve their module through sys.modules
-_spec.loader.exec_module(inst)
-PKG = str(inst.PKG)
-_ENV_KEYS = ("OMP_PROFILE", "PI_CODING_AGENT_DIR", "SWARM_AGENTS_FILE")
-
-
-@pytest.fixture()
-def home(tmp_path, monkeypatch):
-    h = tmp_path / "home"
-    h.mkdir()
-    monkeypatch.setenv("HOME", str(h))
-    for key in _ENV_KEYS:
-        monkeypatch.delenv(key, raising=False)
-    return h
-
-
-@pytest.fixture()
-def ws(tmp_path):
-    w = tmp_path / "ws"
-    w.mkdir()
-    return w.resolve()
-
-
-def _cfg(ws):
-    return ws / ".omp" / "config.yml"
-
-
-def _write(path, text):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    return path
+from install_helpers import _ENV_KEYS, PKG, ROOT, _cfg, _snapshot, _write, _yaml, inst
 
 
 def _run(ws, mode="link", dry_run=False):
@@ -136,6 +101,33 @@ def test_link_dry_run_writes_nothing(ws, home):
     assert f"+  - {PKG}" in out.splitlines()
 
 
+@pytest.mark.parametrize("key", ['"extensions"', "'extensions'", "\ufeffextensions"], ids=["double-quoted", "single-quoted", "bom"])
+def test_link_recognises_quoted_or_bom_prefixed_key(ws, home, yaml_mode, key):
+    text = f"{key}:\n  - /opt/a\ntheme: dark\n"
+    _write(_cfg(ws), text)
+    assert _run(ws)[0] == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == f"{key}:\n  - /opt/a\n  - {PKG}\ntheme: dark\n"
+
+
+def test_link_refuses_a_key_it_cannot_edit(ws, home, yaml_mode):
+    text = "{extensions: [/opt/a], theme: dark}\n"
+    _write(_cfg(ws), text)
+    rc, out = _run(ws)
+    assert rc == 2
+    assert _cfg(ws).read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize("entry", ["@/opt/x", "@scope/pkg", "yes", "On", "1.5", "0x1F", "2001-12-14", "NULL"])
+def test_carry_over_keeps_entries_yaml_would_misread_as_strings(ws, home, yaml_mode, entry):
+    _write(home / ".omp" / "agent" / "config.yml", f"extensions:\n  - {json.dumps(entry)}\n")
+    assert _run(ws)[0] == 0
+    text = _cfg(ws).read_text(encoding="utf-8")
+    if _yaml is not None:
+        assert _yaml.safe_load(text) == {"extensions": [entry, PKG]}
+    else:
+        assert text == f"extensions:\n  - {json.dumps(entry)}\n  - {PKG}\n"
+
+
 # ---------------------------------------------------------------- carry-over (project array replaces the user array)
 
 
@@ -163,36 +155,101 @@ def test_no_carry_over_when_workspace_has_key(ws, home):
     assert _warnings(out) == []
 
 
+def test_carry_over_user_yaml_without_key_suppresses_legacy_settings(ws, home):
+    _write(home / ".omp" / "agent" / "config.yml", "theme: dark\n")
+    _write(home / ".omp" / "agent" / "settings.json", json.dumps({"extensions": ["/opt/legacy"]}))
+    rc, out = _run(ws)
+    assert rc == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == f"extensions:\n  - {PKG}\n"
+    assert _warnings(out) == []
+
+
+def test_carry_over_reads_user_config_yaml(ws, home):
+    _write(home / ".omp" / "agent" / "config.yaml", "extensions:\n  - /opt/fromyaml\n")
+    assert _run(ws)[0] == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == f"extensions:\n  - /opt/fromyaml\n  - {PKG}\n"
+
+
+def test_carry_over_reads_pi_coding_agent_dir(ws, home, tmp_path, monkeypatch):
+    agent_dir = tmp_path / "agentdir"
+    _write(agent_dir / "config.yml", "extensions:\n  - /opt/fromagentdir\n")
+    _write(home / ".omp" / "agent" / "config.yml", "extensions:\n  - /opt/base\n")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    assert _run(ws)[0] == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == f"extensions:\n  - /opt/fromagentdir\n  - {PKG}\n"
+
+
+@pytest.mark.parametrize("var", ["OMP_PROFILE", "PI_PROFILE"])
+def test_carry_over_reads_the_profile_config(ws, home, monkeypatch, var):
+    _write(home / ".omp" / "profiles" / "work" / "agent" / "config.yml", "extensions:\n  - /opt/fromprofile\n")
+    _write(home / ".omp" / "agent" / "config.yml", "extensions:\n  - /opt/base\n")
+    monkeypatch.setenv(var, "work")
+    assert _run(ws)[0] == 0
+    assert _cfg(ws).read_text(encoding="utf-8") == f"extensions:\n  - /opt/fromprofile\n  - {PKG}\n"
+
+
 # ---------------------------------------------------------------- shadow scan
 
 
 def test_project_agent_matches_on_frontmatter_name(ws, home):
-    other = _write(ws / ".omp" / "agents" / "zz-other.md", "---\nname: a01-orchestrator\n---\nbody\n")
-    _write(ws / ".omp" / "agents" / "a03-architect.md", "---\nname: my-architect\n---\n")
+    other = _write(ws / ".omp" / "agents" / "zz-other.md", "---\nname: a01-orchestrator\ndescription: mine\n---\nbody\n")
+    _write(ws / ".omp" / "agents" / "a03-architect.md", "---\nname: my-architect\ndescription: mine\n---\n")
     assert _shadows(ws, home) == {("agent", "a01-orchestrator", "project", other)}
 
 
 def test_user_agent_warns(ws, home):
-    user = _write(home / ".omp" / "agent" / "agents" / "a02-requirements.md", "---\nname: a02-requirements\n---\n")
+    user = _write(home / ".omp" / "agent" / "agents" / "a02-requirements.md", "---\nname: a02-requirements\ndescription: mine\n---\n")
     assert _shadows(ws, home) == {("agent", "a02-requirements", "user", user)}
 
 
 def test_project_and_user_skills_warn(ws, home):
-    project = _write(ws / ".omp" / "skills" / "a03-architect" / "SKILL.md", "no frontmatter: the dir name counts\n")
-    user = _write(home / ".omp" / "agent" / "skills" / "ux" / "SKILL.md", "---\nname: a04-ux-designer\n---\n")
+    project = _write(ws / ".omp" / "skills" / "a03-architect" / "SKILL.md", "---\ndescription: the dir name counts\n---\n")
+    user = _write(home / ".omp" / "agent" / "skills" / "ux" / "SKILL.md", "---\nname: a04-ux-designer\ndescription: mine\n---\n")
     assert _shadows(ws, home) == {("skill", "a03-architect", "project", project), ("skill", "a04-ux-designer", "user", user)}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "---\nname: a02-requirements\n---\n",
+        "---\ndescription: the stem does not count\n---\n",
+        "no frontmatter\n",
+        "---\nname: a02-requirements\ndescription: 1\n---\n",
+    ],
+    ids=["no-description", "no-name", "no-frontmatter", "non-string-description"],
+)
+def test_agent_omp_does_not_load_never_warns(ws, home, text):
+    _write(ws / ".omp" / "agents" / "a02-requirements.md", text)
+    _write(home / ".omp" / "agent" / "agents" / "a02-requirements.md", text)
+    assert _shadows(ws, home) == set()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "no frontmatter\n",
+        "---\nname: a03-architect\n---\n",
+        '---\nname: a03-architect\ndescription: ""\n---\n',
+        "---\nname: a03-architect\ndescription: mine\nenabled: false\n---\n",
+    ],
+    ids=["no-frontmatter", "no-description", "empty-description", "disabled"],
+)
+def test_skill_omp_does_not_load_never_warns(ws, home, text):
+    _write(ws / ".omp" / "skills" / "a03-architect" / "SKILL.md", text)
+    _write(home / ".omp" / "agent" / "skills" / "a03-architect" / "SKILL.md", text)
+    assert _shadows(ws, home) == set()
 
 
 def test_custom_skill_directory_warns(ws, home):
     _write(_cfg(ws), "skills:\n  customDirectories:\n    - custom\n")
-    skill = _write(ws / "custom" / "a06-frontend" / "SKILL.md", "---\nname: a06-frontend\n---\n")
+    skill = _write(ws / "custom" / "a06-frontend" / "SKILL.md", "---\nname: a06-frontend\ndescription: mine\n---\n")
     assert _shadows(ws, home) == {("skill", "a06-frontend", "project", skill)}
 
 
 @pytest.mark.parametrize("first", [True, False], ids=["before-package", "after-package"])
 def test_extension_entry_warns_only_before_package(ws, home, tmp_path, first):
     ext = tmp_path / "ext"
-    agent = _write(ext / "agents" / "x.md", "---\nname: a04-ux-designer\n---\n")
+    agent = _write(ext / "agents" / "x.md", "---\nname: a04-ux-designer\ndescription: mine\n---\n")
     entries = [str(ext), PKG] if first else [PKG, str(ext)]
     _write(_cfg(ws), "extensions:\n" + "".join(f"  - {e}\n" for e in entries))
     rc, out = _run(ws)
@@ -204,9 +261,9 @@ def test_extension_entry_warns_only_before_package(ws, home, tmp_path, first):
 
 
 def test_lower_priority_providers_do_not_warn(ws, home):
-    _write(ws / ".claude" / "skills" / "a05-backend" / "SKILL.md", "---\nname: a05-backend\n---\n")
-    _write(ws / ".agents" / "skills" / "a06-frontend" / "SKILL.md", "---\nname: a06-frontend\n---\n")
-    _write(ws / ".claude" / "agents" / "a05-backend.md", "---\nname: a05-backend\n---\n")
+    _write(ws / ".claude" / "skills" / "a05-backend" / "SKILL.md", "---\nname: a05-backend\ndescription: mine\n---\n")
+    _write(ws / ".agents" / "skills" / "a06-frontend" / "SKILL.md", "---\nname: a06-frontend\ndescription: mine\n---\n")
+    _write(ws / ".claude" / "agents" / "a05-backend.md", "---\nname: a05-backend\ndescription: mine\n---\n")
     assert _shadows(ws, home) == set()
     assert _warnings(_run(ws)[1]) == []
 
@@ -263,24 +320,50 @@ def test_link_after_copy_reports_every_leftover(ws, home):
     assert len(warned) == len(_package_files())
 
 
+# ---------------------------------------------------------------- never through a symlink, never outside a workspace (CR-01, WR-01)
+
+
+@pytest.mark.parametrize("link", ["file", "parent"])
+def test_copy_mode_refuses_a_symlinked_destination(ws, home, tmp_path, link):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    if link == "file":
+        (ws / ".omp" / "agents").mkdir(parents=True)
+        (ws / ".omp" / "agents" / "a05-backend.md").symlink_to(victim)
+    else:
+        (ws / ".omp").symlink_to(outside)
+    before = _snapshot(outside, ws)
+    rc, _ = _run(ws, "copy")
+    assert rc == 2
+    assert _snapshot(outside, ws) == before
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_link_refuses_a_symlinked_config(ws, home, tmp_path):
+    target = _write(tmp_path / "outside" / "config.yml", "theme: dark\n")
+    (ws / ".omp").mkdir()
+    _cfg(ws).symlink_to(target)
+    rc, _ = _run(ws)
+    assert rc == 2
+    assert target.read_text(encoding="utf-8") == "theme: dark\n"
+    assert _cfg(ws).is_symlink()
+
+
+@pytest.mark.parametrize("where", ["home", "omp-dir", "checkout"])
+def test_install_omp_refuses_home_omp_dir_and_checkout(home, tmp_path, monkeypatch, where):
+    fake = tmp_path / "checkout"  # stands in for the checkout, so no test ever targets the real one
+    target = {"home": home, "omp-dir": home / ".omp" / "agent", "checkout": fake / "omp"}[where]
+    target.mkdir(parents=True, exist_ok=True)
+    if where == "checkout":
+        monkeypatch.setattr(inst, "ROOT", fake.resolve())
+    before = _snapshot(tmp_path)
+    for mode in ("link", "copy"):
+        assert _run(target, mode)[0] == 2
+    assert _snapshot(tmp_path) == before
+    assert inst.preflight(target, "link") is not None
+
+
 # ---------------------------------------------------------------- the one command (build_agents.py --install-workspace)
-
-_TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", "omp", "skills", "hooks")
-
-
-@pytest.fixture()
-def tree(tmp_path):
-    """A copy of the checkout the installer runs from; build_agents.py resolves ROOT from its own path."""
-    t = tmp_path / "checkout"
-    ignore = shutil.ignore_patterns("__pycache__", "node_modules")
-    for name in _TREE:
-        src = ROOT / name
-        if src.is_dir():
-            shutil.copytree(src, t / name, ignore=ignore, symlinks=True)
-        else:
-            t.mkdir(exist_ok=True)
-            shutil.copy2(src, t / name)
-    return t.resolve()
 
 
 def _cli(tree, ws, home, *args):
@@ -288,15 +371,6 @@ def _cli(tree, ws, home, *args):
     env["HOME"] = str(home)
     cmd = [sys.executable, str(tree / "scripts" / "build_agents.py"), "--install-workspace", str(ws), *args]
     return subprocess.run(cmd, cwd=tree, capture_output=True, text=True, env=env)
-
-
-def _snapshot(*dirs):
-    return {
-        p: p.read_bytes()
-        for d in dirs
-        for p in sorted(Path(d).rglob("*"))
-        if p.is_file() and "__pycache__" not in p.parts
-    }
 
 
 def test_install_workspace_has_no_repo_side_effect(tree, ws, home):
@@ -321,3 +395,24 @@ def test_install_workspace_dry_run_writes_nothing(tree, ws, home, mode):
     assert r.returncode == 0, r.stdout + r.stderr
     assert _snapshot(tree, ws, home) == before
     assert list(ws.iterdir()) == []
+
+
+@pytest.mark.parametrize("link", ["claude-skill-dir", "claude-settings", "grok-dir"])
+def test_install_workspace_refuses_symlinked_claude_and_grok_destinations(tree, ws, home, tmp_path, link):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.json", "{}\n")
+    if link == "claude-skill-dir":  # the review's probe: the copy would rewrite the checkout's own skill
+        dest = ws / ".claude" / "skills" / "agent-swarm" / "orchestrate"
+        dest.parent.mkdir(parents=True)
+        dest.symlink_to(tree / "skills" / "orchestrate")
+    elif link == "claude-settings":
+        (ws / ".claude").mkdir()
+        (ws / ".claude" / "settings.json").symlink_to(victim)
+    else:
+        (ws / ".grok").symlink_to(outside)
+    before = _snapshot(tree, outside, ws)
+    r = _cli(tree, ws, home)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert _snapshot(tree, outside, ws) == before
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.json"]
+    assert not (ws / ".omp").exists()

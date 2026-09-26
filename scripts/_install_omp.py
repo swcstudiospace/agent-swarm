@@ -38,6 +38,10 @@ class InstallError(Exception):
     """Unsupported workspace state: exit 2, nothing written."""
 
 
+class UnsafeDestination(InstallError):
+    """A destination the installer would reach through a symlink: exit 2, nothing written (CR-01)."""
+
+
 @dataclass(frozen=True)
 class Shadow:
     """A same-name agent or skill that omp resolves ahead of the package."""
@@ -98,9 +102,18 @@ def _flow(rest: str) -> list[str] | None:
     return None if any(i is None for i in items) else items  # type: ignore[return-value]
 
 
+_BOM = "\ufeff"
+
+
+def _key_re(key: str) -> str:
+    """A YAML mapping key, plain or quoted (`extensions`, `"extensions"`, `'extensions'`)."""
+    k = re.escape(key)
+    return rf"(?:{k}|\"{k}\"|'{k}')"
+
+
 def _read_list(text: str, *keys: str) -> list[str] | None:
     """Lenient reader for a (nested) YAML string list, block or flow style; None when absent or unreadable."""
-    lines = text.splitlines()
+    lines = text.removeprefix(_BOM).splitlines()
     start, depth = 0, -1
     for n, key in enumerate(keys):
         found = None
@@ -111,7 +124,7 @@ def _read_list(text: str, *keys: str) -> list[str] | None:
             w = _indent(raw)
             if w <= depth:
                 break
-            m = re.match(rf"^\s*{re.escape(key)}\s*:(.*)$", raw)
+            m = re.match(rf"^\s*{_key_re(key)}\s*:(.*)$", raw)
             if m and (n > 0 or w == 0):
                 found = (i, w, m.group(1))
                 break
@@ -150,14 +163,19 @@ class _Block:
     prefix: str  # item indentation
 
 
-_KEY = re.compile(r"^extensions\s*:(.*)$")
+_KEY = re.compile(rf"^{_key_re('extensions')}\s*:(.*)$")
+_ANY_KEY = re.compile(r"^(?!\s)\W*extensions\W*\s*:")  # a top-level spelling of the key the strict reader cannot edit
 
 
 def _parse_extensions(text: str) -> _Block | None:
-    """Strict reader for the workspace's top-level `extensions:` block list; None when the key is absent."""
+    """Strict reader for the workspace's top-level `extensions:` block list; None when the key is absent.
+
+    `text` carries no BOM (the caller strips it)."""
     lines = text.splitlines(keepends=True)
     keys = [i for i, line in enumerate(lines) if _KEY.match(line.rstrip("\r\n"))]
     if not keys:
+        if any(_ANY_KEY.match(line) for line in lines if not _skip(line)):
+            raise InstallError("an `extensions` key this installer cannot edit (flow mapping, complex or escaped key)")
         return None
     if len(keys) > 1:
         raise InstallError("more than one top-level `extensions` key")
@@ -192,8 +210,19 @@ def _parse_extensions(text: str) -> _Block | None:
     return _Block(items, last + 1, prefix)
 
 
+_PLAIN = re.compile(r"[\w/][\w./+@~-]*")
+# Plain scalars that decode to something other than a string: YAML 1.2 core (Bun.YAML, what omp reads) ...
+_YAML12_NONSTR = re.compile(
+    r"~|null|Null|NULL|true|True|TRUE|false|False|FALSE|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+    r"|0x[\da-fA-F]+|0o[0-7]+|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)"
+)
+# ... and YAML 1.1 (PyYAML, which validates the result).
+_YAML11_NONSTR = re.compile(r"(?i)y|n|yes|no|on|off|true|false|null|[-+]?[\d_]*\.?[\d_]+(?:e[-+]?\d+)?|0b[01_]+|0x[\da-f_]+|\d{4}-\d\d?-\d\d?(?:[t ].*)?")
+
+
 def _yaml_item(value: str) -> str:
-    plain = re.fullmatch(r"[\w./+@-][\w./+@~-]*", value) and value not in ("null", "true", "false")
+    """`value` as a YAML string scalar: plain when both YAML 1.1 and 1.2 read it back as that string, else quoted."""
+    plain = _PLAIN.fullmatch(value) and not (_YAML12_NONSTR.fullmatch(value) or _YAML11_NONSTR.fullmatch(value))
     return value if plain else json.dumps(value)
 
 
@@ -228,20 +257,116 @@ def _resolve_entry(entry: str, base: Path, home: Path) -> Path:
     return Path(os.path.realpath(p if p.is_absolute() else base / p))
 
 
-def _frontmatter_name(path: Path) -> str | None:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+def _frontmatter(path: Path) -> dict[str, tuple[str, list[str]]] | None:
+    """Top-level frontmatter keys → (inline value, indented continuation lines); None without closed frontmatter."""
+    text = _read(path)
+    if text is None:
         return None
-    if not lines or lines[0].strip() != "---":
+    lines = text.removeprefix(_BOM).splitlines()
+    if not lines or lines[0].rstrip() != "---":
         return None
+    out: dict[str, tuple[str, list[str]]] = {}
+    key: str | None = None
     for line in lines[1:]:
-        if line.strip() == "---":
-            break
-        m = re.match(r"^name\s*:(.*)$", line)
+        if line.rstrip() == "---":
+            return out
+        if _skip(line):
+            continue
+        m = re.match(r"""^("[^"]*"|'[^']*'|[A-Za-z_][\w.-]*)[ \t]*:(?:[ \t]+(.*))?$""", line)
         if m:
-            return _scalar(m.group(1))
+            key = k = m.group(1).strip("\"'")
+            out[k] = (m.group(2) or "", [])
+        elif key is not None and _indent(line) > 0:
+            out[key][1].append(line.strip())
+        else:
+            key = None
     return None
+
+
+def _fm_string(value: tuple[str, list[str]] | None) -> str | None:
+    """The string a frontmatter value decodes to (YAML 1.2, as omp parses it); None for null, bool, number or a collection."""
+    if value is None:
+        return None
+    raw, more = value[0].strip(), value[1]
+    if raw[:1] in ("|", ">"):
+        return "\n".join(more)
+    if not raw:
+        if not more or more[0].startswith("-") or re.match(r"""^("[^"]*"|'[^']*'|[^\s'"][^:]*):(\s|$)""", more[0]):
+            return None
+        raw = " ".join(more)
+    elif more and not raw.startswith(("'", '"')):
+        raw = " ".join([raw, *more])
+    v = _scalar(raw)
+    if v is None or (not raw.startswith(("'", '"')) and _YAML12_NONSTR.fullmatch(v)):
+        return None
+    return v
+
+
+def _fm_truthy(value: tuple[str, list[str]] | None) -> bool:
+    """JavaScript truthiness of a frontmatter value (omp's `!frontmatter.description`)."""
+    if value is None:
+        return False
+    s = _fm_string(value)
+    if s is not None:
+        return s != ""
+    raw = _strip_comment(value[0]).strip()
+    if not raw:
+        return bool(value[1])  # a nested collection is truthy, a bare key is null
+    if raw in ("~", "null", "Null", "NULL", "false", "False", "FALSE"):
+        return False
+    try:
+        return float(int(raw, 0) if re.fullmatch(r"0[xo][\da-fA-F]+", raw) else raw) != 0
+    except ValueError:
+        return True
+
+
+def _agent_name(path: Path) -> str | None:
+    """The name omp registers an agent file under: `name` and `description` strings required, no stem fallback."""
+    fm = _frontmatter(path) or {}
+    name, description = _fm_string(fm.get("name")), _fm_string(fm.get("description"))
+    return name if name and description else None
+
+
+def _skill_name(path: Path) -> str | None:
+    """The name omp registers a SKILL.md under: needs a truthy `description`, skipped on `enabled: false`;
+    the trimmed frontmatter `name` string, else the directory name."""
+    fm = _frontmatter(path) or {}
+    enabled = fm.get("enabled")
+    if enabled is not None and _strip_comment(enabled[0]).strip() in ("false", "False", "FALSE") or not _fm_truthy(fm.get("description")):
+        return None
+    name = _fm_string(fm.get("name"))
+    return (name.strip() if name is not None else "") or path.parent.name
+
+
+def _profile(env: Mapping[str, str]) -> str | None:
+    """The active omp profile: `OMP_PROFILE` when set (even empty), else `PI_PROFILE`; "default" means none."""
+    raw = env["OMP_PROFILE"] if "OMP_PROFILE" in env else env.get("PI_PROFILE")
+    name = (raw or "").strip()
+    return name if name and name != "default" else None
+
+
+def user_dir(home: Path, env: Mapping[str, str]) -> Path:
+    """omp's `getAgentDir()`: the profile's agent dir, else `PI_CODING_AGENT_DIR`, else `~/.omp/agent`.
+    A named profile ignores `PI_CODING_AGENT_DIR` (pi-utils `DirResolver`)."""
+    profile = _profile(env)
+    if profile:
+        return home / ".omp" / "profiles" / profile / "agent"
+    if env.get("PI_CODING_AGENT_DIR"):
+        return Path(os.path.abspath(env["PI_CODING_AGENT_DIR"]))
+    return home / ".omp" / "agent"
+
+
+def _user_agents_dir(home: Path, env: Mapping[str, str]) -> Path:
+    """omp's one user agents dir (`getConfigDirs("agents", {project: false})[0]`): profile-aware, never
+    `PI_CODING_AGENT_DIR`."""
+    profile = _profile(env)
+    return (home / ".omp" / "profiles" / profile / "agent" if profile else home / ".omp" / "agent") / "agents"
+
+
+def _user_yaml(home: Path, env: Mapping[str, str]) -> Path | None:
+    """The user config omp reads: the first readable of `config.yml`, `config.yaml` in the agent dir."""
+    d = user_dir(home, env)
+    return next((d / n for n in ("config.yml", "config.yaml") if _read(d / n) is not None), None)
 
 
 def package_names(pkg: Path = PKG) -> tuple[set[str], set[str]]:
@@ -261,11 +386,10 @@ def _nearest(start: Path, rel: str) -> Path | None:
 
 
 def _skill_ancestors(ws: Path, home: Path) -> list[Path]:
-    """`ws` and its ancestors up to its git toplevel, else `$HOME` (closest first)."""
+    """omp's `getAncestorDirs(cwd, repoRoot ?? home)`: `ws` up to its git toplevel, else `$HOME`, inclusive; to `/`
+    when that stop dir is not an ancestor (closest first)."""
     top = next((d for d in (ws, *ws.parents) if (d / ".git").exists()), None)
     stop = top or home
-    if not ws.is_relative_to(stop):
-        return [ws]
     out = [ws]
     while out[-1] != stop and out[-1].parent != out[-1]:
         out.append(out[-1].parent)
@@ -289,8 +413,8 @@ def shadow_scan(
 ) -> list[Shadow]:
     """Same-name agents and skills that omp resolves ahead of the package (D-05). Reads only.
 
-    `before` holds the extension roots ordered before the package. Agents match on frontmatter `name:` (else the
-    file stem); skills on frontmatter `name:`, else the directory name."""
+    `before` holds the extension roots ordered before the package. Agents and skills are named as omp's loaders
+    name them (`_agent_name`, `_skill_name`); files those loaders drop never warn."""
     env = os.environ if env is None else env
     ws, home = Path(ws), Path(home)
     if agent_names is None or skill_names is None:
@@ -305,34 +429,28 @@ def shadow_scan(
             return
         pattern, names = ("*.md", agent_names) if kind == "agent" else ("*/SKILL.md", skill_names)
         for f in sorted(d.glob(pattern)):
-            if not f.is_file() or f in seen:
+            if not f.is_file() or f in seen or (kind == "skill" and f.parent.name.startswith(".")):
                 continue
-            fallback = f.stem if kind == "agent" else f.parent.name
-            name = _frontmatter_name(f) or fallback
+            name = _agent_name(f) if kind == "agent" else _skill_name(f)
             if name in names:
                 seen.add(f)
                 found.append(Shadow(kind, name, f, level, custom))
 
-    profile = env.get("OMP_PROFILE")
-    profile_dir = home / ".omp" / "profiles" / profile / "agent" if profile else None
-    # agents: nearest project dir, user dir (+ profile), earlier extension roots
+    # agents: nearest project dir (walks to /), the one user dir, earlier extension roots
     project_agents = _nearest(ws, ".omp/agents")
     if project_agents:
         scan(project_agents, "agent", "project")
-    scan(home / ".omp" / "agent" / "agents", "agent", "user")
-    if profile_dir:
-        scan(profile_dir / "agents", "agent", "user")
+    scan(_user_agents_dir(home, env), "agent", "user")
     for root in before:
         scan(Path(root) / "agents", "agent", "extension")
     # skills: ws and ancestors, the agent dir, earlier extension roots, skills.customDirectories
     for d in _skill_ancestors(ws, home):
         scan(d / ".omp" / "skills", "skill", "project")
-    agent_dir = Path(env["PI_CODING_AGENT_DIR"]) if env.get("PI_CODING_AGENT_DIR") else profile_dir or home / ".omp" / "agent"
-    scan(agent_dir / "skills", "skill", "user")
+    scan(user_dir(home, env) / "skills", "skill", "user")
     for root in before:
         scan(Path(root) / "skills", "skill", "extension")
-    for level, cfg, base in (("project", ws / ".omp" / "config.yml", ws), ("user", home / ".omp" / "agent" / "config.yml", home)):
-        text = _read(cfg)
+    for level, cfg, base in (("project", ws / ".omp" / "config.yml", ws), ("user", _user_yaml(home, env), home)):
+        text = _read(cfg) if cfg else None
         for entry in (_read_list(text, "skills", "customDirectories") or []) if text else []:
             scan(_resolve_entry(entry, base, home), "skill", level, custom=True)
     return found
@@ -353,29 +471,79 @@ class _Plan:
     shadows: list[Shadow] = field(default_factory=list)
 
 
-def _inherited(ws: Path, home: Path) -> tuple[list[str], Path | None]:
-    """The list omp uses in `ws` while its config.yml has no `extensions` key (project JSON, user YAML, user JSON)."""
-    for path in (ws / ".omp" / "settings.json", home / ".omp" / "agent" / "config.yml", home / ".omp" / "agent" / "settings.json"):
-        text = _read(path)
-        if text is None:
-            continue
-        if path.suffix == ".json":
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                raise InstallError(f"{path} is not valid JSON; cannot tell which extensions it enables") from None
-            if not isinstance(data, dict) or "extensions" not in data:
-                continue
-            value = data["extensions"]
-            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-                raise InstallError(f"{path} `extensions` is not a list of strings")
-            return list(value), path
+def _json_extensions(path: Path) -> list[str] | None:
+    """The `extensions` list of a legacy settings.json; None when the file or the key is absent."""
+    text = _read(path)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise InstallError(f"{path} is not valid JSON; cannot tell which extensions it enables") from None
+    if not isinstance(data, dict) or "extensions" not in data:
+        return None
+    value = data["extensions"]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise InstallError(f"{path} `extensions` is not a list of strings")
+    return list(value)
+
+
+def _inherited(ws: Path, home: Path, env: Mapping[str, str]) -> tuple[list[str], Path | None]:
+    """The list omp uses in `ws` while its config.yml has no `extensions` key, in omp's `readConfiguredExtensions`
+    order: project settings.json, the user YAML (present without the key: nothing), then user settings.json."""
+    project = ws / ".omp" / "settings.json"
+    value = _json_extensions(project)
+    if value is not None:
+        return value, project
+    user_yaml = _user_yaml(home, env)
+    if user_yaml:
+        text = _read(user_yaml) or ""
         value = _read_list(text, "extensions")
         if value is not None:
-            return value, path
-        if re.search(r"(?m)^extensions\s*:", text):
-            raise InstallError(f"{path} has an `extensions` value this installer cannot read")
-    return [], None
+            return value, user_yaml
+        if any(_ANY_KEY.match(line) for line in text.removeprefix(_BOM).splitlines() if not _skip(line)):
+            raise InstallError(f"{user_yaml} has an `extensions` value this installer cannot read")
+        return [], user_yaml  # a present user YAML suppresses the legacy settings.json
+    legacy = user_dir(home, env) / "settings.json"
+    value = _json_extensions(legacy)
+    return (value, legacy) if value is not None else ([], None)
+
+
+def workspace_problem(ws: Path, home: Path) -> str | None:
+    """Why `ws` must not be installed into (WR-01), or None: this checkout or inside it, `$HOME`, inside `~/.omp`."""
+    ws, home = Path(ws).resolve(), Path(home).resolve()
+    where = (
+        "is inside the agent-swarm checkout, which wires itself (.omp/config.yml)" if ws.is_relative_to(ROOT)
+        else "is $HOME" if ws == home
+        else "is inside ~/.omp" if ws.is_relative_to(home / ".omp")
+        else None
+    )
+    if where is None:
+        return None
+    return f"error: workspace {ws} {where}; install into a workspace outside the agent-swarm checkout, $HOME and ~/.omp"
+
+
+def unsafe_destinations(ws: Path, dests: list[Path]) -> list[str]:
+    """Reasons the installer must not write `dests` (CR-01): a symlink at a destination or at any path component
+    between `ws` and it, or a destination outside `ws`. Reads only; `ws` must be resolved."""
+    reasons: list[str] = []
+    for dest in dests:
+        p = Path(dest)
+        while p != ws:
+            if p.is_symlink():
+                reasons.append(f"{p} is a symlink")
+                break
+            if p.parent == p:
+                reasons.append(f"{dest} is outside {ws}")
+                break
+            p = p.parent
+    return list(dict.fromkeys(reasons))
+
+
+def _check_destinations(ws: Path, dests: list[Path]) -> None:
+    reasons = unsafe_destinations(ws, dests)
+    if reasons:
+        raise UnsafeDestination("; ".join(reasons))
 
 
 def _check_package(pkg: Path) -> None:
@@ -391,14 +559,16 @@ def _plan(ws: Path, mode: str, home: Path, env: Mapping[str, str]) -> _Plan:
     _check_package(PKG)
     cfg = ws / ".omp" / "config.yml"
     plan = _Plan(config=cfg)
-    if cfg.exists():
-        plan.old = _read(cfg)
-        if plan.old is None:
-            raise InstallError(f"{cfg} is unreadable")
     agents, skills = package_names()
     if mode == "copy":
         plan.copies = [(PKG / "agents" / f"{s}.md", ws / ".omp" / "agents" / f"{s}.md") for s in sorted(agents)]
         plan.copies += [(PKG / "skills" / s / "SKILL.md", ws / ".omp" / "skills" / s / "SKILL.md") for s in sorted(skills)]
+    _check_destinations(ws, [d for _, d in plan.copies] if mode == "copy" else [cfg])
+    if cfg.exists():
+        plan.old = _read(cfg)
+        if plan.old is None:
+            raise InstallError(f"{cfg} is unreadable")
+    if mode == "copy":
         entries = _read_list(plan.old, "extensions") if plan.old else None
         plan.linked = next((e for e in entries or [] if _resolve_entry(e, ws, home) == PKG), None)
         dests = {d for _, d in plan.copies}
@@ -408,8 +578,10 @@ def _plan(ws: Path, mode: str, home: Path, env: Mapping[str, str]) -> _Plan:
             if s.custom or (s.path.is_relative_to(own) and s.path not in dests)
         ]
         return plan
-    block = _parse_extensions(plan.old or "")
-    _validate(plan.old or "", block.items if block else None)
+    bom = _BOM if (plan.old or "").startswith(_BOM) else ""
+    body = (plan.old or "")[len(bom):]  # parsed and edited without the BOM, which is kept on write
+    block = _parse_extensions(body)
+    _validate(body, block.items if block else None)
     pkg_item = _yaml_item(str(PKG))
     if block:
         hit = next((i for i, e in enumerate(block.items) if _resolve_entry(e, ws, home) == PKG), None)
@@ -417,29 +589,32 @@ def _plan(ws: Path, mode: str, home: Path, env: Mapping[str, str]) -> _Plan:
             plan.linked = block.items[hit]
             before = block.items[:hit]
         else:
-            lines = (plan.old or "").splitlines(keepends=True)
+            lines = body.splitlines(keepends=True)
             if not lines[block.after - 1].endswith("\n"):
                 lines[block.after - 1] += "\n"
             lines.insert(block.after, f"{block.prefix}- {pkg_item}\n")
-            plan.new = "".join(lines)
+            new = "".join(lines)
             before = block.items
-            _validate(plan.new, block.items + [str(PKG)])
+            _validate(new, block.items + [str(PKG)])
+            plan.new = bom + new
     else:
-        inherited, plan.carried_from = _inherited(ws, home)
+        inherited, plan.carried_from = _inherited(ws, home, env)
         plan.replaced = [e for e in inherited if _resolve_entry(e, ws, home) == PKG]
         plan.carried = [e for e in inherited if e not in plan.replaced]
-        old = plan.old or ""
-        if old and not old.endswith("\n"):
-            old += "\n"
-        plan.new = old + "extensions:\n" + "".join(f"  - {_yaml_item(e)}\n" for e in plan.carried + [str(PKG)])
+        if body and not body.endswith("\n"):
+            body += "\n"
+        new = body + "extensions:\n" + "".join(f"  - {_yaml_item(e)}\n" for e in plan.carried + [str(PKG)])
         before = plan.carried
-        _validate(plan.new, plan.carried + [str(PKG)])
+        _validate(new, plan.carried + [str(PKG)])
+        plan.new = bom + new
     roots = tuple(p for p in (_resolve_entry(e, ws, home) for e in before) if p.is_dir())
     plan.shadows = shadow_scan(ws, home, roots, env, agents, skills)
     return plan
 
 
 def _error(ws: Path, exc: InstallError) -> str:
+    if isinstance(exc, UnsafeDestination):
+        return f"error: refusing to install into {ws}: {exc}; the installer never writes through a symlink. Nothing was written."
     cfg = ws / ".omp" / "config.yml"
     return (
         f"error: cannot install the omp package into {cfg}: {exc}; nothing was written.\n"
@@ -449,10 +624,14 @@ def _error(ws: Path, exc: InstallError) -> str:
 
 def preflight(ws: Path, mode: str, home: Path | None = None, env: Mapping[str, str] | None = None) -> str | None:
     """The error `install_omp` would stop on (exit 2), or None. Reads only."""
+    ws, home = Path(ws).resolve(), Path.home() if home is None else Path(home)
+    problem = workspace_problem(ws, home)
+    if problem:
+        return problem
     try:
-        _plan(Path(ws).resolve(), mode, Path.home() if home is None else Path(home), os.environ if env is None else env)
+        _plan(ws, mode, home, os.environ if env is None else env)
     except InstallError as exc:
-        return _error(Path(ws).resolve(), exc)
+        return _error(ws, exc)
     return None
 
 
@@ -477,6 +656,10 @@ def install_omp(
         return 2
     if not ws.is_dir():
         say(f"error: workspace {ws} is not an existing directory")
+        return 2
+    problem = workspace_problem(ws, home)
+    if problem:
+        say(problem)
         return 2
     try:
         plan = _plan(ws, mode, home, env)

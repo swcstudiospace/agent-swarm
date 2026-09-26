@@ -260,6 +260,11 @@ def write_grok_hooks(path: Path, hook_cmd: str) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
+def _workspace_hooks(workspace: Path) -> tuple[Path, Path]:
+    """(Claude settings, Grok hook file) the workspace install writes."""
+    return workspace / ".claude" / "settings.json", workspace / ".grok" / "hooks" / "agent-swarm.json"
+
+
 def _workspace_copies(workspace: Path) -> list[tuple[Path, Path]]:
     """(source, destination) pairs of the Claude/Grok workspace copy."""
     pairs = []
@@ -283,8 +288,7 @@ def install_workspace(workspace: Path, dry_run: bool = False) -> None:
     the hook script by absolute path; the tracked repo files stay path-free (OPEN-4)."""
     root = ROOT.resolve()
     hook_cmd = f"python3 {root / 'hooks' / 'user_prompt_submit.py'}"
-    settings = workspace / ".claude" / "settings.json"
-    grok_hook = workspace / ".grok" / "hooks" / "agent-swarm.json"
+    settings, grok_hook = _workspace_hooks(workspace)
     pairs = _workspace_copies(workspace)
     if dry_run:
         for src, dest in pairs:
@@ -321,10 +325,16 @@ def main() -> int:
         if not workspace.is_dir():
             print(f"error: workspace {workspace} is not an existing directory", file=sys.stderr)
             return 2
-        if workspace == ROOT.resolve():
-            print("error: the agent-swarm checkout wires itself (.omp/config.yml); install into another workspace", file=sys.stderr)
-            return 2
         problem = _install_omp.preflight(workspace, mode)
+        if not problem:
+            # CR-01: no Claude/Grok write may follow a symlink; refuse before generation or any copy.
+            dests = [d for _, d in _workspace_copies(workspace)] + list(_workspace_hooks(workspace))
+            unsafe = _install_omp.unsafe_destinations(workspace, dests)
+            if unsafe:
+                problem = (
+                    f"error: refusing to install into {workspace}: {'; '.join(unsafe)}; "
+                    "the installer never writes through a symlink. Nothing was written."
+                )
         if problem:
             print(problem, file=sys.stderr)
             return 2
