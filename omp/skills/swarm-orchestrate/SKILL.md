@@ -35,7 +35,12 @@ Never use from a specialist session.
 7. FAILED tasks: nothing in-session retries them (only the headless runner does). For each task FAILED after ingest, read `attempt` from `swarm_status` (`max_attempts` defaults to 3):
    - `attempt` < `max_attempts`: `swarm_transition` FAILED → RETRY, re-lease it RETRY → CLAIMED → IN_PROGRESS, and re-dispatch it to its agent with the error in the payload;
    - otherwise: FAILED → ESCALATED, and report it as an escalation.
-8. Loop: re-dispatch rework tasks (IN_PROGRESS after reconcile, already leased) to their agent with the feedback from notes. Repeat from step 1 until every task is DONE, ESCALATED, CANCELLED or BLOCKED awaiting a human, then yield the swarm.status summary listing every ESCALATED, FAILED and BLOCKED task (with its escalation or need).
+8. Loop: re-dispatch rework tasks (IN_PROGRESS after reconcile, already leased) to their agent with the feedback from notes. Repeat from step 1 until every task is DONE, ESCALATED, CANCELLED or BLOCKED awaiting a human. Then yield one task.result, your output schema (a bare swarm.status object is rejected):
+   - `task_id`: the `correlation_id` of your plan.execute assignment (it carries no task_id of its own);
+   - `state`: IN_REVIEW when every task is DONE. Otherwise BLOCKED when any task is BLOCKED awaiting a human, else FAILED;
+   - `needs` (with BLOCKED): each BLOCKED task and its need;
+   - `error` (with FAILED): `{code, message}`, code the escalation's `reason_code` (e.g. E-CONTRACT), message naming every ESCALATED, FAILED and CANCELLED task;
+   - `summary_md`: the swarm.status summary, i.e. the per-state task counts and every ESCALATED, FAILED and BLOCKED task with its escalation or need.
 
 ## Parent contract
 The session that loaded this skill (the human's top-level) **must never** do domain work. All implementation goes through A01 waves.

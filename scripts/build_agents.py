@@ -146,6 +146,7 @@ OMP_ORCH_PREAMBLE = """<swarm_runtime>
   - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
   - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first.
 """ + _OMP_COMMON + """- Dispatch: spawn specialists via the omp `task` tool with `agent: <slug>` (a02-requirements … a15-docs), batching independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
+- Final yield (omp): your final `yield` is the task.result that swarm-orchestrate step 8 defines (`task_id`, `state`, `summary_md`). The swarm.status block from <output_format> goes into `summary_md`; it is never yielded as-is.
 </swarm_runtime>
 """
 
