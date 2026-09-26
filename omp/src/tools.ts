@@ -257,7 +257,8 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       "security → sec_gate, release → rel_plan. The script derives the verdict from findings, signs it and records " +
       "one verdict row per target of the gate task; you never state a verdict. Review, quality and security: " +
       "per_target_findings maps each target task id to your findings for it; the script's own findings are added to " +
-      "every target (review: a target you omit gets every finding; quality and security: only the script's). " +
+      "every target (review: a target you omit gets every finding; quality and security: only the script's); a key " +
+      "that is not a target of the gate task is refused (E-INPUT). " +
       "To fail a target, include at least " +
       "one finding of severity major or higher (major, critical or blocker); minor and info findings pass. " +
       "A failing verdict is returned as text starting `FAIL:`, not as an error. Call this before swarm_ingest of " +

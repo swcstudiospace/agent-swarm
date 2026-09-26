@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import agent_finding, issue_gate, load_per_target  # noqa: E402
+from swarm.verdicts import agent_finding, check_per_target_keys, issue_gate, load_per_target  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(_test|\.test|\.spec|_spec)\.[a-z]+$|(^|/)test_[^/]+\.py$")
@@ -160,6 +160,7 @@ def run(args, ctx) -> dict:
     mechanical = mechanical_checks(changes, args.max_lines, Path(__file__).resolve(), ctx.root)
     extra = load_extra(args.findings_file, len(mechanical))
     own = load_per_target(args.per_target_findings, len(mechanical) + len(extra))
+    check_per_target_keys(own, ctx.task_id, ctx.root)
     semantic = extra + [f for items in own.values() for f in items]
     findings = mechanical + semantic
     llm = bool(args.findings_file or args.per_target_findings)

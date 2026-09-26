@@ -436,3 +436,21 @@ def test_qa_gate_runs_at_highest_risk_of_gate_and_targets(tmp_path, monkeypatch)
     out = _gate_script(swarm, work, corr, "qa_gate.py", "P-qa")
     assert out["risk_class"] == "high"
     assert out["runs"]["e2e"] == "skipped:infra" and out["runs"]["perf"] == "skipped:infra"
+
+
+@pytest.mark.parametrize("script,gate,gate_id", [("qa_gate.py", "quality", "P-qa"), ("sec_gate.py", "security", "P-sec"),
+                                                 ("rev_gate.py", "review", "P-rev")])
+def test_per_target_findings_for_unknown_target_are_refused(tmp_path, script, gate, gate_id):
+    """A finding under an id that is not a gate_for target (mistyped or stale) would never reach a verdict: the gate
+    script refuses it with E-INPUT (exit 2) and records nothing."""
+    plan = [{"id": "be", "capability": "code.backend", "agent": "A05"},
+            {"id": gate_id[2:], "capability": f"gate.{gate}", "agent": {"quality": "A08", "security": "A10"}.get(gate, "A09"),
+             "depends_on": ["be"], "gates": {"gate": gate, "for": ["be"]}}]
+    ts, swarm, work, corr = _setup(tmp_path, plan, leased=(gate_id,))
+    f = tmp_path / "findings.json"
+    f.write_text(json.dumps({"P-bee": _MAJOR}))
+    g = _script(swarm, script, "--task-id", gate_id, "--correlation-id", corr, "--root", str(work),
+                "--per-target-findings", str(f), "--json")
+    assert g.returncode == 2, g.stdout + g.stderr
+    assert "P-bee" in json.loads(g.stdout)["error"]["message"]
+    assert gate not in ts.latest_verdicts("P-be")

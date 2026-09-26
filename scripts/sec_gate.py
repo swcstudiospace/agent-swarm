@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import gate_verdict, issue_gate, load_per_target  # noqa: E402
+from swarm.verdicts import check_per_target_keys, gate_verdict, issue_gate, load_per_target  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".vue", ".svelte"}
@@ -192,6 +192,7 @@ def run(args, ctx) -> dict:
     # D-13: the agent's per-target findings join the script's own findings on their target only; a target the
     # agent omits gets the script's findings alone
     own = load_per_target(args.per_target_findings, len(findings), prefix="SF", owner="A10")
+    check_per_target_keys(own, ctx.task_id, ctx.root)
     per_target = {t: findings + items for t, items in own.items()} if own else None
     env, recorded = issue_gate(ctx, gate="security", agent_id="A10@local", findings=findings, runs=runs,
                                per_target=per_target, extra={"scan_digest": digest, "suppressed": suppressed})

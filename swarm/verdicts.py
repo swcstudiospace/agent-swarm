@@ -49,6 +49,25 @@ def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner:
     return out
 
 
+def check_per_target_keys(own: dict[str, list[dict]], task_id: str | None, root=None) -> None:
+    """E-INPUT when --per-target-findings names a target that is not in the gate task's gate_for: a finding under a
+    mistyped or stale id could otherwise never reach a verdict. Nothing to check without a gate task."""
+    from .taskstore import TaskStore
+    if not own or not task_id:
+        return
+    try:
+        task = TaskStore(root=root).get(task_id)
+    except SwarmError:
+        return
+    gate_for = (task.get("notes_json") or {}).get("gate_for")
+    if not gate_for:
+        return
+    unknown = sorted(set(own) - set(gate_for))
+    if unknown:
+        raise SwarmError(ErrorCode.E_INPUT, f"per-target findings name ids that are not targets of {task_id}: "
+                         f"{', '.join(unknown)} (targets: {', '.join(gate_for)})", task_id=task_id)
+
+
 RISK_ORDER = ("low", "medium", "high")
 
 

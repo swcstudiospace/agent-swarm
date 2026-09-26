@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import gate_risk_class, gate_verdict, issue_gate, load_per_target  # noqa: E402
+from swarm.verdicts import check_per_target_keys, gate_risk_class, gate_verdict, issue_gate, load_per_target  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
                  "high": ["unit", "integration", "e2e", "perf"]}
@@ -105,6 +105,7 @@ def run(args, ctx) -> dict:
     # D-13: the agent's per-target findings join the script's own findings on their target only; a target the
     # agent omits gets the script's findings alone
     own = load_per_target(args.per_target_findings, len(findings), prefix="QF", owner="A05")
+    check_per_target_keys(own, ctx.task_id, ctx.root)
     per_target = {t: findings + items for t, items in own.items()} if own else None
     env, recorded = issue_gate(ctx, gate="quality", agent_id="A08@local", findings=findings, runs=runs,
                                per_target=per_target)
