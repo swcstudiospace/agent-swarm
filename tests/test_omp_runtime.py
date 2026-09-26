@@ -461,6 +461,42 @@ def test_signal_to_runner_group_ends_sessions(tmp_path, sig):
     assert state == "FAILED" and json.loads(notes).get("running") is None
 
 
+def test_ignored_sighup_keeps_runner_and_session(tmp_path):
+    """WR-10: a runner started with SIGHUP ignored (nohup) keeps it ignored: a hangup to its group neither stops the
+    runner nor ends the session, which completes normally."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT)
+    started, go = stub.parent / "started", stub.parent / "go"
+    gated = stub.parent / "omp-gated"  # the session holds until the test has sent the hangup
+    gated.write_text(f"#!{sys.executable}\nimport os, sys, time\nopen({str(started)!r}, 'w').close()\n"
+                     f"deadline = time.monotonic() + 30\nwhile not os.path.exists({str(go)!r}) and time.monotonic() < deadline:\n"
+                     f"    time.sleep(0.05)\nos.execv({str(stub)!r}, [{str(stub)!r}, *sys.argv[1:]])\n")
+    gated.chmod(0o755)
+    runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",
+                               str(gated), "--task-timeout", "100", "--repo", str(work), "--once", "--json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=ROOT,
+                              start_new_session=True, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+    try:
+        deadline = time.monotonic() + 30
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert started.exists(), "the gated session never started"
+        os.killpg(runner.pid, signal.SIGHUP)
+        time.sleep(1)
+        assert runner.poll() is None, "the runner died on an ignored SIGHUP"
+        go.touch()
+        out, err = runner.communicate(timeout=30)
+    finally:
+        go.touch()
+        if runner.poll() is None:
+            runner.kill()
+        runner.wait()
+    assert runner.returncode == 0, out + err
+    assert _states(swarm) == {"T-one": "DONE"}
+
+
 # ---------------------------------------------------------------- (d) headless omp vs in-session ingest
 def test_omp_headless_and_ingest_same_transitions(tmp_path):
     d1, d2 = tmp_path / "a", tmp_path / "b"

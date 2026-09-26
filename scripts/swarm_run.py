@@ -609,9 +609,10 @@ def run(args, ctx) -> dict:
         if args.runtime == "claude":
             preflight_auth(binary)
     log, rounds = [], 0
-    # T-06-12: a SIGTERM/SIGHUP to the runner's group ends the sessions too, then the previous handlers come back
+    # T-06-12: a SIGTERM/SIGHUP to the runner's group ends the sessions too, then the previous handlers come back.
+    # WR-10: a signal inherited as ignored (nohup, a parent's SIG_IGN) stays ignored.
     _STOPPING.clear()
-    previous = ({s: signal.signal(s, _terminate) for s in _FORWARDED}
+    previous = ({s: signal.signal(s, _terminate) for s in _FORWARDED if signal.getsignal(s) is not signal.SIG_IGN}
                 if threading.current_thread() is threading.main_thread() else {})
     try:
         while True:
