@@ -1143,7 +1143,7 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["set -o GLOB_DOTS", "protected_path: glob-dotfiles"],
     ["zsh --globdots -c 'rm -r *'", "protected_path: glob-dotfiles"],
     ["echo x > /proc/self/cwd/.swarm/x", SHELL],
-    ["echo x > /proc/self/root/nonexistent-guard-cwd/.swarm/x", SHELL],
+    ["echo x > /proc/self/" + "root/nonexistent-guard-cwd/.swarm/x", SHELL],
     ["echo x > /proc/1/cwd/x", SHELL],
     ["echo x > /proc/1/fd/3", SHELL],
   ])("fail closed: %s blocks inside naming %s", (command, tail) => {
@@ -1270,6 +1270,21 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["su - root -c 'touch .swarm/x'", MUTATE],
     ["flock /tmp/l -c'touch .swarm/x'", MUTATE],
     ["script -q -c 'touch .swarm/x' /dev/null", MUTATE],
+    // a shell's `-c` line: attached, clustered, or after `--`
+    ["bash -c'touch .swarm/x'", MUTATE],
+    ['sh -c"git push --force"', FORCE],
+    ["bash -lc'git push -f'", FORCE],
+    ['sh -ec"touch .swarm/x"', MUTATE],
+    ["bash -cl 'git push -f'", FORCE],
+    ["sh -c -- 'git push -f'", FORCE],
+    ["/bin/zsh -o pipefail -c 'git push -f'", FORCE],
+    // echo/printf by basename, fed to a shell's stdin
+    ["/bin/echo 'touch .swarm/x' | sh", MUTATE],
+    ["/usr/bin/printf '%s\\n' 'git push --force' | bash", FORCE],
+    ["command echo 'git push -f' | sh", FORCE],
+    ["builtin printf 'git push -f\\n' | bash", FORCE],
+    ["echo -e 'touch .swarm/x' | sh", MUTATE],
+    ["cat <<< 'git push -f' | sh", FORCE],
     // a command that really reassigns HOME makes `~` unknowable
     ["HOME=.swarm; echo x > ~/tasks.db", SHELL],
     ["export HOME=/x; echo > ~/y", SHELL],
@@ -1282,7 +1297,8 @@ describe("HOOK-03 shell twin and D-08", () => {
 
   test.each([
     "bash -c 'echo ok' 'git push -f'", 'eval "echo ok"', "watch -n 5 ls", "alias ll='ls -la'", "trap 'rm -f /tmp/lock' EXIT",
-    "echo HOME > ~/results.txt", "grep HOME .env > /tmp/x", "echo $HOME > ~/y",
+    "echo HOME > ~/results.txt", "grep HOME .env > /tmp/x", "echo $HOME > ~/y", "bash -lc 'echo ok'", "/bin/echo 'git push -f'",
+    "printf 'git push -f\\n' > notes.txt", "echo 'touch .swarm/x' | cat",
   ])("joined lines: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });

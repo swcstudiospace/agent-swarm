@@ -339,8 +339,8 @@ const PREFIX = new RegExp(
   String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?!-[A-Za-z]*S|--split-string)(?:-[A-Za-z]*[uC]\s+\S+|--(?:unset|chdir)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|pkexec(?:\s+(?:--user\s+\S+|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|(?:if|then|else|elif|do|while|until|!|coproc)\s+|(?:${CUT}[\uE000-\uF8FF])+(?:\s+|$)|${LEAD_REDIRECT}|(?!GLOBIGNORE=)[A-Za-z_]\w*=(?=(?<value>${VALUE}))\k<value>\s+)`,
   "y",
 );
-/** `sh -c`, `bash -ec`, `/bin/zsh -x -o pipefail -c`, `fish -c` …: the next word is a command line of its own. */
-const SHELL_C = /^(?:\S*\/)?(?:[a-z]*sh|fish)(?:\s+(?:[-+][oO]\s+\S+|--(?:rcfile|init-file)\s+\S+|[-+]\S+))*\s+-[A-Za-z]*c(?:\s+--)?\s+/;
+/** A shell program word (`sh`, `bash`, `/bin/zsh`, `dash`, `fish` …) by basename. */
+const SHELL_WORD = /^(?:[a-z]*sh|fish)$/;
 /** A word that runs the rest of its line through the shell again, all its arguments joined (`eval`, `watch`, `parallel`, `sudo -s|-i`). */
 const JOINS_ARGS = /^\s*(?:(?:\S*\/)?(?:eval|watch|parallel)\b|(?:\S*\/)?sudo\b.*\s(?:-[A-Za-z]*[si]|--shell|--login)(?:\s|$))/;
 /** `env -S LINE` / `--split-string=LINE` once the `env` word was stripped: the rest of the line is the command. */
@@ -433,7 +433,7 @@ function shellWords(text: string): string[] {
 
 /**
  * Every blank-delimited token that is a plain word once unquoted (`"rm"`, `\sudo`, `r""m`, `'-i'`) written plain, so
- * PREFIX, SHELL_C and the regex rows see the command bash runs. A token whose unquoted form holds a blank, quote,
+ * PREFIX, the shell `-c` parsing and the regex rows see the command bash runs. A token whose unquoted form holds a blank, quote,
  * operator, expansion, glob, `=`, `#`, `!` or `~`, or that leaves a quote open, keeps its quotes.
  */
 const simplifyWords = (text: string): string =>
@@ -455,17 +455,40 @@ function dashC(words: string[]): string | undefined {
 }
 
 /**
- * The command lines a segment hands to a shell, now or later: the word after `sh -c` (and kin; the words after it are
- * `$0`, `$1` …), the `-c` value of `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE` value, the
- * `trap` action, and an `env -S` line (its string split, the remaining words appended). eval/watch/parallel/`sudo -s`,
- * which join all their arguments, are normalizeSegments' (JOINS_ARGS).
+ * The command lines a shell started with `-c` runs: the first operand after the options (`sh -c LINE`, `bash -lc LINE`,
+ * `bash -cl LINE`, `sh -c -- LINE`; the words after it are `$0`, `$1` …), and — failing closed, since shells differ
+ * on it — the text attached to the `c` of the cluster (`bash -c'LINE'`, `sh -ec"LINE"`). Undefined when `words` is not
+ * a shell given `-c`.
+ */
+function shellDashC(words: string[]): string[] | undefined {
+  if (!SHELL_WORD.test(posix.basename(unquote(words[0] ?? "")))) return undefined;
+  let c = false;
+  const out: string[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const w = unquote(words[i]);
+    if (/^(?:[-+][oO]|--(?:rcfile|init-file))$/.test(w)) i++;
+    else if (/^-[A-Za-z]*c/.test(w)) {
+      c = true;
+      const attached = w.slice(w.indexOf("c") + 1);
+      if (attached !== "") out.push(attached);
+    } else if (w === "--" || /^[-+]/.test(w)) continue;
+    else {
+      if (c) out.push(w);
+      break;
+    }
+  }
+  return c ? out : undefined;
+}
+
+/**
+ * The command lines a segment hands to a shell, now or later: a shell's `-c` line (shellDashC), the `-c` value of
+ * `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE` value, the `trap` action, and an `env -S`
+ * line (its string split, the remaining words appended). eval/watch/parallel/`sudo -s`, which join all their
+ * arguments, are normalizeSegments' (JOINS_ARGS).
  */
 function commandLines(seg: string): string[] {
-  const shell = SHELL_C.exec(seg);
-  if (shell !== null) {
-    const word = shellWords(seg.slice(shell[0].length))[0];
-    return word === undefined ? [] : [unquote(word)];
-  }
+  const shell = shellDashC(shellWords(seg));
+  if (shell !== undefined) return shell;
   const split = SPLIT_STRING.exec(seg);
   if (split !== null) {
     const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
@@ -744,7 +767,7 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
   if (depth < MAX_LITERAL_DEPTH && built.some(({ item }) => readsStdinScript(item.text))) {
     for (const { item, body } of built) {
       const hereString = /<<<\s*((?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+)/.exec(`${item.prefix} ${item.text}`)?.[1];
-      const echoed = /^(?:echo|printf)(?:\s|$)/.test(item.text) ? shellWords(item.text).slice(1).map(unquote).join(" ") : undefined;
+      const echoed = printedText(item.text);
       for (const fed of [body, hereString === undefined ? undefined : unquote(hereString), echoed]) {
         if (fed !== undefined) item.payload.push(...normalizeSegments(fed, depth + 1, cuts));
       }
@@ -755,6 +778,26 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     for (const item of normalizeSegments(cuts[n], depth, cuts)) items.unshift({ ...item, chdirs: [CUT, ...item.chdirs] });
   }
   return items;
+}
+
+/**
+ * What an `echo`/`printf` segment prints, by argv0's basename (`/bin/echo`, `/usr/bin/printf`; `command`/`builtin` are
+ * stripped as prefixes): echo's operands joined (leading `-neE` flags aside), printf's format and arguments one per line
+ * with `\n`/`\t` in them decoded. Undefined for any other command.
+ */
+function printedText(seg: string): string | undefined {
+  const words = shellWords(seg).map(unquote);
+  const cmd = posix.basename(words[0] ?? "");
+  if (cmd === "echo") {
+    let i = 1;
+    while (/^-[neE]+$/.test(words[i] ?? "")) i++;
+    return words.slice(i).join(" ").replace(/\\n/g, "\n").replace(/\\t/g, " ");
+  }
+  if (cmd !== "printf") return undefined;
+  const args = words.slice(1);
+  if (args[0] === "-v") args.splice(0, 2);
+  if (args[0] === "--") args.shift();
+  return args.map((a) => a.replace(/\\n/g, "\n").replace(/\\t/g, " ")).join("\n");
 }
 
 /** A shell that reads its script from stdin: no script operand, `-s`, or `-`/`/dev/stdin`; `source`/`.` of stdin. */
