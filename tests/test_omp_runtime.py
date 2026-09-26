@@ -6,11 +6,14 @@ import os
 import shlex
 import shutil
 import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from conftest import ROOT, omp_calls, run_script, stub_claude, stub_omp
+from conftest import ROOT, omp_calls, omp_grandchild, run_script, stub_claude, stub_omp
 
 FIXTURE = ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl"
 KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
@@ -154,7 +157,7 @@ def test_omp_command_shape(sr, tmp_path, monkeypatch):
     opt = dict(zip(argv[7::2], argv[8::2]))
     assert opt == {"-e": str(ROOT / "omp"), "--cwd": str(tmp_path), "--approval-mode": "yolo",
                    "--tools": "read,grep,glob,bash,write,swarm_gate,yield", "--append-system-prompt": str(sdir / "agents" / "a12-release.md"),
-                   "--max-time": "60s", "--model": "@smol"}
+                   "--max-time": "81s", "--model": "@smol"}
     body = (sdir / "agents" / "a12-release.md").read_text()
     assert not body.startswith("---") and "<swarm_runtime>" in body
     assert cwd == tmp_path and "SWARM_SIGNING_KEY" not in env and env["SWARM_AGENT"] == "a12-release"
@@ -166,6 +169,18 @@ def test_omp_command_missing_body_is_e_dep(sr, tmp_path):
     with pytest.raises(SwarmError) as e:
         sr.headless_command("omp", {"slug": "a99-nobody", "id": "A99"}, tmp_path, tmp_path / ".swarm", args)
     assert e.value.code.value == "E-DEP"
+
+
+@pytest.mark.parametrize("timeout", [2, 5, 6, 30, 59, 60, 61, 90, 119, 120, 121, 600, 1800, 7200])
+def test_omp_max_time_below_task_timeout(sr, tmp_path, timeout):
+    """WR-03: omp's own --max-time ends the session before the runner's kill, with a margin of at most 60 s."""
+    args = type("A", (), {"omp_bin": "omp", "model": "", "task_timeout": timeout})()
+    argv, _, _ = sr.headless_command("omp", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    max_time = argv[argv.index("--max-time") + 1]
+    assert max_time.endswith("s")
+    seconds = int(max_time[:-1])
+    assert 1 <= seconds < timeout
+    assert timeout - seconds <= 60
 
 
 @pytest.mark.parametrize(("explicit", "env", "want"), [("omp", None, "omp"), ("auto", "omp", "omp"), ("auto", "grok", "grok"),
@@ -197,10 +212,12 @@ def test_dry_run_prints_omp_invocation(tmp_path):
     lines = [ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: ")]
     assert len(lines) == 1
     tokens = shlex.split(lines[0].removeprefix("dry-run T-one [A05]: "))
-    assert dict(t.split("=", 1) for t in tokens[:6]) == {
+    # WR-06: a replay from the runner's shell drops the key vars, as the live child env does
+    assert tokens[:7] == ["env", "-u", "SWARM_SIGNING_KEY", "-u", "SWARM_ED25519_KEY", "-u", "SWARM_REQUIRE_KEY"]
+    assert dict(t.split("=", 1) for t in tokens[7:13]) == {
         "SWARM_DIR": str(swarm), "SWARM_CHILD": "1", "SWARM_AGENT_SESSION": "1", "SWARM_AGENT": "a05-backend",
         "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
-    argv, (redirect, stdin) = tokens[6:-2], tokens[-2:]
+    argv, (redirect, stdin) = tokens[13:-2], tokens[-2:]
     assert argv[0] == "omp" and "--no-extensions" in argv
     opt = lambda k: argv[argv.index(k) + 1]  # noqa: E731
     assert opt("-e") == str(ROOT / "omp")
@@ -212,6 +229,25 @@ def test_dry_run_prints_omp_invocation(tmp_path):
     raw = [json.loads(ln) for ln in (swarm / "events.jsonl").read_text().splitlines() if '"task.result.raw"' in ln]
     meta = raw[-1]["payload"]["meta"]
     assert meta["runtime"] == "omp" and meta["argv"] == argv
+
+
+def test_dry_run_line_replays_without_keys(tmp_path):
+    """WR-06: the printed line, run by a shell that exports the runner's keys, starts a key-less session."""
+    swarm = tmp_path / ".swarm"
+    keys = {"SWARM_SIGNING_KEY": "runner-secret", "SWARM_ED25519_KEY": "11" * 32, "SWARM_REQUIRE_KEY": "1"}
+    env = _env(swarm, **keys)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT)
+    r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(stub), "--dry-run", "--repo", str(work),
+                   "--json", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    line = next(ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: "))
+    p = subprocess.run(["/bin/sh", "-c", line.removeprefix("dry-run T-one [A05]: ")], capture_output=True, text=True,
+                       env=env, cwd=work, timeout=60)
+    assert p.returncode == 0, p.stdout + p.stderr
+    (call,) = omp_calls(stub)
+    assert not set(KEY_VARS) & set(call["env"])
+    assert call["env"]["SWARM_AGENT"] == "a05-backend" and call["env"]["SWARM_AGENT_SESSION"] == "1"
 
 
 # ---------------------------------------------------------------- (c) preflight checks only the selected runtime
@@ -252,6 +288,104 @@ def test_missing_omp_is_e_dep(tmp_path):
     assert err["code"] == "E-DEP"
     assert "omp not on PATH (--runtime omp" in err["message"]
     assert _states(swarm) == {"T-one": "PLANNED"}
+
+
+def _failed_reasons(swarm, tid) -> list[str]:
+    con = sqlite3.connect(swarm / "tasks.db")
+    rows = [r for (r,) in con.execute("SELECT reason FROM transitions WHERE task_id = ? AND to_state = 'FAILED' ORDER BY id",
+                                      (tid,))]
+    con.close()
+    return rows
+
+
+def test_relative_omp_bin_resolved_at_preflight(tmp_path):
+    """WR-05: a relative --omp-bin found from the runner's cwd still spawns, although the session's cwd is the repo."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT)
+    # the runner's cwd must hold the relative path; from the repo (work/) `omp-bin/omp` does not exist
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin", "omp-bin/omp",
+                        "--repo", str(work), "--once", "--json"], capture_output=True, text=True, env=env, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _states(swarm) == {"T-one": "DONE"}
+    (call,) = omp_calls(stub)
+    assert os.path.isabs(call["argv"][0]) and os.path.samefile(call["argv"][0], stub)
+
+
+def test_spawn_failure_fails_the_task(tmp_path):
+    """WR-05: a binary that passes preflight but cannot be executed fails its task (E-DEP) instead of aborting the run
+    and stranding the task IN_PROGRESS."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    bad = tmp_path / "bad-bin" / "omp"
+    bad.parent.mkdir()
+    bad.write_text("#!/nonexistent/interpreter\n")
+    bad.chmod(0o755)
+    r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(bad), "--repo", str(work), "--once", "--json", env=env)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    assert _states(swarm) == {"T-one": "FAILED"}
+    assert any("E-DEP" in reason for reason in _failed_reasons(swarm, "T-one"))
+
+
+def test_yield_error_fails_gate_session_and_records_no_gate(tmp_path):
+    """WR-02: a session whose yield failed is E-CONTRACT → FAILED even when its final text carries an IN_REVIEW json
+    block, and the runner records no gate for it (CR-04)."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm, SWARM_SIGNING_KEY="runner-secret")
+    plan = {"tasks": [{"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
+                      {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
+                       "gates": {"gate": "review", "for": ["be"]}}]}
+    work = _plan(tmp_path, env, plan, "--risk-class", "low")
+    stub = stub_omp(tmp_path, {"state": "IN_REVIEW", "outputs": [], "summary_md": "stub omp session"},
+                    yield_error="could not run the gate script", yield_error_on='"gate": "review"')
+    r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(stub), "--repo", str(work), "--json", env=env)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    con = sqlite3.connect(swarm / "tasks.db")
+    rows = list(con.execute("SELECT gate FROM verdicts WHERE task_id = 'T-be'"))
+    con.close()
+    assert rows == []
+    states = _states(swarm)
+    assert states["T-be"] == "IN_REVIEW" and states["T-rev"] == "ESCALATED"
+    reasons = _failed_reasons(swarm, "T-rev")
+    assert reasons and all("E-CONTRACT" in x and "could not run the gate script" in x for x in reasons)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def test_timeout_kills_the_session_process_group(tmp_path):
+    """WR-04: on --task-timeout the session's whole process group goes, its tool processes included, and the partial
+    stream is kept in the task.result.raw meta."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT, hang=True)
+    try:
+        r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(stub), "--task-timeout", "3", "--repo", str(work),
+                       "--once", "--json", env=env)
+        assert r.returncode in (0, 1), r.stdout + r.stderr
+        pid = omp_grandchild(stub)
+        assert pid is not None
+        deadline = time.monotonic() + 5
+        while _alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(pid), "the session's tool process outlived the timeout"
+    finally:
+        pid = omp_grandchild(stub)
+        if pid is not None and _alive(pid):
+            os.kill(pid, 9)
+    assert _states(swarm) == {"T-one": "FAILED"}
+    assert _failed_reasons(swarm, "T-one") == ["E-TIMEOUT: task_timeout exceeded"]
+    raw = [json.loads(ln) for ln in (swarm / "events.jsonl").read_text().splitlines() if '"task.result.raw"' in ln]
+    meta = raw[-1]["payload"]["meta"]
+    assert meta["timed_out"] is True and meta["session_id"] == "stub-session" and meta["is_error"] is True
 
 
 # ---------------------------------------------------------------- (d) headless omp vs in-session ingest

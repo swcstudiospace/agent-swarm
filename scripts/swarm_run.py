@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -189,11 +190,13 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", "--cwd", str(repo), *model], env, repo
     if runtime == "omp":
         tools, body = omp_agent(slug, sdir)
+        # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
+        margin = min(60, max(5, args.task_timeout // 10))
         # -e spelled as omp's absolute root path: omp dedups extension roots by that string, not realpath (D-01)
         return [binary, "-p", "--mode", "json", "--no-session", "--no-title", "--no-extensions",
                 "-e", str((ROOT / "omp").resolve()), "--cwd", str(repo), "--approval-mode", "yolo",
                 "--tools", tools, "--append-system-prompt", str(body),
-                "--max-time", f"{max(60, args.task_timeout - 60)}s", *model], env, repo
+                "--max-time", f"{max(1, args.task_timeout - margin)}s", *model], env, repo
     cmd = [binary, "-p", "--agent", slug, "--output-format", "json",
            "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns),
            "--add-dir", str(ROOT), *model]
@@ -240,20 +243,58 @@ def omp_stream_text(stdout: str) -> tuple[str, dict]:
             if isinstance(details.get("data"), dict):
                 text += f"\n```json\n{json.dumps(details['data'])}\n```"
         else:
+            # D-02: an error yield fails the session, whatever json block the assistant text carries (WR-02)
             meta["yield_error"] = details.get("error") or f"yield status={details.get('status')} isError={m.get('isError')}"
+            meta["is_error"] = True
         break
     return text, meta
 
 
-def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
-    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
-    cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=args.task_timeout, cwd=cwd, env=env)
-    meta = {"returncode": proc.returncode, "stderr": proc.stderr[-2000:]}
+class AgentTimeout(subprocess.TimeoutExpired):
+    """The session outlived --task-timeout and its process group was killed; text/meta hold its partial output."""
+
+    def __init__(self, cmd, timeout, text: str, meta: dict):
+        super().__init__(cmd, timeout)
+        self.text, self.meta = text, meta
+
+
+# process groups of the running sessions: they run in their own session, so a Ctrl-C no longer reaches them
+_SESSIONS: set[int] = set()
+_SESSIONS_LOCK = threading.Lock()
+
+
+def kill_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_sessions() -> None:
+    with _SESSIONS_LOCK:
+        for pgid in _SESSIONS:
+            kill_group(pgid, signal.SIGKILL)
+
+
+def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
+    """SIGTERM the session's whole process group, SIGKILL it after 10 s; the partial (stdout, stderr)."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        kill_group(proc.pid, sig)
+        try:
+            return proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+    proc.kill()  # a descendant that left the group still holds the pipes
+    proc.wait()
+    return "", ""
+
+
+def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
+    meta = {"returncode": returncode, "stderr": (stderr or "")[-2000:]}
     if runtime == "omp":
-        text, stream_meta = omp_stream_text(proc.stdout)
+        text, stream_meta = omp_stream_text(stdout or "")
         return text, {**meta, **stream_meta}
-    text = proc.stdout
+    text = stdout or ""
     try:
         data = json.loads(text)
         meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
@@ -263,17 +304,41 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     return text, meta
 
 
+def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
+    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+    cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
+    try:
+        # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                cwd=cwd, env=env, start_new_session=True)
+    except OSError as e:
+        raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
+    with _SESSIONS_LOCK:
+        _SESSIONS.add(proc.pid)
+    try:
+        try:
+            out, err = proc.communicate(prompt, timeout=args.task_timeout)
+        except subprocess.TimeoutExpired:
+            text, meta = session_output(runtime, *reap_group(proc), proc.returncode)
+            raise AgentTimeout(cmd, args.task_timeout, text, {**meta, "timed_out": True}) from None
+    finally:
+        with _SESSIONS_LOCK:
+            _SESSIONS.discard(proc.pid)
+    return session_output(runtime, out, err, proc.returncode)
+
+
 def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) -> dict:
-    """--dry-run: print the exact session invocation (env deltas, argv, stdin file) to stderr; spawn nothing."""
+    """--dry-run: print the exact session invocation (key-var unsets, env deltas, argv, stdin file) to stderr as a
+    replayable `env -u … K=V … argv < file` line; spawn nothing."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
+    # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06)
+    unset = " ".join(f"-u {k}" for k in AGENT_SESSION_STRIPPED)
     deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in CHILD_ENV_KEYS)
     stdin = sdir / "assignments" / f"{task['task_id']}.a{task['attempt']}.md"
-    print(f"dry-run {task['task_id']} [{agent['id']}]: {deltas} {shlex.join(cmd)} < {shlex.quote(str(stdin))}",
+    print(f"dry-run {task['task_id']} [{agent['id']}]: env {unset} {deltas} {shlex.join(cmd)} < {shlex.quote(str(stdin))}",
           file=sys.stderr, flush=True)
     return {"dry_run": True, "runtime": runtime, "argv": cmd}
-
-
 
 
 def canned_result(task: dict, agent: dict) -> str:
@@ -430,6 +495,9 @@ def execute_one(store_path, task, agent, args, ctx, repo):
             result = validate_result(parse_result(text), task_id=tid)
         except SwarmError as e:
             err = e
+        if meta.get("yield_error"):  # D-02: an error yield is E-CONTRACT, whatever json the text carries (WR-02)
+            result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent yielded an error: {meta['yield_error']}"[:500],
+                                           task_id=tid)
         # CR-04: record a gate only for a session that completed and asked to finish it — a crashed, errored or
         # BLOCKED/FAILED gate session gets no script run, so its targets keep the gate absent
         if (not args.dry_run and task["notes_json"].get("gate") and result is not None
@@ -443,6 +511,14 @@ def execute_one(store_path, task, agent, args, ctx, repo):
             outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
         else:
             outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit, mode="headless")
+    except AgentTimeout as e:
+        # WR-04: keep what the session wrote before its process group was killed
+        (sdir / "results").mkdir(parents=True, exist_ok=True)
+        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(e.text or "")
+        ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": e.meta})
+        store.set_notes(tid, meta=e.meta)
+        store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
+        outcome = "FAILED"
     except subprocess.TimeoutExpired:
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
         outcome = "FAILED"
@@ -476,9 +552,13 @@ def run(args, ctx) -> dict:
                          "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
     args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
     if not args.dry_run:
-        binary = runtime_bin(args.runtime, args)
-        if not shutil.which(binary):
-            raise SwarmError(ErrorCode.E_DEP, f"{binary} not on PATH (--runtime {args.runtime}; use --dry-run to simulate)")
+        name = runtime_bin(args.runtime, args)
+        binary = shutil.which(name)
+        if not binary:
+            raise SwarmError(ErrorCode.E_DEP, f"{name} not on PATH (--runtime {args.runtime}; use --dry-run to simulate)")
+        # absolute: sessions spawn with cwd=repo (omp, grok) or ROOT (claude), where a relative path breaks (WR-05)
+        binary = os.path.abspath(binary)
+        setattr(args, f"{args.runtime}_bin", binary)
         if args.runtime == "claude":
             preflight_auth(binary)
     log, rounds = [], 0
@@ -501,10 +581,14 @@ def run(args, ctx) -> dict:
             batch.append((t, agent))
         with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
             futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo) for t, a in batch]
-            for f in as_completed(futs):
-                tid, aid, outcome = f.result()
-                log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
-                print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
+            try:
+                for f in as_completed(futs):
+                    tid, aid, outcome = f.result()
+                    log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
+                    print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
+            except BaseException:  # e.g. Ctrl-C: sessions run in their own session, so the signal missed them
+                kill_sessions()
+                raise
         if args.once or rounds >= args.max_rounds:
             break
     log += reconcile(store, corr, ctx.emit)

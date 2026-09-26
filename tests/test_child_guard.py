@@ -24,11 +24,16 @@ def test_headless_agent_env_marks_child(tmp_path, monkeypatch):
     mod = _load_swarm_run(tmp_path, monkeypatch)
     seen = {}
 
-    def fake_run(cmd, **kw):
-        seen["env"] = kw["env"]
-        return SimpleNamespace(stdout='{"result":"ok"}', stderr="", returncode=0)
+    class FakePopen:
+        pid, returncode = 0, 0
 
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        def __init__(self, cmd, **kw):
+            seen["env"] = kw["env"]
+
+        def communicate(self, input=None, timeout=None):
+            return '{"result":"ok"}', ""
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
     args = SimpleNamespace(runtime="claude", claude_bin="claude", permission_mode="bypassPermissions",
                            max_turns=5, model="", allowed_tools="", task_timeout=10)
     mod.run_agent_headless({"slug": "a05-backend", "id": "A05"}, "implement the thing", tmp_path, args)

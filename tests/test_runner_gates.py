@@ -72,11 +72,16 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     # each runtime's own stdout shape: omp streams JSONL, claude/grok print one JSON object
     stdout = (ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl").read_text() if runtime == "omp" else '{"result":"ok"}'
 
-    def fake_run(cmd, **kw):
-        seen["cmd"], seen["env"] = cmd, kw["env"]
-        return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+    class FakePopen:
+        pid, returncode = 0, 0
 
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        def __init__(self, cmd, **kw):
+            seen["cmd"], seen["env"] = cmd, kw["env"]
+
+        def communicate(self, input=None, timeout=None):
+            return stdout, ""
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
     args = SimpleNamespace(runtime=runtime, claude_bin="claude", grok_bin="grok", omp_bin="omp",
                            permission_mode="bypassPermissions", max_turns=5, model="", allowed_tools="", task_timeout=10)
     mod.run_agent_headless({"slug": "a09-reviewer", "id": "A09"}, "review the thing", tmp_path, args)
