@@ -1137,9 +1137,26 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["touch /nonexistent-guard-cwd/.?/x", MUTATE],
     ["shopt -s dotglob", "protected_path: glob-dotfiles"],
     ["GLOBIGNORE=x", "protected_path: glob-dotfiles"],
+    ["shopt -qs extglob dotglob", "protected_path: glob-dotfiles"],
+    ["declare -x GLOBIGNORE=.", "protected_path: glob-dotfiles"],
+    ["unsetopt no_glob_dots", "protected_path: glob-dotfiles"],
+    ["set -o GLOB_DOTS", "protected_path: glob-dotfiles"],
+    ["zsh --globdots -c 'rm -r *'", "protected_path: glob-dotfiles"],
+    ["echo x > /proc/self/cwd/.swarm/x", SHELL],
+    ["echo x > /proc/self/root/nonexistent-guard-cwd/.swarm/x", SHELL],
+    ["echo x > /proc/1/cwd/x", SHELL],
+    ["echo x > /proc/1/fd/3", SHELL],
   ])("fail closed: %s blocks inside naming %s", (command, tail) => {
     expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([
+    "grep -R dotglob .", 'git commit -m "fix dotglob handling"', "echo GLOBIGNORE", "man shopt", "shopt dotglob", "shopt -u dotglob",
+    'git commit -m "GLOBIGNORE=x is unsafe"', "setopt noglobdots", "echo x > /proc/self/fd/1", "echo x > /proc/$$/fd/2",
+    "echo x > /proc/thread-self/fd/0", "cmd 2> /proc/self/fd/1", "echo x > /dev/fd/3",
+  ])("dotglob and descriptors: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
 
   /** Commands run by another command (find, xargs, parallel, runners, stdin scripts) and the less common writers. */

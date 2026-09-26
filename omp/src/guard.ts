@@ -916,8 +916,39 @@ const segmentBase = (seg: Segment, facts: GuardFacts) => ({ cwd: seg.cwd ?? fact
 
 /** The D-08 state directories (compared in any case: a case-insensitive file system maps `.Swarm` onto `.swarm`). */
 const PROTECTED_DIRS = [".swarm", ".omp"];
-/** Device sinks a write may always name. */
-const SAFE_SINK = /^\/dev\/(?:null|zero|full|stdout|stderr|tty|fd\/\d+)$/;
+/** Device sinks a write may always name: the null/zero/full/tty devices and an open descriptor (`/dev/fd/N`, `/proc/self/fd/N`). */
+const SAFE_SINK = /^(?:\/dev\/(?:null|zero|full|stdout|stderr|tty|fd\/\d+)|\/proc\/(?:self|thread-self|\$\$|\$\{\$\})\/fd\/\d+)$/;
+
+/** A shell option that makes globs match dotfiles: bash `dotglob`, zsh `GLOB_DOTS` (zsh ignores case and `_`). */
+const isDotglobOption = (name: string) => /^(?:dotglob|globdots)$/.test(name.toLowerCase().replace(/[_-]/g, ""));
+/** A word whose value is only known at run time (an expansion, a cut substitution, a glob or brace list). */
+const dynamicWord = (w: string) => /[$`\u0001*?[{]/.test(w);
+
+/**
+ * The segment turns dotglob on, or may: `shopt -s … dotglob`, `setopt globdots` / `unsetopt noglobdots`, `set -o
+ * globdots`, a shell started with `-O dotglob` / `-o globdots` / `--globdots`, any of these naming an expansion, or a
+ * `GLOBIGNORE=`/`BASHOPTS=` assignment word (also after `export`/`declare`/`local`/`readonly`/`env`). A mention of the
+ * name as data (`grep -R dotglob .`, `echo GLOBIGNORE`, a commit message) is none.
+ */
+function enablesDotglob({ words, targetWords, marked }: Segment): boolean {
+  const cmd = words[0] ?? "";
+  const args = targetWords.slice(1);
+  const named = (w: string) => dynamicWord(w) || isDotglobOption(w);
+  if (cmd === "shopt") return args.some(dynamicWord) || (args.some((w) => /^-\w*s\w*$/.test(w)) && args.some(isDotglobOption));
+  if (cmd === "setopt") return args.some(named);
+  if (cmd === "unsetopt") return args.some((w) => dynamicWord(w) || /^no_?glob_?dots$/i.test(w.replace(/_/g, "")));
+  const optionAfter = (flag: RegExp) => args.some((w, i) => flag.test(w) && args[i + 1] !== undefined && named(args[i + 1]));
+  if (cmd === "set" && optionAfter(/^-o$/)) return true;
+  if (/^[a-z]*sh$/.test(cmd) && (optionAfter(/^-[A-Za-z]*[Oo]$/) || args.some((w) => w.startsWith("--") && isDotglobOption(w.slice(2))))) return true;
+  for (const w of shellWords(marked).map(unquote)) {
+    const assignment = /^([A-Za-z_]\w*)\+?=/.exec(w);
+    if (assignment !== null) {
+      if (assignment[1] === "GLOBIGNORE" || assignment[1] === "BASHOPTS") return true;
+    } else if (!/^(?:export|declare|typeset|local|readonly|env|-\w+)$/.test(w)) break;
+  }
+  return false;
+}
+
 /** A glob character or an extglob group in a word (brace lists are expanded first, by braceAlternatives). */
 const GLOB_CHAR = /[*?[]|[@!+]\(/;
 /** More brace alternatives than this in one word leave it unjudgeable. */
@@ -1481,10 +1512,11 @@ export const RULES: readonly Rule[] = [
   {
     id: "glob-dotfiles",
     capability: "protected_path",
-    pattern: ({ text, words, targetWords }) =>
-      /\b(?:GLOBIGNORE|dotglob|glob_?dots)\b/i.test(text) ||
-      ((words[0] === "shopt" || words[0] === "setopt") && targetWords.slice(1).some((w) => /[$`\u0001*?[{]/.test(w))),
-    samples: ["shopt -s dotglob", "GLOBIGNORE=x", "setopt globdots", "bash -O dotglob -c 'rm -r *'", 'shopt -s "$OPT"'],
+    pattern: enablesDotglob,
+    samples: [
+      "shopt -s dotglob", "shopt -s extglob dotglob", "GLOBIGNORE=x", "export GLOBIGNORE=.", "setopt globdots", "setopt GLOB_DOTS",
+      "bash -O dotglob -c 'rm -r *'", 'shopt -s "$OPT"', "BASHOPTS=dotglob bash -c 'rm -r *'", "zsh -o globdots -c 'rm -r *'",
+    ],
   },
   // universal destructive (every swarm agent, treated as L4)
   {
