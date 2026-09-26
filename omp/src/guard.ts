@@ -238,8 +238,11 @@ export interface Rule {
   samples: readonly string[];
 }
 
-/** A shell word as an assignment value: quoted runs (with spaces), escapes and bare characters, up to whitespace. */
-const VALUE = String.raw`(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])*`;
+/**
+ * A shell word as an assignment value: quoted runs (with spaces), escapes and bare runs, up to whitespace. The bare
+ * run is `+` inside `*`: use it only atomically (PREFIX's lookahead + backreference), never where it can backtrack.
+ */
+const VALUE = String.raw`(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\]+)*`;
 /** sudo/doas flags that take the next word (`-u root`, `-g wheel`, `-C 3`, `-D dir`, `-h host`, `-p prompt`, `-r role`, `-t type`, `-U user`, `-T secs`). */
 const SUDO_VALUE_FLAG = String.raw`-[ugCDhprtUT]\s+\S+|--(?:user|group|host|prompt|role|type|chdir|close-from|other-user|command-timeout)\s+\S+`;
 /**
@@ -249,12 +252,15 @@ const SUDO_VALUE_FLAG = String.raw`-[ugCDhprtUT]\s+\S+|--(?:user|group|host|prom
 const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|nice(?:\s+(?:-n\s+\S+|-\S+))*|ionice(?:\s+(?:-[cn]\s+\S+|-\S+))*|stdbuf(?:\s+-\S+)+|timeout(?:\s+(?:-[sk]\s+\S+|-\S+))*\s+\S+|xargs(?:\s+(?:-[nIPdaLsE]\s+\S+|-\S+))*)\s+`;
 /**
  * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …`, `sudo`/`doas` with their flags,
- * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces) and the WRAPPER set. Every wrapper word
+ * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces), the WRAPPER set and the shell keywords
+ * that put a command in a compound (`if`, `then`, `else`, `elif`, `do`, `while`, `until`, `!`). Every wrapper word
  * may be spelled as a path (`/usr/bin/env`, `/usr/bin/sudo`, `…/timeout`), like argv[0]'s basename (T-05-24).
  * The directory an `env -C`/`sudo -D` prefix names is kept (prefixChdirs) for matchRule's directory tracking.
  */
 const PREFIX = new RegExp(
-  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?:-[A-Za-z]*[uCS]\s+\S+|--(?:unset|chdir|split-string)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|[A-Za-z_]\w*=${VALUE}\s+)`,
+  // the assignment value is matched atomically (lookahead + backreference): giving characters back can never reach
+  // the whitespace after it, and backtracking through a 1 MB value would cost seconds (WR-09)
+  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?:-[A-Za-z]*[uCS]\s+\S+|--(?:unset|chdir|split-string)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|(?:if|then|else|elif|do|while|until|!)\s+|[A-Za-z_]\w*=(?=(?<value>${VALUE}))\k<value>\s+)`,
   "y",
 );
 /** `sh -c`, `bash -ec`, `/bin/zsh -x -c` …: the next word is a command line of its own. */
@@ -282,13 +288,17 @@ function quotedLiteral(text: string, at: number): string | undefined {
 /** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
 const HEREDOC = /<<-?[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s<>|&;()]+))/y;
 
+/** The shell operator that ends a split piece; a newline reads as `;`, the end of the text as `""`. */
+type Op = ";" | "&&" | "||" | "|" | "&" | "(" | ")" | "{" | "}" | "";
+
 /**
- * Split on `;`, `&&`, `||`, `|`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes. Heredoc bodies and `#`
- * comments are data, not commands: they are skipped without quote tracking (an apostrophe in them must not
- * swallow the commands after them). An unbalanced quote at the end re-splits its tail with quotes off.
+ * Split on `;`, `&&`, `||`, `|`, a lone `&`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes, keeping the operator that
+ * ends each piece (matchRule's directory tracking reads the structure). Heredoc bodies and `#` comments are data,
+ * not commands: they are skipped without quote tracking (an apostrophe in them must not swallow the commands after
+ * them). An unbalanced quote at the end re-splits its tail with quotes off.
  */
-function splitTopLevel(text: string, quotesOn = true): string[] {
-  const out: string[] = [];
+function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }[] {
+  const out: { text: string; end: Op }[] = [];
   let cur = "";
   let blank = true; // cur holds only whitespace
   let quote: string | undefined;
@@ -296,8 +306,8 @@ function splitTopLevel(text: string, quotesOn = true): string[] {
   let quoteOut = 0;
   let quoteCur = "";
   let heredoc: string | undefined;
-  const boundary = () => {
-    out.push(cur);
+  const boundary = (end: Op) => {
+    out.push({ text: cur, end });
     cur = "";
     blank = true;
   };
@@ -343,52 +353,79 @@ function splitTopLevel(text: string, quotesOn = true): string[] {
       blank = false;
       i += m[0].length - 1;
     } else if (c === "\n") {
-      boundary();
+      boundary(";");
       if (heredoc !== undefined) {
         i = heredocEnd(i + 1);
         heredoc = undefined;
       }
     } else if (c === ";" || c === "|" || (c === "&" && text[i + 1] === "&")) {
-      if (c !== ";" && text[i + 1] === c) i++;
-      boundary();
+      const double = c !== ";" && text[i + 1] === c;
+      if (double) i++;
+      // `|&` pipes stderr too: one pipe
+      else if (c === "|" && text[i + 1] === "&") i++;
+      boundary(c === ";" ? ";" : c === "&" ? "&&" : double ? "||" : "|");
+    } else if (c === "&" && text[i + 1] !== ">" && !/[<>]/.test(text[i - 1] ?? "")) {
+      // a lone `&` runs what precedes it in the background (`>&`, `&>`, `2>&1` are redirections)
+      boundary("&");
     } else if (c === "(" || c === ")") {
       // a subshell `( … )`: its body is its own segment list (`$(…)` was cut out before the split)
-      boundary();
+      boundary(c);
     } else if (c === "{" && blank && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
       // a brace group `{ …; }` opener as a word of its own (`${VAR}` and `{a,b}` are glued, never split)
-      boundary();
+      boundary("{");
     } else if (c === "}" && (i === 0 || /[\s;]/.test(text[i - 1])) && (i + 1 === text.length || /[\s;&|)]/.test(text[i + 1]))) {
-      boundary();
+      boundary("}");
     } else {
       cur += c;
       if (blank && !/\s/.test(c)) blank = false;
     }
   }
-  out.push(cur);
+  boundary("");
   if (quote !== undefined) {
     // bash would reject an unterminated quote; a heredoc or comment the scan missed is the likelier reading
     const tail = splitTopLevel(text.slice(quoteAt + 1), false);
     out.length = quoteOut;
-    tail[0] = `${quoteCur}${quote}${tail[0]}`;
+    tail[0] = { text: `${quoteCur}${quote}${tail[0].text}`, end: tail[0].end };
     out.push(...tail);
   }
   return out;
 }
 
-/** A normalized segment and the directories its stripped `env -C`/`sudo -D` prefixes run it in, as written. */
+/** One split piece after normalization (`text` is "" for the empty piece before a `(`/`{` or after a `)`/`}`). */
 interface Normalized {
   text: string;
+  /** The operator that ends the piece. */
+  end: Op;
+  /** Directories its stripped `env -C`/`sudo -D` prefixes run it in, as written. */
   chdirs: string[];
+  /** A wrapper, assignment or keyword was stripped: a `cd` behind it may not move this shell. */
+  prefixed: boolean;
+  /** It opens a loop (`while`/`until`/`for`/`select`) or an `if`/`case`, or closes one (`fi`/`done`/`esac`). */
+  compound: Compound | "close" | undefined;
+  /** The normalized `sh -c "…"` / `eval "…"` literal it runs in a child shell. */
+  payload: Normalized[];
 }
+type Compound = "loop" | "if" | "case";
+/** The compound keyword a piece starts with, before prefix stripping. */
+const COMPOUND_WORD = /^(?:(while|until|for|select)|(if)|(case)|(fi|done|esac))(?=[\s;]|$)/;
 
 /**
  * D-03 normalization: the inner text of every `$(…)` / backtick substitution becomes its own command, the rest is
- * split on `;`, `&&`, `||`, `|` (outside quotes), and each segment loses leading `env X=…`, `X=…`, `sudo`, `command`
- * and wrapper words. A literal `sh -c "…"` / `eval "…"` argument is normalized in turn and its segments appended
- * (the outer segment stays too); `bash -c "$VAR"` is opaque by design (the documented residual).
+ * split on `;`, `&&`, `||`, `|`, `&` (outside quotes), and each segment loses leading `env X=…`, `X=…`, `sudo`,
+ * `command`, wrapper words and shell keywords (`if`, `then`, `do`, `!` …). A literal `sh -c "…"` / `eval "…"`
+ * argument is normalized in turn and its segments appended (the outer segment stays too); `bash -c "$VAR"` is opaque
+ * by design (the documented residual).
  */
 export function normalize(command: string): string[] {
-  return normalizeSegments(command, 0).map((s) => s.text);
+  const texts: string[] = [];
+  const collect = (items: Normalized[]) => {
+    for (const item of items) {
+      if (item.text !== "") texts.push(item.text);
+      collect(item.payload);
+    }
+  };
+  collect(normalizeSegments(command, 0));
+  return texts;
 }
 
 function normalizeSegments(command: string, depth: number): Normalized[] {
@@ -401,39 +438,52 @@ function normalizeSegments(command: string, depth: number): Normalized[] {
     rest = `${rest.slice(0, m.index)} ${rest.slice(m.index + m[0].length)}`;
   }
   parts.push(rest);
-  const segments: Normalized[] = [];
+  const items: Normalized[] = [];
   for (const part of parts) {
-    for (let seg of splitTopLevel(part)) {
-      seg = seg.trim();
+    for (const piece of splitTopLevel(part)) {
+      let seg = piece.text.trim();
+      const keyword = COMPOUND_WORD.exec(seg);
+      const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
       // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
       let at = 0;
       for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
       const chdirs = at === 0 ? [] : prefixChdirs(seg.slice(0, at));
       seg = seg.slice(at);
-      if (seg === "") continue;
-      segments.push({ text: seg, chdirs });
-      if (depth < MAX_LITERAL_DEPTH) {
-        // `sh -c "<literal>"`, or the quoted line left behind by a stripped `eval`
-        const literal = quotedLiteral(seg, SHELL_C.exec(seg)?.[0].length ?? 0);
-        if (literal !== undefined) segments.push(...normalizeSegments(literal, depth + 1));
-      }
+      // `sh -c "<literal>"`, or the quoted line left behind by a stripped `eval`
+      const literal = seg !== "" && depth < MAX_LITERAL_DEPTH ? quotedLiteral(seg, SHELL_C.exec(seg)?.[0].length ?? 0) : undefined;
+      const payload = literal === undefined ? [] : normalizeSegments(literal, depth + 1);
+      items.push({ text: seg, end: piece.end, chdirs, prefixed: at > 0, compound, payload });
     }
   }
-  return segments;
+  return items;
 }
 
+/** Per wrapper: its chdir option with the directory attached (`-CDIR`, `--chdir=DIR`) and as a word of its own. */
+const CHDIR_OPTION: Record<string, readonly [RegExp, RegExp]> = {
+  env: [/^(?:--chdir=|-[A-Za-z]*C(?=.))(.*)$/, /^(?:--chdir|-[A-Za-z]*C)$/],
+  sudo: [/^(?:--chdir=|-[A-Za-z]*D(?=.))(.*)$/, /^(?:--chdir|-[A-Za-z]*D)$/],
+  doas: [/^(?:--chdir=|-[A-Za-z]*D(?=.))(.*)$/, /^(?:--chdir|-[A-Za-z]*D)$/],
+};
+
 /**
- * The directories a stripped prefix runs its command in: `env -C DIR` / `-CDIR` / `-iC DIR` / `--chdir[=]DIR` and
- * `sudo -D DIR` / `--chdir[=]DIR`, in order. sudo's `-C N` (close-from) reads as a directory too: one more
- * candidate only over-blocks.
+ * The directories a stripped prefix runs its command in, in order: `env -C DIR` / `-CDIR` / `-iC DIR` /
+ * `--chdir[=]DIR` and `sudo`/`doas` `-D DIR` / `--chdir[=]DIR`.
  */
 function prefixChdirs(prefix: string): string[] {
+  if (!/(?:^|\s)-(?:[A-Za-z]*[CD]|-chdir)/.test(prefix)) return [];
   const words = prefix.split(/\s+/).filter((w) => w !== "").map((w) => w.replace(/^(['"])(.*)\1$/, "$2"));
   const dirs: string[] = [];
+  let option: readonly [RegExp, RegExp] | undefined; // the chdir option of the wrapper whose flags these are
   for (let i = 0; i < words.length; i++) {
-    const attached = /^(?:--chdir=|-[A-Za-z]*[CD](?=.))(.*)$/.exec(words[i]);
+    const wrapper = words[i].includes("=") ? "" : posix.basename(words[i]);
+    if (Object.hasOwn(CHDIR_OPTION, wrapper)) {
+      option = CHDIR_OPTION[wrapper];
+      continue;
+    }
+    if (option === undefined || !words[i].startsWith("-")) continue;
+    const attached = option[0].exec(words[i]);
     if (attached !== null) dirs.push(attached[1]);
-    else if (/^(?:--chdir|-[A-Za-z]*[CD])$/.test(words[i]) && words[i + 1] !== undefined) dirs.push(words[++i]);
+    else if (option[1].test(words[i]) && words[i + 1] !== undefined) dirs.push(words[++i]);
   }
   return dirs;
 }
@@ -867,55 +917,161 @@ export const RULES: readonly Rule[] = [
   },
 ];
 
-/** More directories than this in one command make the rest unknown (bounds segments × directories). */
-const MAX_CWDS = 16;
+/** One possible shell state while walking a command: the directory and the pushd stack (undefined: unknown). */
+interface World {
+  dir: string | undefined;
+  stack: (string | undefined)[] | undefined;
+}
+/** More worlds than this in one command collapse to one unknown directory (bounds segments × directories). */
+const MAX_WORLDS = 16;
+
+/** Deduplicated worlds; past MAX_WORLDS, one unknown world (it blocks every relative write, a superset). */
+function distinct(worlds: World[]): World[] {
+  const byKey = new Map<string, World>();
+  for (const w of worlds) byKey.set(JSON.stringify([w.dir ?? null, w.stack ?? null]), w);
+  return byKey.size > MAX_WORLDS ? [{ dir: undefined, stack: undefined }] : [...byKey.values()];
+}
 
 /**
  * The directory `cd`/`pushd` with these operands (or an `env -C` prefix) moves to from `from`; undefined when it
- * cannot be known here: `cd -`, `pushd +N`/`-N`, more than one operand, a `$VAR`/glob/brace/quoted/escaped operand,
- * or a relative operand from an unknown directory or under a non-empty CDPATH. No operand is `~`.
+ * cannot be known here: `cd -`, `pushd +N`/`-N`, a `-`-led or more than one operand, a `$VAR`/glob/brace/quoted/
+ * escaped operand, or a relative operand from an unknown directory or under a non-empty CDPATH. No operand is `~`.
  */
 function chdirTo(dirs: string[], from: string | undefined, facts: GuardFacts): string | undefined {
   if (dirs.length > 1) return undefined;
   const dir = dirs[0] ?? "~";
-  if (dir === "-" || /^[+-]\d+$/.test(dir) || /[$`*?[{\\"']/.test(dir.replace(HOME_PREFIX, ""))) return undefined;
+  if (/^[-+]/.test(dir) || /[$`*?[{\\"']/.test(dir.replace(HOME_PREFIX, ""))) return undefined;
   const absolute = dir.startsWith("/") || HOME_PREFIX.test(dir);
   if (!absolute && (from === undefined || (Boolean(facts.env.CDPATH) && !/^\.\.?(?:\/|$)/.test(dir)))) return undefined;
   return resolvePath(dir, { cwd: from ?? "/", home: facts.home });
 }
 
 /**
- * The first row (table order) matching any normalized segment of `command`. D-08: every segment is tried in each
- * directory its relative paths may resolve in — the session cwd plus every `cd`/`pushd` target and `env -C`/`sudo -D`
- * directory before it, each resolved from the one before. Earlier directories stay candidates, so subshells, `||`
- * branches, `popd` and the one-command scope of `env -C` need no model (that only over-blocks). A directory that
- * cannot be resolved adds an unknown one (`cwd` undefined: every relative write target is protected) for all later
- * segments. `$(…)`/backtick bodies are cut out and listed first, so in a command holding one every directory change
- * is unknown and every segment is tried in every directory of the command.
+ * The worlds after `cd`/`pushd`/`popd` (`words`) in world `w`. A move that may fail — or may not run at all
+ * (`conditional`: after `&&`/`||`, inside an `if`/`case`/loop, behind a wrapper) — keeps the unmoved world too; a
+ * move to the directory itself or an ancestor cannot fail. `popd` returns to the pushed directory, stays put on an
+ * empty stack (it fails), and yields an unknown directory on an unknown stack; inside a loop (any iteration count)
+ * the stack is unknown.
+ */
+function changeDir(words: string[], w: World, conditional: boolean, loop: boolean, facts: GuardFacts): World[] {
+  let i = 1;
+  while (/^-[LPe@]+$/.test(words[i] ?? "")) i++;
+  if (words[i] === "--") i++;
+  const args = words.slice(i);
+  const unknown: World = { dir: undefined, stack: undefined };
+  const kept = conditional ? [w] : [];
+  if (words[0] === "popd") {
+    if (args.length > 0 || w.stack === undefined || loop) return [...kept, unknown];
+    if (w.stack.length === 0) return [w];
+    return [...kept, { dir: w.stack[w.stack.length - 1], stack: w.stack.slice(0, -1) }];
+  }
+  if (words[0] === "pushd" && args.length === 0) return [...kept, unknown];
+  const dir = chdirTo(args, w.dir, facts);
+  const from = w.dir === undefined ? undefined : w.dir || "/";
+  const sure = dir === "/" || (dir !== undefined && from !== undefined && (from === dir || from.startsWith(`${dir}/`)));
+  const stack = words[0] !== "pushd" ? w.stack : loop || w.stack === undefined ? undefined : [...w.stack, w.dir];
+  return sure && !conditional ? [{ dir, stack }] : [w, { dir, stack }];
+}
+
+/** A `(`/`{` nesting level of the walk (the command itself is level 0). */
+interface Level {
+  open: Op;
+  /** The current member runs only after `&&`/`||`. */
+  cond: boolean;
+  /** The group itself was opened conditionally or inside a compound. */
+  inherited: boolean;
+  /** Open `if`/`case`/loop compounds at this level. */
+  compounds: Compound[];
+  /** Worlds at the start of the current and-or list, pipeline and pipeline member. */
+  list: World[];
+  pipe: World[] | undefined;
+  member: World[];
+  /** A `(` subshell: the worlds its close restores. */
+  saved: World[] | undefined;
+}
+
+/**
+ * Push each segment of `items` once per directory it may run in, starting from `start` (D-08). Bash scoping:
+ * `cd`/`pushd`/`popd` move the shell for what follows; a `( … )` subshell, every pipeline member and a `&`
+ * background list restore the directory afterwards (the last pipeline member's moves are also kept, as zsh and
+ * `lastpipe` run it in the shell); `{ …; }` does not restore. `env -C`/`sudo -D` move only their own command and its
+ * `sh -c` payload (a child shell with an empty stack); the command does not run where the chdir fails.
+ */
+function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segment[]): void {
+  let cur = start;
+  const levels: Level[] = [
+    { open: "", cond: false, inherited: false, compounds: [], list: cur, pipe: undefined, member: cur, saved: undefined },
+  ];
+  for (const item of items) {
+    const level = levels[levels.length - 1];
+    if (item.compound === "close") level.compounds.pop();
+    else if (item.compound !== undefined) level.compounds.push(item.compound);
+    if (item.text !== "") {
+      const seg = parseSegment(item.text, undefined);
+      let runIn = cur;
+      for (const dir of item.chdirs) runIn = distinct(runIn.map((w) => ({ dir: chdirTo([dir], w.dir, facts), stack: w.stack })));
+      for (const cwd of new Set(runIn.map((w) => w.dir))) out.push({ ...seg, cwd });
+      walk(item.payload, runIn.map((w) => ({ dir: w.dir, stack: [] })), facts, out);
+      if (item.chdirs.length === 0 && /^(?:cd|pushd|popd)$/.test(seg.words[0] ?? "")) {
+        const conditional = item.prefixed || level.cond || level.inherited || level.compounds.length > 0;
+        const loop = levels.some((l) => l.compounds.includes("loop"));
+        cur = distinct(cur.flatMap((w) => changeDir(seg.words, w, conditional, loop, facts)));
+      }
+    }
+    const { end } = item;
+    if (end === "(" || end === "{") {
+      const inherited = level.cond || level.inherited || level.compounds.length > 0;
+      const saved = end === "(" ? cur : undefined;
+      levels.push({ open: end, cond: false, inherited, compounds: [], list: cur, pipe: undefined, member: cur, saved });
+      continue;
+    }
+    const pattern = end === ")" && level.compounds[level.compounds.length - 1] === "case";
+    if (!pattern && levels.length > 1 && level.open === (end === ")" ? "(" : end === "}" ? "{" : undefined)) {
+      if (level.pipe !== undefined) cur = distinct([...level.pipe, ...cur]);
+      levels.pop();
+      if (level.saved !== undefined) cur = level.saved;
+      continue;
+    }
+    if (end === "|") {
+      level.pipe ??= level.member;
+      cur = level.pipe;
+    } else if (end === "&") {
+      cur = level.list;
+      level.pipe = undefined;
+      level.cond = false;
+    } else {
+      // `;`, `&&`, `||`, a newline, the end, a case pattern's `)`, an unmatched `)`/`}`
+      if (level.pipe !== undefined) cur = distinct([...level.pipe, ...cur]);
+      level.pipe = undefined;
+      level.cond = end === "&&" || end === "||";
+    }
+    level.member = cur;
+    if (end !== "&&" && end !== "||" && end !== "|") level.list = cur;
+  }
+}
+
+/**
+ * The first row (table order) matching any normalized segment of `command`, each segment tried in every directory it
+ * may run in (D-08, walk). An unknown directory (`cwd` undefined) makes every relative write target protected.
+ * `$(…)`/backtick bodies are cut out and listed first, so the order of directory changes is lost: in a command
+ * holding one, any directory change makes every segment run in the session cwd and an unknown directory.
  */
 export function matchRule(command: string, facts: GuardFacts): Rule | undefined {
-  const substituted = /\$\(|`/.test(command);
-  const cwds = new Set<string | undefined>([facts.cwd]);
-  let current: string | undefined = facts.cwd;
-  const moveTo = (dirs: string[]) => {
-    current = substituted ? undefined : chdirTo(dirs, current, facts);
-    cwds.add(cwds.size < MAX_CWDS ? current : undefined);
-  };
-  const parsed: Segment[] = [];
+  const items = normalizeSegments(command, 0);
   const segments: Segment[] = [];
-  for (const { text, chdirs } of normalizeSegments(command, 0)) {
-    for (const dir of chdirs) moveTo([dir]);
-    const seg = parseSegment(text, undefined);
-    parsed.push(seg);
-    if (!substituted) for (const cwd of cwds) segments.push({ ...seg, cwd });
-    const { words } = seg;
-    if (words[0] === "cd" || words[0] === "pushd") {
-      let i = 1;
-      while (/^-[LPe@n]+$/.test(words[i] ?? "")) i++;
-      moveTo(words.slice(words[i] === "--" ? i + 1 : i));
-    }
-  }
-  if (substituted) for (const seg of parsed) for (const cwd of cwds) segments.push({ ...seg, cwd });
+  if (/\$\(|`/.test(command)) {
+    const flat: Normalized[] = [];
+    const collect = (list: Normalized[]) => {
+      for (const item of list) {
+        flat.push(item);
+        collect(item.payload);
+      }
+    };
+    collect(items);
+    const parsed = flat.filter((item) => item.text !== "").map((item) => ({ item, seg: parseSegment(item.text, undefined) }));
+    const moves = parsed.some(({ item, seg }) => item.chdirs.length > 0 || /^(?:cd|pushd|popd)$/.test(seg.words[0] ?? ""));
+    for (const { seg } of parsed) for (const cwd of moves ? [facts.cwd, undefined] : [facts.cwd]) segments.push({ ...seg, cwd });
+  } else walk(items, [{ dir: facts.cwd, stack: [] }], facts, segments);
   return RULES.find((rule) =>
     segments.some((seg) => (typeof rule.pattern === "function" ? rule.pattern(seg, facts, command) : rule.pattern.test(seg.text))),
   );

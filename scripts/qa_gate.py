@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import issue_gate, load_per_target  # noqa: E402
+from swarm.verdicts import gate_verdict, issue_gate, load_per_target  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
                  "high": ["unit", "integration", "e2e", "perf"]}
@@ -101,13 +101,14 @@ def run(args, ctx) -> dict:
             findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "coverage",
                                          f"coverage {m.group(1)}% < {args.min_coverage}%", owner_suggestion="A05"))
 
-    # D-13: the agent's per-target findings join the script's own findings on their target only
+    # D-13: the agent's per-target findings join the script's own findings on their target only; a target the
+    # agent omits gets the script's findings alone
     own = load_per_target(args.per_target_findings, len(findings), prefix="QF", owner="A05")
-    per_target = {t: findings + items for t, items in own.items()} if args.per_target_findings else None
-    findings = findings + [f for items in own.values() for f in items]
+    per_target = {t: findings + items for t, items in own.items()} if own else None
     env, recorded = issue_gate(ctx, gate="quality", agent_id="A08@local", findings=findings, runs=runs,
                                per_target=per_target)
-    verdict = env["payload"]["verdict"]
+    findings = findings + [f for items in own.values() for f in items]
+    verdict = gate_verdict(env, recorded)
     return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "runs": runs,
             "findings": findings, "executed": executed, "envelope": env, "recorded": sorted(recorded),
             "summary": f"quality gate {verdict.upper()} — runners: {[e['runner'] for e in executed] or 'none'}"}
@@ -120,7 +121,7 @@ def add_args(p):
     p.add_argument("--min-coverage", type=int, default=0, help="fail if pytest-cov TOTAL below this percent")
     p.add_argument("--per-target-findings",
                    help="JSON object {target task id: [findings]}: the agent's findings; each gate target's verdict "
-                        "gets the script's findings plus only its own (targets it omits get every finding)")
+                        "gets the script's findings plus only its own (targets it omits get the script's findings only)")
 
 
 if __name__ == "__main__":

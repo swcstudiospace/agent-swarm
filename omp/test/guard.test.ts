@@ -890,6 +890,19 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["cd - && echo x > y", "protected_path: protected-path-shell"],
     ["cd $(dirname .swarm/x) && touch tasks.db", "protected_path: protected-path-mutate"],
     ['cd .swarm && echo "$(touch tasks.db)"', "protected_path: protected-path-mutate"],
+    // scope: a move that may fail or may not run keeps the old directory too; only restored scopes drop it
+    ["true || cd .swarm; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["cd .swarm; cd /nonexistent; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["pushd /nonexistent; cd .swarm; popd; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["cd .swarm; pushd /; pushd /nonexistent; popd; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["cd .swarm; cd .. & touch tasks.db", "protected_path: protected-path-mutate"],
+    ["cd .swarm; nohup cd ..; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["cd .swarm; for d in; do cd ..; done; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["if cd .swarm; then touch tasks.db; fi", "protected_path: protected-path-mutate"],
+    ["echo | cd .swarm; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["{ cd .swarm; }; touch tasks.db", "protected_path: protected-path-mutate"],
+    ["(cd .swarm; case x in a) touch tasks.db;; esac)", "protected_path: protected-path-mutate"],
+    ["pushd .swarm; popd +1; touch tasks.db", "protected_path: protected-path-mutate"],
   ])("D-08 cd: %s blocks inside naming %s, passes in main", (command, tail) => {
     expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
@@ -898,6 +911,9 @@ describe("HOOK-03 shell twin and D-08", () => {
   test.each([
     "cd src && touch a.ts", "cd .swarm && cat tasks.db", "cd .swarm && ls; cd .. && git status", "cd /tmp && echo x > out.txt",
     'cd "$DIR" && echo x > /tmp/out.txt', "env -C build make", "cd build && make -j$(nproc)", "pushd src && sed -i s/a/b/ x.ts && popd",
+    // restored or one-command scopes do not reach later writes
+    "pushd .omp; popd; echo x > out.txt", "(cd .swarm && cat x); echo y > out.txt", "env -C .swarm true; touch a.txt",
+    "cd .swarm; cd ..; touch a.txt", "cd .swarm | touch a.txt", "cd .swarm & touch a.txt", "sudo -D .swarm true && touch a.txt",
   ])("D-08 cd: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
@@ -906,6 +922,27 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(bash("cd .swarm && sqlite3 tasks.db \"UPDATE tasks SET state='DONE'\""), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
     expect(guardToolCall(bash(`env -C ${CWD}/.swarm sqlite3 tasks.db .dump`), facts(B05))).toEqual({ block: true, reason: SWARM_STATE });
   });
+
+  /** Compound keywords and a lone `&` put a command behind them; every row still sees it. */
+  test.each([
+    ["if true; then git push -f; fi", "destructive: git-force-push"],
+    ["for i in 1; do touch .swarm/x; done", "protected_path: protected-path-mutate"],
+    ["true & git push --force", "destructive: git-force-push"],
+    ["! git push -f", "destructive: git-force-push"],
+    ["while false; do :; done; until true; do rm -rf /; done", "destructive: rm-rf-protected"],
+    ["if false; then :; elif true; then git reset --hard; else :; fi", "destructive: git-reset-hard"],
+    ["make |& git push -f", "destructive: git-force-push"],
+  ])("keywords: %s blocks inside naming %s", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each(["if [ -f x ]; then echo ok; fi", "make &> build.log", "ls 2>&1 | tee log.txt", "sleep 1 & wait; echo x > out.txt", "cat a >&2"])(
+    "keywords: %s passes",
+    (command) => {
+      expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+    },
+  );
 
   test("through the handler: eval, protected write and orch shell block for a05; main untouched", () => {
     const { run } = guardHandler({ activeTools: ["task"] });

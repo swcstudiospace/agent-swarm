@@ -49,6 +49,12 @@ def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner:
     return out
 
 
+def gate_verdict(env: dict, recorded: dict[str, dict]) -> str:
+    """A gate script's overall verdict: fail when its envelope or any recorded per-target verdict fails."""
+    verdicts = [env["payload"]["verdict"], *(e["payload"]["verdict"] for e in recorded.values())]
+    return "fail" if "fail" in verdicts else "pass"
+
+
 def simulated_failures() -> set[str]:
     """SWARM_DRYRUN_FAIL='T7f3a-be:quality,T7f3a-fe:review' makes those dry-run gate verdicts fail every time."""
     return {x.strip() for x in os.environ.get("SWARM_DRYRUN_FAIL", "").split(",") if x.strip()}

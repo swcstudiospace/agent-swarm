@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import issue_gate, load_per_target  # noqa: E402
+from swarm.verdicts import gate_verdict, issue_gate, load_per_target  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".vue", ".svelte"}
@@ -189,13 +189,14 @@ def run(args, ctx) -> dict:
         hits = [f for f in findings if f["kind"] == kind and f["severity"] in blocking]
         runs[kind] = "fail" if hits else ("pass" if counts[kind] or kind != "iac" else "skipped:no-iac")
     digest = "sha256:" + hashlib.sha256(json.dumps(sorted(f["id"] for f in findings + suppressed)).encode()).hexdigest()
-    # D-13: the agent's per-target findings join the scan's findings on their target only (never allow-listed)
+    # D-13: the agent's per-target findings join the script's own findings on their target only; a target the
+    # agent omits gets the script's findings alone
     own = load_per_target(args.per_target_findings, len(findings), prefix="SF", owner="A10")
-    per_target = {t: findings + items for t, items in own.items()} if args.per_target_findings else None
-    findings = findings + [f for items in own.values() for f in items]
+    per_target = {t: findings + items for t, items in own.items()} if own else None
     env, recorded = issue_gate(ctx, gate="security", agent_id="A10@local", findings=findings, runs=runs,
                                per_target=per_target, extra={"scan_digest": digest, "suppressed": suppressed})
-    verdict = env["payload"]["verdict"]
+    findings = findings + [f for items in own.values() for f in items]
+    verdict = gate_verdict(env, recorded)
     return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "runs": runs,
             "suppressed": suppressed, "scan_digest": digest, "envelope": env,
             "summary": f"security gate {verdict.upper()} — {len(findings)} findings, {len(suppressed)} suppressed; runs: {runs}"}
@@ -207,7 +208,7 @@ def add_args(p):
     p.add_argument("--timeout", type=int, default=600, help="per-audit-tool timeout in seconds")
     p.add_argument("--per-target-findings",
                    help="JSON object {target task id: [findings]}: the agent's findings; each gate target's verdict "
-                        "gets the scan's findings plus only its own (targets it omits get every finding)")
+                        "gets the scan's findings plus only its own (targets it omits get the script's findings only)")
 
 
 if __name__ == "__main__":

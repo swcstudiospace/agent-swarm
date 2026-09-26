@@ -397,6 +397,26 @@ def test_headless_quality_agent_failure_reaches_its_target_only(tmp_path, monkey
     assert ts.latest_verdicts("P-fe")["quality"]["verdict"] == "pass"
 
 
+@pytest.mark.parametrize("script,gate,gate_id", [("qa_gate.py", "quality", "P-qa"), ("sec_gate.py", "security", "P-sec")])
+def test_gate_findings_for_one_target_leave_omitted_target_clean(tmp_path, script, gate, gate_id):
+    """In-session swarm_gate: findings listed for one target only never fail a target the agent omitted, and the
+    script's overall status fails because one recorded target verdict failed."""
+    plan = [{"id": "be", "capability": "code.backend", "agent": "A05"},
+            {"id": "fe", "capability": "code.frontend", "agent": "A06"},
+            {"id": gate_id[2:], "capability": f"gate.{gate}", "agent": "A08" if gate == "quality" else "A10",
+             "depends_on": ["be", "fe"], "gates": {"gate": gate, "for": ["be", "fe"]}}]
+    ts, swarm, work, corr = _setup(tmp_path, plan, targets=("P-be", "P-fe"), leased=(gate_id,))
+    f = tmp_path / "findings.json"
+    f.write_text(json.dumps({"P-be": _MAJOR}))
+    low = ["--risk-class", "low"] if gate == "quality" else []  # low risk: the empty repo's own checks pass
+    g = _script(swarm, script, "--task-id", gate_id, "--correlation-id", corr, "--root", str(work),
+                "--per-target-findings", str(f), *low, "--json")
+    assert g.returncode == 1, g.stdout + g.stderr
+    assert json.loads(g.stdout)["verdict"] == "fail"
+    assert ts.latest_verdicts("P-be")[gate]["verdict"] == "fail"
+    assert ts.latest_verdicts("P-fe")[gate]["verdict"] == "pass"
+
+
 def test_gate_risk_class_is_highest_of_gate_and_targets(tmp_path, monkeypatch):
     """The runner runs qa_gate at the highest risk class of the gate task and its targets (high-risk tiers)."""
     sr = _load_swarm_run(tmp_path, monkeypatch)
