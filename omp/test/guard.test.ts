@@ -610,6 +610,39 @@ describe("HOOK-02", () => {
     expect(guardToolCall(bash(command), inside(agent))).toBeUndefined();
   });
 
+  /** Every exemption token counts only in its own syntactic slot: never as a flag value, a later positional, or after `--`. */
+  test.each<[string, string, string]>([
+    ["kubectl -n production exec pod -- python3 -c 'x' --dry-run=client", A11, "kubectl-prod-change"],
+    ["kubectl -n prod apply -l --dry-run -f k.yaml", A11, "kubectl-prod-change"],
+    ["kubectl -n prod rollout restart deploy/status", A11, "kubectl-prod-change"],
+    ["kubectl -n prod apply -f view-last-applied", A11, "kubectl-prod-change"],
+    ["kubectl -n prod --as get delete ns x", A11, "kubectl-prod-change"],
+    ["helm upgrade plugin ./chart", A11, "helm-release-change"],
+    ["helm upgrade app ./c --set --dry-run", A11, "helm-release-change"],
+    ["helm upgrade app ./c -- --dry-run", A11, "helm-release-change"],
+    ["npm publish -- --dry-run", A12, "package-publish"],
+    ["cargo publish -- --dry-run", A12, "package-publish"],
+    ["gradle publishToMavenLocal publish", A12, "package-publish"],
+    ["gzip -- -c .swarm/tasks.db", B05, "protected-path-mutate"],
+    ["gzip -S -c .swarm/tasks.db", B05, "protected-path-mutate"],
+    ["cd .swarm && wget -- -O https://h/tasks.db", B05, "protected-path-shell"],
+    ["echo x > /dev/null/../../nonexistent-guard-cwd/.swarm/x", B05, "protected-path-shell"],
+    ["PWD=/nonexistent-guard-cwd/.swarm; echo x > $PWD/tasks.db", B05, "protected-path-shell"],
+    ["TMPDIR=.swarm; echo x > $TMPDIR/x", B05, "protected-path-shell"],
+    ["bun --cwd . scripts/ts/orch_plan.ts", B05, "swarm-state"],
+    ["node -r ./x.js scripts/ts/orch_plan.ts", B05, "swarm-state"],
+  ])("exemption slot: %s blocks for %s as %s", (command, agent, id) => {
+    expect(guardToolCall(bash(command), inside(agent))?.reason).toMatch(new RegExp(`[(: ]${id}\\)$`));
+  });
+
+  test.each<[string, string]>([
+    ["kubectl -n prod exec pod --dry-run=client -- ls", A11], ["helm upgrade app ./c --dry-run", A11], ["helm plugin install https://x", A11],
+    ["npm publish --dry-run", A12], ["gzip -c .swarm/tasks.db > /tmp/x.gz", B05], ["gzip -S .z -c .swarm/tasks.db > /tmp/x", B05],
+    ["cd .swarm && echo x > /dev/null", B05], ["echo x > $PWD/out.txt", B05], ["echo x > $TMPDIR/x", B05],
+  ])("exemption slot: %s still passes for %s", (command, agent) => {
+    expect(guardToolCall(bash(command), inside(agent))).toBeUndefined();
+  });
+
   test("top-level session with SWARM_TASK_ID and no session_init is in the swarm", () => {
     const facts: GuardFacts = { ...main, env: { SWARM_TASK_ID: "T-1" } };
     blockedWith(guardToolCall(bash("git reset --hard"), facts), "destructive");

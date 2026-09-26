@@ -202,6 +202,9 @@ function isProdMarker(token: string): boolean {
  * `--dry-run=none`/`=false` (and any other value) run for real.
  */
 const isDryRun = (w: string) => /^--dry-run(?:=(?:client|server|true))?$/.test(w);
+/** helm flags whose value is the next word (`--set k=v`, `-f values.yaml`, `--kube-context c` …). */
+const HELM_VALUE_FLAG =
+  /^(?:-f|--values|--set|--set-string|--set-file|--set-json|--set-literal|-n|--namespace|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--kube-ca-file|--version|--repo|--username|--password|--post-renderer|--post-renderer-args|--timeout|--description|-o|--output|--registry-config|--repository-cache|--repository-config|--burst-limit|--qps)$/;
 /** kubectl flags whose value names where the change lands (D-04 markers apply to these values). */
 const KUBECTL_TARGET_FLAG = /^(?:-n|--namespace|--context|--cluster|--kubeconfig|-s|--server)$/;
 /** kubectl flags whose value is a file, selector, format, container, identity or count, never a prod marker. */
@@ -232,14 +235,19 @@ const KUBECTL_VERB: Record<string, true> = {
  */
 function kubectlProdChange({ words, marked }: Segment): boolean {
   const k = words.findIndex((w) => w === "kubectl" || w === "oc" || w === "kubecolor");
-  if (!(k === 0 || (k === 1 && /^(?:microk8s|k3s|minikube)$/.test(words[0]))) || words.some(isDryRun)) return false;
+  if (!(k === 0 || (k === 1 && /^(?:microk8s|k3s|minikube)$/.test(words[0])))) return false;
   const targets: string[] = [];
   const positional: string[] = [];
+  let dryRun = false; // only kubectl's own flag counts: not a flag value, not the pod command after `--`
   for (let i = k + 1; i < words.length; i++) {
     const w = words[i];
     if (w === "--") break; // the command `exec`/`debug` run in the pod
     if (!w.startsWith("-") || w === "-") {
       positional.push(w);
+      continue;
+    }
+    if (isDryRun(w)) {
+      dryRun = true;
       continue;
     }
     const long = /^(--[^=]+)(?:=(.*))?$/.exec(w);
@@ -250,7 +258,7 @@ function kubectlProdChange({ words, marked }: Segment): boolean {
     if (target && value !== undefined) targets.push(value);
   }
   const at = positional.findIndex((w) => Object.hasOwn(KUBECTL_VERB, w));
-  if (at === -1 || !Object.hasOwn(KUBECTL_CHANGE, positional[at])) return false;
+  if (dryRun || at === -1 || !Object.hasOwn(KUBECTL_CHANGE, positional[at])) return false;
   const [verb, sub] = [positional[at], positional[at + 1]];
   if (verb === "rollout" && (sub === "status" || sub === "history")) return false;
   if (verb === "apply" && sub === "view-last-applied") return false;
@@ -889,7 +897,10 @@ function git(words: string[]): { sub: string | undefined; args: string[] } {
 }
 const gitIs = (seg: Segment, sub: string) => git(seg.words).sub === sub;
 const shortFlag = (w: string, letters: RegExp) => /^-[A-Za-z]+$/.test(w) && letters.test(w);
-const operands = (args: string[]) => args.filter((a) => !a.startsWith("-"));
+/** The words before a `--` end of options: a tool's own flags (what follows are operands, or another command's words). */
+const ownWords = (words: string[]) => (words.includes("--") ? words.slice(0, words.indexOf("--")) : words);
+/** Operands: the non-flag words before a `--`, and every word after it. */
+const operands = (args: string[]) => [...ownWords(args).filter((a) => !a.startsWith("-")), ...args.slice(ownWords(args).length + 1)];
 
 /** A target that `~`/`$HOME` expansion makes absolute. */
 const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/;
@@ -1001,7 +1012,8 @@ function protectedTarget(target: string, seg: Segment, facts: GuardFacts): boole
   if (SAFE_SINK.test(target)) return false;
   let path = target;
   if (facts.tmp !== "") path = path.replace(/^(?:\$TMPDIR|\$\{TMPDIR\})(?=\/|$)/, facts.tmp);
-  if (seg.cwd !== undefined) path = path.replace(/^(?:\$PWD|\$\{PWD\})(?=\/|$)/, seg.cwd || "/");
+  // `$PWD` is the tracked directory unless the command assigns PWD itself (matchRule marks the env)
+  if (seg.cwd !== undefined && facts.env.PWD !== CUT) path = path.replace(/^(?:\$PWD|\$\{PWD\})(?=\/|$)/, seg.cwd || "/");
   const rest = path.replace(HOME_PREFIX, "");
   if (/[$`\u0001]/.test(rest) || rest.startsWith("~") || (HOME_PREFIX.test(path) && facts.home.includes(CUT))) return true;
   if (seg.cwd === undefined && !path.startsWith("/") && !HOME_PREFIX.test(path)) return true;
@@ -1239,7 +1251,7 @@ function shellWriteTargets({ marked, targetWords: words }: Segment): string[] {
   }
   const remoteName =
     (cmd === "curl" && words.some((w) => /^(?:-[A-Za-z]*O[A-Za-z]*|--remote-name(?:-all)?)$/.test(w))) ||
-    (cmd === "wget" && !words.some((w) => /^(?:-O|--output-document)/.test(w)));
+    (cmd === "wget" && !ownWords(words).some((w) => /^(?:-O|--output-document)/.test(w)));
   if (remoteName) {
     for (const url of args.filter((a) => /^[a-z][\w+.-]*:\/\//i.test(a))) targets.push(posix.basename(url.replace(/[?#].*$/, "")) || "index.html");
   }
@@ -1264,9 +1276,17 @@ const COMPRESSOR = /^(?:gzip|gunzip|bzip2|bunzip2|xz|unxz|lzma|unlzma|zstd|unzst
 function shellMutateTargets({ targetWords: words, opaque }: Segment): string[] {
   const cmd = words[0] ?? "";
   const args = operands(words.slice(1));
-  const has = (flag: RegExp) => words.some((w, i) => i > 0 && flag.test(w));
+  const has = (flag: RegExp) => ownWords(words).some((w, i) => i > 0 && flag.test(w));
   if (opaque || MUTATES_OPERANDS.test(cmd)) return args;
-  if (COMPRESSOR.test(cmd)) return has(/^(?:-[A-Za-z]*[ctl][A-Za-z]*|--(?:stdout|to-stdout|test|list))$/) ? [] : args;
+  if (COMPRESSOR.test(cmd)) {
+    // writing to stdout / testing / listing leaves the operands alone: only as the tool's own flag, not an option's value (`-S -c`)
+    const own = ownWords(words);
+    for (let i = 1; i < own.length; i++) {
+      if (/^(?:-[SDTFM]|--(?:suffix|threads|format|memlimit|memory))$/.test(own[i])) i++;
+      else if (/^(?:-[A-Za-z]*[ctl][A-Za-z]*|--(?:stdout|to-stdout|test|list))$/.test(own[i])) return [];
+    }
+    return args;
+  }
   if (cmd === "mv") {
     // `-t DIR` / `--target-directory[=]DIR` makes every other operand a source; otherwise the last one is the destination
     const t = words.findIndex((w) => w === "-t" || w === "--target-directory");
@@ -1354,6 +1374,9 @@ const GATE_STEMS: Record<string, true> = {
 
 /** An interpreter or runner word, versioned pythons (`python3.12`) included. */
 const INTERPRETER = /^(?:python(?:3(?:\.\d+)?)?|pypy3?|bun|bunx|node|deno|tsx|ts-node|npx|uv|pipx)$/;
+/** Interpreter and runner flags whose value is the next word, so it is never read as the script (`bun --cwd . x.ts`). */
+const INTERPRETER_VALUE_FLAG =
+  /^(?:-[XWr]|--(?:cwd|config|env-file|preload|require|import|loader|experimental-loader|with|python|project|directory|from|spec|index-url|extra-index-url|conditions|tsconfig-override))$/;
 /** python's module-run option: `-m mod`, `-mmod`, or clustered behind no-value flags (`-Bm mod`); group 1 is `mod`. */
 const MODULE_OPTION = /^-[bBdEiIOPqsSuvxR]*m(.*)$/;
 
@@ -1373,7 +1396,7 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
       const name = /(?:^|\.)([A-Za-z0-9_]+)$/.exec(mod[1] === "" ? (words[at] ?? "") : mod[1]);
       return name === null ? undefined : { stem: name[1], args: words.slice(at + 1) };
     }
-    if (/^-[XW]$/.test(words[i])) i++; // `python -X dev`, `-W error` take a value
+    if (INTERPRETER_VALUE_FLAG.test(words[i])) i++; // `python -X dev`, `bun --cwd dir`, `node -r mod` take a value
     i++;
   }
   const word = i === 0 ? argv0 : words[i];
@@ -1595,10 +1618,18 @@ export const RULES: readonly Rule[] = [
     id: "helm-release-change",
     capability: "prod_infra",
     agents: ["a11-devops"],
+    // `helm plugin …` is exempt only as the subcommand; `--dry-run` only as helm's own flag (not a `--set` value, not after `--`)
     pattern: ({ words }) => {
       const at = toolAt(words, /^helm$/);
-      const rest = at === -1 ? [] : words.slice(at + 1);
-      return !rest.includes("plugin") && !words.some(isDryRun) && rest.some((w) => /^(?:install|upgrade|uninstall|delete|del|un|rollback)$/.test(w));
+      if (at === -1) return false;
+      const positional: string[] = [];
+      let dryRun = false;
+      for (let i = at + 1; i < words.length && words[i] !== "--"; i++) {
+        if (!words[i].startsWith("-")) positional.push(words[i]);
+        else if (isDryRun(words[i])) dryRun = true;
+        else if (HELM_VALUE_FLAG.test(words[i])) i++;
+      }
+      return !dryRun && positional[0] !== "plugin" && positional.some((w) => /^(?:install|upgrade|uninstall|delete|del|un|rollback)$/.test(w));
     },
     samples: ["helm upgrade app ./chart", "helm install app ./chart", "helm --kube-context prod upgrade --install app ./c", "helm uninstall app", "helm rollback app 1"],
   },
@@ -1683,11 +1714,12 @@ export const RULES: readonly Rule[] = [
     id: "package-publish",
     capability: "prod_high_risk",
     agents: ["a12-release"],
+    // the verb and a `--dry-run` count only among the tool's own words (before `--`)
     pattern: ({ words }) =>
-      !words.some(isDryRun) &&
       words.some((w, i) => {
         const tool = posix.basename(w).replace(/@[^/]*$/, "");
-        return Object.hasOwn(PUBLISH_VERB, tool) && words.slice(i + 1).some((v) => PUBLISH_VERB[tool].test(v));
+        const own = ownWords(words.slice(i + 1));
+        return Object.hasOwn(PUBLISH_VERB, tool) && own.some((v) => PUBLISH_VERB[tool].test(v)) && !own.some(isDryRun);
       }),
     samples: ["npm publish", "pnpm publish --access public", "bun publish", "npm --registry https://r publish", "cargo publish", "twine upload dist/*", "poetry publish", "gem push x.gem"],
   },
@@ -1880,7 +1912,11 @@ export function matchRule(command: string, facts: GuardFacts, start: string | un
     ...facts,
     home: assignsVariable(command, "HOME") ? CUT : facts.home,
     tmp: assignsVariable(command, "TMPDIR") ? "" : facts.tmp,
-    env: assignsVariable(command, "CDPATH") ? { ...facts.env, CDPATH: CUT } : facts.env,
+    env: {
+      ...facts.env,
+      ...(assignsVariable(command, "CDPATH") ? { CDPATH: CUT } : {}),
+      ...(assignsVariable(command, "PWD") ? { PWD: CUT } : {}),
+    },
   };
   const segments: Segment[] = [];
   walk(normalizeSegments(command, 0, []), [{ dir: start, stack: [] }], shellFacts, segments);
