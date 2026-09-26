@@ -416,6 +416,19 @@ describe("HOOK-02", () => {
     ["git --work-tree /x push --force", "git-force-push"],
     ["git --git-dir /x/.git --namespace n reset --hard", "git-reset-hard"],
     ["git -c core.x=1 --no-pager push origin +feat", "git-force-push"],
+    // T-05-24: a wrapper word spelled as a path strips exactly like the bare word
+    ["/usr/bin/env git push --force origin main", "git-force-push"],
+    ["/bin/env git push -f", "git-force-push"],
+    ["../tools/env A=1 git clean -fdx", "git-clean-force"],
+    ["/usr/bin/sudo -u x git reset --hard", "git-reset-hard"],
+    ["/usr/bin/doas git reset --hard", "git-reset-hard"],
+    ["/usr/bin/command -p git push -f", "git-force-push"],
+    ["/usr/bin/time -p git reset --hard", "git-reset-hard"],
+    ["/usr/bin/nohup git push -f &", "git-force-push"],
+    ["/usr/bin/timeout -s KILL 5m /usr/bin/nice -n 5 git push -f", "git-force-push"],
+    ["/usr/bin/stdbuf -oL git reset --hard", "git-reset-hard"],
+    ["echo origin | /usr/bin/xargs -n 1 git push -f", "git-force-push"],
+    ["/usr/bin/eval 'git push -f'", "git-force-push"],
   ])("normalization: %s → %s", (command, id) => {
     expect(guardToolCall(bash(command), inside())?.reason).toEndWith(`: ${id})`);
   });
@@ -426,6 +439,7 @@ describe("HOOK-02", () => {
     ]);
     expect(normalize('psql -c "SELECT 1; DROP TABLE t" | cat')).toEqual(['psql -c "SELECT 1; DROP TABLE t"', "cat"]);
     expect(normalize('A="b c" B=1 env -u X sudo -u root command -p git status')).toEqual(["git status"]);
+    expect(normalize("/usr/bin/env -i /usr/bin/sudo -u root /bin/nice -n 5 git status")).toEqual(["git status"]);
     expect(normalize("(cd x && git status) | { read a; echo ${a} {1,2}; }")).toEqual(["cd x", "git status", "read a", "echo ${a} {1,2}"]);
     expect(normalize('echo "(x)" && find . \\( -name x \\)')).toEqual(['echo "(x)"', "find . \\( -name x \\)"]);
     expect(normalize("cat <<EOF > notes.md\nDon't panic; git push -f\nEOF\necho done")).toEqual(["cat <<EOF > notes.md", "echo done"]);
@@ -443,6 +457,8 @@ describe("HOOK-02", () => {
       [`${"sudo ".repeat(200_000)}git status`, ["git status"]],
       [`${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
       [`sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
+      [`${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
+      [`${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
       [`A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
     ];
     for (const [command, expected] of big) {
@@ -467,6 +483,9 @@ describe("HOOK-02", () => {
     "git push origin feat/x:feat/x", "git branch --delete merged", "git --work-tree /x status", "git -c core.x=1 push origin feat",
     // IN-01: the tmp dir subtree is scratch space
     `rm -rf ${TMP}/build-cache`, `rm -rf ${TMP}/swarm-omp-abc/x ${TMP}/y`,
+    // T-05-24: absolute-path wrappers around harmless commands, and words that only start like a wrapper
+    "/usr/bin/env git status", "/usr/bin/env python3 -m pytest", "/usr/bin/time ls", "/usr/bin/timeout 5 bun test", "/bin/ls -la",
+    "/usr/bin/envsubst -V", "/opt/bin/sudoers-lint x", "/usr/bin/sudo -u x git log",
   ])("negative inside swarm: %s → undefined", (command) => {
     expect(guardToolCall(bash(command), inside())).toBeUndefined();
   });
@@ -560,6 +579,8 @@ describe("HOOK-03 shell twin and D-08", () => {
     "bun scripts/ts/orch_plan.ts",
     "scripts/ts/orch_status.ts --ingest x",
     "cd /repo && SWARM_DIR=/tmp python3 ./scripts/orch_status.py --ingest=r.json",
+    // T-05-24: an absolute-path env wrapper
+    "/usr/bin/env python3 scripts/orch_status.py --ingest r.json",
     // WR-02: the executed word's basename, `-m` module runs and versioned interpreters count too
     "cd scripts && python3 orch_status.py --ingest r.json",
     "python3 -m scripts.orch_plan --brief-text x",
@@ -596,6 +617,10 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["uv run python scripts/rel_plan.py", B05, true],
     ["/usr/bin/python3 -X dev /repo/scripts/qa_gate.py", "a08-qa", true],
     ["./scripts/rev_gate.py --task T-1", "a09-reviewer", true],
+    // T-05-24: an absolute-path env wrapper
+    ["/usr/bin/env python3 scripts/rev_gate.py", B05, true],
+    ["/usr/bin/env python3 scripts/rev_gate.py --task T-1", "a09-reviewer", true],
+    ["/bin/env -i /usr/bin/python3 scripts/qa_gate.py", "a08-qa", true],
     // WR-02: the probe spellings of the owner's own run
     ["cd scripts && python3 rev_gate.py --task-id T-rev --json", "a09-reviewer", true],
     ["cd /opt/agent-swarm/scripts && python3 ./rev_gate.py --task-id T-rev --json", "a09-reviewer", true],
@@ -685,6 +710,56 @@ describe("HOOK-03 shell twin and D-08", () => {
 
   test("D-08: write xd://lsp passes inside", () => {
     expect(guardToolCall(call("write", { path: "xd://lsp", content: "{}" }), facts(B05))).toBeUndefined();
+  });
+
+  /** T-06-07: MCP tools and their `xd://mcp__…` devices act with the operator's credentials; every swarm session is closed to them. */
+  const MCP_TOOLS = ["mcp__linear_save_issue", "mcp__notion_update_page", "mcp__linear__delete_comment", "MCP__Greptile_Review"];
+  const MCP_DEVICES = ["xd://mcp__linear_save_issue", "XD://MCP__Notion_Create_Pages", "xd://mcp__linear_save_issue?x=1", "xd://mcp__relume_get_component/sub", "  xd://mcp__aio_status  "];
+  const headless = (): GuardFacts => facts(undefined, { env: { SWARM_AGENT: B05 } });
+  const inSwarm: [string, () => GuardFacts][] = [["a05", () => facts(B05)], ["a01", () => facts(A01)], ["headless SWARM_AGENT", headless]];
+
+  test.each(inSwarm)("T-06-07: %s blocks every MCP tool and MCP device write", (_, inside) => {
+    for (const name of MCP_TOOLS) {
+      expect(guardToolCall(call(name, { id: "x" }), inside())).toEqual({ block: true, reason: `BLOCKED needs: human-approval (mcp: ${name})` });
+    }
+    for (const path of MCP_DEVICES) {
+      const blocked = { block: true, reason: `BLOCKED needs: human-approval (mcp: ${path.trim()})` };
+      expect(guardToolCall(call("write", { path, content: "{}" }), inside())).toEqual(blocked);
+      expect(guardToolCall(call("write", { file_path: path, content: "{}" }), inside())).toEqual(blocked);
+    }
+  });
+
+  test("T-06-07: the main session and a generic task child still reach MCP tools and devices", () => {
+    for (const outside of [facts(undefined), facts("task")]) {
+      for (const name of MCP_TOOLS) expect(guardToolCall(call(name, { id: "x" }), outside)).toBeUndefined();
+      for (const path of MCP_DEVICES) expect(guardToolCall(call("write", { path, content: "{}" }), outside)).toBeUndefined();
+    }
+  });
+
+  test("T-06-07: through the handler, a05, A01 and a headless SWARM_AGENT session block; main passes", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const expected = { block: true, reason: "BLOCKED needs: human-approval (mcp: mcp__linear_save_issue)" };
+    const device = { block: true, reason: "BLOCKED needs: human-approval (mcp: xd://mcp__linear_save_issue)" };
+    for (const ctx of [agentCtx(CWD, B05, [], false), a01Ctx()]) {
+      expect(run(call("mcp__linear_save_issue", {}), ctx)).toEqual(expected);
+      expect(run(call("write", { path: "xd://mcp__linear_save_issue", content: "{}" }), ctx)).toEqual(device);
+    }
+    expect(run(call("mcp__linear_save_issue", {}), fakeCtx(CWD))).toBeUndefined();
+    expect(run(call("write", { path: "xd://mcp__linear_save_issue", content: "{}" }), fakeCtx(CWD))).toBeUndefined();
+    process.env.SWARM_AGENT = B05;
+    expect(run(call("mcp__linear_save_issue", {}), fakeCtx(CWD))).toEqual(expected);
+    expect(run(call("write", { path: "xd://mcp__linear_save_issue", content: "{}" }), fakeCtx(CWD))).toEqual(device);
+  });
+
+  test.each([
+    ["xd://lsp", undefined],
+    ["xd://ast_edit", undefined],
+    ["xd://mcp_x", undefined],
+    ["xd://run_code", "BLOCKED needs: human-approval (eval: xd-device)"],
+    ["xd://debug?x=1", "BLOCKED needs: human-approval (eval: xd-device)"],
+  ])("T-06-07: write %s keeps its outcome inside", (path, blocked) => {
+    const res = guardToolCall(call("write", { path, content: JSON.stringify({ ops: [], paths: ["src"] }) }), facts(B05));
+    expect(res).toEqual(blocked === undefined ? undefined : { block: true, reason: blocked });
   });
 
   const PROTECTED = [".swarm/tasks.db", "./.omp/config.yml", "~/.omp/agent/config.yml", `${CWD}/.swarm/x`, `${HOME}/.omp/y`, "src/../.swarm/z"];
