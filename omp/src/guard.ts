@@ -539,21 +539,32 @@ const GATE_STEMS: Record<string, true> = {
   sec_gate: true, security_gate: true, rel_plan: true, release_gate: true,
 };
 
-const INTERPRETER = /^(?:python3?|bun|node|deno|uv|pipx)$/;
+/** An interpreter word, versioned pythons (`python3.12`) included. */
+const INTERPRETER = /^(?:python(?:3(?:\.\d+)?)?|bun|node|deno|uv|pipx)$/;
+/** python's module-run option: `-m mod`, `-mmod`, or clustered behind no-value flags (`-Bm mod`); group 1 is `mod`. */
+const MODULE_OPTION = /^-[bBdEiIOPqsSuvxR]*m(.*)$/;
 
 /**
- * The repo script a segment executes (WR-07): argv[0] itself, or the first word after `python`/`python3`/`bun`/
- * `node`/`deno`/`uv`/`pipx` and their `run`/flags, when it lives under `scripts/` or `scripts/ts/`. A script named
- * anywhere else (`cat scripts/x.py`, `grep … scripts/ts/x.ts`, `pytest tests/test_x_gate.py`) is not a run.
+ * The repo script a segment executes (WR-07, WR-02): argv[0] itself, the first word after `python`/`python3[.N]`/
+ * `bun`/`node`/`deno`/`uv`/`pipx` and their `run`/flags, or the module after `-m` (`python3 -m scripts.rev_gate`).
+ * The stem is the executed file's basename or the module's last dotted name, so `cd scripts && python3 rev_gate.py`
+ * is a run too. A script only named (`cat scripts/x.py`, `grep … scripts/ts/x.ts`, `pytest tests/test_x_gate.py`,
+ * `python3 -m pytest scripts/x.py`) is not a run.
  */
 function executedScript({ words, argv0 }: Segment): { stem: string; args: string[] } | undefined {
   let i = 0;
   while (i < words.length && (INTERPRETER.test(words[i]) || words[i] === "run" || (i > 0 && words[i].startsWith("-")))) {
+    const mod = i > 0 ? MODULE_OPTION.exec(words[i]) : null;
+    if (mod !== null) {
+      const at = mod[1] === "" ? i + 1 : i; // `-m mod` or `-mmod`
+      const name = /(?:^|\.)([A-Za-z0-9_]+)$/.exec(mod[1] === "" ? (words[at] ?? "") : mod[1]);
+      return name === null ? undefined : { stem: name[1], args: words.slice(at + 1) };
+    }
     if (/^-[XW]$/.test(words[i])) i++; // `python -X dev`, `-W error` take a value
     i++;
   }
   const word = i === 0 ? argv0 : words[i];
-  const m = /(?:^|\/)scripts\/(?:ts\/)?([A-Za-z0-9_-]+)\.(?:py|ts)$/.exec(word ?? "");
+  const m = /(?:^|\/)([A-Za-z0-9_-]+)\.(?:py|ts)$/.exec(word ?? "");
   return m === null ? undefined : { stem: m[1], args: words.slice(i + 1) };
 }
 
@@ -567,7 +578,7 @@ const gateScriptRun = (seg: Segment): boolean => {
   return run !== undefined && Object.hasOwn(GATE_STEMS, run.stem);
 };
 
-/** A run of `scripts/orch_plan.py|ts`, or of `scripts/orch_status.py|ts` with `--ingest`/`--transition`. */
+/** A run of `orch_plan.py|ts` (or module), or of `orch_status.py|ts` (or module) with `--ingest`/`--transition`. */
 function orchStateScript(seg: Segment): boolean {
   const run = executedScript(seg);
   if (run === undefined) return false;

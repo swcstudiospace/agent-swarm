@@ -560,6 +560,13 @@ describe("HOOK-03 shell twin and D-08", () => {
     "bun scripts/ts/orch_plan.ts",
     "scripts/ts/orch_status.ts --ingest x",
     "cd /repo && SWARM_DIR=/tmp python3 ./scripts/orch_status.py --ingest=r.json",
+    // WR-02: the executed word's basename, `-m` module runs and versioned interpreters count too
+    "cd scripts && python3 orch_status.py --ingest r.json",
+    "python3 -m scripts.orch_plan --brief-text x",
+    "python3 -m scripts.orch_status --ingest=r.json",
+    "python3.12 scripts/orch_status.py --transition T-1 DONE",
+    "cd scripts/ts && bun orch_plan.ts",
+    "python3 other/orch_plan.py",
   ];
 
   test.each(ORCH)("HOOK-03 shell: %s blocks for a05, passes for A01 with task and for main", (command) => {
@@ -589,6 +596,18 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["uv run python scripts/rel_plan.py", B05, true],
     ["/usr/bin/python3 -X dev /repo/scripts/qa_gate.py", "a08-qa", true],
     ["./scripts/rev_gate.py --task T-1", "a09-reviewer", true],
+    // WR-02: the probe spellings of the owner's own run
+    ["cd scripts && python3 rev_gate.py --task-id T-rev --json", "a09-reviewer", true],
+    ["cd /opt/agent-swarm/scripts && python3 ./rev_gate.py --task-id T-rev --json", "a09-reviewer", true],
+    ["python3 -m scripts.rev_gate --task-id T-rev --json", "a09-reviewer", true],
+    ["python3.12 scripts/rev_gate.py --task-id T-rev --json", "a09-reviewer", true],
+    ["PYTHONPATH=. python -m scripts.rev_gate --task-id T-rev", "a09-reviewer", true],
+    ["bun scripts/ts/rev_gate.ts", "a09-reviewer", true],
+    ["python3 -mscripts.sec_gate", "a10-security", true],
+    ["python3 -B -m scripts.rel_plan", "a12-release", true],
+    ["/usr/bin/python3.11 -X dev scripts/qa_gate.py", "a08-qa", true],
+    ["python3 -m scripts.unknown_gate", "a09-reviewer", false],
+    ["python3.12 -m pytest tests/test_rev_gate.py", "a09-reviewer", false],
   ])("gate script: %s from %s blocks=%p", (command, agent, blocks) => {
     const res = guardToolCall(bash(command), facts(agent));
     if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-shell)" });
@@ -596,7 +615,23 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
   });
 
-  /** WR-07: reading, testing or linting the scripts is not running them; only an execution under scripts/ counts. */
+  /** WR-02: each gate stem, run by its owner or another agent through each spelling, is a run. */
+  const GATE_OWNER: Record<string, string> = {
+    qa_gate: "a08-qa", quality_gate: "a08-qa", rev_gate: "a09-reviewer", review_gate: "a09-reviewer",
+    sec_gate: "a10-security", security_gate: "a10-security", rel_plan: "a12-release", release_gate: "a12-release",
+  };
+  test.each(
+    Object.entries(GATE_OWNER).flatMap(([stem, owner]) =>
+      [`cd scripts && python3 ${stem}.py --json`, `python3 -m scripts.${stem} --json`, `python3.12 scripts/${stem}.py`, `bun scripts/ts/${stem}.ts`].flatMap(
+        (command) => [[command, owner], [command, B05]],
+      ),
+    ),
+  )("WR-02 gate script: %s from %s blocks", (command, agent) => {
+    expect(guardToolCall(bash(command), facts(agent))).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-shell)" });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  /** WR-07: reading, testing or linting the scripts is not running them; only an execution counts. */
   test.each([
     "cat scripts/orch_plan.py",
     "grep -n foo scripts/ts/orch_status.ts",
@@ -606,9 +641,18 @@ describe("HOOK-03 shell twin and D-08", () => {
     "ruff check scripts/rev_gate.py",
     "git diff scripts/qa_gate.py",
     "bun test tests/ts/orch_plan.test.ts",
-    "python3 other/orch_plan.py",
     "python3 scripts/orch_status.py --history",
     "bun scripts/ts/orch_status.ts --history",
+    // WR-02: basename and module matching still leave non-executions alone
+    "python3 -m scripts.orch_status --history",
+    "cd scripts && python3 orch_status.py --history",
+    "cd scripts && cat rev_gate.py",
+    "cd scripts && grep -n verdict rev_gate.py qa_gate.py",
+    "python3 -m pytest scripts/rev_gate.py",
+    "pytest tests/test_rev_gate.py",
+    "python3.12 -m pytest tests/test_qa_gate.py",
+    "ruff check rev_gate.py",
+    "bun test tests/ts/rel_plan.test.ts",
   ])("WR-07: %s passes for a05, a08 and a09", (command) => {
     for (const agent of [B05, "a08-qa", "a09-reviewer"]) expect(guardToolCall(bash(command), facts(agent))).toBeUndefined();
   });
