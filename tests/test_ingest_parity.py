@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from test_runner_gates import _clean_env, _lease, _load_swarm_run
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +19,7 @@ _PLAN = [
 ]
 _MAJOR = [{"severity": "major", "kind": "agent-verdict", "summary": "gate agent reported 'request_changes' without findings"}]
 _REQUEST_CHANGES = {"verdict": "request_changes", "findings": []}
+_PASS = {"verdict": "pass", "findings": []}
 
 
 def _script(swarm: Path, name: str, *args) -> subprocess.CompletedProcess:
@@ -25,22 +28,24 @@ def _script(swarm: Path, name: str, *args) -> subprocess.CompletedProcess:
                           env=env, cwd=ROOT)
 
 
-def _setup(base: Path):
-    """Plan P-be (low risk) + review gate task P-rev on an empty repo; P-be IN_REVIEW, P-rev leased by A01.
-    Returns (store, state dir, repo, correlation id)."""
-    from swarm.taskstore import TaskStore
+def _setup(base: Path, plan: list | None = None, risk: str = "low", targets=("P-be",), leased=("P-rev",)):
+    """Plan `plan` (default: P-be, low risk, + review gate task P-rev) on an empty repo; `targets` IN_REVIEW, the
+    `leased` gate tasks leased by A01. Returns (store, state dir, repo, correlation id)."""
+    from swarm.taskstore import GATES_BY_RISK, TaskStore
     work, swarm = base / "work", base / ".swarm"
     work.mkdir(parents=True)
-    plan = base / "plan.json"
-    plan.write_text(json.dumps({"tasks": _PLAN}))
-    p = _script(swarm, "orch_plan.py", "--plan", str(plan), "--prefix", "P", "--risk-class", "low",
+    plan_file = base / "plan.json"
+    plan_file.write_text(json.dumps({"tasks": plan or _PLAN}))
+    p = _script(swarm, "orch_plan.py", "--plan", str(plan_file), "--prefix", "P", "--risk-class", risk,
                 "--repo", str(work), "--json")
     assert p.returncode == 0, p.stdout + p.stderr
     ts = TaskStore(swarm / "tasks.db")
-    assert ts.required_gates("P-be") == ["review"]
-    _lease(ts, "P-be")
-    ts.transition("P-be", "IN_REVIEW")
-    _lease(ts, "P-rev")
+    for t in targets:
+        assert ts.required_gates(t) == GATES_BY_RISK[risk]
+        _lease(ts, t)
+        ts.transition(t, "IN_REVIEW")
+    for g in leased:
+        _lease(ts, g)
     return ts, swarm, work, json.loads(p.stdout)["correlation_id"]
 
 
@@ -50,12 +55,19 @@ def _rev_gate(swarm: Path, work: Path, corr: str, per_target: dict, gate_id: str
     g = _script(swarm, "rev_gate.py", "--task-id", gate_id, "--correlation-id", corr, "--root", str(work),
                 "--per-target-findings", str(f), "--json")
     assert g.returncode in (0, 1), g.stdout + g.stderr
-    assert json.loads(g.stdout)["recorded"] == ["P-be"]
+    assert json.loads(g.stdout)["recorded"] == sorted(per_target)
 
 
-def _ingest(swarm: Path, verdicts: dict, gate_id: str = "P-rev") -> subprocess.CompletedProcess:
+def _gate_script(swarm: Path, work: Path, corr: str, name: str, gate_id: str, *args) -> dict:
+    """Run a non-review gate script for leased gate task `gate_id`; returns its --json output."""
+    g = _script(swarm, name, "--task-id", gate_id, "--correlation-id", corr, "--root", str(work), *args, "--json")
+    assert g.returncode in (0, 1), g.stdout + g.stderr
+    return json.loads(g.stdout)
+
+
+def _ingest(swarm: Path, verdicts: dict, gate_id: str = "P-rev", gate: str = "review") -> subprocess.CompletedProcess:
     f = swarm.parent / "result.json"
-    f.write_text(json.dumps({"task_id": gate_id, "state": "IN_REVIEW", "gate": "review", "verdicts": verdicts}))
+    f.write_text(json.dumps({"task_id": gate_id, "state": "IN_REVIEW", "gate": gate, "verdicts": verdicts}))
     return _script(swarm, "orch_status.py", "--ingest", str(f), "--json")
 
 
@@ -132,6 +144,105 @@ def test_consistent_pass_done(tmp_path, swarm_dir):
     r = _ingest(swarm, {"P-be": {"verdict": "pass", "findings": []}})
     assert r.returncode == 0, r.stdout + r.stderr
     assert ts.get("P-be")["state"] == "DONE"
+
+
+_PLAN_MEDIUM = [
+    {"id": "be", "capability": "code.backend", "agent": "A05"},  # risk medium: requires the review and quality gates
+    {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be"],
+     "gates": {"gate": "review", "for": ["be"]}},
+    {"id": "qa", "capability": "gate.quality", "agent": "A08", "depends_on": ["be"],
+     "gates": {"gate": "quality", "for": ["be"]}},
+]
+
+
+def _qa_pass(swarm: Path, work: Path, corr: str, gate_id: str, targets: list[str]) -> None:
+    """qa_gate on the empty repo at --risk-class low (only a minor no-runner finding: pass), then its ingest."""
+    out = _gate_script(swarm, work, corr, "qa_gate.py", gate_id, "--risk-class", "low")
+    assert (out["verdict"], out["recorded"]) == ("pass", sorted(targets))
+    r = _ingest(swarm, {t: _PASS for t in targets}, gate_id, gate="quality")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_refused_review_holds_target_until_review_accepted(tmp_path, swarm_dir):
+    """CR-01: the pass row of a refused review ingest (verdict mismatch) must not approve the target when another
+    gate's ingest reconciles; the re-run review's accepted failure then reworks it."""
+    ts, swarm, work, corr = _setup(tmp_path, _PLAN_MEDIUM, "medium", leased=("P-rev", "P-qa"))
+    _rev_gate(swarm, work, corr, {"P-be": []})
+    _assert_mismatch_refused(ts, _ingest(swarm, {"P-be": _REQUEST_CHANGES}))
+    _qa_pass(swarm, work, corr, "P-qa", ["P-be"])
+    assert ts.get("P-qa")["state"] == "DONE"
+    assert ts.get("P-be")["state"] == "IN_REVIEW"
+    _fail_review(swarm, work, corr, "P-rev")  # the review agent re-runs swarm_gate with the major finding
+    be = ts.get("P-be")
+    assert (be["state"], be["rework_loops"]) == ("IN_PROGRESS", 1)
+
+
+_PLAN_TWO_TARGETS = [
+    {"id": "be", "capability": "code.backend", "agent": "A05"},
+    {"id": "fe", "capability": "code.frontend", "agent": "A06"},
+    {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["be", "fe"],
+     "gates": {"gate": "review", "for": ["be", "fe"]}},
+    {"id": "qa", "capability": "gate.quality", "agent": "A08", "depends_on": ["be", "fe"],
+     "gates": {"gate": "quality", "for": ["be", "fe"]}},
+]
+
+
+def test_target_first_failing_at_rerun_gets_next_rerun(tmp_path, swarm_dir):
+    """WR-01: a multi-target review gate fails P-be, then its rerun P-rev.r1 fails P-fe for the first time: P-fe
+    gets P-rev.r2 (the lineage's next rerun), so once reworked it waits for a review instead of stalling."""
+    ts, swarm, work, corr = _setup(tmp_path, _PLAN_TWO_TARGETS, "medium", targets=("P-be", "P-fe"))
+
+    def review_lineage() -> dict:
+        return {t["task_id"]: t["state"] for t in ts.list(correlation_id=corr) if t["task_id"].startswith("P-rev")}
+
+    _rev_gate(swarm, work, corr, {"P-be": _MAJOR, "P-fe": []})
+    assert _ingest(swarm, {"P-be": _REQUEST_CHANGES, "P-fe": _PASS}).returncode == 0
+    assert ts.get("P-be")["rework_loops"] == 1 and review_lineage()["P-rev.r1"] == "PLANNED"
+
+    ts.transition("P-be", "IN_REVIEW")
+    _lease(ts, "P-rev.r1")
+    _rev_gate(swarm, work, corr, {"P-be": [], "P-fe": _MAJOR}, "P-rev.r1")
+    assert _ingest(swarm, {"P-be": _PASS, "P-fe": _REQUEST_CHANGES}, "P-rev.r1").returncode == 0
+    fe = ts.get("P-fe")
+    assert (fe["state"], fe["rework_loops"]) == ("IN_PROGRESS", 1)
+    assert review_lineage().get("P-rev.r2") == "PLANNED"
+
+    ts.transition("P-fe", "IN_REVIEW")
+    _lease(ts, "P-qa")
+    _qa_pass(swarm, work, corr, "P-qa", ["P-be", "P-fe"])
+    assert ts.get("P-be")["state"] == "DONE"
+    assert ts.get("P-fe")["state"] == "IN_REVIEW"
+    assert not ts.get("P-fe")["notes_json"].get("gate_stall")
+    events = (swarm / "events.jsonl").read_text().splitlines()
+    assert not [e for e in map(json.loads, events)
+                if e["type"] == "escalation.request" and e["payload"]["task_id"] == "P-fe"]
+
+
+@pytest.mark.parametrize("rel_deps", [["rev", "qa", "sec"], ["be"]], ids=["after-gates", "after-build"])
+def test_release_rerun_waits_for_other_gate_reruns(tmp_path, swarm_dir, rel_deps):
+    """WR-03: after a release-gate failure reworks a high-risk target, the release rerun depends on the review,
+    quality and security reruns of that rework, so it is not ready before them."""
+    plan: list[dict] = [{"id": "be", "capability": "code.backend", "agent": "A05"}]
+    plan += [{"id": s, "capability": cap, "agent": a, "depends_on": ["be"], "gates": {"gate": gate, "for": ["be"]}}
+             for s, cap, a, gate in (("rev", "gate.review", "A09", "review"), ("qa", "gate.quality", "A08", "quality"),
+                                     ("sec", "gate.security", "A10", "security"))]
+    plan.append({"id": "rel", "capability": "release.plan", "agent": "A12", "depends_on": rel_deps,
+                 "gates": {"gate": "release", "for": ["be"]}})
+    ts, swarm, work, corr = _setup(tmp_path, plan, "high", leased=())
+    for g in ("P-rev", "P-qa", "P-sec"):  # these gate tasks ran; their rows are superseded by the rework anyway
+        _lease(ts, g)
+        for s in ("IN_REVIEW", "APPROVED", "DONE"):
+            ts.transition(g, s)
+    _lease(ts, "P-rel")
+    assert _gate_script(swarm, work, corr, "rel_plan.py", "P-rel")["verdict"] == "fail"
+    assert _ingest(swarm, {"P-be": {"verdict": "fail", "findings": []}}, "P-rel", gate="release").returncode == 0
+    assert ts.get("P-be")["rework_loops"] == 1
+
+    others = {"P-rev.r1", "P-qa.r1", "P-sec.r1"}
+    assert others <= set(ts.get("P-rel.r1")["depends_on"])
+    ts.transition("P-be", "IN_REVIEW")
+    ready = {t["task_id"] for t in ts.ready(corr)}
+    assert others <= ready and "P-rel.r1" not in ready
 
 
 def _headless(base: Path, monkeypatch, verdicts: dict):

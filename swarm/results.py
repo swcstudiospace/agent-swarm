@@ -232,7 +232,7 @@ RERUN_SUFFIX = re.compile(r"(\.r\d+)+$")
 
 
 def _rerun_index(task: dict) -> int:
-    """Rework loop a gate task reruns for: N for "<base>.rN", 0 for the original gate task."""
+    """Rerun sequence of a gate task within its lineage: N for "<base>.rN", 0 for the original gate task."""
     m = re.search(r"\.r(\d+)$", task["task_id"])
     return int(m.group(1)) if m else 0
 
@@ -255,31 +255,45 @@ def reconcile(store: TaskStore, corr: str, emit: Emit) -> list[str]:
                 store.transition(tid, S.IN_PROGRESS, reason="rework loop")
                 notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
                 # reopen gate tasks that target this task so they re-run after rework: one rerun per gate lineage
-                # (<base>, <base>.r1, <base>.r2, ...), cloned from its latest member, never from a superseded one
+                # (<base>, <base>.r1, <base>.r2, ...), cloned from its latest member, never from a superseded one, and
+                # numbered by the lineage (a multi-target gate's members are triggered by different targets)
                 lineages: dict[str, list[dict]] = {}
                 for g in store.list(correlation_id=corr):
                     if tid in g["notes_json"].get("gate_for", []):
                         lineages.setdefault(RERUN_SUFFIX.sub("", g["task_id"]), []).append(g)
+                created: dict[str, tuple[str, set[str]]] = {}  # new rerun id → (its gate, its lineage's member ids)
                 for base, members in lineages.items():
                     g = max(members, key=_rerun_index)
                     if g["state"] not in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value):
                         continue
-                    new_id = f"{base}.r{nt['rework_loops']}"
-                    try:
-                        store.get(new_id)
-                    except SwarmError:
-                        store.create(task_id=new_id, correlation_id=corr, capability=g["capability"],
-                                     title=g["title"].removesuffix(" (rerun)") + " (rerun)",
-                                     agent_id=g["agent_id"], dag_depth=g["dag_depth"], depends_on=g["depends_on"],
-                                     acceptance=g["acceptance"], budget=g["budget"], risk_class=g["risk_class"],
-                                     priority=g["priority"], notes={k: v for k, v in g["notes_json"].items() if k not in ("result", "meta")})
-                        store.transition(new_id, S.VALIDATED)
-                        store.transition(new_id, S.PLANNED, reason="gate rerun")
-                        # downstream of any lineage member must now wait for the rerun too
-                        member_ids = {m["task_id"] for m in members}
-                        for d in store.list(correlation_id=corr):
-                            if member_ids.intersection(d["depends_on"]) and new_id not in d["depends_on"] and d["state"] != S.DONE.value:
-                                store.update(d["task_id"], depends_on=d["depends_on"] + [new_id])
+                    new_id = f"{base}.r{_rerun_index(g) + 1}"
+                    store.create(task_id=new_id, correlation_id=corr, capability=g["capability"],
+                                 title=g["title"].removesuffix(" (rerun)") + " (rerun)",
+                                 agent_id=g["agent_id"], dag_depth=g["dag_depth"], depends_on=g["depends_on"],
+                                 acceptance=g["acceptance"], budget=g["budget"], risk_class=g["risk_class"],
+                                 priority=g["priority"], notes={k: v for k, v in g["notes_json"].items() if k not in ("result", "meta")})
+                    store.transition(new_id, S.VALIDATED)
+                    store.transition(new_id, S.PLANNED, reason="gate rerun")
+                    created[new_id] = (g["notes_json"].get("gate"), {m["task_id"] for m in members})
+                # once every rerun of this rework exists: downstream of any lineage member waits for that lineage's
+                # rerun, and a release-gate rerun (it reads the other gates' verdicts) waits for the other reruns
+                for d in store.list(correlation_id=corr):
+                    if d["state"] == S.DONE.value:
+                        continue
+                    release_rerun = created.get(d["task_id"], ("", set()))[0] == "release"
+                    extra = [nid for nid, (gate, mids) in created.items()
+                             if nid != d["task_id"] and nid not in d["depends_on"]
+                             and (mids.intersection(d["depends_on"]) or (release_rerun and gate != "release"))]
+                    if extra:
+                        store.update(d["task_id"], depends_on=d["depends_on"] + extra)
+            continue
+        # CR-01: a leased (CLAIMED/IN_PROGRESS) gate task of a required gate for this target has no accepted result
+        # yet, or its result was refused (review verdict mismatch): a row it recorded may be contradicted, so hold
+        # the target until that gate task's result is accepted
+        leased = {g["notes_json"].get("gate") for g in store.list(correlation_id=corr)
+                  if tid in (g["notes_json"].get("gate_for") or [])
+                  and g["state"] in (S.CLAIMED.value, S.IN_PROGRESS.value)}
+        if leased.intersection(store.required_gates(tid)):
             continue
         reasons = store.missing_gate_reasons(tid)
         if not reasons:
