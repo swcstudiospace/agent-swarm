@@ -65,7 +65,9 @@ class AgentScript:
         self.agent_id, self.name, self.run, self.description, self.add_args = agent_id, name, run, description, add_args
 
     def parser(self) -> argparse.ArgumentParser:
-        p = argparse.ArgumentParser(prog=self.name, description=self.description)
+        # T-05-23: no prefix abbreviations (`--ing` for --ingest, `--tr` for --transition): only exact flags, so a
+        # policy that matches flag spellings cannot be sidestepped
+        p = argparse.ArgumentParser(prog=self.name, description=self.description, allow_abbrev=False)
         # an exported-but-empty env var means unset (WR-06); an explicit empty flag still fails check_task_id
         p.add_argument("--task-id", default=os.environ.get("SWARM_TASK_ID") or None)
         p.add_argument("--correlation-id", default=os.environ.get("SWARM_CORRELATION_ID") or None)
