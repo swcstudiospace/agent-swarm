@@ -405,30 +405,16 @@ def canned_result(task: dict, agent: dict) -> str:
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
 
 
-def gate_risk_class(store, task: dict) -> str:
-    """The highest risk class of the gate task and its gate_for targets: the quality gate's tier selection."""
-    order = ["low", "medium", "high"]
-    risks = [task.get("risk_class") or "low"]
-    for target in task["notes_json"].get("gate_for") or []:
-        row = store.get(target)
-        if row:
-            risks.append(row.get("risk_class") or "low")
-    return max((r for r in risks if r in order), key=order.index, default="medium")
-
-
-def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, risk_class=None, timeout=300) -> None:
+def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, timeout=300) -> None:
     """Run the gate task's real gate script on its own id with the runner's keys (D-12/D-13): with --dry-run in a
     runner dry-run, otherwise after the agent session while the gate task is still leased. The script derives and
-    records the verdict; per_target_findings adds the agent's findings as gate input; risk_class selects the quality
-    gate's required tiers."""
+    records the verdict; per_target_findings adds the agent's findings as gate input."""
     gate = task["notes_json"]["gate"]
     script = ROOT / "scripts" / f"{GATE_SCRIPTS[gate]}.py"
     cmd = [sys.executable, str(script), *(["--dry-run"] if dry_run else []), "--task-id", task["task_id"],
            "--correlation-id", task["correlation_id"], "--root", str(repo), "--json"]
     if per_target_findings is not None:
         cmd += ["--per-target-findings", str(per_target_findings)]
-    if gate == "quality" and risk_class:
-        cmd += ["--risk-class", risk_class]
     # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record
     env = {k: v for k, v in os.environ.items() if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD")}
     env["SWARM_DIR"] = str(Path(sdir).resolve())
@@ -546,7 +532,7 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         if args.dry_run:
             meta = dry_run_invocation(task, agent, repo, sdir, args)
             if task["notes_json"].get("gate"):
-                run_gate_script(task, repo, sdir, dry_run=True, risk_class=gate_risk_class(store, task))
+                run_gate_script(task, repo, sdir, dry_run=True)
             text = canned_result(task, agent)
         else:
             text, meta = run_agent_headless(agent, prompt, repo, args)
@@ -569,8 +555,7 @@ def execute_one(store_path, task, agent, args, ctx, repo):
                 and result["state"] == S.IN_REVIEW.value and not meta.get("is_error") and not meta.get("returncode")):
             # WR-12: the key-holding runner, not the agent, records this gate — once per dispatch, still leased
             run_gate_script(task, repo, sdir, dry_run=False, timeout=args.task_timeout,
-                            per_target_findings=gate_findings_file(task, text, sdir, ctx.emit),
-                            risk_class=gate_risk_class(store, task))
+                            per_target_findings=gate_findings_file(task, text, sdir, ctx.emit))
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
         if result is None:

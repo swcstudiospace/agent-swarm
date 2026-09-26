@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
-from swarm.verdicts import gate_verdict, issue_gate, load_per_target  # noqa: E402
+from swarm.verdicts import gate_risk_class, gate_verdict, issue_gate, load_per_target  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
                  "high": ["unit", "integration", "e2e", "perf"]}
@@ -52,7 +52,8 @@ def _count(pattern: str, text: str) -> int:
 
 
 def run(args, ctx) -> dict:
-    risk = args.risk_class
+    # D-13: a gate task runs at the highest risk class of itself and its targets unless --risk-class overrides it
+    risk = args.risk_class or gate_risk_class(ctx.task_id, ctx.root) or "medium"
     tiers = args.tier.split(",") if args.tier else TIERS_BY_RISK[risk]
     findings, runs, executed = [], {t: "skipped:not-selected" for t in ("unit", "integration", "e2e", "perf")}, []
 
@@ -109,13 +110,14 @@ def run(args, ctx) -> dict:
                                per_target=per_target)
     findings = findings + [f for items in own.values() for f in items]
     verdict = gate_verdict(env, recorded)
-    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "runs": runs,
+    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "risk_class": risk, "runs": runs,
             "findings": findings, "executed": executed, "envelope": env, "recorded": sorted(recorded),
             "summary": f"quality gate {verdict.upper()} — runners: {[e['runner'] for e in executed] or 'none'}"}
 
 
 def add_args(p):
-    p.add_argument("--risk-class", choices=["low", "medium", "high"], default="medium")
+    p.add_argument("--risk-class", choices=["low", "medium", "high"],
+                   help="tier selection; default: the highest risk class of the gate task and its targets, else medium")
     p.add_argument("--tier", help="comma list overriding risk-based tier selection (unit,integration,e2e,perf)")
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--min-coverage", type=int, default=0, help="fail if pytest-cov TOTAL below this percent")

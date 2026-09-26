@@ -391,8 +391,7 @@ def test_headless_quality_agent_failure_reaches_its_target_only(tmp_path, monkey
                                              "verdicts": {"P-be": _REQUEST_CHANGES, "P-fe": _PASS}}) + "\n```"
     task = ts.get("P-qa")
     findings = sr.gate_findings_file(task, text, swarm, lambda t, p: None)
-    sr.run_gate_script(task, work, swarm, dry_run=False, per_target_findings=findings,
-                       risk_class=sr.gate_risk_class(ts, task))
+    sr.run_gate_script(task, work, swarm, dry_run=False, per_target_findings=findings)
     assert ts.latest_verdicts("P-be")["quality"]["verdict"] == "fail"
     assert ts.latest_verdicts("P-fe")["quality"]["verdict"] == "pass"
 
@@ -417,15 +416,23 @@ def test_gate_findings_for_one_target_leave_omitted_target_clean(tmp_path, scrip
     assert ts.latest_verdicts("P-fe")[gate]["verdict"] == "pass"
 
 
-def test_gate_risk_class_is_highest_of_gate_and_targets(tmp_path, monkeypatch):
-    """The runner runs qa_gate at the highest risk class of the gate task and its targets (high-risk tiers)."""
-    sr = _load_swarm_run(tmp_path, monkeypatch)
-    rows = {"T-be": {"risk_class": "high"}, "T-fe": {"risk_class": "low"}}
-
-    class Store:
-        def get(self, tid):
-            return rows.get(tid)
-
-    gate = {"risk_class": "low", "notes_json": {"gate": "quality", "gate_for": ["T-fe", "T-be", "T-gone"]}}
-    assert sr.gate_risk_class(Store(), gate) == "high"
-    assert sr.gate_risk_class(Store(), {**gate, "notes_json": {"gate": "quality", "gate_for": ["T-fe"]}}) == "low"
+def test_qa_gate_runs_at_highest_risk_of_gate_and_targets(tmp_path, monkeypatch):
+    """Without --risk-class, qa_gate (runner and in-session swarm_gate alike) runs at the highest risk class of the
+    gate task and its targets, so a high-risk target requires the e2e and perf tiers; an unknown target is skipped."""
+    from swarm.verdicts import gate_risk_class
+    plan = [{"id": "be", "capability": "code.backend", "agent": "A05"},
+            {"id": "fe", "capability": "code.frontend", "agent": "A06"},
+            {"id": "qa", "capability": "gate.quality", "agent": "A08", "depends_on": ["be", "fe"],
+             "gates": {"gate": "quality", "for": ["be", "fe"]}}]
+    ts, swarm, work, corr = _setup(tmp_path, plan, targets=("P-be", "P-fe"), leased=("P-qa",))
+    monkeypatch.setenv("SWARM_DIR", str(swarm))
+    assert gate_risk_class("P-qa", work) == "low"
+    with ts.conn:
+        ts.conn.execute("UPDATE tasks SET risk_class='high' WHERE task_id='P-fe'")
+    ts.set_notes("P-qa", gate_for=["P-be", "P-fe", "P-gone"])
+    assert gate_risk_class("P-qa", work) == "high"
+    assert gate_risk_class("P-be", work) is None  # not a gate task
+    ts.set_notes("P-qa", gate_for=["P-be", "P-fe"])
+    out = _gate_script(swarm, work, corr, "qa_gate.py", "P-qa")
+    assert out["risk_class"] == "high"
+    assert out["runs"]["e2e"] == "skipped:infra" and out["runs"]["perf"] == "skipped:infra"

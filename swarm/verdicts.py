@@ -49,6 +49,33 @@ def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner:
     return out
 
 
+RISK_ORDER = ("low", "medium", "high")
+
+
+def gate_risk_class(task_id: str | None, root=None) -> str | None:
+    """The highest risk class of a gate task and its gate_for targets (the quality gate's tier selection);
+    None when task_id is not a known gate task. A target missing from the Task Store is skipped."""
+    from .taskstore import TaskStore
+    if not task_id:
+        return None
+    store = TaskStore(root=root)
+    try:
+        task = store.get(task_id)
+    except SwarmError:
+        return None
+    notes = task.get("notes_json") or {}
+    if not notes.get("gate"):
+        return None
+    risks = [task.get("risk_class")]
+    for target in notes.get("gate_for") or []:
+        try:
+            risks.append(store.get(target).get("risk_class"))
+        except SwarmError:
+            continue
+    known = [r for r in risks if r in RISK_ORDER]
+    return max(known, key=RISK_ORDER.index) if known else None
+
+
 def gate_verdict(env: dict, recorded: dict[str, dict]) -> str:
     """A gate script's overall verdict: fail when its envelope or any recorded per-target verdict fails."""
     verdicts = [env["payload"]["verdict"], *(e["payload"]["verdict"] for e in recorded.values())]

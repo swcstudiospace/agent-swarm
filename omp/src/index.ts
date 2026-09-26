@@ -5,6 +5,7 @@
  * getActiveTools run only inside handlers.
  */
 import { homedir, tmpdir } from "node:os";
+import { resolve } from "node:path";
 import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
 import { swarmCommand } from "./commands.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
@@ -43,7 +44,11 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         known = { agent: callingAgent(ctx), topLevel };
         // getActiveTools only for A01: the depth-cap check is the only reader (D-06)
         const hasTask = known.agent === ORCHESTRATOR ? pi.getActiveTools().includes("task") : true;
-        return guardToolCall(event, { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir() });
+        // D-08: the runtime roots bridge.swarmRoot() picks from (env SWARM_ROOT, the package's repo), spelled without fs
+        const root = env.SWARM_ROOT?.trim();
+        const runtimeRoots = [...(root ? [resolve(root)] : []), resolve(import.meta.dir, "..", "..")];
+        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots };
+        return guardToolCall(event, facts);
       } catch (err) {
         if (!inSwarm({ ...known, env })) return undefined;
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };

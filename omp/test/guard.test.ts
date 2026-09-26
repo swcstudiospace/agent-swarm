@@ -29,7 +29,7 @@ const call = (toolName: string, input: unknown = {}): ToolCallEvent => ({ toolNa
 const yieldData = (data: unknown) => call("yield", { data });
 
 /** A01 at the depth cap: no `task`, not a restricted child, not in plan mode. */
-const capped: GuardFacts = { agent: A01, restricted: false, planMode: false, hasTask: false, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP };
+const capped: GuardFacts = { agent: A01, restricted: false, planMode: false, hasTask: false, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP, runtimeRoots: [] };
 
 /** The tool_call handler the real factory registers, with a runtime getActiveTools (a bridge call would throw). */
 function guardHandler(opts: FakePiOptions = {}) {
@@ -243,7 +243,7 @@ describe("HOOK-03", () => {
   });
 
   test.each([["a05-backend"], ["task"], [undefined]])("pure: agent %p is blocked on both state tools", (agent) => {
-    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, tmp: TMP };
+    const facts: GuardFacts = { agent, restricted: true, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, tmp: TMP, runtimeRoots: [] };
     for (const toolName of STATE_TOOLS) expect(guardToolCall(call(toolName), facts)).toEqual({ block: true, reason: SWARM_STATE });
   });
 
@@ -284,7 +284,7 @@ describe("HOOK-03", () => {
 
 describe("HOOK-02", () => {
   const B05 = "a05-backend";
-  const inside = (agent = B05): GuardFacts => ({ agent, restricted: false, planMode: false, hasTask: true, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP });
+  const inside = (agent = B05): GuardFacts => ({ agent, restricted: false, planMode: false, hasTask: true, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP, runtimeRoots: [] });
   const main: GuardFacts = { ...inside(), agent: undefined, topLevel: true };
   const bash = (command: string) => call("bash", { command });
   const blockedWith = (res: ReturnType<typeof guardToolCall>, capability: string) => {
@@ -568,7 +568,7 @@ describe("HOOK-02", () => {
 describe("HOOK-03 shell twin and D-08", () => {
   const B05 = "a05-backend";
   const facts = (agent: string | undefined, extra: Partial<GuardFacts> = {}): GuardFacts => ({
-    agent, restricted: false, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, tmp: TMP, ...extra,
+    agent, restricted: false, planMode: false, hasTask: true, topLevel: agent === undefined, env: {}, cwd: CWD, home: HOME, tmp: TMP, runtimeRoots: [], ...extra,
   });
   const bash = (command: string) => call("bash", { command });
   const SWARM_STATE = "BLOCKED needs: human-approval (swarm-state)";
@@ -823,7 +823,7 @@ describe("HOOK-03 shell twin and D-08", () => {
     // WR-06 negatives: reads and mutations elsewhere
     "sed 's/a/b/' .omp/config.yml", "sed -i 's/a/b/' README.md", "sqlite3 /tmp/x.db 'SELECT 1'", "tar -tf .swarm/a.tar", "tar -xf a.tar -C build",
     "dd if=.swarm/tasks.db of=/tmp/x", "chmod 755 x", "mkdir -p build/out", "touch out.txt", "ln -s /a /b", "rsync -a .swarm/ /tmp/bak/",
-    "unzip a.zip -d build", "rmdir build", "truncate -s0 log.txt",
+    "unzip a.zip -d build", "rmdir build", "truncate -s0 log.txt", "mv a.txt b.txt", "mv -t build a.txt", "rsync -a --remove-source-files out/ /tmp/bak/",
   ])("D-08 shell: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
@@ -847,6 +847,10 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["mkdir -p .omp/extensions", "protected_path: protected-path-mutate"],
     ["rmdir .swarm/plans", "protected_path: protected-path-mutate"],
     ["unlink .omp/config.yml", "protected_path: protected-path-mutate"],
+    ["mv .swarm/tasks.db /tmp/x", "protected_path: protected-path-mutate"],
+    ["mv -t /tmp .omp/config.yml", "protected_path: protected-path-mutate"],
+    ["mv --target-directory=/tmp a .swarm/keys", "protected_path: protected-path-mutate"],
+    ["rsync -a --remove-source-files .swarm/results/ /tmp/bak/", "protected_path: protected-path-mutate"],
     ["rm .swarm/tasks.db", "destructive: rm-rf-protected"],
     ["rm -f .swarm/tasks.db", "destructive: rm-rf-protected"],
     ["rm -r .swarm", "destructive: rm-rf-protected"],
@@ -953,6 +957,55 @@ describe("HOOK-03 shell twin and D-08", () => {
     for (const ev of [call("eval", { code: "x" }), call("write", { path: ".omp/config.yml" }), bash(ORCH[0])]) {
       expect(run(ev, fakeCtx(CWD))).toBeUndefined();
     }
+  });
+
+  /** D-08: the agent-swarm runtime root (the live guard, the gate scripts the runner runs with keys) is not writable. */
+  const ROOT = "/nonexistent-swarm-root";
+  const WS = "/nonexistent-ws";
+  const inWs = (cwd = WS) => facts(B05, { cwd, runtimeRoots: [ROOT] });
+  const RUNTIME_WRITES: [string, unknown, string][] = [
+    ["write", { path: `${ROOT}/omp/src/guard.ts`, content: "x" }, "protected-path-write"],
+    ["write", { file_path: `${ROOT}/agents.json`, content: "x" }, "protected-path-write"],
+    ["edit", { input: `[${ROOT}/scripts/qa_gate.py#AB12]\nPUT 1.=1:\n+x\n` }, "protected-path-write"],
+    ["write", { path: "xd://ast_edit", content: JSON.stringify({ ops: [], paths: [`${ROOT}/swarm/gates.py`] }) }, "protected-path-write"],
+    ["bash", { command: `echo x > ${ROOT}/scripts/qa_gate.py` }, "protected-path-shell"],
+    ["bash", { command: `cp x ${ROOT}/scripts/rev_gate.py` }, "protected-path-shell"],
+    ["bash", { command: `cd ${ROOT}/scripts && touch qa_gate.py` }, "protected-path-mutate"],
+    ["bash", { command: `sed -i s/a/b/ ${ROOT}/hooks/autonomous_run.py` }, "protected-path-mutate"],
+    ["bash", { command: `mv ${ROOT}/scripts/qa_gate.py /tmp/x` }, "protected-path-mutate"],
+    ["bash", { command: `cd ../nonexistent-swarm-root && echo x >> omp/src/guard.ts` }, "protected-path-shell"],
+  ];
+  test.each(RUNTIME_WRITES)("runtime root: %s %p blocks from another workspace naming %s", (tool, input, id) => {
+    expect(guardToolCall(call(tool, input), inWs())).toEqual({ block: true, reason: `BLOCKED needs: human-approval (protected_path: ${id})` });
+    expect(guardToolCall(call(tool, input), facts(undefined, { cwd: WS, runtimeRoots: [ROOT] }))).toBeUndefined();
+  });
+
+  test("runtime root: rm of a runtime file is destructive", () => {
+    expect(guardToolCall(bash(`rm ${ROOT}/scripts/sec_gate.py`), inWs())).toEqual({ block: true, reason: "BLOCKED needs: human-approval (destructive: rm-rf-protected)" });
+  });
+
+  test.each<[string, unknown]>([
+    ["bash", { command: `cat ${ROOT}/scripts/qa_gate.py` }], ["bash", { command: `python3 ${ROOT}/scripts/code_checks.py --json` }],
+    ["bash", { command: `cp ${ROOT}/scripts/x.py ./x.py` }], ["bash", { command: "echo x > out.txt" }],
+    ["bash", { command: `echo x > ${ROOT}-other/x` }], ["write", { path: "src/app.ts", content: "x" }],
+  ])("runtime root: %s %p passes from another workspace", (tool, input) => {
+    expect(guardToolCall(call(tool, input), inWs())).toBeUndefined();
+  });
+
+  test.each([ROOT, `${ROOT}/omp`])("runtime root: a session working in the checkout (cwd %s) writes it (self-development residual)", (cwd) => {
+    expect(guardToolCall(bash(`echo x > ${ROOT}/scripts/foo.py`), inWs(cwd))).toBeUndefined();
+    expect(guardToolCall(call("write", { path: `${ROOT}/omp/src/guard.ts`, content: "x" }), inWs(cwd))).toBeUndefined();
+    expect(guardToolCall(bash(`echo x > ${ROOT}/.swarm/tasks.db`), inWs(cwd))).toEqual({
+      block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-shell)",
+    });
+  });
+
+  test("runtime root through the handler: the package's repo is protected from another workspace, not from itself", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const write = call("write", { path: join(REPO_ROOT, "scripts", "qa_gate.py"), content: "x" });
+    expect(run(write, agentCtx(WS, B05, [], false))).toEqual({ block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-write)" });
+    expect(run(write, agentCtx(REPO_ROOT, B05, [], false))).toBeUndefined();
+    expect(run(write, fakeCtx(WS))).toBeUndefined();
   });
 
   const MALFORMED: [string, unknown][] = [

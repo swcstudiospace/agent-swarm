@@ -47,6 +47,11 @@ export interface GuardFacts {
   home: string;
   /** os.tmpdir() at call time ($TMPDIR honoured): its subtree is the specialists' scratch space, inside like cwd (IN-01). */
   tmp: string;
+  /**
+   * The agent-swarm runtime roots, as spelled (env SWARM_ROOT and the extension package's repo; index.ts, no I/O):
+   * write targets inside one are protected unless the session's cwd is inside it too (isProtectedPath).
+   */
+  runtimeRoots: readonly string[];
 }
 
 /**
@@ -522,12 +527,12 @@ const within = (path: string, dir: string) => dir !== "" && dir !== "/" && path.
 const segmentBase = (seg: Segment, facts: GuardFacts) => ({ cwd: seg.cwd ?? facts.cwd, home: facts.home });
 
 /**
- * D-08 over a shell target: a `.swarm`/`.omp` path once resolved in the segment's directory, or any relative target
- * while that directory is unknown (`cd "$DIR"`, `cd -`): fail closed rather than resolve it against the wrong one.
+ * D-08 over a shell target: a protected path (isProtectedPath) once resolved in the segment's directory, or any
+ * relative target while that directory is unknown (`cd "$DIR"`, `cd -`): fail closed rather than guess the directory.
  */
 function protectedTarget(target: string, seg: Segment, facts: GuardFacts): boolean {
   if (seg.cwd === undefined && !target.startsWith("/") && !HOME_PREFIX.test(target)) return true;
-  return isProtectedPath(target, segmentBase(seg, facts));
+  return isProtectedPath(target, facts, seg.cwd ?? facts.cwd);
 }
 
 /** A repo-state segment (`.git`, `.swarm`, `.omp`) anywhere in the target path, before any resolution. */
@@ -587,9 +592,20 @@ const DDL = /\b(?:DROP\s+(?:TABLE|COLUMN|DATABASE|SCHEMA)|TRUNCATE)\b/i;
 
 const reason = (capability: string, id: string) => `BLOCKED needs: human-approval (${capability}: ${id})`;
 
-/** D-08: a path inside `.swarm/` or `.omp/` (cwd's, ~/.omp, or any other) after `~` expansion and cwd resolution. */
-export function isProtectedPath(path: string, facts: Pick<GuardFacts, "cwd" | "home">): boolean {
-  return resolvePath(path, facts).split("/").some((s) => s === ".swarm" || s === ".omp");
+/**
+ * D-08: a path, after `~` expansion and resolution against `base` (default the session cwd), inside `.swarm/` or
+ * `.omp/` (cwd's, ~/.omp, or any other), or inside a runtime root the session's cwd is not in: a swarm session never
+ * rewrites the running guard (`omp/`) or the gate scripts the runner later runs with keys (`scripts/`). A session
+ * working inside the agent-swarm checkout itself (self-development) is exempt (the AGENTS.md residual).
+ */
+export function isProtectedPath(path: string, facts: Pick<GuardFacts, "cwd" | "home" | "runtimeRoots">, base = facts.cwd): boolean {
+  const resolved = resolvePath(path, { cwd: base, home: facts.home });
+  if (resolved.split("/").some((s) => s === ".swarm" || s === ".omp")) return true;
+  const cwd = posix.resolve(facts.cwd || "/");
+  return facts.runtimeRoots.some((r) => {
+    const root = posix.resolve(r);
+    return root !== "/" && cwd !== root && !within(cwd, root) && (resolved === root || within(resolved, root));
+  });
 }
 
 /** Files a segment writes, as far as detectable: `>`/`>>` targets, tee operands, cp/mv/install destinations. */
@@ -603,23 +619,35 @@ function shellWriteTargets({ text, words }: Segment): string[] {
   if (words[0] === "cp" || words[0] === "mv" || words[0] === "install") {
     const t = words.findIndex((w) => w === "-t" || w === "--target-directory");
     if (t > 0 && words[t + 1] !== undefined) targets.push(words[t + 1]);
-    for (const w of words) if (w.startsWith("--target-directory=")) targets.push(w.slice("--target-directory=".length));
-    if (args.length > 1) targets.push(args[args.length - 1]);
+    const long = words.filter((w) => w.startsWith("--target-directory=")).map((w) => w.slice("--target-directory=".length));
+    targets.push(...long);
+    // with a target directory every operand is a source
+    if (t <= 0 && long.length === 0 && args.length > 1) targets.push(args[args.length - 1]);
   }
   return targets;
 }
 
 /**
  * Files a segment mutates in place, as far as detectable: the operands of rmdir/unlink/shred/truncate/sqlite3/chmod/
- * chown/chgrp/touch/mkdir, the destination of ln/rsync, `sed -i` file operands, `dd of=`, `tar -C`/`--directory`,
- * `unzip -d`. `$SWARM_DIR`/symlink spellings stay the documented residual.
+ * chown/chgrp/touch/mkdir, the destination of ln/rsync, the sources `mv` (and `rsync --remove-source-files`) delete,
+ * `sed -i` file operands, `dd of=`, `tar -C`/`--directory`, `unzip -d`. `$SWARM_DIR`/symlink spellings stay the
+ * documented residual.
  */
 function shellMutateTargets({ words }: Segment): string[] {
   const cmd = words[0] ?? "";
   const args = operands(words.slice(1));
   if (/^(?:rmdir|unlink|shred|truncate|sqlite3|chmod|chown|chgrp|touch|mkdir|mkfifo)$/.test(cmd)) return args;
-  // ln and rsync read their sources and write the last operand
-  if (cmd === "ln" || cmd === "rsync") return args.length > 1 ? [args[args.length - 1]] : [];
+  if (cmd === "mv") {
+    // `-t DIR` / `--target-directory[=]DIR` makes every other operand a source; otherwise the last one is the destination
+    const t = words.findIndex((w) => w === "-t" || w === "--target-directory");
+    if (t > 0) return args.filter((a) => a !== words[t + 1]);
+    return words.some((w) => w.startsWith("--target-directory=")) ? args : args.slice(0, -1);
+  }
+  // ln and rsync read their sources and write the last operand; rsync --remove-source-files deletes the sources too
+  if (cmd === "ln" || cmd === "rsync") {
+    if (args.length < 2) return [];
+    return cmd === "rsync" && words.includes("--remove-source-files") ? args : [args[args.length - 1]];
+  }
   if (cmd === "sed") {
     if (!words.some((w) => /^-[A-Za-z]*i|^--in-place/.test(w))) return [];
     // the first operand is the script unless one was given with -e/-f
@@ -747,6 +775,8 @@ export const RULES: readonly Rule[] = [
       "shred ~/.omp/agent/config.yml",
       "ln -s /tmp/x .swarm/tasks.db",
       "rsync -a src/ .swarm/",
+      "mv .swarm/tasks.db /tmp/x",
+      "rsync -a --remove-source-files .omp/ /tmp/bak/",
       "dd if=/dev/zero of=.swarm/tasks.db",
       "tar -xf a.tar -C .swarm",
       "unzip a.zip -d ~/.omp",
