@@ -118,9 +118,23 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   }
   // HOOK-02 (D-03): bash only; normalize, then the first matching row in table order decides
   if (event.toolName !== "bash") return undefined;
-  const command = typeof event.input === "object" && event.input !== null ? (event.input as { command?: unknown }).command : undefined;
+  const input: object = typeof event.input === "object" && event.input !== null ? event.input : {};
+  const command = "command" in input ? input.command : undefined;
   if (typeof command !== "string" || command.trim() === "") return undefined;
-  const hit = matchRule(command, facts);
+  // the bash tool's own `env` reaches the shell: GLOBIGNORE/BASHOPTS turn dotglob on, HOME and CDPATH move paths
+  const env = new Map<string, unknown>("env" in input && typeof input.env === "object" && input.env !== null ? Object.entries(input.env) : []);
+  if (env.has("GLOBIGNORE") || env.has("BASHOPTS")) return { block: true, reason: reason("protected_path", "glob-dotfiles") };
+  const home = env.get("HOME");
+  const cdpath = env.get("CDPATH");
+  const shellFacts: GuardFacts = {
+    ...facts,
+    home: typeof home === "string" ? home : facts.home,
+    env: typeof cdpath === "string" ? { ...facts.env, CDPATH: cdpath } : facts.env,
+  };
+  // the bash tool's `cwd` is where the command starts; an internal URL (`local://…`) is a directory the guard cannot place
+  const cwd = "cwd" in input && typeof input.cwd === "string" ? input.cwd.trim() : "";
+  const start = cwd === "" ? facts.cwd : /^[a-z][\w+.-]*:\/\//i.test(cwd) ? undefined : resolvePath(cwd, shellFacts);
+  const hit = matchRule(command, shellFacts, start);
   return hit === undefined ? undefined : { block: true, reason: ruleReason(hit) };
 }
 
@@ -217,14 +231,25 @@ function kubectlProdChange({ words }: Segment): boolean {
 }
 
 /**
- * One shell segment after normalize(): its text and whitespace words (quotes stripped, argv[0] basename), and the
- * directory its relative paths resolve in (matchRule's directory tracking; undefined when it cannot be known).
+ * One shell segment after normalization, as the rows read it, and the directory its relative paths resolve in
+ * (matchRule's directory tracking; undefined when it cannot be known).
  */
 export interface Segment {
+  /** The command text, a cut `$(…)`/backtick substitution read as a blank (the regex rows match it). */
   text: string;
+  /** Its shell words, unquoted and unescaped, argv[0] as its basename; a word that was only a substitution is dropped. */
   words: string[];
-  /** The first word as written (path kept): `./scripts/orch_plan.py` where words[0] is `orch_plan.py`. */
+  /** The first word as written, unquoted (path kept): `./scripts/orch_plan.py` where words[0] is `orch_plan.py`. */
   argv0: string;
+  /**
+   * The words the write/mutate checks read: `words`, but a cut substitution stays (as CUT), and operands that exist
+   * only at run time (`xargs`, `parallel`, `find -exec … {}`) are CUT too, so they are judged unknowable, never absent.
+   */
+  targetWords: string[];
+  /** The text with CUT kept (the redirection scan reads it). */
+  marked: string;
+  /** The command itself cannot be known (named by an expansion or glob): every operand is a mutate target. */
+  opaque: boolean;
   cwd: string | undefined;
 }
 type Matcher = (seg: Segment, facts: GuardFacts, command: string) => boolean;
@@ -253,42 +278,149 @@ const SUDO_VALUE_FLAG = String.raw`-[ugCDhprtUT]\s+\S+|--(?:user|group|host|prom
 /**
  * Wrappers that run the rest of the line unchanged; a flag that takes a value takes it along (`nice -n 5`,
  * `timeout -s KILL 5m`, `xargs -n 1`), and `timeout` also drops its duration. `busybox`/`toybox` followed by an
- * applet name run that applet.
+ * applet name run that applet; `exec [-a NAME]`, `parallel`, `setsid`, `fakeroot`, `chrt PRIO`, `taskset MASK`,
+ * `unshare`, `chroot DIR`, `flock FILE` and `watch` run the command after them (prefixInfo keeps what they imply).
  */
-const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec|builtin|eval|(?:busybox|toybox)(?=\s+[A-Za-z_])|nice(?:\s+(?:-n\s+\S+|-\S+))*|ionice(?:\s+(?:-[cn]\s+\S+|-\S+))*|stdbuf(?:\s+-\S+)+|timeout(?:\s+(?:-[sk]\s+\S+|-\S+))*\s+\S+|xargs(?:\s+(?:-[nIPdaLsE]\s+\S+|-\S+))*)\s+`;
+const WRAPPER = String.raw`(?:time(?:\s+-p)?|nohup|exec(?:\s+(?:-a\s+\S+|-[cl]+))*|builtin|eval|(?:busybox|toybox)(?=\s+[A-Za-z_])|nice(?:\s+(?:-n\s+\S+|-\S+))*|ionice(?:\s+(?:-[cn]\s+\S+|-\S+))*|stdbuf(?:\s+-\S+)+|timeout(?:\s+(?:-[sk]\s+\S+|-\S+))*\s+\S+|xargs(?:\s+(?:-[nIPdaLsE]\s+\S+|-\S+))*|parallel(?:\s+(?:-[jSN]\s+\S+|-\S+))*|setsid(?:\s+-\S+)*|fakeroot(?:\s+(?:-[is]\s+\S+|-\S+))*|chrt(?:\s+-\S+)*\s+\d+|taskset(?:\s+-\S+)*\s+\S+|unshare(?:\s+(?:-[SGRw]\s+\S+|-\S+))*|chroot(?:\s+-\S+)*\s+\S+|flock(?:\s+(?:-[wE]\s+\S+|-\S+))*\s+\S+|watch(?:\s+(?:-[nd]\s+\S+|-\S+))*)\s+`;
+/** Where normalization cut a `$(…)`/backtick substitution out of the text: a non-blank placeholder no check can resolve. */
+const CUT = "\u0001";
+/** A redirection operator at the start of a shell word (`>`, `2>>`, `&>`, `<>`, `<<<`, `<<-`, `>|`, `>&`). */
+const REDIRECT_OP = String.raw`\d*(?:>>?\|?|<>|<<<|<<-?|<|&>>?)&?`;
+/** A redirection written before the command word (`2>/dev/null rm …`): PREFIX strips it, the redirection scan still reads it. */
+const LEAD_REDIRECT = String.raw`${REDIRECT_OP}\s*(?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+\s+`;
 /**
- * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …`, `sudo`/`doas` with their flags,
- * `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces), the WRAPPER set and the shell keywords
- * that put a command in a compound (`if`, `then`, `else`, `elif`, `do`, `while`, `until`, `!`). Every wrapper word
- * may be spelled as a path (`/usr/bin/env`, `/usr/bin/sudo`, `…/timeout`), like argv[0]'s basename (T-05-24).
- * The directory an `env -C`/`sudo -D` prefix names is kept (prefixChdirs) for matchRule's directory tracking.
+ * Leading words that do not change what runs: `env [-i] [-u NAME] [-C DIR] …` (up to an `-S` line), `sudo`/`doas`
+ * with their flags, `command [-pvV]`, `NAME=value` assignments (quoted values may hold spaces; `GLOBIGNORE=` stays,
+ * the glob-dotfiles row reads it), the WRAPPER set, a leading cut substitution and the shell keywords that put a
+ * command in a compound (`if`, `then`, `else`, `elif`, `do`, `while`, `until`, `!`, `coproc`). Every wrapper word may
+ * be spelled as a path (`/usr/bin/env`, `/usr/bin/sudo`, `…/timeout`), like argv[0]'s basename (T-05-24).
  */
 const PREFIX = new RegExp(
   // the assignment value is matched atomically (lookahead + backreference): giving characters back can never reach
   // the whitespace after it, and backtracking through a 1 MB value would cost seconds (WR-09)
-  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?:-[A-Za-z]*[uCS]\s+\S+|--(?:unset|chdir|split-string)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|(?:if|then|else|elif|do|while|until|!)\s+|[A-Za-z_]\w*=(?=(?<value>${VALUE}))\k<value>\s+)`,
+  String.raw`(?:(?:\S*\/)?(?:env(?:\s+(?!-[A-Za-z]*S|--split-string)(?:-[A-Za-z]*[uC]\s+\S+|--(?:unset|chdir)\s+\S+|-\S+))*\s+|(?:sudo|doas)(?:\s+(?:${SUDO_VALUE_FLAG}|-\S+))*\s+|pkexec(?:\s+(?:--user\s+\S+|-\S+))*\s+|command(?:\s+-[pvV]+)*\s+|${WRAPPER})|(?:if|then|else|elif|do|while|until|!|coproc)\s+|${CUT}+(?:\s+|$)|${LEAD_REDIRECT}|(?!GLOBIGNORE=)[A-Za-z_]\w*=(?=(?<value>${VALUE}))\k<value>\s+)`,
   "y",
 );
-/** `sh -c`, `bash -ec`, `/bin/zsh -x -c` …: the next word is a command line of its own. */
-const SHELL_C = /^(?:\S*\/)?(?:ba|z|da|k|a)?sh(?:\s+-\S+)*\s+-[A-Za-z]*c\s+/;
+/** `sh -c`, `bash -ec`, `/bin/zsh -x -o pipefail -c`, `fish -c` …: the next word is a command line of its own. */
+const SHELL_C = /^(?:\S*\/)?(?:[a-z]*sh|fish)(?:\s+(?:[-+][oO]\s+\S+|--(?:rcfile|init-file)\s+\S+|[-+]\S+))*\s+-[A-Za-z]*c(?:\s+--)?\s+/;
+/** Other words that hand the next word to a shell, now or later: `su|runuser|script … -c LINE`, `flock FILE -c LINE`, `alias NAME=LINE`, `trap LINE`. */
+const LINE_ARG = /^(?:(?:\S*\/)?(?:su|runuser|script)(?:\s+\S+)*?\s+(?:-c|--command)\s+|(?:-c|--command)\s+|alias\s+[^\s=]+=|trap\s+(?:--\s+)?)/;
+/** `env -S LINE` / `--split-string=LINE` once the `env` word was stripped: the rest of the line is the command. */
+const SPLIT_STRING = /^(?:-[A-Za-z]*S\s*|--split-string(?:=|\s+))/;
 /** Nesting cap for `sh -c "sh -c '…'"` recursion. */
 const MAX_LITERAL_DEPTH = 3;
 
-/** The content of the quoted string starting at `text[at]` (bash unescaping inside `"…"`); undefined when unterminated. */
-function quotedLiteral(text: string, at: number): string | undefined {
-  const q = text[at];
-  if (q !== '"' && q !== "'") return undefined;
-  let out = "";
-  for (let i = at + 1; i < text.length; i++) {
-    const c = text[i];
-    if (c === q) return out;
-    if (c === "\\" && q === '"' && i + 1 < text.length && /["\\$`\n]/.test(text[i + 1])) {
-      out += text[++i];
-      continue;
-    }
-    out += c;
+/** The value of the `$'…'` escape whose letter is at `word[i]`, and the index of its last character. */
+function ansiEscape(word: string, i: number): [string, number] {
+  const c = word[i];
+  if (Object.hasOwn(ANSI_ESCAPE, c)) return [ANSI_ESCAPE[c], i];
+  const code = /^(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3}))/.exec(word.slice(i, i + 9));
+  if (code !== null) {
+    const value = Number.parseInt(code[1] ?? code[2] ?? code[3] ?? code[4], code[4] === undefined ? 16 : 8);
+    return [String.fromCodePoint(Math.min(value, 0x10ffff)), i + code[0].length - 1];
   }
-  return undefined;
+  if (c === "c" && i + 1 < word.length) return [String.fromCharCode(word.charCodeAt(i + 1) & 31), i + 1];
+  return [`\\${c}`, i];
+}
+const ANSI_ESCAPE: Record<string, string> = {
+  a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
+};
+
+/**
+ * A shell word without its quoting (`'…'` literal; `"…"` and `$"…"` where `\` escapes only `$`, backtick, `"`, `\`
+ * and newline; `$'…'` with its C escapes decoded; a bare `\x` is x), and whether every quote it opens is closed.
+ */
+function dequote(word: string): { text: string; closed: boolean } {
+  let text = "";
+  let quote: string | undefined;
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      else text += c;
+    } else if (quote === "$'") {
+      if (c === "'") quote = undefined;
+      else if (c === "\\" && i + 1 < word.length) {
+        const [value, end] = ansiEscape(word, i + 1);
+        text += value;
+        i = end;
+      } else text += c;
+    } else if (c === "\\" && i + 1 < word.length) {
+      const next = word[++i];
+      text += quote === '"' && !/[$`"\\\n]/.test(next) ? c + next : next;
+    } else if (quote === '"') {
+      if (c === '"') quote = undefined;
+      else text += c;
+    } else if (c === "$" && (word[i + 1] === "'" || word[i + 1] === '"')) quote = word[++i] === "'" ? "$'" : '"';
+    else if (c === "'" || c === '"') quote = c;
+    else text += c;
+  }
+  return { text, closed: quote === undefined };
+}
+const unquote = (word: string): string => dequote(word).text;
+
+/**
+ * The shell words of a segment, as written: split on blanks outside quotes, a quoted run (with its blanks) or an
+ * escape staying inside its word. With a quote left open (bash would reject the line) the blanks split everywhere.
+ */
+function shellWords(text: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < text.length) cur += c + text[++i];
+      else {
+        cur += c;
+        if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      }
+    } else if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+      if (cur !== "") words.push(cur);
+      cur = "";
+    } else if (c === "$" && text[i + 1] === "'") {
+      cur += "$'";
+      quote = "$'";
+      i++;
+    } else {
+      cur += c;
+      if (c === "'" || c === '"') quote = c;
+      else if (c === "\\" && i + 1 < text.length) cur += text[++i];
+    }
+  }
+  if (quote !== undefined) return text.split(/\s+/).filter((w) => w !== "");
+  if (cur !== "") words.push(cur);
+  return words;
+}
+
+/**
+ * Every blank-delimited token that is a plain word once unquoted (`"rm"`, `\sudo`, `r""m`, `'-i'`) written plain, so
+ * PREFIX, SHELL_C and the regex rows see the command bash runs. A token whose unquoted form holds a blank, quote,
+ * operator, expansion, glob, `=`, `#`, `!` or `~`, or that leaves a quote open, keeps its quotes.
+ */
+const simplifyWords = (text: string): string =>
+  text.replace(/\S+/g, (token) => {
+    if (!/["'\\]/.test(token)) return token;
+    const { text: plain, closed } = dequote(token);
+    return closed && plain !== "" && !/[\s"'\\<>|&;()`$*?[\]{}=#!~\u0001]/.test(plain) ? plain : token;
+  });
+
+/**
+ * The command line a segment hands to a child shell or runs later: the word after `sh -c` (and kin) or LINE_ARG, the
+ * rest of an `env -S` line, or the quoted line left behind by a stripped `eval`/`watch`.
+ */
+function commandLine(seg: string): string | undefined {
+  const at = SHELL_C.exec(seg)?.[0].length ?? LINE_ARG.exec(seg)?.[0].length;
+  if (at !== undefined) {
+    const word = shellWords(seg.slice(at))[0];
+    return word === undefined ? undefined : unquote(word);
+  }
+  const split = SPLIT_STRING.exec(seg);
+  if (split !== null) {
+    const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
+    return [unquote(first), ...rest].join(" ");
+  }
+  return seg[0] === '"' || seg[0] === "'" ? unquote(shellWords(seg)[0] ?? "") : undefined;
 }
 
 /** A heredoc operator and its delimiter word (`<<EOF`, `<<-'EOF'`, `<< "EOF"`); sticky, positioned by splitTopLevel. */
@@ -296,15 +428,23 @@ const HEREDOC = /<<-?[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s<>|&;()]+))/y;
 
 /** The shell operator that ends a split piece; a newline reads as `;`, the end of the text as `""`. */
 type Op = ";" | "&&" | "||" | "|" | "&" | "(" | ")" | "{" | "}" | "";
+/** A split piece, the operator that ends it, and the heredoc body its line opened (fed to it on stdin). */
+interface Piece {
+  text: string;
+  end: Op;
+  body?: string;
+}
 
 /**
- * Split on `;`, `&&`, `||`, `|`, a lone `&`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes, keeping the operator that
- * ends each piece (matchRule's directory tracking reads the structure). Heredoc bodies and `#` comments are data,
- * not commands: they are skipped without quote tracking (an apostrophe in them must not swallow the commands after
- * them). An unbalanced quote at the end re-splits its tail with quotes off.
+ * Split on `;`, `&&`, `||`, `|`, a lone `&`, newlines and `(`/`)`/`{ `/` }` grouping outside quotes, keeping the
+ * operator that ends each piece (matchRule's directory tracking reads the structure). Only an unquoted, unescaped
+ * `>`/`<` makes a following `|` or `&` part of a redirection (`>|`, `2>&1`); an extglob group (`@(a|b)`, `x!(y)`)
+ * stays inside its word. Heredoc bodies and `#` comments are data, not commands: they are skipped without quote
+ * tracking (an apostrophe in them must not swallow the commands after them), and a body is kept on its piece. An
+ * unbalanced quote at the end re-splits its tail with quotes off.
  */
-function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }[] {
-  const out: { text: string; end: Op }[] = [];
+function splitTopLevel(text: string, quotesOn = true): Piece[] {
+  const out: Piece[] = [];
   let cur = "";
   let blank = true; // cur holds only whitespace
   let quote: string | undefined;
@@ -312,6 +452,9 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
   let quoteOut = 0;
   let quoteCur = "";
   let heredoc: string | undefined;
+  let redirect = false; // the previous character is an unquoted, unescaped `<` or `>`
+  let plain = ""; // the previous character when it was a plain one (not quoted, escaped or an operator)
+  let extglob = 0; // open extglob groups, whose `|` and parentheses belong to the word
   const boundary = (end: Op) => {
     out.push({ text: cur, end });
     cur = "";
@@ -334,14 +477,22 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
   let m: RegExpExecArray | null;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
+    const afterRedirect = redirect;
+    const before = plain;
+    redirect = false;
+    plain = "";
     if (quote !== undefined) {
-      if (c === quote) quote = undefined;
-      else if (c === "\\" && quote === '"' && i + 1 < text.length) cur += text[i++];
-      cur += c;
+      // an escaped character never closes the quote, and stays in the text as written
+      if (c === "\\" && quote !== "'" && i + 1 < text.length) cur += c + text[++i];
+      else {
+        cur += c;
+        if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      }
       continue;
     }
     if (quotesOn && (c === "'" || c === '"')) {
-      quote = c;
+      // `$'…'` (ANSI-C quoting) lets `\'` escape its closing quote
+      quote = c === "'" && before === "$" ? "$'" : c;
       quoteAt = i;
       quoteOut = out.length;
       quoteCur = cur;
@@ -361,10 +512,19 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
     } else if (c === "\n") {
       boundary(";");
       if (heredoc !== undefined) {
-        i = heredocEnd(i + 1);
+        const end = heredocEnd(i + 1);
+        out[out.length - 1].body = text.slice(i + 1, end);
+        i = end;
         heredoc = undefined;
       }
-    } else if (c === "|" && text[i - 1] === ">") {
+    } else if (extglob > 0 && (c === "(" || c === ")" || c === "|")) {
+      cur += c;
+      if (c !== "|") extglob += c === "(" ? 1 : -1;
+    } else if (c === "(" && /[@!+*?]/.test(before) && !(before === "!" && cur.trim() === "!")) {
+      // an extglob group `@(…)`, `x!(…)`, `*(…)`: part of the word, not a subshell (`! (…)` negates one)
+      extglob = 1;
+      cur += c;
+    } else if (c === "|" && afterRedirect && text[i - 1] === ">") {
       // `>|`, `2>|`, `&>|`: a noclobber-override redirection, not a pipe
       cur += c;
     } else if (c === ";" || c === "|" || (c === "&" && text[i + 1] === "&")) {
@@ -373,7 +533,7 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
       // `|&` pipes stderr too: one pipe
       else if (c === "|" && text[i + 1] === "&") i++;
       boundary(c === ";" ? ";" : c === "&" ? "&&" : double ? "||" : "|");
-    } else if (c === "&" && text[i + 1] !== ">" && !/[<>]/.test(text[i - 1] ?? "")) {
+    } else if (c === "&" && text[i + 1] !== ">" && !afterRedirect) {
       // a lone `&` runs what precedes it in the background (`>&`, `&>`, `2>&1` are redirections)
       boundary("&");
     } else if (c === "(" || c === ")") {
@@ -387,6 +547,8 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
     } else {
       cur += c;
       if (blank && !/\s/.test(c)) blank = false;
+      redirect = c === "<" || c === ">";
+      plain = c;
     }
   }
   boundary("");
@@ -394,25 +556,37 @@ function splitTopLevel(text: string, quotesOn = true): { text: string; end: Op }
     // bash would reject an unterminated quote; a heredoc or comment the scan missed is the likelier reading
     const tail = splitTopLevel(text.slice(quoteAt + 1), false);
     out.length = quoteOut;
-    tail[0] = { text: `${quoteCur}${quote}${tail[0].text}`, end: tail[0].end };
+    tail[0] = { ...tail[0], text: `${quoteCur}${quote}${tail[0].text}` };
     out.push(...tail);
   }
   return out;
 }
 
+/** Operands a wrapper supplies at run time: `xargs`/`parallel` append them, `-I R`/`{}` put them into words holding R. */
+interface RuntimeArgs {
+  append: boolean;
+  replace: string[];
+}
+
 /** One split piece after normalization (`text` is "" for the empty piece before a `(`/`{` or after a `)`/`}`). */
 interface Normalized {
+  /** The command text, CUT marking where a substitution was cut out. */
   text: string;
   /** The operator that ends the piece. */
   end: Op;
-  /** Directories its stripped `env -C`/`sudo -D` prefixes run it in, as written. */
+  /** Directories its stripped `env -C`/`sudo -D`/`unshare -w`/`chroot` prefixes run it in, as written (CUT: unknown). */
   chdirs: string[];
   /** A wrapper, assignment or keyword was stripped: a `cd` behind it may not move this shell. */
   prefixed: boolean;
   /** It opens a loop (`while`/`until`/`for`/`select`) or an `if`/`case`, or closes one (`fi`/`done`/`esac`). */
   compound: Compound | "close" | undefined;
-  /** The normalized `sh -c "…"` / `eval "…"` literal it runs in a child shell. */
+  /** What it runs in a child shell: an `sh -c` (and kin) line, `find -exec` commands, a script fed to a shell's stdin. */
   payload: Normalized[];
+  runtime: RuntimeArgs | undefined;
+  /** The stripped prefix (its redirections, `2>/dev/null rm …`, still write). */
+  prefix: string;
+  /** The command word was a cut substitution (`$(which rm) -rf x`): what runs cannot be known here. */
+  opaque: boolean;
 }
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
@@ -420,16 +594,18 @@ const COMPOUND_WORD = /^(?:(while|until|for|select)|(if)|(case)|(fi|done|esac))(
 
 /**
  * D-03 normalization: the inner text of every `$(…)` / backtick substitution becomes its own command, the rest is
- * split on `;`, `&&`, `||`, `|`, `&` (outside quotes), and each segment loses leading `env X=…`, `X=…`, `sudo`,
- * `command`, wrapper words and shell keywords (`if`, `then`, `do`, `!` …). A literal `sh -c "…"` / `eval "…"`
- * argument is normalized in turn and its segments appended (the outer segment stays too); `bash -c "$VAR"` is opaque
- * by design (the documented residual).
+ * split on `;`, `&&`, `||`, `|`, `&` (outside quotes), plain quoted words are unquoted, and each segment loses leading
+ * `env X=…`, `X=…`, `sudo`, `command`, wrapper words and shell keywords (`if`, `then`, `do`, `!` …). What a segment
+ * runs in a child shell is normalized in turn and its segments appended (the outer segment stays too): a literal
+ * `sh -c "…"` / `eval "…"` / `su -c` / `env -S` line, `find -exec` commands, and a heredoc, here-string or `echo`
+ * fed to a shell reading its script from stdin. `bash -c "$VAR"` is opaque by design (the documented residual).
  */
 export function normalize(command: string): string[] {
   const texts: string[] = [];
   const collect = (items: Normalized[]) => {
     for (const item of items) {
-      if (item.text !== "") texts.push(item.text);
+      const text = item.text.replaceAll(CUT, " ").trim();
+      if (text !== "") texts.push(text);
       collect(item.payload);
     }
   };
@@ -440,31 +616,104 @@ export function normalize(command: string): string[] {
 function normalizeSegments(command: string, depth: number): Normalized[] {
   const parts: string[] = [];
   // a backslash-newline continues the line: `git \` ⏎ `push --force` is one command
-  let rest = command.replace(/\\\r?\n/g, " ");
+  // `${IFS}` / `$IFS` separate words exactly like a blank
+  let rest = command.replace(/\\\r?\n/g, " ").replace(/\$\{IFS\}|\$IFS(?!\w)/g, " ");
   const sub = /\$\(([^()]*)\)|`([^`]*)`/;
   for (let m = sub.exec(rest), n = 0; m !== null && n < 256; m = sub.exec(rest), n++) {
     parts.push(m[1] ?? m[2] ?? "");
-    rest = `${rest.slice(0, m.index)} ${rest.slice(m.index + m[0].length)}`;
+    rest = `${rest.slice(0, m.index)}${CUT}${rest.slice(m.index + m[0].length)}`;
   }
   parts.push(rest);
   const items: Normalized[] = [];
   for (const part of parts) {
+    const built: { item: Normalized; body: string | undefined }[] = [];
     for (const piece of splitTopLevel(part)) {
-      let seg = piece.text.trim();
+      let seg = simplifyWords(piece.text.trim());
       const keyword = COMPOUND_WORD.exec(seg);
       const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
       // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
       let at = 0;
       for (PREFIX.lastIndex = 0; PREFIX.test(seg); at = PREFIX.lastIndex);
-      const chdirs = at === 0 ? [] : prefixChdirs(seg.slice(0, at));
+      const prefix = seg.slice(0, at);
+      const info = at === 0 ? undefined : prefixInfo(prefix);
       seg = seg.slice(at);
-      // `sh -c "<literal>"`, or the quoted line left behind by a stripped `eval`
-      const literal = seg !== "" && depth < MAX_LITERAL_DEPTH ? quotedLiteral(seg, SHELL_C.exec(seg)?.[0].length ?? 0) : undefined;
-      const payload = literal === undefined ? [] : normalizeSegments(literal, depth + 1);
-      items.push({ text: seg, end: piece.end, chdirs, prefixed: at > 0, compound, payload });
+      // `sudo -e FILE` edits FILE
+      if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
+      let payload: Normalized[] = [];
+      if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
+        const line = commandLine(seg);
+        if (line !== undefined) payload.push(...normalizeSegments(line, depth + 1));
+        if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth));
+      }
+      const runtime = info?.runtime;
+      if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
+      const opaque = /(?:^|\s)\u0001+(?:\s|$)/.test(prefix);
+      const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque };
+      items.push(item);
+      built.push({ item, body: piece.body });
+    }
+    // a script fed to a shell's stdin (`bash <<EOF`, `sh <<< '…'`, `echo … | sh`) runs like `sh -c`
+    if (depth < MAX_LITERAL_DEPTH && built.some(({ item }) => readsStdinScript(item.text))) {
+      for (const { item, body } of built) {
+        const hereString = /<<<\s*((?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+)/.exec(`${item.prefix} ${item.text}`)?.[1];
+        const echoed = /^(?:echo|printf)(?:\s|$)/.test(item.text) ? shellWords(item.text).slice(1).map(unquote).join(" ") : undefined;
+        for (const fed of [body, hereString === undefined ? undefined : unquote(hereString), echoed]) {
+          if (fed !== undefined) item.payload.push(...normalizeSegments(fed, depth + 1));
+        }
+      }
     }
   }
   return items;
+}
+
+/** A shell that reads its script from stdin: no script operand, `-s`, or `-`/`/dev/stdin`; `source`/`.` of stdin. */
+function readsStdinScript(seg: string): boolean {
+  if (!/^(?:\S*\/)?(?:[a-z]*sh|fish|source|\.)(?:\s|$)/.test(seg)) return false;
+  const words = shellWords(seg).map(unquote);
+  const stdin = (w: string | undefined) => w === "-" || w === "/dev/stdin" || w === "/proc/self/fd/0";
+  const cmd = posix.basename(words[0] ?? "");
+  if (cmd === "source" || cmd === ".") return stdin(words[1]);
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    // a redirection (`<<EOF`, `<<< 'x'`, `2>/dev/null`) is not a script operand; a bare operator takes the next word
+    if (/^\d*(?:<<<|<<-?|<>|<|>>?|&>>?)$/.test(w)) i++;
+    else if (/^\d*[<>&]/.test(w)) continue;
+    else if (/^(?:[-+][oO]|--rcfile|--init-file)$/.test(w)) i++;
+    else if (/^[-+]./.test(w)) {
+      if (/^-[A-Za-z]*c/.test(w)) return false;
+      if (/^-[A-Za-z]*s/.test(w)) return true;
+    } else return stdin(w);
+  }
+  return true;
+}
+
+/** `items` and their payloads with words holding one of `replace` read as run-time operands. */
+function withReplace(items: Normalized[], replace: string[]): Normalized[] {
+  return items.map((item) => ({
+    ...item,
+    runtime: { append: item.runtime?.append ?? false, replace: [...(item.runtime?.replace ?? []), ...replace] },
+    payload: withReplace(item.payload, replace),
+  }));
+}
+
+/**
+ * The commands `find … -exec|-execdir|-ok|-okdir CMD … ;|+` runs, each found path (`{}`) a run-time operand;
+ * `-execdir`/`-okdir` run them in directories that cannot be known here.
+ */
+function findCommands(seg: string, depth: number): Normalized[] {
+  const words = shellWords(seg);
+  const out: Normalized[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const action = unquote(words[i]);
+    if (!/^-(?:exec|execdir|ok|okdir)$/.test(action)) continue;
+    let j = i + 1;
+    while (j < words.length && !/^[;+]$/.test(unquote(words[j]))) j++;
+    for (const item of withReplace(normalizeSegments(words.slice(i + 1, j).join(" "), depth + 1), ["{}"])) {
+      out.push(action.endsWith("dir") ? { ...item, chdirs: [CUT, ...item.chdirs] } : item);
+    }
+    i = j;
+  }
+  return out;
 }
 
 /** Per wrapper: its chdir option with the directory attached (`-CDIR`, `--chdir=DIR`) and as a word of its own. */
@@ -472,36 +721,77 @@ const CHDIR_OPTION: Record<string, readonly [RegExp, RegExp]> = {
   env: [/^(?:--chdir=|-[A-Za-z]*C(?=.))(.*)$/, /^(?:--chdir|-[A-Za-z]*C)$/],
   sudo: [/^(?:--chdir=|-[A-Za-z]*D(?=.))(.*)$/, /^(?:--chdir|-[A-Za-z]*D)$/],
   doas: [/^(?:--chdir=|-[A-Za-z]*D(?=.))(.*)$/, /^(?:--chdir|-[A-Za-z]*D)$/],
+  unshare: [/^(?:--wd=|-w(?=.))(.*)$/, /^(?:--wd|-w)$/],
 };
 
 /**
- * The directories a stripped prefix runs its command in, in order: `env -C DIR` / `-CDIR` / `-iC DIR` /
- * `--chdir[=]DIR` and `sudo`/`doas` `-D DIR` / `--chdir[=]DIR`.
+ * What a stripped prefix implies for its command: the directories it runs in, in order (`env -C DIR` / `-CDIR` /
+ * `-iC DIR` / `--chdir[=]DIR`, `sudo`/`doas` `-D`/`--chdir`, `unshare -w`/`--wd`; `chroot` and `unshare -R` make it
+ * unknown), the operands `xargs` (`-I R`, `-i`, `--replace[=R]`) and `parallel` supply at run time, and a `sudo -e`.
  */
-function prefixChdirs(prefix: string): string[] {
-  if (!/(?:^|\s)-(?:[A-Za-z]*[CD]|-chdir)/.test(prefix)) return [];
-  const words = prefix.split(/\s+/).filter((w) => w !== "").map((w) => w.replace(/^(['"])(.*)\1$/, "$2"));
-  const dirs: string[] = [];
-  let option: readonly [RegExp, RegExp] | undefined; // the chdir option of the wrapper whose flags these are
+function prefixInfo(prefix: string): { chdirs: string[]; runtime: RuntimeArgs | undefined; edit: boolean } {
+  if (!/-|\b(?:xargs|parallel|chroot)\b/.test(prefix)) return { chdirs: [], runtime: undefined, edit: false };
+  const words = shellWords(prefix).map(unquote);
+  const info: { chdirs: string[]; runtime: RuntimeArgs | undefined; edit: boolean } = { chdirs: [], runtime: undefined, edit: false };
+  let wrapper = "";
   for (let i = 0; i < words.length; i++) {
-    const wrapper = words[i].includes("=") ? "" : posix.basename(words[i]);
-    if (Object.hasOwn(CHDIR_OPTION, wrapper)) {
-      option = CHDIR_OPTION[wrapper];
+    const w = words[i];
+    if (!w.startsWith("-")) {
+      const name = w.includes("=") ? "" : posix.basename(w);
+      if (/^(?:env|sudo|doas|unshare|xargs|parallel|chroot|exec|nice|timeout|nohup|setsid|watch|flock|stdbuf|ionice|chrt|taskset|fakeroot|busybox|toybox|command|builtin|eval|time)$/.test(name)) {
+        wrapper = name;
+        if (name === "chroot") info.chdirs.push(CUT);
+        if (name === "xargs") info.runtime = { append: true, replace: [] };
+        if (name === "parallel") info.runtime = { append: true, replace: ["{"] };
+      }
       continue;
     }
-    if (option === undefined || !words[i].startsWith("-")) continue;
-    const attached = option[0].exec(words[i]);
-    if (attached !== null) dirs.push(attached[1]);
-    else if (option[1].test(words[i]) && words[i + 1] !== undefined) dirs.push(words[++i]);
+    const option = Object.hasOwn(CHDIR_OPTION, wrapper) ? CHDIR_OPTION[wrapper] : undefined;
+    const attached = option?.[0].exec(w);
+    if (attached) info.chdirs.push(attached[1]);
+    else if (option?.[1].test(w) && words[i + 1] !== undefined) info.chdirs.push(words[++i]);
+    else if ((wrapper === "sudo" || wrapper === "doas") && /^(?:-[A-Za-z]*e|--edit)$/.test(w)) info.edit = true;
+    else if (wrapper === "unshare" && /^(?:-R|--root)(?:=|$)/.test(w)) info.chdirs.push(CUT);
+    else if (wrapper === "xargs") {
+      const replace = w === "-I" ? words[++i] : /^(?:-I|-i|--replace=)(.+)$/.exec(w)?.[1] ?? (w === "-i" || w === "--replace" ? "{}" : undefined);
+      if (replace !== undefined && replace !== "") info.runtime = { append: false, replace: [replace] };
+    }
   }
-  return dirs;
+  return info;
 }
 
-function parseSegment(text: string, cwd: string | undefined): Segment {
-  const words = text.split(/\s+/).filter((w) => w !== "").map((w) => w.replace(/^(['"])(.*)\1$/, "$2"));
-  const argv0 = words[0] ?? "";
-  if (words.length > 0) words[0] = posix.basename(words[0]);
-  return { text, words, argv0, cwd };
+/** A redirection shell word (`2>/dev/null`, `>&2`, `<<EOF`); a bare operator's target is the next word. */
+const REDIRECT_WORD = new RegExp(`^${REDIRECT_OP}`);
+
+/**
+ * The segment the rows read from a normalized piece: its words unquoted, redirection words dropped (the redirection
+ * scan reads their targets from `marked`), unquoted brace lists expanded (`{touch,.swarm/x}`, `cp a{,.bak}`) and
+ * run-time operands marked CUT; `cwd` is set by the caller.
+ */
+function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "opaque">): Segment {
+  const all: string[] = [];
+  const raw = shellWords(item.text);
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op !== null) {
+      if (op[0] === raw[i]) i++;
+      continue;
+    }
+    const word = unquote(raw[i]);
+    all.push(...(/["'\\]/.test(raw[i]) ? [word] : (braceAlternatives(word) ?? [word])));
+  }
+  const argv0 = all[0] ?? "";
+  if (all.length > 0) all[0] = posix.basename(all[0]);
+  const { runtime } = item;
+  const targetWords =
+    runtime === undefined
+      ? all
+      : [...all.map((w, i) => (i > 0 && runtime.replace.some((r) => w.includes(r)) ? CUT : w)), ...(runtime.append ? [CUT] : [])];
+  const words = all.filter((w, i) => i === 0 || !/^\u0001+$/.test(w));
+  // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
+  const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
+  const text = item.text.replaceAll(CUT, " ").trim();
+  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, cwd: undefined };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -530,17 +820,128 @@ const within = (path: string, dir: string) => dir !== "" && dir !== "/" && path.
 /** Where a segment's paths resolve: its tracked directory, else the session cwd (protectedTarget fails closed first). */
 const segmentBase = (seg: Segment, facts: GuardFacts) => ({ cwd: seg.cwd ?? facts.cwd, home: facts.home });
 
-/**
- * D-08 over a shell target: a protected path (isProtectedPath) once resolved in the segment's directory, or any
- * relative target while that directory is unknown (`cd "$DIR"`, `cd -`): fail closed rather than guess the directory.
- */
-function protectedTarget(target: string, seg: Segment, facts: GuardFacts): boolean {
-  if (seg.cwd === undefined && !target.startsWith("/") && !HOME_PREFIX.test(target)) return true;
-  return isProtectedPath(target, facts, seg.cwd ?? facts.cwd);
+/** The D-08 state directories (compared in any case: a case-insensitive file system maps `.Swarm` onto `.swarm`). */
+const PROTECTED_DIRS = [".swarm", ".omp"];
+/** Device sinks a write may always name. */
+const SAFE_SINK = /^\/dev\/(?:null|zero|full|stdout|stderr|tty|fd\/\d+)$/;
+/** A glob character or an extglob group in a word (brace lists are expanded first, by braceAlternatives). */
+const GLOB_CHAR = /[*?[]|[@!+]\(/;
+/** More brace alternatives than this in one word leave it unjudgeable. */
+const MAX_ALTERNATIVES = 64;
+
+/** The first brace group bash expands in `word`: its bounds and its comma parts (none for a `{a..z}` sequence). */
+function braceGroup(word: string): { start: number; end: number; parts: string[] | undefined } | undefined {
+  for (let start = word.indexOf("{"); start !== -1; start = word.indexOf("{", start + 1)) {
+    if (word[start - 1] === "$") continue;
+    const parts: string[] = [];
+    let depth = 0;
+    let from = start + 1;
+    for (let i = start; i < word.length; i++) {
+      if (word[i] === "{") depth++;
+      else if (word[i] === "," && depth === 1) {
+        parts.push(word.slice(from, i));
+        from = i + 1;
+      } else if (word[i] === "}" && --depth === 0) {
+        parts.push(word.slice(from, i));
+        if (parts.length > 1) return { start, end: i, parts };
+        if (/\.\./.test(parts[0])) return { start, end: i, parts: undefined };
+        break;
+      }
+    }
+  }
+  return undefined;
 }
 
-/** A repo-state segment (`.git`, `.swarm`, `.omp`) anywhere in the target path, before any resolution. */
-const repoStateSegment = (target: string) => target.split("/").some((s) => s === ".git" || s === ".swarm" || s === ".omp");
+/** The words brace expansion makes of `word` (a `{a..z}` sequence read as `*`); undefined past MAX_ALTERNATIVES. */
+function braceAlternatives(word: string): string[] | undefined {
+  const done: string[] = [];
+  const todo = [word];
+  for (let next = todo.pop(); next !== undefined; next = todo.pop()) {
+    const group = braceGroup(next);
+    if (group === undefined) done.push(next);
+    else {
+      const [head, tail] = [next.slice(0, group.start), next.slice(group.end + 1)];
+      // pushed last-first, so they come off the stack (and out) in written order, as bash expands them
+      for (const part of [...(group.parts ?? ["*"])].reverse()) todo.push(head + part + tail);
+    }
+    if (done.length + todo.length > MAX_ALTERNATIVES) return undefined;
+  }
+  return done;
+}
+
+/** One path component's glob as a case-insensitive regex; an extglob group matches anything (a superset). */
+function globRegex(pattern: string): RegExp {
+  let re = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (/[@!+*?]/.test(c) && pattern[i + 1] === "(") {
+      let depth = 0;
+      for (i++; i < pattern.length; i++) {
+        if (pattern[i] === "(") depth++;
+        else if (pattern[i] === ")" && --depth === 0) break;
+      }
+      re += ".*";
+    } else if (c === "*") re += ".*";
+    else if (c === "?") re += ".";
+    else if (c === "[" && pattern.indexOf("]", i + 2) !== -1) {
+      const close = pattern.indexOf("]", i + 2);
+      const body = pattern.slice(i + 1, close).replace(/^[!^]/, "^").replace(/\\/g, "\\\\");
+      re += `[${body}]`;
+      i = close;
+    } else re += c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  }
+  try {
+    return new RegExp(`^${re}$`, "i");
+  } catch {
+    return /^.*$/;
+  }
+}
+
+/**
+ * `pattern` may name `name`: a plain component equals it in any case, a glob matches it. A leading dot is matched only
+ * by a literal one, a bracket or an extglob group (bash without dotglob, which the glob-dotfiles row keeps off).
+ */
+function mayName(pattern: string, name: string): boolean {
+  if (!GLOB_CHAR.test(pattern)) return pattern.toLowerCase() === name.toLowerCase();
+  if (name.startsWith(".") && !/^(?:\.|\[|[@!+*?]\()/.test(pattern)) return false;
+  return globRegex(pattern).test(name);
+}
+
+/**
+ * D-08 over a shell target, resolved in the segment's directory: a protected path (isProtectedPath), including any
+ * brace alternative or glob that may name one; and, failing closed, any target that cannot be judged from the text —
+ * a variable or cut substitution (`"$f"`, `$(…)/x`; `$HOME`, `$TMPDIR` and `$PWD` prefixes are expanded), `~user`,
+ * `~+`, `~-`, a run-time operand (`xargs`, `find -exec {}`), a glob component that may name `..`, a word of more than
+ * MAX_ALTERNATIVES alternatives, or a relative target while the directory is unknown (`cd "$DIR"`, `cd -`).
+ */
+function protectedTarget(target: string, seg: Segment, facts: GuardFacts): boolean {
+  if (SAFE_SINK.test(target)) return false;
+  let path = target;
+  if (facts.tmp !== "") path = path.replace(/^(?:\$TMPDIR|\$\{TMPDIR\})(?=\/|$)/, facts.tmp);
+  if (seg.cwd !== undefined) path = path.replace(/^(?:\$PWD|\$\{PWD\})(?=\/|$)/, seg.cwd || "/");
+  const rest = path.replace(HOME_PREFIX, "");
+  if (/[$`\u0001]/.test(rest) || rest.startsWith("~") || (HOME_PREFIX.test(path) && facts.home.includes(CUT))) return true;
+  if (seg.cwd === undefined && !path.startsWith("/") && !HOME_PREFIX.test(path)) return true;
+  const alternatives = braceAlternatives(path);
+  if (alternatives === undefined) return true;
+  const base = segmentBase(seg, facts);
+  return alternatives.some((alt) => {
+    const resolved = resolvePath(alt, base);
+    // `/proc/<pid>/cwd|root|fd/…` reach a directory or file the text does not name
+    if (/^\/proc\/[^/]+\/(?:cwd|root|fd|map_files)(?:\/|$)/.test(resolved)) return true;
+    if (!GLOB_CHAR.test(alt)) return isProtectedPath(alt, facts, base.cwd);
+    const parts = resolved.split("/");
+    if (parts.some((p) => GLOB_CHAR.test(p) && mayName(p, ".."))) return true;
+    if (parts.some((p) => PROTECTED_DIRS.some((name) => mayName(p, name)))) return true;
+    return guardedRoots(facts).some((root) => {
+      const names = root.split("/");
+      return names.length <= parts.length && names.every((name, i) => mayName(parts[i], name));
+    });
+  });
+}
+
+/** A `.git`, `.swarm` or `.omp` component, in any case or through a glob, anywhere in the path. */
+const repoStateSegment = (path: string) => path.split("/").some((p) => [".git", ...PROTECTED_DIRS].some((name) => mayName(p, name)));
 
 /** An `rm -rf` target that is `/`, `~`, the session cwd or the tmp dir itself, or outside both subtrees (incl. `..`). */
 function outsideCwd(target: string, seg: Segment, facts: GuardFacts): boolean {
@@ -550,11 +951,11 @@ function outsideCwd(target: string, seg: Segment, facts: GuardFacts): boolean {
 
 /**
  * `rm` that is universal-destructive: `-r -f` of `/`, `~`, cwd, the tmp dir or anything outside those two subtrees;
- * `-r` alone of a `.git`, `.swarm` or `.omp` path; and any `rm` of a `.swarm`/`.omp` path (the D-08 state dirs),
- * whatever the flags.
+ * `-r` alone of a `.git`, `.swarm` or `.omp` path; and any `rm` of a protected path (the D-08 state dirs, a guarded
+ * runtime root, or a target that cannot be judged), whatever the flags. Brace alternatives count one by one.
  */
 function rmProtected(seg: Segment, facts: GuardFacts): boolean {
-  const { words } = seg;
+  const { targetWords: words } = seg;
   if (words[0] !== "rm") return false;
   let recursive = false;
   let force = false;
@@ -573,17 +974,20 @@ function rmProtected(seg: Segment, facts: GuardFacts): boolean {
   return targets.some((t) => {
     if (protectedTarget(t, seg, facts)) return true;
     if (!recursive) return false;
-    // a repo-state dir as written, or on the way from the session cwd once resolved (`cd .git && rm -r objects`)
-    const fromSession = posix.relative(facts.cwd || "/", resolvePath(t, segmentBase(seg, facts)));
-    return repoStateSegment(t) || repoStateSegment(fromSession) || (force && outsideCwd(t, seg, facts));
+    return (braceAlternatives(t) ?? []).some((alt) => {
+      // a repo-state dir as written, or on the way from the session cwd once resolved (`cd .git && rm -r objects`)
+      const fromSession = posix.relative(facts.cwd || "/", resolvePath(alt, segmentBase(seg, facts)));
+      return repoStateSegment(alt) || repoStateSegment(fromSession) || (force && outsideCwd(alt, seg, facts));
+    });
   });
 }
 
-/** `git push` of tags, or to main/master or a release tag (refspec destination). */
+/** `git push` of tags or of every branch (`--all`, `--mirror`), or to main/master or a release tag (refspec destination). */
 function pushToProtected(seg: Segment): boolean {
   const { sub, args } = git(seg.words);
   if (sub !== "push") return false;
-  if (args.includes("--tags") || args.includes("--follow-tags")) return true;
+  // `--all`/`--mirror` push every branch, main and master included
+  if (args.some((a) => /^--(?:tags|follow-tags|all|mirror)$/.test(a))) return true;
   const refs = operands(args).slice(1);
   return refs.some((ref) => {
     const dest = (ref.split(":").pop() ?? "").replace(/^\+/, "").replace(/^refs\/(?:heads|tags)\//, "");
@@ -598,29 +1002,60 @@ const reason = (capability: string, id: string) => `BLOCKED needs: human-approva
 
 /**
  * D-08: a path, after `~` expansion and resolution against `base` (default the session cwd), inside `.swarm/` or
- * `.omp/` (cwd's, ~/.omp, or any other), or inside a runtime root the session's cwd is not in: a swarm session never
- * rewrites the running guard (`omp/`) or the gate scripts the runner later runs with keys (`scripts/`). A session
- * working inside the agent-swarm checkout itself (self-development) is exempt (the AGENTS.md residual).
+ * `.omp/` (cwd's, ~/.omp, or any other; any case), or inside a runtime root the session's cwd is not in: a swarm
+ * session never rewrites the running guard (`omp/`) or the gate scripts the runner later runs with keys (`scripts/`).
+ * A session working inside the agent-swarm checkout itself (self-development) is exempt (the AGENTS.md residual).
  */
 export function isProtectedPath(path: string, facts: Pick<GuardFacts, "cwd" | "home" | "runtimeRoots">, base = facts.cwd): boolean {
-  const resolved = resolvePath(path, { cwd: base, home: facts.home });
-  if (resolved.split("/").some((s) => s === ".swarm" || s === ".omp")) return true;
+  const resolved = resolvePath(path, { cwd: base, home: facts.home }).toLowerCase();
+  if (resolved.split("/").some((s) => PROTECTED_DIRS.includes(s))) return true;
+  return guardedRoots(facts).some((root) => resolved === root || resolved.startsWith(`${root}/`));
+}
+
+/** The runtime roots the session's cwd is not in (lower-cased; never `/`): the ones D-08 protects. */
+function guardedRoots(facts: Pick<GuardFacts, "cwd" | "runtimeRoots">): string[] {
   const cwd = posix.resolve(facts.cwd || "/");
-  return facts.runtimeRoots.some((r) => {
+  return facts.runtimeRoots.flatMap((r) => {
     const root = posix.resolve(r);
-    return root !== "/" && cwd !== root && !within(cwd, root) && (resolved === root || within(resolved, root));
+    return root === "/" || cwd === root || within(cwd, root) ? [] : [root.toLowerCase()];
   });
 }
 
-/** Files a segment writes, as far as detectable: `>`/`>>` targets, tee operands, cp/mv/install destinations. */
-function shellWriteTargets({ text, words }: Segment): string[] {
-  const targets: string[] = [];
-  for (const m of text.matchAll(/(?:^|[^<>])\d*&?>>?\|?\s*("[^"]*"|'[^']*'|[^\s<>|&;]+)/g)) {
-    targets.push(m[1].replace(/^(['"])(.*)\1$/, "$2"));
+/** The values of `flags` (`-C dir`) and of `long=` (`--directory=dir`) in `words`. */
+function optionValues(words: string[], flags: string[], long?: string): string[] {
+  const out: string[] = [];
+  for (let i = 1; i < words.length; i++) {
+    if (flags.includes(words[i]) && words[i + 1] !== undefined) out.push(words[++i]);
+    else if (long !== undefined && words[i].startsWith(`${long}=`)) out.push(words[i].slice(long.length + 1));
   }
+  return out;
+}
+
+/**
+ * A redirection and its target word: `>`, `>>`, `>|`, `n>`, `&>`, `<>` (read-write), `>&file`; group 4 is the `&` of
+ * `>&`, group 5 the target (quoted runs and escapes included).
+ */
+const REDIRECT = /(?:^|[^<>&\d])(\d*|&)(>>?|<>)(\|?)(&?)\s*((?:"[^"]*"|'[^']*'|\\.|[^\s<>|&;()"'\\])+)/g;
+/** Options whose value is a file the command writes (`sort -o`, `curl -o`, `gcc -o`, `--output=…`). */
+const OUTPUT_OPTION = /^(?:-o|--output|--output-file|--outfile|--out-file|--output-document|--log-file|--output-dir)$/;
+const OUTPUT_OPTION_EQ = /^(?:--output|--output-file|--outfile|--out-file|--output-document|--log-file|--output-dir)=(.*)$/;
+
+/**
+ * Files a segment writes, as far as detectable: redirection targets (fd duplications like `2>&1` aside), tee operands,
+ * cp/mv/install destinations, output-file options (`-o FILE`, `--output=FILE`, wget `-O`/`-P`), and the file a
+ * `curl -O`/`wget` download names after its URL.
+ */
+function shellWriteTargets({ marked, targetWords: words }: Segment): string[] {
+  const targets: string[] = [];
+  for (const m of marked.matchAll(REDIRECT)) {
+    const target = unquote(m[5]);
+    if (m[4] === "&" && /^(?:\d+-?|-)$/.test(target)) continue;
+    targets.push(target);
+  }
+  const cmd = words[0] ?? "";
   const args = operands(words.slice(1));
-  if (words[0] === "tee") targets.push(...args);
-  if (words[0] === "cp" || words[0] === "mv" || words[0] === "install") {
+  if (cmd === "tee") targets.push(...args);
+  if (cmd === "cp" || cmd === "mv" || cmd === "install") {
     const t = words.findIndex((w) => w === "-t" || w === "--target-directory");
     if (t > 0 && words[t + 1] !== undefined) targets.push(words[t + 1]);
     const long = words.filter((w) => w.startsWith("--target-directory=")).map((w) => w.slice("--target-directory=".length));
@@ -628,48 +1063,111 @@ function shellWriteTargets({ text, words }: Segment): string[] {
     // with a target directory every operand is a source
     if (t <= 0 && long.length === 0 && args.length > 1) targets.push(args[args.length - 1]);
   }
+  for (let i = 1; i < words.length; i++) {
+    const eq = OUTPUT_OPTION_EQ.exec(words[i]);
+    if (eq !== null) targets.push(eq[1]);
+    else if ((OUTPUT_OPTION.test(words[i]) || (cmd === "wget" && /^-[OP]$/.test(words[i]))) && words[i + 1] !== undefined) targets.push(words[++i]);
+    else if (/^-o./.test(words[i])) targets.push(words[i].slice(2));
+  }
+  const remoteName =
+    (cmd === "curl" && words.some((w) => /^(?:-[A-Za-z]*O[A-Za-z]*|--remote-name(?:-all)?)$/.test(w))) ||
+    (cmd === "wget" && !words.some((w) => /^(?:-O|--output-document)/.test(w)));
+  if (remoteName) {
+    for (const url of args.filter((a) => /^[a-z][\w+.-]*:\/\//i.test(a))) targets.push(posix.basename(url.replace(/[?#].*$/, "")) || "index.html");
+  }
   return targets;
 }
 
+/** Commands whose every operand is a file they create, change, link or remove. */
+const MUTATES_OPERANDS =
+  /^(?:rmdir|unlink|link|ln|shred|truncate|fallocate|sqlite3|chmod|chown|chgrp|chattr|setfacl|setfattr|touch|mkdir|mkfifo|mknod|mktemp|sponge|sudoedit|rename|patch|ed|ex|vi|vim|nvim|emacs|trash|trash-put|dos2unix|unix2dos)$/;
+/** Compressors that replace their operands (unless writing to stdout, testing or listing). */
+const COMPRESSOR = /^(?:gzip|gunzip|bzip2|bunzip2|xz|unxz|lzma|unlzma|zstd|unzstd|lz4|lzip|compress|uncompress)$/;
+
 /**
- * Files a segment mutates in place, as far as detectable: the operands of rmdir/unlink/shred/truncate/sqlite3/chmod/
- * chown/chgrp/touch/mkdir, the destination of ln/rsync, the sources `mv` (and `rsync --remove-source-files`) delete,
- * `sed -i` file operands, `dd of=`, `tar -C`/`--directory`, `unzip -d`. `$SWARM_DIR`/symlink spellings stay the
- * documented residual.
+ * Files a segment mutates in place, as far as detectable: the MUTATES_OPERANDS operands (`ln`/`link` all of them: a
+ * link makes its source writable elsewhere), compressor operands, the sources `mv`, `cp -l|-s` and `rsync
+ * --remove-source-files` give away, `install -d` directories, the ln/rsync destination, in-place editors (`sed -i`,
+ * `perl|ruby -i`, `awk -i inplace`, `yq -i`), `dd of=`, `tar -C` and the archive `tar -c|-r|-u` writes, `unzip -d`,
+ * `zip`'s archive, `split`'s prefix, `script`'s log files, `find -delete` (the found paths: unknowable) and
+ * `-fprint*`/`-fls` files, and the paths `git checkout|restore|rm|mv|clone|init|worktree` and `git config -f` touch
+ * (under `git -C`/`--work-tree`).
  */
-function shellMutateTargets({ words }: Segment): string[] {
+function shellMutateTargets({ targetWords: words, opaque }: Segment): string[] {
   const cmd = words[0] ?? "";
   const args = operands(words.slice(1));
-  if (/^(?:rmdir|unlink|shred|truncate|sqlite3|chmod|chown|chgrp|touch|mkdir|mkfifo)$/.test(cmd)) return args;
+  const has = (flag: RegExp) => words.some((w, i) => i > 0 && flag.test(w));
+  if (opaque || MUTATES_OPERANDS.test(cmd)) return args;
+  if (COMPRESSOR.test(cmd)) return has(/^(?:-[A-Za-z]*[ctl][A-Za-z]*|--(?:stdout|to-stdout|test|list))$/) ? [] : args;
   if (cmd === "mv") {
     // `-t DIR` / `--target-directory[=]DIR` makes every other operand a source; otherwise the last one is the destination
     const t = words.findIndex((w) => w === "-t" || w === "--target-directory");
     if (t > 0) return args.filter((a) => a !== words[t + 1]);
     return words.some((w) => w.startsWith("--target-directory=")) ? args : args.slice(0, -1);
   }
-  // ln and rsync read their sources and write the last operand; rsync --remove-source-files deletes the sources too
-  if (cmd === "ln" || cmd === "rsync") {
-    if (args.length < 2) return [];
-    return cmd === "rsync" && words.includes("--remove-source-files") ? args : [args[args.length - 1]];
-  }
+  if (cmd === "cp") return has(/^(?:-[A-Za-z]*[ls][A-Za-z]*|--link|--symbolic-link)$/) ? args : [];
+  if (cmd === "install") return has(/^(?:-[A-Za-z]*d[A-Za-z]*|--directory)$/) ? args : [];
+  // rsync reads its sources and writes the last operand; --remove-source-files deletes the sources too
+  if (cmd === "rsync") return args.length < 2 ? [] : words.includes("--remove-source-files") ? args : [args[args.length - 1]];
   if (cmd === "sed") {
-    if (!words.some((w) => /^-[A-Za-z]*i|^--in-place/.test(w))) return [];
+    if (!has(/^-[A-Za-z]*i|^--in-place/)) return [];
     // the first operand is the script unless one was given with -e/-f
-    const scripted = words.some((w) => /^(?:-[A-Za-z]*[ef]|--expression|--file)/.test(w));
-    return scripted ? args : args.slice(1);
+    return has(/^(?:-[A-Za-z]*[ef]|--expression|--file)/) ? args : args.slice(1);
   }
+  if (cmd === "perl" || cmd === "ruby") return has(/^-[A-Za-z]*i/) ? args : [];
+  if (/^[gm]?awk$/.test(cmd)) return words.some((w, i) => /^(?:-i|--include)$/.test(w) && words[i + 1] === "inplace") || has(/^--include=inplace$/) ? args : [];
+  if (cmd === "yq") return has(/^(?:-[A-Za-z]*i[A-Za-z]*|--inplace)$/) ? args : [];
   if (cmd === "dd") return words.flatMap((w) => (w.startsWith("of=") ? [w.slice(3)] : []));
-  const valueOf = (flags: string[], long?: string): string[] => {
-    const out: string[] = [];
+  if (cmd === "tar") {
+    const out = optionValues(words, ["-C", "--directory"], "--directory");
+    const creating = has(/^--(?:create|append|update|concatenate)$/) || /^-?[A-Za-z]*[cru]/.test(words[1] ?? "");
+    if (!creating) return out;
     for (let i = 1; i < words.length; i++) {
-      if (flags.includes(words[i]) && words[i + 1] !== undefined) out.push(words[i + 1]);
-      else if (long !== undefined && words[i].startsWith(`${long}=`)) out.push(words[i].slice(long.length + 1));
+      if (words[i].startsWith("--file=")) out.push(words[i].slice("--file=".length));
+      else if ((words[i] === "--file" || (i === 1 ? /^-?[A-Za-z]*f$/ : /^-[A-Za-z]*f$/).test(words[i])) && words[i + 1] !== undefined) out.push(words[++i]);
     }
     return out;
-  };
-  if (cmd === "tar") return valueOf(["-C", "--directory"], "--directory");
-  if (cmd === "unzip") return valueOf(["-d"]);
+  }
+  if (cmd === "unzip") return optionValues(words, ["-d"]);
+  if (cmd === "zip") return args.slice(0, 1);
+  if (cmd === "split") return args.slice(1, 2);
+  if (cmd === "script") {
+    const out: string[] = [];
+    for (let i = 1; i < words.length; i++) {
+      if (/^(?:-c|--command|-E|--echo|-m|--logging-format)$/.test(words[i])) i++;
+      else if (/^(?:-[OBTI]|--log-(?:out|in|io|timing)|--timing)$/.test(words[i]) && words[i + 1] !== undefined) out.push(words[++i]);
+      else if (!words[i].startsWith("-")) out.push(words[i]);
+    }
+    return out;
+  }
+  if (cmd === "find") {
+    const out = has(/^-delete$/) ? [CUT] : [];
+    for (let i = 1; i < words.length; i++) if (/^-(?:fprint0?|fprintf|fls)$/.test(words[i]) && words[i + 1] !== undefined) out.push(words[++i]);
+    return out;
+  }
+  if (cmd === "git") return gitPaths(words);
   return [];
+}
+
+/** The paths a path-mutating git subcommand touches, joined to `git -C` directories; a `--work-tree` itself. */
+function gitPaths(words: string[]): string[] {
+  let base = "";
+  const out: string[] = [];
+  let i = 1;
+  for (; i < words.length && words[i].startsWith("-"); i += GIT_VALUE_OPTION.test(words[i]) ? 2 : 1) {
+    const w = words[i];
+    const value = GIT_VALUE_OPTION.test(w) ? (words[i + 1] ?? "") : w.slice(w.indexOf("=") + 1);
+    if (w === "-C") base = value.startsWith("/") || HOME_PREFIX.test(value) ? value : posix.join(base || ".", value);
+    else if (/^--work-tree(?:=|$)/.test(w)) out.push(value);
+  }
+  const sub = words[i] ?? "";
+  const args = words.slice(i + 1);
+  const at = (p: string) => (base === "" || p.startsWith("/") || HOME_PREFIX.test(p) ? p : posix.join(base, p));
+  if (sub === "config") return optionValues(["", ...args], ["-f", "--file"], "--file").map(at);
+  if (!/^(?:checkout|restore|rm|mv|clone|init|worktree)$/.test(sub)) return [];
+  const paths = operands(args).filter((a) => a !== "add");
+  if (sub === "clone" && paths.length === 1) paths.push(posix.basename(paths[0]).replace(/\.git$/, ""));
+  return [...out, ...paths].map(at);
 }
 
 /**
@@ -678,7 +1176,7 @@ function shellMutateTargets({ words }: Segment): string[] {
  */
 const sqliteOnSwarm = (seg: Segment, facts: GuardFacts) =>
   seg.words[0] === "sqlite3" &&
-  operands(seg.words.slice(1)).some((t) => resolvePath(t, segmentBase(seg, facts)).split("/").includes(".swarm"));
+  operands(seg.words.slice(1)).some((t) => resolvePath(t, segmentBase(seg, facts)).toLowerCase().split("/").includes(".swarm"));
 
 /** Gate script stems (swarm_gate's GATE_SCRIPTS, plus the gate names themselves). */
 const GATE_STEMS: Record<string, true> = {
@@ -686,8 +1184,8 @@ const GATE_STEMS: Record<string, true> = {
   sec_gate: true, security_gate: true, rel_plan: true, release_gate: true,
 };
 
-/** An interpreter word, versioned pythons (`python3.12`) included. */
-const INTERPRETER = /^(?:python(?:3(?:\.\d+)?)?|bun|node|deno|uv|pipx)$/;
+/** An interpreter or runner word, versioned pythons (`python3.12`) included. */
+const INTERPRETER = /^(?:python(?:3(?:\.\d+)?)?|pypy3?|bun|bunx|node|deno|tsx|ts-node|npx|uv|pipx)$/;
 /** python's module-run option: `-m mod`, `-mmod`, or clustered behind no-value flags (`-Bm mod`); group 1 is `mod`. */
 const MODULE_OPTION = /^-[bBdEiIOPqsSuvxR]*m(.*)$/;
 
@@ -787,6 +1285,15 @@ export const RULES: readonly Rule[] = [
       "touch .swarm/x",
       "mkdir -p .omp/extensions",
     ],
+  },
+  // D-08: dotglob would let a leading `*`/`?` name `.swarm`/`.omp` (shell targets assume it off, as bash starts)
+  {
+    id: "glob-dotfiles",
+    capability: "protected_path",
+    pattern: ({ text, words, targetWords }) =>
+      /\b(?:GLOBIGNORE|dotglob|glob_?dots)\b/i.test(text) ||
+      ((words[0] === "shopt" || words[0] === "setopt") && targetWords.slice(1).some((w) => /[$`\u0001*?[{]/.test(w))),
+    samples: ["shopt -s dotglob", "GLOBIGNORE=x", "setopt globdots", "bash -O dotglob -c 'rm -r *'", 'shopt -s "$OPT"'],
   },
   // universal destructive (every swarm agent, treated as L4)
   {
@@ -974,10 +1481,11 @@ function distinct(worlds: World[]): World[] {
 function chdirTo(dirs: string[], from: string | undefined, facts: GuardFacts): string | undefined {
   if (dirs.length > 1) return undefined;
   const dir = dirs[0] ?? "~";
-  if (/^[-+]/.test(dir) || /[$`*?[{\\"']/.test(dir.replace(HOME_PREFIX, ""))) return undefined;
+  if (/^[-+]/.test(dir) || /[$`*?[{\\"'\u0001]/.test(dir.replace(HOME_PREFIX, ""))) return undefined;
   const absolute = dir.startsWith("/") || HOME_PREFIX.test(dir);
   if (!absolute && (from === undefined || (Boolean(facts.env.CDPATH) && !/^\.\.?(?:\/|$)/.test(dir)))) return undefined;
-  return resolvePath(dir, { cwd: from ?? "/", home: facts.home });
+  const to = resolvePath(dir, { cwd: from ?? "/", home: facts.home });
+  return to.includes(CUT) ? undefined : to;
 }
 
 /**
@@ -1041,7 +1549,7 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
     if (item.compound === "close") level.compounds.pop();
     else if (item.compound !== undefined) level.compounds.push(item.compound);
     if (item.text !== "") {
-      const seg = parseSegment(item.text, undefined);
+      const seg = parseSegment(item);
       let runIn = cur;
       for (const dir of item.chdirs) runIn = distinct(runIn.map((w) => ({ dir: chdirTo([dir], w.dir, facts), stack: w.stack })));
       for (const cwd of new Set(runIn.map((w) => w.dir))) out.push({ ...seg, cwd });
@@ -1049,7 +1557,7 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
       if (item.chdirs.length === 0 && /^(?:cd|pushd|popd)$/.test(seg.words[0] ?? "")) {
         const conditional = item.prefixed || level.cond || level.inherited || level.compounds.length > 0;
         const loop = levels.some((l) => l.compounds.includes("loop"));
-        cur = distinct(cur.flatMap((w) => changeDir(seg.words, w, conditional, loop, facts)));
+        cur = distinct(cur.flatMap((w) => changeDir(seg.targetWords, w, conditional, loop, facts)));
       }
     }
     const { end } = item;
@@ -1086,11 +1594,20 @@ function walk(items: Normalized[], start: World[], facts: GuardFacts, out: Segme
 
 /**
  * The first row (table order) matching any normalized segment of `command`, each segment tried in every directory it
- * may run in (D-08, walk). An unknown directory (`cwd` undefined) makes every relative write target protected.
- * `$(…)`/backtick bodies are cut out and listed first, so the order of directory changes is lost: in a command
- * holding one, any directory change makes every segment run in the session cwd and an unknown directory.
+ * may run in from `start` (the session cwd, or the bash tool's `cwd`; undefined: unknown) (D-08, walk). An unknown
+ * directory (`cwd` undefined) makes every relative write target protected. `$(…)`/backtick bodies are cut out and
+ * listed first, so the order of directory changes is lost: in a command holding one, any directory change makes
+ * every segment run in the start directory and an unknown one.
  */
-export function matchRule(command: string, facts: GuardFacts): Rule | undefined {
+export function matchRule(command: string, facts: GuardFacts, start: string | undefined): Rule | undefined {
+  // a command that assigns HOME, TMPDIR or CDPATH itself changes what `~`, `$TMPDIR` and a relative `cd` mean
+  const assigns = (name: string) => new RegExp(`\\b${name}\\b`).test(command.replace(new RegExp(`\\$\\{?${name}\\b\\}?`, "g"), ""));
+  const shellFacts: GuardFacts = {
+    ...facts,
+    home: assigns("HOME") ? CUT : facts.home,
+    tmp: assigns("TMPDIR") ? "" : facts.tmp,
+    env: assigns("CDPATH") ? { ...facts.env, CDPATH: CUT } : facts.env,
+  };
   const items = normalizeSegments(command, 0);
   const segments: Segment[] = [];
   if (/\$\(|`/.test(command)) {
@@ -1102,12 +1619,12 @@ export function matchRule(command: string, facts: GuardFacts): Rule | undefined 
       }
     };
     collect(items);
-    const parsed = flat.filter((item) => item.text !== "").map((item) => ({ item, seg: parseSegment(item.text, undefined) }));
+    const parsed = flat.filter((item) => item.text !== "").map((item) => ({ item, seg: parseSegment(item) }));
     const moves = parsed.some(({ item, seg }) => item.chdirs.length > 0 || /^(?:cd|pushd|popd)$/.test(seg.words[0] ?? ""));
-    for (const { seg } of parsed) for (const cwd of moves ? [facts.cwd, undefined] : [facts.cwd]) segments.push({ ...seg, cwd });
-  } else walk(items, [{ dir: facts.cwd, stack: [] }], facts, segments);
+    for (const { seg } of parsed) for (const cwd of moves ? [start, undefined] : [start]) segments.push({ ...seg, cwd });
+  } else walk(items, [{ dir: start, stack: [] }], shellFacts, segments);
   return RULES.find((rule) =>
-    segments.some((seg) => (typeof rule.pattern === "function" ? rule.pattern(seg, facts, command) : rule.pattern.test(seg.text))),
+    segments.some((seg) => (typeof rule.pattern === "function" ? rule.pattern(seg, shellFacts, command) : rule.pattern.test(seg.text))),
   );
 }
 

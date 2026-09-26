@@ -961,6 +961,142 @@ describe("HOOK-03 shell twin and D-08", () => {
     },
   );
 
+  const MUTATE = "protected_path: protected-path-mutate";
+  const SHELL = "protected_path: protected-path-shell";
+  const RM = "destructive: rm-rf-protected";
+  /** Lexical spellings bash reads as the plain command: quoting, escapes, ANSI-C `$'…'`, `${IFS}`, brace lists, redirection placement. */
+  test.each([
+    ["echo x \\> | tee .swarm/tasks.db", SHELL],
+    ["echo x \\>& git push -f", "destructive: git-force-push"],
+    ['busybox "rm" -rf .swarm', RM],
+    ["toybox 'tee' .swarm/x", SHELL],
+    ["busybox \\tee .swarm/x", SHELL],
+    ['"rm" -rf .swarm', RM],
+    ["'git' push -f", "destructive: git-force-push"],
+    ["\\rm -rf .swarm", RM],
+    ['r""m -rf .swarm', RM],
+    ['"sudo" rm -rf .swarm', RM],
+    ['sed "-i" s/a/b/ .omp/config.yml', MUTATE],
+    ["$'touch' .swarm/x", MUTATE],
+    ["touch $'\\x2eswarm/x'", MUTATE],
+    ["echo $'\\''; touch .swarm/x; echo '", MUTATE],
+    ['sh -c "touch .sw\\arm/x"', MUTATE],
+    ["touch${IFS}.swarm/x", MUTATE],
+    ["{touch,.swarm/x}", MUTATE],
+    ["2>/dev/null rm -rf .swarm", RM],
+    ["cp x .swarm/y 2>/dev/null", SHELL],
+    ["> .swarm/x", SHELL],
+    ["cat <> .swarm/tasks.db", SHELL],
+    ["cmd >& .swarm/x", SHELL],
+    ["exec 3>.swarm/x", SHELL],
+    ["touch .SWARM/x", MUTATE],
+  ])("lexical: %s blocks inside naming %s", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  /** Targets and commands bash only knows at run time fail closed: expansions, cut substitutions, `~user`, `/proc/*\/cwd`, globs that may name a state dir. */
+  test.each([
+    ['echo x > "$(printf .swarm/tasks.db)"', SHELL],
+    ["echo x > $(echo .swarm)/tasks.db", SHELL],
+    ["touch $(echo .swarm)/x", MUTATE],
+    ['echo x > "$F"', SHELL],
+    ['echo x | tee "$SWARM_DIR/tasks.db"', SHELL],
+    ["rm -rf $(mktemp -d)", RM],
+    ['for f in *.log; do rm "$f"; done', RM],
+    ["echo x > ~root/x", SHELL],
+    ["cd .swarm; cd ..; touch ~-/tasks.db", MUTATE],
+    ["cd .swarm && touch /proc/self/cwd/x", MUTATE],
+    ["HOME=/nonexistent-guard-cwd/.swarm; touch ~/x", MUTATE],
+    ["CDPATH=/nonexistent-guard-cwd/.swarm cd x && touch y", MUTATE],
+    ["$RM -rf .swarm", MUTATE],
+    ["$(which rm) -rf .swarm", MUTATE],
+    ["/bin/r? -rf .swarm", MUTATE],
+    ["touch .swar[m]/x", MUTATE],
+    ["rm -rf .sw*", RM],
+    ["echo x > .{swarm,x}/tasks.db", SHELL],
+    ["touch .{a..z}warm/x", MUTATE],
+    ["touch .sw@(a)rm/x", MUTATE],
+    ["rm -rf .gi?", RM],
+    ["rm -rf .*", RM],
+    ["rm -rf /tmp/{x,..}", RM],
+    ["touch /nonexistent-guard-cwd/.?/x", MUTATE],
+    ["shopt -s dotglob", "protected_path: glob-dotfiles"],
+    ["GLOBIGNORE=x", "protected_path: glob-dotfiles"],
+  ])("fail closed: %s blocks inside naming %s", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  /** Commands run by another command (find, xargs, parallel, runners, stdin scripts) and the less common writers. */
+  test.each([
+    ["find . -name tasks.db -exec rm {} \\;", RM],
+    ["find . -name '*.pyc' -delete", MUTATE],
+    ["find . -exec sh -c 'touch .swarm/x' \\;", MUTATE],
+    ["find . -fprint .swarm/x", MUTATE],
+    ["echo .swarm/tasks.db | xargs rm", RM],
+    ["ls | xargs -I{} sh -c 'rm {}'", RM],
+    ["parallel rm ::: a", RM],
+    ["setsid rm -rf .swarm", RM],
+    ["flock /tmp/l -c 'touch .swarm/x'", MUTATE],
+    ["flock /tmp/l touch .swarm/x", MUTATE],
+    ["su -c 'touch .swarm/x' root", MUTATE],
+    ["env -S 'touch .swarm/x'", MUTATE],
+    ["watch -n1 'touch .swarm/x'", MUTATE],
+    ["exec -a x rm -rf .swarm", RM],
+    ["pkexec touch .swarm/x", MUTATE],
+    ["alias ls='rm -rf .swarm'", RM],
+    ["trap 'touch .swarm/x' EXIT", MUTATE],
+    ["bash -o pipefail -c 'touch .swarm/x'", MUTATE],
+    ["bash <<EOF\ntouch .swarm/x\nEOF", MUTATE],
+    ["sh <<< 'touch .swarm/x'", MUTATE],
+    ["echo 'touch .swarm/x' | sh", MUTATE],
+    ["sudo -e .omp/config.yml", MUTATE],
+    ["perl -pi -e 's/a/b/' .omp/config.yml", MUTATE],
+    ["awk -i inplace '{print}' .omp/config.yml", MUTATE],
+    ["sort -o .swarm/tasks.db x", SHELL],
+    ["curl -o .swarm/tasks.db http://x", SHELL],
+    ["cd .swarm && curl -O http://x/tasks.db", SHELL],
+    ["install -d .swarm/x", MUTATE],
+    ["ln .swarm/tasks.db /tmp/x", MUTATE],
+    ["cp -al .swarm /tmp/x", MUTATE],
+    ["npx tsx scripts/ts/orch_plan.ts", "swarm-state"],
+    ["gzip .swarm/tasks.db", MUTATE],
+    ["tar -cf .swarm/tasks.db src", MUTATE],
+    ["zip .swarm/x.zip a", MUTATE],
+    ["sponge .omp/config.yml", MUTATE],
+    ["git checkout -- .omp/config.yml", MUTATE],
+    ["git -C .omp checkout -- config.yml", MUTATE],
+    ["git push --all origin", "prod_high_risk: git-push-protected"],
+  ])("runners and writers: %s blocks inside naming %s", (command, tail) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${tail})` });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([
+    "echo x > /dev/null", "cmd 2>&1", "make 2>&1 | tee out.txt", "cmd >&2", "ls *.ts > out.txt", "find . -name x -exec grep y {} \\;",
+    'echo x > "$HOME/notes.txt"', 'echo x > "$TMPDIR/x"', 'echo "$(date)" > build.log', "rm -rf *", "rm -r ?omp", "cp a{,.bak}",
+    "echo '>' | tee out.txt", "[ -f .swarm/x ] && echo ok", '"$PYTHON" -m pytest', "git ls-files | xargs wc -l", "ls | xargs -I{} cp {} /tmp/",
+    "gzip -c .swarm/tasks.db > /tmp/x.gz", "tar -czf out.tgz src", "git checkout main", "kubectl get pods -o json",
+    "curl -sSL https://example.com -o /tmp/x.html", "cat <<EOF > notes.md\ntouch .swarm/x\nEOF", 'git commit -m "fix: a -> b"',
+  ])("lexical: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
+  test("bash tool cwd and env: the command starts in `cwd`; HOME, CDPATH, GLOBIGNORE and BASHOPTS reach the shell", () => {
+    const run = (input: Record<string, unknown>) => guardToolCall(call("bash", input), facts(B05));
+    expect(run({ command: "touch tasks.db", cwd: ".swarm" })).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${MUTATE})` });
+    expect(run({ command: "touch tasks.db", cwd: "src" })).toBeUndefined();
+    // an internal URL cwd is a directory the guard cannot place
+    expect(run({ command: "touch tasks.db", cwd: "local://x" })).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${MUTATE})` });
+    expect(run({ command: "touch ~/tasks.db", env: { HOME: `${CWD}/.swarm` } })).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${MUTATE})` });
+    expect(run({ command: "cd x && touch y", env: { CDPATH: `${CWD}/.swarm` } })).toEqual({ block: true, reason: `BLOCKED needs: human-approval (${MUTATE})` });
+    for (const key of ["GLOBIGNORE", "BASHOPTS"]) {
+      expect(run({ command: "ls", env: { [key]: "x" } })).toEqual({ block: true, reason: "BLOCKED needs: human-approval (protected_path: glob-dotfiles)" });
+    }
+    expect(guardToolCall(call("bash", { command: "touch tasks.db", cwd: ".swarm" }), facts(undefined))).toBeUndefined();
+  });
+
   test("through the handler: eval, protected write and orch shell block for a05; main untouched", () => {
     const { run } = guardHandler({ activeTools: ["task"] });
     const a05 = agentCtx(CWD, B05, [], false);
@@ -988,6 +1124,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["bash", { command: `mv ${ROOT}/scripts/qa_gate.py /tmp/x` }, "protected-path-mutate"],
     ["bash", { command: `echo x &>| ${ROOT}/swarm/envelope.py` }, "protected-path-shell"],
     ["bash", { command: `busybox cp /tmp/x ${ROOT}/scripts/qa_gate.py` }, "protected-path-shell"],
+    ["bash", { command: "touch /nonexistent-swarm-roo?/scripts/qa_gate.py" }, "protected-path-mutate"],
+    ["bash", { command: "echo x > /nonexistent-swarm-root/{scripts,x}/qa_gate.py" }, "protected-path-shell"],
+    ["bash", { command: "echo x > /NONEXISTENT-SWARM-ROOT/scripts/qa_gate.py" }, "protected-path-shell"],
     ["bash", { command: `cd ../nonexistent-swarm-root && echo x >> omp/src/guard.ts` }, "protected-path-shell"],
   ];
   test.each(RUNTIME_WRITES)("runtime root: %s %p blocks from another workspace naming %s", (tool, input, id) => {
