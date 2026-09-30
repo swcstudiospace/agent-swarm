@@ -19,9 +19,10 @@ A complete design specification for a distributed swarm of 15 specialized AI age
 ## Platform
 
 AgentSwarm runs on **[Agent Substrate](https://github.com/swcstudiospace/agent-substrate)**, the shared
-platform providing the infrastructure services this spec assumes ([01 §2.2](01-architecture.md),
-[04 §2](04-integration-plan.md)): events over substrate-mcp, governed memory, leases and handoffs, and
-Graph ID = `correlation_id`. The integration ADR lives in that repo
+platform providing four of the infrastructure substrates this spec assumes ([01 §2.2](01-architecture.md),
+[04 §2](04-integration-plan.md)): events over substrate-mcp, governed memory, leases and handoffs, and the
+Graph ID a `correlation_id` maps onto. The artifact registry, secrets and the OTel telemetry plane are not
+in that set. The integration ADR lives in that repo
 (`docs/adr/*-swarm-substrate-integration.md`), tracked as Linear
 [SPE-5050](https://linear.app/swcstudio/issue/SPE-5050) /
 [SPE-5051](https://linear.app/swcstudio/issue/SPE-5051);
