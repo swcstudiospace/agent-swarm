@@ -3,36 +3,56 @@
 
   python3 scripts/orch_status.py                              # table for latest correlation
   python3 scripts/orch_status.py --correlation-id <id> --json
-  python3 scripts/orch_status.py --transition T-be IN_PROGRESS --reason "lease granted"
-  python3 scripts/orch_status.py --ingest status.json         # task.status payload from an agent
-  python3 scripts/orch_status.py --history T-be
+  python3 scripts/orch_status.py --transition T7f3a-be IN_PROGRESS --reason "lease granted"
+  python3 scripts/orch_status.py --ingest result.json         # task.result payload from an agent
+  python3 scripts/orch_status.py --history T7f3a-be
 """
 from __future__ import annotations
-import json
+import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR, read_events  # noqa: E402
+from swarm.runlog import read_events  # noqa: E402
+from swarm.paths import latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
 
-AGENT_REPORTABLE = {"IN_PROGRESS", "IN_REVIEW", "FAILED", "BLOCKED"}  # states agents may report
 
-
-def latest_correlation() -> str | None:
-    f = SWARM_DIR / "latest_correlation"
-    return f.read_text().strip() if f.exists() else None
+def ingest(store: TaskStore, path: Path, ctx) -> dict:
+    """task.result file → shared swarm.results path (same as the headless runner)."""
+    result = parse_result(path.read_text(encoding="utf-8"))
+    tid = ctx.task_id or (result or {}).get("task_id")
+    if not isinstance(tid, str):
+        ctx.emit("task.result.rejected", {"task_id": None, "mode": "ingest", "reason": "no task_id in result"})
+        raise SwarmError(ErrorCode.E_CONTRACT, "task.result has no task_id (use --task-id or include task_id)")
+    try:
+        task = store.get(tid)
+    except SwarmError as e:
+        raise SwarmError(ErrorCode.E_INPUT, f"unknown task {tid}", task_id=tid) from e
+    try:
+        result = validate_result(result, task_id=tid)
+        state = apply_result(store, task, agent_id=result.get("agent_id") or task["agent_id"] or "agent", result=result,
+                             meta={"ingest": str(path)}, emit=ctx.emit, mode="ingest")
+    except SwarmError as e:
+        if e.code is ErrorCode.E_CONTRACT:
+            reject(store, tid, reason=str(e), mode="ingest", emit=ctx.emit)
+        raise
+    log = reconcile(store, task["correlation_id"], ctx.emit)
+    t = store.get(tid)
+    return {"status": "ok", "task": t, "reconcile": log, "summary": f"ingested task.result for {tid} → {state} (now {t['state']})"}
 
 
 def run(args, ctx) -> dict:
-    store = TaskStore()
-    corr = ctx.correlation_id or latest_correlation()
+    store = TaskStore(root=ctx.root)
+    corr = ctx.correlation_id or latest_correlation(ctx.root)
 
     if args.history:
         return {"status": "ok", "task_id": args.history, "history": store.history(args.history),
-                "verdicts": store.latest_verdicts(args.history), "summary": f"history for {args.history}"}
+                "verdicts": store.latest_verdicts(args.history),
+                "missing_gate_reasons": store.missing_gate_reasons(args.history), "summary": f"history for {args.history}"}
 
     if args.transition:
         tid, state = args.transition
@@ -43,24 +63,12 @@ def run(args, ctx) -> dict:
         return {"status": "ok", "task": t, "summary": f"{tid} → {t['state']}"}
 
     if args.ingest:
-        payload = json.loads(Path(args.ingest).read_text())
-        tid, state = payload["task_id"], payload["state"]
-        if state not in AGENT_REPORTABLE:
-            ctx.emit("task.status.rejected", {"task_id": tid, "state": state, "reason": "agents may not report this state"})
-            raise SwarmError(ErrorCode.E_CONTRACT, f"agents may not report state {state}", task_id=tid)
-        try:
-            t = store.transition(tid, state, actor=payload.get("agent_id", "agent"), reason=payload.get("notes", "task.status"))
-        except SwarmError as e:
-            ctx.emit("task.status.rejected", {"task_id": tid, "state": state, "reason": str(e)})
-            raise
-        for a in payload.get("artifacts", []):
-            store.add_artifact(tid, kind=a.get("kind", "artifact"), uri=a.get("uri", ""), version=str(a.get("version", "1")),
-                               digest=a.get("digest", ""), producer=payload.get("agent_id", ""))
-        return {"status": "ok", "task": t, "summary": f"ingested task.status for {tid} → {t['state']}"}
+        return ingest(store, Path(args.ingest), ctx)
 
     tasks = store.list(correlation_id=corr)
+    where = {"db": str(store.path), "swarm_dir": str(store.path.parent)}  # D-04: absolute, cwd-independent
     if not tasks:
-        return {"status": "ok", "correlation_id": corr, "tasks": [], "summary": "no tasks (run orch_plan.py first)"}
+        return {"status": "ok", "correlation_id": corr, "tasks": [], **where, "summary": "no tasks (run orch_plan.py first)"}
     ready = {t["task_id"] for t in store.ready(corr)}
     rows, counts = [], {}
     for t in tasks:
@@ -80,13 +88,16 @@ def run(args, ctx) -> dict:
                      f"{'yes' if r['ready'] else '':<6}{gates}")
     lines.append(f"\ncounts: {counts}   escalated: {escalated or 'none'}   complete: {done}")
     return {"status": "ok", "correlation_id": corr, "tasks": rows, "counts": counts, "escalated": escalated,
-            "complete": done, "events": len(read_events(correlation_id=corr)), "summary": "\n".join(lines)}
+            "complete": done, "events": len(read_events(correlation_id=corr, root=ctx.root)), **where,
+            "summary": "\n".join(lines)}
 
 
 def add_args(p):
+    p.add_argument("--repo", dest="root", default=argparse.SUPPRESS,
+                   help="alias of --root (same flag as swarm_run.py --repo)")
     p.add_argument("--transition", nargs=2, metavar=("TASK_ID", "STATE"), help="A01-only legal transition")
     p.add_argument("--reason", default="")
-    p.add_argument("--ingest", help="path to a task.status payload JSON from an agent")
+    p.add_argument("--ingest", help="path to a task.result JSON (swarm/schemas/task.result.v1.json) from an agent")
     p.add_argument("--history", metavar="TASK_ID")
 
 

@@ -22,14 +22,14 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 
 ## Prerequisites
 
-- Agent-swarm checkout at `/root/src/repos/agent-swarm` (or `$SWARM_ROOT`).
+- Agent-swarm checkout at `$SWARM_ROOT` (the installer fills in the absolute path of the agent-swarm checkout).
 - Target application repo (`--repo` / cwd).
 - python3; bun optional; claude or grok CLI for unattended `swarm_run`.
 
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 /root/src/repos/agent-swarm/scripts/orch_plan.py --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: a01-orchestrator, a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa, a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs.
@@ -42,6 +42,6 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 
 ## Verification
 
-- A plan JSON exists under `.swarm/plans/`.
+- A plan JSON exists under `<app>/.swarm/plans/` (the same `--repo` the run uses).
 - Child slugs match agents.json.
 - Parent transcript contains no product-code patches from the parent itself.

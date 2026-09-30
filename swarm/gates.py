@@ -1,8 +1,9 @@
 """Gate verdicts (quality / review / security / release) and conjunction rules."""
 from __future__ import annotations
 import time
+from pathlib import Path
 from .errors import SwarmError, ErrorCode
-from .envelope import build_envelope, sign_envelope
+from .envelope import build_envelope, sign_envelope, signing_config_error
 
 GATES = {"quality", "review", "security", "release"}
 VERDICTS = {"pass", "fail", "waive"}
@@ -28,8 +29,10 @@ def derive_verdict(findings: list[dict]) -> str:
 
 def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict] | None = None,
                  verdict: str | None = None, runs: dict | None = None, expires_s: int = 86400,
-                 correlation_id: str | None = None, extra: dict | None = None) -> dict:
-    """Return a signed envelope carrying a gate verdict. Waive requires explicit verdict."""
+                 correlation_id: str | None = None, extra: dict | None = None,
+                 root: str | Path | None = None, audit: bool = True) -> dict:
+    """Return a signed envelope carrying a gate verdict. Waive requires explicit verdict.
+    `root` routes the dev-key audit event to the caller's state dir; audit=False skips it (agent-session preview)."""
     if gate not in GATES:
         raise SwarmError(ErrorCode.E_CONTRACT, f"unknown gate {gate}")
     findings = findings or []
@@ -40,9 +43,12 @@ def make_verdict(*, gate: str, task_id: str, agent_id: str, findings: list[dict]
         raise SwarmError(ErrorCode.E_POLICY, "waive requires extra.waived_by (human, L3)")
     payload = {"gate": gate, "task_id": task_id, "verdict": verdict, "findings": findings,
                "runs": runs or {}, "expires_s": expires_s, "issued_at": time.time(), **(extra or {})}
+    config_error = signing_config_error()
+    if config_error:
+        raise SwarmError(ErrorCode.E_POLICY, config_error, task_id=task_id)
     env = build_envelope(source=agent_id, target="A01", msg_type="gate.verdict", payload=payload,
                          correlation_id=correlation_id, priority="P1")
-    return sign_envelope(env)
+    return sign_envelope(env, root=root, audit=audit)
 
 
 def validate_verdict(env: dict) -> dict:

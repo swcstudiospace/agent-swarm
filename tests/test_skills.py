@@ -28,3 +28,6 @@ def test_orchestrate_skill():
     assert "a01-orchestrator" in text
     assert "spawn_subagent" in text
     assert "UserPromptSubmit" in text or "hook" in text.lower()
+    for skill in (ROOT / "skills").rglob("*"):
+        if skill.is_file():
+            assert "/root/" not in skill.read_text(), skill

@@ -9,10 +9,14 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 
+from .envelope import real_key_configured
 from .errors import SwarmError, ErrorCode
+from .paths import swarm_dir
+from .gates import validate_verdict
 
 
 class TaskState(str, Enum):
@@ -55,8 +59,6 @@ DEFAULT_MAX_ATTEMPTS = 3
 GATES_BY_RISK = {"low": ["review"], "medium": ["review", "quality"],
                  "high": ["review", "quality", "security", "release"]}
 
-DEFAULT_DB = Path(os.environ.get("SWARM_DIR", ".swarm")) / "tasks.db"
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
   task_id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL, parent_id TEXT,
@@ -74,7 +76,7 @@ CREATE TABLE IF NOT EXISTS transitions (
 );
 CREATE TABLE IF NOT EXISTS verdicts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, gate TEXT, verdict TEXT,
-  agent_id TEXT, findings TEXT, expires_at REAL, ts REAL
+  agent_id TEXT, findings TEXT, expires_at REAL, ts REAL, envelope_json TEXT, sig TEXT
 );
 CREATE TABLE IF NOT EXISTS artifacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, uri TEXT,
@@ -82,16 +84,69 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 """
 
+_VERIFIED = {"ok", "fail", "expired"}  # a verified, current envelope; reconcile acts only on these
 _JSON_COLS = ("inputs", "outputs", "acceptance", "budget", "depends_on")
 
 
+def _verdicts_since(task: dict) -> float:
+    """Rework cut-off that transition(CHANGES_REQUESTED) writes to notes.verdicts_since; 0 before any rework."""
+    return float(task["notes_json"].get("verdicts_since") or 0)
+
+
+def _gates_of(task: dict) -> list[str]:
+    override = (task.get("notes_json") or {}).get("gates")
+    return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
+
+
 class TaskStore:
-    def __init__(self, path: str | Path | None = None):
-        self.path = Path(path or DEFAULT_DB)
+    def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
+        self.path = Path(path) if path else swarm_dir(root, create=True) / "tasks.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=30)  # contenders wait for the write lock, not "database is locked"
         self.conn.row_factory = sqlite3.Row
+        self._tx_depth = 0
         self.conn.executescript(_SCHEMA)
+        self._migrate_verdicts()
+
+    def _migrate_verdicts(self) -> None:
+        """D-14: in-place, idempotent add of the signed-envelope columns to a v1 verdicts table.
+        No backup is taken; legacy rows keep NULL envelope_json and count as missing."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(verdicts)")}
+        for col, ddl in (("envelope_json", "ALTER TABLE verdicts ADD COLUMN envelope_json TEXT"),
+                         ("sig", "ALTER TABLE verdicts ADD COLUMN sig TEXT")):
+            if col in cols:
+                continue
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError as e:  # concurrent opener added it first
+                if "duplicate column" not in str(e):
+                    raise
+        self._commit()
+
+    def _commit(self) -> None:
+        """Commit unless inside transaction(); the outermost transaction() commits."""
+        if self._tx_depth == 0:
+            self.conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        """All-or-nothing block: BEGIN IMMEDIATE (write lock) on outermost entry,
+        commit on success, rollback on exception. Nested entries join the outer one."""
+        if self._tx_depth == 0:
+            if self.conn.in_transaction:
+                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+        self._tx_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                self.conn.rollback()
+            raise
+        self._tx_depth -= 1
+        if self._tx_depth == 0:
+            self.conn.commit()
 
     # ---- CRUD -------------------------------------------------------------
     def create(self, *, task_id: str, correlation_id: str, capability: str, title: str = "",
@@ -110,7 +165,7 @@ class TaskStore:
              risk_class, priority, S.CREATED.value, json.dumps(depends_on or []), max_attempts,
              json.dumps(notes or {}), now, now))
         self._log(task_id, None, S.CREATED, "system", "created")
-        self.conn.commit()
+        self._commit()
         return self.get(task_id)
 
     def get(self, task_id: str) -> dict:
@@ -142,50 +197,61 @@ class TaskStore:
         args.append(time.time())
         args.append(task_id)
         self.conn.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=?", args)
-        self.conn.commit()
+        self._commit()
         return self.get(task_id)
 
     # ---- state machine (A01 only) ----------------------------------------
     def transition(self, task_id: str, to_state: TaskState | str, *, actor: str = "A01",
                    reason: str = "") -> dict:
         to_state = TaskState(to_state)
-        task = self.get(task_id)
-        from_state = TaskState(task["state"])
-        if to_state not in LEGAL_TRANSITIONS[from_state]:
-            raise SwarmError(ErrorCode.E_CONTRACT,
-                             f"illegal transition {from_state.value} → {to_state.value} for {task_id}",
-                             task_id=task_id)
-        extra = {}
-        if to_state is S.CHANGES_REQUESTED:
-            loops = task["rework_loops"] + 1
-            if loops > MAX_REWORK_LOOPS:
-                to_state, reason = S.ESCALATED, f"rework loops exhausted ({loops-1}); {reason}"
-                if S.ESCALATED not in LEGAL_TRANSITIONS[from_state]:
-                    # IN_REVIEW → CHANGES_REQUESTED → ESCALATED in one audited step
-                    self._apply(task_id, from_state, S.CHANGES_REQUESTED, actor, "rework cap reached")
-                    from_state = S.CHANGES_REQUESTED
-            else:
-                extra["rework_loops"] = loops
-                notes = task["notes_json"]
-                notes["verdicts_since"] = time.time() + 0.001
-                extra["notes"] = json.dumps(notes)
-        if to_state in (S.CLAIMED,) and from_state in (S.PLANNED, S.RETRY, S.BLOCKED):
-            attempt = task["attempt"] + 1
-            if attempt > task["max_attempts"]:
-                raise SwarmError(ErrorCode.E_TIMEOUT, f"max_attempts exceeded for {task_id}", task_id=task_id)
-            extra["attempt"] = attempt
-        if to_state is S.APPROVED:
-            missing = self.missing_gates(task_id)
-            if missing:
-                raise SwarmError(ErrorCode.E_POLICY,
-                                 f"fail-closed: {task_id} lacks passing gates {missing}", task_id=task_id)
-        self._apply(task_id, from_state, to_state, actor, reason, **extra)
+        # WR-02: read, legality/cap checks and every write run under one BEGIN IMMEDIATE write lock, so
+        # concurrent callers serialize and a state change never commits without its audit row.
+        with self.transaction():
+            task = self.get(task_id)
+            from_state = TaskState(task["state"])
+            if to_state not in LEGAL_TRANSITIONS[from_state]:
+                raise SwarmError(ErrorCode.E_CONTRACT,
+                                 f"illegal transition {from_state.value} → {to_state.value} for {task_id}",
+                                 task_id=task_id)
+            extra = {}
+            if to_state is S.CHANGES_REQUESTED:
+                loops = task["rework_loops"] + 1
+                if loops > MAX_REWORK_LOOPS:
+                    to_state, reason = S.ESCALATED, f"rework loops exhausted ({loops-1}); {reason}"
+                    if S.ESCALATED not in LEGAL_TRANSITIONS[from_state]:
+                        # IN_REVIEW → CHANGES_REQUESTED → ESCALATED in one audited step
+                        self._apply(task_id, from_state, S.CHANGES_REQUESTED, actor, "rework cap reached")
+                        from_state = S.CHANGES_REQUESTED
+                else:
+                    extra["rework_loops"] = loops
+                    notes = task["notes_json"]
+                    notes["verdicts_since"] = time.time() + 0.001
+                    extra["notes"] = json.dumps(notes)
+            if to_state in (S.CLAIMED,) and from_state in (S.PLANNED, S.RETRY, S.BLOCKED):
+                attempt = task["attempt"] + 1
+                if attempt > task["max_attempts"]:
+                    raise SwarmError(ErrorCode.E_TIMEOUT, f"max_attempts exceeded for {task_id}", task_id=task_id)
+                extra["attempt"] = attempt
+            if to_state is S.APPROVED:
+                if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
+                    raise SwarmError(ErrorCode.E_POLICY,
+                                     "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
+                missing = self.missing_gates(task_id)
+                if missing:
+                    raise SwarmError(ErrorCode.E_POLICY,
+                                     f"fail-closed: {task_id} lacks passing gates {missing}", task_id=task_id)
+            self._apply(task_id, from_state, to_state, actor, reason, **extra)
         return self.get(task_id)
 
     def _apply(self, task_id, from_state, to_state, actor, reason, **extra):
-        self.update(task_id, state=to_state.value, **extra)
+        """State write conditional on from_state plus its audit row; the caller's transaction() commits both."""
+        cols = ["state=?", *(f"{k}=?" for k in extra), "updated_at=?"]
+        args = [to_state.value, *extra.values(), time.time(), task_id, from_state.value]
+        cur = self.conn.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=? AND state=?", args)
+        if cur.rowcount != 1:
+            raise SwarmError(ErrorCode.E_CONTRACT, f"concurrent transition on {task_id}: expected {from_state.value}",
+                             task_id=task_id)
         self._log(task_id, from_state, to_state, actor, reason)
-        self.conn.commit()
 
     def _log(self, task_id, from_state, to_state, actor, reason):
         self.conn.execute("INSERT INTO transitions (task_id, from_state, to_state, actor, reason, ts)"
@@ -198,21 +264,37 @@ class TaskStore:
             "SELECT * FROM transitions WHERE task_id=? ORDER BY id", (task_id,))]
 
     # ---- gates ------------------------------------------------------------
-    def record_verdict(self, task_id: str, gate: str, verdict: str, agent_id: str,
-                       findings=None, expires_s: int = 86400) -> None:
+    def record_verdict(self, task_id: str, envelope: dict) -> None:
+        """Store a signed gate.verdict envelope as a row on task_id (the envelope's own task_id)."""
+        p = validate_verdict(envelope)
+        if p["task_id"] != task_id:
+            raise SwarmError(ErrorCode.E_CONTRACT, f"verdict names {p['task_id']!r}, recorded on {task_id!r}", task_id=task_id)
         self.get(task_id)
-        self.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts)"
-                          " VALUES (?,?,?,?,?,?,?)",
-                          (task_id, gate, verdict, agent_id, json.dumps(findings or []),
-                           time.time() + expires_s, time.time()))
-        self.conn.commit()
+        now = time.time()
+        self.conn.execute("INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts,"
+                          " envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
+                          (task_id, p["gate"], p["verdict"], envelope["source"], json.dumps(p["findings"]),
+                           now + p["expires_s"], now, json.dumps(envelope), envelope["sig"]))
+        self._commit()
 
-    def latest_verdicts(self, task_id: str, *, include_stale: bool = False) -> dict[str, dict]:
+    def latest_verdicts(self, task_id: str, *, include_stale: bool = False,
+                        verified_only: bool = False) -> dict[str, dict]:
         """Latest verdict per gate. Verdicts issued before the task's last rework loop are stale
-        (the producer changed the artifact) and are ignored unless include_stale=True."""
-        since = 0.0 if include_stale else float(self.get(task_id)["notes_json"].get("verdicts_since", 0))
+        (the producer changed the artifact) and are ignored unless include_stale=True.
+        verified_only=True drops rows whose signed envelope does not verify or disagrees with the row or task."""
+        task = self.get(task_id)
+        out = self._latest_rows(task, include_stale=include_stale)
+        if verified_only:
+            now = time.time()
+            out = {g: d for g, d in out.items() if self._check_row(task, g, d, now) in _VERIFIED}
+        return out
+
+    def _latest_rows(self, task: dict, *, include_stale: bool = False) -> dict[str, dict]:
+        """Highest-id row per gate of `task`, inserted at or after its last rework unless include_stale."""
+        since = 0.0 if include_stale else _verdicts_since(task)
         out: dict[str, dict] = {}
-        for r in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id", (task_id, since)):
+        for r in self.conn.execute("SELECT * FROM verdicts WHERE task_id=? AND ts>=? ORDER BY id",
+                                   (task["task_id"], since)):
             d = dict(r)
             d["findings"] = json.loads(d["findings"])
             out[d["gate"]] = d
@@ -221,19 +303,77 @@ class TaskStore:
     def required_gates(self, task_id: str) -> list[str]:
         """Gates from risk class, unless the plan overrides them via notes.gates (e.g. [] for
         non-code tasks such as requirements or docs, or gate tasks themselves)."""
+        return _gates_of(self.get(task_id))
+
+    def _check_row(self, task: dict, gate: str, row: dict | None, now: float) -> str:
+        """Verify one verdict row of `task` against its signed envelope. Returns ok | fail | expired
+        (signature verified and current) or absent | unsigned | bad-sig | mismatch | stale | dry-run (not
+        trustworthy for this task). mismatch: the signed gate/task_id/verdict disagree with the row, or the
+        envelope's correlation_id is not the task's. stale: the signed issued_at precedes the task's last rework
+        (notes.verdicts_since), even when the row itself was re-inserted after it. dry-run: a signed dry_run
+        verdict on a task that A01 did not dispatch in a runner dry-run (notes.dry_run)."""
+        if row is None:
+            return "absent"
+        if not row.get("envelope_json"):
+            return "unsigned"
+        try:
+            env = json.loads(row["envelope_json"])
+            p = validate_verdict(env)
+        except Exception:  # any corrupt/forged envelope is untrusted, never an abort of missing_gates/reconcile
+            return "bad-sig"
+        if p["gate"] != gate or p["task_id"] != task["task_id"] or p["verdict"] != row["verdict"]:
+            return "mismatch"
+        if env["correlation_id"] != task["correlation_id"]:
+            return "mismatch"
+        try:
+            if float(p["issued_at"]) < _verdicts_since(task):
+                return "stale"
+        except (KeyError, TypeError, ValueError):
+            return "mismatch"
+        if p.get("dry_run") and not task["notes_json"].get("dry_run"):
+            return "dry-run"
+        if p["verdict"] not in ("pass", "waive"):
+            return "fail"
+        try:
+            if not float(p["issued_at"]) + float(p["expires_s"]) > now:
+                return "expired"
+        except (KeyError, TypeError, ValueError):
+            return "mismatch"
+        return "ok"
+
+    def missing_gate_reasons(self, task_id: str) -> dict[str, str]:
+        """Required gates lacking a verified, current, unexpired pass/waive verdict → reason, in required order."""
         task = self.get(task_id)
-        override = (task.get("notes_json") or {}).get("gates")
-        return list(override) if override is not None else GATES_BY_RISK[task["risk_class"]]
+        latest = self._latest_rows(task)
+        now = time.time()
+        out = {}
+        for g in _gates_of(task):
+            reason = self._check_row(task, g, latest.get(g), now)
+            if reason != "ok":
+                out[g] = reason
+        return out
 
     def missing_gates(self, task_id: str) -> list[str]:
-        latest = self.latest_verdicts(task_id)
-        now = time.time()
-        missing = []
-        for g in self.required_gates(task_id):
-            v = latest.get(g)
-            if not v or v["verdict"] not in ("pass", "waive") or v["expires_at"] < now:
-                missing.append(g)
-        return missing
+        return list(self.missing_gate_reasons(task_id))
+
+    def gate_verdict_since(self, target: str, *, gate: str, gate_task_id: str, since: float) -> bool:
+        """True when a `gate` row on `target` holds a verifying signed envelope for that gate and target that
+        gate task `gate_task_id`'s script issued at or after `since` (its lease start): proof the script ran for
+        this lease. Pass/fail does not matter; malformed or forged rows are skipped."""
+        return self.gate_verdict_value_since(target, gate=gate, gate_task_id=gate_task_id, since=since) is not None
+
+    def gate_verdict_value_since(self, target: str, *, gate: str, gate_task_id: str, since: float) -> str | None:
+        """The signed verdict of the latest row gate_verdict_since accepts (same filtering), else None."""
+        for r in self.conn.execute("SELECT envelope_json FROM verdicts WHERE task_id=? AND gate=? ORDER BY id DESC",
+                                   (target, gate)):
+            try:
+                p = validate_verdict(json.loads(r["envelope_json"]))
+                if (p["gate"] == gate and p["task_id"] == target and p.get("gate_task") == gate_task_id
+                        and float(p["issued_at"]) >= since):
+                    return p["verdict"]
+            except Exception:
+                continue
+        return None
 
     # ---- artifacts --------------------------------------------------------
     def add_artifact(self, task_id: str, *, kind: str, uri: str, version: str = "1",
@@ -273,6 +413,17 @@ class TaskStore:
         return d
 
     def set_notes(self, task_id: str, **kv) -> dict:
-        notes = self.get(task_id)["notes_json"]
-        notes.update(kv)
-        return self.update(task_id, notes=json.dumps(notes))
+        """Merge kv into notes; re-read and write under one write lock so concurrent writers keep each other's keys."""
+        with self.transaction():
+            notes = self.get(task_id)["notes_json"]
+            notes.update(kv)
+            self.update(task_id, notes=json.dumps(notes))
+        return self.get(task_id)
+
+    def append_feedback(self, task_id: str, entry: dict) -> dict:
+        """Append entry to notes.feedback in one transaction; parallel gate scripts and runner threads lose none."""
+        with self.transaction():
+            notes = self.get(task_id)["notes_json"]
+            notes.setdefault("feedback", []).append(entry)
+            self.update(task_id, notes=json.dumps(notes))
+        return self.get(task_id)

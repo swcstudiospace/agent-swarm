@@ -7,7 +7,8 @@ untracked files always count as
 added), produces per-file diff stats, runs rules-only checks (oversized files,
 TODO/FIXME/XXX, debug prints, commented-out code, missing tests, secret-looking
 strings, invisible/bidi control characters), merges optional LLM findings from
---findings-file, and writes a signed `gate.verdict` (gate=review) envelope to
+--findings-file (every target) and --per-target-findings (each gate target only its
+own), and writes a signed `gate.verdict` (gate=review) envelope to
 .swarm/verdicts/<task_id>.review.json (recorded in the Task Store when the task exists).
 """
 from __future__ import annotations
@@ -19,10 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
-from swarm.gates import make_verdict, make_finding, SEVERITIES  # noqa: E402
-from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
-from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.gates import make_finding  # noqa: E402
+from swarm.verdicts import agent_finding, check_per_target_keys, issue_gate, load_per_target  # noqa: E402
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h"}
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(_test|\.test|\.spec|_spec)\.[a-z]+$|(^|/)test_[^/]+\.py$")
@@ -141,52 +140,42 @@ def load_extra(path: str | None, offset: int) -> list[dict]:
         return []
     raw = json.loads(Path(path).read_text())
     raw = raw.get("findings", raw) if isinstance(raw, dict) else raw
-    out = []
-    for i, f in enumerate(raw, offset + 1):
-        sev = f.get("severity", "minor")
-        if sev not in SEVERITIES:
-            raise SwarmError(ErrorCode.E_INPUT, f"bad severity {sev!r} in {path}")
-        out.append(make_finding(f.get("id") or f"RF-{i:03d}", sev, f.get("kind", "semantic"), f.get("summary", ""),
-                                evidence=f.get("evidence", ""), ac_ref=f.get("ac_ref"),
-                                owner_suggestion=f.get("owner_suggestion", "A05"), location=f.get("location")))
-    return out
+    return [agent_finding(f, i, path) for i, f in enumerate(raw, offset + 1)]
 
 
 def run(args, ctx) -> dict:
-    task = args.task_id or "T-unassigned"
     if ctx.dry_run:
         stats = {"files": 1, "added": 12, "deleted": 3, "per_file": [{"file": "src/example.py", "added": 12, "deleted": 3}]}
-        env = make_verdict(gate="review", task_id=args.task_id or "T-dry", agent_id="A09@dry", findings=[],
-                           runs={"rules": "pass", "semantic": "skipped:dry-run"}, correlation_id=ctx.correlation_id,
-                           extra={"mode": "rules-only", "diff_base": "HEAD~1", "stats": stats})
+        env, recorded = issue_gate(ctx, gate="review", agent_id="A09@dry", findings=[], expires_s=172800,
+                                   runs={"rules": "pass", "semantic": "skipped:dry-run"}, simulate=True,
+                                   extra={"mode": "rules-only", "diff_base": "HEAD~1", "stats": stats})
         return {"status": "ok", "verdict": "pass", "findings": [], "stats": stats, "dry_run": True, "envelope": env,
+                "recorded": sorted(recorded),
                 "summary": "dry-run: canned pass verdict"}
     base = resolve_base(ctx.root, args.diff_base)
     changes = collect_changes(ctx.root, base)
     per_file = [{"file": f, "added": c["added"], "deleted": c["deleted"]} for f, c in sorted(changes.items())]
     stats = {"files": len(changes), "added": sum(c["added"] for c in changes.values()),
              "deleted": sum(c["deleted"] for c in changes.values()), "per_file": per_file}
-    findings = mechanical_checks(changes, args.max_lines, Path(__file__).resolve(), ctx.root)
-    extra = load_extra(args.findings_file, len(findings))
-    findings += extra
-    runs = {"rules": "pass" if not any(f["severity"] in ("major", "critical", "blocker") for f in findings[:len(findings) - len(extra)]) else "fail",
-            "semantic": ("pass" if not any(f["severity"] in ("major", "critical", "blocker") for f in extra) else "fail")
-            if args.findings_file else "skipped:no-llm-findings"}
-    env = make_verdict(gate="review", task_id=task, agent_id="A09@local", findings=findings, runs=runs,
-                       correlation_id=ctx.correlation_id, expires_s=172800,
-                       extra={"mode": "rules+semantic" if args.findings_file else "rules-only",
-                              "diff_base": base or "whole-tree", "stats": {k: v for k, v in stats.items() if k != "per_file"}})
+    mechanical = mechanical_checks(changes, args.max_lines, Path(__file__).resolve(), ctx.root)
+    extra = load_extra(args.findings_file, len(mechanical))
+    own = load_per_target(args.per_target_findings, len(mechanical) + len(extra))
+    check_per_target_keys(own, ctx.task_id, ctx.root)
+    semantic = extra + [f for items in own.values() for f in items]
+    findings = mechanical + semantic
+    llm = bool(args.findings_file or args.per_target_findings)
+    blocking = ("major", "critical", "blocker")
+    runs = {"rules": "fail" if any(f["severity"] in blocking for f in mechanical) else "pass",
+            "semantic": ("fail" if any(f["severity"] in blocking for f in semantic) else "pass")
+            if llm else "skipped:no-llm-findings"}
+    # WR-14: a gate task's target gets the shared findings plus only the findings attributed to it
+    per_target = {t: mechanical + extra + items for t, items in own.items()} if args.per_target_findings else None
+    env, recorded = issue_gate(ctx, gate="review", agent_id="A09@local", findings=findings, runs=runs, expires_s=172800,
+                               per_target=per_target,
+                               extra={"mode": "rules+semantic" if llm else "rules-only",
+                                      "diff_base": base or "whole-tree", "stats": {k: v for k, v in stats.items() if k != "per_file"}})
     verdict = env["payload"]["verdict"]
-    out_dir = SWARM_DIR / "verdicts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{task}.review.json").write_text(json.dumps(env, indent=2))
-    if args.task_id:
-        try:
-            TaskStore().record_verdict(args.task_id, "review", verdict, "A09", findings, expires_s=172800)
-        except SwarmError as e:
-            if e.code is not ErrorCode.E_INPUT:
-                raise
-    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "stats": stats,
+    return {"recorded": sorted(recorded), "status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "findings": findings, "stats": stats,
             "runs": runs, "diff_base": base or "whole-tree", "envelope": env,
             "summary": f"review gate {verdict.upper()} — {stats['files']} files, +{stats['added']}/-{stats['deleted']}, "
                        f"{len(findings)} findings (base: {base or 'whole-tree'})"}
@@ -194,7 +183,10 @@ def run(args, ctx) -> dict:
 
 def add_args(p):
     p.add_argument("--diff-base", help="git ref to diff against (default: HEAD~1, then origin/main, else whole tree)")
-    p.add_argument("--findings-file", help="JSON list of additional (LLM semantic) findings to merge into the verdict")
+    p.add_argument("--findings-file", help="JSON list of additional (LLM semantic) findings to merge into every target's verdict")
+    p.add_argument("--per-target-findings",
+                   help="JSON object {target task id: [findings]}: each gate target's verdict gets only its own findings "
+                        "(targets it omits get every finding)")
     p.add_argument("--max-lines", type=int, default=800, help="changed-lines threshold per file for a major 'size' finding")
 
 

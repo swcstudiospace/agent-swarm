@@ -3,15 +3,25 @@
 Signing: ed25519 via `cryptography` when SWARM_ED25519_KEY (hex seed) is set;
 otherwise HMAC-SHA256 with SWARM_SIGNING_KEY (default dev key). Signatures are
 REQUIRED for task.assign, gate verdicts and promote/rollback commands.
+
+Every signing with the dev-insecure-key fallback emits a `security.dev_key` event, except a gate-script
+preview inside a key-less agent session (SWARM_AGENT_SESSION=1), which never records (WR-15).
+Verification accepts the dev key only when neither SWARM_ED25519_KEY nor
+SWARM_REQUIRE_KEY=1 is set; otherwise a dev-key `hmac:` signature never verifies.
+SWARM_REQUIRE_KEY=1 makes APPROVED fail closed (E-POLICY) unless SWARM_ED25519_KEY
+(loadable) or SWARM_SIGNING_KEY is configured, and `signing_config_error()` lets
+verdict signing fail fast on a missing or unloadable key.
 """
 from __future__ import annotations
 import base64
+import binascii
 import hashlib
 import hmac
 import json
 import os
 import time
 import uuid
+from pathlib import Path
 
 from .errors import SwarmError, ErrorCode
 
@@ -63,9 +73,14 @@ def build_envelope(*, source: str, target: str, msg_type: str, payload: dict,
 
 
 def validate_envelope(env: dict, *, require_sig: bool = True) -> None:
+    if not isinstance(env, dict):
+        raise SwarmError(ErrorCode.E_CONTRACT, "envelope must be an object")
     missing = [f for f in REQUIRED_FIELDS if f not in env]
     if missing:
         raise SwarmError(ErrorCode.E_CONTRACT, f"envelope missing fields {missing}")
+    not_str = [f for f in ("type", "schema", "priority", "risk_class") if not isinstance(env[f], str)]
+    if not_str:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"envelope fields must be strings: {not_str}")
     if env["priority"] not in PRIORITIES:
         raise SwarmError(ErrorCode.E_CONTRACT, f"bad priority {env['priority']!r}")
     if env["risk_class"] not in RISK_CLASSES:
@@ -96,30 +111,83 @@ def _ed25519_key():
         return None
 
 
-def sign_envelope(env: dict) -> dict:
+def real_key_configured() -> bool:
+    """True when a non-dev signing key is configured (loadable Ed25519 seed or HMAC secret)."""
+    return _ed25519_key() is not None or bool(os.environ.get("SWARM_SIGNING_KEY"))
+
+
+def _dev_key_forbidden() -> bool:
+    """The public dev key must not verify once a real key is configured (even an unloadable
+    Ed25519 seed: misconfiguration fails closed) or required via SWARM_REQUIRE_KEY=1."""
+    return bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1"
+
+
+def signing_config_error() -> str | None:
+    """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None."""
+    if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
+        return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
+    if (os.environ.get("SWARM_ED25519_KEY") and _ed25519_key() is None
+            and not os.environ.get("SWARM_SIGNING_KEY")):
+        return ("fail-closed: SWARM_ED25519_KEY is set but cannot be loaded "
+                "(cryptography missing or seed is not 32-byte hex)")
+    return None
+
+
+def _warn_dev_key(env: dict, root: str | Path | None) -> None:
+    try:
+        from .runlog import emit
+        emit("security.dev_key", {"msg_type": env["type"], "source": env["source"]},
+             source="swarm.envelope", correlation_id=env.get("correlation_id"), root=root)
+    except Exception:  # signing never fails on logging
+        pass
+
+
+def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = True) -> dict:
+    """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10).
+    audit=False skips that event for a key-less agent-session preview that can never record (WR-15)."""
     key = _ed25519_key()
     if key is not None:
         sig = key.sign(_canonical(env))
         env["sig"] = "ed25519:" + base64.b64encode(sig).decode()
     else:
-        secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
+        # an empty SWARM_SIGNING_KEY counts as unset, exactly as verify_envelope treats it
+        secret = (os.environ.get("SWARM_SIGNING_KEY") or "dev-insecure-key").encode()
+        if audit and not os.environ.get("SWARM_SIGNING_KEY"):
+            _warn_dev_key(env, root)
         mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
         env["sig"] = "hmac:" + base64.b64encode(mac).decode()
     return env
 
 
+def _b64(data: str) -> bytes | None:
+    try:
+        return base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
 def verify_envelope(env: dict) -> bool:
-    sig = env.get("sig") or ""
+    sig = env.get("sig") if isinstance(env, dict) else None
+    if not isinstance(sig, str):
+        return False
     if sig.startswith("hmac:"):
-        secret = os.environ.get("SWARM_SIGNING_KEY", "dev-insecure-key").encode()
-        expected = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
-        return hmac.compare_digest(expected, base64.b64decode(sig[5:]))
+        secret = os.environ.get("SWARM_SIGNING_KEY")
+        if not secret:
+            if _dev_key_forbidden():
+                return False
+            secret = "dev-insecure-key"
+        given = _b64(sig[5:])
+        if given is None:
+            return False
+        expected = hmac.new(secret.encode(), _canonical(env), hashlib.sha256).digest()
+        return hmac.compare_digest(expected, given)
     if sig.startswith("ed25519:"):
         key = _ed25519_key()
-        if key is None:
+        given = _b64(sig[8:])
+        if key is None or given is None:
             return False
         try:
-            key.public_key().verify(base64.b64decode(sig[8:]), _canonical(env))
+            key.public_key().verify(given, _canonical(env))
             return True
         except Exception:
             return False

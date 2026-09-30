@@ -21,7 +21,7 @@ Don't use for: Do not write product source or schema DDL.
 ## Prerequisites
 
 - Swarm root with `agents.json`, `scripts/`, `swarm/`.
-- `SWARM_DIR` (default `.swarm`).
+- `SWARM_DIR` (default `<git toplevel>/.swarm`, made absolute).
 - `python3` and/or `bun` on PATH.
 - Signed `task.assign` with task_id and correlation_id.
 

@@ -24,11 +24,16 @@ def test_headless_agent_env_marks_child(tmp_path, monkeypatch):
     mod = _load_swarm_run(tmp_path, monkeypatch)
     seen = {}
 
-    def fake_run(cmd, **kw):
-        seen["env"] = kw["env"]
-        return SimpleNamespace(stdout='{"result":"ok"}', stderr="", returncode=0)
+    class FakePopen:
+        pid, returncode = 0, 0
 
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        def __init__(self, cmd, **kw):
+            seen["env"] = kw["env"]
+
+        def communicate(self, input=None, timeout=None):
+            return '{"result":"ok"}', ""
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
     args = SimpleNamespace(runtime="claude", claude_bin="claude", permission_mode="bypassPermissions",
                            max_turns=5, model="", allowed_tools="", task_timeout=10)
     mod.run_agent_headless({"slug": "a05-backend", "id": "A05"}, "implement the thing", tmp_path, args)
@@ -46,6 +51,29 @@ def test_hook_silent_inside_swarm_child():
     assert not json.loads(p.stdout or "{}").get("additionalContext")
 
 
+_SPAWN_TRAP = r"""
+import os, runpy, subprocess, sys
+
+def trap(name):
+    def _boom(*a, **kw):
+        sys.stderr.write(f"SPAWN:{name}\n")
+        raise RuntimeError(name)
+    return _boom
+
+subprocess.Popen = trap("Popen")
+for fn in ("fork", "posix_spawn", "posix_spawnp", "system", "execv", "execve", "execvp", "execvpe", "spawnv", "spawnve"):
+    if hasattr(os, fn):
+        setattr(os, fn, trap(fn))
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
+
+
 def test_hook_does_not_spawn_runner():
-    src = HOOK.read_text()
-    assert "Popen" not in src and "autonomous_run" not in src
+    """The hook only writes context: with every process-creation primitive trapped, a positive prompt still
+    gets its additionalContext and no primitive is reached (a spawn attempt would trip fail-open to `{}`)."""
+    env = {**os.environ, "SWARM_CHILD": "0"}
+    p = subprocess.run([sys.executable, "-c", _SPAWN_TRAP, str(HOOK)], input=json.dumps({"prompt": "implement a billing feature"}),
+                       capture_output=True, text=True, env=env)
+    assert p.returncode == 0
+    assert "SPAWN:" not in p.stderr
+    assert "agent-swarm-orchestrate" in json.loads(p.stdout).get("additionalContext", "")

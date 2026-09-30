@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /root/src/repos/agent-swarm/hooks/user_prompt_submit.py"
+            "command": "python3 hooks/user_prompt_submit.py"
           }
         ]
       }

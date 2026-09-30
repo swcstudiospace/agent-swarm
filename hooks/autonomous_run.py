@@ -14,19 +14,22 @@ import sys
 import time
 from pathlib import Path
 
-POSITIVE = (
-    "implement", "feature", "bug", "fix", "refactor", "release", "deploy", "hotfix",
-    "requirements", "architecture", "code review", "security audit", "run the swarm",
-    "agent-swarm", "a01-orchestrator", "build a", "build me",
-)
-NEGATIVE = ("/uplift", "/think", "what is", "explain only", "/all-in-one:")
+# Auto-run for every plugin-handled prompt. Slash/ctl strings stay negative so
+# Skill dispatch and /all-in-one:* are not consumed by the swarm. Empty and
+# leading-/ briefs are skipped. "what is" is not a skip: trivia still kicks.
+NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 
 
 def classify(prompt: str) -> bool:
     low = prompt.lower()
     if any(n in low for n in NEGATIVE):
         return False
-    return any(p in low for p in POSITIVE)
+    trimmed = prompt.strip()
+    if not trimmed:
+        return False
+    if trimmed.startswith("/"):
+        return False
+    return True
 
 
 def pattern_for(brief: str) -> str:
@@ -52,7 +55,7 @@ def main() -> int:
     ap.add_argument("--cwd", default=".", help="target application repo")
     ap.add_argument("--brief", required=True, help="the user's original prompt (classification + dedupe key)")
     ap.add_argument("--spec", default="", help="uplifted XML spec file; when readable, A01 plans from it instead of --brief")
-    ap.add_argument("--runtime", default="auto", choices=["auto", "claude", "grok"])
+    ap.add_argument("--runtime", default="auto", choices=["auto", "claude", "grok", "omp"])
     ap.add_argument("--swarm-root", default=os.environ.get("SWARM_ROOT", str(Path(__file__).resolve().parent.parent)))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--wait", action="store_true", help="run in-process (tests); default is already in-process for this script")
@@ -61,8 +64,9 @@ def main() -> int:
         return 0
     root = Path(args.swarm_root).resolve()
     repo = Path(args.cwd).resolve()
-    swarm_dir = Path(os.environ.get("SWARM_DIR", str(root / ".swarm")))
-    swarm_dir.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(root))
+    from swarm.paths import swarm_dir as resolve_swarm_dir
+    swarm_dir = resolve_swarm_dir(repo, create=True)  # absolute; exported to both children
     digest = hashlib.sha256(f"{repo}|{args.brief}".encode()).hexdigest()[:16]
     lock = swarm_dir / "kickoffs" / f"{digest}.lock"
     log = swarm_dir / "autonomous.log"
@@ -81,6 +85,24 @@ def main() -> int:
         run.append("--dry-run")
     try:
         p1 = subprocess.run(plan, cwd=str(root), env=env, capture_output=True, text=True, timeout=120)
+        try:
+            plan_json = json.loads(p1.stdout)
+        except ValueError:
+            plan_json = {}
+        if p1.returncode != 0 or plan_json.get("status") != "ok" or not plan_json.get("correlation_id"):
+            err = plan_json.get("error") if isinstance(plan_json.get("error"), dict) else {}
+            log.write_text(json.dumps({
+                "brief": args.brief[:500],
+                "repo": str(repo),
+                "spec": str(spec) if spec else None,
+                "plan_rc": p1.returncode,
+                "plan_out": p1.stdout[-4000:],
+                "plan_err": p1.stderr[-2000:],
+                "skipped_run": True,
+                "error": {"code": err.get("code"), "message": err.get("message")},
+            }, indent=2))
+            return 0
+        run += ["--correlation-id", plan_json["correlation_id"]]
         p2 = subprocess.run(run, cwd=str(root), env=env, capture_output=True, text=True, timeout=3600)
         log.write_text(
             json.dumps({

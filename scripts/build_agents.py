@@ -3,8 +3,12 @@
 
 Claude: .claude/agents/<slug>.md  (name, description, tools, model: inherit)
 Grok:   .grok/agents/<slug>.md    (prompt_mode, permission_mode, agents_md)
+omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, output)
+        omp/skills/<slug>/SKILL.md
+        omp/skills/swarm-orchestrate/SKILL.md  (with A01)
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
+Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
 """
 from __future__ import annotations
 import argparse
@@ -15,10 +19,31 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
+from _write_skills import omp_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
+import _install_omp  # noqa: E402
 
 CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
+OMP_AGENTS_DIR = ROOT / "omp" / "agents"
+OMP_SKILLS_DIR = ROOT / "omp" / "skills"
+SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
+TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
+BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
+# D-01: the omp package's hidden swarm_* tools reach only the agents granted here (omp frontmatter only).
+SWARM_TOOLS = {
+    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"],
+    "A08": ["swarm_gate"],
+    "A09": ["swarm_gate"],
+    "A10": ["swarm_gate"],
+    "A12": ["swarm_gate"],
+}
+# Fail-closed ceiling for SWARM_TOOLS: A01 moves task state, the gate agents record verdicts, no agent does both.
+ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"}
+# gate agent → (swarm_gate gate name, gate script stem); mirrors GATE_AGENTS in omp/src/context.ts
+GATES = {"A08": ("quality", "qa_gate"), "A09": ("review", "rev_gate"), "A10": ("security", "sec_gate"), "A12": ("release", "rel_plan")}
+GATE_AGENTS = set(GATES)
 
 CLAUDE_PREAMBLE = """<swarm_runtime>
 You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
@@ -88,6 +113,85 @@ def render_grok(agent: dict, defaults: dict) -> str:
     return "\n".join(fm) + "\n\n" + GROK_PREAMBLE + "\n" + _body(agent) + "\n"
 
 
+_OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md in the runtime root).
+- Runtime root: the absolute path on the `Runtime root:` line of the `## AgentSwarm runtime` section of your system prompt; when that section is absent, the repository root is the runtime root. It contains `swarm/` (runtime toolkit) and `scripts/` (your tools). The repository you work on (`<repo>`, the git toplevel of your working directory) holds `.swarm/` (task store, verdicts, event log).
+- The assignment you receive is a `task.assign` payload: task_id, correlation_id, capability, inputs[], acceptance[], budget, risk_class. Echo task_id and correlation_id in every script call (`--task-id`, `--correlation-id`) and in your final JSON.
+- Run your scripts with `python3 <runtime root>/scripts/<script>.py … --root <repo> --json` or `bun <runtime root>/scripts/ts/<script>.ts … --root <repo> --json`, read the JSON, then act; every `scripts/` path in the body below lives under the runtime root. Never fabricate script output.
+- Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
+- Finish by calling the `yield` tool with your `task.result` (or gate verdict) payload as defined in <output_format> as `data`; under omp this replaces any fenced-json finish instruction in the body below. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
+- Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
+"""
+
+OMP_PREAMBLE = "<swarm_runtime>\n" + _OMP_COMMON + "</swarm_runtime>\n"
+
+
+def _omp_gate_preamble(agent_id: str) -> str:
+    """A gate agent's omp preamble: the specialist one plus the swarm_gate-only rule (Phase 5 D-1)."""
+    gate, script = GATES[agent_id]
+    line = (
+        f"- Gate recording (omp): record your {gate} gate only with the `swarm_gate` tool (`gate: \"{gate}\"`); it runs "
+        f"`{script}` against this session's workspace and signs the verdict. Never run `<runtime root>/scripts/{script}.py` or "
+        f"`<runtime root>/scripts/ts/{script}.ts` through bash (the guard blocks it), even where the body below says to run the script."
+    )
+    if gate in ("review", "quality", "security"):
+        line += (
+            " Pass every failing target in `per_target_findings` with at least one finding of severity `major` or "
+            "higher; an empty list passes a target."
+        )
+    return "<swarm_runtime>\n" + _OMP_COMMON + line + "\n</swarm_runtime>\n"
+
+
+OMP_ORCH_PREAMBLE = """<swarm_runtime>
+- Step 0 (mandatory, before reading any file, running any script or writing anything): check your tool definitions and apply the first matching rule below; only then continue with the assignment.
+  - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
+  - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first.
+""" + _OMP_COMMON + """- Dispatch: spawn specialists via the omp `task` tool with `agent: <slug>` (a02-requirements … a15-docs), batching independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
+- Final yield (omp): your final `yield` is the task.result that swarm-orchestrate step 8 defines (`task_id`, `state`, `summary_md`). The swarm.status block from <output_format> goes into `summary_md`; it is never yielded as-is.
+</swarm_runtime>
+"""
+
+
+def render_omp(agent: dict, agents: list[dict]) -> str:
+    output = json.dumps(json.loads(SCHEMA.read_text(encoding="utf-8")), separators=(",", ":"))
+    is_orch = agent["id"] == "A01"
+    if not agent["tools"]:
+        raise ValueError(f"{agent['id']}: empty tools list")
+    unmapped = [t for t in agent["tools"] if t not in TOOL_MAP]
+    if unmapped:
+        raise ValueError(f"{agent['id']}: unmapped tool(s) for omp: {', '.join(unmapped)}")
+    mapped = [TOOL_MAP[t] for t in agent["tools"]]
+    if not is_orch and "task" in mapped:
+        raise ValueError(f"{agent['id']}: specialists must not get the omp task tool")
+    grants = SWARM_TOOLS.get(agent["id"], [])
+    allowed = ORCH_SWARM_TOOLS if is_orch else {"swarm_gate"} if agent["id"] in GATE_AGENTS else set()
+    denied = [t for t in grants if t not in allowed]
+    if denied:
+        raise ValueError(f"{agent['id']}: swarm tool(s) not allowed for this agent: {', '.join(denied)}")
+    tools = ", ".join(mapped + grants)
+    spawns = ", ".join(a["slug"] for a in agents if a["id"] != "A01") if is_orch else '""'
+    fm = [
+        "---",
+        f"name: {yaml_str(agent['slug'])}",
+        f'description: {yaml_str(agent["id"] + " " + agent["code"] + " — " + agent["description"])}',
+        f"tools: {tools}",
+        f"spawns: {spawns}",
+    ]
+    if agent["id"] in BLOCKING:
+        fm.append("blocking: true")
+    if is_orch:
+        fm += ["autoloadSkills: a01-orchestrator,swarm-orchestrate", f"output: {output}", "---"]
+    else:
+        fm += [f"autoloadSkills: {agent['slug']}", f"output: {output}", "---"]
+    if is_orch:
+        preamble = OMP_ORCH_PREAMBLE
+    elif agent["id"] in GATES:
+        preamble = _omp_gate_preamble(agent["id"])
+    else:
+        preamble = OMP_PREAMBLE
+    return "\n".join(fm) + "\n\n" + preamble + "\n" + _body(agent) + "\n"
+
+
+
 def install_targets() -> list[Path]:
     return [CLAUDE_DIR, GROK_DIR]
 
@@ -101,6 +205,34 @@ def _write_or_check(target: Path, content: str, check: bool, changed: list, writ
         target.write_text(content, encoding="utf-8")
         written.append(str(target.relative_to(ROOT)))
 
+
+def _contained(p: Path, base: Path) -> bool:
+    """True if p is a real (non-symlink) entry whose resolved path stays under base."""
+    return not p.is_symlink() and p.resolve().is_relative_to(base.resolve())
+
+
+def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
+    """(removable, unsafe) generated omp entries the manifest no longer produces.
+
+    Unsafe entries are symlinks or resolve outside omp/agents or omp/skills; they are
+    reported but never followed or deleted.
+    """
+    removable: list[Path] = []
+    unsafe: list[Path] = []
+    for p in OMP_AGENTS_DIR.glob("*.md"):
+        if p.stem not in slugs:
+            (removable if _contained(p, OMP_AGENTS_DIR) else unsafe).append(p)
+    known_skills = slugs | {"swarm-orchestrate"}
+    for d in (OMP_SKILLS_DIR.iterdir() if OMP_SKILLS_DIR.is_dir() else []):
+        if d.name in known_skills:
+            continue
+        if not _contained(d, OMP_SKILLS_DIR):
+            unsafe.append(d)
+            continue
+        skill = d / "SKILL.md"
+        if skill.is_symlink() or skill.exists():
+            (removable if _contained(skill, OMP_SKILLS_DIR) else unsafe).append(skill)
+    return sorted(removable), sorted(unsafe)
 
 def _copy_file(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -129,48 +261,127 @@ def write_grok_hooks(path: Path, hook_cmd: str) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def install_workspace(workspace: Path) -> None:
-    hook_py = ROOT / "hooks" / "user_prompt_submit.py"
-    hook_cmd = f"python3 {hook_py}"
+def _workspace_hooks(workspace: Path) -> tuple[Path, Path]:
+    """(Claude settings, Grok hook file) the workspace install writes."""
+    return workspace / ".claude" / "settings.json", workspace / ".grok" / "hooks" / "agent-swarm.json"
+
+
+def _workspace_copies(workspace: Path) -> list[tuple[Path, Path]]:
+    """(source, destination) pairs of the Claude/Grok workspace copy."""
+    pairs = []
     for agent in load_manifest():
         slug = agent["slug"]
-        _copy_file(CLAUDE_DIR / f"{slug}.md", workspace / ".claude" / "agents" / f"{slug}.md")
-        _copy_file(GROK_DIR / f"{slug}.md", workspace / ".grok" / "agents" / f"{slug}.md")
+        pairs.append((CLAUDE_DIR / f"{slug}.md", workspace / ".claude" / "agents" / f"{slug}.md"))
+        pairs.append((GROK_DIR / f"{slug}.md", workspace / ".grok" / "agents" / f"{slug}.md"))
         skill_src = ROOT / "skills" / slug / "SKILL.md"
         if skill_src.exists():
-            _copy_file(skill_src, workspace / ".claude" / "skills" / "agent-swarm" / slug / "SKILL.md")
+            pairs.append((skill_src, workspace / ".claude" / "skills" / "agent-swarm" / slug / "SKILL.md"))
     orch = ROOT / "skills" / "orchestrate" / "SKILL.md"
     if orch.exists():
-        _copy_file(orch, workspace / ".claude" / "skills" / "agent-swarm" / "orchestrate" / "SKILL.md")
-    merge_claude_settings(workspace / ".claude" / "settings.json", hook_cmd)
-    write_grok_hooks(workspace / ".grok" / "hooks" / "agent-swarm.json", hook_cmd)
-    write_grok_hooks(ROOT / ".grok" / "hooks" / "agent-swarm.json", hook_cmd)
+        pairs.append((orch, workspace / ".claude" / "skills" / "agent-swarm" / "orchestrate" / "SKILL.md"))
+    return pairs
+
+
+def install_workspace(workspace: Path, dry_run: bool = False) -> None:
+    """Copy the Claude/Grok agents, skills and hooks into `workspace`; never writes into this repo (D-08).
+
+    Skill copies get the literal `$SWARM_ROOT` replaced by this checkout's realpath, and the workspace hooks call
+    the hook script by absolute path; the tracked repo files stay path-free (OPEN-4)."""
+    root = ROOT.resolve()
+    hook_cmd = f"python3 {root / 'hooks' / 'user_prompt_submit.py'}"
+    settings, grok_hook = _workspace_hooks(workspace)
+    pairs = _workspace_copies(workspace)
+    if dry_run:
+        for src, dest in pairs:
+            print(f"dry-run: would copy {src.relative_to(ROOT)} -> {dest}")
+        print(f"dry-run: would set the UserPromptSubmit hook in {settings} (replacing existing ones): {hook_cmd}")
+        print(f"dry-run: would write {grok_hook}: {hook_cmd}")
+        return
+    skills_src = ROOT / "skills"
+    for src, dest in pairs:
+        if src.is_relative_to(skills_src):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(src.read_text(encoding="utf-8").replace("$SWARM_ROOT", str(root)), encoding="utf-8")
+        else:
+            _copy_file(src, dest)
+    merge_claude_settings(settings, hook_cmd)
+    write_grok_hooks(grok_hook, hook_cmd)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="fail if generated output differs from disk")
     ap.add_argument("--only", help="comma list of agent ids/slugs")
-    ap.add_argument("--install-workspace", help="copy generated agents, skills, and hooks into this workspace root")
+    ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, plus the omp package")
+    ap.add_argument("--omp-mode", choices=("link", "copy"), help="omp step of --install-workspace: link the package (default) or copy agents and skills only (no tools, no guard)")
+    ap.add_argument("--dry-run", action="store_true", help="with --install-workspace: print the plan and the config diff, write nothing")
     args = ap.parse_args()
+    if (args.omp_mode or args.dry_run) and not args.install_workspace:
+        ap.error("--omp-mode and --dry-run need --install-workspace")
+    workspace = Path(args.install_workspace).expanduser().resolve() if args.install_workspace else None
+    mode = args.omp_mode or "link"
+    if workspace:
+        if args.check:
+            ap.error("--check cannot be combined with --install-workspace")
+        if not workspace.is_dir():
+            print(f"error: workspace {workspace} is not an existing directory", file=sys.stderr)
+            return 2
+        problem = _install_omp.preflight(workspace, mode)
+        if not problem:
+            # CR-01: no Claude/Grok write may follow a symlink; refuse before generation or any copy.
+            dests = [d for _, d in _workspace_copies(workspace)] + list(_workspace_hooks(workspace))
+            unsafe = _install_omp.unsafe_destinations(workspace, dests)
+            if unsafe:
+                problem = (
+                    f"error: refusing to install into {workspace}: {'; '.join(unsafe)}; "
+                    "the installer never writes through a symlink. Nothing was written."
+                )
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
+        if args.dry_run:
+            print("dry-run: skipping generation; the files below are copied as they are on disk")
+            install_workspace(workspace, dry_run=True)
+            return _install_omp.install_omp(workspace, mode, True, sys.stdout)
     manifest_raw = json.loads((ROOT / "agents.json").read_text())
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     GROK_DIR.mkdir(parents=True, exist_ok=True)
     changed, written = [], []
-    for agent in load_manifest():
+    agents = list(load_manifest())
+    for agent in agents:
         if only and agent["id"].lower() not in only and agent["slug"] not in only:
             continue
         _write_or_check(CLAUDE_DIR / f"{agent['slug']}.md", render_claude(agent, defaults), args.check, changed, written)
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
+        _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
+        _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
+        if agent["id"] == "A01":
+            _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written)
+    refused = []
+    if not only:
+        removable, refused = _omp_orphans({a["slug"] for a in agents})
+        for orphan in removable:
+            changed.append(str(orphan.relative_to(ROOT)))
+            if not args.check:
+                orphan.unlink()
+                if orphan.name == "SKILL.md" and not any(orphan.parent.iterdir()):
+                    orphan.parent.rmdir()
+                written.append(f"removed {orphan.relative_to(ROOT)}")
+        changed += [str(p.relative_to(ROOT)) for p in refused]
     if args.check:
         print("stale:" if changed else "up-to-date", ", ".join(changed))
         return 1 if changed else 0
     print(f"wrote {len(written)} agent file(s): {', '.join(written) or '(none changed)'}")
-    if args.install_workspace:
-        install_workspace(Path(args.install_workspace).resolve())
-        print(f"installed into {args.install_workspace}")
+    if refused:
+        # Symlinked or out-of-tree orphans are never deleted; fail so a human removes them.
+        print("refused to remove (symlink or outside omp/): " + ", ".join(str(p.relative_to(ROOT)) for p in refused), file=sys.stderr)
+        return 1
+    if workspace:
+        install_workspace(workspace)
+        print(f"installed Claude/Grok agents, skills and hook into {workspace}")
+        return _install_omp.install_omp(workspace, mode, False, sys.stdout)
     return 0
 
 

@@ -128,12 +128,12 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
 <workflow>
 1. SAST/secrets/deps/IaC/threat-model. Do not edit product code. Never accept risk (L4 human).
-2. Run `sec_gate.py` / `sec_gate.ts` per target. Fail-closed. Emit security gate.verdict.
+2. Run `sec_gate.py` / `sec_gate.ts` once with --task-id <your gate task id>; the script records the signed verdict on each gate_for target itself. Fail-closed. Emit security gate.verdict.
 </workflow>
 
 
 <acceptance_criteria>
-- Every listed script ran (or --dry-run) and you reasoned over its JSON; you never invented scan results.
+- Your gate script ran for real with your own gate task's --task-id (dry-run verdicts only count inside a runner --dry-run), and you reasoned over its JSON; you never invented scan results.
 - Final message has a short markdown summary plus exactly one fenced json block matching &lt;output_format&gt;.
 - state is IN_REVIEW | FAILED | BLOCKED (with needs).
 - correlation_id and task_id are echoed.
@@ -160,7 +160,7 @@ escalated: third gate failure or poison task — do not retry; report for A01
 </graph_of_thought>
 
 <graceful_degradation>
-If a binary is missing, record skipped:tool-missing in JSON and continue other checks. Never invent scan results. If the Task Store or signing key is missing, fail closed with E-DEP. Prefer --dry-run only when the operator asked for it or SWARM_DRYRUN is set.
+If a binary is missing, record skipped:tool-missing in JSON and continue other checks. Never invent scan results. If the Task Store or signing key is missing, fail closed with E-DEP. Never pass --dry-run to your gate script unless your task.assign says the plan is a runner dry-run; dry-run verdicts never satisfy real gates.
 </graceful_degradation>
 
 <security_and_validation>

@@ -4,8 +4,12 @@
  * Mirrors swarm/script_base.py: --task-id --correlation-id --root --json --dry-run
  * Exit 0 ok / 1 finding-fail / 2 taxonomy error.
  */
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { swarmDir } from "../../omp/src/paths.ts";
+
+// Phase 7 D-09: the one TS copy of the path helpers lives in the omp package; re-exported for script consumers.
+export { gitToplevel, swarmDir } from "../../omp/src/paths.ts";
 
 export const EXIT = { OK: 0, FAIL: 1, ERROR: 2 } as const;
 
@@ -33,14 +37,13 @@ export function parseAgentArgs(argv: string[]): AgentArgs {
   return out;
 }
 
-function swarmDir(root: string): string {
-  return process.env.SWARM_DIR || resolve(root, ".swarm");
-}
-
 function emitEvent(root: string, payload: Record<string, unknown>): void {
   const dir = swarmDir(root);
   if (!existsSync(dir) && !process.env.SWARM_DIR) return;
   mkdirSync(dir, { recursive: true });
+  try {
+    writeFileSync(resolve(dir, ".gitignore"), "*", { flag: "wx" }); // D-11: never overwrite
+  } catch {}
   const line = JSON.stringify({ ts: new Date().toISOString(), ...payload }) + "\n";
   appendFileSync(resolve(dir, "events.jsonl"), line);
 }

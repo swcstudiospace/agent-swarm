@@ -36,8 +36,8 @@ def agent_skill(a: dict) -> str:
     spawn = ""
     if a["id"] == "A01":
         spawn = """
-6. For each ready task, spawn `subagent_type` = slug (Claude Agent tool or Grok `spawn_subagent`). Do not implement domain work.
-7. Ingest child JSON with `orch_status.py --ingest`. Apply fail-closed gates (max 2 rework loops).
+6. For each ready task, lease it (`orch_status.py --repo <app> --transition <id> CLAIMED`, then `IN_PROGRESS`), then spawn `subagent_type` = slug (Claude Agent tool or Grok `spawn_subagent`). Do not implement domain work.
+7. Ingest child JSON with `orch_status.py --repo <app> --ingest`. Apply fail-closed gates (max 2 rework loops); gate scripts, not you, record verdicts.
 """
     return f"""---
 name: {a['slug']}
@@ -62,7 +62,7 @@ Don't use for: {DONT[a['id']]}
 ## Prerequisites
 
 - Swarm root with `agents.json`, `scripts/`, `swarm/`.
-- `SWARM_DIR` (default `.swarm`).
+- `SWARM_DIR` (default `<git toplevel>/.swarm`, made absolute).
 - `python3` and/or `bun` on PATH.
 - Signed `task.assign` with task_id and correlation_id.
 
@@ -118,14 +118,14 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 
 ## Prerequisites
 
-- Agent-swarm checkout at `/root/src/repos/agent-swarm` (or `$SWARM_ROOT`).
+- Agent-swarm checkout at `$SWARM_ROOT` (the installer fills in the absolute path of the agent-swarm checkout).
 - Target application repo (`--repo` / cwd).
 - python3; bun optional; claude or grok CLI for unattended `swarm_run`.
 
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 /root/src/repos/agent-swarm/scripts/orch_plan.py --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: {slugs}.
@@ -138,10 +138,102 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 
 ## Verification
 
-- A plan JSON exists under `.swarm/plans/`.
+- A plan JSON exists under `<app>/.swarm/plans/` (the same `--repo` the run uses).
 - Child slugs match agents.json.
 - Parent transcript contains no product-code patches from the parent itself.
 """
+
+def swarm_orchestrate_skill() -> str:
+    """Phase 5: omp-native in-session driver (separate file, separate slug)."""
+    return """---
+name: swarm-orchestrate
+description: "Drive AgentSwarm SDLC waves in-session via A01: status → lease → one tasks[] call (explicit agent per task) → ingest (runs reconcile) → DONE or ESCALATED. Parent never implements domain work."
+disable-model-invocation: false
+---
+
+# swarm-orchestrate (in-session A01 driver)
+
+## When to Use
+- You are a01-orchestrator and a wave is ready, or the user explicitly asked for the full SDLC through the swarm.
+- You were given a plan whose tasks carry `agent` fields.
+
+Never use from a specialist session.
+
+## Prerequisites
+- Tools: swarm_plan, swarm_status, swarm_transition, swarm_ingest, task (plus read tools). You do **not** have `swarm_gate`: the gate agents (a08-qa, a09-reviewer, a10-security, a12-release) run it themselves.
+- A correlation from swarm_plan or /swarm.
+
+## Procedure
+
+1. `swarm_status` for the correlation → the ready tasks, each with its `agent` and gate notes (`gate`, `gate_for`).
+2. Lease every task of the ready wave with `swarm_transition`: PLANNED → CLAIMED, then CLAIMED → IN_PROGRESS. Lease gate tasks before their gate agent runs: `swarm_gate` refuses a gate task that is not IN_PROGRESS.
+3. Make **one** `task` call for the wave:
+   - `tasks[]` holds one item per task, each with `agent: <slug>` and a task.assign payload: `task_id`, `correlation_id`, `capability`, `inputs`, `acceptance`, `risk_class`.
+   - Add `schemaMode: "strict"` to every item for a08-qa, a09-reviewer, a10-security and a12-release.
+   - Gate agents run `swarm_gate` themselves. Never pass them findings or a verdict.
+4. `swarm_ingest` every child's task.result before the next wave. Ingest applies the result and runs reconcile itself; there is no separate reconcile call. Reconcile:
+   - moves a target failing a required gate CHANGES_REQUESTED → IN_PROGRESS (rework, feedback in its notes) and creates one gate rerun task per gate lineage, `<base>.r<N>` (base = the gate task id without trailing `.rN`; N = the lineage's next rerun sequence, not the target's rework count). Tasks that depended on the lineage wait for its rerun, and a release-gate rerun also waits for the other gate reruns of the same rework;
+   - moves a target passing every required gate APPROVED → DONE;
+   - after MAX_REWORK_LOOPS=2 rework loops, moves a still-failing target to ESCALATED and emits `escalation.request`.
+5. Missing yield (D-07): a child whose output ends with `SUBAGENT_WARNING_MISSING_YIELD`, or has no parseable task.result, is ingested as FAILED with `error: {code: "E-CONTRACT", message: "missing yield"}`, or as BLOCKED with `needs` when it stated a need. Never IN_REVIEW.
+6. Refusals and blocks:
+   - Ingest refuses a gate result with E-CONTRACT `review verdict mismatch:` or `gate script not run`: the result is not applied and the gate task stays leased (IN_PROGRESS). Reconcile holds that gate's targets (never APPROVED) until the gate task that recorded the row has an accepted result; a FAILED gate task holds them until step 7 retries or escalates it. Re-dispatch that gate agent with the error text. Never transition around it.
+   - A BLOCKED task: escalate to the human. Never self-release it.
+7. FAILED tasks: nothing in-session retries them (only the headless runner does). For each task FAILED after ingest, read `attempt` from `swarm_status` (`max_attempts` defaults to 3):
+   - `attempt` < `max_attempts`: `swarm_transition` FAILED → RETRY, re-lease it RETRY → CLAIMED → IN_PROGRESS, and re-dispatch it to its agent with the error in the payload;
+   - otherwise: FAILED → ESCALATED, and report it as an escalation.
+8. Loop: re-dispatch rework tasks (IN_PROGRESS after reconcile, already leased) to their agent with the feedback from notes. Repeat from step 1 until every task is DONE, ESCALATED, CANCELLED or BLOCKED awaiting a human. Then yield one task.result, your output schema (a bare swarm.status object is rejected):
+   - `task_id`: the `correlation_id` of your plan.execute assignment (it carries no task_id of its own);
+   - `state`: IN_REVIEW when every task is DONE. Otherwise BLOCKED when any task is BLOCKED awaiting a human, else FAILED;
+   - `needs` (with BLOCKED): each BLOCKED task and its need;
+   - `error` (with FAILED): `{code, message}`, code the escalation's `reason_code` (e.g. E-CONTRACT), message naming every ESCALATED, FAILED and CANCELLED task;
+   - `summary_md`: the swarm.status summary, i.e. the per-state task counts and every ESCALATED, FAILED and BLOCKED task with its escalation or need.
+
+## Parent contract
+The session that loaded this skill (the human's top-level) **must never** do domain work. All implementation goes through A01 waves.
+
+## Depth cap & plan mode
+- If you have no `task` tool and are not in plan mode, you may only `yield {state: "BLOCKED", needs: "depth"}`.
+- In plan mode: yield a plan; perform zero Task Store writes.
+
+## Negatives you must honour
+- Specialists never receive the `task` tool.
+- A01 running inside a workpool child yields BLOCKED depth.
+- Plan mode never mutates the Task Store.
+"""
+
+
+def yaml_str(text: str) -> str:
+    """Encode text as a YAML double-quoted scalar (a JSON string literal is one)."""
+    return json.dumps(text, ensure_ascii=False)
+
+
+def omp_skill(a: dict) -> str:
+    desc = yaml_str(
+        f"{a['id']} {a['code']} {a['name']} — {a['description']} "
+        f"Use when the swarm assigns capability {', '.join(a['capabilities'][:3])}."
+    )
+    return f"""---
+name: {yaml_str(a['slug'])}
+description: {desc}
+---
+
+# {a['name']} ({a['id']} {a['code']}) — omp
+
+## When to Use
+
+- The assignment capability is one of: {', '.join(a['capabilities'])}.
+- The user names this agent, slug `{a['slug']}`, or code `{a['code']}`.
+
+Don't use for: {DONT[a['id']]}
+
+## Procedure
+
+1. Dispatch via the omp `task` tool with `agent: {a['slug']}` (definition: `omp/agents/{a['slug']}.md`), passing the signed `task.assign` payload.
+2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.
+3. Don't use it for: {DONT[a['id']]}
+"""
+
 
 
 def main() -> None:
@@ -150,11 +242,23 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
         (d / "SKILL.md").write_text(agent_skill(a))
         print("wrote", d / "SKILL.md")
+    # legacy root orchestrate (kept)
     od = ROOT / "skills" / "orchestrate"
     od.mkdir(parents=True, exist_ok=True)
     (od / "SKILL.md").write_text(orch_skill())
     print("wrote", od / "SKILL.md")
 
+    # Phase 5: canonical omp swarm-orchestrate
+    omp_orch = ROOT / "omp" / "skills" / "swarm-orchestrate"
+    omp_orch.mkdir(parents=True, exist_ok=True)
+    (omp_orch / "SKILL.md").write_text(swarm_orchestrate_skill())
+    print("wrote", omp_orch / "SKILL.md")
+
+    for a in AGENTS:
+        d = ROOT / "omp" / "skills" / a["slug"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(omp_skill(a), encoding="utf-8")
+        print("wrote", d / "SKILL.md")
 
 if __name__ == "__main__":
     main()

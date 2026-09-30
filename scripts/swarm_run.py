@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
-"""A01 — autonomous swarm runner: executes a planned task DAG with Claude Code subagents.
+"""A01 — autonomous swarm runner: executes a planned task DAG with headless agent sessions.
 
-Each ready task is dispatched to its agent as a headless session
-    claude -p --agent <slug> --output-format json --permission-mode <mode> "<task.assign prompt>"
-run from --repo (the codebase being worked on
-defaults to cwd). Gate tasks record
-verdicts on their targets
+Each ready task is dispatched to its agent as a headless session, run with the task.assign prompt on stdin:
+    claude -p --agent <slug> --output-format json --permission-mode <mode> …                (--runtime claude)
+    grok -p --agent <slug> --output-format json --yolo --cwd <repo>                          (--runtime grok)
+    omp -p --mode json --no-session --no-title --no-extensions -e <agent-swarm>/omp --cwd <repo>
+        --approval-mode yolo --tools <frontmatter tools>,yield
+        --append-system-prompt $SWARM_DIR/agents/<slug>.md --max-time <n>s                   (--runtime omp)
+--runtime auto picks grok when SWARM_RUNTIME=grok or grok is on PATH and claude is not, else claude; it never
+picks omp (use --runtime omp or SWARM_RUNTIME=omp). Preflight checks only the selected runtime's binary (and
+`claude auth status` for claude). The omp result is the `yield` payload of the terminal agent_end, falling back
+to the last fenced json block in the final assistant text.
+
+Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>), so a gate
+script they run records nothing. For each gate task the runner itself runs the gate script on the gate task's own
+id after the session, while the task is still leased; the script records signed verdicts on the gate task's Task
+Store gate_for targets (the runner writes no rows itself).
 A01 rules (fail-closed gates, bounded rework, escalation) are
 applied between rounds by the Task Store.
 
   python3 scripts/swarm_run.py                          # run latest plan to completion
-  python3 scripts/swarm_run.py --dry-run                # simulate with canned agent results (no claude)
+  python3 scripts/swarm_run.py --runtime omp            # run it on omp (needs only `omp` on PATH)
+  python3 scripts/swarm_run.py --dry-run                # canned agent results; prints each task's invocation to stderr
   python3 scripts/swarm_run.py --once --max-parallel 3  # a single scheduling round
 """
 from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -30,15 +44,17 @@ from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
 from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
+from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.gates import SEVERITIES  # noqa: E402
+from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
+from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
+                           agent_failed, agent_findings, agent_verdict)
 
-JSON_BLOCK = re.compile(r"```json\s*(\{.*?\})\s*```", re.S)
-
-
-def latest_correlation() -> str | None:
-    f = SWARM_DIR / "latest_correlation"
-    return f.read_text().strip() if f.exists() else None
+# WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
+# nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
+# three; it performs every APPROVED transition and the recorded gate run.
+AGENT_SESSION_STRIPPED = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
 
 
 def upstream_context(store: TaskStore, task: dict) -> str:
@@ -72,8 +88,12 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path) -> 
     gate_note = ""
     if notes.get("gate"):
         gate_note = (f"\n## Gate instructions\nYou are issuing the **{notes['gate']}** gate for tasks {notes['gate_for']}. "
-                     f"Run your gate script with `--task-id <target>` for EACH target, then report one JSON with "
-                     f"`\"gate\": \"{notes['gate']}\"` and `\"verdicts\": {{\"<target_task_id>\": {{\"verdict\": \"pass|fail\", \"findings\": [...]}}}}`.")
+                     f"Run your gate script with `--task-id {task['task_id']}` (this gate task's own id) to see its findings; "
+                     f"in this headless session it records nothing. After the session the runner re-runs it with the "
+                     f"signing key and records the verdict on each gate_for target. Then report one JSON with "
+                     f"`\"gate\": \"{notes['gate']}\"` and `\"verdicts\": {{\"<target_task_id>\": {{\"verdict\": \"pass|fail\", \"findings\": [...]}}}}` "
+                     f"(advisory: fail findings become rework feedback, review findings are passed to the review gate "
+                     f"script; only script-written verdicts count).")
     return f"""# task.assign (signed envelope)
 ```json
 {json.dumps(env, indent=2)}
@@ -107,40 +127,215 @@ def preflight_auth(claude_bin: str) -> None:
                                           "or export ANTHROPIC_API_KEY; use --dry-run to simulate without credentials")
 
 
+RUNTIMES = ("claude", "grok", "omp")
+# the child-env deltas every runtime gets; --dry-run prints exactly these (never key material)
+CHILD_ENV_KEYS = ("SWARM_DIR", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_AGENT", "AIO_UPLIFT", "AIO_SWARM")
+FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n?", re.S)
+FRONTMATTER_TOOLS = re.compile(r"^tools:[ \t]*(.*?)[ \t]*$", re.M)
+
+
 def resolve_runtime(explicit: str) -> str:
-    """auto: grok when SWARM_RUNTIME=grok or (grok on PATH and claude is not)."""
-    if explicit in ("claude", "grok"):
+    """claude|grok|omp as given; auto: SWARM_RUNTIME=grok|omp, else grok when grok is on PATH and claude is not,
+    else claude. auto never picks omp from PATH (OPEN-3)."""
+    if explicit in RUNTIMES:
         return explicit
-    if os.environ.get("SWARM_RUNTIME") == "grok":
-        return "grok"
+    if os.environ.get("SWARM_RUNTIME") in ("grok", "omp"):
+        return os.environ["SWARM_RUNTIME"]
     if shutil.which("grok") and not shutil.which("claude"):
         return "grok"
     return "claude"
 
 
-def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
-    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+def runtime_bin(runtime: str, args) -> str:
+    return {"claude": getattr(args, "claude_bin", "claude"), "grok": getattr(args, "grok_bin", "grok"),
+            "omp": getattr(args, "omp_bin", "omp")}[runtime]
+
+
+def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
+    """(--tools CSV incl. yield, body file): omp/agents/<slug>.md's frontmatter tools, and its body with the
+    frontmatter stripped, written to $SWARM_DIR/agents/<slug>.md (a missing file would be appended as literal text)."""
+    src = ROOT / "omp" / "agents" / f"{slug}.md"
+    try:
+        raw = src.read_text()
+    except OSError as e:
+        raise SwarmError(ErrorCode.E_DEP, f"omp agent body {src} unreadable ({e.strerror}); run scripts/build_agents.py") from e
+    fm = FRONTMATTER.match(raw)
+    tools_m = FRONTMATTER_TOOLS.search(fm.group(1)) if fm else None
+    if fm is None or tools_m is None:
+        raise SwarmError(ErrorCode.E_DEP, f"omp agent body {src} has no frontmatter tools: line")
+    tools = [t.strip() for t in tools_m.group(1).strip("\"'").split(",") if t.strip()]
+    if "yield" not in tools:
+        tools.append("yield")
+    body = sdir / "agents" / f"{slug}.md"
+    body.parent.mkdir(parents=True, exist_ok=True)
+    # atomic: parallel tasks of one agent rewrite the same file while an earlier child may be reading it
+    tmp = body.with_name(f".{slug}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(raw[fm.end():])
+    os.replace(tmp, body)
+    return ",".join(tools), body
+
+
+def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) -> tuple[list[str], dict, Path]:
+    """(argv, env, cwd) of one agent session; the prompt goes on stdin. Shared by the live path and --dry-run."""
+    slug = agent["slug"]
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
-    env = dict(os.environ, SWARM_DIR=str(SWARM_DIR.resolve()), SWARM_CHILD="1", AIO_UPLIFT="0", AIO_SWARM="0")
+    env = {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}
+    # SWARM_AGENT: the session's agent identity; the omp swarm_gate tool runs only that agent's gate (WR-03)
+    env.update(SWARM_DIR=str(sdir), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=slug,
+               AIO_UPLIFT="0", AIO_SWARM="0")
+    model = ["--model", args.model] if args.model else []
+    binary = runtime_bin(runtime, args)
     if runtime == "grok":
-        grok_bin = getattr(args, "grok_bin", "grok")
-        cmd = [grok_bin, "-p", "--agent", agent["slug"], "--output-format", "json",
-               "--yolo", "--cwd", str(repo)]
-        if args.model:
-            cmd += ["--model", args.model]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=args.task_timeout, cwd=str(repo), env=env)
-    else:
-        cmd = [args.claude_bin, "-p", "--agent", agent["slug"], "--output-format", "json",
-               "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns),
-               "--add-dir", str(ROOT)]
-        if args.model:
-            cmd += ["--model", args.model]
-        if args.allowed_tools:
-            cmd += ["--allowedTools", *[t.strip() for t in args.allowed_tools.split(",") if t.strip()]]
-        cmd += ["--add-dir", str(repo)]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=args.task_timeout, cwd=ROOT, env=env)
-    text, meta = proc.stdout, {"returncode": proc.returncode, "stderr": proc.stderr[-2000:]}
+        return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", "--cwd", str(repo), *model], env, repo
+    if runtime == "omp":
+        tools, body = omp_agent(slug, sdir)
+        # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
+        margin = min(60, max(5, args.task_timeout // 10))
+        # -e spelled as omp's absolute root path: omp dedups extension roots by that string, not realpath (D-01)
+        return [binary, "-p", "--mode", "json", "--no-session", "--no-title", "--no-extensions",
+                "-e", str((ROOT / "omp").resolve()), "--cwd", str(repo), "--approval-mode", "yolo",
+                "--tools", tools, "--append-system-prompt", str(body),
+                "--max-time", f"{max(1, args.task_timeout - margin)}s", *model], env, repo
+    cmd = [binary, "-p", "--agent", slug, "--output-format", "json",
+           "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns),
+           "--add-dir", str(ROOT), *model]
+    if args.allowed_tools:
+        cmd += ["--allowedTools", *[t.strip() for t in args.allowed_tools.split(",") if t.strip()]]
+    return cmd + ["--add-dir", str(repo)], env, ROOT  # cwd ROOT: .claude/agents resolves
+
+
+def omp_stream_text(stdout: str) -> tuple[str, dict]:
+    """Normalise an `omp -p --mode json` stream to (final text, meta). The text is the last assistant message's
+    text parts from the last terminal agent_end, plus — when the session yielded successfully — a trailing fenced
+    json block of the yield data, so parse_result (last block wins) takes the yield payload first."""
+    session_id, turns, end = None, 0, None
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "session":
+            session_id = ev.get("id")
+        elif ev.get("type") == "turn_end":
+            turns += 1
+        elif ev.get("type") == "agent_end" and ev.get("isTerminal") is not False:
+            end = ev
+    meta = {"session_id": session_id, "total_cost_usd": None, "num_turns": turns, "is_error": True}
+    if end is None:
+        return "", meta
+    messages = [m for m in end.get("messages") or [] if isinstance(m, dict)]
+    assistants = [m for m in messages if m.get("role") == "assistant"]
+    last = assistants[-1] if assistants else {}
+    content = last.get("content") or []
+    text = content if isinstance(content, str) else "\n".join(
+        p.get("text") or "" for p in content if isinstance(p, dict) and p.get("type") == "text")
+    meta["total_cost_usd"] = sum(((m.get("usage") or {}).get("cost") or {}).get("total") or 0 for m in assistants)
+    meta["is_error"] = last.get("stopReason") in ("error", "aborted")
+    for m in reversed(messages):
+        if m.get("role") != "toolResult" or m.get("toolName") != "yield":
+            continue
+        details = m.get("details")
+        details = details if isinstance(details, dict) else {}
+        if m.get("isError") is False and details.get("status") == "success":
+            if isinstance(details.get("data"), dict):
+                text += f"\n```json\n{json.dumps(details['data'])}\n```"
+        else:
+            # D-02: an error yield fails the session, whatever json block the assistant text carries (WR-02)
+            meta["yield_error"] = details.get("error") or f"yield status={details.get('status')} isError={m.get('isError')}"
+            meta["is_error"] = True
+        break
+    return text, meta
+
+
+class AgentTimeout(subprocess.TimeoutExpired):
+    """The session outlived --task-timeout and its process group was killed; text/meta hold its partial output."""
+
+    def __init__(self, cmd, timeout, text: str, meta: dict):
+        super().__init__(cmd, timeout)
+        self.text, self.meta = text, meta
+
+
+# process groups of the running sessions: they run in their own session, so a signal to the runner's group misses them
+_SESSIONS: set[int] = set()
+_SESSIONS_LOCK = threading.Lock()
+_STOPPING = threading.Event()  # the runner is ending its sessions: a session that registers now is killed at once
+_FORWARDED = (signal.SIGTERM, signal.SIGHUP)
+
+
+def kill_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def kill_sessions(grace: float = 5) -> None:
+    """SIGTERM every session group, so omp disposes its session and tool processes; SIGKILL what outlives `grace` s
+    (WR-09). The workers still reap their sessions and record the killed tasks as rejected results, clearing
+    notes.running, so the next run retries them."""
+    with _SESSIONS_LOCK:
+        _STOPPING.set()
+        groups = list(_SESSIONS)
+    for pgid in groups:
+        kill_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while groups and time.monotonic() < deadline:
+        time.sleep(0.1)
+        groups = [g for g in groups if _group_alive(g)]
+    for pgid in groups:
+        kill_group(pgid, signal.SIGKILL)
+
+
+def _terminate(signum, _frame) -> None:
+    """SIGTERM/SIGHUP (GNU timeout, a terminal hangup, `kill -- -PGID`): raise into run()'s BaseException path, which
+    ends the sessions (T-06-12). A repeat while that teardown runs is ignored, so it cannot cut kill_sessions short."""
+    if _STOPPING.is_set():
+        return
+    _STOPPING.set()
+    raise SystemExit(128 + signum)
+
+
+def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
+    """SIGTERM the session's whole process group, SIGKILL it after 10 s; the partial (stdout, stderr)."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        kill_group(proc.pid, sig)
+        try:
+            return proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+    proc.kill()  # a descendant that left the group still holds the pipes
+    proc.wait()
+    return "", ""
+
+
+# omp 18.3.1 `-e`: a package that fails to load is only this stderr line (main.ts formatExtensionLoadNotifications),
+# rc 0, and the session runs on without it — for ours, without the swarm guard, in yolo (T-06-06)
+OMP_EXTENSION_LOAD_ERROR = re.compile(r"^(?:\x1b\[[0-9;]*m)*(Failed to load extension .*?)(?:\x1b\[[0-9;]*m)*$", re.M)
+
+
+def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
+    meta = {"returncode": returncode, "stderr": (stderr or "")[-2000:]}
+    if runtime == "omp":
+        text, stream_meta = omp_stream_text(stdout or "")
+        meta.update(stream_meta)
+        load_error = OMP_EXTENSION_LOAD_ERROR.search(stderr or "")
+        if load_error:
+            meta.update(extension_error=load_error.group(1)[:500], is_error=True)
+        return text, meta
+    text = stdout or ""
     try:
         data = json.loads(text)
         meta.update({k: data.get(k) for k in ("total_cost_usd", "duration_ms", "num_turns", "is_error", "session_id")})
@@ -150,15 +345,50 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str,
     return text, meta
 
 
-def _simulated_failures() -> set[str]:
-    """SWARM_DRYRUN_FAIL='T-be:quality,T-fe:review' makes those dry-run gate verdicts fail every time."""
-    return {x.strip() for x in os.environ.get("SWARM_DRYRUN_FAIL", "").split(",") if x.strip()}
+def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
+    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+    cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
+    try:
+        # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                cwd=cwd, env=env, start_new_session=True)
+    except OSError as e:
+        raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
+    with _SESSIONS_LOCK:
+        _SESSIONS.add(proc.pid)
+        stopping = _STOPPING.is_set()
+    if stopping:  # spawned after kill_sessions took its snapshot (WR-09)
+        kill_group(proc.pid, signal.SIGKILL)
+    try:
+        try:
+            out, err = proc.communicate(prompt, timeout=args.task_timeout)
+        except subprocess.TimeoutExpired:
+            text, meta = session_output(runtime, *reap_group(proc), proc.returncode)
+            raise AgentTimeout(cmd, args.task_timeout, text, {**meta, "timed_out": True}) from None
+    finally:
+        with _SESSIONS_LOCK:
+            _SESSIONS.discard(proc.pid)
+    return session_output(runtime, out, err, proc.returncode)
+
+
+def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) -> dict:
+    """--dry-run: print the exact session invocation (key-var unsets, env deltas, argv, stdin file) to stderr as a
+    replayable `env -u … K=V … argv < file` line; spawn nothing."""
+    runtime = resolve_runtime(getattr(args, "runtime", "auto"))
+    cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
+    # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06)
+    unset = " ".join(f"-u {k}" for k in AGENT_SESSION_STRIPPED)
+    deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in CHILD_ENV_KEYS)
+    stdin = sdir / "assignments" / f"{task['task_id']}.a{task['attempt']}.md"
+    print(f"dry-run {task['task_id']} [{agent['id']}]: env {unset} {deltas} {shlex.join(cmd)} < {shlex.quote(str(stdin))}",
+          file=sys.stderr, flush=True)
+    return {"dry_run": True, "runtime": runtime, "argv": cmd}
 
 
 def canned_result(task: dict, agent: dict) -> str:
     notes = task["notes_json"]
     if notes.get("gate"):
-        fails = _simulated_failures()
+        fails = simulated_failures()
         verdicts = {}
         for t in notes["gate_for"]:
             if f"{t}:{notes['gate']}" in fails:
@@ -175,96 +405,99 @@ def canned_result(task: dict, agent: dict) -> str:
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
 
 
-def parse_result(text: str) -> dict | None:
-    blocks = JSON_BLOCK.findall(text or "")
-    for raw in reversed(blocks):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-    return None
+def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, timeout=300) -> None:
+    """Run the gate task's real gate script on its own id with the runner's keys (D-12/D-13): with --dry-run in a
+    runner dry-run, otherwise after the agent session while the gate task is still leased. The script derives and
+    records the verdict; per_target_findings adds the agent's findings as gate input."""
+    gate = task["notes_json"]["gate"]
+    script = ROOT / "scripts" / f"{GATE_SCRIPTS[gate]}.py"
+    cmd = [sys.executable, str(script), *(["--dry-run"] if dry_run else []), "--task-id", task["task_id"],
+           "--correlation-id", task["correlation_id"], "--root", str(repo), "--json"]
+    if per_target_findings is not None:
+        cmd += ["--per-target-findings", str(per_target_findings)]
+    # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record
+    env = {k: v for k, v in os.environ.items() if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD")}
+    env["SWARM_DIR"] = str(Path(sdir).resolve())
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    if proc.returncode == 2:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed: {(proc.stdout or proc.stderr)[-400:]}",
+                         task_id=task["task_id"])
 
 
-def apply_result(store: TaskStore, task: dict, agent: dict, result: dict | None, meta: dict, ctx) -> str:
-    tid = task["task_id"]
-    ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta, "parsed": bool(result)})
+FINDINGS_GATES = ("review", "quality", "security")
+
+
+def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
+    """Review, quality and security gates: write {target: [findings]} — what the agent reported under verdicts{}
+    for each gate_for target — to results/<tid>.a<N>.findings.json for the gate script's --per-target-findings, so
+    an agent-reported failure reaches the recorded verdict and fails only its own target (WR-14). Normalization fails closed and reports every change (WR-16/WR-17):
+    - an entry fails its target unless its verdict is in results.PASS_VERDICTS (pass, A09's legacy approve;
+      case-insensitive — request_changes, block, waive, unknown and missing verdicts fail); a failing entry
+      without a finding of major or worse gets one synthesized major finding (results.agent_findings, IN-15),
+      reported in gate.findings.synthesized;
+    - a severity outside SEVERITIES (case-insensitive) or a non-object finding counts as major;
+    - a missing severity counts as major under a failing entry, else minor;
+    - findings under a key that is not a gate_for id cannot be attributed, so they apply to every target.
+    Changes emit one gate.findings.coerced event; unattributed keys emit gate.findings.unattributed.
+    None for the release gate or when the session left no parseable result. The agent's verdicts never count:
+    the gate script still derives each verdict."""
+    notes = task["notes_json"]
+    if notes.get("gate") not in FINDINGS_GATES:
+        return None
+    result = parse_result(text or "")
     if result is None:
-        store.transition(tid, S.FAILED, reason="no JSON result block from agent")
-        return "FAILED"
-    store.set_notes(tid, result=result, meta=meta)
-    state = str(result.get("state", "IN_REVIEW")).upper()
-    for o in result.get("outputs", []) or []:
-        store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""), version=str(o.get("version", "1")),
-                           digest=o.get("digest", ""), producer=agent["id"])
-    if state == "BLOCKED":
-        store.transition(tid, S.BLOCKED, reason=str(result.get("needs", "blocked"))[:500])
-        return "BLOCKED"
-    if state == "FAILED":
-        store.transition(tid, S.FAILED, reason=json.dumps(result.get("error", {}))[:500])
-        return "FAILED"
-    # gate task: record verdicts on targets
-    gate = task["notes_json"].get("gate")
-    if gate:
-        verdicts = result.get("verdicts") or {}
-        if not verdicts and result.get("verdict"):
-            verdicts = {t: {"verdict": result["verdict"], "findings": result.get("findings", [])} for t in task["notes_json"]["gate_for"]}
-        for target, v in verdicts.items():
-            verdict = v.get("verdict", "fail")
-            if verdict == "waive" and not v.get("waived_by"):
-                verdict = "fail"  # self-waive is E-POLICY
-            store.record_verdict(target, gate, verdict, agent["id"], v.get("findings", []))
-            if verdict == "fail":
-                fb = store.get(target)["notes_json"].get("feedback", [])
-                fb.append({"gate": gate, "findings": v.get("findings", [])})
-                store.set_notes(target, feedback=fb)
-    store.transition(tid, S.IN_REVIEW, reason="agent reported IN_REVIEW")
-    return "IN_REVIEW"
+        return None
+    verdicts = result.get("verdicts")
+    verdicts = verdicts if isinstance(verdicts, dict) else {}
+    gate_for = list(notes.get("gate_for", []))
+    coerced: list[dict] = []
+    synthesized: list[dict] = []
+
+    def entries(key: str, applied_to: list[str]) -> list[tuple[object, bool]]:
+        if key not in verdicts:
+            return []
+        v = verdicts[key]
+        items, synth = agent_findings(v)
+        if synth:
+            synthesized.append({"key": key, "verdict": agent_verdict(v), "applied_to": applied_to})
+        failed = agent_failed(v)
+        return [(f, failed) for f in items]
+
+    def normalize(f, failed: bool) -> dict:
+        if not isinstance(f, dict):
+            coerced.append({"from": "non-object", "to": "major"})
+            return {"severity": "major", "kind": "semantic", "summary": str(f)[:300]}
+        sev = f.get("severity")
+        if isinstance(sev, str) and sev.lower() in SEVERITIES:
+            return {**f, "severity": sev.lower()}
+        to = "major" if sev is not None or failed else "minor"
+        coerced.append({"from": "missing" if sev is None else str(sev), "to": to})
+        return {**f, "severity": to, "evidence": f"{f.get('evidence') or ''} [agent severity {sev!r}]".strip()}
+
+    stray = sorted(k for k in verdicts if k not in gate_for)
+    unattributed = [normalize(f, failed) for k in stray for f, failed in entries(k, gate_for)]
+    per_target = {}
+    for target in gate_for:
+        findings, seen = [], set()
+        for f in [normalize(f, failed) for f, failed in entries(target, [target])] + unattributed:
+            key = json.dumps(f, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                findings.append(f)
+        per_target[target] = findings
+    if coerced:
+        emit("gate.findings.coerced", {"task_id": task["task_id"], "coerced": coerced})
+    if synthesized:
+        emit("gate.findings.synthesized", {"task_id": task["task_id"], "synthesized": synthesized})
+    if stray:
+        emit("gate.findings.unattributed", {"task_id": task["task_id"], "keys": stray, "applied_to": gate_for,
+                                            "findings": len(unattributed)})
+    path = Path(sdir) / "results" / f"{task['task_id']}.a{task['attempt']}.findings.json"
+    path.write_text(json.dumps(per_target, indent=2))
+    return path
 
 
-def reconcile(store: TaskStore, corr: str, ctx) -> list[str]:
-    """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework."""
-    notes_log = []
-    for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
-        tid = t["task_id"]
-        latest = store.latest_verdicts(tid)
-        failing = [g for g in store.required_gates(tid) if latest.get(g, {}).get("verdict") == "fail"]
-        if failing:
-            before = t["rework_loops"]
-            nt = store.transition(tid, S.CHANGES_REQUESTED, reason=f"gates failed: {failing}")
-            if nt["state"] == S.ESCALATED.value:
-                ctx.emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": failing,
-                                                "options": ["human review", "cancel", "waive gate (L3)"]})
-                notes_log.append(f"{tid}: ESCALATED after {before} rework loops")
-            else:
-                store.transition(tid, S.IN_PROGRESS, reason="rework loop")
-                notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
-                # reopen gate tasks that target this task so they re-run after rework
-                for g in store.list(correlation_id=corr):
-                    if tid in g["notes_json"].get("gate_for", []) and g["state"] in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value):
-                        new_id = f"{g['task_id']}.r{nt['rework_loops']}"
-                        try:
-                            store.get(new_id)
-                        except SwarmError:
-                            store.create(task_id=new_id, correlation_id=corr, capability=g["capability"], title=g["title"] + " (rerun)",
-                                         agent_id=g["agent_id"], dag_depth=g["dag_depth"], depends_on=g["depends_on"],
-                                         acceptance=g["acceptance"], budget=g["budget"], risk_class=g["risk_class"],
-                                         priority=g["priority"], notes={k: v for k, v in g["notes_json"].items() if k not in ("result", "meta")})
-                            store.transition(new_id, S.VALIDATED)
-                            store.transition(new_id, S.PLANNED, reason="gate rerun")
-                            # downstream of the old gate must now wait for the rerun too
-                            for d in store.list(correlation_id=corr):
-                                if g["task_id"] in d["depends_on"] and new_id not in d["depends_on"] and d["state"] not in (S.DONE.value,):
-                                    store.update(d["task_id"], depends_on=d["depends_on"] + [new_id])
-            continue
-        if not store.missing_gates(tid):
-            store.transition(tid, S.APPROVED, reason="all required gates pass")
-            store.transition(tid, S.DONE, reason="approved")
-            notes_log.append(f"{tid}: DONE")
-    # rework: a task in IN_PROGRESS from rework must become ready again — handled by dispatch (state IN_PROGRESS w/ rework)
-    return notes_log
-
-
-def dispatchable(store: TaskStore, corr: str) -> list[dict]:
+def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
     ready = store.ready(corr)
     # rework tasks sit in IN_PROGRESS with no running session; treat them as ready too
     for t in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
@@ -276,28 +509,67 @@ def dispatchable(store: TaskStore, corr: str) -> list[dict]:
             ready.append(store.get(t["task_id"]))
         else:
             store.transition(t["task_id"], S.ESCALATED, reason="max_attempts reached")
+            emit("escalation.request", {"task_id": t["task_id"], "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
+                                        "options": ["human review", "cancel", "re-plan"]})
     return ready
 
 
 def execute_one(store_path, task, agent, args, ctx, repo):
     store = TaskStore(store_path)  # sqlite: one connection per thread
+    sdir = store.path.parent
     tid = task["task_id"]
     if task["state"] != S.IN_PROGRESS.value:
         store.transition(tid, S.CLAIMED, reason=f"awarded to {agent['id']}")
         store.transition(tid, S.IN_PROGRESS, reason="lease started")
-    store.set_notes(tid, running=time.time())
+    # A01 is the only writer of notes.dry_run: dry-run gate rows record and count only on flagged tasks,
+    # and a real dispatch clears a flag left by an earlier dry-run
+    store.set_notes(tid, running=time.time(), dry_run=bool(args.dry_run))
     try:
         task = store.get(tid)
         prompt = assignment_prompt(store, task, agent, repo)
-        (SWARM_DIR / "assignments").mkdir(parents=True, exist_ok=True)
-        (SWARM_DIR / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
+        (sdir / "assignments").mkdir(parents=True, exist_ok=True)
+        (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
-            text, meta = canned_result(task, agent), {"dry_run": True}
+            meta = dry_run_invocation(task, agent, repo, sdir, args)
+            if task["notes_json"].get("gate"):
+                run_gate_script(task, repo, sdir, dry_run=True)
+            text = canned_result(task, agent)
         else:
             text, meta = run_agent_headless(agent, prompt, repo, args)
-        (SWARM_DIR / "results").mkdir(parents=True, exist_ok=True)
-        (SWARM_DIR / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
-        outcome = apply_result(store, task, agent, parse_result(text), meta, ctx)
+        (sdir / "results").mkdir(parents=True, exist_ok=True)
+        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        result, err = None, None
+        try:
+            result = validate_result(parse_result(text), task_id=tid)
+        except SwarmError as e:
+            err = e
+        if meta.get("yield_error"):  # D-02: an error yield is E-CONTRACT, whatever json the text carries (WR-02)
+            result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent yielded an error: {meta['yield_error']}"[:500],
+                                           task_id=tid)
+        if meta.get("extension_error"):  # T-06-06: an unguarded session's result is never applied, nor its gate recorded
+            result, err = None, SwarmError(ErrorCode.E_DEP, "omp ran the session without the swarm guard: "
+                                           f"{meta['extension_error']}"[:500], task_id=tid)
+        # CR-04: record a gate only for a session that completed and asked to finish it — a crashed, errored or
+        # BLOCKED/FAILED gate session gets no script run, so its targets keep the gate absent
+        if (not args.dry_run and task["notes_json"].get("gate") and result is not None
+                and result["state"] == S.IN_REVIEW.value and not meta.get("is_error") and not meta.get("returncode")):
+            # WR-12: the key-holding runner, not the agent, records this gate — once per dispatch, still leased
+            run_gate_script(task, repo, sdir, dry_run=False, timeout=args.task_timeout,
+                            per_target_findings=gate_findings_file(task, text, sdir, ctx.emit))
+        ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
+        store.set_notes(tid, meta=meta)
+        if result is None:
+            outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
+        else:
+            outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit, mode="headless")
+    except AgentTimeout as e:
+        # WR-04: keep what the session wrote before its process group was killed
+        (sdir / "results").mkdir(parents=True, exist_ok=True)
+        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(e.text or "")
+        ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": e.meta})
+        store.set_notes(tid, meta=e.meta)
+        store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
+        outcome = "FAILED"
     except subprocess.TimeoutExpired:
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
         outcome = "FAILED"
@@ -310,44 +582,76 @@ def execute_one(store_path, task, agent, args, ctx, repo):
 
 
 def run(args, ctx) -> dict:
-    corr = ctx.correlation_id or latest_correlation()
+    repo = Path(args.repo).resolve()
+    sdir = swarm_dir(repo, create=True)
+    # one absolute state dir for this process and every child it spawns (D-10)
+    os.environ["SWARM_DIR"] = str(sdir)
+    store_path = sdir / "tasks.db"
+    store = TaskStore(store_path)
+    corr = ctx.correlation_id
+    if corr is None:
+        terminal = {"DONE", "CANCELLED", "ESCALATED"}
+        live = sorted({t["correlation_id"] for t in store.list() if t["state"] not in terminal})
+        if len(live) > 1:
+            raise SwarmError(ErrorCode.E_INPUT, f"{len(live)} non-terminal plans {live}; pass --correlation-id")
+        corr = live[0] if live else latest_correlation(repo)
     if not corr:
         raise SwarmError(ErrorCode.E_INPUT, "no plan found — run scripts/orch_plan.py first")
     ctx.correlation_id = corr
-    if not args.dry_run and not shutil.which(args.claude_bin):
-        raise SwarmError(ErrorCode.E_DEP, f"{args.claude_bin} not on PATH (use --dry-run to simulate)")
+    if not store.list(correlation_id=corr):
+        raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
+                         "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
+    args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
     if not args.dry_run:
-        preflight_auth(args.claude_bin)
-    repo = Path(args.repo).resolve()
-    store = TaskStore()
-    store_path = store.path
+        name = runtime_bin(args.runtime, args)
+        binary = shutil.which(name)
+        if not binary:
+            raise SwarmError(ErrorCode.E_DEP, f"{name} not on PATH (--runtime {args.runtime}; use --dry-run to simulate)")
+        # absolute: sessions spawn with cwd=repo (omp, grok) or ROOT (claude), where a relative path breaks (WR-05)
+        binary = os.path.abspath(binary)
+        setattr(args, f"{args.runtime}_bin", binary)
+        if args.runtime == "claude":
+            preflight_auth(binary)
     log, rounds = [], 0
-    while True:
-        rounds += 1
-        log += reconcile(store, corr, ctx)
-        ready = dispatchable(store, corr)
-        if not ready:
-            remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
-            if remaining:
-                log.append(f"stalled: {[(t['task_id'], t['state']) for t in remaining]}")
-            break
-        batch = []
-        for t in ready[: args.max_parallel]:
-            try:
-                agent = get_agent(t["agent_id"]) if t["agent_id"] else by_capability(t["capability"])[0]
-            except (KeyError, IndexError):
-                store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
-                continue
-            batch.append((t, agent))
-        with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
-            futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo) for t, a in batch]
-            for f in as_completed(futs):
-                tid, aid, outcome = f.result()
-                log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
-                print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
-        if args.once or rounds >= args.max_rounds:
-            break
-    log += reconcile(store, corr, ctx)
+    # T-06-12: a SIGTERM/SIGHUP to the runner's group ends the sessions too, then the previous handlers come back.
+    # WR-10: a signal inherited as ignored (nohup, a parent's SIG_IGN) stays ignored.
+    _STOPPING.clear()
+    previous = ({s: signal.signal(s, _terminate) for s in _FORWARDED if signal.getsignal(s) is not signal.SIG_IGN}
+                if threading.current_thread() is threading.main_thread() else {})
+    try:
+        while True:
+            rounds += 1
+            log += reconcile(store, corr, ctx.emit)
+            ready = dispatchable(store, corr, ctx.emit)
+            if not ready:
+                remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
+                if remaining:
+                    log.append(f"stalled: {[(t['task_id'], t['state']) for t in remaining]}")
+                break
+            batch = []
+            for t in ready[: args.max_parallel]:
+                try:
+                    agent = get_agent(t["agent_id"]) if t["agent_id"] else by_capability(t["capability"])[0]
+                except (KeyError, IndexError):
+                    store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
+                    continue
+                batch.append((t, agent))
+            with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
+                try:
+                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo) for t, a in batch]
+                    for f in as_completed(futs):
+                        tid, aid, outcome = f.result()
+                        log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
+                        print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
+                except BaseException:  # Ctrl-C, SIGTERM, SIGHUP: sessions run in their own session, so it missed them
+                    kill_sessions()
+                    raise
+            if args.once or rounds >= args.max_rounds:
+                break
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
+    log += reconcile(store, corr, ctx.emit)
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}
     for t in tasks:
@@ -370,8 +674,10 @@ def add_args(p):
     p.add_argument("--model", help="override model for all agents")
     p.add_argument("--claude-bin", default="claude")
     p.add_argument("--grok-bin", default="grok")
-    p.add_argument("--runtime", choices=["auto", "claude", "grok"], default="auto",
-                   help="headless runner: claude -p --agent, grok -p --agent --yolo, or auto")
+    p.add_argument("--omp-bin", default="omp")
+    p.add_argument("--runtime", choices=["auto", *RUNTIMES], default="auto",
+                   help="headless runner: claude -p --agent, grok -p --agent --yolo, omp -p --mode json, or auto "
+                        "(claude/grok; omp only when explicit or SWARM_RUNTIME=omp)")
     p.add_argument("--allowed-tools", default="Bash(python3:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Read,Grep,Glob",
                    help="comma list passed to claude --allowedTools so headless agents can run their scripts unattended")
 

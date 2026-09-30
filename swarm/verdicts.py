@@ -1,0 +1,221 @@
+"""Gate-verdict recording (D-12/D-13): gate scripts are the only writers of verdict rows.
+
+A gate script invoked with a leased (IN_PROGRESS) gate task's id (notes.gate) records one signed verdict per
+target in that task's Task Store notes.gate_for, signed with the target's correlation — agents cannot choose
+or spoof targets. Any other --task-id writes only the envelope file and emits gate.verdict.unrecorded.
+--dry-run verdicts are signed dry_run: true and recorded only for gate tasks A01 flagged as a runner dry-run.
+Inside a headless agent session (SWARM_AGENT_SESSION=1, no signing keys) nothing is recorded: the runner re-runs
+the gate script with its keys after the session (WR-12).
+"""
+from __future__ import annotations
+import os
+from typing import Callable
+
+from .errors import SwarmError, ErrorCode
+from .gates import SEVERITIES, make_finding, make_verdict
+
+GATE_SCRIPTS = {"quality": "qa_gate", "review": "rev_gate", "security": "sec_gate", "release": "rel_plan"}
+SIM_FINDING = {"id": "SIM-1", "severity": "major", "kind": "functional", "summary": "simulated gate failure",
+               "evidence": "", "ac_ref": None, "owner_suggestion": None, "location": None}
+
+
+def agent_finding(f, i: int, path: str, *, prefix: str = "RF", owner: str = "A05") -> dict:
+    """One agent-reported finding from a findings file, validated: an object with a severity in SEVERITIES
+    (default minor); a missing id becomes <prefix>-<i>."""
+    if not isinstance(f, dict):
+        raise SwarmError(ErrorCode.E_INPUT, f"finding {i} in {path} is not an object")
+    sev = f.get("severity", "minor")
+    if sev not in SEVERITIES:
+        raise SwarmError(ErrorCode.E_INPUT, f"bad severity {sev!r} in {path}")
+    return make_finding(f.get("id") or f"{prefix}-{i:03d}", sev, f.get("kind", "semantic"), f.get("summary", ""),
+                        evidence=f.get("evidence", ""), ac_ref=f.get("ac_ref"),
+                        owner_suggestion=f.get("owner_suggestion", owner), location=f.get("location"))
+
+
+def load_per_target(path: str | None, offset: int, *, prefix: str = "RF", owner: str = "A05") -> dict[str, list[dict]]:
+    """--per-target-findings {target task id: [findings]} (D-13): the agent's findings for each gate target; a gate
+    gives each listed target a verdict derived from the script's own findings plus only that target's list."""
+    import json
+    from pathlib import Path
+    if not path:
+        return {}
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict) or not all(isinstance(v, list) for v in raw.values()):
+        raise SwarmError(ErrorCode.E_INPUT, f"{path}: expected an object {{target task id: [findings]}}")
+    out: dict[str, list[dict]] = {}
+    for target, items in raw.items():
+        out[target] = [agent_finding(f, i, path, prefix=prefix, owner=owner) for i, f in enumerate(items, offset + 1)]
+        offset += len(items)
+    return out
+
+
+def check_per_target_keys(own: dict[str, list[dict]], task_id: str | None, root=None) -> None:
+    """E-INPUT when --per-target-findings names a target that is not in the gate task's gate_for: a finding under a
+    mistyped or stale id could otherwise never reach a verdict. Nothing to check without a gate task."""
+    from .taskstore import TaskStore
+    if not own or not task_id:
+        return
+    try:
+        task = TaskStore(root=root).get(task_id)
+    except SwarmError:
+        return
+    gate_for = (task.get("notes_json") or {}).get("gate_for")
+    if not gate_for:
+        return
+    unknown = sorted(set(own) - set(gate_for))
+    if unknown:
+        raise SwarmError(ErrorCode.E_INPUT, f"per-target findings name ids that are not targets of {task_id}: "
+                         f"{', '.join(unknown)} (targets: {', '.join(gate_for)})", task_id=task_id)
+
+
+RISK_ORDER = ("low", "medium", "high")
+
+
+def gate_risk_class(task_id: str | None, root=None) -> str | None:
+    """The highest risk class of a gate task and its gate_for targets (the quality gate's tier selection);
+    None when task_id is not a known gate task. A target missing from the Task Store is skipped."""
+    from .taskstore import TaskStore
+    if not task_id:
+        return None
+    store = TaskStore(root=root)
+    try:
+        task = store.get(task_id)
+    except SwarmError:
+        return None
+    notes = task.get("notes_json") or {}
+    if not notes.get("gate"):
+        return None
+    risks = [task.get("risk_class")]
+    for target in notes.get("gate_for") or []:
+        try:
+            risks.append(store.get(target).get("risk_class"))
+        except SwarmError:
+            continue
+    known = [r for r in risks if r in RISK_ORDER]
+    return max(known, key=RISK_ORDER.index) if known else None
+
+
+def gate_verdict(env: dict, recorded: dict[str, dict]) -> str:
+    """A gate script's overall verdict: fail when its envelope or any recorded per-target verdict fails."""
+    verdicts = [env["payload"]["verdict"], *(e["payload"]["verdict"] for e in recorded.values())]
+    return "fail" if "fail" in verdicts else "pass"
+
+
+def simulated_failures() -> set[str]:
+    """SWARM_DRYRUN_FAIL='T7f3a-be:quality,T7f3a-fe:review' makes those dry-run gate verdicts fail every time."""
+    return {x.strip() for x in os.environ.get("SWARM_DRYRUN_FAIL", "").split(",") if x.strip()}
+
+
+def simulated_per_target(targets: list[str] | None, gate: str) -> dict[str, list[dict]]:
+    """Dry-run findings per target: SIM-1 (major) for targets named in SWARM_DRYRUN_FAIL, else none."""
+    fails = simulated_failures()
+    return {t: ([dict(SIM_FINDING)] if f"{t}:{gate}" in fails else []) for t in targets or []}
+
+
+def resolve_targets(store, task_id: str | None, *, gate: str, correlation_id: str | None = None) -> list[str] | None:
+    """gate_for of a gate task; None when task_id is not a gate task. E-POLICY when its gate differs, when
+    correlation_id is given and is not the gate task's own correlation, or when a gate task with targets is
+    not leased (IN_PROGRESS) — only a running gate task records verdicts."""
+    if not task_id:
+        return None
+    try:
+        task = store.get(task_id)
+    except SwarmError as e:
+        if e.code is not ErrorCode.E_INPUT:
+            raise
+        return None
+    notes = task.get("notes_json") or {}
+    if not notes.get("gate"):
+        return None
+    if notes["gate"] != gate:
+        raise SwarmError(ErrorCode.E_POLICY, f"{task_id} is a {notes['gate']} gate task; this script issues {gate}",
+                         task_id=task_id)
+    own = task["correlation_id"]
+    if correlation_id and correlation_id != own:
+        raise SwarmError(ErrorCode.E_POLICY,
+                         f"gate task {task_id} belongs to correlation {own!r}, not {correlation_id!r}; --correlation-id "
+                         "defaults to the SWARM_CORRELATION_ID env var: unset a stale SWARM_CORRELATION_ID export or "
+                         f"pass --correlation-id {own}", task_id=task_id)
+    targets = list(notes.get("gate_for") or [])
+    if targets and task["state"] != "IN_PROGRESS":
+        raise SwarmError(ErrorCode.E_POLICY, f"{task_id} is not a running gate task (state {task['state']}); "
+                         "lease it first", task_id=task_id)
+    return targets
+
+
+def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id: str, findings: list[dict],
+                         runs: dict, correlation_id: str | None, expires_s: int, extra: dict | None = None,
+                         verdict: str | None = None, per_target: dict[str, list[dict]] | None = None,
+                         emit: Callable[..., object], root=None) -> dict[str, dict]:
+    """Record one signed verdict row per gate_for target of `gate_task_id`; return {target: envelope}.
+    Each target verdict is signed with the target's own correlation; a given `correlation_id` must be the
+    gate task's (E-POLICY otherwise). All rows (and fail feedback) of one run commit together or not at all (D-13).
+    `root` is the caller's --root, so dev-key signing events land in the same state dir."""
+    targets = resolve_targets(store, gate_task_id, gate=gate, correlation_id=correlation_id)
+    if not targets:
+        emit("gate.verdict.unrecorded", {"task_id": gate_task_id, "gate": gate,
+                                         "reason": "not a gate task" if targets is None else "empty gate_for"})
+        return {}
+    out = {}
+    with store.transaction():
+        for target in targets:
+            tf = (per_target or {}).get(target, findings)
+            env = make_verdict(gate=gate, task_id=target, agent_id=agent_id, findings=tf, runs=runs,
+                               verdict=None if per_target and target in per_target else verdict,
+                               expires_s=expires_s, correlation_id=store.get(target)["correlation_id"],
+                               extra={**(extra or {}), "gate_task": gate_task_id}, root=root)
+            store.record_verdict(target, env)
+            if env["payload"]["verdict"] == "fail":
+                store.append_feedback(target, {"gate": gate, "source": "script", "findings": tf})
+            out[target] = env
+    return out
+
+
+
+def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dict, expires_s: int = 86400,
+               extra: dict | None = None, simulate: bool = False,
+               per_target: dict[str, list[dict]] | None = None) -> tuple[dict, dict[str, dict]]:
+    """Gate-script tail: sign the verdict for ctx.task_id, write verdicts/<id>.<gate>.json, and record rows on
+    the gate task's targets. per_target ({target: findings}) gives each target a verdict derived from its own
+    findings (D-13); targets it omits get `findings`. The file envelope always carries `findings`.
+    simulate (--dry-run): canned pass, SIM-1 fail for SWARM_DRYRUN_FAIL targets, plus
+    the caller's findings; every envelope carries a signed dry_run: true, and rows are recorded only when A01
+    flagged the gate task as a runner dry-run (notes.dry_run), where they also count only on flagged targets."""
+    import json
+    from .paths import swarm_dir
+    from .taskstore import TaskStore
+    store = TaskStore(root=ctx.root) if ctx.task_id else None
+    targets = (resolve_targets(store, ctx.task_id, gate=gate, correlation_id=ctx.correlation_id)
+               if store else None)  # E-POLICY before any write
+    gate_task = store.get(ctx.task_id) if store and targets is not None else None
+    # file envelope: the caller's correlation, else the gate task's; a non-gate/unknown id keeps a minted one
+    corr = ctx.correlation_id or (gate_task["correlation_id"] if gate_task else None)
+    if simulate:
+        extra = {**(extra or {}), "dry_run": True}
+    from .script_base import check_task_id
+    task = check_task_id(ctx.task_id or ("T-dry" if simulate else "T-unassigned"))
+    session = os.environ.get("SWARM_AGENT_SESSION") == "1"
+    # WR-15: a key-less agent-session preview never records, so it must not raise the security.dev_key
+    # misconfiguration signal; gate.verdict.unrecorded below marks it instead
+    env = make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
+                       correlation_id=corr, extra=extra, root=ctx.root, audit=not session)
+    out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
+    if session:
+        ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,
+                                             "reason": "agent session: the runner records this gate after the session"})
+        return env, {}
+    if store is None:
+        ctx.emit("gate.verdict.unrecorded", {"task_id": None, "gate": gate, "reason": "no --task-id"})
+        return env, {}
+    if simulate:
+        if targets and not (gate_task and gate_task["notes_json"].get("dry_run")):
+            ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,
+                                                 "reason": "dry-run outside a runner dry-run"})
+            return env, {}
+        per_target = {t: sim + list(findings) for t, sim in simulated_per_target(targets, gate).items()}
+    recorded = record_gate_verdicts(store, gate_task_id=ctx.task_id, gate=gate, agent_id=agent_id, findings=findings,
+                                    runs=runs, correlation_id=ctx.correlation_id, expires_s=expires_s, extra=extra,
+                                    per_target=per_target, emit=ctx.emit, root=ctx.root)
+    return env, recorded

@@ -3,8 +3,8 @@
 
 Detects pytest / npm test / go test / cargo test, runs the tiers required by the
 risk class, parses pass/fail, and writes a signed `gate.verdict` envelope to
-.swarm/verdicts/<task_id>.quality.json (also recorded in the Task Store when the
-task exists there).
+.swarm/verdicts/<task_id>.quality.json. When --task-id is a quality gate task, one verdict
+row is recorded on each target in its Task Store notes.gate_for (swarm.verdicts).
 """
 from __future__ import annotations
 import json
@@ -14,10 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which  # noqa: E402
-from swarm.gates import make_verdict, make_finding  # noqa: E402
-from swarm.taskstore import TaskStore  # noqa: E402
-from swarm.runlog import SWARM_DIR  # noqa: E402
-from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.gates import make_finding  # noqa: E402
+from swarm.verdicts import check_per_target_keys, gate_risk_class, gate_verdict, issue_gate, load_per_target  # noqa: E402
 
 TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
                  "high": ["unit", "integration", "e2e", "perf"]}
@@ -54,16 +52,16 @@ def _count(pattern: str, text: str) -> int:
 
 
 def run(args, ctx) -> dict:
-    risk = args.risk_class
+    # D-13: a gate task runs at the highest risk class of itself and its targets unless --risk-class overrides it
+    risk = args.risk_class or gate_risk_class(ctx.task_id, ctx.root) or "medium"
     tiers = args.tier.split(",") if args.tier else TIERS_BY_RISK[risk]
     findings, runs, executed = [], {t: "skipped:not-selected" for t in ("unit", "integration", "e2e", "perf")}, []
 
     if ctx.dry_run:
         runs.update({t: "pass" for t in tiers})
-        verdict_env = make_verdict(gate="quality", task_id=args.task_id or "T-dry", agent_id="A08@dry",
-                                   findings=[], runs=runs, correlation_id=ctx.correlation_id)
+        verdict_env, recorded = issue_gate(ctx, gate="quality", agent_id="A08@dry", findings=[], runs=runs, simulate=True)
         return {"status": "ok", "verdict": "pass", "runs": runs, "findings": [], "dry_run": True,
-                "envelope": verdict_env, "summary": "dry-run: canned pass verdict"}
+                "envelope": verdict_env, "recorded": sorted(recorded), "summary": "dry-run: canned pass verdict"}
 
     runners = detect_runners(ctx.root)
     if not runners:
@@ -104,28 +102,29 @@ def run(args, ctx) -> dict:
             findings.append(make_finding(f"QF-{len(findings)+1:03d}", "major", "coverage",
                                          f"coverage {m.group(1)}% < {args.min_coverage}%", owner_suggestion="A05"))
 
-    env = make_verdict(gate="quality", task_id=args.task_id or "T-unassigned", agent_id="A08@local",
-                       findings=findings, runs=runs, correlation_id=ctx.correlation_id)
-    verdict = env["payload"]["verdict"]
-    out_dir = SWARM_DIR / "verdicts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{args.task_id or 'T-unassigned'}.quality.json").write_text(json.dumps(env, indent=2))
-    if args.task_id:
-        try:
-            TaskStore().record_verdict(args.task_id, "quality", verdict, "A08", findings)
-        except SwarmError as e:
-            if e.code is not ErrorCode.E_INPUT:
-                raise
-    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "runs": runs,
-            "findings": findings, "executed": executed, "envelope": env,
+    # D-13: the agent's per-target findings join the script's own findings on their target only; a target the
+    # agent omits gets the script's findings alone
+    own = load_per_target(args.per_target_findings, len(findings), prefix="QF", owner="A05")
+    check_per_target_keys(own, ctx.task_id, ctx.root)
+    per_target = {t: findings + items for t, items in own.items()} if own else None
+    env, recorded = issue_gate(ctx, gate="quality", agent_id="A08@local", findings=findings, runs=runs,
+                               per_target=per_target)
+    findings = findings + [f for items in own.values() for f in items]
+    verdict = gate_verdict(env, recorded)
+    return {"status": "ok" if verdict == "pass" else "fail", "verdict": verdict, "risk_class": risk, "runs": runs,
+            "findings": findings, "executed": executed, "envelope": env, "recorded": sorted(recorded),
             "summary": f"quality gate {verdict.upper()} — runners: {[e['runner'] for e in executed] or 'none'}"}
 
 
 def add_args(p):
-    p.add_argument("--risk-class", choices=["low", "medium", "high"], default="medium")
+    p.add_argument("--risk-class", choices=["low", "medium", "high"],
+                   help="tier selection; default: the highest risk class of the gate task and its targets, else medium")
     p.add_argument("--tier", help="comma list overriding risk-based tier selection (unit,integration,e2e,perf)")
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--min-coverage", type=int, default=0, help="fail if pytest-cov TOTAL below this percent")
+    p.add_argument("--per-target-findings",
+                   help="JSON object {target task id: [findings]}: the agent's findings; each gate target's verdict "
+                        "gets the script's findings plus only its own (targets it omits get the script's findings only)")
 
 
 if __name__ == "__main__":
