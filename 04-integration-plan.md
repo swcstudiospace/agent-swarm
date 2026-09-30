@@ -40,6 +40,10 @@ This plan defines how the 15 agents interact, share data, and resolve conflicts 
 
 **Correlation invariant:** one business request = one `correlation_id`; every artifact, message, PR, run, and release carries it. This is what makes the whole system auditable end-to-end.
 
+### 2.1 Platform substrate
+
+**[Agent Substrate](https://github.com/swcstudiospace/agent-substrate)** is the shared platform AgentSwarm runs on. It provides four of the substrates above: events over substrate-mcp (message bus), governed memory (the memory plane), leases and handoffs (offer/claim and single-writer ownership), and the Graph ID that a `correlation_id` maps onto. The artifact registry and secrets stay externally provisioned, and the telemetry plane stays OTel. The table above stays authoritative for what flows where; the integration decision itself — including the id mapping and cross-platform trace correlation — is an ADR in that repo (`docs/adr/*-swarm-substrate-integration.md`), tracked as Linear [SPE-5050](https://linear.app/swcstudio/issue/SPE-5050) / [SPE-5051](https://linear.app/swcstudio/issue/SPE-5051). See [docs/substrate-integration.md](docs/substrate-integration.md) for the vocabulary map. No swarm runtime behaviour depends on it today.
+
 ## 3. Reference event flows
 
 ### 3.1 Greenfield feature (happy path)

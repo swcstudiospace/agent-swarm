@@ -14,6 +14,20 @@ A complete design specification for a distributed swarm of 15 specialized AI age
 | 6 | [06-testing-protocols.md](06-testing-protocols.md) | 7-level validation: golden tasks → contracts → integration flows → chaos → E2E benchmark → security red-team → prod invariants |
 | 7 | [07-scalability.md](07-scalability.md) | Manifest schema, new-agent onboarding (shadow→probation→full), traffic shaping, contract evolution, multi-swarm |
 | 8 | [CLAUDE.md](CLAUDE.md) · [prompts/](prompts/) · [scripts/](scripts/) · [swarm/](swarm/) | Runnable implementation: subagent prompts, per-agent Python tools, orchestration runtime |
+| 9 | [docs/substrate-integration.md](docs/substrate-integration.md) | Platform pointer: how the spec's substrates map onto [Agent Substrate](https://github.com/swcstudiospace/agent-substrate) |
+
+## Platform
+
+AgentSwarm runs on **[Agent Substrate](https://github.com/swcstudiospace/agent-substrate)**, the shared
+platform providing four of the infrastructure substrates this spec assumes ([01 §2.2](01-architecture.md),
+[04 §2](04-integration-plan.md)): events over substrate-mcp, governed memory, leases and handoffs, and the
+Graph ID a `correlation_id` maps onto. The artifact registry, secrets and the OTel telemetry plane are not
+in that set. The integration ADR lives in that repo
+(`docs/adr/*-swarm-substrate-integration.md`), tracked as Linear
+[SPE-5050](https://linear.app/swcstudio/issue/SPE-5050) /
+[SPE-5051](https://linear.app/swcstudio/issue/SPE-5051);
+[docs/substrate-integration.md](docs/substrate-integration.md) is the mirror pointer here. No swarm
+runtime behaviour depends on it today.
 
 ## The 15 agents
 
