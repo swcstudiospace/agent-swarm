@@ -251,15 +251,26 @@ def merge_claude_settings(settings_path: Path, hook_cmd: str) -> None:
     hooks["UserPromptSubmit"] = [
         {"hooks": [{"type": "command", "command": hook_cmd}]}
     ]
+    # n3/n8: register Stop for a01-orchestrator completion / ultrathink end (on_a01_complete.py)
+    # This makes the opt-in AIO_SWARM_AFTER_ORCH trigger reachable for gsd-autonomous parallel.
+    complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
+    hooks["Stop"] = [
+        {"hooks": [{"type": "command", "command": complete_cmd}]}
+    ]
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def write_grok_hooks(path: Path, hook_cmd: str) -> None:
-    payload = {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": hook_cmd}]}]}}
+    complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
+    payload = {
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": hook_cmd}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": complete_cmd}]}]
+        }
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n")
-
 
 def _workspace_hooks(workspace: Path) -> tuple[Path, Path]:
     """(Claude settings, Grok hook file) the workspace install writes."""
@@ -289,13 +300,15 @@ def install_workspace(workspace: Path, dry_run: bool = False) -> None:
     the hook script by absolute path; the tracked repo files stay path-free (OPEN-4)."""
     root = ROOT.resolve()
     hook_cmd = f"python3 {root / 'hooks' / 'user_prompt_submit.py'}"
+    complete_cmd = f"python3 {root / 'hooks' / 'on_a01_complete.py'}"
     settings, grok_hook = _workspace_hooks(workspace)
     pairs = _workspace_copies(workspace)
     if dry_run:
         for src, dest in pairs:
             print(f"dry-run: would copy {src.relative_to(ROOT)} -> {dest}")
         print(f"dry-run: would set the UserPromptSubmit hook in {settings} (replacing existing ones): {hook_cmd}")
-        print(f"dry-run: would write {grok_hook}: {hook_cmd}")
+        print(f"dry-run: would set the Stop (a01-complete) hook in {settings}: {complete_cmd}")
+        print(f"dry-run: would write {grok_hook}: {hook_cmd} + Stop for on_a01_complete")
         return
     skills_src = ROOT / "skills"
     for src, dest in pairs:
@@ -306,7 +319,6 @@ def install_workspace(workspace: Path, dry_run: bool = False) -> None:
             _copy_file(src, dest)
     merge_claude_settings(settings, hook_cmd)
     write_grok_hooks(grok_hook, hook_cmd)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
