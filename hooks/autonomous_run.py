@@ -21,15 +21,21 @@ NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 
 
 def classify(prompt: str) -> bool:
-    low = prompt.lower()
-    if any(n in low for n in NEGATIVE):
-        return False
-    trimmed = prompt.strip()
-    if not trimmed:
-        return False
-    if trimmed.startswith("/"):
-        return False
-    return True
+    """Thin delegate to swarm.signal_detector for parity (n8 plan). Fail-open."""
+    try:
+        from swarm.signal_detector import classify as _sd_classify
+        return _sd_classify(prompt) == "sdlc"
+    except Exception:
+        # original fallback
+        low = prompt.lower()
+        if any(n in low for n in NEGATIVE):
+            return False
+        trimmed = prompt.strip()
+        if not trimmed:
+            return False
+        if trimmed.startswith("/"):
+            return False
+        return True
 
 
 def pattern_for(brief: str) -> str:

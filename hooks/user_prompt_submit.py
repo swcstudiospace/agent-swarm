@@ -47,17 +47,24 @@ def extract_prompt(payload: object) -> str:
 
 def classify(prompt: str) -> bool:
     """True only for SDLC-shaped prompts (D-09): silent on empty, slash, system-reminder, opt-out tokens,
-    the dispatch marker, questions/explanations and trivial edits."""
-    trimmed = prompt.strip()
-    if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
-        return False
-    low = trimmed.lower()
-    if DISPATCH_MARKER in low or any(n in low for n in NEGATIVE):
-        return False
-    if trimmed.endswith("?") or QUESTION.search(trimmed) or TRIVIAL.search(trimmed):
-        return False
-    return SDLC.search(trimmed) is not None
-
+    the dispatch marker, questions/explanations and trivial edits.
+    Thin delegate to swarm.signal_detector for parity (n8 plan).
+    """
+    try:
+        from swarm.signal_detector import classify as _sd_classify
+        res = _sd_classify(prompt)
+        return res == "sdlc"
+    except Exception:
+        # fail-open fallback to original logic
+        trimmed = prompt.strip()
+        if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
+            return False
+        low = trimmed.lower()
+        if DISPATCH_MARKER in low or any(n in low for n in NEGATIVE):
+            return False
+        if trimmed.endswith("?") or QUESTION.search(trimmed) or TRIVIAL.search(trimmed):
+            return False
+        return SDLC.search(trimmed) is not None
 
 def main() -> int:
     try:
