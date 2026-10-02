@@ -1,10 +1,10 @@
 """State/Idempotency Store for hook triggers, swarm run state (PENDING/FIRED etc per n5/n7).
 Boring extraction + extension from taskstore + runlog facts. Single-writer tx, atomic check-set.
-No dead abstraction; thin over sqlite.
 """
 
 from __future__ import annotations
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -69,24 +69,28 @@ class TriggerStore:
             conn.close()
 
     def record(self, trigger_id: str, **kw: Any) -> None:
-        # idempotent record
         self.seen_trigger(trigger_id, **kw)
 
 
 class SwarmStateStore:
-    """Light obs projection store for 6-state (n5) + stale guard (n7). Separate from runtime tasks.db."""
+    """Light obs projection store for 6-state (n5) + stale guard (n7). Primary .claude for advertised, .swarm mirror."""
 
     STATES = ("PENDING", "FIRED", "RUNNING", "PARTIAL_FAILURE", "FAILED", "COMPLETE")
 
     def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
-        self.path = Path(path) if path else swarm_dir(root, create=True) / "swarm-state.json"
-        if not self.path.exists():
-            self._write({"version": "1.0", "swarm_state": "PENDING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
+        self.root = Path(root) if root else Path(".")
+        self.claude_path = self.root / ".claude" / "swarm-state.json"
+        self.swarm_path = (swarm_dir(root, create=True) / "swarm-state.json") if root else (Path(".swarm") / "swarm-state.json")
+        self.claude_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.claude_path.exists():
+            self._write(self.claude_path, {"version": "1.0", "swarm_state": "PENDING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
+        if not self.swarm_path.exists():
+            self._write(self.swarm_path, {"version": "1.0", "swarm_state": "PENDING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
 
-    def _write(self, data: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
+    def _write(self, p: Path, data: dict) -> None:
+        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(data, indent=2) + "\n")
-        tmp.replace(self.path)
+        tmp.replace(p)
 
     def update(self, state: str, *, corr: str | None = None, progress: dict | None = None, extra: dict | None = None) -> dict:
         if state not in self.STATES:
@@ -100,24 +104,34 @@ class SwarmStateStore:
             "progress": progress or {},
             **(extra or {}),
         }
-        self._write(data)
+        self._write(self.claude_path, data)  # advertised
+        self._write(self.swarm_path, data)  # mirror
         return data
 
     def get(self) -> dict:
-        if not self.path.exists():
-            return {}
-        return json.loads(self.path.read_text())
+        if self.claude_path.exists():
+            return json.loads(self.claude_path.read_text())
+        return {}
 
     def append_gsd_line(self, line: str, *, root: str | Path | None = None) -> None:
-        # one-line append to gsd STATE.md if present (n5)
-        from .paths import swarm_dir
-        state_md = Path(swarm_dir(root, create=False) or ".") / ".planning/STATE.md"
+        # fix: use application root, not inside .swarm
+        base = Path(root) if root else self.root
+        state_md = base / ".planning" / "STATE.md"
         if state_md.exists():
             with state_md.open("a") as f:
                 f.write(f"swarm: {line}\n")
 
+    def check_pending_timeout(self, max_age: float = 3600) -> None:
+        data = self.get()
+        if data.get("swarm_state") == "PENDING":
+            ts = data.get("updated_at")
+            if ts:
+                # simple age check; emit stale if old
+                # (stub; real would parse and compare)
+                pass
 
-# compat thin for taskstore consumers (n8 w6 cutover)
+
+# compat thin
 def get_trigger_store(root: str | Path | None = None) -> TriggerStore:
     return TriggerStore(root=root)
 

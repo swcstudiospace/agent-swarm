@@ -5,6 +5,10 @@ Fail-open. Opt-in via AIO_SWARM_AFTER_ORCH. Delegates to swarm.hook_trigger.
 
 import json
 import sys
+from pathlib import Path
+
+# Support absolute-path invocation from workspace installs (greptile fix)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from swarm.hook_trigger import fire_if_ready
 

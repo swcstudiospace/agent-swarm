@@ -10,13 +10,17 @@ from .signal_detector import detect_completion
 from .state_store import get_trigger_store, get_swarm_state_store
 from .observability import emit_hook_fired
 
+
 def is_opt_in() -> bool:
-    return bool(os.environ.get("AIO_SWARM_AFTER_ORCH") or os.environ.get("SWARM_AFTER_ORCH"))
+    v = os.environ.get("AIO_SWARM_AFTER_ORCH") or os.environ.get("SWARM_AFTER_ORCH")
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-def compute_trigger_id(session_id: str, transcript_fp: str, corr: str | None = None) -> str:
-    """n3 ID scheme: sha256(session|fp|corr)[:16]"""
-    key = f"{session_id}|{transcript_fp}|{corr or ''}".encode()
+def compute_trigger_id(session_id: str, corr: str | None, event_type: str) -> str:
+    """Stable ID (greptile: avoid payload jitter)."""
+    key = f"{session_id}|{corr or ''}|{event_type}".encode()
     return hashlib.sha256(key).hexdigest()[:16]
 
 
@@ -27,10 +31,10 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
     event = detect_completion(payload)
     if not event:
         return {"fired": False, "reason": "no-signal"}
-    fp = hashlib.sha256(str(payload)[:2048].encode()).hexdigest()[:8]
-    tid = compute_trigger_id(session_id, fp, corr)
+    event_type = event.get("type", "unknown")
+    tid = compute_trigger_id(session_id, corr, event_type)
     store = get_trigger_store(root=root)
-    if store.seen_trigger(tid, correlation_id=corr, brief_hash=fp):
+    if store.seen_trigger(tid, correlation_id=corr, brief_hash=event_type):
         emit_hook_fired("a01_complete", corr=corr, deduped=True, root=root)
         return {"fired": False, "deduped": True, "id": tid}
     # fire side effect: record + update obs, then invoke existing Swarm entry (autonomous_run) detached for gsd+ultrathink parallel
