@@ -33,9 +33,24 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
     if store.seen_trigger(tid, correlation_id=corr, brief_hash=fp):
         emit_hook_fired("a01_complete", corr=corr, deduped=True, root=root)
         return {"fired": False, "deduped": True, "id": tid}
-    # fire side effect (stub: emit + state update; real: spawn gsd or parallel run)
+    # fire side effect: record + update obs, then invoke existing Swarm entry (autonomous_run) detached for gsd+ultrathink parallel
     emit_hook_fired("a01_complete", corr=corr, deduped=False, root=root, event=event)
     ss = get_swarm_state_store(root=root)
     ss.update("FIRED", corr=corr, extra={"last_trigger": tid})
-    # TODO in later wave: actual detached kick for gsd-autonomous or parallel swarm
+    try:
+        import subprocess
+        hook_path = Path(__file__).resolve().parent.parent / "hooks" / "autonomous_run.py"
+        env = dict(os.environ)
+        env["SWARM_CHILD"] = "0"
+        env["AIO_SWARM_AFTER_ORCH"] = "1"
+        subprocess.Popen(
+            ["python3", str(hook_path), "--brief", f"gsd-autonomous follow-on after a01 {corr or ''}"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass  # fail open
     return {"fired": True, "deduped": False, "id": tid, "event": event}
