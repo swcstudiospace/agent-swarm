@@ -1,0 +1,10 @@
+{
+  "version": "1.0",
+  "correlation_id": "test-corr-2026",
+  "swarm_state": "RUNNING",
+  "updated_at": "2026-10-02T04:54:35Z",
+  "progress": {
+    "done": 0,
+    "total": 1
+  }
+}

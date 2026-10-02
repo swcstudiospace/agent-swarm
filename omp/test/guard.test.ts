@@ -1078,6 +1078,7 @@ describe("HOOK-03 shell twin and D-08", () => {
   const MUTATE = "protected_path: protected-path-mutate";
   const SHELL = "protected_path: protected-path-shell";
   const RM = "destructive: rm-rf-protected";
+  const STDIN = "destructive: shell-stdin";
   /** Lexical spellings bash reads as the plain command: quoting, escapes, ANSI-C `$'…'`, `${IFS}`, brace lists, redirection placement. */
   test.each([
     ["echo x \\> | tee .swarm/tasks.db", SHELL],
@@ -1179,9 +1180,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["alias ls='rm -rf .swarm'", RM],
     ["trap 'touch .swarm/x' EXIT", MUTATE],
     ["bash -o pipefail -c 'touch .swarm/x'", MUTATE],
-    ["bash <<EOF\ntouch .swarm/x\nEOF", MUTATE],
-    ["sh <<< 'touch .swarm/x'", MUTATE],
-    ["echo 'touch .swarm/x' | sh", MUTATE],
+    ["bash <<EOF\ntouch .swarm/x\nEOF", STDIN],
+    ["sh <<< 'touch .swarm/x'", STDIN],
+    ["echo 'touch .swarm/x' | sh", STDIN],
     ["sudo -e .omp/config.yml", MUTATE],
     ["perl -pi -e 's/a/b/' .omp/config.yml", MUTATE],
     ["awk -i inplace '{print}' .omp/config.yml", MUTATE],
@@ -1278,13 +1279,15 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["bash -cl 'git push -f'", FORCE],
     ["sh -c -- 'git push -f'", FORCE],
     ["/bin/zsh -o pipefail -c 'git push -f'", FORCE],
-    // echo/printf by basename, fed to a shell's stdin
-    ["/bin/echo 'touch .swarm/x' | sh", MUTATE],
-    ["/usr/bin/printf '%s\\n' 'git push --force' | bash", FORCE],
-    ["command echo 'git push -f' | sh", FORCE],
-    ["builtin printf 'git push -f\\n' | bash", FORCE],
-    ["echo -e 'touch .swarm/x' | sh", MUTATE],
-    ["cat <<< 'git push -f' | sh", FORCE],
+    // a shell reading its script from stdin is blocked whatever the script: it may be built at run time
+    ["/bin/echo 'touch .swarm/x' | sh", STDIN],
+    ["/usr/bin/printf '%s\\n' 'git push --force' | bash", STDIN],
+    ["command echo 'ls' | sh", STDIN],
+    ["echo -e 'touch .swarm/x' | sh", STDIN],
+    ["cat <<< 'git push -f' | sh", STDIN],
+    ["(echo ls) | { bash; }", STDIN],
+    ["sh -s -- -y", STDIN],
+    ["bash /dev/stdin < s.sh", STDIN],
     // a command that really reassigns HOME makes `~` unknowable
     ["HOME=.swarm; echo x > ~/tasks.db", SHELL],
     ["export HOME=/x; echo > ~/y", SHELL],
@@ -1299,6 +1302,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     "bash -c 'echo ok' 'git push -f'", 'eval "echo ok"', "watch -n 5 ls", "alias ll='ls -la'", "trap 'rm -f /tmp/lock' EXIT",
     "echo HOME > ~/results.txt", "grep HOME .env > /tmp/x", "echo $HOME > ~/y", "bash -lc 'echo ok'", "/bin/echo 'git push -f'",
     "printf 'git push -f\\n' > notes.txt", "echo 'touch .swarm/x' | cat",
+    // a shell with its own script or `-c` line, and non-shells ending in `sh`, may take stdin
+    "bash script.sh < in.txt", "echo x | bash -c 'cat'", "echo x | ssh host cat", "mosh host < /dev/null", "source env.sh",
+    "echo ls | bash -cl 'cat'",
   ])("joined lines: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
