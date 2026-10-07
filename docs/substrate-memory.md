@@ -90,8 +90,8 @@ legitimate.
 
 Under the substrate's default grants a `decision` at `agent:` scope is not granted (only `graph` and `repo`, and `global` as a
 review proposal), so a swarm `decision` written at scope `agent` comes back denied and raises `E-POLICY`; an operator grant in the
-substrate's `SUBSTRATE_MEMORY_GRANTS` can widen that. The client applies no grant policy of its own (it only rejects unknown kinds
-and malformed scopes as `E-INPUT`) and acts on the gate's verdict. Use `graph` or `repo` scope for decisions.
+substrate's `SUBSTRATE_MEMORY_GRANTS` can widen that. The client applies no grant policy of its own (it only rejects malformed
+input, such as an unknown kind, scope or id, as `E-INPUT`) and acts on the gate's verdict. Use `graph` or `repo` scope for decisions.
 
 ## Fail modes
 
