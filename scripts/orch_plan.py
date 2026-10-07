@@ -24,6 +24,7 @@ from swarm.taskstore import TaskStore, GATES_BY_RISK  # noqa: E402
 from swarm.manifest import by_capability  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm import substrate_client, substrate_tee  # noqa: E402
 
 # (suffix, capability, agent, title, depends_on suffixes, gate spec)
 # gate spec: None = derive from risk class; [] = no gates; {"gate": "quality", "for": [...]} = this IS a gate task
@@ -138,7 +139,28 @@ def _reuse_result(store: TaskStore, ctx, corr: str, pattern: str) -> dict:
             "summary": f"reused existing plan for correlation {corr} ({len(tasks)} tasks, no changes)"}
 
 
+def _bind_graph(args, ctx, corr: str, brief: str, tasks: list[dict]) -> None:
+    """ADR 0001 S1: bind this correlation to one Graph ID and register the node set. Fail-open, off without SUBSTRATE_URL.
+
+    The Graph ID never enters the stored notes or the brief hash, so re-planning the same brief still reuses.
+    """
+    if not substrate_client.enabled():
+        return
+    try:
+        offered = substrate_tee.resolve_graph_id(corr, explicit=args.graph_id, brief_text=brief)
+        graph_id = substrate_tee.bind_graph(corr, offered, root=ctx.root)  # the server's winner, even on conflict
+        if graph_id:
+            substrate_client.mcp_call("graph_register", {
+                "graph_id": graph_id, "repo": substrate_tee.repo_slug(ctx.root), "surface": substrate_tee.ORCH_SURFACE,
+                "status": "planned",
+                "nodes": [{"node_id": t["task_id"]} for t in tasks]}, surface=substrate_tee.ORCH_SURFACE)
+    except Exception:  # noqa: BLE001 - substrate never changes the plan's outcome
+        pass
+
+
 def run(args, ctx) -> dict:
+    if args.graph_id is not None and not substrate_tee.is_graph_id(args.graph_id):
+        raise SwarmError(ErrorCode.E_INPUT, f"invalid --graph-id {args.graph_id!r}: expected ut-<base36>-<8 hex>")
     brief = ""
     if args.brief and Path(args.brief).exists():
         brief = Path(args.brief).read_text(encoding="utf-8")
@@ -218,6 +240,7 @@ def run(args, ctx) -> dict:
     (plans / f"{corr}.json").write_text(json.dumps(plan, indent=2))
     (sdir / "latest_correlation").write_text(corr)
     ctx.correlation_id = corr
+    _bind_graph(args, ctx, corr, brief, plan["tasks"])  # before plan.updated, so that event and the exit record are tee'd
     ctx.emit("plan.updated", {"pattern": args.pattern, "task_count": len(created)})
     lines = [f"{t['task_id']:<14} {t['agent_id']:<4} d={t['dag_depth']} ← {','.join(t['depends_on']) or '-'}" for t in created]
     return {"status": "ok", "correlation_id": corr, "pattern": args.pattern, "tasks": plan["tasks"],
@@ -236,6 +259,8 @@ def add_args(p):
     p.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")
     p.add_argument("--prefix", default=None, help="task id prefix (default: T + first 4 hex of the correlation id)")
     p.add_argument("--acceptance", action="append", default=[], help="acceptance criterion (repeatable)")
+    p.add_argument("--graph-id", default=None, help="substrate Graph ID to bind this correlation to (ut-<base36>-<8 hex>); "
+                                                    "default: env SUBSTRATE_GRAPH_ID, a Graph ID in the brief, else minted")
 
 
 if __name__ == "__main__":
