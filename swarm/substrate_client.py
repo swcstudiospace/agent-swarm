@@ -3,12 +3,13 @@
 Two doors, both optional: ``rest_post`` (POST {SUBSTRATE_URL}/events and friends) and ``mcp_call``
 (JSON-RPC 2.0 ``tools/call`` on POST {SUBSTRATE_URL}/mcp). Everything here is off unless SUBSTRATE_URL is set
 and SUBSTRATE_DISABLED is not ``1``; when off, no socket is opened. Every failure (no network, timeout, non-2xx,
-bad body, ``isError``) yields ``None``: the caller's behaviour never depends on substrate being reachable.
+bad body, ``isError``) yields ``None``: the caller's behaviour never depends on substrate being reachable. The one caller
+that must tell a refusal from no answer (the lease bridge) uses ``mcp_call_outcome``, which classifies instead.
 A bearer token comes from env SUBSTRATE_TOKEN (or, for an explicit ``surface``, an opted-in SUBSTRATE_TOKEN_<SURFACE>) and is
 only ever placed in the Authorization header, as an unredirected header so a redirect never carries it to another URL:
 it is never logged, printed or returned. Redirects are never followed (a 3xx is a failed answer). HTTP_PROXY, HTTPS_PROXY
-and NO_PROXY are honoured. The caller waits at most TIMEOUT_S + DEADLINE_SLACK_S for one request (DNS, connect, headers
-and body, run on a daemon worker); at that deadline the request's socket is shut down.
+and NO_PROXY are honoured. The caller waits at most TIMEOUT_S + DEADLINE_SLACK_S for one request (slot acquisition,
+DNS, connect, headers and body, run on a daemon worker); at that deadline the request's socket is shut down.
 """
 from __future__ import annotations
 import functools
@@ -23,7 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Mapping
+from typing import Mapping, NamedTuple
 
 TIMEOUT_S = 1.5  # per socket operation; the whole request is also bounded, see DEADLINE_SLACK_S
 DEADLINE_SLACK_S = 0.5  # the caller's total wait for one request (DNS + connect + read) is TIMEOUT_S + this
@@ -178,6 +179,10 @@ _workers_lock = threading.Lock()
 _workers: set[threading.Thread] = set()
 
 
+class RequestBusy(Exception):
+    """The request deadline expired waiting for local capacity; no server outage was observed."""
+
+
 def _read_upto(f, n: int) -> bytes:
     parts: list[bytes] = []
     got = 0
@@ -217,13 +222,17 @@ def _open(req: urllib.request.Request, timeout: float) -> _Response:
     """Send `req` through a per-call urllib opener on a daemon worker; never follows redirects.
 
     The opener honours HTTP_PROXY / HTTPS_PROXY / NO_PROXY as they are now. `timeout` bounds each socket operation; the
-    caller waits at most TIMEOUT_S + DEADLINE_SLACK_S from entry over DNS, connect, headers and body, then shuts the
-    request's socket down (ending the worker's blocked I/O) and raises TimeoutError. At most MAX_IN_FLIGHT workers exist;
-    with none free this raises at once without starting one. Raises on any network failure.
+    caller waits at most TIMEOUT_S + DEADLINE_SLACK_S from entry over slot acquisition, DNS, connect, headers and body,
+    then shuts the request's socket down (ending the worker's blocked I/O) and raises TimeoutError.
+    At most MAX_IN_FLIGHT workers exist; waiting for a free slot shares that deadline and raises RequestBusy if it
+    expires before a worker can start. Raises on any network failure.
     """
-    started = time.monotonic()
-    if not _slots.acquire(blocking=False):
-        raise OSError("substrate: too many requests still in flight")
+    deadline = time.monotonic() + TIMEOUT_S + DEADLINE_SLACK_S
+    if not _slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise RequestBusy("substrate request slots busy")
+    if time.monotonic() >= deadline:
+        _slots.release()
+        raise RequestBusy("substrate request slots busy")
     try:
         holder = _Holder()
         req._substrate_holder = holder  # type: ignore[attr-defined]
@@ -239,7 +248,7 @@ def _open(req: urllib.request.Request, timeout: float) -> _Response:
         _slots.release()
         raise
     try:
-        got = out.get(timeout=max(0.0, started + TIMEOUT_S + DEADLINE_SLACK_S - time.monotonic()))
+        got = out.get(timeout=max(0.0, deadline - time.monotonic()))
     except queue.Empty:
         holder.kill()
         raise TimeoutError("substrate request exceeded its deadline") from None
@@ -287,6 +296,8 @@ def _request(url: str, body: dict, env: Mapping[str, str], accept: str, surface:
                 got = (int(status), data.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as e:  # an HTTP answer is still an answer (the real _open returns a non-2xx _Response)
             got = (int(e.code), _read_capped(e).decode("utf-8", errors="replace"))  # a bad body falls to the except below
+    except RequestBusy:
+        raise  # local contention is not evidence of an outage; classified by the public caller
     except Exception:  # noqa: BLE001 - fail open: nothing may escape this client
         got = None
     if got is None:  # network failure, deadline, oversized or malformed reply: back off
@@ -326,32 +337,80 @@ def _rpc_response(text: str) -> dict | None:
     return None
 
 
+class Outcome(NamedTuple):
+    """What one MCP tool call came to, for callers that must tell "the server said no" from "no answer".
+
+    `status` is one of:
+      ok          `value` holds the JSON object or array in ``result.content[0].text``;
+      refused     the server answered and refused this caller: HTTP 401/403, or an ``isError`` reply whose text is a JSON
+                  ``{"error": …}`` (how substrate-mcp words a deliberate refusal, e.g. a surface or session it will not
+                  accept for this token);
+      error       the server answered but could not act: any other non-2xx, an ``isError`` reply that is a thrown server
+                  error (no Postgres, unknown node, …), or a reply that is not a tool result;
+      unreachable no answer: network failure, deadline, oversized reply, or this process's outage back-off;
+      busy        the deadline expired waiting for a local request slot; nothing was sent and no back-off started;
+      off         the integration is off; nothing was sent.
+    `detail` is the server's own text for refused/error, capped at DETAIL_MAX; it never carries the token.
+    """
+    status: str
+    value: dict | list | None = None
+    detail: str = ""
+
+
+DETAIL_MAX = 300
+
+
+def mcp_call_outcome(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *,
+                     surface: str | None = None) -> Outcome:
+    """Call an MCP tool statelessly and classify the answer (see `Outcome`). Never raises; `surface` selects the token
+    as in `rest_post`."""
+    try:
+        e = _env(env)
+        base = base_url(e)
+        if base is None:
+            return Outcome("off")
+        rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
+        got = _request(base + "/mcp", rpc, e, "application/json, text/event-stream", surface)
+        if got is None:
+            return Outcome("unreachable")
+        status, text = got
+        if not 200 <= status < 300:
+            return Outcome("refused" if status in (401, 403) else "error", None, f"HTTP {status}: {text}"[:DETAIL_MAX])
+        resp = _rpc_response(text)
+        result = resp.get("result") if resp else None
+        if not isinstance(result, dict):
+            rpc_error = resp.get("error") if resp else None
+            return Outcome("error", None, (json.dumps(rpc_error) if rpc_error else "no tool result")[:DETAIL_MAX])
+        content = result.get("content")
+        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+            return Outcome("error", None, "tool result has no content")
+        raw = content[0].get("text", "")
+        if result.get("isError"):
+            try:
+                said = json.loads(raw)
+            except (TypeError, ValueError):
+                said = None
+            if isinstance(said, dict) and "error" in said:
+                return Outcome("refused", None, str(said["error"])[:DETAIL_MAX])
+            return Outcome("error", None, str(raw)[:DETAIL_MAX])
+        parsed = json.loads(raw)
+        if not isinstance(parsed, (dict, list)):
+            return Outcome("error", None, "tool result is not a JSON object or array")
+        return Outcome("ok", parsed)
+    except RequestBusy:
+        return Outcome("busy")
+    except Exception:  # noqa: BLE001 - fail open: nothing may escape this client
+        return Outcome("error", None, "malformed reply")
+
+
 def mcp_call_json(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *,
                   surface: str | None = None) -> dict | list | None:
     """Call an MCP tool statelessly; return the JSON value (object or array) in ``result.content[0].text``, None on any failure.
 
     `surface` selects the token as in `rest_post`.
     """
-    try:
-        e = _env(env)
-        base = base_url(e)
-        if base is None:
-            return None
-        rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
-        got = _request(base + "/mcp", rpc, e, "application/json, text/event-stream", surface)
-        if got is None or not 200 <= got[0] < 300:
-            return None
-        resp = _rpc_response(got[1])
-        result = resp.get("result") if resp else None
-        if not isinstance(result, dict) or result.get("isError"):
-            return None
-        content = result.get("content")
-        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
-            return None
-        parsed = json.loads(content[0].get("text", ""))
-        return parsed if isinstance(parsed, (dict, list)) else None
-    except Exception:  # noqa: BLE001
-        return None
+    got = mcp_call_outcome(tool, arguments, env, surface=surface)
+    return got.value if got.status == "ok" else None
 
 
 def mcp_call(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *, surface: str | None = None) -> dict | None:

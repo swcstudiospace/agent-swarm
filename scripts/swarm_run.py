@@ -18,6 +18,10 @@ id after the session, while the task is still leased; the script records signed 
 Store gate_for targets (the runner writes no rows itself).
 A01 rules (fail-closed gates, bounded rework, escalation) are
 applied between rounds by the Task Store.
+With SUBSTRATE_URL set (never on --dry-run) each task is worked under a substrate lease the runner holds for its agent:
+claimed before dispatch (a denied claim waits), beaten every TTL/3 while the session runs and through review, completed at
+DONE, released and re-claimed on CHANGES_REQUESTED, released otherwise; work left in review by an earlier run is claimed
+again at start (swarm/substrate_lease.py, docs/substrate-leases.md).
 
   python3 scripts/swarm_run.py                          # run latest plan to completion
   python3 scripts/swarm_run.py --runtime omp            # run it on omp (needs only `omp` on PATH)
@@ -36,7 +40,9 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -50,7 +56,7 @@ from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
-from swarm import memory as swarm_memory, substrate_client, substrate_tee  # noqa: E402
+from swarm import memory as swarm_memory, substrate_client, substrate_lease, substrate_tee  # noqa: E402
 
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
@@ -89,9 +95,12 @@ def substrate_memory_section(repo: Path, correlation_id: str) -> str:
         return _SUBSTRATE_CONTEXT[key]
 
 
-def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path) -> str:
+def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path, lease_s: int | None = None) -> str:
+    """The session's stdin. `lease_s` is the granted TTL of the task's substrate lease (LEASE-05); a task dispatched
+    unleased keeps the old meaning, its wall-clock budget."""
     assign = {"task_id": task["task_id"], "correlation_id": task["correlation_id"], "agent_id": agent["id"],
-              "capability": task["capability"], "title": task["title"], "lease_s": task["budget"].get("max_wall_s", 1800),
+              "capability": task["capability"], "title": task["title"],
+              "lease_s": lease_s if lease_s is not None else task["budget"].get("max_wall_s", 1800),
               "inputs": task["inputs"], "acceptance": task["acceptance"], "budget": task["budget"],
               "risk_class": task["risk_class"], "priority": task["priority"], "attempt": task["attempt"],
               "rework_loop": task["rework_loops"]}
@@ -279,11 +288,62 @@ class AgentTimeout(subprocess.TimeoutExpired):
         self.text, self.meta = text, meta
 
 
-# process groups of the running sessions: they run in their own session, so a signal to the runner's group misses them
-_SESSIONS: set[int] = set()
+class LeaseStopped(Exception):
+    """The lease keeper stopped the dispatch: the substrate says the runner no longer holds the task's node (LEASE-06),
+    or the task moved on in another process. `reason` is the FAILED reason from substrate_lease's refusal table (or
+    substrate_lease.moved_on_reason); text/meta hold the session's partial output."""
+
+    def __init__(self, reason: str, text: str, meta: dict):
+        super().__init__(reason)
+        self.reason, self.text, self.meta = reason, text, meta
+
+
+class DispatchWatch:
+    """The lease keeper's handle on one dispatch (LEASE-06), attached before the session spawns and detached once the
+    result is applied. `stop(reason)` records the first reason and stops whichever child works the task at that moment:
+    the agent session, then the runner's gate script. A child that attaches after a reason was recorded is stopped at
+    once, and `applying` refuses the result, so a lost lease never gets a verdict recorded or a result accepted."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reason: str | None = None
+        self._child: Callable[[str], None] | None = None
+
+    def stop(self, reason: str) -> None:
+        with self._lock:  # waits while a result is being applied: that result was written under a held lease
+            if self.reason is None:
+                self.reason = reason
+            child = self._child
+        if child is not None:
+            child(self.reason)
+
+    def attach(self, child: Callable[[str], None] | None) -> None:
+        """`on_session` / `on_process`: the running child's stop, or None once it has ended."""
+        with self._lock:
+            self._child = child
+            reason = self.reason
+        if child is not None and reason is not None:
+            child(reason)
+
+    def check(self, text: str, meta: dict) -> None:
+        if self.reason is not None:
+            raise LeaseStopped(self.reason, text, {**meta, "lease_stopped": self.reason})
+
+    @contextmanager
+    def applying(self, text: str, meta: dict):
+        """Write the result only while no stop has been recorded, and hold the keeper's stop off until it is written."""
+        with self._lock:
+            self.check(text, meta)
+            yield
+
+
+# process groups of the running children (agent sessions, the runner's gate scripts): they run in their own session,
+# so a signal to the runner's group misses them
+_SESSIONS: dict[int, ChildGroup] = {}
 _SESSIONS_LOCK = threading.Lock()
 _STOPPING = threading.Event()  # the runner is ending its sessions: a session that registers now is killed at once
 _FORWARDED = (signal.SIGTERM, signal.SIGHUP)
+STOP_GRACE_S = 10  # a stopped or timed-out child group gets this long between SIGTERM and SIGKILL
 
 
 def kill_group(pgid: int, sig: int) -> None:
@@ -303,15 +363,28 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
+def _end_group(pgid: int, deadline: float) -> None:
+    """Return once no process is left in the group, SIGKILLing what is still there at `deadline` (monotonic). The
+    leader's exit proves nothing: a tool with its own pipes can outlive SIGTERM after its parent has gone."""
+    while _group_alive(pgid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _group_alive(pgid):
+        kill_group(pgid, signal.SIGKILL)
+        settle = time.monotonic() + 2  # SIGKILL cannot be caught; what is left is the init process reaping orphans
+        while _group_alive(pgid) and time.monotonic() < settle:
+            time.sleep(0.05)
+
+
 def kill_sessions(grace: float = 5) -> None:
     """SIGTERM every session group, so omp disposes its session and tool processes; SIGKILL what outlives `grace` s
     (WR-09). The workers still reap their sessions and record the killed tasks as rejected results, clearing
     notes.running, so the next run retries them."""
     with _SESSIONS_LOCK:
         _STOPPING.set()
-        groups = list(_SESSIONS)
-    for pgid in groups:
-        kill_group(pgid, signal.SIGTERM)
+        sessions = list(_SESSIONS.values())
+    for group in sessions:
+        group.stop("E-TIMEOUT: runner shutdown", grace=grace)
+    groups = [group.pgid for group in sessions]
     deadline = time.monotonic() + grace
     while groups and time.monotonic() < deadline:
         time.sleep(0.1)
@@ -330,16 +403,68 @@ def _terminate(signum, _frame) -> None:
 
 
 def reap_group(proc: subprocess.Popen) -> tuple[str, str]:
-    """SIGTERM the session's whole process group, SIGKILL it after 10 s; the partial (stdout, stderr)."""
+    """SIGTERM the child's whole process group, SIGKILL it after STOP_GRACE_S; the partial (stdout, stderr). Returns
+    once every process in the group is gone, not only the leader."""
+    deadline = time.monotonic() + STOP_GRACE_S
     for sig in (signal.SIGTERM, signal.SIGKILL):
         kill_group(proc.pid, sig)
         try:
-            return proc.communicate(timeout=10)
+            out = proc.communicate(timeout=STOP_GRACE_S)
         except subprocess.TimeoutExpired:
             continue
+        _end_group(proc.pid, deadline)
+        return out
     proc.kill()  # a descendant that left the group still holds the pipes
     proc.wait()
     return "", ""
+
+
+class ChildGroup:
+    """A child in its own session and process group (WR-04), registered for kill_sessions (WR-09). `stop(reason)` is the
+    lease keeper's handle: SIGTERM the group and SIGKILL what is left STOP_GRACE_S later. `close()` forgets the group only
+    once every process in a stopped group has exited, so a stopped session leaves no tool running (LEASE-06)."""
+
+    def __init__(self, cmd: list[str], *, cwd, env: dict, stdin=subprocess.PIPE):
+        self.proc = subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     cwd=cwd, env=env, start_new_session=True)
+        self.pgid = self.proc.pid
+        self.stopped: list[str] = []
+        self._lock = threading.Lock()
+        self._deadline: float | None = None
+        self._killer: threading.Timer | None = None
+        self._closed = False
+        with _SESSIONS_LOCK:
+            _SESSIONS[self.pgid] = self
+            stopping = _STOPPING.is_set()
+        if stopping:  # spawned after kill_sessions took its snapshot (WR-09)
+            self.stop("E-TIMEOUT: runner shutdown", grace=0)
+
+    def stop(self, reason: str, *, grace: float | None = None) -> None:
+        grace = STOP_GRACE_S if grace is None else grace
+        with self._lock:
+            self.stopped.append(reason)
+            if self._deadline is not None or self._closed:  # already stopping, or already gone and forgotten
+                return
+            self._deadline = time.monotonic() + grace
+            kill_group(self.pgid, signal.SIGTERM)
+            # a process that ignores SIGTERM is killed after the grace even when it no longer holds the child's pipes
+            self._killer = threading.Timer(grace, kill_group, (self.pgid, signal.SIGKILL))
+            self._killer.daemon = True
+            self._killer.start()
+
+    def close(self) -> None:
+        """After the leader has been reaped: wait out a stopped group (SIGKILL at the grace), then forget it."""
+        with self._lock:
+            self._closed = True
+            deadline, killer = self._deadline, self._killer
+        try:
+            if deadline is not None:
+                _end_group(self.pgid, deadline)
+        finally:
+            if killer is not None:
+                killer.cancel()
+            with _SESSIONS_LOCK:
+                _SESSIONS.pop(self.pgid, None)
 
 
 # omp 18.3.1 `-e`: a package that fails to load is only this stderr line (main.ts formatExtensionLoadNotifications),
@@ -366,30 +491,35 @@ def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[
     return text, meta
 
 
-def run_agent_headless(agent: dict, prompt: str, repo: Path, args) -> tuple[str, dict]:
+def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session=None) -> tuple[str, dict]:
+    """Run one agent session. `on_session(stop)` is called once the session is spawned and `on_session(None)` once it
+    has ended; `stop(reason)` ends the session's process group and makes this raise LeaseStopped (the lease keeper's
+    handle on a session whose node the runner no longer holds). A stopped session returns only once its whole process
+    group is gone."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
     try:
         # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                cwd=cwd, env=env, start_new_session=True)
+        group = ChildGroup(cmd, cwd=cwd, env=env)
     except OSError as e:
         raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
-    with _SESSIONS_LOCK:
-        _SESSIONS.add(proc.pid)
-        stopping = _STOPPING.is_set()
-    if stopping:  # spawned after kill_sessions took its snapshot (WR-09)
-        kill_group(proc.pid, signal.SIGKILL)
+    proc = group.proc
     try:
+        if on_session is not None:
+            on_session(group.stop)
         try:
             out, err = proc.communicate(prompt, timeout=args.task_timeout)
         except subprocess.TimeoutExpired:
             text, meta = session_output(runtime, *reap_group(proc), proc.returncode)
             raise AgentTimeout(cmd, args.task_timeout, text, {**meta, "timed_out": True}) from None
     finally:
-        with _SESSIONS_LOCK:
-            _SESSIONS.discard(proc.pid)
-    return session_output(runtime, out, err, proc.returncode)
+        if on_session is not None:
+            on_session(None)
+        group.close()
+    text, meta = session_output(runtime, out, err, proc.returncode)
+    if group.stopped:  # a result finished under a lease the runner no longer holds is never applied
+        raise LeaseStopped(group.stopped[0], text, {**meta, "lease_stopped": group.stopped[0]})
+    return text, meta
 
 
 def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) -> dict:
@@ -426,10 +556,12 @@ def canned_result(task: dict, agent: dict) -> str:
     return f"dry-run\n```json\n{json.dumps(payload)}\n```"
 
 
-def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, timeout=300) -> None:
+def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, timeout=300, on_process=None) -> None:
     """Run the gate task's real gate script on its own id with the runner's keys (D-12/D-13): with --dry-run in a
     runner dry-run, otherwise after the agent session while the gate task is still leased. The script derives and
-    records the verdict; per_target_findings adds the agent's findings as gate input."""
+    records the verdict; per_target_findings adds the agent's findings as gate input. `on_process` works as
+    run_agent_headless's `on_session`: the lease keeper stops a gate script whose task lost its lease, and this raises
+    LeaseStopped."""
     gate = task["notes_json"]["gate"]
     script = ROOT / "scripts" / f"{GATE_SCRIPTS[gate]}.py"
     cmd = [sys.executable, str(script), *(["--dry-run"] if dry_run else []), "--task-id", task["task_id"],
@@ -439,9 +571,24 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
     # the autonomous hook starts this runner with SWARM_CHILD=1; the runner's own gate run must still record
     env = {k: v for k, v in os.environ.items() if k not in ("SWARM_AGENT_SESSION", "SWARM_CHILD")}
     env["SWARM_DIR"] = str(Path(sdir).resolve())
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-    if proc.returncode == 2:
-        raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed: {(proc.stdout or proc.stderr)[-400:]}",
+    group = ChildGroup(cmd, cwd=None, env=env, stdin=subprocess.DEVNULL)
+    try:
+        if on_process is not None:
+            on_process(group.stop)
+        try:
+            out, err = group.proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            reap_group(group.proc)
+            raise
+    finally:
+        if on_process is not None:
+            on_process(None)
+        group.close()
+    if group.stopped:  # verdicts it wrote before the stop never approve anything: this gate task's result is refused
+        raise LeaseStopped(group.stopped[0], "", {"lease_stopped": group.stopped[0]})
+    rc = group.proc.returncode
+    if rc == 2 or rc < 0 or rc >= 129:  # 1 means findings; signals must never accept a partially written release plan
+        raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed (exit {rc}): {(out or err)[-400:]}",
                          task_id=task["task_id"])
 
 
@@ -535,7 +682,44 @@ def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
     return ready
 
 
-def execute_one(store_path, task, agent, args, ctx, repo):
+def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases) -> tuple[list[tuple[dict, dict]], list[str]]:
+    """(task, agent) pairs to dispatch this round, and the tasks left waiting on a lease. The first `max_parallel` ready
+    tasks fill the round, as before; with leases on, each must first hold its node (or run unleased when the substrate
+    cannot answer). A denied, refused or busy claim leaves the task where it is (PLANNED/RETRY, or IN_PROGRESS for a rework)
+    without taking a slot, for a later round or run (LEASE-05)."""
+    batch, waiting, slots = [], [], max_parallel
+    for t in ready:
+        if slots <= 0:
+            break
+        try:
+            agent = get_agent(t["agent_id"]) if t["agent_id"] else by_capability(t["capability"])[0]
+        except (KeyError, IndexError):
+            store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
+            slots -= 1
+            continue
+        if leases is not None:
+            claim = leases.acquire(t, agent["id"])
+            if not claim.dispatch:
+                holder = (claim.holder or {}).get("session_id")
+                waiting.append(f"{t['task_id']}: {claim.status}" + (f" (held by {holder})" if holder else ""))
+                continue
+        batch.append((t, agent))
+        slots -= 1
+    return batch, waiting
+
+
+def execute_one(store_path, task, agent, args, ctx, repo, leases=None):
+    """Dispatch one task to its agent and apply the result. With leases on, the dispatch is watched by the lease keeper
+    and the task's lease is settled from its final state, whatever happened on the way (LEASE-07): only after the
+    session's and the gate script's process groups are gone."""
+    try:
+        return _execute_one(store_path, task, agent, args, ctx, repo, leases)
+    finally:
+        if leases is not None:
+            leases.settle(task["task_id"])
+
+
+def _execute_one(store_path, task, agent, args, ctx, repo, leases):
     store = TaskStore(store_path)  # sqlite: one connection per thread
     sdir = store.path.parent
     tid = task["task_id"]
@@ -545,9 +729,15 @@ def execute_one(store_path, task, agent, args, ctx, repo):
     # A01 is the only writer of notes.dry_run: dry-run gate rows record and count only on flagged tasks,
     # and a real dispatch clears a flag left by an earlier dry-run
     store.set_notes(tid, running=time.time(), dry_run=bool(args.dry_run))
+    # LEASE-06: the keeper watches the whole dispatch, from before the session spawns until its result is written, so
+    # a lease lost (or a task moved on elsewhere) at any point stops the session or gate script and rejects the result
+    watch = DispatchWatch()
+    if leases is not None:
+        leases.watch(tid, watch.stop)
+    text, meta, raw_recorded = "", {}, False
     try:
         task = store.get(tid)
-        prompt = assignment_prompt(store, task, agent, repo)
+        prompt = assignment_prompt(store, task, agent, repo, lease_s=leases.lease_s(tid) if leases is not None else None)
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
         (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
@@ -556,7 +746,8 @@ def execute_one(store_path, task, agent, args, ctx, repo):
                 run_gate_script(task, repo, sdir, dry_run=True)
             text = canned_result(task, agent)
         else:
-            text, meta = run_agent_headless(agent, prompt, repo, args)
+            watch.check(text, meta)  # lost before the session spawned: it never starts
+            text, meta = run_agent_headless(agent, prompt, repo, args, on_session=watch.attach)
         (sdir / "results").mkdir(parents=True, exist_ok=True)
         (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
         result, err = None, None
@@ -576,13 +767,16 @@ def execute_one(store_path, task, agent, args, ctx, repo):
                 and result["state"] == S.IN_REVIEW.value and not meta.get("is_error") and not meta.get("returncode")):
             # WR-12: the key-holding runner, not the agent, records this gate — once per dispatch, still leased
             run_gate_script(task, repo, sdir, dry_run=False, timeout=args.task_timeout,
-                            per_target_findings=gate_findings_file(task, text, sdir, ctx.emit))
+                            per_target_findings=gate_findings_file(task, text, sdir, ctx.emit), on_process=watch.attach)
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
-        if result is None:
-            outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
-        else:
-            outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit, mode="headless")
+        raw_recorded = True
+        with watch.applying(text, meta):
+            if result is None:
+                outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
+            else:
+                outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit,
+                                       mode="headless")
     except AgentTimeout as e:
         # WR-04: keep what the session wrote before its process group was killed
         (sdir / "results").mkdir(parents=True, exist_ok=True)
@@ -591,6 +785,21 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         store.set_notes(tid, meta=e.meta)
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
         outcome = "FAILED"
+    except LeaseStopped as e:
+        # LEASE-06: the substrate says another session (or nobody) holds the node, or the task moved on elsewhere, so
+        # this result is never applied, whether the stop came during the session, the gate script or before the write
+        text, meta = e.text or text, {**meta, **e.meta}
+        (sdir / "results").mkdir(parents=True, exist_ok=True)
+        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        if not raw_recorded:
+            ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
+        store.set_notes(tid, meta=meta)
+        state = store.get(tid)["state"]
+        if state in substrate_lease.LET_GO:  # moved on in another process (CANCELLED): that transition stands
+            outcome = state
+        else:
+            store.transition(tid, S.FAILED, reason=e.reason[:500])
+            outcome = "FAILED"
     except subprocess.TimeoutExpired:
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
         outcome = "FAILED"
@@ -598,8 +807,20 @@ def execute_one(store_path, task, agent, args, ctx, repo):
         store.transition(tid, S.FAILED, reason=str(e)[:500])
         outcome = "FAILED"
     finally:
+        if leases is not None:
+            leases.watch(tid, None)
         store.set_notes(tid, running=None)
     return tid, agent["id"], outcome
+
+
+def lease_bridge(args, store_path: Path, corr: str, repo: Path, ctx):
+    """The run's substrate leases (ADR 0001 S2), or None: --dry-run never touches the substrate, and off means off."""
+    if args.dry_run or not substrate_client.enabled():
+        return None
+    try:
+        return substrate_lease.LeaseBridge(store_path, corr, root=repo, emit=ctx.emit)
+    except ValueError as e:  # SWARM_REPLICA or SWARM_LEASE_TTL_S: refused at start, not at every claim
+        raise SwarmError(ErrorCode.E_INPUT, str(e)) from e
 
 
 def run(args, ctx) -> dict:
@@ -633,6 +854,7 @@ def run(args, ctx) -> dict:
         setattr(args, f"{args.runtime}_bin", binary)
         if args.runtime == "claude":
             preflight_auth(binary)
+    leases = lease_bridge(args, store_path, corr, repo, ctx)
     log, rounds = [], 0
     # T-06-12: a SIGTERM/SIGHUP to the runner's group ends the sessions too, then the previous handlers come back.
     # WR-10: a signal inherited as ignored (nohup, a parent's SIG_IGN) stays ignored.
@@ -640,26 +862,26 @@ def run(args, ctx) -> dict:
     previous = ({s: signal.signal(s, _terminate) for s in _FORWARDED if signal.getsignal(s) is not signal.SIG_IGN}
                 if threading.current_thread() is threading.main_thread() else {})
     try:
+        if leases is not None:
+            # work an earlier process left in review is held (and beaten) again before reconcile or any gate dispatch
+            leases.resume()
+            leases.start()
         while True:
             rounds += 1
-            log += reconcile(store, corr, ctx.emit)
+            log += reconcile(store, corr, ctx.emit, leases=leases)
             ready = dispatchable(store, corr, ctx.emit)
             if not ready:
                 remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
                 if remaining:
                     log.append(f"stalled: {[(t['task_id'], t['state']) for t in remaining]}")
                 break
-            batch = []
-            for t in ready[: args.max_parallel]:
-                try:
-                    agent = get_agent(t["agent_id"]) if t["agent_id"] else by_capability(t["capability"])[0]
-                except (KeyError, IndexError):
-                    store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
-                    continue
-                batch.append((t, agent))
+            batch, waiting = select_batch(store, ready, args.max_parallel, leases)
+            if not batch and waiting:  # every candidate's node is held elsewhere: asking again at once would only spin
+                log.append(f"waiting on leases: {waiting}")
+                break
             with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
                 try:
-                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo) for t, a in batch]
+                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo, leases) for t, a in batch]
                     for f in as_completed(futs):
                         tid, aid, outcome = f.result()
                         log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
@@ -672,7 +894,9 @@ def run(args, ctx) -> dict:
     finally:
         for s, handler in previous.items():
             signal.signal(s, signal.SIG_DFL if handler is None else handler)
-    log += reconcile(store, corr, ctx.emit)
+        if leases is not None:
+            leases.close()  # the keeper stops; settling below needs no thread
+    log += reconcile(store, corr, ctx.emit, leases=leases)
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}
     for t in tasks:
