@@ -72,7 +72,7 @@ python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude o
 python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
 python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, omp/agents, omp/skills (--check)
-python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, plus the omp package (see below)
+python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, the omp package and substrate-mcp (see below)
 python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
@@ -84,14 +84,19 @@ Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then 
 
 `build_agents.py --install-workspace` regenerates the agents, copies the Claude/Grok agents, skills and
 UserPromptSubmit hook into the workspace, then installs the omp targets (`omp/agents/`, `omp/skills/` and the
-`omp/` extension package). It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a
-workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a
-symlink (the file or a parent dir under `<ws>`).
+`omp/` extension package). It also wires substrate-mcp: the `substrate` MCP entry in `<ws>/.mcp.json` (Claude, omp)
+and `<ws>/.grok/config.toml` (Grok), naming `${SUBSTRATE_TOKEN}` and never a value, plus one 0600 env file per agent
+outside the workspace holding that agent's `SUBSTRATE_TOKEN`, taken from `SUBSTRATE_TOKEN_<SURFACE>` in your
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). It never writes into this repo or `~/.omp`.
+It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, any
+destination reached through a symlink (the file or a parent dir under `<ws>`), a runtime that cannot call MCP, and an
+agent whose token it cannot deliver; for the last it prints what you must create.
 
 ```bash
 python3 scripts/build_agents.py --install-workspace /path/to/ws                  # omp link mode (default)
 python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # omp agents + skills only
-python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print the plan and config diff, write nothing
+python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print the plan, config diff and env files, write nothing
+python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # without substrate-mcp (integration off)
 ```
 
 - **Link** (default) adds this checkout's `omp/` realpath to `extensions:` in `<ws>/.omp/config.yml`, so that file

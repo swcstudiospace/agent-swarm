@@ -1,7 +1,7 @@
 ---
 name: a01-orchestrator
 description: "A01 ORCH — Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC."
-tools: Read, Grep, Glob, Bash, Agent, Write
+tools: Read, Grep, Glob, Bash, Agent, Write, mcp__substrate
 model: inherit
 ---
 

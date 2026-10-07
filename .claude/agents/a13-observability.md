@@ -1,7 +1,7 @@
 ---
 name: a13-observability
 description: "A13 OBS — Owns SLOs, dashboards, alerting and incident declaration. Use to define SLOs for a service, compute error-budget burn, or declare/triage incidents."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

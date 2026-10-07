@@ -47,15 +47,19 @@ additive, and the Task Store keeps every row (criterion 10).
 ## Identity
 
 Every packet is sent **as its sender**, through `substrate_lease._call()`, the seam the lease calls use, with the
-sender's own `SUBSTRATE_TOKEN_<SURFACE>`. `coord_handoff` has no argument that names a sender: the substrate records
-whoever the token is, signs that, and reads the sender's chain tip (`prev_event_hash`) from the ledger itself. So A05
-cannot sign as A14, and a packet re-labelled after signing fails verification (`bad-signature`).
+sender's own token from `workspace.credential()`: its env file for the workspace (the runner's `--repo`), else its
+`SUBSTRATE_TOKEN_<SURFACE>` ([substrate-workspace.md](substrate-workspace.md)). `coord_handoff` has no argument that
+names a sender: the substrate records whoever the token is, signs that, and reads the sender's chain tip
+(`prev_event_hash`) from the ledger itself. So A05 cannot sign as A14, and a packet re-labelled after signing fails
+verification (`bad-signature`). The runner's own `coord_handoff_list` read goes the same way, as A01; `reconstruct`
+reads as the receiving agent.
 
 `coord_handoff` names no surface, so the server cannot refuse a packet sent on the wrong token the way it refuses a
-claim. The runner therefore checks first, with `substrate_lease.has_own_token()`. A sender with no token of its own is
-not sent on the fallback `SUBSTRATE_TOKEN`, the runner's (A01's), because that would record and sign A01 as the sender.
-It is recorded as `handoff.refused` instead. If the ledger records a packet under another surface than the intended
-sender (a token configured under the wrong name), the runner says so with `handoff.misattributed`.
+claim. The runner therefore checks first, with `substrate_lease.has_own_token()`, which asks the same
+`workspace.credential()` lookup. A sender with no token of its own sends nothing: the runner's `SUBSTRATE_TOKEN` (A01's)
+never stands in, because that would record and sign A01 as the sender. It is recorded as `handoff.refused` instead. If
+the ledger records a packet under another surface than the intended sender (a token configured under the wrong name),
+the runner says so with `handoff.misattributed`.
 
 Sessions: `session_id` is the sender's `<AGENT>@<replica>:<graph_id>`, and for a dependency or gate packet
 `to_session_id` is the receiver's, since this runner dispatches it.

@@ -1,7 +1,8 @@
 """Substrate leases for swarm tasks (ADR 0001 S2; LEASE-05..09).
 
 The runner (A01, scripts/swarm_run.py) holds a lease on each task's Graph-of-Thought node on behalf of the agent it
-dispatches the task to. It calls as that agent's surface, with session `<AGENT>@<replica>:<graph_id>`, so two replicas of
+dispatches the task to. It calls as that agent's surface, with the token in that agent's env file (swarm/workspace.py, the
+same token the agent's own session gets) and session `<AGENT>@<replica>:<graph_id>`, so two replicas of
 one agent class are two holders and racing claims grant exactly one. The substrate lease decides who may touch the work;
 the Task Store stays A01's record of lifecycle state and keeps only an advisory mirror of the lease in `notes.lease`.
 
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
-from . import substrate_client, substrate_tee
+from . import substrate_client, substrate_tee, workspace as workspace_mod
 from .taskstore import TaskStore, TaskState as S
 
 DEFAULT_TTL_S = 900  # the substrate's own default (SUBSTRATE_LEASE_TTL_SECONDS)
@@ -117,27 +118,38 @@ class Lease:
     due: float = 0.0
     stop: Callable[[str], None] | None = None
     halted: str | None = None
+    workspace: str | Path | None = None  # whose agent env files hold the token every call on this lease carries
 
 
-def _call(tool: str, arguments: dict, surface: str, env: Mapping[str, str]) -> substrate_client.Outcome:
-    """Every lease call, and every handoff call (substrate_handoff.py), goes through here as `surface`, so it carries
-    that agent's token. Today the token is SUBSTRATE_TOKEN_<SURFACE> from the runner's own environment
-    (substrate_client._token). Phase 14 (INST-04) changes only this function and `has_own_token`, to take it from the
-    agent's env file."""
-    return substrate_client.mcp_call_outcome(tool, arguments, env, surface=surface)
+def _call(tool: str, arguments: dict, agent_id: str, workspace: str | Path | None,
+          env: Mapping[str, str]) -> substrate_client.Outcome:
+    """Every lease call, and every handoff call (substrate_handoff.py), goes through here, as agent `agent_id`'s
+    surface, with that agent's own token from `workspace.credential`: its env file for `workspace` (INST-03), the same
+    token its session, its handoffs and its teed run-log rows carry. The runner's SUBSTRATE_TOKEN (A01's) never stands
+    in, so an agent whose token was never delivered is refused here, by name, instead of claiming with someone else's."""
+    if not substrate_client.enabled(env):
+        return substrate_client.Outcome("off")
+    token, _source, problem = workspace_mod.credential(agent_id, workspace, env)
+    if token is None:
+        return substrate_client.Outcome("refused", None, f"no token for {agent_id}: {problem}; re-run "
+                                        "scripts/build_agents.py --install-workspace")
+    own = {k: v for k, v in env.items() if not workspace_mod.carries_token(k)}
+    return substrate_client.mcp_call_outcome(tool, arguments, {**own, workspace_mod.TOKEN: token})
 
 
-def has_own_token(surface: str, env: Mapping[str, str]) -> bool:
-    """Whether `_call` as `surface` carries that surface's own token rather than the fallback SUBSTRATE_TOKEN, which
-    is the runner's (A01's). A claim made on the fallback is refused by the server, because the claim names its
-    surface; a handoff names none (the sender is whoever the token says), so a handoff checks this first."""
-    return bool(substrate_client.own_token(env, surface))
+def has_own_token(agent_id: str, workspace: str | Path | None, env: Mapping[str, str]) -> bool:
+    """Whether `_call` as agent `agent_id` has a token of that agent's own (`workspace.credential`: its env file for
+    `workspace`, else its SUBSTRATE_TOKEN_<SURFACE>). Never the runner's SUBSTRATE_TOKEN (A01's). A claim names its
+    surface, so the server would refuse one on the wrong token; a handoff names none (the sender is whoever the token
+    says), so a handoff checks this first and sends nothing without one."""
+    return workspace_mod.credential(agent_id, workspace, env)[0] is not None
 
 
 # --- the four calls, one node at a time ---------------------------------------------------------------------
-def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int,
+def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int, workspace: str | Path | None,
                env: Mapping[str, str] | None = None) -> tuple[Claim, Lease | None]:
-    """`graph_claim` for `node_id` as agent `agent_id`'s surface and session. The Lease is set only when it is held."""
+    """`graph_claim` for `node_id` as agent `agent_id`'s surface and session, with the token from that agent's env file
+    for `workspace`. The Lease is set only when it is held."""
     e = os.environ if env is None else env
     surface = substrate_tee.AGENT_SURFACES.get(agent_id)
     if surface is None:
@@ -145,13 +157,13 @@ def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int,
     session = substrate_tee.session_id(agent_id, graph_id, e)
     args = {"graph_id": graph_id, "node_id": node_id, "session_id": session, "ttl_seconds": clamp_ttl(ttl_s),
             "surface": surface}
-    got = _call("graph_claim", args, surface, e)
+    got = _call("graph_claim", args, agent_id, workspace, e)
     if got.status == "error" and "unknown node" in got.detail:
         # a task created after orch_plan registered the node set (a gate rerun): register the node as A01, which upserts
         # nodes and leaves the edges alone when none are sent, then ask once more
         substrate_client.mcp_call_outcome("graph_register", {"graph_id": graph_id, "nodes": [{"node_id": node_id}]}, e,
                                           surface=substrate_tee.ORCH_SURFACE)
-        got = _call("graph_claim", args, surface, e)
+        got = _call("graph_claim", args, agent_id, workspace, e)
     if got.status == "off":
         return Claim(OFF), None
     if got.status == "busy":
@@ -173,7 +185,7 @@ def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int,
             return Claim(UNLEASED, reason="granted without a lease_id"), None
         granted = reply.get("ttl_seconds")
         ttl = granted if isinstance(granted, int) and not isinstance(granted, bool) and granted > 0 else clamp_ttl(ttl_s)
-        held = Lease(node_id, agent_id, surface, session, graph_id, lease_id, ttl, action)
+        held = Lease(node_id, agent_id, surface, session, graph_id, lease_id, ttl, action, workspace=workspace)
         return Claim(HELD, lease_s=ttl, reason=action), held
     holder = lease.get("holder") if isinstance(lease.get("holder"), dict) else None
     return Claim(DENIED, reason=str(reply.get("reason") or action or "held by another session")[:300], holder=holder,
@@ -190,7 +202,7 @@ def heartbeat(lease: Lease, env: Mapping[str, str] | None = None) -> str:
     A server that cannot answer is the fail-open case, not a statement that the lease is gone."""
     e = os.environ if env is None else env
     got = _call("graph_heartbeat", {"graph_id": lease.graph_id, "node_id": lease.task_id, "lease_id": lease.lease_id,
-                                    "ttl_seconds": lease.ttl_s}, lease.surface, e)
+                                    "ttl_seconds": lease.ttl_s}, lease.agent_id, lease.workspace, e)
     if got.status == "ok" and isinstance(got.value, dict):
         return OK if got.value.get("ok") is True else str(got.value.get("reason") or "unknown")
     if got.status in ("refused", "error") and "not-holder" in got.detail:
@@ -203,7 +215,7 @@ def release(lease: Lease, env: Mapping[str, str] | None = None) -> str:
     or nobody does), or `failed: <why>`."""
     e = os.environ if env is None else env
     got = _call("graph_release", {"graph_id": lease.graph_id, "node_id": lease.task_id, "lease_id": lease.lease_id},
-                lease.surface, e)
+                lease.agent_id, lease.workspace, e)
     if got.status == "ok" and isinstance(got.value, dict):
         v = got.value
         if v.get("released") is True:
@@ -219,7 +231,7 @@ def complete(lease: Lease, env: Mapping[str, str] | None = None) -> str:
     so this lease cannot close it), or `failed: <why>`."""
     e = os.environ if env is None else env
     got = _call("graph_complete", {"graph_id": lease.graph_id, "node_id": lease.task_id, "lease_id": lease.lease_id},
-                lease.surface, e)
+                lease.agent_id, lease.workspace, e)
     if got.status == "ok" and isinstance(got.value, dict):
         v = got.value
         if v.get("completed") is True:
@@ -262,12 +274,13 @@ def _agent_of(task: dict) -> str | None:
     return agent if agent in substrate_tee.AGENT_SURFACES else None
 
 
-def settle_mirrored(store: TaskStore, task_id: str, *, emit, env: Mapping[str, str] | None = None) -> str:
+def settle_mirrored(store: TaskStore, task_id: str, *, emit, workspace: str | Path | None,
+                    env: Mapping[str, str] | None = None) -> str:
     """For a process that does not hold the lease in memory (`orch_status --transition`): complete or release the lease
-    mirrored in notes.lease when the task has left the holding states. Returns `deferred` while a runner is still
-    working the task (notes.running): releasing then would free the node under a live agent, so that runner's keeper
-    stops the session on its next beat and its dispatch settles the lease once the session's process group is gone.
-    Never raises."""
+    mirrored in notes.lease when the task has left the holding states, with the token from the agent's env file for
+    `workspace`. Returns `deferred` while a runner is still working the task (notes.running): releasing then would free
+    the node under a live agent, so that runner's keeper stops the session on its next beat and its dispatch settles the
+    lease once the session's process group is gone. Never raises."""
     try:
         e = os.environ if env is None else env
         if not substrate_client.enabled(e):
@@ -281,7 +294,8 @@ def settle_mirrored(store: TaskStore, task_id: str, *, emit, env: Mapping[str, s
         if task["notes_json"].get("running") is not None:
             return "deferred"
         lease = Lease(task_id, m["agent"], substrate_tee.AGENT_SURFACES[m["agent"]], str(m.get("session_id") or ""),
-                      str(m.get("graph_id") or ""), str(m["lease_id"]), int(m.get("ttl_s") or DEFAULT_TTL_S))
+                      str(m.get("graph_id") or ""), str(m["lease_id"]), int(m.get("ttl_s") or DEFAULT_TTL_S),
+                      workspace=workspace)
         return _close(store, lease, task["state"], emit, e)
     except Exception as exc:  # noqa: BLE001 - a lease never changes a transition's outcome
         emit("lease.unsettled", {"task_id": task_id, "op": "settle", "reason": f"internal: {exc}"[:300]})
@@ -297,7 +311,8 @@ class LeaseBridge:
     (DONE completes, anything else releases); `rework` after CHANGES_REQUESTED. The keeper thread beats every held lease
     every TTL/3, whether or not a session is running: the producer's lease is kept through review so DONE can complete it
     and CHANGES_REQUESTED can release and re-claim it. Claims, beats, settlements and reworks of one task run one at a
-    time (a per-task lock), so a claim answered while another thread lets the task go is never left untracked.
+    time (a per-task lock), so a claim answered while another thread lets the task go is never left untracked. `root` is
+    the workspace (the runner's --repo): every call is made with the token in the executing agent's env file for it.
     """
 
     def __init__(self, store_path: str | Path, correlation_id: str, *, emit: Callable[[str, dict], object],
@@ -383,7 +398,7 @@ class LeaseBridge:
             if graph is None:
                 claim, lease = Claim(UNLEASED, reason="no Graph ID is bound to this run"), None
             else:
-                claim, lease = claim_node(agent_id, graph, tid, ttl_s=self.ttl_s, env=self.env)
+                claim, lease = claim_node(agent_id, graph, tid, ttl_s=self.ttl_s, workspace=self.root, env=self.env)
             if lease is not None:
                 self._hold(lease)
             elif claim.status == DENIED:
@@ -477,7 +492,8 @@ class LeaseBridge:
             if not watching and self._moved_on(tid):
                 self.settle(tid)
                 return "settled"
-            claim, fresh = claim_node(lease.agent_id, lease.graph_id, tid, ttl_s=self.ttl_s, env=self.env)
+            claim, fresh = claim_node(lease.agent_id, lease.graph_id, tid, ttl_s=self.ttl_s, workspace=self.root,
+                                      env=self.env)
             if fresh is not None:
                 if not self._hold(fresh, replaces=lease):  # let go of meanwhile: a grant nobody tracks is released
                     release(fresh, self.env)
@@ -578,7 +594,8 @@ class LeaseBridge:
                     agent, graph = _agent_of(task), self.graph_id()
                     if agent is None or graph is None:
                         return "none"
-                    claim, lease = claim_node(agent, graph, task_id, ttl_s=self.ttl_s, env=self.env)
+                    claim, lease = claim_node(agent, graph, task_id, ttl_s=self.ttl_s, workspace=self.root,
+                                              env=self.env)
                     if lease is None:
                         _mirror(self._store(), task_id, state="unsettled", agent=agent,
                                 reason=f"DONE: claim {claim.status} {claim.reason}".strip()[:300], holder=claim.holder)

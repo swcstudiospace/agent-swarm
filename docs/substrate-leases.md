@@ -25,7 +25,7 @@ phase.
 |---|---|
 | `SWARM_REPLICA` | This runner's replica name, default `r0`, 1-64 characters of `[A-Za-z0-9._-]`. Anything else stops the run at start with `E-INPUT`: the substrate would refuse every claim anyway (LEASE-01). |
 | `SWARM_LEASE_TTL_S` | TTL to request, default 900 (the substrate's default), clamped to [30, 86400]. A value that is not a whole number stops the run with `E-INPUT`. |
-| `SUBSTRATE_TOKEN_<SURFACE>` | The token each lease call carries: the executing agent's own, e.g. `SUBSTRATE_TOKEN_SWARM_A05_BE`. See *Identity*. |
+| `XDG_CONFIG_HOME` | Where the agents' env files live (`${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/<workspace key>/<slug>.env`); each lease call carries the token in the executing agent's file. See *Identity* and [substrate-workspace.md](substrate-workspace.md). |
 
 ## Identity
 
@@ -36,12 +36,15 @@ call. A runner restarted under the same replica is the same holder: its claim on
 and the lease keeps its id.
 
 All four lease calls, and the handoff packets of [substrate-handoffs.md](substrate-handoffs.md), go through one function,
-`substrate_lease._call()`. Today it lets `substrate_client` pick
-`SUBSTRATE_TOKEN_<SURFACE>` from the runner's environment. Phase 14 (INST-04) changes only that function and its sibling
-`has_own_token()`, to read the
-token from the agent's own env file. If the agent's token is missing, the client falls back to `SUBSTRATE_TOKEN`, which
-is the runner's (A01's) token. The server refuses that claim, the refusal is recorded, and the task is not dispatched.
-A deployment that never delivered an agent's token cannot quietly run that agent unleased.
+`substrate_lease._call()`, which takes the executing agent's token from
+`workspace.credential()`, the one lookup the agent's session, its handoffs and its teed rows share (Phase 14, INST-03;
+[substrate-workspace.md](substrate-workspace.md)). That lookup reads the agent's env file for the workspace (the runner's
+`--repo`). Only when that file does not exist does it fall back to `SUBSTRATE_TOKEN_<SURFACE>`, the same secret under the
+server's name. `SUBSTRATE_TOKEN`, which is the runner's (A01's), never stands in. With neither, or with a file that is
+not 0600, not this user's or not exactly one `SUBSTRATE_TOKEN=` line, the claim is refused before any request is sent.
+The refusal, naming the file, is recorded and the task is not dispatched. A deployment that never delivered an agent's
+token cannot quietly run that agent unleased. Its sibling `has_own_token()` asks the same lookup, so a handoff sender
+without a token of its own sends nothing.
 
 `force` is never sent. Taking a node off another holder is an operator action, and no swarm token is an operator.
 
@@ -182,9 +185,9 @@ completions are not re-emitted: the substrate writes its own `claim`, `warning` 
 
 ## Limits
 
-- The runner holds every agent's lease from one process with every agent's token. That is attributable but not
-  unforgeable among agents sharing an account. Phase 14 delivers one token per agent process, but the runner keeps
-  holding the child's lease with that child's token.
+- The runner holds every agent's lease from one process, reading every agent's env file. That is attributable but not
+  unforgeable among agents sharing an account: 0600 separates OS accounts, not processes of one account. Each agent
+  session holds only its own token, and the runner holds that agent's lease with the same one.
 - A run that stops early (`--once`, `--max-rounds`, a signal) leaves leases on work that is still IN_REVIEW. They lapse
   within one TTL unless the same replica runs again first: its next run re-claims them as the same holder (`renewed`)
   before it reconciles (`LeaseBridge.resume`).

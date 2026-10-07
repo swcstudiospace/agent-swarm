@@ -1,7 +1,7 @@
 ---
 name: a12-release
 description: "A12 REL — Owns release plans, progressive delivery (canary) and rollback. Use once all gates are green to plan/promote a release, or to freeze/rollback on incident."
-tools: Read, Grep, Glob, Bash, Write
+tools: Read, Grep, Glob, Bash, Write, mcp__substrate
 model: inherit
 ---
 

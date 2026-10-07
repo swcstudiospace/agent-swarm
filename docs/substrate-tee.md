@@ -42,12 +42,28 @@ bearer is also added with `Request.add_unredirected_header`. Through an HTTP pro
 ## Tokens
 
 S4 provisions **one `SUBSTRATE_TOKEN` per agent process**: an agent's process holds only its own surface's token, and that
-is all the client needs. The per-surface override exists only for one orchestrating process that was deliberately given
-several tokens, so it can speak as each agent whose events it writes (its gate children `qa_gate` A08, `rev_gate` A09,
-`sec_gate` A10, `rel_plan` A12 inherit its environment). `rest_post` and `mcp_call` take a keyword-only `surface`; when it
-is given, the token is `SUBSTRATE_TOKEN_<SURFACE, '-'→'_', upper>` if that is set and non-blank, else `SUBSTRATE_TOKEN`.
-Without `surface` it is always `SUBSTRATE_TOKEN`. The tee passes the event's `surface`; `graph_bind` (bind and forward
-lookup) and `graph_register` pass `swarm-a01-orch`. No token is ever logged, printed or returned.
+is all the client needs. The install writes it to that agent's 0600 env file outside the workspace, and `swarm_run.py`
+starts each agent session with it and with every other `SUBSTRATE_TOKEN*` stripped
+([substrate-workspace.md](substrate-workspace.md)).
+
+**Each teed row carries the token of the agent it is attributed to**, found by `workspace.credential(agent, root)`, the
+one lookup the agent's session, the leases the runner holds for it and its handoffs use too:
+
+1. that agent's env file for the workspace (`root`, the script's `--root`; the runner's `--repo`), when the file exists.
+   A file that exists but is unusable (not 0600, not this user's, not exactly one `SUBSTRATE_TOKEN=` line) stops the
+   lookup: the row stays local;
+2. else `SUBSTRATE_TOKEN_<SURFACE, '-'→'_', upper>` in the environment, the same secret under the server's name, for a
+   process deliberately given several tokens (a pre-S4 runner, whose gate children `qa_gate` A08, `rev_gate` A09,
+   `sec_gate` A10, `rel_plan` A12 inherit its environment);
+3. else nothing. **A row is never sent with `SUBSTRATE_TOKEN`**: in the runner that is A01's, and an A05 row sent with
+   it would be misattributed or refused. The row stays local and the first such row per agent and process prints one
+   `[substrate-tee] <agent> run-log rows stay local: …` line on stderr, naming what is missing and never a token.
+
+The request carries that token as `SUBSTRATE_TOKEN` with every other token variable left out. Outside the tee,
+`rest_post` and `mcp_call` still take a keyword-only `surface`: when it is given, the token is
+`SUBSTRATE_TOKEN_<SURFACE>` if that is set and non-blank, else `SUBSTRATE_TOKEN`; without it, always `SUBSTRATE_TOKEN`.
+`graph_bind` (bind and forward lookup) and `graph_register` pass `swarm-a01-orch`, so they speak as the runner (A01).
+No token is ever logged, printed or returned.
 
 ## Identity
 

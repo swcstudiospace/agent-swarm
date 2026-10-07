@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import pytest
 
 from swarm import substrate_client, substrate_handoff as hand_mod, substrate_lease as lease_mod, substrate_tee as tee_mod
+from swarm import workspace as ws_mod
+from swarm.manifest import load_manifest
 from swarm.results import reconcile
 from swarm.taskstore import TaskStore
 from swarm.verdicts import record_gate_verdicts
@@ -117,13 +119,22 @@ class FakeHandoffSubstrate(FakeSubstrate):
         return {"events": rows[: a.get("limit", 100)], "count": len(rows)}
 
 
+def _deliver(workspace) -> None:
+    """Every agent's token where S4 puts it: its env file for `workspace`."""
+    for agent in load_manifest():
+        ws_mod.write_token(ws_mod.env_file(workspace, agent["slug"]), f"tok-{tee_mod.AGENT_SURFACES[agent['id']]}")
+
+
 @pytest.fixture()
-def fake(monkeypatch):
+def fake(monkeypatch, tmp_path, tmp_path_factory):
     monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")
-    monkeypatch.setenv("SUBSTRATE_TOKEN", "tok-swarm-a01-orch")
-    for surface in tee_mod.AGENT_SURFACES.values():
-        monkeypatch.setenv("SUBSTRATE_TOKEN_" + surface.upper().replace("-", "_"), f"tok-{surface}")
+    monkeypatch.setenv("SUBSTRATE_TOKEN", "tok-swarm-a01-orch")  # the runner's own: it never signs for another agent
+    # each agent's token in its env file for the workspace (tmp_path). The config dir lies outside tmp_path, so the
+    # reconstruction guard below, which catches any read under tmp_path, sees only swarm state, never a credential.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("config")))
+    _deliver(tmp_path)
     f = FakeHandoffSubstrate()
+    f.workspace = tmp_path
     monkeypatch.setattr(substrate_client, "_open", f)
     return f
 
@@ -163,8 +174,9 @@ def _walk(store, tid, *states):
 
 def _bridges(store, events, env=None):
     emit = lambda t, p, **k: events.append((t, p))  # noqa: E731
-    leases = lease_mod.LeaseBridge(store.path, CORR, emit=emit, env=env)
-    return leases, hand_mod.HandoffBridge(store.path, CORR, emit=emit, env=env, leases=leases)
+    root = store.path.parent.parent  # the workspace whose agent env files the fixture wrote
+    leases = lease_mod.LeaseBridge(store.path, CORR, emit=emit, root=root, env=env)
+    return leases, hand_mod.HandoffBridge(store.path, CORR, emit=emit, root=root, env=env, leases=leases)
 
 
 def _types(events):
@@ -215,6 +227,8 @@ def _hotfix_escalated(tmp_path, fake):
 # --- HAND-01: the sender signs, as itself ---------------------------------------------------------------------------
 def test_each_boundary_is_written_by_its_sender_and_a05_cannot_sign_as_a14(tmp_path, fake):
     store, leases, handoffs, events = _hotfix_escalated(tmp_path, fake)
+    # INST-03: the runner's environment holds only its own token; each sender signs with its env file's
+    assert not [k for k in os.environ if k.startswith("SUBSTRATE_TOKEN_")]
     calls = [c for c in fake.at("coord_handoff")]
     assert [(c["caller"], c["args"]["to"]) for c in calls] == [
         ("swarm-a14-maint", "swarm-a05-be"),  # dependency: A14's rca → A05's patch
@@ -240,7 +254,11 @@ def test_a_sender_without_its_own_token_writes_nothing_rather_than_writing_as_th
     _task(store, "T-arch", "A03")
     _walk(store, "T-arch", "CLAIMED", "IN_PROGRESS", "IN_REVIEW")
     task = _task(store, "T-be", "A05", deps=["T-arch"])
-    monkeypatch.delenv("SUBSTRATE_TOKEN_SWARM_A03_ARCH")  # SUBSTRATE_TOKEN (A01's) is still there to fall back on
+    # A03's token was never delivered: no env file and no SUBSTRATE_TOKEN_SWARM_A03_ARCH. SUBSTRATE_TOKEN (A01's) is
+    # still there to fall back on, and must not be used.
+    ws_mod.env_file(fake.workspace, "a03-architect").unlink()
+    assert not lease_mod.has_own_token("A03", fake.workspace, os.environ)
+    assert lease_mod.has_own_token("A05", fake.workspace, os.environ)  # its env file: the same lookup as its session
     _, handoffs = _bridges(store, events)
     assert handoffs.dispatched(task, "A05") == ["refused"]
     assert fake.at("coord_handoff") == [] and fake.handoffs == []
@@ -254,7 +272,7 @@ def test_a_token_configured_under_another_agents_name_is_reported(tmp_path, fake
     store, events = _store(tmp_path), []
     _task(store, "T-arch", "A03")
     task = _task(store, "T-be", "A05", deps=["T-arch"])
-    monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A03_ARCH", "tok-swarm-a09-rev")
+    ws_mod.write_token(ws_mod.env_file(fake.workspace, "a03-architect"), "tok-swarm-a09-rev")
     _, handoffs = _bridges(store, events)
     assert handoffs.dispatched(task, "A05") == ["sent"]
     assert _packets(fake)[0]["from"]["surface"] == "swarm-a09-rev"  # the ledger says who really sent it
@@ -322,7 +340,7 @@ def test_the_rework_cap_hands_the_lease_over_with_the_packet(tmp_path, fake):
     mirror = store.get("H-patch")["notes_json"]["lease"]
     assert mirror["state"] == "released" and mirror["action"] == "handover"
     # and A14 can now claim the node it was handed
-    claim, _ = lease_mod.claim_node("A14", GID, "H-patch", ttl_s=900)
+    claim, _ = lease_mod.claim_node("A14", GID, "H-patch", ttl_s=900, workspace=fake.workspace)
     assert claim.status == "held"
 
 
@@ -356,7 +374,7 @@ def test_a14_rebuilds_the_patch_from_the_handoff_list_and_the_event_query_alone(
     before = len(fake.calls)
     _GUARD.update(on=True, roots=(str(sdir), str(tmp_path)), seen=[])
     try:
-        ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14")
+        ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14", workspace=fake.workspace)
     finally:
         _GUARD["on"] = False
     assert _GUARD["seen"] == []
@@ -381,7 +399,7 @@ def test_a14_rebuilds_the_patch_from_the_handoff_list_and_the_event_query_alone(
 def test_a_packet_that_does_not_verify_is_listed_but_never_shapes_the_context(tmp_path, fake):
     _hotfix_escalated(tmp_path, fake)
     fake.handoffs[-1]["packet"]["from"] = {"surface": "swarm-a14-maint", "session_id": None}  # tampered in storage
-    ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14")
+    ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14", workspace=fake.workspace)
     assert ctx.packets[-1]["trust"] == "rejected" and ctx.packets[-1]["verdict"]["reason"] == "bad-signature"
     assert ctx.goal.startswith("Rework H-patch work") and ctx.blockers == ["quality [major] second failure (src/patch.py)"]
     assert "1 packet(s) failed verification and were ignored" in hand_mod.render(ctx)
@@ -389,7 +407,7 @@ def test_a_packet_that_does_not_verify_is_listed_but_never_shapes_the_context(tm
 
 def test_an_unanswered_ledger_rebuilds_nothing(tmp_path, fake):
     fake.down = True
-    ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14")
+    ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14", workspace=fake.workspace)
     assert ctx.status == "unreachable" and ctx.packets == [] and hand_mod.render(ctx) == ""
 
 
@@ -411,6 +429,7 @@ def test_with_no_handoff_key_packets_are_unsigned_say_so_and_the_run_completes(t
     monkeypatch.setattr(runner, "run_agent_headless", session)
     repo = tmp_path / "work"
     repo.mkdir()
+    _deliver(repo)  # the run's workspace is its --repo: the runner reads the agents' env files for it
     args = _args(repo=str(repo), max_parallel=2, max_rounds=10, once=False)
     args.runtime, args.grok_bin = "grok", sys.executable  # any executable: the sessions are stubbed
     ctx = SimpleNamespace(correlation_id=CORR, emit=lambda t, p, **k: events.append((t, p)))
@@ -422,7 +441,7 @@ def test_with_no_handoff_key_packets_are_unsigned_say_so_and_the_run_completes(t
         ("handoff.unsigned", "dispatch@T-be/dep:T-arch")]
     assert "UNSIGNED (no handoff key on the substrate)" in prompts["T-be"]
     assert "- the endpoint answers" in prompts["T-be"] and "## Handoffs" not in prompts["T-arch"]
-    ctx2 = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    ctx2 = hand_mod.reconstruct(GID, "T-be", agent="A05", workspace=repo)
     assert ctx2.signed is False and ctx2.packets[0]["trust"] == "unsigned" and ctx2.dod == ["the endpoint answers"]
 
 
@@ -434,7 +453,7 @@ def test_a_rerun_writes_no_second_packet_for_one_boundary(tmp_path, fake):
     task = _task(store, "T-be", "A05", deps=["T-arch"])
     # another agent quoting the boundary does not suppress the real sender's packet
     lease_mod._call("coord_handoff", {"to": "swarm-a05-be", "goal": "noise", "graph_id": GID, "node_id": "T-be",
-                                      "notes": "boundary: dispatch@T-be/dep:T-arch"}, "swarm-a09-rev", os.environ)
+                                      "notes": "boundary: dispatch@T-be/dep:T-arch"}, "A09", fake.workspace, os.environ)
     _, first = _bridges(store, events)
     assert first.dispatched(task, "A05") == ["sent"]
     assert first.dispatched(task, "A05") == ["duplicate"]  # a rework or retry of the task

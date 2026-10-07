@@ -23,7 +23,7 @@ import pytest
 
 from conftest import ROOT, run_script
 
-from swarm import runlog, substrate_client, substrate_tee as tee_mod
+from swarm import runlog, substrate_client, substrate_tee as tee_mod, workspace
 
 GID_A = "ut-mabc123-0123abcd"
 GID_B = "ut-mxyz789-89abcdef"
@@ -111,9 +111,14 @@ def _env(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def on(monkeypatch):
+def on(monkeypatch, tmp_path):
     monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787/")
     monkeypatch.setenv("SUBSTRATE_TOKEN", TOKEN)
+    # a row goes out only with its own agent's token (workspace.credential), never with SUBSTRATE_TOKEN: here every agent
+    # has one under the server's name, and no env files exist (XDG_CONFIG_HOME is an empty tmp dir)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    for surface in tee_mod.AGENT_SURFACES.values():
+        monkeypatch.setenv(workspace.server_var(surface), TOKEN)
 
 
 @pytest.fixture()
@@ -302,13 +307,41 @@ def test_redirect_is_not_followed(monkeypatch, http_server):
 
 
 @pytest.mark.parametrize("own", [None, "", "   "])
-def test_surface_token_falls_back_when_unset_or_blank(tmp_path, on, fake, monkeypatch, own):
+def test_a_row_without_its_agents_token_stays_local(tmp_path, on, fake, monkeypatch, capsys, own):
+    # no env file and no (or a blank) SUBSTRATE_TOKEN_SWARM_A08_QA: the row is not sent with SUBSTRATE_TOKEN, the
+    # runner's (A01's) own token, which would misattribute it; the first such row says so once
+    monkeypatch.delenv("SUBSTRATE_TOKEN_SWARM_A08_QA")
     if own is not None:
         monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A08_QA", own)
     fake.bindings[CORR] = GID_A
+    rec = _emit(tmp_path, typ="script.qa_gate", source="A08@qa_gate", task_id=None)
     _emit(tmp_path, typ="script.qa_gate", source="A08@qa_gate", task_id=None)
-    assert fake.at("/events")[0]["headers"]["authorization"] == f"Bearer {TOKEN}"
+    assert rec["type"] == "script.qa_gate" and fake.at("/events") == []
+    err = capsys.readouterr().err
+    assert err.count("A08 run-log rows stay local") == 1 and TOKEN not in err
     assert substrate_client._token({"SUBSTRATE_TOKEN": " t "}, "swarm-a08-qa") == "t"
+
+
+def test_a_row_goes_out_with_its_agents_env_file_token(tmp_path, on, fake, monkeypatch):
+    # an S4 runner: only A01's token in the environment, and A05's in A05's env file for this workspace
+    for surface in tee_mod.AGENT_SURFACES.values():
+        monkeypatch.delenv(workspace.server_var(surface))
+    a05 = "a05-env-file-token-0123456789"
+    workspace.write_token(workspace.env_file(tmp_path, "a05-backend"), a05)
+    fake.bindings[CORR] = GID_A
+    _emit(tmp_path)  # source A05@code_checks
+    (sent,) = fake.at("/events")
+    assert sent["headers"]["authorization"] == f"Bearer {a05}"
+    assert sent["body"]["surface"] == "swarm-a05-be"
+
+
+def test_a_bad_env_file_is_not_bypassed_by_the_surface_variable(tmp_path, on, fake):
+    path = workspace.env_file(tmp_path, "a05-backend")
+    workspace.write_token(path, "a05-env-file-token-0123456789")
+    path.chmod(0o644)  # readable by others: refused, and SUBSTRATE_TOKEN_SWARM_A05_BE is not tried instead
+    fake.bindings[CORR] = GID_A
+    _emit(tmp_path)
+    assert fake.at("/events") == []
 
 
 def test_surface_token_override_wins_and_never_leaks(tmp_path, on, fake, monkeypatch, capsys):

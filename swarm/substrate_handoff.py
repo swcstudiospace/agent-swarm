@@ -215,7 +215,7 @@ class HandoffBridge:
         with self._lock:
             if self._known is not None:
                 return self._known
-        got = substrate_lease._call("coord_handoff_list", {"graph_id": graph}, substrate_tee.ORCH_SURFACE, self.env)
+        got = substrate_lease._call("coord_handoff_list", {"graph_id": graph}, ORCH, self.root, self.env)
         if got.status != "ok" or not isinstance(got.value, list):
             return None
         keys: set[tuple[str, str]] = set()
@@ -265,9 +265,10 @@ class HandoffBridge:
         graph = self.graph_id()
         if graph is None:
             return self._unsent(b, "no Graph ID is bound to this run")
-        # The sender is whoever the token is. On the fallback token the packet would be recorded, and signed, as the
-        # runner's, which is a false attribution with a valid seal on it.
-        if not substrate_lease.has_own_token(sender_surface, self.env):
+        # The sender is whoever the token is. On the runner's SUBSTRATE_TOKEN the packet would be recorded, and signed,
+        # as the runner's, which is a false attribution with a valid seal on it: a sender without its own token (its
+        # env file for this workspace, else its SUBSTRATE_TOKEN_<SURFACE>; workspace.credential) sends nothing.
+        if not substrate_lease.has_own_token(b.sender, self.root, self.env):
             return self._refused(b, f"no token of its own for {sender_surface}: the packet would be recorded as the "
                                     "runner's")
         known = self._ledger_keys(graph)
@@ -286,7 +287,7 @@ class HandoffBridge:
             args["to_session_id"] = substrate_tee.session_id(b.receiver, graph, self.env)
         if b.lease is not None:  # released by the server only once the packet is durable; the packet never holds the id
             args.update(lease_id=b.lease.lease_id, release_lease=True)
-        got = substrate_lease._call("coord_handoff", args, sender_surface, self.env)
+        got = substrate_lease._call("coord_handoff", args, b.sender, self.root, self.env)
         reply = got.value if got.status == "ok" and isinstance(got.value, dict) else None
         if reply is None or reply.get("stored") is not True:
             with self._lock:
@@ -406,7 +407,7 @@ class HandoffBridge:
         nothing to show or the substrate does not answer."""
         try:
             graph = self.graph_id()
-            return render(reconstruct(graph, task_id, agent=agent_id, env=self.env)) if graph else ""
+            return render(reconstruct(graph, task_id, agent=agent_id, workspace=self.root, env=self.env)) if graph else ""
         except Exception:  # noqa: BLE001 - fail open: the prompt keeps its Task Store sections
             return ""
 
@@ -433,21 +434,20 @@ class Context:
     detail: str = ""
 
 
-def reconstruct(graph_id: str, node_id: str, *, agent: str, env: Mapping[str, str] | None = None,
-                events_limit: int = EVENTS_LIMIT) -> Context:
+def reconstruct(graph_id: str, node_id: str, *, agent: str, workspace: str | Path | None = None,
+                env: Mapping[str, str] | None = None, events_limit: int = EVENTS_LIMIT) -> Context:
     """Rebuild `node_id`'s context as agent `agent` from two substrate reads, `coord_handoff_list` and `events_query`,
     and nothing else: no Task Store, no run log, no bus, no local cache (HAND-02). A packet whose signature does not
-    verify is listed and never shapes the context."""
+    verify is listed and never shapes the context. The reads carry `agent`'s own token for `workspace`."""
     e = os.environ if env is None else env
-    surface = substrate_tee.AGENT_SURFACES.get(agent)
-    if surface is None:  # the reads go as the receiver, on its own token
+    if substrate_tee.AGENT_SURFACES.get(agent) is None:  # the reads go as the receiver, on its own token
         raise ValueError(f"no substrate surface for agent {agent!r}")
-    listed = substrate_lease._call("coord_handoff_list", {"graph_id": graph_id}, surface, e)
+    listed = substrate_lease._call("coord_handoff_list", {"graph_id": graph_id}, agent, workspace, e)
     if listed.status != "ok" or not isinstance(listed.value, list):
         return Context("error" if listed.status == "ok" else listed.status, graph_id, node_id,
                        detail=listed.detail or "coord_handoff_list gave no list")
     queried = substrate_lease._call("events_query", {"graph_id": graph_id, "node_id": node_id, "order": "desc",
-                                                     "limit": events_limit}, surface, e)
+                                                     "limit": events_limit}, agent, workspace, e)
     events = queried.value.get("events") if queried.status == "ok" and isinstance(queried.value, dict) else None
     packets = []
     for entry in listed.value:

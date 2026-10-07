@@ -1,7 +1,7 @@
 ---
 name: a08-qa
 description: "A08 QA — Quality gate. Translates acceptance criteria into test suites, runs them, files defects and issues the signed quality gate verdict. Never modifies product code."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

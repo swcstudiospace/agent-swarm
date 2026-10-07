@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "server": "substrate",
+  "runtimes": {
+    "claude": {
+      "path": ".mcp.json",
+      "format": "json"
+    },
+    "omp": {
+      "path": ".mcp.json",
+      "format": "json"
+    },
+    "grok": {
+      "path": ".grok/config.toml",
+      "format": "toml"
+    }
+  },
+  "json": {
+    "type": "http",
+    "url": "${SUBSTRATE_URL}/mcp",
+    "headers": {
+      "Authorization": "Bearer ${SUBSTRATE_TOKEN}"
+    }
+  },
+  "toml": {
+    "entry": {
+      "url": "${SUBSTRATE_URL}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SUBSTRATE_TOKEN}"
+      }
+    },
+    "block": "# substrate-mcp, projected by agent-substrate packages/projector. The token is named here, never written.\n[mcp_servers.substrate]\nurl = \"${SUBSTRATE_URL}/mcp\"\nheaders = { Authorization = \"Bearer ${SUBSTRATE_TOKEN}\" }\n"
+  }
+}

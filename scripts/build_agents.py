@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate Claude Code and Grok Build subagent definitions from agents.json + prompts/.
 
-Claude: .claude/agents/<slug>.md  (name, description, tools, model: inherit)
+Claude: .claude/agents/<slug>.md  (name, description, tools incl. mcp__substrate, model: inherit)
 Grok:   .grok/agents/<slug>.md    (prompt_mode, permission_mode, agents_md)
 omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, output)
         omp/skills/<slug>/SKILL.md
@@ -9,6 +9,9 @@ omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, outp
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
+                               [--runtimes claude,grok,omp | --no-substrate]
+The install also wires substrate-mcp (scripts/_install_substrate.py): the `substrate` MCP entry for each runtime and one
+0600 env file per agent holding its SUBSTRATE_TOKEN, read from SUBSTRATE_TOKEN_<SURFACE> (docs/substrate-workspace.md).
 """
 from __future__ import annotations
 import argparse
@@ -23,6 +26,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
 from _write_skills import omp_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
 import _install_omp  # noqa: E402
+import _install_substrate  # noqa: E402
+from swarm.workspace import CLAUDE_TOOLS  # noqa: E402
 
 CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
@@ -83,7 +88,9 @@ def _desc(agent: dict) -> str:
 
 def render_claude(agent: dict, defaults: dict) -> str:
     del defaults  # model is always inherit for dual-runtime files
-    tools = ", ".join(agent["tools"])
+    # the agent's tools list is also what a Claude session may call, so the substrate server's tools are named here or
+    # stay invisible however the runner wires the server (a workspace without it simply has none to offer)
+    tools = ", ".join([*agent["tools"], CLAUDE_TOOLS])
     desc = _desc(agent)
     fm = [
         "---",
@@ -312,12 +319,20 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="fail if generated output differs from disk")
     ap.add_argument("--only", help="comma list of agent ids/slugs")
-    ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, plus the omp package")
+    ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, the omp package, and the substrate-mcp wiring")
     ap.add_argument("--omp-mode", choices=("link", "copy"), help="omp step of --install-workspace: link the package (default) or copy agents and skills only (no tools, no guard)")
     ap.add_argument("--dry-run", action="store_true", help="with --install-workspace: print the plan and the config diff, write nothing")
+    ap.add_argument("--runtimes", help="with --install-workspace: the runtimes that will execute swarm nodes here, each wired to "
+                                       f"substrate-mcp (default {','.join(_install_substrate.RUNTIMES)}); a runtime that cannot call MCP is refused")
+    ap.add_argument("--no-substrate", action="store_true", help="with --install-workspace: no substrate-mcp entries and no agent env files "
+                                                                "(the swarm then runs with the substrate integration off)")
     args = ap.parse_args()
-    if (args.omp_mode or args.dry_run) and not args.install_workspace:
-        ap.error("--omp-mode and --dry-run need --install-workspace")
+    if (args.omp_mode or args.dry_run or args.runtimes or args.no_substrate) and not args.install_workspace:
+        ap.error("--omp-mode, --dry-run, --runtimes and --no-substrate need --install-workspace")
+    if args.runtimes and args.no_substrate:
+        ap.error("--runtimes wires substrate-mcp; it cannot be combined with --no-substrate")
+    runtimes = ([r.strip() for r in args.runtimes.split(",") if r.strip()] if args.runtimes
+                else list(_install_substrate.RUNTIMES))
     workspace = Path(args.install_workspace).expanduser().resolve() if args.install_workspace else None
     mode = args.omp_mode or "link"
     if workspace:
@@ -336,13 +351,18 @@ def main() -> int:
                     f"error: refusing to install into {workspace}: {'; '.join(unsafe)}; "
                     "the installer never writes through a symlink. Nothing was written."
                 )
+        if not problem and not args.no_substrate:
+            # INST-03/04: a refused runtime, an unreadable config or a missing token stops the install here, before
+            # generation or any write; a dry run prints its plan and the missing tokens instead
+            problem = _install_substrate.preflight(workspace, runtimes, tokens=not args.dry_run)
         if problem:
             print(problem, file=sys.stderr)
             return 2
         if args.dry_run:
             print("dry-run: skipping generation; the files below are copied as they are on disk")
             install_workspace(workspace, dry_run=True)
-            return _install_omp.install_omp(workspace, mode, True, sys.stdout)
+            substrate = 0 if args.no_substrate else _install_substrate.install_substrate(workspace, runtimes, True, sys.stdout)
+            return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout))
     manifest_raw = json.loads((ROOT / "agents.json").read_text())
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
@@ -379,6 +399,9 @@ def main() -> int:
         print("refused to remove (symlink or outside omp/): " + ", ".join(str(p.relative_to(ROOT)) for p in refused), file=sys.stderr)
         return 1
     if workspace:
+        # the substrate step first: its env files live outside the workspace, so a failure there writes nothing in it
+        if not args.no_substrate and _install_substrate.install_substrate(workspace, runtimes, False, sys.stdout):
+            return 2
         install_workspace(workspace)
         print(f"installed Claude/Grok agents, skills and hook into {workspace}")
         return _install_omp.install_omp(workspace, mode, False, sys.stdout)

@@ -1,7 +1,7 @@
 ---
 name: a07-data
 description: "A07 DATA — Owns data models, schema migrations (expand/contract, reversible) and data contracts. Use for any persistence, migration or pipeline change."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

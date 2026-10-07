@@ -11,12 +11,13 @@ import re
 import secrets
 import sqlite3
 import subprocess
+import sys
 import time
 from contextlib import closing
 from pathlib import Path
 from typing import Mapping
 
-from . import substrate_client
+from . import substrate_client, workspace
 from .paths import swarm_dir
 
 # --- identity ----------------------------------------------------------------------------------------------
@@ -262,11 +263,17 @@ def lookup_graph_id(correlation_id: str, *, root: str | Path | None = None, env:
 
 
 def reset() -> None:
-    """Forget the in-process negative lookups, memoized repo slugs and prune clock (tests; a long-lived process)."""
+    """Forget the in-process negative lookups, memoized repo slugs, unsent-agent notes and prune clock (tests; a
+    long-lived process)."""
     global _last_prune
     _unbound.clear()
     _SLUGS.clear()
+    _UNSENT.clear()
     _last_prune = None
+
+
+# agent -> why its run-log rows stay local (no token of its own); reported once per process
+_UNSENT: dict[str, str] = {}
 
 
 def _claim(root: str | Path | None, surface: str, msg_id: str) -> bool:
@@ -359,13 +366,24 @@ def build_event(record: Mapping, graph_id: str, *, env: Mapping[str, str] | None
 
 
 def tee(record: Mapping, ctx_root: str | Path | None = None, *, env: Mapping[str, str] | None = None) -> bool:
-    """Send one run-log record to substrate. True only when substrate accepted a new event. Never raises."""
+    """Send one run-log record to substrate. True only when substrate accepted a new event. Never raises.
+
+    The record goes out with the token of the agent it is attributed to, from `workspace.credential`: that agent's env
+    file for the workspace `ctx_root`, else its SUBSTRATE_TOKEN_<SURFACE>, else nowhere. It is never sent with this
+    process's SUBSTRATE_TOKEN, which in the runner is A01's: an A05 row sent with it would be misattributed or refused.
+    A row with no token of its own stays local, and the first one per agent says so on stderr (fail-open, recorded)."""
     try:
         e = os.environ if env is None else env
         if not substrate_client.enabled(e):
             return False
-        corr = record.get("correlation_id")
-        if not corr or agent_of(record) is None or kind_for(str(record.get("type"))) is None or not record.get("msg_id"):
+        corr, agent = record.get("correlation_id"), agent_of(record)
+        if not corr or agent is None or kind_for(str(record.get("type"))) is None or not record.get("msg_id"):
+            return False
+        token, _source, problem = workspace.credential(agent, ctx_root, e)
+        if token is None:
+            if agent not in _UNSENT:
+                _UNSENT[agent] = problem
+                print(f"[substrate-tee] {agent} run-log rows stay local: no token of its own ({problem})", file=sys.stderr)
             return False
         graph_id = lookup_graph_id(corr, root=ctx_root, env=e)
         if graph_id is None:  # unbound run: skip, never invent a Graph ID here
@@ -375,7 +393,8 @@ def tee(record: Mapping, ctx_root: str | Path | None = None, *, env: Mapping[str
             return False
         if not _claim(ctx_root, body["surface"], record["msg_id"]):
             return False
-        got = substrate_client.rest_post("/events", body, e, surface=body["surface"])
+        own = {k: v for k, v in e.items() if not workspace.carries_token(k)}
+        got = substrate_client.rest_post("/events", body, {**own, workspace.TOKEN: token})
         if got is not None and 200 <= got[0] < 300:
             _mark_sent(ctx_root, body["surface"], record["msg_id"])
             return True

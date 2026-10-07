@@ -1,7 +1,7 @@
 ---
 name: a10-security
 description: "A10 SEC — Security gate. Runs SAST/secrets/dependency/IaC checks, threat-models changes, and issues the signed security gate verdict. Fail-closed; can never accept risk itself."
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, mcp__substrate
 model: inherit
 ---
 
