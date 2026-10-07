@@ -86,6 +86,11 @@ TYPE_KINDS: dict[str, str] = {
     "lease.refused": "warning",                # the server refused this agent's claim (token / session): not dispatched
     "lease.lost": "warning",                   # a refused heartbeat stopped a session or dropped a held lease
     "lease.unsettled": "warning",              # a release or completion did not land; the lease is left to lapse
+    # the runner's handoff packets (substrate_handoff.py); a packet that lands is written by the server as `handoff`
+    "handoff.unsent": "warning",               # the substrate did not take a boundary's packet: retried next round
+    "handoff.refused": "warning",              # refused, or the sender has no token of its own: not written, not retried
+    "handoff.unsigned": "warning",             # the substrate has no handoff key: packets are recorded unsigned (once a run)
+    "handoff.misattributed": "warning",        # the ledger recorded the packet under another surface than its sender's
 }
 # `script.<name>` and `script.<name>.error` are the exit record of one agent script run -> tool.call.
 PREFIX_KINDS: tuple[tuple[str, str], ...] = (("script.", "tool.call"),)

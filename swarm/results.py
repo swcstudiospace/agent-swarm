@@ -263,12 +263,15 @@ def _unaccepted_gates(store: TaskStore, tid: str, reasons: dict[str, str]) -> di
     return out
 
 
-def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None) -> list[str]:
+def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates.
 
     `leases` is the runner's substrate_lease.LeaseBridge, or None (ingest, dry runs, substrate off). It is told about
     each transition here that changes who may hold the node: DONE completes it, CHANGES_REQUESTED releases and re-claims
-    it for the rework, ESCALATED releases it (LEASE-07)."""
+    it for the rework, ESCALATED releases it (LEASE-07). `handoffs` is the runner's substrate_handoff.HandoffBridge, or
+    None likewise. It writes a packet at each transition here that changes the accountable agent: a failing gate hands
+    the rework to the producer, and ESCALATED hands the task on (HAND-01). It goes first, so an escalation hands over
+    the lease with its packet before `settle` would release it."""
     notes_log = []
     for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
         tid = t["task_id"]
@@ -281,11 +284,16 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None) -> list[str]
                 emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": failing,
                                             "options": ["human review", "cancel", "waive gate (L3)"]})
                 notes_log.append(f"{tid}: ESCALATED after {before} rework loops")
+                if handoffs is not None:
+                    handoffs.escalated(tid, reason=f"the rework cap was reached with gates {failing} failing",
+                                       failing=failing, verdicts=latest)
                 if leases is not None:
                     leases.settle(tid)
             else:
                 store.transition(tid, S.IN_PROGRESS, reason="rework loop")
                 notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
+                if handoffs is not None:  # the verdict rows read above: the transition made them stale
+                    handoffs.gate_failed(tid, failing, latest, rework=nt["rework_loops"])
                 if leases is not None:  # the rework is a new hold, visible in the trail, not a silent re-run
                     leases.rework(tid)
                 # reopen gate tasks that target this task so they re-run after rework: one rerun per gate lineage

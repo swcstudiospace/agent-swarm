@@ -1159,6 +1159,7 @@ def test_run_resumes_review_leases_before_the_first_reconcile(tmp_path, monkeypa
             calls.append("close")
 
     monkeypatch.setattr(runner, "lease_bridge", lambda *a, **k: Bridge())
+    monkeypatch.setattr(runner, "handoff_bridge", lambda *a, **k: None)  # handoffs are not what this test is about
     monkeypatch.setattr(runner, "reconcile", lambda *a, **k: calls.append("reconcile") or [])
     store = _store(tmp_path)
     _plan(store)

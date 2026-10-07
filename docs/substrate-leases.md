@@ -35,8 +35,10 @@ A05 are therefore two holders (`A05@r1:…`, `A05@r2:…`), and the session is d
 call. A runner restarted under the same replica is the same holder: its claim on its own still-live lease is `renewed`,
 and the lease keeps its id.
 
-All four lease calls go through one function, `substrate_lease._call()`. Today it lets `substrate_client` pick
-`SUBSTRATE_TOKEN_<SURFACE>` from the runner's environment. Phase 14 (INST-04) changes only that function, to read the
+All four lease calls, and the handoff packets of [substrate-handoffs.md](substrate-handoffs.md), go through one function,
+`substrate_lease._call()`. Today it lets `substrate_client` pick
+`SUBSTRATE_TOKEN_<SURFACE>` from the runner's environment. Phase 14 (INST-04) changes only that function and its sibling
+`has_own_token()`, to read the
 token from the agent's own env file. If the agent's token is missing, the client falls back to `SUBSTRATE_TOKEN`, which
 is the runner's (A01's) token. The server refuses that claim, the refusal is recorded, and the task is not dispatched.
 A deployment that never delivered an agent's token cannot quietly run that agent unleased.
@@ -52,7 +54,7 @@ A deployment that never delivered an agent's token cannot quietly run that agent
 | Session running, gate script running, and the task waiting in review | `graph_heartbeat` every TTL/3 | One keeper thread per run beats every held lease, not only the leases of running sessions. |
 | `DONE` (`reconcile`, after APPROVED) | `graph_complete`, fenced on the held `lease_id` | A process with no lease in memory claims first as the producer (`renewed` if its lease is live), then completes. |
 | `CHANGES_REQUESTED` → rework (`reconcile`) | `graph_release`, then `graph_claim` | The trail reads `released` then `claim`, so the rework loop is visible. The rework dispatch reuses the new lease. |
-| `FAILED`, `BLOCKED`, `ESCALATED` (`execute_one`'s `finally`, `reconcile`) | `graph_release`, fenced | `execute_one` settles only after the session's and the gate script's process groups are gone. |
+| `FAILED`, `BLOCKED`, `ESCALATED` (`execute_one`'s `finally`, `reconcile`) | `graph_release`, fenced | `execute_one` settles only after the session's and the gate script's process groups are gone. An `ESCALATED` producer still holding the node (the rework cap is reached in review) hands the lease over inside its `coord_handoff` packet instead (`release_lease`), and the mirror reads `released` with action `handover`. |
 | `CANCELLED` or any manual transition (`orch_status --transition`) | `graph_release` (or `graph_complete` for DONE) with the `lease_id` mirrored in `notes.lease` | Not while a runner still works the task (`notes.running` set): see *A task that moves on elsewhere*. A live runner's keeper also settles a task that left the holding states, on its next beat. |
 
 The producer's lease is held **through review**: it is not released at IN_REVIEW. LEASE-07 has DONE go through
@@ -186,5 +188,5 @@ completions are not re-emitted: the substrate writes its own `claim`, `warning` 
 - A run that stops early (`--once`, `--max-rounds`, a signal) leaves leases on work that is still IN_REVIEW. They lapse
   within one TTL unless the same replica runs again first: its next run re-claims them as the same holder (`renewed`)
   before it reconciles (`LeaseBridge.resume`).
-- The in-session path (`orch_status --ingest`) does not lease in this phase, and `coord_handoff` packets at
-  accountable-agent boundaries are Phase 13.
+- The in-session path (`orch_status --ingest`) does not lease in this phase. `coord_handoff` packets at
+  accountable-agent boundaries are in [substrate-handoffs.md](substrate-handoffs.md).

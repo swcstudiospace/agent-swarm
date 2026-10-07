@@ -120,10 +120,18 @@ class Lease:
 
 
 def _call(tool: str, arguments: dict, surface: str, env: Mapping[str, str]) -> substrate_client.Outcome:
-    """Every lease call goes through here, as `surface`, so it carries that agent's token. Today the token is
-    SUBSTRATE_TOKEN_<SURFACE> from the runner's own environment (substrate_client._token). Phase 14 (INST-04) changes only
-    this function, to take it from the agent's env file."""
+    """Every lease call, and every handoff call (substrate_handoff.py), goes through here as `surface`, so it carries
+    that agent's token. Today the token is SUBSTRATE_TOKEN_<SURFACE> from the runner's own environment
+    (substrate_client._token). Phase 14 (INST-04) changes only this function and `has_own_token`, to take it from the
+    agent's env file."""
     return substrate_client.mcp_call_outcome(tool, arguments, env, surface=surface)
+
+
+def has_own_token(surface: str, env: Mapping[str, str]) -> bool:
+    """Whether `_call` as `surface` carries that surface's own token rather than the fallback SUBSTRATE_TOKEN, which
+    is the runner's (A01's). A claim made on the fallback is refused by the server, because the claim names its
+    surface; a handoff names none (the sender is whoever the token says), so a handoff checks this first."""
+    return bool(substrate_client.own_token(env, surface))
 
 
 # --- the four calls, one node at a time ---------------------------------------------------------------------
@@ -585,6 +593,15 @@ class LeaseBridge:
         except Exception as exc:  # noqa: BLE001
             self.emit("lease.unsettled", {"task_id": task_id, "op": "settle", "reason": f"internal: {exc}"[:300]})
             return "error"
+
+    def handed_over(self, task_id: str) -> None:
+        """A `coord_handoff` with `release_lease` released this task's lease once its packet was durable (Phase 13).
+        Stop beating it and record the release, so `settle` does not release it a second time."""
+        with self._lock:
+            lease = self._held.pop(task_id, None)
+            self._lost.pop(task_id, None)
+        if lease is not None:
+            _mirror(self._store(), task_id, state="released", action="handover", **_ident(lease))
 
     def rework(self, task_id: str) -> Claim:
         """CHANGES_REQUESTED (LEASE-07): release the producer's lease and claim the node again, so the rework loop reads
