@@ -88,8 +88,10 @@ can never produce two entries, and a different `attempt`, text, subject, scope o
 replays a *refused* key (only an `accepted` one), which is what makes a re-submit with a new `expected_version` under the same key
 legitimate.
 
-The substrate gate never grants a `decision` at `agent:` scope (only `graph` and `repo`, and `global` as a review proposal), so a
-swarm `decision` written at scope `agent` comes back denied and raises `E-POLICY`. Use `graph` or `repo` scope for decisions.
+Under the substrate's default grants a `decision` at `agent:` scope is not granted (only `graph` and `repo`, and `global` as a
+review proposal), so a swarm `decision` written at scope `agent` comes back denied and raises `E-POLICY`; an operator grant in the
+substrate's `SUBSTRATE_MEMORY_GRANTS` can widen that. The client never refuses a write itself, it acts on the gate's verdict. Use
+`graph` or `repo` scope for decisions.
 
 ## Fail modes
 
