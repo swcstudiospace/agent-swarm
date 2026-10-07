@@ -6,6 +6,7 @@ Every agent script emits its inputs, outputs and verdicts here so the orchestrat
 from __future__ import annotations
 import json
 import time
+import uuid
 from pathlib import Path
 
 from .paths import swarm_dir
@@ -25,9 +26,15 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
         "correlation_id": correlation_id,
         "task_id": task_id,
         "payload": payload,
+        "msg_id": uuid.uuid4().hex,
     }
     with log_file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    try:  # substrate tee (ADR 0001 S1): after the local write, fail-open, a no-op without SUBSTRATE_URL
+        from .substrate_tee import tee
+        tee(record, root)
+    except Exception:  # noqa: BLE001 - the local log is the source of truth; the tee never disturbs it
+        pass
     return record
 
 
