@@ -199,13 +199,13 @@ def _exchange(opener: urllib.request.OpenerDirector, req: urllib.request.Request
             with opener.open(req, timeout=timeout) as resp:
                 got = _Response(int(resp.status), _read_upto(resp, MAX_BODY_BYTES + 1))
         except urllib.error.HTTPError as e:  # non-2xx (3xx included: never followed) is still an answer
-            try:
+            try:  # a failing or oversized error body is a failure like any other: it propagates and backs off
                 body = _read_upto(e, MAX_BODY_BYTES + 1)
-            except Exception:  # noqa: BLE001
-                body = b""
             finally:
                 e.close()
-            got = _Response(int(e.code), b"" if len(body) > MAX_BODY_BYTES else body)
+            if len(body) > MAX_BODY_BYTES:
+                raise ValueError("substrate reply larger than MAX_BODY_BYTES") from None
+            got = _Response(int(e.code), body)
     except Exception as exc:  # noqa: BLE001 - delivered to the caller, who decides
         got = exc
     finally:
@@ -286,11 +286,7 @@ def _request(url: str, body: dict, env: Mapping[str, str], accept: str, surface:
                     status = resp.getcode()
                 got = (int(status), data.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as e:  # an HTTP answer is still an answer (the real _open returns a non-2xx _Response)
-            try:
-                text = _read_capped(e).decode("utf-8", errors="replace")
-            except Exception:  # noqa: BLE001
-                text = ""
-            got = (int(e.code), text)
+            got = (int(e.code), _read_capped(e).decode("utf-8", errors="replace"))  # a bad body falls to the except below
     except Exception:  # noqa: BLE001 - fail open: nothing may escape this client
         got = None
     if got is None:  # network failure, deadline, oversized or malformed reply: back off

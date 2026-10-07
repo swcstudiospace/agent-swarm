@@ -30,7 +30,8 @@ marks the request dead and shuts the registered socket down (`SHUT_RDWR`), which
 body read in the worker at once; a connect that completes later is shut down and closed on the spot. Only a worker stuck in
 DNS (no socket yet) can outlive its deadline, and at most 4 workers (`MAX_IN_FLIGHT`) exist at once: with none free, a
 request fails immediately without starting a thread. The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is
-rejected. A deadline hit, socket error, no free worker or oversized reply counts as a network failure: the call returns
+rejected. A deadline hit, socket error, no free worker or oversized reply counts as a network failure, whatever the status
+(a non-2xx whose body cannot be read in time or is oversized included): the call returns
 None and all substrate calls of that process pause for 30 s, so a dead host costs one timeout, not one per emitted record.
 
 **Redirects.** Redirects are never followed: a 3xx is just a non-2xx answer, so the bearer is never re-sent anywhere. The

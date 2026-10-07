@@ -427,6 +427,94 @@ def test_real_reply_over_the_body_cap_is_a_failure(monkeypatch, http_server):
     assert substrate_client.rest_post("/events", {}) is None and len(hits) == 2  # backed off
 
 
+def test_real_error_reply_over_the_body_cap_backs_off(monkeypatch, http_server):
+    hits = []
+
+    class BigError(_Quiet):
+        def do_POST(self):
+            self._drain()
+            hits.append(1)
+            body = b"x" * 11
+            self.send_response(500)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    _point_at(monkeypatch, http_server(BigError))
+    monkeypatch.setattr(substrate_client, "MAX_BODY_BYTES", 10)
+    assert substrate_client.rest_post("/events", {}) is None
+    assert substrate_client.rest_post("/events", {}) is None and len(hits) == 1  # backed off
+
+
+def test_trickling_error_body_is_cut_at_the_deadline_and_backs_off(monkeypatch):
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(4)
+    lsock.settimeout(0.05)
+    stop, conns = threading.Event(), []
+
+    def serve(c):
+        try:
+            c.settimeout(2.0)
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\n\r\n")
+            while not stop.is_set():
+                time.sleep(0.05)
+                c.sendall(b"X")
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def accept():
+        while not stop.is_set():
+            try:
+                c, _ = lsock.accept()
+            except OSError:
+                continue
+            conns.append(c)
+            threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    try:
+        monkeypatch.setenv("SUBSTRATE_URL", f"http://127.0.0.1:{lsock.getsockname()[1]}")
+        monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.2)
+        monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.1)
+        started = time.monotonic()
+        assert substrate_client.rest_post("/events", {}) is None
+        assert time.monotonic() - started < 1.5
+        assert substrate_client.rest_post("/events", {}) is None and len(conns) == 1  # backed off
+        assert substrate_client._wait_idle(1.0)
+    finally:
+        stop.set()
+        acceptor.join(2)
+        lsock.close()
+
+
+def test_fake_http_error_body_over_the_cap_backs_off_but_none_body_is_an_answer(on, monkeypatch):
+    monkeypatch.setattr(substrate_client, "MAX_BODY_BYTES", 10)
+    n = []
+
+    def big(req, timeout=None):
+        n.append(1)
+        raise urllib.error.HTTPError(req.full_url, 500, "no", {}, io.BytesIO(b"x" * 11))
+
+    monkeypatch.setattr(substrate_client, "_open", big)
+    assert substrate_client.rest_post("/events", {}) is None
+    assert substrate_client.rest_post("/events", {}) is None and len(n) == 1  # backed off
+    substrate_client.reset()
+    m = []
+
+    def empty(req, timeout=None):
+        m.append(1)
+        raise urllib.error.HTTPError(req.full_url, 503, "no", {}, None)
+
+    monkeypatch.setattr(substrate_client, "_open", empty)
+    assert substrate_client.rest_post("/events", {}) == (503, "")
+    assert substrate_client.rest_post("/events", {}) == (503, "") and len(m) == 2  # an answer: no back-off
+
+
 @pytest.fixture()
 def fake_dns(monkeypatch):
     """`*.invalid` never reaches real DNS: it fails at once, except `slow.invalid`, whose lookup blocks until the yielded
