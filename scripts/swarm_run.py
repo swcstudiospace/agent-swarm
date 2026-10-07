@@ -229,6 +229,7 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
     env, _source, _problem = workspace.child_env(
         {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}, repo, agent["id"])
+    env.pop("SWARM_SUBSTRATE_AGENT", None)  # never inherit another process's MCP authorization marker
     # SWARM_AGENT: the session's agent identity; the omp swarm_gate tool runs only that agent's gate (WR-03)
     env.update(SWARM_DIR=str(sdir), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=slug,
                AIO_UPLIFT="0", AIO_SWARM="0")
@@ -240,6 +241,14 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", *trust, "--cwd", str(repo),
                 *model], env, repo
     if runtime == "omp":
+        if wired and env.get(workspace.TOKEN):
+            try:
+                config = json.loads(workspace.mcp_config(repo, runtime).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                config = None
+            servers = config.get("mcpServers") if isinstance(config, dict) else None
+            if isinstance(servers, dict) and servers.get(workspace.SERVER) == workspace.SPEC["json"]:
+                env["SWARM_SUBSTRATE_AGENT"] = slug
         tools, body = omp_agent(slug, sdir)
         # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
         margin = min(60, max(5, args.task_timeout // 10))

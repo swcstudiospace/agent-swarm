@@ -74,7 +74,10 @@ It also refuses (exit 2, nothing written):
   workspace that is its own git checkout is not covered by a parent's trust. A `--yolo` session already runs every tool
   call unasked; `--trust` records the grant in `~/.grok/trusted_folders.toml`;
 - **omp**: runs with `--cwd <ws>`, where it reads `.mcp.json`. Its `--tools` list names built-ins only and does not hide
-  MCP tools, which mount as `xd://mcp__substrate_*` devices.
+  MCP tools, which mount as `xd://mcp__substrate_*` devices. The runner sets `SWARM_SUBSTRATE_AGENT` only when it finds
+  the exact projected entry and resolves this agent's token. The swarm guard then allows the known substrate API for
+  that matching session identity; operator-credential MCP tools and lookalike device names remain blocked. A01's
+  depth cap still takes precedence.
 
 Those flags appear only when the workspace has the entry. `--dry-run` prints the variables a replay must unset (names only)
 and, on a second line, the env file the session's `SUBSTRATE_TOKEN` comes from; it never prints a token.

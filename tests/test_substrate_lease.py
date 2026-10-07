@@ -449,7 +449,7 @@ def test_saturated_slots_wait_then_dispatch_with_a_lease(tmp_path, queued_fake, 
 def test_saturated_slots_defer_claim_without_unleased_dispatch(tmp_path, queued_fake, runner, monkeypatch, cached_graph):
     queued_fake.register("T-be")
     # Another replica already holds the node; local congestion must not bypass that fact.
-    claim, _ = lease_mod.claim_node("A05", GID, "T-be", ttl_s=900, env=_replica("other"))
+    claim, _ = lease_mod.claim_node("A05", GID, "T-be", ttl_s=900, workspace=queued_fake.workspace, env=_replica("other"))
     assert claim.status == "held"
     store, events = _store(tmp_path), []
     task = _plan(store)

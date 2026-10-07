@@ -87,6 +87,15 @@ const RAW_CODE_DEVICE = /^xd:\/\/(?:run_code|debug)(?:[/?#]|$)/i;
 const MCP_TOOL = /^(?:xd:\/\/)?mcp__/i;
 /** T-06-07: write path is an MCP tool's `xd://mcp__…` device, any case, optional query or subpath. */
 const MCP_DEVICE = /^xd:\/\/mcp__/i;
+/** S4: only the known substrate API, never a similarly prefixed operator server or an arbitrary device suffix. */
+const SUBSTRATE_TOOL = /^(?:xd:\/\/)?mcp__substrate_(?:memory_(?:brief|write|search|pending)|events_(?:emit|query|verify)|graph_(?:get|register|bind|claim|heartbeat|release|complete)|coord_(?:handoff(?:_verify|_list)?|drift_scan|reap_leases))$/;
+
+function ownSubstrateTool(name: string, facts: GuardFacts): boolean {
+  // The runner replaces this marker only after resolving this agent's token and the exact projected MCP entry.
+  // Inherited markers cannot authorize a differently named child. A bare operator token is never sufficient.
+  return facts.agent !== undefined && facts.env.SWARM_SUBSTRATE_AGENT === facts.agent &&
+    Boolean(facts.env.SUBSTRATE_TOKEN) && SUBSTRATE_TOOL.test(name);
+}
 
 export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCallResult | undefined {
   // HOOK-04 (D-06): A01 without `task`, not a restricted child and not in plan mode, can only report BLOCKED/depth
@@ -101,13 +110,15 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   if (!inSwarm(facts)) return undefined;
   // D-08: eval and the raw-code devices run code past tool_call, so they are closed outright; config/state paths are not writable
   if (event.toolName === "eval") return { block: true, reason: reason("eval", "eval-in-swarm") };
-  // T-06-07: MCP tools act with the operator's credentials past every other row, so they are closed outright too
-  if (MCP_TOOL.test(event.toolName)) return { block: true, reason: reason("mcp", event.toolName) };
+  // Operator-credential MCP stays closed. S4's projected substrate entry uses this process's own agent token.
+  if (MCP_TOOL.test(event.toolName) && !ownSubstrateTool(event.toolName, facts)) {
+    return { block: true, reason: reason("mcp", event.toolName) };
+  }
   if (event.toolName === "write" && typeof event.input === "object" && event.input !== null) {
     const { path, file_path } = event.input as { path?: unknown; file_path?: unknown };
     const devices = [path, file_path].filter((p): p is string => typeof p === "string").map((p) => p.trim());
     if (devices.some((p) => RAW_CODE_DEVICE.test(p))) return { block: true, reason: reason("eval", "xd-device") };
-    const mcp = devices.find((p) => MCP_DEVICE.test(p));
+    const mcp = devices.find((p) => MCP_DEVICE.test(p) && !ownSubstrateTool(p, facts));
     if (mcp !== undefined) return { block: true, reason: reason("mcp", mcp) };
   }
   if (event.toolName === "write" || event.toolName === "edit") {

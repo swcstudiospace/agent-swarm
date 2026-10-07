@@ -113,6 +113,24 @@ def test_omp_runs_where_the_entry_is_and_its_tools_list_names_only_builtins(sr, 
     assert "--no-tools" not in argv and all(not t.startswith("mcp") for t in argv[argv.index("--tools") + 1].split(","))
 
 
+@pytest.mark.parametrize("entry", ["projected", "absent", "operator-token", "invalid-json"])
+def test_omp_guard_scope_requires_the_projected_own_token_entry(sr, ws, tmp_path, monkeypatch, entry):
+    monkeypatch.setenv("SWARM_SUBSTRATE_AGENT", "a09-reviewer")
+    if entry != "absent":
+        _wire(ws)
+    if entry == "operator-token":
+        config = json.loads((ws / ".mcp.json").read_text())
+        config["mcpServers"]["substrate"]["headers"]["Authorization"] = "Bearer operator-token"
+        (ws / ".mcp.json").write_text(json.dumps(config))
+    elif entry == "invalid-json":
+        (ws / ".mcp.json").write_text("{")
+    _, env, _ = sr.headless_command("omp", A05, ws, tmp_path / ".swarm", _args())
+    assert env.get("SWARM_SUBSTRATE_AGENT") == ("a05-backend" if entry == "projected" else None)
+    # Even a projected entry never unlocks a session lacking that agent's own credential.
+    _, env, _ = sr.headless_command("omp", {"slug": "a10-security", "id": "A10"}, ws, tmp_path / ".swarm", _args())
+    assert "SWARM_SUBSTRATE_AGENT" not in env
+
+
 def _planned(tmp_path, env):
     plan = tmp_path / "plan.json"
     plan.write_text(json.dumps(ONE_TASK))
