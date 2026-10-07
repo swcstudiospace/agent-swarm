@@ -17,7 +17,8 @@ def _log_file(root: str | Path | None, *, create: bool) -> Path:
 
 
 def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | None = None,
-         task_id: str | None = None, root: str | Path | None = None) -> dict:
+         task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
+    """Append one record to the run log; `tee=False` (dry runs) keeps it local and never sends it to substrate."""
     log_file = _log_file(root, create=True)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -30,9 +31,11 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
     }
     with log_file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if not tee:
+        return record
     try:  # substrate tee (ADR 0001 S1): after the local write, fail-open, a no-op without SUBSTRATE_URL
-        from .substrate_tee import tee
-        tee(record, root)
+        from .substrate_tee import tee as tee_record
+        tee_record(record, root)
     except Exception:  # noqa: BLE001 - the local log is the source of truth; the tee never disturbs it
         pass
     return record

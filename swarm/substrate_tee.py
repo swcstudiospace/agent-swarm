@@ -137,27 +137,49 @@ def resolve_graph_id(correlation_id: str | None = None, *, explicit: str | None 
 
 # --- durable local state: binding cache + dedupe window ----------------------------------------------------
 DEDUPE_WINDOW_S = 24 * 3600
+PENDING_STALE_S = 60.0  # a `pending` claim older than this was left by a killed sender and may be re-claimed
+PRUNE_EVERY_S = 60.0  # the expired-row DELETE runs at most this often per process
 _DB_NAME = "substrate-tee.db"
+_last_prune: float | None = None  # monotonic time of this process's last prune
+ORCH_SURFACE = AGENT_SURFACES["A01"]  # graph_bind / graph_register speak as the orchestrator (swarm-a01-orch)
 
 
 def _connect(root: str | Path | None) -> sqlite3.Connection:
     con = sqlite3.connect(swarm_dir(root, create=True) / _DB_NAME, timeout=2.0)
-    con.execute("CREATE TABLE IF NOT EXISTS bindings (correlation_id TEXT PRIMARY KEY, graph_id TEXT NOT NULL, created REAL NOT NULL)")
+    # `bindings` (pre per-server cache) is left as is and no longer read: a binding is only valid for the server that made it
+    con.execute("CREATE TABLE IF NOT EXISTS bindings_by_server (substrate_url TEXT NOT NULL, correlation_id TEXT NOT NULL, "
+                "graph_id TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY (substrate_url, correlation_id))")
     con.execute("CREATE TABLE IF NOT EXISTS seen (surface TEXT NOT NULL, msg_id TEXT NOT NULL, first_seen REAL NOT NULL, "
-                "PRIMARY KEY (surface, msg_id))")
+                "state TEXT NOT NULL DEFAULT 'sent', PRIMARY KEY (surface, msg_id))")
+    if "state" not in {row[1] for row in con.execute("PRAGMA table_info(seen)")}:  # a db from before pending/sent
+        try:
+            con.execute("ALTER TABLE seen ADD COLUMN state TEXT NOT NULL DEFAULT 'sent'")
+        except sqlite3.OperationalError:  # another process added it first
+            pass
+    con.execute("CREATE INDEX IF NOT EXISTS seen_first_seen ON seen(first_seen)")
+    con.commit()
     return con
 
 
-def cached_graph_id(correlation_id: str, root: str | Path | None = None) -> str | None:
+def cached_graph_id(correlation_id: str, root: str | Path | None = None, *, env: Mapping[str, str] | None = None) -> str | None:
+    """The Graph ID cached for `correlation_id` on the current SUBSTRATE_URL; None when there is none (or the tee is off)."""
+    server = substrate_client.base_url(env)
+    if server is None:
+        return None
     with closing(_connect(root)) as con:
-        row = con.execute("SELECT graph_id FROM bindings WHERE correlation_id = ?", (correlation_id,)).fetchone()
+        row = con.execute("SELECT graph_id FROM bindings_by_server WHERE substrate_url = ? AND correlation_id = ?",
+                          (server, correlation_id)).fetchone()
     return row[0] if row else None
 
 
-def remember_graph_id(correlation_id: str, graph_id: str, root: str | Path | None = None) -> None:
+def remember_graph_id(correlation_id: str, graph_id: str, root: str | Path | None = None, *,
+                      env: Mapping[str, str] | None = None) -> None:
+    server = substrate_client.base_url(env)
+    if server is None:
+        return
     with closing(_connect(root)) as con, con:
-        con.execute("INSERT OR REPLACE INTO bindings(correlation_id, graph_id, created) VALUES (?, ?, ?)",
-                    (correlation_id, graph_id, time.time()))
+        con.execute("INSERT OR REPLACE INTO bindings_by_server(substrate_url, correlation_id, graph_id, created) VALUES (?, ?, ?, ?)",
+                    (server, correlation_id, graph_id, time.time()))
 
 
 def bind_graph(correlation_id: str, graph_id: str, *, root: str | Path | None = None,
@@ -167,11 +189,11 @@ def bind_graph(correlation_id: str, graph_id: str, *, root: str | Path | None = 
     The server's answer always wins: on `conflict` (another run bound this correlation first) the returned id is
     adopted and cached, never the offered one. None means substrate did not answer, nothing is cached.
     """
-    got = substrate_client.mcp_call("graph_bind", {"correlation_id": correlation_id, "graph_id": graph_id}, env)
+    got = substrate_client.mcp_call("graph_bind", {"correlation_id": correlation_id, "graph_id": graph_id}, env, surface=ORCH_SURFACE)
     bound = got.get("graph_id") if got else None
     if not is_graph_id(bound):
         return None
-    remember_graph_id(correlation_id, bound, root)
+    remember_graph_id(correlation_id, bound, root, env=env)
     _unbound.pop(correlation_id, None)
     return bound
 
@@ -186,40 +208,58 @@ def lookup_graph_id(correlation_id: str, *, root: str | Path | None = None, env:
     A correlation substrate calls `unbound` (or does not answer for) is remembered in memory for 60 s, so a burst of
     records for it costs one network call. That negative result is never written to sqlite; `bind_graph` clears it.
     """
-    hit = cached_graph_id(correlation_id, root)
+    hit = cached_graph_id(correlation_id, root, env=env)
     if hit:
         return hit
     now = time.monotonic()
     if _unbound.get(correlation_id, 0.0) > now:
         return None
-    got = substrate_client.mcp_call("graph_bind", {"correlation_id": correlation_id}, env)
+    got = substrate_client.mcp_call("graph_bind", {"correlation_id": correlation_id}, env, surface=ORCH_SURFACE)
     gid = got.get("graph_id") if got else None
     if got and got.get("status") == "existing" and is_graph_id(gid):
         _unbound.pop(correlation_id, None)
-        remember_graph_id(correlation_id, gid, root)
+        remember_graph_id(correlation_id, gid, root, env=env)
         return gid
     _unbound[correlation_id] = now + _UNBOUND_TTL_S
     return None
 
 
 def reset() -> None:
-    """Forget the in-process negative lookups and memoized repo slugs (tests; a long-lived process)."""
+    """Forget the in-process negative lookups, memoized repo slugs and prune clock (tests; a long-lived process)."""
+    global _last_prune
     _unbound.clear()
     _SLUGS.clear()
+    _last_prune = None
 
 
 def _claim(root: str | Path | None, surface: str, msg_id: str) -> bool:
-    """Atomically record (surface, msg_id) as seen; False when it already was inside the window. Prunes on write."""
-    now = time.time()
+    """Atomically claim (surface, msg_id) as `pending`; False when it is `sent` inside the window or freshly `pending`.
+
+    A `pending` row older than PENDING_STALE_S (its sender died between claim and send) and a row past the window are
+    re-claimed in the same statement. Expired rows are pruned at most once per PRUNE_EVERY_S per process.
+    """
+    global _last_prune
+    now, mono = time.time(), time.monotonic()
     with closing(_connect(root)) as con, con:
-        con.execute("DELETE FROM seen WHERE first_seen < ?", (now - DEDUPE_WINDOW_S,))
-        return con.execute("INSERT OR IGNORE INTO seen(surface, msg_id, first_seen) VALUES (?, ?, ?)",
-                           (surface, msg_id, now)).rowcount == 1
+        if _last_prune is None or mono - _last_prune >= PRUNE_EVERY_S:
+            con.execute("DELETE FROM seen WHERE first_seen < ?", (now - DEDUPE_WINDOW_S,))
+            _last_prune = mono
+        if con.execute("INSERT OR IGNORE INTO seen(surface, msg_id, first_seen, state) VALUES (?, ?, ?, 'pending')",
+                       (surface, msg_id, now)).rowcount == 1:
+            return True
+        return con.execute("UPDATE seen SET first_seen = ?, state = 'pending' WHERE surface = ? AND msg_id = ? "
+                           "AND ((state = 'pending' AND first_seen < ?) OR first_seen < ?)",
+                           (now, surface, msg_id, now - PENDING_STALE_S, now - DEDUPE_WINDOW_S)).rowcount == 1
+
+
+def _mark_sent(root: str | Path | None, surface: str, msg_id: str) -> None:
+    with closing(_connect(root)) as con, con:
+        con.execute("UPDATE seen SET state = 'sent' WHERE surface = ? AND msg_id = ?", (surface, msg_id))
 
 
 def _release(root: str | Path | None, surface: str, msg_id: str) -> None:
     with closing(_connect(root)) as con, con:
-        con.execute("DELETE FROM seen WHERE surface = ? AND msg_id = ?", (surface, msg_id))
+        con.execute("DELETE FROM seen WHERE surface = ? AND msg_id = ? AND state = 'pending'", (surface, msg_id))
 
 
 _ORIGIN_RE = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$")
@@ -299,8 +339,9 @@ def tee(record: Mapping, ctx_root: str | Path | None = None, *, env: Mapping[str
             return False
         if not _claim(ctx_root, body["surface"], record["msg_id"]):
             return False
-        got = substrate_client.rest_post("/events", body, e)
+        got = substrate_client.rest_post("/events", body, e, surface=body["surface"])
         if got is not None and 200 <= got[0] < 300:
+            _mark_sent(ctx_root, body["surface"], record["msg_id"])
             return True
         _release(ctx_root, body["surface"], record["msg_id"])  # dropped: a republish may try again
         return False

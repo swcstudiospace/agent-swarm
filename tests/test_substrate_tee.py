@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 import subprocess
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -49,7 +50,7 @@ class FakeSubstrate:
 
     def __call__(self, req, timeout=None):
         call = {"path": urlparse(req.full_url).path, "headers": {k.lower(): v for k, v in req.header_items()},
-                "body": json.loads(req.data), "timeout": timeout}
+                "body": json.loads(req.data), "timeout": timeout, "req": req}
         self.calls.append(call)
         if call["path"] == "/events":
             if self.events_status >= 400:
@@ -228,6 +229,92 @@ def test_dead_host_costs_one_attempt_per_backoff(on, monkeypatch):
     assert len(n) == 1
 
 
+def test_bearer_is_unredirected_so_a_redirect_drops_it(on, fake):
+    substrate_client.rest_post("/events", {"a": 1})
+    req = fake.calls[0]["req"]
+    assert req.get_header("Authorization") == f"Bearer {TOKEN}"
+    assert "Authorization" in req.unredirected_hdrs and "Authorization" not in req.headers
+    # what urllib's redirect handler builds for the next hop (another host, or https -> http) carries no token
+    moved = urllib.request.HTTPRedirectHandler().redirect_request(req, None, 302, "Found", {}, "http://elsewhere.test/events")
+    assert moved is not None and moved.full_url == "http://elsewhere.test/events"
+    assert moved.get_header("Authorization") is None and not any(TOKEN in v for _, v in moved.header_items())
+
+
+@pytest.mark.parametrize("own", [None, "", "   "])
+def test_surface_token_falls_back_when_unset_or_blank(tmp_path, on, fake, monkeypatch, own):
+    if own is not None:
+        monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A08_QA", own)
+    fake.bindings[CORR] = GID_A
+    _emit(tmp_path, typ="script.qa_gate", source="A08@qa_gate", task_id=None)
+    assert fake.at("/events")[0]["headers"]["authorization"] == f"Bearer {TOKEN}"
+    assert substrate_client._token({"SUBSTRATE_TOKEN": " t "}, "swarm-a08-qa") == "t"
+
+
+def test_surface_token_override_wins_and_never_leaks(tmp_path, on, fake, monkeypatch, capsys):
+    a08, a01 = "a08-own-token-value", "a01-own-token-value"
+    monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A08_QA", a08)
+    fake.bindings[CORR] = GID_A
+    _emit(tmp_path, typ="script.qa_gate", source="A08@qa_gate", task_id=None)
+    (lookup,) = fake.at("/mcp", "graph_bind")
+    assert fake.at("/events")[0]["headers"]["authorization"] == f"Bearer {a08}"  # the gate speaks as itself
+    assert lookup["headers"]["authorization"] == f"Bearer {TOKEN}"  # graph_bind is A01's; no A01 override set
+    monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A01_ORCH", a01)
+    assert tee_mod.bind_graph("corr-other", GID_B, root=tmp_path) == GID_B
+    assert fake.at("/mcp", "graph_bind")[-1]["headers"]["authorization"] == f"Bearer {a01}"
+    assert substrate_client.rest_post("/events", {}, surface="swarm-a05-be")[0] == 200  # no A05 override: the default
+    assert fake.calls[-1]["headers"]["authorization"] == f"Bearer {TOKEN}"
+    out = capsys.readouterr()
+    logged = (tmp_path / ".swarm" / "events.jsonl").read_text() + json.dumps(fake.events)
+    for tok in (a08, a01, TOKEN):
+        assert tok not in out.out + out.err + logged
+
+
+class _Trickle:
+    """A reply whose read() only returns once the response is closed, like a stream that never finishes."""
+
+    status = 200
+
+    def __init__(self):
+        self.released = threading.Event()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def read(self):
+        self.released.wait(10)
+        return b'{"late":true}'
+
+    def close(self):
+        self.released.set()
+
+
+def test_slow_reply_is_cut_at_the_total_deadline_and_backs_off(on, monkeypatch):
+    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.05)
+    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.05)
+    resp, timeouts = _Trickle(), []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: timeouts.append(timeout) or resp)
+    started = time.monotonic()
+    assert substrate_client.rest_post("/events", {}) is None
+    assert time.monotonic() - started < 1.0
+    assert resp.released.wait(2.0)  # the deadline timer closed the response, which ended the read
+    assert timeouts == [0.05]
+    assert substrate_client.mcp_call("graph_bind", {}) is None and len(timeouts) == 1  # a network failure: back-off
+
+
+def test_reply_over_the_body_cap_is_a_failure(on, monkeypatch):
+    assert substrate_client.MAX_BODY_BYTES == 1 << 20
+    monkeypatch.setattr(substrate_client, "MAX_BODY_BYTES", 10)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp("x" * 10))
+    assert substrate_client.rest_post("/events", {}) == (200, "x" * 10)
+    n = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: n.append(1) or _Resp("x" * 11))
+    assert substrate_client.rest_post("/events", {}) is None
+    assert substrate_client.rest_post("/events", {}) is None and len(n) == 1  # counted as a failure: backed off
+
+
 # --- tables -------------------------------------------------------------------------------------------------
 def test_surfaces_match_agents_json():
     agents = json.loads((ROOT / "agents.json").read_text())["agents"]
@@ -351,6 +438,31 @@ def test_bind_without_an_answer_caches_nothing(tmp_path, on, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
     assert tee_mod.bind_graph(CORR, GID_A, root=tmp_path) is None
     assert tee_mod.lookup_graph_id(CORR, root=tmp_path) is None
+    assert tee_mod.cached_graph_id(CORR, tmp_path) is None
+
+
+def test_binding_cache_is_per_server(tmp_path, on, fake, monkeypatch):
+    fake.bindings[CORR] = GID_A
+    assert tee_mod.bind_graph(CORR, GID_A, root=tmp_path) == GID_A
+    assert tee_mod.cached_graph_id(CORR, tmp_path) == GID_A
+    monkeypatch.setenv("SUBSTRATE_URL", "http://other.test:9000")
+    assert tee_mod.cached_graph_id(CORR, tmp_path) is None
+    fake.bindings[CORR] = GID_B  # the other server bound this correlation elsewhere
+    lookups = len(fake.at("/mcp", "graph_bind"))
+    _emit(tmp_path)
+    assert len(fake.at("/mcp", "graph_bind")) == lookups + 1  # asked the new server, did not reuse the old binding
+    assert [e["graph_id"] for e in fake.events] == [GID_B] and tee_mod.cached_graph_id(CORR, tmp_path) == GID_B
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")  # same server as `on`, normalised
+    assert tee_mod.cached_graph_id(CORR, tmp_path) == GID_A
+
+
+def test_legacy_binding_table_is_not_read(tmp_path, on):
+    tee_mod._connect(tmp_path).close()
+    con = sqlite3.connect(_db(tmp_path))
+    con.execute("CREATE TABLE IF NOT EXISTS bindings (correlation_id TEXT PRIMARY KEY, graph_id TEXT NOT NULL, created REAL NOT NULL)")
+    con.execute("INSERT INTO bindings VALUES (?, ?, ?)", (CORR, GID_A, time.time()))
+    con.commit()
+    con.close()
     assert tee_mod.cached_graph_id(CORR, tmp_path) is None
 
 
@@ -511,15 +623,99 @@ def test_dedupe_window_is_24h_and_pruned_on_write(tmp_path, on, fake):
     fake.bindings[CORR] = GID_A
     _emit(tmp_path)
     con = sqlite3.connect(_db(tmp_path))
-    con.execute("INSERT INTO seen VALUES ('swarm-a05-be', 'ancient', ?)", (time.time() - 25 * 3600,))
-    con.execute("INSERT INTO seen VALUES ('swarm-a05-be', 'recent', ?)", (time.time() - 23 * 3600,))
+    con.execute("INSERT INTO seen(surface, msg_id, first_seen) VALUES ('swarm-a05-be', 'ancient', ?)", (time.time() - 25 * 3600,))
+    con.execute("INSERT INTO seen(surface, msg_id, first_seen) VALUES ('swarm-a05-be', 'recent', ?)", (time.time() - 23 * 3600,))
     con.commit()
     con.close()
+    tee_mod._last_prune = None  # the first emit pruned; let the next one prune again
     _emit(tmp_path)
     con = sqlite3.connect(_db(tmp_path))
     ids = {r[0] for r in con.execute("SELECT msg_id FROM seen")}
     con.close()
     assert "ancient" not in ids and "recent" in ids and len(ids) == 3
+
+
+def _put_seen(tmp_path, msg_id, state, age_s):
+    tee_mod._connect(tmp_path).close()
+    con = sqlite3.connect(_db(tmp_path))
+    con.execute("INSERT OR REPLACE INTO seen(surface, msg_id, first_seen, state) VALUES ('swarm-a05-be', ?, ?, ?)",
+                (msg_id, time.time() - age_s, state))
+    con.commit()
+    con.close()
+
+
+def _seen_rows(tmp_path):
+    con = sqlite3.connect(_db(tmp_path))
+    rows = {r[0]: (r[1], r[2]) for r in con.execute("SELECT msg_id, state, first_seen FROM seen")}
+    con.close()
+    return rows
+
+
+def test_success_marks_sent_and_failure_deletes_the_claim(tmp_path, on, fake):
+    fake.bindings[CORR] = GID_A
+    ok = _emit(tmp_path)
+    assert _seen_rows(tmp_path)[ok["msg_id"]][0] == "sent"
+    fake.events_status = 503
+    failed = _emit(tmp_path)
+    assert failed["msg_id"] not in _seen_rows(tmp_path) and len(fake.events) == 2
+
+
+@pytest.mark.parametrize("state,age_s,reclaimed", [
+    ("pending", 5, False),           # another sender is on it right now
+    ("pending", 61, True),           # its sender was killed between claim and send
+    ("sent", 23 * 3600, False),      # already delivered inside the window
+    ("sent", 25 * 3600, True),       # past the window (even before a prune removes it)
+])
+def test_claim_pending_versus_sent(tmp_path, on, fake, state, age_s, reclaimed):
+    fake.bindings[CORR] = GID_A
+    _put_seen(tmp_path, "m-x", state, age_s)
+    tee_mod._last_prune = time.monotonic()  # no prune in this claim: the claim rule alone decides
+    rec = {"type": "task.claimed", "source": "A05@x", "correlation_id": CORR, "task_id": "T", "payload": {}, "msg_id": "m-x"}
+    assert tee_mod.tee(rec, tmp_path) is reclaimed
+    assert len(fake.events) == (1 if reclaimed else 0)
+    got_state, first_seen = _seen_rows(tmp_path)["m-x"]
+    assert got_state == ("sent" if reclaimed else state)
+    assert (time.time() - first_seen < 60) is (reclaimed or age_s < 60)
+
+
+def test_reclaim_is_exclusive(tmp_path, on):
+    _put_seen(tmp_path, "m-y", "pending", 120)
+    assert tee_mod._claim(tmp_path, "swarm-a05-be", "m-y") is True
+    assert tee_mod._claim(tmp_path, "swarm-a05-be", "m-y") is False  # the re-claim refreshed the timestamp
+
+
+def test_old_seen_table_is_migrated(tmp_path, on):
+    (tmp_path / ".swarm").mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(_db(tmp_path))
+    con.execute("CREATE TABLE seen (surface TEXT NOT NULL, msg_id TEXT NOT NULL, first_seen REAL NOT NULL, PRIMARY KEY (surface, msg_id))")
+    con.execute("INSERT INTO seen VALUES ('swarm-a05-be', 'old', ?)", (time.time() - 3600,))
+    con.commit()
+    con.close()
+    assert tee_mod._claim(tmp_path, "swarm-a05-be", "old") is False  # an old row counts as sent
+    assert _seen_rows(tmp_path)["old"][0] == "sent"
+    assert tee_mod._claim(tmp_path, "swarm-a05-be", "new") is True and _seen_rows(tmp_path)["new"][0] == "pending"
+
+
+def test_prune_runs_at_most_once_per_interval_and_is_indexed(tmp_path, on, monkeypatch):
+    statements = []
+    real = tee_mod._connect
+
+    def traced(root):
+        con = real(root)
+        con.set_trace_callback(statements.append)
+        return con
+    monkeypatch.setattr(tee_mod, "_connect", traced)
+
+    def prunes():
+        return sum(1 for s in statements if s.startswith("DELETE FROM seen WHERE first_seen"))
+    assert tee_mod._claim(tmp_path, "swarm-a05-be", "p1") and tee_mod._claim(tmp_path, "swarm-a05-be", "p2")
+    assert prunes() == 1
+    tee_mod._last_prune -= tee_mod.PRUNE_EVERY_S + 1
+    assert tee_mod._claim(tmp_path, "swarm-a05-be", "p3") and prunes() == 2
+    con = sqlite3.connect(_db(tmp_path))
+    plan = " ".join(str(r) for r in con.execute("EXPLAIN QUERY PLAN DELETE FROM seen WHERE first_seen < 0"))
+    con.close()
+    assert "seen_first_seen" in plan
 
 
 # --- fail-open ----------------------------------------------------------------------------------------------
@@ -620,3 +816,24 @@ def test_dry_run_plan_never_touches_substrate(tmp_path, on, fake, capsys):
     rc, out, _ = _orch_plan(capsys, tmp_path, "--dry-run")
     assert rc == 0 and out["dry_run"] is True
     assert fake.calls == []  # a dry run has no correlation on the context: no bind, no register, no tee
+
+
+def _probe(tmp_path, *args):
+    from swarm.script_base import AgentScript
+    return AgentScript("A08", "qa_probe", lambda a, ctx: {"summary": "probe"}).main(["--json", "--root", str(tmp_path), *args])
+
+
+@pytest.mark.parametrize("inherited", [False, True], ids=["flag", "env"])
+def test_dry_run_with_a_bound_correlation_never_tees(tmp_path, on, fake, monkeypatch, capsys, inherited):
+    fake.bindings[CORR] = GID_A
+    tee_mod.remember_graph_id(CORR, GID_A, tmp_path)  # already bound and cached: only the event POST would remain
+    if inherited:
+        monkeypatch.setenv("SWARM_CORRELATION_ID", CORR)
+    corr_args = () if inherited else ("--correlation-id", CORR)
+    assert _probe(tmp_path, "--dry-run", *corr_args) == 0
+    assert fake.calls == []
+    (rec,) = runlog.read_events(correlation_id=CORR, root=tmp_path)  # still written to the local run log
+    assert rec["type"] == "script.qa_probe"
+    assert _probe(tmp_path, *corr_args) == 0  # the same run for real tees its exit record
+    assert [(e["surface"], e["payload"]["swarm_type"]) for e in fake.events] == [("swarm-a08-qa", "script.qa_probe")]
+    capsys.readouterr()
