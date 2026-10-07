@@ -18,7 +18,8 @@ Tests: `tests/test_substrate_tee.py`.
 | `SUBSTRATE_TOKEN` | This process's bearer token (sent as `Authorization: Bearer …`). The server maps it to a surface via `SUBSTRATE_TOKEN_<SURFACE, '-'→'_', upper>`, e.g. `SUBSTRATE_TOKEN_SWARM_A05_BE`. It is only ever placed in that header; it is never logged, printed or put in an event. |
 | `SUBSTRATE_TOKEN_<SURFACE>` | Optional per-surface override, read by this client under the same name the server uses, e.g. `SUBSTRATE_TOKEN_SWARM_A08_QA`. See *Tokens*. |
 | `SUBSTRATE_GRAPH_ID` | Graph ID to offer for a new run (see *Graph ID*). |
-| `SWARM_REPLICA` | Replica name in the session id; default `r0`. |
+| `SWARM_REPLICA` | Replica name in the session id; default `r0`; 1-64 characters of `[A-Za-z0-9._-]` (see *Session*). |
+| `SWARM_LEASE_TTL_S` | TTL the runner asks for on each task's lease; see [substrate-leases.md](substrate-leases.md). |
 
 **Transport and time bounds.** Every request goes through one seam, `substrate_client._open(req, timeout)`, which builds a
 urllib opener per call: `ProxyHandler()` (so `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`, upper or lower case, are honoured
@@ -74,7 +75,10 @@ writes on behalf of others (`task.result.raw`, `escalation.request` from `swarm_
 
 **Session.** `session_id = <AGENT_ID>@<replica>:<graph_id>`, e.g. `A05@r0:ut-mabc123-0123abcd`: one (agent, replica,
 Graph ID) triple. Substrate chains events per session and its `prev` lookup ignores the graph, so a session shared across
-graphs would interleave chains; including the Graph ID prevents a false "broken chain" in `events_verify`.
+graphs would interleave chains; including the Graph ID prevents a false "broken chain" in `events_verify`. The tee and the
+lease bridge build it through one function, `substrate_tee.session_id()`. `replica_id()` rejects a replica outside
+`[A-Za-z0-9._-]{1,64}`, the shape the substrate accepts for a swarm session. The tee then sends nothing, and `swarm_run`
+refuses to start (`E-INPUT`) when leasing is on.
 
 **Event body** (`POST {SUBSTRATE_URL}/events`): `kind`, `summary` (`<swarm type> <task_id or correlation_id>`), `surface`,
 `session_id`, `graph_id`, `node_id` (= `task_id`, omitted when the record has none), `actor: "agent"`, `repo` (the `owner/name`
@@ -107,8 +111,13 @@ type at runtime is skipped, never downgraded to `note`. The exact swarm type alw
 | `gate.findings.synthesized` | `swarm_run` | `warning` | Findings were synthesized rather than reported. |
 | `gate.findings.unattributed` | `swarm_run` | `warning` | Findings named no known gate target. |
 | `task.result.rejected` | `results.reject`, `orch_status` | `warning` | A result failed validation; the task is failed or left as is. |
-| `escalation.request` | `results.reconcile`, `swarm_run` | `warning` | Rework/attempts exhausted; a human is needed. (`handoff` is reserved for lease handoffs, which the swarm does not yet emit.) |
+| `escalation.request` | `results.reconcile`, `swarm_run` | `warning` | Rework/attempts exhausted; a human is needed. (`handoff` is reserved for the substrate's own lease handoffs and Phase 13's packets.) |
 | `security.dev_key` | `swarm.envelope` | `warning` | An envelope was signed with the development key. |
+| `lease.denied` | `substrate_lease` (runner) | `note` | Another session holds the task's node; the task waits. |
+| `lease.unleased` | `substrate_lease` (runner) | `warning` | Dispatched without a lease because the substrate could not answer (fail-open). |
+| `lease.refused` | `substrate_lease` (runner) | `warning` | The substrate refused this agent's claim; the task is not dispatched. |
+| `lease.lost` | `substrate_lease` (runner) | `warning` | A refused heartbeat stopped a session or dropped a held lease. |
+| `lease.unsettled` | `substrate_lease`, `orch_status` | `warning` | A release or completion did not land. |
 | `script.<name>` (prefix) | `AgentScript.main` | `tool.call` | Exit record of one agent script run. |
 | `script.<name>.error` (prefix) | `AgentScript.main` | `tool.call` | Same, for a failed run; `payload.status` is `error`. |
 
@@ -176,7 +185,8 @@ rows are pruned at most once per 60 s per process, not on every event.
 ## Not in S1
 
 - Fetching a brief from substrate before planning (S2+), and any consumption of other agents' briefs.
-- Leases / `graph_claim` / `coord_handoff` from the swarm, and `handoff` events.
+- Leases (S2): the runner's `graph_claim` / `graph_heartbeat` / `graph_release` / `graph_complete` are documented in
+  [substrate-leases.md](substrate-leases.md). `coord_handoff` packets and `handoff` events are Phase 13.
 - Tee'ing signed `swarm.v1` envelopes that are not run-log records (verdict files, `task.assign`).
 - `trace_id`/`causation_id` production in the run log (they are forwarded when a record carries them).
 - A `--graph-id` entry in the omp extension's `orch_plan` tool schema (`omp/src/tools.ts`); the CLI flag and the

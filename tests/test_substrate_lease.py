@@ -1,0 +1,757 @@
+"""ADR 0001 S2 / LEASE-05..09: the runner holds each swarm task's substrate lease for the agent working it.
+
+The substrate is a fake behind `substrate_client._open` that keeps substrate-mcp's lease rules (lease.ts plus the Phase 11
+contract: swarm session shape, holder-only `lease_id`, `not-holder`) on a clock the test moves. No socket is opened except
+by the one test that runs a real agent session process."""
+import importlib.util
+import io
+import itertools
+import json
+import os
+import re
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from urllib.parse import urlparse
+
+import pytest
+
+from conftest import ROOT
+
+from swarm import substrate_client, substrate_lease as lease_mod, substrate_tee as tee_mod
+from swarm.errors import ErrorCode, SwarmError
+from swarm.taskstore import TaskStore
+
+GID = "ut-mabc123-0123abcd"
+CORR = "corr-s2"
+TOKENS = {f"tok-{s}": s for s in tee_mod.AGENT_SURFACES.values()}
+SESSION_RE = re.compile(r"(A\d{2})@([A-Za-z0-9._-]{1,64}):(.+)")
+
+
+# --- fake substrate ------------------------------------------------------------------------------------------
+class _Resp(io.BytesIO):
+    def __init__(self, body: str, status: int = 200):
+        super().__init__(body.encode("utf-8"))
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@dataclass
+class Err:
+    """An `isError` tool reply. `refusal()` in mcp.ts words its text as JSON {"error": …}; a thrown error is plain text."""
+    text: str
+
+
+def _refusal(msg: str) -> Err:
+    return Err(json.dumps({"error": msg}))
+
+
+def _iso(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).isoformat()
+
+
+class FakeSubstrate:
+    def __init__(self):
+        self.now = 1_700_000_000.0
+        self.lock = threading.Lock()
+        self.nodes: dict[tuple[str, str], dict] = {}
+        self.trail: list[dict] = []  # what the server writes to the ledger: claim / warning / note
+        self.calls: list[dict] = []
+        self.down = False
+        self.forced: dict[str, object] = {}  # tool -> canned reply
+        self.grant_ttl: int | None = None  # a server that grants another TTL than the one asked for
+        self._ids = itertools.count(1)
+
+    def register(self, *node_ids, graph=GID):
+        for n in node_ids:
+            self.nodes.setdefault((graph, n), {"lease_id": None, "surface": None, "session": None, "epoch": 0,
+                                               "expires": 0.0, "state": None})
+
+    def node(self, node_id, graph=GID):
+        return self.nodes[(graph, node_id)]
+
+    def at(self, tool):
+        return [c for c in self.calls if c["tool"] == tool]
+
+    def trail_of(self, node_id):
+        return [(e["kind"], e["action"]) for e in self.trail if e["node"] == node_id]
+
+    def force_release(self, node_id):
+        n = self.node(node_id)
+        self.trail.append({"kind": "warning", "action": "forced", "node": node_id, "session": n["session"],
+                           "lease_id": n["lease_id"]})
+        n.update(lease_id=None, surface=None, session=None, expires=0.0)
+
+    def __call__(self, req, timeout=None):
+        if self.down:
+            raise OSError("connection refused")
+        path = urlparse(req.full_url).path
+        if path != "/mcp":  # the tee's /events and the memory brief: accepted / absent, never what is under test
+            return _Resp('{"ok":true}', 200) if path == "/events" else _Resp("{}", 404)
+        body = json.loads(req.data)
+        name, args = body["params"]["name"], body["params"]["arguments"]
+        token = {k.lower(): v for k, v in req.header_items()}.get("authorization", "").removeprefix("Bearer ")
+        caller = TOKENS.get(token)
+        with self.lock:
+            self.calls.append({"tool": name, "args": args, "caller": caller})
+            out = self.forced[name] if name in self.forced else getattr(self, "tool_" + name)(args, caller)
+        if isinstance(out, Err):
+            result = {"content": [{"type": "text", "text": out.text}], "isError": True}
+        else:
+            result = {"content": [{"type": "text", "text": json.dumps(out)}]}
+        return _Resp(json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+
+    # -- tools
+    def tool_graph_bind(self, a, caller):
+        return {"status": "existing", "correlation_id": a["correlation_id"], "graph_id": GID} if a.get("correlation_id") == CORR \
+            else {"status": "unbound", "correlation_id": a.get("correlation_id"), "graph_id": None}
+
+    def tool_graph_register(self, a, caller):
+        self.register(*(n["node_id"] for n in a.get("nodes", [])), graph=a["graph_id"])
+        return {"graph_id": a["graph_id"], "registered": len(a.get("nodes", []))}
+
+    def tool_graph_claim(self, a, caller):
+        if a.get("surface") and caller and a["surface"] != caller:
+            return _refusal(f"surface {a['surface']} is not this token's surface")
+        surface = a.get("surface") or caller
+        if surface.startswith("swarm-"):  # LEASE-01: a swarm session names this token's agent, a replica and this graph
+            m = SESSION_RE.fullmatch(a["session_id"])
+            if m is None or tee_mod.AGENT_SURFACES.get(m.group(1)) != surface or m.group(3) != a["graph_id"]:
+                return _refusal("a swarm session must be <AGENT>@<replica>:<graph_id> for this surface and graph")
+        node = self.nodes.get((a["graph_id"], a["node_id"]))
+        if node is None:
+            return Err(f"unknown node {a['graph_id']}/{a['node_id']}")
+        ttl = a.get("ttl_seconds", 900)
+        if not 30 <= ttl <= 86_400:
+            return Err("ttl_seconds: out of range")
+        live = node["lease_id"] is not None and node["expires"] > self.now
+        same = node["surface"] == surface and node["session"] == a["session_id"]
+        if live and not same:
+            return self._claim_reply(False, node, "denied", ttl)
+        if live:
+            action = "renewed"
+        else:
+            action = "granted" if node["lease_id"] is None else ("reclaimed" if same else "stolen")
+            node.update(lease_id=f"lse_{next(self._ids)}", surface=surface, session=a["session_id"], epoch=node["epoch"] + 1)
+            self.trail.append({"kind": "warning" if action == "stolen" else "claim", "action": action,
+                               "node": a["node_id"], "session": a["session_id"], "lease_id": node["lease_id"]})
+        node["expires"] = self.now + ttl
+        return self._claim_reply(True, node, action, self.grant_ttl or ttl)
+
+    def _claim_reply(self, claimed, node, action, ttl):
+        lease = {"lease_id": node["lease_id"] if claimed else None,  # LEASE-02: a denied claim never shows the holder's id
+                 "holder": {"surface": node["surface"], "session_id": node["session"]}, "epoch": node["epoch"],
+                 "state": "held", "expires_at": _iso(node["expires"])}
+        # the server's reply: `action` is what the index did, `decision` the verdict once the ledger is accounted
+        # for, `ttl_seconds` the granted TTL (null when no hold stands)
+        return {"claimed": claimed, "lease": lease, "action": action, "decision": "granted" if claimed else "denied",
+                "reason": None if claimed else "held by another session", "ttl_seconds": ttl if claimed else None}
+
+    def tool_graph_heartbeat(self, a, caller):
+        node = self.node(a["node_id"], a["graph_id"])
+        if node["lease_id"] is None:
+            return {"ok": False, "reason": "unheld"}
+        if caller and caller != node["surface"]:
+            return {"ok": False, "reason": "not-holder"}
+        if node["lease_id"] != a["lease_id"]:
+            return {"ok": False, "reason": "lost"}
+        if node["expires"] <= self.now:
+            return {"ok": False, "reason": "expired"}
+        node["expires"] = self.now + a.get("ttl_seconds", 900)
+        return {"ok": True, "ttl_seconds": a.get("ttl_seconds", 900)}
+
+    def _drop(self, a, caller, completing):
+        node = self.node(a["node_id"], a["graph_id"])
+        if node["lease_id"] is None:
+            return ({"completed": False, "released": True, "action": "noop", "reason": "unheld"} if completing
+                    else {"released": True, "action": "noop"})
+        if caller and caller != node["surface"]:
+            return {"released": False, "completed": False, "reason": "not-holder"}
+        if node["lease_id"] != a.get("lease_id"):
+            return {"released": False, "completed": False, "reason": "stale-lease"}
+        self.trail.append({"kind": "note", "action": "completed" if completing else "released", "node": a["node_id"],
+                           "session": node["session"], "lease_id": node["lease_id"]})
+        node.update(lease_id=None, surface=None, session=None, expires=0.0)
+        if completing:
+            node["state"] = "completed"
+        return {"released": True, "action": "released", **({"completed": True} if completing else {})}
+
+    def tool_graph_release(self, a, caller):
+        return self._drop(a, caller, completing=False)
+
+    def tool_graph_complete(self, a, caller):
+        return self._drop(a, caller, completing=True)
+
+
+# --- fixtures and helpers --------------------------------------------------------------------------------------
+_PINNED = {k: v for k, v in sys.modules.items() if k == "swarm" or k.startswith("swarm.")}
+
+
+@pytest.fixture(autouse=True)
+def _env(tmp_path, monkeypatch):
+    for k, v in _PINNED.items():  # other modules' swarm_dir fixture reloads swarm.*; keep the objects patched here
+        monkeypatch.setitem(sys.modules, k, v)
+    for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "runner-secret")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    substrate_client.reset()
+    tee_mod.reset()
+    yield
+    substrate_client.reset()
+    tee_mod.reset()
+
+
+@pytest.fixture()
+def fake(monkeypatch):
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")
+    monkeypatch.setenv("SUBSTRATE_TOKEN", "tok-swarm-a01-orch")  # the orchestrator's own token
+    for surface in tee_mod.AGENT_SURFACES.values():  # and, as S4 will deliver them, each agent's
+        monkeypatch.setenv("SUBSTRATE_TOKEN_" + surface.upper().replace("-", "_"), f"tok-{surface}")
+    f = FakeSubstrate()
+    monkeypatch.setattr(substrate_client, "_open", f)
+    return f
+
+
+def _store(tmp_path, name="tasks.db") -> TaskStore:
+    return TaskStore(tmp_path / ".swarm" / name)
+
+
+def _plan(store, tid="T-be", agent="A05", gates=(), **notes) -> dict:
+    store.create(task_id=tid, correlation_id=CORR, capability="code.backend", agent_id=agent,
+                 notes={"gates": list(gates), **notes})
+    store.transition(tid, "VALIDATED")
+    store.transition(tid, "PLANNED")
+    return store.get(tid)
+
+
+def _bridge(store, events, env=None, **kw) -> lease_mod.LeaseBridge:
+    return lease_mod.LeaseBridge(store.path, CORR, emit=lambda t, p: events.append((t, p)), env=env, **kw)
+
+
+def _replica(name):
+    return {**os.environ, "SWARM_REPLICA": name}
+
+
+def _types(events):
+    return [t for t, _ in events]
+
+
+def _load(script):
+    spec = importlib.util.spec_from_file_location(f"{script}_s2_under_test", ROOT / "scripts" / f"{script}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture()
+def runner():
+    mod = _load("swarm_run")
+    # a fixed, unsigned envelope so the test reads task.assign back out of the prompt
+    mod.build_envelope = lambda **kw: {"msg_type": kw["msg_type"], "payload": kw["payload"]}
+    mod.sign_envelope = lambda env, **kw: env
+    return mod
+
+
+def _args(**kw):
+    return SimpleNamespace(dry_run=False, task_timeout=30, runtime="claude", claude_bin="claude", grok_bin="grok",
+                           omp_bin="omp", permission_mode="acceptEdits", max_turns=5, model="", allowed_tools="", **kw)
+
+
+def _assign(prompt: str) -> dict:
+    return json.loads(re.search(r"```json\n(.*?)\n```", prompt, re.S).group(1))["payload"]
+
+
+def _session(seen: dict, state="IN_REVIEW"):
+    """Stands in for run_agent_headless: records the prompt, registers with the keeper like the real one, reports `state`."""
+    def run(agent, prompt, repo, args, *, on_session=None):
+        seen["prompt"] = prompt
+        if on_session is not None:
+            on_session(lambda reason: seen.setdefault("stopped", reason))
+            on_session(None)
+        tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
+        if state is None:
+            return "the session printed no result", {"returncode": 0}
+        return "done\n```json\n" + json.dumps({"task_id": tid, "state": state, "summary_md": "ok"}) + "\n```", {"returncode": 0}
+    return run
+
+
+def _execute(runner, store, task, bridge, tmp_path, events, args=None):
+    repo = tmp_path / "work"
+    repo.mkdir(exist_ok=True)
+    agent = {"id": task["agent_id"], "slug": "a05-backend"}
+    ctx = SimpleNamespace(emit=lambda t, p, **k: events.append((t, p)))
+    return runner.execute_one(store.path, task, agent, args or _args(), ctx, repo, bridge)
+
+
+# --- LEASE-05: claim before dispatch ---------------------------------------------------------------------------
+def test_grant_dispatches_with_lease_s_from_the_granted_ttl(tmp_path, fake, runner, monkeypatch):
+    monkeypatch.setenv("SWARM_LEASE_TTL_S", "120")
+    fake.grant_ttl = 90  # the server's grant wins over what was asked for
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)
+    batch, waiting = runner.select_batch(store, [task], 3, bridge)
+    assert [t["task_id"] for t, _ in batch] == ["T-be"] and waiting == []
+    (claim,) = fake.at("graph_claim")
+    assert claim["caller"] == "swarm-a05-be"  # A05's own token, not the runner's
+    assert claim["args"] == {"graph_id": GID, "node_id": "T-be", "session_id": f"A05@r0:{GID}", "ttl_seconds": 120,
+                             "surface": "swarm-a05-be"}
+    seen = {}
+    monkeypatch.setattr(runner, "run_agent_headless", _session(seen))
+    _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
+    assert outcome == "IN_REVIEW"
+    assert _assign(seen["prompt"])["lease_s"] == 90
+    node = fake.node("T-be")
+    mirror = store.get("T-be")["notes_json"]["lease"]
+    assert mirror["state"] == "held" and mirror["lease_id"] == node["lease_id"] and node["session"] == f"A05@r0:{GID}"
+    assert bridge.held("T-be") is not None  # IN_REVIEW keeps the lease for DONE / CHANGES_REQUESTED
+    assert not [t for t in _types(events) if t.startswith("lease.")]
+
+
+def test_denied_claim_leaves_the_task_undispatched(tmp_path, fake, runner):
+    fake.register("T-be")
+    other = _store(tmp_path, "other.db")
+    assert _bridge(other, [], env=_replica("r9")).acquire(_plan(other), "A05").status == "held"
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    batch, waiting = runner.select_batch(store, [task], 3, _bridge(store, events))
+    assert batch == [] and waiting == [f"T-be: denied (held by A05@r9:{GID})"]
+    t = store.get("T-be")
+    assert t["state"] == "PLANNED" and t["attempt"] == 0 and [h["to_state"] for h in store.history("T-be")][-1] == "PLANNED"
+    assert t["notes_json"]["lease"]["state"] == "denied"
+    assert t["notes_json"]["lease"]["holder"] == {"surface": "swarm-a05-be", "session_id": f"A05@r9:{GID}"}
+    assert _types(events) == ["lease.denied"]
+
+
+def test_a_denied_task_does_not_take_a_parallel_slot(tmp_path, fake, runner):
+    fake.register("T-a", "T-b")
+    other = _store(tmp_path, "other.db")
+    _bridge(other, [], env=_replica("r9")).acquire(_plan(other, "T-a"), "A05")
+    store = _store(tmp_path)
+    ready = [_plan(store, "T-a"), _plan(store, "T-b")]
+    batch, waiting = runner.select_batch(store, ready, 1, _bridge(store, []))
+    assert [t["task_id"] for t, _ in batch] == ["T-b"] and len(waiting) == 1
+
+
+def test_refused_claim_is_not_dispatched(tmp_path, fake, runner, monkeypatch):
+    # A05's token was never delivered: the client falls back to SUBSTRATE_TOKEN (A01's) and the server refuses the claim.
+    # Running it unleased would be exactly the misconfigured-but-looks-healthy agent the ADR warns about.
+    monkeypatch.delenv("SUBSTRATE_TOKEN_SWARM_A05_BE")
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    batch, waiting = runner.select_batch(store, [_plan(store)], 3, _bridge(store, events))
+    assert batch == [] and waiting == ["T-be: refused"]
+    assert store.get("T-be")["state"] == "PLANNED" and store.get("T-be")["notes_json"]["lease"]["state"] == "refused"
+    assert _types(events) == ["lease.refused"] and "surface" in events[0][1]["reason"]
+
+
+@pytest.mark.parametrize("failure", ["down", "server-error"])
+def test_unreachable_substrate_dispatches_unleased_and_records_it(tmp_path, fake, runner, monkeypatch, failure):
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)  # the Graph ID is resolved before the outage
+    assert bridge.graph_id() == GID
+    if failure == "down":
+        fake.down = True
+    else:
+        fake.forced["graph_claim"] = Err("graph_claim requires SUBSTRATE_PG_URL")
+    batch, waiting = runner.select_batch(store, [task], 3, bridge)
+    assert len(batch) == 1 and waiting == []
+    mirror = store.get("T-be")["notes_json"]["lease"]
+    assert mirror["state"] == "unleased"
+    assert ("unreachable" if failure == "down" else "SUBSTRATE_PG_URL") in mirror["reason"]
+    assert _types(events) == ["lease.unleased"]
+    seen = {}
+    monkeypatch.setattr(runner, "run_agent_headless", _session(seen))
+    _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
+    assert outcome == "IN_REVIEW"  # the run carries on as before (LEASE-09)
+    assert _assign(seen["prompt"])["lease_s"] == task["budget"]["max_wall_s"]  # no grant: the old meaning
+
+
+def test_an_unregistered_node_is_registered_as_the_orchestrator_then_claimed(tmp_path, fake):
+    store, events = _store(tmp_path), []
+    task = _plan(store, "T-qa.r1")  # a gate rerun, created after orch_plan registered the node set
+    claim = _bridge(store, events).acquire(task, "A05")
+    assert claim.status == "held"
+    (reg,) = fake.at("graph_register")
+    assert reg["caller"] == "swarm-a01-orch" and reg["args"] == {"graph_id": GID, "nodes": [{"node_id": "T-qa.r1"}]}
+    assert len(fake.at("graph_claim")) == 2
+
+
+# --- LEASE-06: heartbeats and the refusal table ------------------------------------------------------------------
+def _held(tmp_path, fake, events, tid="T-be", state="IN_PROGRESS", **kw):
+    fake.register(tid)
+    store = _store(tmp_path)
+    task = _plan(store, tid)
+    bridge = _bridge(store, events, clock=lambda: fake.now, **kw)
+    assert bridge.acquire(task, "A05").status == "held"
+    for s in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW")[: ("CLAIMED", "IN_PROGRESS", "IN_REVIEW").index(state) + 1]:
+        store.transition(tid, s)
+    return store, bridge
+
+
+def _steal(fake, tid="T-be", replica="r2", ttl=lease_mod.DEFAULT_TTL_S):
+    """The runner's lease lapses and another A05 replica takes the node."""
+    fake.now += ttl + 1
+    claim = lease_mod.claim_node("A05", GID, tid, ttl_s=ttl, env=_replica(replica))[0]
+    assert claim.status == "held" and claim.reason == "stolen"
+
+
+def test_heartbeat_extends_and_keeps_the_session(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events)
+    stops = []
+    bridge.watch("T-be", stops.append)
+    before = fake.node("T-be")["expires"]
+    fake.now += 200
+    assert bridge.beat("T-be") == "ok" and fake.node("T-be")["expires"] == fake.now + lease_mod.DEFAULT_TTL_S > before
+    assert stops == [] and events == []
+
+
+@pytest.mark.parametrize("reason", ["lost", "unheld", "not-holder"])
+def test_a_refusal_stops_the_session_with_its_tabled_reason(tmp_path, fake, monkeypatch, reason):
+    events = []
+    store, bridge = _held(tmp_path, fake, events)
+    stops = []
+    bridge.watch("T-be", stops.append)
+    if reason == "lost":
+        _steal(fake)
+    elif reason == "unheld":
+        fake.force_release("T-be")  # an operator prised it loose: the session must not carry on
+    else:  # the runner's A05 token now names another surface
+        monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A05_BE", "tok-swarm-a06-fe")
+    assert bridge.beat("T-be") == "stopped"
+    assert stops == [lease_mod.SESSION_REFUSALS[reason]]
+    assert stops[0].startswith("E-POLICY" if reason == "not-holder" else "E-TIMEOUT")
+    assert bridge.held("T-be") is None
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "lost"
+    assert events == [("lease.lost", {"task_id": "T-be", "agent": "A05", "reason": reason, "session_stopped": True})]
+
+
+def test_expired_reclaims_instead_of_beating_and_the_session_carries_on(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events)
+    stops = []
+    bridge.watch("T-be", stops.append)
+    old = fake.node("T-be")["lease_id"]
+    fake.now += lease_mod.DEFAULT_TTL_S + 1  # host under load: the beat came too late, but nobody took the node
+    assert bridge.beat("T-be") == "reclaimed"
+    new = fake.node("T-be")["lease_id"]
+    assert new != old and bridge.held("T-be").lease_id == new
+    assert fake.trail_of("T-be") == [("claim", "granted"), ("claim", "reclaimed")]
+    assert stops == [] and store.get("T-be")["notes_json"]["lease"]["lease_id"] == new
+    stops_after = []
+    bridge.watch("T-be", stops_after.append)  # the session is still the one watched on the new lease
+    fake.force_release("T-be")
+    assert bridge.beat("T-be") == "stopped" and len(stops_after) == 1
+
+
+def test_expired_whose_reclaim_is_denied_stops_the_session(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events)
+    stops = []
+    bridge.watch("T-be", stops.append)
+    _steal(fake)
+    fake.forced["graph_heartbeat"] = {"ok": False, "reason": "expired"}  # the steal lands between the beat and re-claim
+    assert bridge.beat("T-be") == "stopped"
+    assert stops == [lease_mod.RECLAIM_NOT_GRANTED]
+    assert events[-1][1]["reason"] == "expired; re-claim denied"
+
+
+def test_no_answer_keeps_the_session_and_retries_sooner(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events)
+    stops = []
+    bridge.watch("T-be", stops.append)
+    fake.down = True
+    assert bridge.beat("T-be") == "unanswered"
+    assert bridge.held("T-be").due == fake.now + substrate_client.BACKOFF_S < fake.now + lease_mod.heartbeat_interval(900)
+    assert stops == [] and events == []
+
+
+def test_a_lease_lost_before_the_session_starts_stops_it_on_arrival(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events)
+    _steal(fake)
+    assert bridge.beat("T-be") == "dropped"  # nothing watching yet
+    stops = []
+    bridge.watch("T-be", stops.append)
+    assert stops == [lease_mod.SESSION_REFUSALS["lost"]]
+
+
+def test_between_rounds_a_lost_lease_is_dropped_and_the_task_left_to_a01(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events, state="IN_REVIEW")
+    _steal(fake)
+    assert bridge.beat("T-be") == "dropped"
+    assert store.get("T-be")["state"] == "IN_REVIEW" and bridge.held("T-be") is None
+    assert events[-1] == ("lease.lost", {"task_id": "T-be", "agent": "A05", "reason": "lost", "session_stopped": False})
+    # the gates pass: A01 still calls it DONE, and says the node is someone else's
+    from swarm.results import reconcile
+    reconcile(store, CORR, lambda *a, **k: None, leases=bridge)
+    assert store.get("T-be")["state"] == "DONE"
+    assert fake.node("T-be")["state"] is None and fake.node("T-be")["session"] == f"A05@r2:{GID}"
+    assert events[-1][0] == "lease.unsettled" and events[-1][1]["reason"] == "claim denied"
+
+
+def test_between_rounds_an_unheld_lease_is_reclaimed(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events, state="IN_REVIEW")
+    fake.force_release("T-be")  # e.g. lapsed and reaped while the runner was paused
+    assert bridge.beat("T-be") == "reclaimed" and fake.node("T-be")["session"] == f"A05@r0:{GID}"
+
+
+def test_session_transition_table():
+    assert lease_mod.session_transition("expired") == lease_mod.RECLAIM
+    assert lease_mod.session_transition("lost").startswith("E-TIMEOUT: lease lost")
+    assert lease_mod.session_transition("unheld").startswith("E-TIMEOUT: lease unheld")
+    assert lease_mod.session_transition("not-holder").startswith("E-POLICY: lease not-holder")
+    assert lease_mod.session_transition("brand-new") == "E-TIMEOUT: lease refused (brand-new)"
+
+
+def test_the_keeper_stops_a_real_session_whose_node_was_taken(tmp_path, fake, runner, monkeypatch):
+    """End to end on a real process group: the keeper thread beats, the substrate answers `lost`, the runner kills the
+    session and fails the task with the tabled reason, long before the session would have finished."""
+    monkeypatch.setattr(lease_mod, "heartbeat_interval", lambda ttl: 0.05)
+    child = [sys.executable, "-c", "import sys, time; sys.stdin.read(); time.sleep(60)"]
+    monkeypatch.setattr(runner, "headless_command", lambda runtime, agent, repo, sdir, args: (child, dict(os.environ), repo))
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)
+    batch, _ = runner.select_batch(store, [task], 1, bridge)
+    assert batch
+    _steal(fake)
+    bridge.start()
+    try:
+        t0 = time.monotonic()
+        _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events, args=_args())
+        elapsed = time.monotonic() - t0
+    finally:
+        bridge.close()
+    assert outcome == "FAILED" and elapsed < 20
+    assert store.history("T-be")[-1]["reason"] == lease_mod.SESSION_REFUSALS["lost"]
+    assert store.get("T-be")["notes_json"]["meta"]["lease_stopped"] == lease_mod.SESSION_REFUSALS["lost"]
+    assert ("lease.lost" in _types(events)) and fake.node("T-be")["session"] == f"A05@r2:{GID}"  # never released by us
+
+
+# --- LEASE-07: DONE, CHANGES_REQUESTED, FAILED, CANCELLED ----------------------------------------------------------
+def test_done_goes_through_graph_complete_fenced_on_the_lease(tmp_path, fake):
+    from swarm.results import reconcile
+    events = []
+    store, bridge = _held(tmp_path, fake, events, state="IN_REVIEW")
+    lease_id = fake.node("T-be")["lease_id"]
+    reconcile(store, CORR, lambda *a, **k: None, leases=bridge)
+    assert store.get("T-be")["state"] == "DONE"
+    (done,) = fake.at("graph_complete")
+    assert done["args"]["lease_id"] == lease_id and done["caller"] == "swarm-a05-be"
+    assert fake.node("T-be")["state"] == "completed" and fake.trail_of("T-be")[-1] == ("note", "completed")
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "completed" and bridge.held("T-be") is None
+    assert events == []
+
+
+def test_a_restarted_runner_completes_as_the_same_holder(tmp_path, fake):
+    from swarm.results import reconcile
+    store, first = _held(tmp_path, fake, [], state="IN_REVIEW")
+    lease_id = fake.node("T-be")["lease_id"]
+    fresh = _bridge(store, [])  # same replica, new process: no lease in memory
+    reconcile(store, CORR, lambda *a, **k: None, leases=fresh)
+    assert fake.at("graph_complete")[0]["args"]["lease_id"] == lease_id  # `renewed` keeps the id
+    assert fake.node("T-be")["state"] == "completed"
+    assert fake.trail_of("T-be") == [("claim", "granted"), ("note", "completed")]
+
+
+def test_changes_requested_releases_and_reclaims_and_the_rework_reuses_it(tmp_path, fake, runner):
+    from swarm.results import reconcile
+    from swarm.verdicts import record_gate_verdicts
+    fake.register("S-be", "S-qa")
+    store, events = _store(tmp_path), []
+    target = _plan(store, "S-be", gates=["quality"])
+    _plan(store, "S-qa", agent="A08", gate="quality", gate_for=["S-be"])
+    bridge = _bridge(store, events)
+    assert bridge.acquire(target, "A05").status == "held"
+    for s in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("S-be", s)
+    for s in ("CLAIMED", "IN_PROGRESS"):
+        store.transition("S-qa", s)
+    record_gate_verdicts(store, gate_task_id="S-qa", gate="quality", agent_id="A08@local", verdict="fail", runs={},
+                         findings=[{"id": "F1", "severity": "major", "kind": "functional", "summary": "broken"}],
+                         correlation_id=CORR, expires_s=600, emit=lambda *a, **k: None)
+    first = fake.node("S-be")["lease_id"]
+    reconcile(store, CORR, lambda *a, **k: None, leases=bridge)
+    assert store.get("S-be")["state"] == "IN_PROGRESS" and store.get("S-be")["rework_loops"] == 1
+    assert fake.trail_of("S-be") == [("claim", "granted"), ("note", "released"), ("claim", "granted")]
+    second = fake.node("S-be")["lease_id"]
+    assert second != first and bridge.held("S-be").lease_id == second
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [first]  # fenced on the lease it held
+    claims = len(fake.at("graph_claim"))
+    batch, _ = runner.select_batch(store, [store.get("S-be")], 3, bridge)
+    assert [t["task_id"] for t, _ in batch] == ["S-be"] and len(fake.at("graph_claim")) == claims  # no third claim
+    assert events == []
+
+
+def test_failed_releases(tmp_path, fake, runner, monkeypatch):
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)
+    runner.select_batch(store, [task], 1, bridge)
+    lease_id = fake.node("T-be")["lease_id"]
+    monkeypatch.setattr(runner, "run_agent_headless", _session({}, state=None))  # no result: E-CONTRACT, FAILED
+    _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
+    assert outcome == "FAILED"
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [lease_id]
+    assert fake.node("T-be")["lease_id"] is None and fake.trail_of("T-be")[-1] == ("note", "released")
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "released" and bridge.held("T-be") is None
+
+
+def test_cancelled_by_orch_status_releases_the_mirrored_lease(tmp_path, fake):
+    events = []
+    store, bridge = _held(tmp_path, fake, events, state="IN_PROGRESS")
+    lease_id = fake.node("T-be")["lease_id"]
+    orch = _load("orch_status")  # another process: it knows the lease only from notes.lease
+    rc = orch.AgentScript("A01", "orch_status", orch.run, description=orch.__doc__, add_args=orch.add_args).main(
+        ["--json", "--root", str(tmp_path), "--transition", "T-be", "CANCELLED"])
+    assert rc == 0 and store.get("T-be")["state"] == "CANCELLED"
+    rel = [c for c in fake.at("graph_release")]
+    assert [(c["caller"], c["args"]["lease_id"]) for c in rel] == [("swarm-a05-be", lease_id)]
+    assert fake.node("T-be")["lease_id"] is None and store.get("T-be")["notes_json"]["lease"]["state"] == "released"
+    # the runner's keeper notices on its next beat and lets go instead of re-claiming a cancelled task's node
+    assert bridge.beat("T-be") == "settled" and bridge.held("T-be") is None and fake.node("T-be")["lease_id"] is None
+
+
+# --- LEASE-08: two replicas, one node -----------------------------------------------------------------------------
+def test_two_replicas_racing_for_a_node_dispatch_it_once(tmp_path, fake, runner):
+    for n in range(5):
+        tid = f"R{n}-be"
+        fake.register(tid)
+        stores = [_store(tmp_path, f"r{i}-{n}.db") for i in (1, 2)]
+        bridges = [_bridge(s, [], env=_replica(f"r{i}")) for i, s in zip((1, 2), stores)]
+        tasks = [_plan(s, tid) for s in stores]
+        results: list = [None, None]
+        gate = threading.Barrier(2)
+
+        def race(i):
+            gate.wait()
+            results[i] = runner.select_batch(stores[i], [tasks[i]], 1, bridges[i])
+
+        threads = [threading.Thread(target=race, args=(i,)) for i in (0, 1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        dispatched = [i for i in (0, 1) if results[i][0]]
+        assert len(dispatched) == 1, results
+        winner = f"A05@r{dispatched[0] + 1}:{GID}"
+        assert results[1 - dispatched[0]][1] == [f"{tid}: denied (held by {winner})"]
+        assert [k for k, _ in fake.trail_of(tid)] == ["claim"]
+
+
+def test_a_dead_replicas_node_is_free_to_the_next_claimant_within_one_ttl(tmp_path, fake, monkeypatch):
+    monkeypatch.setenv("SWARM_LEASE_TTL_S", "30")
+    fake.register("T-be")
+    s1, s2 = _store(tmp_path, "r1.db"), _store(tmp_path, "r2.db")
+    r1 = _bridge(s1, [], env=_replica("r1"), clock=lambda: fake.now)
+    assert r1.acquire(_plan(s1), "A05").status == "held"
+    granted_at = fake.now
+    # r1 is killed: no keeper, no release. Nothing reaps; the lease simply lapses.
+    r2 = _bridge(s2, [], env=_replica("r2"), clock=lambda: fake.now)
+    task2 = _plan(s2)
+    fake.now = granted_at + 29
+    assert r2.acquire(task2, "A05").status == "denied"  # never two holders at once
+    fake.now = granted_at + 30
+    claim = r2.acquire(task2, "A05")
+    assert claim.status == "held" and claim.reason == "stolen"
+    assert fake.trail_of("T-be") == [("claim", "granted"), ("warning", "stolen")]
+    assert not [c for c in fake.calls if c["tool"].startswith("coord_reap")]
+    # had r1 merely stalled, its next beat finds the node gone
+    assert r1.beat("T-be") == "dropped"
+
+
+# --- off, dry-run, configuration -----------------------------------------------------------------------------------
+def test_no_bridge_when_off_or_dry_run(tmp_path, monkeypatch, runner):
+    calls = []
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: calls.append(a))
+    ctx = SimpleNamespace(emit=lambda *a, **k: None)
+    assert runner.lease_bridge(SimpleNamespace(dry_run=False), tmp_path / "t.db", CORR, tmp_path, ctx) is None
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")
+    assert runner.lease_bridge(SimpleNamespace(dry_run=True), tmp_path / "t.db", CORR, tmp_path, ctx) is None
+    assert calls == []
+    store = _store(tmp_path)
+    ready = [_plan(store, "T-a"), _plan(store, "T-b")]
+    batch, waiting = runner.select_batch(store, ready, 1, None)
+    assert [t["task_id"] for t, _ in batch] == ["T-a"] and waiting == []
+
+
+@pytest.mark.parametrize("var,value", [("SWARM_REPLICA", "r 1"), ("SWARM_REPLICA", "x" * 65), ("SWARM_LEASE_TTL_S", "15m")])
+def test_bad_replica_or_ttl_refuses_the_run_at_start(tmp_path, monkeypatch, runner, var, value):
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")
+    monkeypatch.setenv(var, value)
+    with pytest.raises(SwarmError) as e:
+        runner.lease_bridge(SimpleNamespace(dry_run=False), tmp_path / "t.db", CORR, tmp_path,
+                            SimpleNamespace(emit=lambda *a, **k: None))
+    assert e.value.code is ErrorCode.E_INPUT and var in str(e.value)
+
+
+def test_replica_and_session_shape():
+    assert tee_mod.replica_id({}) == "r0" and tee_mod.replica_id({"SWARM_REPLICA": "  "}) == "r0"
+    assert tee_mod.replica_id({"SWARM_REPLICA": "host-1.a_b"}) == "host-1.a_b"
+    assert tee_mod.session_id("A05", GID, {"SWARM_REPLICA": "r2"}) == f"A05@r2:{GID}"
+    for bad in ("r:1", "r@1", "é", "x" * 65):
+        with pytest.raises(ValueError):
+            tee_mod.replica_id({"SWARM_REPLICA": bad})
+
+
+@pytest.mark.parametrize("raw,ttl,interval", [("", 900, 300.0), ("5", 30, 10.0), ("120", 120, 40.0), ("999999", 86_400, 28_800.0)])
+def test_ttl_is_clamped_and_beaten_every_third(raw, ttl, interval):
+    assert lease_mod.ttl_seconds({"SWARM_LEASE_TTL_S": raw}) == ttl
+    assert lease_mod.heartbeat_interval(ttl) == interval
+    assert lease_mod.heartbeat_interval(1) == 10.0  # the 30 s floor holds even for a nonsense grant
+
+
+# --- substrate_client.mcp_call_outcome: "no" is not "no answer" ------------------------------------------------------
+def _rpc(result: dict) -> str:
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "result": result})
+
+
+@pytest.mark.parametrize("reply,status,detail", [
+    ((_rpc({"content": [{"type": "text", "text": '{"ok": true}'}]}), 200), "ok", ""),
+    (('{"error":"no"}', 401), "refused", 'HTTP 401: {"error":"no"}'),
+    (('{"error":"no"}', 403), "refused", 'HTTP 403: {"error":"no"}'),
+    (("boom", 500), "error", "HTTP 500: boom"),
+    ((_rpc({"isError": True, "content": [{"type": "text", "text": '{"error": "session refused"}'}]}), 200), "refused",
+     "session refused"),
+    ((_rpc({"isError": True, "content": [{"type": "text", "text": "unknown node g/n"}]}), 200), "error", "unknown node g/n"),
+    (("not json at all", 200), "error", "no tool result"),
+    (OSError("down"), "unreachable", ""),
+])
+def test_mcp_call_outcome_classifies_and_mcp_call_json_is_unchanged(monkeypatch, reply, status, detail):
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")
+
+    def answer(*a, **k):
+        if isinstance(reply, Exception):
+            raise reply
+        return _Resp(*reply)
+
+    monkeypatch.setattr(substrate_client, "_open", answer)
+    got = substrate_client.mcp_call_outcome("graph_claim", {})
+    assert (got.status, got.detail) == (status, detail)
+    substrate_client.reset()  # an unreachable host backs off; the second door is asked afresh
+    assert substrate_client.mcp_call_json("graph_claim", {}) == ({"ok": True} if status == "ok" else None)
+
+
+def test_mcp_call_outcome_is_off_without_a_url(monkeypatch):
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: pytest.fail("no socket when off"))
+    assert substrate_client.mcp_call_outcome("graph_claim", {}).status == "off"

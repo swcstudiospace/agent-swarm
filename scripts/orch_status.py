@@ -19,6 +19,7 @@ from swarm.runlog import read_events  # noqa: E402
 from swarm.paths import latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
+from swarm import substrate_lease  # noqa: E402
 
 
 def ingest(store: TaskStore, path: Path, ctx) -> dict:
@@ -58,7 +59,11 @@ def run(args, ctx) -> dict:
         tid, state = args.transition
         if ctx.dry_run:
             return {"status": "ok", "summary": f"dry-run: would transition {tid} → {state}"}
-        t = store.transition(tid, state, actor="A01", reason=args.reason or "manual")
+        store.transition(tid, state, actor="A01", reason=args.reason or "manual")
+        # a lease the runner mirrored in notes.lease is released (CANCELLED, FAILED, …) or completed (DONE) now, by its
+        # lease_id, rather than left to lapse; a no-op when the substrate is off or nothing is held (LEASE-07)
+        substrate_lease.settle_mirrored(store, tid, emit=ctx.emit)
+        t = store.get(tid)
         ctx.emit("task.transition", {"task_id": tid, "state": t["state"], "reason": args.reason})
         return {"status": "ok", "task": t, "summary": f"{tid} → {t['state']}"}
 

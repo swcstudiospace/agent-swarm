@@ -40,6 +40,25 @@ AGENT_SURFACES: dict[str, str] = {
     "A15": "swarm-a15-doc",
 }
 
+# A swarm session names its agent, replica and graph: `<AGENT>@<replica>:<graph_id>`. The substrate refuses a swarm claim
+# whose replica is outside this charset (LEASE-01), so the runner checks it at start instead of failing every claim.
+REPLICA_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+DEFAULT_REPLICA = "r0"
+
+
+def replica_id(env: Mapping[str, str] | None = None) -> str:
+    """SWARM_REPLICA (blank or unset: `r0`). ValueError when it is not 1-64 of [A-Za-z0-9._-]."""
+    e = os.environ if env is None else env
+    replica = (e.get("SWARM_REPLICA") or "").strip() or DEFAULT_REPLICA
+    if REPLICA_RE.fullmatch(replica) is None:
+        raise ValueError(f"SWARM_REPLICA {replica[:80]!r} must be 1-64 characters of [A-Za-z0-9._-]")
+    return replica
+
+
+def session_id(agent: str, graph_id: str, env: Mapping[str, str] | None = None) -> str:
+    """`<AGENT>@<replica>:<graph_id>`: the one session format the tee and the lease bridge both use."""
+    return f"{agent}@{replica_id(env)}:{graph_id}"
+
 # --- swarm event type -> substrate EVENT_KINDS --------------------------------------------------------------
 # EVENT_KINDS is closed: session.start, prompt, claim, tool.call, file.edit, shell, commit, pr, handoff,
 # session.end, note, warning. EVERY type the repo emits via runlog.emit()/Ctx.emit() is listed here (or matched by
@@ -61,6 +80,12 @@ TYPE_KINDS: dict[str, str] = {
     "task.result.rejected": "warning",         # a task.result failed schema/contract validation
     "escalation.request": "warning",           # rework loops / attempts exhausted: a human is needed
     "security.dev_key": "warning",             # an envelope was signed with the development key
+    # the runner's substrate leases (substrate_lease.py); grants, releases and completions are written by the server itself
+    "lease.denied": "note",                    # another holder has the node: the task waits, nothing went wrong
+    "lease.unleased": "warning",               # dispatched without a lease (substrate unreachable or erroring): fail-open
+    "lease.refused": "warning",                # the server refused this agent's claim (token / session): not dispatched
+    "lease.lost": "warning",                   # a refused heartbeat stopped a session or dropped a held lease
+    "lease.unsettled": "warning",              # a release or completion did not land; the lease is left to lapse
 }
 # `script.<name>` and `script.<name>.error` are the exit record of one agent script run -> tool.call.
 PREFIX_KINDS: tuple[tuple[str, str], ...] = (("script.", "tool.call"),)
@@ -297,7 +322,6 @@ def build_event(record: Mapping, graph_id: str, *, env: Mapping[str, str] | None
     msg_id, corr = record.get("msg_id"), record.get("correlation_id")
     if kind is None or agent is None or not msg_id or not corr:
         return None
-    replica = (e.get("SWARM_REPLICA") or "").strip() or "r0"
     task_id = record.get("task_id")
     payload = {"correlation_id": corr, "msg_id": msg_id, "swarm_type": swarm_type}
     for key in ("trace_id", "causation_id"):
@@ -310,7 +334,7 @@ def build_event(record: Mapping, graph_id: str, *, env: Mapping[str, str] | None
         "kind": kind,
         "summary": f"{swarm_type}" + (f" {task_id}" if task_id else f" {corr}"),
         "surface": AGENT_SURFACES[agent],
-        "session_id": f"{agent}@{replica}:{graph_id}",
+        "session_id": session_id(agent, graph_id, e),
         "graph_id": graph_id,
         "actor": "agent",
         "payload": payload,
