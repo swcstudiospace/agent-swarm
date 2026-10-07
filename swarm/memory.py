@@ -36,7 +36,7 @@ ORCH_SURFACE = "swarm-a01-orch"
 
 MAX_UNVERIFIED_POSTS = 3                 # POSTs of one write that came back accepted-but-unverified (or in-flight), same key
 UNVERIFIED_BACKOFF_S = (0.5, 1.0)        # sleeps between those POSTs
-MAX_VERSION_RESUBMITS = 2                # re-reads + re-submits after a version conflict
+MAX_VERSION_RESUBMITS = 2                # re-submits after a version conflict (with the reported or re-read version in force)
 VERSION_REASONS = frozenset({"version.required", "version.stale", "version.raced", "standing.raced"})
 REVIEW_REASON = "review.required"
 IN_FLIGHT_REASON = "write.in-flight"     # another attempt holds the key; the server says "retry with the same key"
@@ -153,11 +153,14 @@ def _outcome(status: str, reply: Mapping | None, key: str, attempts: int, **over
 def _current_version(scope: str, subject: str | None, conflict_with: str, env: Mapping[str, str] | None) -> tuple[bool, int | None]:
     """Re-read the decision in force for (scope, subject): ``(readable, version)``; version None when none is in force.
 
-    The conflict reply names the colliding entry (``conflict_with``) but not its version, so the version comes from
-    ``memory_search`` (superseded entries are excluded by the server). One read is capped at 100 entries, so the read is
-    targeted first (the subject as query text at the scope), and only when that does not find it falls back to the
-    scope-wide read (empty query). When the server named a standing entry but neither read finds it, the version is
-    unreadable: ``(False, None)``, never "nothing in force" (that would drop ``expected_version`` and waste the re-submits).
+    The fallback for an older server whose conflict reply names the colliding entry (``conflict_with``) but does not report
+    ``current_version``: the version then comes from ``memory_search`` (superseded entries are excluded by the server). The
+    read is targeted first (the subject as query text at the scope) and, only when that does not find it, scope-wide (empty
+    query). Its limit: ``memory_search`` matches the query against the entry BODY only and returns at most the newest 100
+    entries of the scope, so an older decision whose body lacks its subject words, with 100+ newer entries in its scope, is
+    found by neither read. When the server named a standing entry but neither read finds it, the version is unreadable:
+    ``(False, None)``, never "nothing in force" (that would drop ``expected_version`` and waste the re-submits), and the write
+    stops as a conflict.
     """
     want = (subject or "").strip().lower()
     answered = True
@@ -184,8 +187,9 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
     """One governed swarm memory write. Raises ``SwarmError`` E-INPUT (bad kind/scope/ids) or E-POLICY (the server denied it).
 
     ``subject`` names what a ``decision`` is about: only a decision with a subject is versioned (replacing one needs
-    ``expected_version``; on a version conflict the client re-reads the version in force and re-submits, twice at most).
-    The same ``idempotency_key`` is sent on every POST of this write.
+    ``expected_version``). On a version conflict the client re-submits with the version in force that the server reports as
+    ``current_version`` (null: none in force, so without ``expected_version``); an older server that does not report it gets
+    the :func:`_current_version` re-read instead. Twice at most. The same ``idempotency_key`` is sent on every POST of this write.
 
     ``unavailable`` is an UNKNOWN result, not proof that nothing was written: when the request went out and the reply was
     lost, the server may have stored the entry. To recover, call again with the SAME logical write (same correlation, task,
@@ -236,7 +240,11 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
             if reason == REVIEW_REASON:  # a global write is a proposal until a reviewer releases it; never retried
                 return _outcome(PROPOSAL, reply, key, posts)
             if reason in VERSION_REASONS and kind == "decision" and body.get("subject") and resubmits < MAX_VERSION_RESUBMITS:
-                readable, version = _current_version(target, body.get("subject"), _str(reply, "conflict_with"), env)
+                reported = reply.get("current_version")
+                if "current_version" in reply and (reported is None or (isinstance(reported, int) and not isinstance(reported, bool))):
+                    readable, version = True, reported  # the server named the version in force: no re-read
+                else:  # an older server (or an unusable value): re-read it
+                    readable, version = _current_version(target, body.get("subject"), _str(reply, "conflict_with"), env)
                 if readable:
                     resubmits += 1
                     if version is None:

@@ -48,11 +48,15 @@ class FakeSubstrate:
 
     `memory` is a list of `(http_status, body)`; the last reply repeats once the list is used up (an exhausted script must not
     raise: substrate_client swallows every exception, which would turn a test bug into a silent "unreachable").
+
+    `memory_search` answers `entries` verbatim whatever the query (for tests where search semantics do not matter), or, when
+    `corpus` is given, searches it the way the real server does (see `_search`).
     """
 
-    def __init__(self, memory=(), entries=None, brief=("# Brief\n- decision d1\n", 200)):
+    def __init__(self, memory=(), entries=None, corpus=None, brief=("# Brief\n- decision d1\n", 200)):
         self.memory = list(memory)
         self.entries = entries          # what memory_search answers; None = the MCP call fails (HTTP 500)
+        self.corpus = corpus            # entry dicts, oldest first; when set, memory_search really searches them
         self.brief = brief
         self.calls: list[dict] = []
 
@@ -67,14 +71,24 @@ class FakeSubstrate:
             return self._answer(req, self.brief[1], self.brief[0])
         assert path == "/mcp", path
         name = body["params"]["name"]
-        if name == "memory_search":  # `entries` may be a function of the search arguments (query-dependent answers)
-            out = self.entries(body["params"]["arguments"]) if callable(self.entries) else self.entries
+        if name == "memory_search":
+            out = self._search(body["params"]["arguments"]) if self.corpus is not None else self.entries
             if out is None:
                 return self._answer(req, 500, "boom")
         else:  # graph_bind forward lookup (assignment_prompt)
             out = {"status": "unbound", "correlation_id": body["params"]["arguments"].get("correlation_id"), "graph_id": None}
         rpc = {"jsonrpc": "2.0", "id": body["id"], "result": {"content": [{"type": "text", "text": json.dumps(out)}]}}
         return _Resp(json.dumps(rpc))
+
+    def _search(self, args):
+        """The substrate's `memory_search`: superseded entries excluded, the query matched against the entry BODY only (`text`
+        on the wire; every query word must appear, case-insensitive; an empty query matches everything), newest first, capped
+        at the call's limit. Never against the subject: that is what makes an older decision hard to find."""
+        words = set(re.findall(r"\w+", args.get("query", "").lower()))
+        hits = [e for e in self.corpus
+                if not e.get("superseded_by") and e.get("scope") == args.get("scope", e.get("scope"))
+                and words <= set(re.findall(r"\w+", str(e.get("text", "")).lower()))]
+        return hits[::-1][:args["limit"]]
 
     @staticmethod
     def _answer(req, status, text):
@@ -104,13 +118,26 @@ def unverified():
     return (202, result(reason="ok", verified=False))
 
 
-def version_conflict(reason="version.stale", conflict_with="mem_old"):
+OLDER_SERVER = object()  # `version_conflict(current_version=...)` default: the reply carries no current_version at all
+
+
+def version_conflict(reason="version.stale", conflict_with="mem_old", current_version=OLDER_SERVER):
+    """A version conflict. A current server reports `current_version` (the version in force, or None when none is); by default
+    the key is absent, as from an older server, so the client falls back to re-reading it."""
     extra = {"conflict_with": conflict_with} if conflict_with else {}
+    if current_version is not OLDER_SERVER:
+        extra["current_version"] = current_version
     return (409, result("conflict", reason, verified=False, **extra))
 
 
-def decision(version, subject="db choice", entry_id="mem_old", **kw):
-    return {"id": entry_id, "kind": "decision", "subject": subject, "version": version, "scope": f"repo:{REPO}", **kw}
+def decision(version, subject="db choice", entry_id="mem_old", text="use postgres 16", **kw):
+    """A decision entry as memory_search returns it; its body (`text`) does not name its subject unless a test says so."""
+    return {"id": entry_id, "kind": "decision", "subject": subject, "version": version, "scope": f"repo:{REPO}", "text": text, **kw}
+
+
+def _newer(n):
+    """`n` facts in the decision's scope written after it (a corpus is oldest first), none naming "db" or "choice"."""
+    return [{"id": f"mem_new_{i}", "kind": "fact", "scope": f"repo:{REPO}", "text": f"retro note {i}: cache warmed"} for i in range(n)]
 
 
 # Other test modules reload every `swarm*` module (see the swarm_dir fixture); pin the ones imported here so the module under
@@ -364,48 +391,80 @@ def test_review_required_is_a_proposal_and_not_retried(serve, write, sleeps):
     assert fake.at("/mcp") == []  # no re-read either
 
 
-@pytest.mark.parametrize("reason", ["version.stale", "version.required", "version.raced", "standing.raced"])
-def test_version_conflict_rereads_and_resubmits_with_expected_version(serve, write, reason):
+@pytest.mark.parametrize("reason", sorted(mem.VERSION_REASONS))
+def test_reported_current_version_is_resubmitted_without_a_reread(serve, write, reason):
+    fake = serve(memory=[version_conflict(reason, current_version=5), accepted(version=6)])
+    out = write(subject="db choice")
+    assert out.ok and out.version == 6 and out.attempts == 2
+    first, second = fake.writes
+    assert "expected_version" not in first and second["expected_version"] == 5
+    assert first["idempotency_key"] == second["idempotency_key"]  # one write, one key, however many re-submits
+    assert fake.at("/mcp", "memory_search") == []
+
+
+def test_reported_null_current_version_resubmits_without_expected_version(serve, write):
+    fake = serve(memory=[version_conflict(current_version=None), accepted()])
+    assert write(subject="db choice", expected_version=2).ok
+    assert "expected_version" not in fake.writes[1] and [w.get("expected_version") for w in fake.writes] == [2, None]
+    assert fake.at("/mcp", "memory_search") == []
+
+
+def test_reported_current_version_still_gives_up_after_two_resubmits(serve, write):
+    fake = serve(memory=[version_conflict(current_version=5)])
+    out = write(subject="db choice")
+    assert out.status == mem.CONFLICT and not out.ok and out.attempts == 1 + mem.MAX_VERSION_RESUBMITS
+    assert [w.get("expected_version") for w in fake.writes] == [None, 5, 5] and len({w["idempotency_key"] for w in fake.writes}) == 1
+    assert fake.at("/mcp", "memory_search") == []
+
+
+@pytest.mark.parametrize("reported", ["5", True, 5.0, {"version": 5}])
+def test_a_non_int_current_version_falls_back_to_the_reread(serve, write, reported):
+    fake = serve(memory=[version_conflict(current_version=reported), accepted(version=4)],
+                 corpus=[decision(3, text="db choice: use postgres 16")])
+    assert write(subject="db choice").ok
+    assert [w.get("expected_version") for w in fake.writes] == [None, 3]
+    assert len(fake.at("/mcp", "memory_search")) == 1
+
+
+# Older servers do not report current_version: the client re-reads it with memory_search (body-text match, newest 100 per scope).
+@pytest.mark.parametrize("reason", sorted(mem.VERSION_REASONS))
+def test_older_server_version_conflict_rereads_and_resubmits_with_expected_version(serve, write, reason):
+    other = decision(9, subject="cache choice", entry_id="mem_other", text="cache choice: redis, not the db choice")
     fake = serve(memory=[version_conflict(reason), accepted(version=4)],
-                 entries=[decision(1, subject="other", entry_id="mem_other"), decision(3)])
+                 corpus=[decision(3, text="db choice: use postgres 16"), other])
     out = write(subject="db choice")
     assert out.ok and out.version == 4 and out.attempts == 2
     first, second = fake.writes
-    assert "expected_version" not in first and second["expected_version"] == 3
-    assert first["idempotency_key"] == second["idempotency_key"]  # one write, one key, however many re-submits
+    assert "expected_version" not in first and second["expected_version"] == 3  # matched by id / subject, not the other hit
+    assert first["idempotency_key"] == second["idempotency_key"]
     (search,) = fake.at("/mcp", "memory_search")  # the targeted read (subject as query) found it: no scope-wide read
     assert search["body"]["params"]["arguments"] == {"query": "db choice", "limit": 100, "scope": f"repo:{REPO}"}
 
 
-def _scope_page(n=100):
-    """A full scope-wide page of other decisions: the read limit is used up before the standing decision would appear."""
-    return [decision(1, subject=f"other {i}", entry_id=f"mem_other_{i}") for i in range(n)]
-
-
-def test_standing_decision_beyond_the_scope_page_is_found_by_the_targeted_read(serve, write):
+def test_older_server_finds_a_decision_whose_body_names_its_subject_beyond_the_newest_100(serve, write):
     fake = serve(memory=[version_conflict(), accepted(version=6)],
-                 entries=lambda args: [decision(5)] if args["query"] == "db choice" else _scope_page())
+                 corpus=[decision(5, text="db choice: use postgres 16")] + _newer(120))
     out = write(subject="db choice")
     assert out.ok and out.version == 6
     assert [w.get("expected_version") for w in fake.writes] == [None, 5]
     assert [c["body"]["params"]["arguments"]["query"] for c in fake.at("/mcp", "memory_search")] == ["db choice"]
 
 
-def test_targeted_read_miss_falls_back_to_the_scope_wide_read(serve, write):
-    fake = serve(memory=[version_conflict(), accepted(version=4)],
-                 entries=lambda args: [] if args["query"] else [decision(3)])
+def test_older_server_targeted_read_miss_falls_back_to_the_scope_wide_read(serve, write):
+    fake = serve(memory=[version_conflict(), accepted(version=4)], corpus=[decision(3)] + _newer(5))  # body lacks "db choice"
     assert write(subject="db choice").ok
     assert [w.get("expected_version") for w in fake.writes] == [None, 3]
     assert [c["body"]["params"]["arguments"]["query"] for c in fake.at("/mcp", "memory_search")] == ["db choice", ""]
 
 
-def test_standing_decision_that_cannot_be_found_is_a_conflict_not_a_version_less_resubmit(serve, write):
-    fake = serve(memory=[version_conflict(), accepted()],
-                 entries=lambda args: [] if args["query"] else _scope_page())
-    out = write(subject="db choice", expected_version=2)
-    assert out.status == mem.CONFLICT and not out.ok and out.reason == "version.stale"
-    assert [w.get("expected_version") for w in fake.writes] == [2]  # never re-submitted, least of all without expected_version
-    assert len(fake.at("/mcp", "memory_search")) == 2
+def test_older_server_cannot_find_a_decision_whose_body_lacks_its_subject_beyond_the_newest_100(serve, write):
+    """The live repro: subject "db choice", body "use postgres 16", 120 newer entries in its scope. Neither read can find it,
+    so the write stops as a conflict rather than re-submitting, least of all without expected_version."""
+    fake = serve(memory=[version_conflict("version.required"), accepted()], corpus=[decision(1)] + _newer(120))
+    out = write(subject="db choice", text="use postgres 17")
+    assert out.status == mem.CONFLICT and not out.ok and out.reason == "version.required" and out.attempts == 1
+    assert len(fake.writes) == 1
+    assert [c["body"]["params"]["arguments"]["query"] for c in fake.at("/mcp", "memory_search")] == ["db choice", ""]
 
 
 def test_stale_expected_version_is_replaced_by_the_current_one(serve, write):

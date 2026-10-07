@@ -59,16 +59,21 @@ Wire status comes from the server's `memoryWriteStatus`; the decision uses the b
 | `denied`, reason `store.*` | 503 | a store outage, not a policy decision: treated as unavailable | `unavailable` | no |
 | `quarantined` (`quarantine.secret` / `.pii` / `.speculative`) | 422 | returned with `reason` and `quarantine_id`; **not retried** | `quarantined` | no |
 | `conflict`, `review.required` | 409 | carried as a proposal (`review_id`); **not retried** | `proposal` | no |
-| `conflict`, `version.required` / `version.stale` (and the race forms `version.raced` / `standing.raced`) on a `decision` with a `subject` | 409 | re-read the version in force: first a targeted `memory_search` (the subject as query text, at the scope), then, only if that misses, the scope-wide read (empty query); match by `conflict_with` id or subject. Re-submit with `expected_version` (or without it when no decision is in force and the server named none), at most 2 re-submits, same key; still conflicting → give up | `conflict` | no |
+| `conflict`, `version.required` / `version.stale` (and the race forms `version.raced` / `standing.raced`) on a `decision` with a `subject` | 409 | re-submit with the version in force, at most 2 re-submits, same key; still conflicting → give up. A current server reports it as `current_version` in the reply: an integer → re-submit with that `expected_version`; `null` (none in force) → re-submit without `expected_version`; no `memory_search` either way. An older server (no `current_version` key, or a value that is neither an integer nor `null`) gets the re-read fallback below | `conflict` | no |
 | `conflict`, `write.in-flight` | 409 | another attempt holds the key: retry with the same key like an unverified write | `conflict` after 3 POSTs | no |
 | any other `conflict` (e.g. `idempotency.reused`) | 409 | returned, not retried | `conflict` | no |
 | no reply: substrate off, unreachable, in the client's 30 s outage back-off, or the reply was lost (timeout, reset) | — | the result is **unknown**: the request may have reached the server and been stored before the reply was lost (only `substrate.disabled` guarantees nothing was sent). Not retried inside the call; recover as below | `unavailable` (`substrate.disabled` / `substrate.unreachable`) | no |
 | a non-result body (401/403 auth refusal) | 401/403 | fail-closed like `denied` | raises `E-POLICY` | — |
 | a non-result body (any other status: audit-gate 5xx, proxy page) | other | not a write result | `unavailable` (`http.<status>`) | no |
 
-A re-read that cannot be answered (`memory_search` down) leaves the conflict as `conflict`; the client never guesses a version.
-The same holds when the server named a standing decision (`conflict_with`) that neither the targeted nor the scope-wide read
-finds: the client stops with `conflict` rather than re-submitting without `expected_version`.
+**Re-read fallback (older servers).** When the conflict reply carries no usable `current_version`, the client re-reads the
+version in force: first a targeted `memory_search` (the subject as query text, at the scope), then, only if that misses, the
+scope-wide read (empty query); it matches by `conflict_with` id or subject and re-submits with `expected_version` (or without it
+when no decision is in force and the server named none). Its limit: `memory_search` matches the query against the entry
+**body** only and returns at most the newest 100 entries of the scope, so a decision whose body lacks its subject words and that
+has 100+ newer entries in its scope is found by neither read. A re-read that cannot be answered (`memory_search` down), or a
+standing decision (`conflict_with`) that neither read finds, leaves the write as `conflict`: the client never guesses a version
+and never re-submits without `expected_version` while the server names a standing decision.
 
 **Recovering from `unavailable`.** Treat it as "unknown", never as "not written". Retry the **same** logical write — same
 `correlation_id`, `task_id`, `attempt`, `kind`, `scope`, `subject` and `text` — so it carries the same idempotency key and the
