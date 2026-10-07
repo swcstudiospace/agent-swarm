@@ -475,7 +475,7 @@ class LeaseBridge:
                     release(fresh, self.env)
                     return "gone"
                 return "reclaimed"
-            if claim.status == UNLEASED:  # no answer: the old id is dead but harmless; re-claim on the next beat
+            if claim.status in (UNLEASED, BUSY):  # no server refusal: re-claim on the next beat, including local contention
                 lease.due = self._clock() + min(heartbeat_interval(lease.ttl_s), substrate_client.BACKOFF_S)
                 return UNANSWERED
             reason, failed = f"{reason}; re-claim {claim.status}", RECLAIM_NOT_GRANTED

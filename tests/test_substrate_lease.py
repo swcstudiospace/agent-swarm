@@ -569,6 +569,37 @@ def test_expired_reclaims_instead_of_beating_and_the_session_carries_on(tmp_path
     assert bridge.beat("T-be") == "stopped" and len(stops_after) == 1
 
 
+def test_expired_reclaim_defers_local_contention_without_stopping_the_session(tmp_path, queued_fake, monkeypatch):
+    store, bridge = _held(tmp_path, queued_fake, [])
+    stops = []
+    bridge.watch("T-be", stops.append)
+    old = bridge.held("T-be")
+    queued_fake.now += lease_mod.DEFAULT_TTL_S + 1
+    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.01)
+    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.05)
+    real_claim = lease_mod.claim_node
+
+    def congested_claim(*args, **kwargs):
+        slots = substrate_client._slots
+        for _ in range(substrate_client.MAX_IN_FLIGHT):
+            assert slots.acquire(timeout=1)
+        try:
+            return real_claim(*args, **kwargs)
+        finally:
+            for _ in range(substrate_client.MAX_IN_FLIGHT):
+                slots.release()
+
+    monkeypatch.setattr(lease_mod, "claim_node", congested_claim)
+    assert bridge.beat("T-be") == "unanswered"
+    assert bridge.held("T-be") is old and stops == []
+    assert old.due == queued_fake.now + substrate_client.BACKOFF_S
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "held"
+    assert substrate_client._down_until == 0
+    monkeypatch.setattr(lease_mod, "claim_node", real_claim)
+    assert bridge.beat("T-be") == "reclaimed"
+    assert bridge.held("T-be").lease_id != old.lease_id and stops == []
+
+
 def test_expired_whose_reclaim_is_denied_stops_the_session(tmp_path, fake):
     events = []
     store, bridge = _held(tmp_path, fake, events)

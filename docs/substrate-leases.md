@@ -108,6 +108,7 @@ table (`substrate_lease.SESSION_REFUSALS`):
 |---|---|---|
 | `expired` | Re-claim as the same session. The lease lapsed but nobody took the node, so it comes back under a new id (`reclaimed` in the trail), and the session carries on. | unchanged |
 | `expired`, and the re-claim is denied or refused | stop the dispatch | FAILED `E-TIMEOUT: lease expired and the re-claim was not granted` |
+| `expired`, and the re-claim is locally busy or unanswered | keep the dispatch and retry after `min(TTL/3, 30 s)`; no server refusal has arrived | unchanged |
 | `lost` (another session holds it) | stop the dispatch | FAILED `E-TIMEOUT: lease lost: …` |
 | `unheld` (released or force-released under it) | stop the dispatch | FAILED `E-TIMEOUT: lease unheld: …` |
 | `not-holder` (the runner's token is not the holder's surface) | stop the dispatch | FAILED `E-POLICY: lease not-holder: …` |
