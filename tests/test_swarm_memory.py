@@ -391,7 +391,16 @@ def test_review_required_is_a_proposal_and_not_retried(serve, write, sleeps):
     assert fake.at("/mcp") == []  # no re-read either
 
 
-@pytest.mark.parametrize("reason", sorted(mem.VERSION_REASONS))
+# The substrate's versioned conflict reasons, listed here rather than read from mem.VERSION_REASONS, so dropping one from the
+# client fails a test instead of silently dropping its test cases.
+RETRIED_REASONS = ("standing.raced", "version.raced", "version.required", "version.stale")
+
+
+def test_every_versioned_conflict_reason_is_retried():
+    assert mem.VERSION_REASONS == frozenset(RETRIED_REASONS)
+
+
+@pytest.mark.parametrize("reason", RETRIED_REASONS)
 def test_reported_current_version_is_resubmitted_without_a_reread(serve, write, reason):
     fake = serve(memory=[version_conflict(reason, current_version=5), accepted(version=6)])
     out = write(subject="db choice")
@@ -427,7 +436,7 @@ def test_a_non_int_current_version_falls_back_to_the_reread(serve, write, report
 
 
 # Older servers do not report current_version: the client re-reads it with memory_search (body-text match, newest 100 per scope).
-@pytest.mark.parametrize("reason", sorted(mem.VERSION_REASONS))
+@pytest.mark.parametrize("reason", RETRIED_REASONS)
 def test_older_server_version_conflict_rereads_and_resubmits_with_expected_version(serve, write, reason):
     other = decision(9, subject="cache choice", entry_id="mem_other", text="cache choice: redis, not the db choice")
     fake = serve(memory=[version_conflict(reason), accepted(version=4)],
