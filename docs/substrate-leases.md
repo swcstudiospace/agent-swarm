@@ -8,8 +8,9 @@ and a dead replica's node frees itself. The lease decides **who may touch the wo
 of **lifecycle state**, keeps the DAG, budgets, bids and arbitration records, and loses nothing (LEASE-09).
 
 Code: `swarm/substrate_lease.py` (the bridge), `scripts/swarm_run.py` (`select_batch`, `execute_one`,
-`run_agent_headless(on_session=)`, `lease_bridge`), `swarm/results.py` (`reconcile(..., leases=)`), `scripts/orch_status.py`
-(`--transition`). Transport, timeouts and back-off are the ones in [substrate-tee.md](substrate-tee.md). The server side
+`run_agent_headless(on_session=)`, `run_gate_script(on_process=)`, `DispatchWatch`, `ChildGroup`, `lease_bridge`),
+`swarm/results.py` (`reconcile(..., leases=)`), `scripts/orch_status.py` (`--transition`), `swarm/runlog.py`
+(`redact_leases`). Transport, timeouts and back-off are the ones in [substrate-tee.md](substrate-tee.md). The server side
 (session shape, holder-only `lease_id`, `not-holder`, no swarm operator) is agent-substrate's Phase 11 and
 `docs/coordination.md` there. Tests: `tests/test_substrate_lease.py`.
 
@@ -46,12 +47,13 @@ A deployment that never delivered an agent's token cannot quietly run that agent
 
 | Swarm event | Substrate call | Notes |
 |---|---|---|
+| Run start (`run`, before the first reconcile) | `graph_claim` for every IN_REVIEW / APPROVED task of the run (`LeaseBridge.resume`) | Work an earlier runner process left in review (`--once`, `--max-rounds`, a restart) is held again, so the keeper beats it through the gates, DONE completes it and a rework releases it. The same replica's claim on its own live lease is `renewed` and keeps the id. |
 | Task picked for a round (`select_batch`), before `CLAIMED` | `graph_claim {graph_id, node_id: task_id, session_id, ttl_seconds, surface}` | `lease_s` in `task.assign` is the granted TTL: `decision.ttl_seconds`, else the requested TTL. |
-| Session running, and the task waiting in review | `graph_heartbeat` every TTL/3 | One keeper thread per run beats every held lease, not only the leases of running sessions. |
+| Session running, gate script running, and the task waiting in review | `graph_heartbeat` every TTL/3 | One keeper thread per run beats every held lease, not only the leases of running sessions. |
 | `DONE` (`reconcile`, after APPROVED) | `graph_complete`, fenced on the held `lease_id` | A process with no lease in memory claims first as the producer (`renewed` if its lease is live), then completes. |
 | `CHANGES_REQUESTED` → rework (`reconcile`) | `graph_release`, then `graph_claim` | The trail reads `released` then `claim`, so the rework loop is visible. The rework dispatch reuses the new lease. |
-| `FAILED`, `BLOCKED`, `ESCALATED` (`execute_one`'s `finally`, `reconcile`) | `graph_release`, fenced | |
-| `CANCELLED` or any manual transition (`orch_status --transition`) | `graph_release` (or `graph_complete` for DONE) with the `lease_id` mirrored in `notes.lease` | A live runner's keeper also settles a task that left the holding states, on its next beat. |
+| `FAILED`, `BLOCKED`, `ESCALATED` (`execute_one`'s `finally`, `reconcile`) | `graph_release`, fenced | `execute_one` settles only after the session's and the gate script's process groups are gone. |
+| `CANCELLED` or any manual transition (`orch_status --transition`) | `graph_release` (or `graph_complete` for DONE) with the `lease_id` mirrored in `notes.lease` | Not while a runner still works the task (`notes.running` set): see *A task that moves on elsewhere*. A live runner's keeper also settles a task that left the holding states, on its next beat. |
 
 The producer's lease is held **through review**: it is not released at IN_REVIEW. LEASE-07 has DONE go through
 `graph_complete` fenced on `lease_id`, and has CHANGES_REQUESTED *release* and re-claim. Both assume a lease that is still
@@ -86,27 +88,57 @@ The interval is TTL/3 of the clamped TTL, so two beats can be missed before the 
 often than every 10 s. After a beat that gets no answer, the next one comes after `min(TTL/3, 30 s)`, the client's
 outage back-off, so one blip cannot run the TTL out.
 
-While a session runs, a refused heartbeat applies this table (`substrate_lease.SESSION_REFUSALS`):
+Held leases are not capped by `--max-parallel`: review leases outlive the round that produced them. The keeper therefore
+schedules every lease on its own due time and beats up to `HEARTBEAT_WORKERS` of them at once, on a small thread pool.
+That is `substrate_client.MAX_IN_FLIGHT - 1` (3): one request slot stays free for the run's claims, settlements and tee,
+because a request that finds every slot taken counts as an outage in the client. With 1 s replies and a 30 s TTL, three
+workers renew 30 leases within TTL/3, where one at a time renewed 10.
+
+Claims, beats, settlements and reworks of one task run one at a time (a per-task lock in the bridge). A worker that
+settles a task while the keeper's re-claim of it is on the wire waits for that claim, then releases the lease it brought
+back. A re-claim that can no longer be installed is released at once, so no grant is left held by nobody.
+
+The keeper watches the whole dispatch, not only the agent session: `execute_one` attaches a `DispatchWatch` before the
+session spawns and detaches it once the result is written. While a dispatch is watched, a refused heartbeat applies this
+table (`substrate_lease.SESSION_REFUSALS`):
 
 | Refusal | Action | Task |
 |---|---|---|
 | `expired` | Re-claim as the same session. The lease lapsed but nobody took the node, so it comes back under a new id (`reclaimed` in the trail), and the session carries on. | unchanged |
-| `expired`, and the re-claim is denied or refused | stop the session | FAILED `E-TIMEOUT: lease expired and the re-claim was not granted` |
-| `lost` (another session holds it) | stop the session | FAILED `E-TIMEOUT: lease lost: …` |
-| `unheld` (released or force-released under it) | stop the session | FAILED `E-TIMEOUT: lease unheld: …` |
-| `not-holder` (the runner's token is not the holder's surface) | stop the session | FAILED `E-POLICY: lease not-holder: …` |
-| any other `ok: false` reason | stop the session | FAILED `E-TIMEOUT: lease refused (<reason>)` |
+| `expired`, and the re-claim is denied or refused | stop the dispatch | FAILED `E-TIMEOUT: lease expired and the re-claim was not granted` |
+| `lost` (another session holds it) | stop the dispatch | FAILED `E-TIMEOUT: lease lost: …` |
+| `unheld` (released or force-released under it) | stop the dispatch | FAILED `E-TIMEOUT: lease unheld: …` |
+| `not-holder` (the runner's token is not the holder's surface) | stop the dispatch | FAILED `E-POLICY: lease not-holder: …` |
+| any other `ok: false` reason | stop the dispatch | FAILED `E-TIMEOUT: lease refused (<reason>)` |
 | no answer, or a server error | keep working; retry sooner | unchanged |
 
-Stopping a session SIGTERMs its process group and SIGKILLs it 10 s later. The session's partial output is kept in
-`results/`, and its result is **never applied**: `LeaseStopped` carries the table's reason to FAILED. FAILED rather than
-RETRY, because FAILED runs the existing ladder: RETRY behind a fresh claim, bounded by `max_attempts`, then ESCALATED.
-A lease that keeps slipping therefore escalates rather than looping. A lease lost before the session registered stops
-the session the moment it registers.
+Stopping a dispatch stops whichever child works the task at that moment: the agent session, or afterwards the runner's
+gate script, which runs in its own process group too and is registered for the runner's signal teardown. Each is
+SIGTERMed as a group and SIGKILLed `STOP_GRACE_S` (10 s) later. The runner forgets a stopped group only once no process
+is left in it: a tool with its own pipes can outlive SIGTERM after its parent has exited, so the leader's exit proves
+nothing, and whatever is still there at the grace is SIGKILLed first. The session's partial output is kept in
+`results/`, and its result is **never applied**: `LeaseStopped` carries the table's reason to FAILED. A stop recorded
+between the session's exit and the result write rejects the result as well, and a gate script stopped half-way leaves
+its gate task FAILED, so the verdict rows it may have written never approve a target (T-05-11). The keeper's stop waits
+while a result is being written; that result was written under a held lease. FAILED rather than RETRY, because FAILED
+runs the existing ladder: RETRY behind a fresh claim, bounded by `max_attempts`, then ESCALATED. A lease that keeps
+slipping therefore escalates rather than looping. A lease lost before the session spawned stops the dispatch before
+it starts.
 
 Between rounds no session is running, so nothing is at risk. `expired` and `unheld` re-claim if the task still needs the
 node, and every other refusal drops the lease with a `lease.lost` warning. The task's state is left to A01. If the
 gates then pass, DONE stands and the completion's claim is denied, which is recorded as `lease.unsettled`.
+
+## A task that moves on elsewhere
+
+`orch_status --transition` (CANCELLED, or any manual move out of the holding states) runs in another process. When the
+task has no running dispatch it releases (or, for DONE, completes) the mirrored lease at once. While a runner still works
+the task (`notes.running` is set) it leaves the lease alone (`settle_mirrored` returns `deferred`): releasing then would
+free the node while the agent is still editing, and another replica could claim it. On its next beat the runner's
+keeper sees the new state, stops the dispatch (reason `the task moved on to <STATE> outside this runner`) and keeps
+beating the lease. The dispatch records no transition of its own, since the other process's transition stands, and
+`execute_one` releases the lease once the session's process group is gone. A runner that died with `notes.running` set
+leaves the lease to lapse within one TTL.
 
 ## A dead replica
 
@@ -121,7 +153,9 @@ gone at its next beat (`lost`) and stops its session.
 lost | unsettled`), plus `lease_id`, `agent`, `surface`, `session_id`, `graph_id`, `ttl_s`, `action`, `reason`, `holder`
 and `at` as they apply. It is advisory, the "advisory mirror of `lease_id`" the ADR names, and never a second authority.
 It is what lets `orch_status --transition` release a lease it does not hold in memory. No `lease_id` goes into any
-run-log event.
+run-log event: `runlog.emit` drops every `lease_id` key from the payload it records and tees (`redact_leases`), including
+the copy inside a task row's raw `notes` JSON. A script's exit record, such as `orch_status --transition`'s, which
+carries the whole task, is covered by that; the CLI output and the Task Store still show the mirror.
 
 ## Run-log types
 
@@ -142,6 +176,7 @@ completions are not re-emitted: the substrate writes its own `claim`, `warning` 
   unforgeable among agents sharing an account. Phase 14 delivers one token per agent process, but the runner keeps
   holding the child's lease with that child's token.
 - A run that stops early (`--once`, `--max-rounds`, a signal) leaves leases on work that is still IN_REVIEW. They lapse
-  within one TTL, and the same replica's next run re-claims them as the same holder.
+  within one TTL unless the same replica runs again first: its next run re-claims them as the same holder (`renewed`)
+  before it reconciles (`LeaseBridge.resume`).
 - The in-session path (`orch_status --ingest`) does not lease in this phase, and `coord_handoff` packets at
   accountable-agent boundaries are Phase 13.

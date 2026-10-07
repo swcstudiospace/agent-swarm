@@ -89,7 +89,8 @@ used for `graph_register`), and `payload`:
 it is a string. `trace_id`/`causation_id` are copied from the record when present (the run log does not carry them yet).
 Only 2xx counts as accepted.
 
-`runlog.emit()` adds an additive `msg_id` (uuid4 hex) to every JSONL record; all other fields and the file format are
+`runlog.emit()` adds an additive `msg_id` (uuid4 hex) to every JSONL record and drops any substrate `lease_id` from the
+payload (`redact_leases`, see [substrate-leases.md](substrate-leases.md)); all other fields and the file format are
 unchanged. The tee is called after the local write.
 
 ## Swarm type → EVENT_KINDS

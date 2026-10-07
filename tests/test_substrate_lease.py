@@ -60,15 +60,25 @@ def _iso(t: float) -> str:
 
 class FakeSubstrate:
     def __init__(self):
-        self.now = 1_700_000_000.0
+        self._now = 1_700_000_000.0
+        self.clock = None  # a callable that replaces the stepped clock (a test's simulated clock that runs on its own)
+        self.latency = 0.0  # real seconds every call takes, slept outside the lock so concurrent calls overlap
         self.lock = threading.Lock()
         self.nodes: dict[tuple[str, str], dict] = {}
         self.trail: list[dict] = []  # what the server writes to the ledger: claim / warning / note
         self.calls: list[dict] = []
         self.down = False
         self.forced: dict[str, object] = {}  # tool -> canned reply
-        self.grant_ttl: int | None = None  # a server that grants another TTL than the one asked for
+        self.grant_ttl: int | None = None  # a server that grants (and enforces) another TTL than the one asked for
         self._ids = itertools.count(1)
+
+    @property
+    def now(self) -> float:
+        return self.clock() if self.clock is not None else self._now
+
+    @now.setter
+    def now(self, value: float) -> None:
+        self._now = value
 
     def register(self, *node_ids, graph=GID):
         for n in node_ids:
@@ -100,8 +110,10 @@ class FakeSubstrate:
         name, args = body["params"]["name"], body["params"]["arguments"]
         token = {k.lower(): v for k, v in req.header_items()}.get("authorization", "").removeprefix("Bearer ")
         caller = TOKENS.get(token)
+        if self.latency:
+            time.sleep(self.latency)
         with self.lock:
-            self.calls.append({"tool": name, "args": args, "caller": caller})
+            self.calls.append({"tool": name, "args": args, "caller": caller, "at": self.now})
             out = self.forced[name] if name in self.forced else getattr(self, "tool_" + name)(args, caller)
         if isinstance(out, Err):
             result = {"content": [{"type": "text", "text": out.text}], "isError": True}
@@ -132,6 +144,7 @@ class FakeSubstrate:
         ttl = a.get("ttl_seconds", 900)
         if not 30 <= ttl <= 86_400:
             return Err("ttl_seconds: out of range")
+        ttl = self.grant_ttl or ttl  # the hold the server grants, enforced as well as reported
         live = node["lease_id"] is not None and node["expires"] > self.now
         same = node["surface"] == surface and node["session"] == a["session_id"]
         if live and not same:
@@ -144,7 +157,7 @@ class FakeSubstrate:
             self.trail.append({"kind": "warning" if action == "stolen" else "claim", "action": action,
                                "node": a["node_id"], "session": a["session_id"], "lease_id": node["lease_id"]})
         node["expires"] = self.now + ttl
-        return self._claim_reply(True, node, action, self.grant_ttl or ttl)
+        return self._claim_reply(True, node, action, ttl)
 
     def _claim_reply(self, claimed, node, action, ttl):
         lease = {"lease_id": node["lease_id"] if claimed else None,  # LEASE-02: a denied claim never shows the holder's id
@@ -165,8 +178,9 @@ class FakeSubstrate:
             return {"ok": False, "reason": "lost"}
         if node["expires"] <= self.now:
             return {"ok": False, "reason": "expired"}
-        node["expires"] = self.now + a.get("ttl_seconds", 900)
-        return {"ok": True, "ttl_seconds": a.get("ttl_seconds", 900)}
+        ttl = self.grant_ttl or a.get("ttl_seconds", 900)
+        node["expires"] = self.now + ttl
+        return {"ok": True, "ttl_seconds": ttl}
 
     def _drop(self, a, caller, completing):
         node = self.node(a["node_id"], a["graph_id"])
@@ -315,6 +329,7 @@ def test_grant_dispatches_with_lease_s_from_the_granted_ttl(tmp_path, fake, runn
     node = fake.node("T-be")
     mirror = store.get("T-be")["notes_json"]["lease"]
     assert mirror["state"] == "held" and mirror["lease_id"] == node["lease_id"] and node["session"] == f"A05@r0:{GID}"
+    assert node["expires"] == fake.now + 90  # the server holds it for the TTL it granted, not the one asked for
     assert bridge.held("T-be") is not None  # IN_REVIEW keeps the lease for DONE / CHANGES_REQUESTED
     assert not [t for t in _types(events) if t.startswith("lease.")]
 
@@ -402,10 +417,10 @@ def _held(tmp_path, fake, events, tid="T-be", state="IN_PROGRESS", **kw):
     return store, bridge
 
 
-def _steal(fake, tid="T-be", replica="r2", ttl=lease_mod.DEFAULT_TTL_S):
-    """The runner's lease lapses and another A05 replica takes the node."""
+def _steal(fake, tid="T-be", replica="r2", ttl=lease_mod.DEFAULT_TTL_S, agent="A05"):
+    """The runner's lease lapses and another replica of the same agent class takes the node."""
     fake.now += ttl + 1
-    claim = lease_mod.claim_node("A05", GID, tid, ttl_s=ttl, env=_replica(replica))[0]
+    claim = lease_mod.claim_node(agent, GID, tid, ttl_s=ttl, env=_replica(replica))[0]
     assert claim.status == "held" and claim.reason == "stolen"
 
 
@@ -521,6 +536,103 @@ def test_session_transition_table():
     assert lease_mod.session_transition("brand-new") == "E-TIMEOUT: lease refused (brand-new)"
 
 
+def test_the_fake_expires_on_the_granted_ttl(tmp_path, fake, monkeypatch):
+    """The heartbeat cadence is a third of the *granted* TTL, and the lease lapses on that clock: a fake that reported
+    90 s but kept the requested 120 s would let a beat arrive 30 s late and still pass."""
+    monkeypatch.setenv("SWARM_LEASE_TTL_S", "120")
+    fake.grant_ttl = 90
+    store, bridge = _held(tmp_path, fake, [])
+    granted_at = fake.now
+    lease = bridge.held("T-be")
+    assert lease.ttl_s == 90 and lease.due == granted_at + 30
+    assert fake.node("T-be")["expires"] == granted_at + 90
+    fake.now = granted_at + 30
+    assert bridge.beat("T-be") == "ok" and fake.node("T-be")["expires"] == granted_at + 30 + 90
+    fake.now = granted_at + 30 + 89  # unbeaten from here: still held one second before the granted TTL runs out
+    assert lease_mod.claim_node("A05", GID, "T-be", ttl_s=120, env=_replica("r2"))[0].status == "denied"
+    fake.now = granted_at + 30 + 90  # and free on the granted clock, 30 s before the requested one
+    assert lease_mod.claim_node("A05", GID, "T-be", ttl_s=120, env=_replica("r2"))[0].reason == "stolen"
+
+
+def test_many_held_leases_are_all_renewed_within_a_third_of_the_ttl(tmp_path, fake, monkeypatch):
+    """Held leases are not capped by --max-parallel (review leases outlive their round). With 1 s replies, one beat at a
+    time would take longer than TTL/3 to get round; the keeper beats up to HEARTBEAT_WORKERS at once, each lease on its
+    own due time."""
+    monkeypatch.setenv("SWARM_LEASE_TTL_S", "30")
+    n = 6 * lease_mod.HEARTBEAT_WORKERS  # one at a time: n simulated seconds, past TTL/3 = 10
+    ids = [f"T{i:02d}-be" for i in range(n)]
+    fake.register(*ids)
+    store, events = _store(tmp_path), []
+    bridge = _bridge(store, events, clock=lambda: fake.now)
+    for tid in ids:
+        assert bridge.acquire(_plan(store, tid), "A05").status == "held"
+    interval = lease_mod.heartbeat_interval(30)
+    due = fake.now + interval  # every lease falls due at once
+    scale = 0.1  # real seconds per simulated second; every call takes one simulated second
+    t0 = time.monotonic()
+    fake.clock = lambda: due + (time.monotonic() - t0) / scale
+    fake.latency = scale
+    bridge.start()
+    try:
+        deadline = time.monotonic() + 30
+        while len({c["args"]["node_id"] for c in fake.at("graph_heartbeat")}) < n and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        bridge.close()
+        fake.latency = 0.0
+    first: dict[str, float] = {}
+    for c in fake.at("graph_heartbeat"):
+        first.setdefault(c["args"]["node_id"], c["at"])
+    assert set(first) == set(ids)
+    assert max(first.values()) - due <= interval, sorted(round(v - due, 2) for v in first.values())
+    assert all(fake.node(t)["lease_id"] == bridge.held(t).lease_id for t in ids) and events == []
+
+
+def test_a_settle_racing_a_reclaim_waits_for_it_and_releases_the_fresh_lease(tmp_path, fake, monkeypatch):
+    """The keeper's re-claim and the worker's settlement of one task run one at a time: a settlement that arrives while
+    the re-claim is on the wire waits, then releases the lease that claim brought back instead of leaving it untracked."""
+    store, bridge = _held(tmp_path, fake, [])
+    bridge.watch("T-be", lambda reason: None)  # a session runs: `expired` re-claims
+    fake.now += lease_mod.DEFAULT_TTL_S + 1
+    real, settler = lease_mod.claim_node, {}
+
+    def claim_while_the_worker_settles(*a, **k):
+        got = real(*a, **k)
+        store.transition("T-be", "FAILED")  # the worker finishes meanwhile and settles the task
+        t = threading.Thread(target=lambda: settler.setdefault("out", bridge.settle("T-be")))
+        t.start()
+        t.join(0.3)
+        settler.update(waited=t.is_alive(), thread=t)
+        return got
+
+    monkeypatch.setattr(lease_mod, "claim_node", claim_while_the_worker_settles)
+    assert bridge.beat("T-be") == "reclaimed"
+    settler["thread"].join(5)
+    fresh = [e["lease_id"] for e in fake.trail if e["action"] == "reclaimed"]
+    assert settler["waited"] and settler["out"] == "released" and len(fresh) == 1
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == fresh
+    assert fake.node("T-be")["lease_id"] is None and bridge.held("T-be") is None
+
+
+def test_a_fresh_claim_that_cannot_be_installed_is_released(tmp_path, fake, monkeypatch):
+    store, bridge = _held(tmp_path, fake, [])
+    bridge.watch("T-be", lambda reason: None)
+    fake.now += lease_mod.DEFAULT_TTL_S + 1
+    real = lease_mod.claim_node
+
+    def claim_after_the_lease_was_let_go(*a, **k):
+        got = real(*a, **k)
+        with bridge._lock:  # whatever let the old lease go while the claim was on the wire
+            bridge._held.pop("T-be")
+        return got
+
+    monkeypatch.setattr(lease_mod, "claim_node", claim_after_the_lease_was_let_go)
+    assert bridge.beat("T-be") == "gone"
+    fresh = [e["lease_id"] for e in fake.trail if e["action"] == "reclaimed"]
+    assert len(fresh) == 1 and [c["args"]["lease_id"] for c in fake.at("graph_release")] == fresh
+    assert fake.node("T-be")["lease_id"] is None and bridge.held("T-be") is None
+
+
 def test_the_keeper_stops_a_real_session_whose_node_was_taken(tmp_path, fake, runner, monkeypatch):
     """End to end on a real process group: the keeper thread beats, the substrate answers `lost`, the runner kills the
     session and fails the task with the tabled reason, long before the session would have finished."""
@@ -545,6 +657,124 @@ def test_the_keeper_stops_a_real_session_whose_node_was_taken(tmp_path, fake, ru
     assert store.history("T-be")[-1]["reason"] == lease_mod.SESSION_REFUSALS["lost"]
     assert store.get("T-be")["notes_json"]["meta"]["lease_stopped"] == lease_mod.SESSION_REFUSALS["lost"]
     assert ("lease.lost" in _types(events)) and fake.node("T-be")["session"] == f"A05@r2:{GID}"  # never released by us
+
+
+def _alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def _wait_for(path, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return path.read_text().strip()
+        time.sleep(0.02)
+    raise AssertionError(f"{path} never appeared")
+
+
+def test_a_stopped_session_is_forgotten_only_once_its_whole_group_is_gone(tmp_path, runner, monkeypatch):
+    """A tool with its own pipes that ignores SIGTERM outlives its parent: `communicate` returns, but the group is not
+    gone. The runner waits out the grace and SIGKILLs it before it forgets the group."""
+    monkeypatch.setattr(runner, "STOP_GRACE_S", 1)
+    pidfile = tmp_path / "tool.pid"
+    tool = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(60)")
+    parent = ("import subprocess, sys, time; "
+              f"subprocess.Popen([sys.executable, '-c', {tool!r}], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+              "stderr=subprocess.DEVNULL); sys.stdin.read(); time.sleep(60)")
+    monkeypatch.setattr(runner, "headless_command",
+                        lambda runtime, agent, repo, sdir, args: ([sys.executable, "-c", parent], dict(os.environ), repo))
+    groups = []
+
+    def on_session(stop):
+        if stop is not None:
+            groups.extend(runner._SESSIONS)
+            threading.Thread(target=lambda: (_wait_for(pidfile), stop("E-TIMEOUT: lease lost")), daemon=True).start()
+
+    with pytest.raises(runner.LeaseStopped):
+        runner.run_agent_headless({"slug": "a05-backend", "id": "A05"}, "go", tmp_path, _args(), on_session=on_session)
+    tool_pid = int(pidfile.read_text())
+    try:
+        assert not _alive(tool_pid), "the tool outlived its stopped session"
+        assert groups and not set(groups) & runner._SESSIONS
+    finally:
+        if _alive(tool_pid):
+            os.kill(tool_pid, 9)
+
+
+def _gate_result(tid: str) -> str:
+    return "done\n```json\n" + json.dumps({"task_id": tid, "state": "IN_REVIEW", "summary_md": "ok"}) + "\n```"
+
+
+def test_a_lease_lost_after_the_session_ends_rejects_its_result(tmp_path, fake, runner, monkeypatch):
+    """The dispatch stays watched after the session exits: a lease taken before the result is written fails the task
+    with the tabled reason, and the IN_REVIEW the session reported is never applied."""
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events, clock=lambda: fake.now)
+    runner.select_batch(store, [task], 1, bridge)
+    beats = []
+
+    def session(agent, prompt, repo, args, *, on_session=None):
+        on_session(lambda reason: None)
+        on_session(None)  # the session has ended; its result is not written yet
+        _steal(fake)
+        beats.append(bridge.beat("T-be"))
+        return _gate_result("T-be"), {"returncode": 0}
+
+    monkeypatch.setattr(runner, "run_agent_headless", session)
+    _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
+    lost = lease_mod.SESSION_REFUSALS["lost"]
+    assert beats == ["stopped"] and outcome == "FAILED"
+    assert "IN_REVIEW" not in [h["to_state"] for h in store.history("T-be")]
+    assert store.history("T-be")[-1]["reason"] == lost and store.get("T-be")["notes_json"]["meta"]["lease_stopped"] == lost
+    assert fake.node("T-be")["session"] == f"A05@r2:{GID}"  # the new holder's, untouched
+
+
+def test_a_lease_lost_while_the_gate_script_runs_stops_it_and_rejects_the_result(tmp_path, fake, runner, monkeypatch):
+    """The runner's gate script writes signed verdicts: it runs watched, in its own process group, and a lost lease
+    stops it and fails the gate task instead of accepting its result."""
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    pidfile = tmp_path / "gate.pid"
+    (root / "scripts" / "rel_plan.py").write_text(
+        f"import os, time\nopen({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+    monkeypatch.setattr(runner, "ROOT", root)
+    fake.register("S-be", "S-rel")
+    store, events = _store(tmp_path), []
+    _plan(store, "S-be", gates=["release"])
+    gate = _plan(store, "S-rel", agent="A12", gate="release", gate_for=["S-be"])
+    bridge = _bridge(store, events)
+    batch, _ = runner.select_batch(store, [gate], 1, bridge)
+    assert batch and bridge.held("S-rel") is not None
+    monkeypatch.setattr(runner, "run_agent_headless", lambda *a, **k: (_gate_result("S-rel"), {"returncode": 0}))
+    beats = []
+
+    def take_the_node_while_the_script_runs():
+        _wait_for(pidfile)
+        _steal(fake, "S-rel", agent="A12")
+        beats.append(bridge.beat("S-rel"))
+
+    taker = threading.Thread(target=take_the_node_while_the_script_runs, daemon=True)
+    taker.start()
+    t0 = time.monotonic()
+    _, _, outcome = _execute(runner, store, gate, bridge, tmp_path, events)
+    taker.join(5)
+    script_pid = int(pidfile.read_text())
+    try:
+        assert time.monotonic() - t0 < 20 and beats == ["stopped"] and not _alive(script_pid)
+    finally:
+        if _alive(script_pid):
+            os.kill(script_pid, 9)
+    lost = lease_mod.SESSION_REFUSALS["lost"]
+    assert outcome == "FAILED" and store.history("S-rel")[-1]["reason"] == lost
+    assert "IN_REVIEW" not in [h["to_state"] for h in store.history("S-rel")]
+    assert store.get("S-rel")["notes_json"]["meta"]["lease_stopped"] == lost
 
 
 # --- LEASE-07: DONE, CHANGES_REQUESTED, FAILED, CANCELLED ----------------------------------------------------------
@@ -630,6 +860,110 @@ def test_cancelled_by_orch_status_releases_the_mirrored_lease(tmp_path, fake):
     assert fake.node("T-be")["lease_id"] is None and store.get("T-be")["notes_json"]["lease"]["state"] == "released"
     # the runner's keeper notices on its next beat and lets go instead of re-claiming a cancelled task's node
     assert bridge.beat("T-be") == "settled" and bridge.held("T-be") is None and fake.node("T-be")["lease_id"] is None
+
+
+def test_cancel_while_a_session_runs_stops_it_before_the_release(tmp_path, fake, runner, monkeypatch):
+    """orch_status leaves a lease to the runner while the task's session runs (notes.running). The runner's keeper stops
+    the session on its next beat and keeps the node; the dispatch releases it only after the session has ended."""
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events, clock=lambda: fake.now)
+    runner.select_batch(store, [task], 1, bridge)
+    lease_id = fake.node("T-be")["lease_id"]
+    orch = _load("orch_status")
+    seen = {}
+
+    def session(agent, prompt, repo, args, *, on_session=None):
+        stops = []
+        on_session(stops.append)
+        seen["rc"] = orch.AgentScript("A01", "orch_status", orch.run, description=orch.__doc__, add_args=orch.add_args).main(
+            ["--json", "--root", str(tmp_path), "--transition", "T-be", "CANCELLED"])
+        seen["released_by_orch_status"] = len(fake.at("graph_release"))
+        seen["beats"] = [bridge.beat("T-be"), bridge.beat("T-be")]
+        seen["stops"] = list(stops)
+        seen["released_while_running"] = len(fake.at("graph_release"))
+        on_session(None)
+        raise runner.LeaseStopped(stops[0], "partial", {"returncode": -15, "lease_stopped": stops[0]})
+
+    monkeypatch.setattr(runner, "run_agent_headless", session)
+    _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
+    assert seen["rc"] == 0 and seen["released_by_orch_status"] == 0
+    assert seen["beats"] == ["halting", "halting"] and seen["stops"] == [lease_mod.moved_on_reason("CANCELLED")]
+    assert seen["released_while_running"] == 0 and fake.node("T-be")["lease_id"] is None  # released after, not during
+    assert outcome == "CANCELLED" and store.get("T-be")["state"] == "CANCELLED"
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [lease_id]
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "released" and bridge.held("T-be") is None
+
+
+def test_orch_status_keeps_lease_ids_out_of_the_run_log(tmp_path, fake, capsys):
+    store, bridge = _held(tmp_path, fake, [], state="IN_REVIEW")
+    lease_id = fake.node("T-be")["lease_id"]
+    orch = _load("orch_status")
+    rc = orch.AgentScript("A01", "orch_status", orch.run, description=orch.__doc__, add_args=orch.add_args).main(
+        ["--json", "--root", str(tmp_path), "--transition", "T-be", "CANCELLED"])
+    assert rc == 0 and lease_id in capsys.readouterr().out  # the CLI prints the task as stored, mirror included
+    assert store.get("T-be")["notes_json"]["lease"]["lease_id"] == lease_id  # and the mirror keeps it
+    log = (tmp_path / ".swarm" / "events.jsonl").read_text()
+    assert '"script.orch_status"' in log and '"notes_json"' in log
+    assert lease_id not in log and "lease_id" not in log
+
+
+def test_a_resumed_runner_holds_review_leases_again_and_reworks_through_a_release(tmp_path, fake):
+    """A runner that stopped with work IN_REVIEW (`--once`) leaves its lease to lapse. The next run claims it again
+    before reconciling, so the keeper beats it through the gates, and a rework releases it rather than renewing it."""
+    from swarm.results import reconcile
+    from swarm.verdicts import record_gate_verdicts
+    fake.register("S-be", "S-qa")
+    store, events = _store(tmp_path), []
+    target = _plan(store, "S-be", gates=["quality"])
+    _plan(store, "S-qa", agent="A08", gate="quality", gate_for=["S-be"])
+    assert _bridge(store, []).acquire(target, "A05").status == "held"
+    for s in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("S-be", s)
+    old = fake.node("S-be")["lease_id"]
+    fake.now += 200  # the first runner is gone: nothing beats the lease
+    resumed = _bridge(store, events, clock=lambda: fake.now)
+    assert resumed.resume() == ["S-be"] and resumed.held("S-be").lease_id == old  # `renewed`: same holder, same id
+    assert fake.node("S-be")["expires"] == fake.now + lease_mod.DEFAULT_TTL_S
+    fake.now += lease_mod.heartbeat_interval(lease_mod.DEFAULT_TTL_S)
+    assert resumed.beat("S-be") == "ok"
+    for s in ("CLAIMED", "IN_PROGRESS"):
+        store.transition("S-qa", s)
+    record_gate_verdicts(store, gate_task_id="S-qa", gate="quality", agent_id="A08@local", verdict="fail", runs={},
+                         findings=[{"id": "F1", "severity": "major", "kind": "functional", "summary": "broken"}],
+                         correlation_id=CORR, expires_s=600, emit=lambda *a, **k: None)
+    reconcile(store, CORR, lambda *a, **k: None, leases=resumed)
+    assert store.get("S-be")["state"] == "IN_PROGRESS"
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [old]
+    assert fake.trail_of("S-be") == [("claim", "granted"), ("note", "released"), ("claim", "granted")]
+    assert resumed.held("S-be").lease_id not in (None, old) and events == []
+
+
+def test_run_resumes_review_leases_before_the_first_reconcile(tmp_path, monkeypatch, runner):
+    calls = []
+
+    class Bridge:
+        def resume(self):
+            calls.append("resume")
+            return []
+
+        def start(self):
+            calls.append("start")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(runner, "lease_bridge", lambda *a, **k: Bridge())
+    monkeypatch.setattr(runner, "reconcile", lambda *a, **k: calls.append("reconcile") or [])
+    store = _store(tmp_path)
+    _plan(store)
+    for s in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("T-be", s)
+    args = SimpleNamespace(repo=str(tmp_path), dry_run=False, runtime="grok", grok_bin=sys.executable,
+                           claude_bin="claude", omp_bin="omp", max_parallel=1, once=True, max_rounds=1)
+    runner.run(args, SimpleNamespace(correlation_id=CORR, emit=lambda *a, **k: None))
+    assert calls[:3] == ["resume", "start", "reconcile"]
 
 
 # --- LEASE-08: two replicas, one node -----------------------------------------------------------------------------

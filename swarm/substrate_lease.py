@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -25,6 +26,10 @@ MIN_TTL_S = 30  # the substrate's bounds: its schema rejects a ttl_seconds outsi
 MAX_TTL_S = 86_400
 TTL_ENV = "SWARM_LEASE_TTL_S"
 IDLE_POLL_S = 1.0  # the keeper's longest sleep, so a lease taken while it sleeps is never beaten late
+# Heartbeats in flight at once. Held leases are not capped by --max-parallel (review leases outlive their round), so one
+# beat at a time falls behind a TTL/3 deadline once replies are slow. One request slot of substrate_client's is left
+# free for the run's other calls: a request that finds every slot taken counts as an outage there.
+HEARTBEAT_WORKERS = max(1, substrate_client.MAX_IN_FLIGHT - 1)
 
 # Lifecycle states in which the task's node stays leased: from the claim, through review, until DONE completes it.
 # APPROVED is held for the instant between it and DONE, so the completion still has a lease to fence on.
@@ -32,6 +37,8 @@ HOLDING = frozenset({S.CLAIMED.value, S.IN_PROGRESS.value, S.IN_REVIEW.value, S.
 # States in which the work is over for now, so a lease the keeper still beats is settled instead. Narrower than "not
 # HOLDING": a task is PLANNED/RETRY between its claim and its CLAIMED transition, and that lease must survive the gap.
 LET_GO = frozenset({S.DONE.value, S.FAILED.value, S.BLOCKED.value, S.ESCALATED.value, S.CANCELLED.value})
+# Work an earlier runner process may have left holding a lease that nothing dispatches again: `resume` re-claims it.
+REVIEW = frozenset({S.IN_REVIEW.value, S.APPROVED.value})
 
 # Claim.status values
 HELD, DENIED, REFUSED, UNLEASED, OFF = "held", "denied", "refused", "unleased", "off"
@@ -53,6 +60,12 @@ RECLAIM_NOT_GRANTED = "E-TIMEOUT: lease expired and the re-claim was not granted
 def session_transition(refusal: str) -> str:
     """The FAILED reason for a refused heartbeat that stops a session (RECLAIM for `expired`, which does not)."""
     return SESSION_REFUSALS.get(refusal, f"E-TIMEOUT: lease refused ({refusal[:80]})")
+
+
+def moved_on_reason(state: str) -> str:
+    """Why the keeper stops a dispatch whose task another process moved out of the holding states (no transition:
+    that process's own transition stands)."""
+    return f"the task moved on to {state} outside this runner"
 
 
 def clamp_ttl(ttl_s: int) -> int:
@@ -90,7 +103,8 @@ class Claim:
 
 @dataclass
 class Lease:
-    """One lease this process holds. `due` (keeper clock) is when to beat next; `stop` ends the session working it."""
+    """One lease this process holds. `due` (keeper clock) is when to beat next; `stop` ends the dispatch working it;
+    `halted` is set once the keeper has stopped that dispatch because the task moved on elsewhere."""
     task_id: str
     agent_id: str
     surface: str
@@ -101,6 +115,7 @@ class Lease:
     action: str = ""
     due: float = 0.0
     stop: Callable[[str], None] | None = None
+    halted: str | None = None
 
 
 def _call(tool: str, arguments: dict, surface: str, env: Mapping[str, str]) -> substrate_client.Outcome:
@@ -238,7 +253,10 @@ def _agent_of(task: dict) -> str | None:
 
 def settle_mirrored(store: TaskStore, task_id: str, *, emit, env: Mapping[str, str] | None = None) -> str:
     """For a process that does not hold the lease in memory (`orch_status --transition`): complete or release the lease
-    mirrored in notes.lease when the task has left the holding states. Never raises."""
+    mirrored in notes.lease when the task has left the holding states. Returns `deferred` while a runner is still
+    working the task (notes.running): releasing then would free the node under a live agent, so that runner's keeper
+    stops the session on its next beat and its dispatch settles the lease once the session's process group is gone.
+    Never raises."""
     try:
         e = os.environ if env is None else env
         if not substrate_client.enabled(e):
@@ -249,6 +267,8 @@ def settle_mirrored(store: TaskStore, task_id: str, *, emit, env: Mapping[str, s
             return "none"
         if task["state"] in HOLDING:
             return "kept"
+        if task["notes_json"].get("running") is not None:
+            return "deferred"
         lease = Lease(task_id, m["agent"], substrate_tee.AGENT_SURFACES[m["agent"]], str(m.get("session_id") or ""),
                       str(m.get("graph_id") or ""), str(m["lease_id"]), int(m.get("ttl_s") or DEFAULT_TTL_S))
         return _close(store, lease, task["state"], emit, e)
@@ -261,10 +281,12 @@ def settle_mirrored(store: TaskStore, task_id: str, *, emit, env: Mapping[str, s
 class LeaseBridge:
     """The leases one runner process holds for one run (one correlation, one Graph ID), and the keeper that beats them.
 
-    `acquire` before dispatch; `watch` while a session runs; `settle` after any transition out of the holding states
+    `resume` at the start of a run (work an earlier process left in review); `acquire` before dispatch; `watch` from
+    before the session spawns until its result is applied; `settle` after any transition out of the holding states
     (DONE completes, anything else releases); `rework` after CHANGES_REQUESTED. The keeper thread beats every held lease
     every TTL/3, whether or not a session is running: the producer's lease is kept through review so DONE can complete it
-    and CHANGES_REQUESTED can release and re-claim it.
+    and CHANGES_REQUESTED can release and re-claim it. Claims, beats, settlements and reworks of one task run one at a
+    time (a per-task lock), so a claim answered while another thread lets the task go is never left untracked.
     """
 
     def __init__(self, store_path: str | Path, correlation_id: str, *, emit: Callable[[str, dict], object],
@@ -275,12 +297,15 @@ class LeaseBridge:
         self.ttl_s = ttl_seconds(self.env)  # ValueError likewise
         self.store_path, self.correlation_id, self.root, self.emit = Path(store_path), correlation_id, root, emit
         self._clock = clock
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards the collections below; never held while waiting for a task lock
+        self._task_locks: dict[str, threading.RLock] = {}
         self._held: dict[str, Lease] = {}
-        self._lost: dict[str, str] = {}  # task -> FAILED reason of a lease lost while no session watched it
+        self._lost: dict[str, str] = {}  # task -> FAILED reason of a lease lost while no dispatch watched it
+        self._inflight: set[str] = set()  # tasks the keeper is beating right now
         self._graph_id: str | None = None
         self._local = threading.local()
         self._halt = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     # -- plumbing
@@ -290,6 +315,13 @@ class LeaseBridge:
             store = self._local.store = TaskStore(self.store_path)
         return store
 
+    def _task_lock(self, task_id: str) -> threading.RLock:
+        with self._lock:
+            lock = self._task_locks.get(task_id)
+            if lock is None:
+                lock = self._task_locks[task_id] = threading.RLock()
+            return lock
+
     def graph_id(self) -> str | None:
         if self._graph_id is None:
             self._graph_id = substrate_tee.lookup_graph_id(self.correlation_id, root=self.root, env=self.env)
@@ -298,11 +330,18 @@ class LeaseBridge:
     def _moved_on(self, task_id: str) -> bool:
         return self._store().get(task_id)["state"] in LET_GO
 
-    def _hold(self, lease: Lease) -> None:
+    def _hold(self, lease: Lease, replaces: Lease | None = None) -> bool:
+        """Track `lease`. With `replaces`, only while that lease is still the one held, taking over its dispatch;
+        False when it is not (the caller then lets the new lease go)."""
         lease.due = self._clock() + heartbeat_interval(lease.ttl_s)
         with self._lock:
+            if replaces is not None:
+                if self._held.get(lease.task_id) is not replaces:
+                    return False
+                lease.stop, lease.halted = replaces.stop, replaces.halted
             self._held[lease.task_id] = lease
         _mirror(self._store(), lease.task_id, state=HELD, action=lease.action, **_ident(lease))
+        return True
 
     def held(self, task_id: str) -> Lease | None:
         with self._lock:
@@ -318,62 +357,97 @@ class LeaseBridge:
         """Hold the task's node before it is dispatched (LEASE-05). A lease this process already holds (a rework
         re-claimed by `rework`) is reused. Records every outcome but `held` and `off` as a note and an event."""
         tid = task["task_id"]
-        with self._lock:
-            lease = self._held.get(tid)
+        with self._task_lock(tid):
+            with self._lock:
+                lease = self._held.get(tid)
+                if lease is not None:
+                    return Claim(HELD, lease_s=lease.ttl_s, reason=lease.action)
+                self._lost.pop(tid, None)
+            graph = self.graph_id()
+            if graph is None:
+                claim, lease = Claim(UNLEASED, reason="no Graph ID is bound to this run"), None
+            else:
+                claim, lease = claim_node(agent_id, graph, tid, ttl_s=self.ttl_s, env=self.env)
             if lease is not None:
-                return Claim(HELD, lease_s=lease.ttl_s, reason=lease.action)
-            self._lost.pop(tid, None)
-        graph = self.graph_id()
-        if graph is None:
-            claim, lease = Claim(UNLEASED, reason="no Graph ID is bound to this run"), None
-        else:
-            claim, lease = claim_node(agent_id, graph, tid, ttl_s=self.ttl_s, env=self.env)
-        if lease is not None:
-            self._hold(lease)
-        elif claim.status == DENIED:
-            _mirror(self._store(), tid, state=DENIED, agent=agent_id, holder=claim.holder, expires_at=claim.expires_at,
-                    reason=claim.reason)
-            self.emit("lease.denied", {"task_id": tid, "agent": agent_id, "holder": claim.holder,
-                                       "expires_at": claim.expires_at})
-        elif claim.status == REFUSED:
-            _mirror(self._store(), tid, state=REFUSED, agent=agent_id, reason=claim.reason)
-            self.emit("lease.refused", {"task_id": tid, "agent": agent_id, "reason": claim.reason})
-        elif claim.status == UNLEASED:
-            _mirror(self._store(), tid, state=UNLEASED, agent=agent_id, reason=claim.reason)
-            self.emit("lease.unleased", {"task_id": tid, "agent": agent_id, "reason": claim.reason})
-        return claim
+                self._hold(lease)
+            elif claim.status == DENIED:
+                _mirror(self._store(), tid, state=DENIED, agent=agent_id, holder=claim.holder,
+                        expires_at=claim.expires_at, reason=claim.reason)
+                self.emit("lease.denied", {"task_id": tid, "agent": agent_id, "holder": claim.holder,
+                                           "expires_at": claim.expires_at})
+            elif claim.status == REFUSED:
+                _mirror(self._store(), tid, state=REFUSED, agent=agent_id, reason=claim.reason)
+                self.emit("lease.refused", {"task_id": tid, "agent": agent_id, "reason": claim.reason})
+            elif claim.status == UNLEASED:
+                _mirror(self._store(), tid, state=UNLEASED, agent=agent_id, reason=claim.reason)
+                self.emit("lease.unleased", {"task_id": tid, "agent": agent_id, "reason": claim.reason})
+            return claim
 
-    # -- while a session runs
+    def resume(self) -> list[str]:
+        """At the start of a run: hold again the leases of this correlation's work in review (IN_REVIEW, APPROVED) that
+        an earlier runner process left (`--once`, `--max-rounds`, a restart). Nothing dispatches that work again, so
+        without this the gates would run while the producer's lease ran out, DONE could not complete the node, and a
+        rework would renew the old hold instead of releasing it. Called before the first reconcile and gate dispatch.
+        The same replica's claim on its own live lease is `renewed` and keeps its id; denied, refused and unleased
+        claims are recorded as for a dispatch. Returns the tasks now held."""
+        if self.graph_id() is None:  # no Graph ID bound: nothing was leased, so nothing to hold again
+            return []
+        held = []
+        for t in self._store().list(correlation_id=self.correlation_id):
+            if t["state"] not in REVIEW or self.held(t["task_id"]) is not None:
+                continue
+            agent = _agent_of(t)
+            if agent is not None and self.acquire(t, agent).status == HELD:
+                held.append(t["task_id"])
+        return held
+
+    # -- while a dispatch runs
     def watch(self, task_id: str, stop: Callable[[str], None] | None) -> None:
-        """Attach the running session's `stop(reason)` (None detaches it). A lease lost before the session got here
-        stops it at once."""
+        """Attach the `stop(reason)` of the dispatch working the task (None detaches it). The runner attaches it before
+        the session spawns and detaches it once the result is applied, so a lease lost at any point in between stops the
+        session or gate script and rejects the result. A lease lost before it got here, or a task that has moved on
+        elsewhere, stops it at once."""
         with self._lock:
             lease = self._held.get(task_id)
             if lease is not None:
                 lease.stop = stop
-                return
-            lost = self._lost.pop(task_id, None) if stop is not None else None
-        if lost is not None:
-            stop(lost)
+                reason = lease.halted if stop is not None else None
+            else:
+                reason = self._lost.pop(task_id, None) if stop is not None else None
+        if reason is not None:
+            stop(reason)
 
     def beat(self, task_id: str) -> str:
         """One heartbeat for the task's lease, with the refusal table applied. Returns what happened: ok, unanswered,
-        reclaimed, stopped (a session was stopped), dropped (no session; the lease is let go), settled (the task had left
-        the holding states) or gone (nothing held)."""
-        lease = self.held(task_id)
-        if lease is None:
-            return "gone"
-        if self._moved_on(task_id):  # moved on in another process (orch_status --transition CANCELLED)
-            self.settle(task_id)
-            return "settled"
-        got = heartbeat(lease, self.env)
-        if got == OK:
-            lease.due = self._clock() + heartbeat_interval(lease.ttl_s)
-            return OK
-        if got == UNANSWERED:  # try again before the next third, so one blip cannot run the TTL out
-            lease.due = self._clock() + min(heartbeat_interval(lease.ttl_s), substrate_client.BACKOFF_S)
-            return UNANSWERED
-        return self._refused(lease, got)
+        reclaimed, stopped (a dispatch was stopped), dropped (no dispatch; the lease is let go), settled (the task had
+        left the holding states and nothing here works it), halting (it had, but a dispatch here still works it: that
+        dispatch is stopped and the lease kept until it ends) or gone (nothing held)."""
+        with self._task_lock(task_id):
+            lease = self.held(task_id)
+            if lease is None:
+                return "gone"
+            state = self._store().get(task_id)["state"]
+            halting = state in LET_GO  # moved on in another process (orch_status --transition CANCELLED)
+            if halting:
+                with self._lock:
+                    stop, first = lease.stop, lease.halted is None
+                    if stop is not None and first:
+                        lease.halted = moved_on_reason(state)
+                if stop is None:  # nothing here works the task any more: let the node go now
+                    self.settle(task_id)
+                    return "settled"
+                # The dispatch here may still be writing: stop it, and keep beating so the node stays ours until the
+                # dispatch has ended. execute_one's settle releases it then, once the session's process group is gone.
+                if first:
+                    stop(lease.halted)
+            got = heartbeat(lease, self.env)
+            if got == OK:
+                lease.due = self._clock() + heartbeat_interval(lease.ttl_s)
+                return "halting" if halting else OK
+            if got == UNANSWERED:  # try again before the next third, so one blip cannot run the TTL out
+                lease.due = self._clock() + min(heartbeat_interval(lease.ttl_s), substrate_client.BACKOFF_S)
+                return UNANSWERED
+            return self._refused(lease, got)
 
     def _refused(self, lease: Lease, reason: str) -> str:
         tid = lease.task_id
@@ -389,11 +463,9 @@ class LeaseBridge:
                 return "settled"
             claim, fresh = claim_node(lease.agent_id, lease.graph_id, tid, ttl_s=self.ttl_s, env=self.env)
             if fresh is not None:
-                with self._lock:
-                    if self._held.get(tid) is not lease:
-                        return "gone"
-                    fresh.stop = lease.stop
-                self._hold(fresh)
+                if not self._hold(fresh, replaces=lease):  # let go of meanwhile: a grant nobody tracks is released
+                    release(fresh, self.env)
+                    return "gone"
                 return "reclaimed"
             if claim.status == UNLEASED:  # no answer: the old id is dead but harmless; re-claim on the next beat
                 lease.due = self._clock() + min(heartbeat_interval(lease.ttl_s), substrate_client.BACKOFF_S)
@@ -425,32 +497,52 @@ class LeaseBridge:
 
     def close(self) -> None:
         """Stop beating. Leases still held (work left IN_REVIEW by an early stop) lapse within their TTL; the same
-        replica's next run re-claims them as the same holder."""
+        replica's next run re-claims them as the same holder (`resume`)."""
         self._halt.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
 
     def _keep(self) -> None:
-        while not self._halt.is_set():
-            self._halt.wait(self.beat_due())
+        pool = ThreadPoolExecutor(max_workers=HEARTBEAT_WORKERS, thread_name_prefix="swarm-lease-beat")
+        try:
+            while not self._halt.is_set():
+                self._wake.clear()  # before looking: a beat that ends after this wakes the wait below at once
+                self._wake.wait(self.beat_due(pool))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
-    def beat_due(self) -> float:
-        """Beat every lease that is due; the seconds until the next one is (at most IDLE_POLL_S)."""
+    def beat_due(self, pool: ThreadPoolExecutor | None = None) -> float:
+        """Start a beat for every lease that is due and not being beaten already: each lease on its own due time, up to
+        HEARTBEAT_WORKERS at once on `pool` (one after another without one). Returns the seconds until the next lease
+        that is not in flight falls due (at most IDLE_POLL_S); a beat that ends sets `_wake`."""
         now = self._clock()
         with self._lock:
-            due = [tid for tid, lease in self._held.items() if lease.due <= now]
+            due = [tid for tid, lease in self._held.items() if lease.due <= now and tid not in self._inflight]
+            self._inflight.update(due)
         for tid in due:
-            if self._halt.is_set():
-                break
-            try:
-                self.beat(tid)
-            except Exception:  # noqa: BLE001 - one bad beat must not end the thread that keeps every other lease alive
-                pass
+            if pool is None:
+                self._beat_one(tid)
+            else:
+                pool.submit(self._beat_one, tid)
         with self._lock:
-            nxt = min((lease.due for lease in self._held.values()), default=None)
+            nxt = min((lease.due for tid, lease in self._held.items() if tid not in self._inflight), default=None)
         wait = IDLE_POLL_S if nxt is None else nxt - self._clock()
         return max(0.01, min(IDLE_POLL_S, wait))
+
+    def _beat_one(self, task_id: str) -> None:
+        try:
+            if not self._halt.is_set():
+                self.beat(task_id)
+        except Exception:  # noqa: BLE001 - one bad beat must not end the keeper; that lease is tried again sooner
+            lease = self.held(task_id)
+            if lease is not None:
+                lease.due = self._clock() + min(heartbeat_interval(lease.ttl_s), substrate_client.BACKOFF_S)
+        finally:
+            with self._lock:
+                self._inflight.discard(task_id)
+            self._wake.set()
 
     # -- after a transition
     def settle(self, task_id: str) -> str:
@@ -458,29 +550,30 @@ class LeaseBridge:
         this process holds no lease); CLAIMED/IN_PROGRESS/IN_REVIEW/APPROVED keep it; anything else → `graph_release`.
         Never raises: a lease never changes a transition's outcome."""
         try:
-            task = self._store().get(task_id)
-            state = task["state"]
-            if state in HOLDING:
-                return "kept"
-            with self._lock:
-                lease = self._held.pop(task_id, None)
-                self._lost.pop(task_id, None)
-            if lease is None and state == S.DONE.value:
-                agent, graph = _agent_of(task), self.graph_id()
-                if agent is None or graph is None:
-                    return "none"
-                claim, lease = claim_node(agent, graph, task_id, ttl_s=self.ttl_s, env=self.env)
+            with self._task_lock(task_id):
+                task = self._store().get(task_id)
+                state = task["state"]
+                if state in HOLDING:
+                    return "kept"
+                with self._lock:
+                    lease = self._held.pop(task_id, None)
+                    self._lost.pop(task_id, None)
+                if lease is None and state == S.DONE.value:
+                    agent, graph = _agent_of(task), self.graph_id()
+                    if agent is None or graph is None:
+                        return "none"
+                    claim, lease = claim_node(agent, graph, task_id, ttl_s=self.ttl_s, env=self.env)
+                    if lease is None:
+                        _mirror(self._store(), task_id, state="unsettled", agent=agent,
+                                reason=f"DONE: claim {claim.status} {claim.reason}".strip()[:300], holder=claim.holder)
+                        if claim.status in (DENIED, REFUSED):  # the swarm calls it DONE and someone else holds the node
+                            self.emit("lease.unsettled", {"task_id": task_id, "agent": agent, "op": "complete",
+                                                          "task_state": state, "reason": f"claim {claim.status}",
+                                                          "holder": claim.holder})
+                        return f"claim {claim.status}"
                 if lease is None:
-                    _mirror(self._store(), task_id, state="unsettled", agent=agent,
-                            reason=f"DONE: claim {claim.status} {claim.reason}".strip()[:300], holder=claim.holder)
-                    if claim.status in (DENIED, REFUSED):  # the swarm calls it DONE and someone else holds the node
-                        self.emit("lease.unsettled", {"task_id": task_id, "agent": agent, "op": "complete",
-                                                      "task_state": state, "reason": f"claim {claim.status}",
-                                                      "holder": claim.holder})
-                    return f"claim {claim.status}"
-            if lease is None:
-                return "none"
-            return _close(self._store(), lease, state, self.emit, self.env)
+                    return "none"
+                return _close(self._store(), lease, state, self.emit, self.env)
         except Exception as exc:  # noqa: BLE001
             self.emit("lease.unsettled", {"task_id": task_id, "op": "settle", "reason": f"internal: {exc}"[:300]})
             return "error"
@@ -489,14 +582,15 @@ class LeaseBridge:
         """CHANGES_REQUESTED (LEASE-07): release the producer's lease and claim the node again, so the rework loop reads
         as `released` then `claim` in the trail. The rework dispatch reuses the new lease; a denied re-claim leaves the
         task IN_PROGRESS without a session, and dispatch asks again."""
-        with self._lock:
-            lease = self._held.pop(task_id, None)
-            self._lost.pop(task_id, None)
-        store = self._store()
-        if lease is not None:
-            _close(store, lease, S.CHANGES_REQUESTED.value, self.emit, self.env)
-        task = store.get(task_id)
-        agent = lease.agent_id if lease is not None else _agent_of(task)
-        if agent is None:
-            return Claim(UNLEASED, reason="no agent to claim for")
-        return self.acquire(task, agent)
+        with self._task_lock(task_id):
+            with self._lock:
+                lease = self._held.pop(task_id, None)
+                self._lost.pop(task_id, None)
+            store = self._store()
+            if lease is not None:
+                _close(store, lease, S.CHANGES_REQUESTED.value, self.emit, self.env)
+            task = store.get(task_id)
+            agent = lease.agent_id if lease is not None else _agent_of(task)
+            if agent is None:
+                return Claim(UNLEASED, reason="no agent to claim for")
+            return self.acquire(task, agent)

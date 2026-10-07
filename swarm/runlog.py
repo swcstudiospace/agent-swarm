@@ -16,9 +16,26 @@ def _log_file(root: str | Path | None, *, create: bool) -> Path:
     return swarm_dir(root, create=create) / "events.jsonl"
 
 
+def redact_leases(value):
+    """A copy of `value` without substrate lease ids. A lease id is the holder's fencing token (LEASE-02): the Task Store
+    mirrors it in notes.lease for A01's own release, and no run-log record, nor its tee, carries it. A task row carries it
+    twice, in `notes_json` and in the raw `notes` JSON text."""
+    if isinstance(value, dict):
+        return {k: redact_leases(v) for k, v in value.items() if k != "lease_id"}
+    if isinstance(value, (list, tuple)):
+        return [redact_leases(v) for v in value]
+    if isinstance(value, str) and '"lease_id"' in value:
+        try:
+            return json.dumps(redact_leases(json.loads(value)))
+        except ValueError:
+            return value
+    return value
+
+
 def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | None = None,
          task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
-    """Append one record to the run log; `tee=False` (dry runs) keeps it local and never sends it to substrate."""
+    """Append one record to the run log; `tee=False` (dry runs) keeps it local and never sends it to substrate. Lease ids
+    are dropped from the payload (`redact_leases`); the caller's own payload object is left as it is."""
     log_file = _log_file(root, create=True)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -26,7 +43,7 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
         "source": source,
         "correlation_id": correlation_id,
         "task_id": task_id,
-        "payload": payload,
+        "payload": redact_leases(payload),
         "msg_id": uuid.uuid4().hex,
     }
     with log_file.open("a", encoding="utf-8") as fh:

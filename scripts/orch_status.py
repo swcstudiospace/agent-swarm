@@ -61,7 +61,9 @@ def run(args, ctx) -> dict:
             return {"status": "ok", "summary": f"dry-run: would transition {tid} → {state}"}
         store.transition(tid, state, actor="A01", reason=args.reason or "manual")
         # a lease the runner mirrored in notes.lease is released (CANCELLED, FAILED, …) or completed (DONE) now, by its
-        # lease_id, rather than left to lapse; a no-op when the substrate is off or nothing is held (LEASE-07)
+        # lease_id, rather than left to lapse; a no-op when the substrate is off or nothing is held (LEASE-07). While a
+        # runner still works the task (notes.running) it is left to that runner, which stops the session first.
+        # The task printed below carries the mirrored lease_id; runlog.emit drops it from the event (no lease_id in the log).
         substrate_lease.settle_mirrored(store, tid, emit=ctx.emit)
         t = store.get(tid)
         ctx.emit("task.transition", {"task_id": tid, "state": t["state"], "reason": args.reason})
