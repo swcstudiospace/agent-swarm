@@ -22,6 +22,7 @@ Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
 from __future__ import annotations
 import json
 import re
+from contextlib import nullcontext
 from typing import Callable
 
 from .errors import SwarmError, ErrorCode
@@ -270,8 +271,8 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
     each transition here that changes who may hold the node: DONE completes it, CHANGES_REQUESTED releases and re-claims
     it for the rework, ESCALATED releases it (LEASE-07). `handoffs` is the runner's substrate_handoff.HandoffBridge, or
     None likewise. It writes a packet at each transition here that changes the accountable agent: a failing gate hands
-    the rework to the producer, and ESCALATED hands the task on (HAND-01). It goes first, so an escalation hands over
-    the lease with its packet before `settle` would release it."""
+    the rework to the producer, and ESCALATED hands the task on (HAND-01). The transition, packet and settlement share
+    the keeper's per-task lock, so neither thread releases the lease before the handoff finishes."""
     notes_log = []
     for t in store.list(correlation_id=corr, state=S.IN_REVIEW.value):
         tid = t["task_id"]
@@ -279,23 +280,25 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
         failing = [g for g in store.required_gates(tid) if latest.get(g, {}).get("verdict") == "fail"]
         if failing:
             before = t["rework_loops"]
-            nt = store.transition(tid, S.CHANGES_REQUESTED, reason=f"gates failed: {failing}")
-            if nt["state"] == S.ESCALATED.value:
-                emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": failing,
-                                            "options": ["human review", "cancel", "waive gate (L3)"]})
-                notes_log.append(f"{tid}: ESCALATED after {before} rework loops")
-                if handoffs is not None:
-                    handoffs.escalated(tid, reason=f"the rework cap was reached with gates {failing} failing",
-                                       failing=failing, verdicts=latest)
-                if leases is not None:
-                    leases.settle(tid)
-            else:
-                store.transition(tid, S.IN_PROGRESS, reason="rework loop")
-                notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
-                if handoffs is not None:  # the verdict rows read above: the transition made them stale
-                    handoffs.gate_failed(tid, failing, latest, rework=nt["rework_loops"])
-                if leases is not None:  # the rework is a new hold, visible in the trail, not a silent re-run
-                    leases.rework(tid)
+            with leases.transition(tid) if leases is not None else nullcontext():
+                nt = store.transition(tid, S.CHANGES_REQUESTED, reason=f"gates failed: {failing}")
+                if nt["state"] == S.ESCALATED.value:
+                    emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": failing,
+                                                "options": ["human review", "cancel", "waive gate (L3)"]})
+                    notes_log.append(f"{tid}: ESCALATED after {before} rework loops")
+                    if handoffs is not None:
+                        handoffs.escalated(tid, reason=f"the rework cap was reached with gates {failing} failing",
+                                           failing=failing, verdicts=latest)
+                    if leases is not None:
+                        leases.settle(tid)
+                else:
+                    store.transition(tid, S.IN_PROGRESS, reason="rework loop")
+                    notes_log.append(f"{tid}: CHANGES_REQUESTED → rework #{nt['rework_loops']} ({failing})")
+                    if handoffs is not None:  # the verdict rows read above: the transition made them stale
+                        handoffs.gate_failed(tid, failing, latest, rework=nt["rework_loops"])
+                    if leases is not None:  # the rework is a new hold, visible in the trail, not a silent re-run
+                        leases.rework(tid)
+            if nt["state"] != S.ESCALATED.value:
                 # reopen gate tasks that target this task so they re-run after rework: one rerun per gate lineage
                 # (<base>, <base>.r1, <base>.r2, ...), cloned from its latest member, never from a superseded one, and
                 # numbered by the lineage (a multi-target gate's members are triggered by different targets). A leased

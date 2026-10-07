@@ -43,7 +43,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -681,13 +681,19 @@ def dispatchable(store: TaskStore, corr: str, emit, handoffs=None) -> list[dict]
             store.transition(t["task_id"], S.RETRY, reason="auto-retry")
             ready.append(store.get(t["task_id"]))
         else:
-            store.transition(t["task_id"], S.ESCALATED, reason="max_attempts reached")
-            emit("escalation.request", {"task_id": t["task_id"], "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
-                                        "options": ["human review", "cancel", "re-plan"]})
-            if handoffs is not None:
-                failed = [h["reason"] for h in store.history(t["task_id"]) if h["to_state"] == S.FAILED.value]
-                handoffs.escalated(t["task_id"], reason="max_attempts reached"
-                                   + (f"; last failure: {failed[-1]}" if failed and failed[-1] else ""))
+            tid = t["task_id"]
+            leases = handoffs.leases if handoffs is not None else None
+            # FAILED normally released the lease already. If one remains, keep it until the escalation packet lands.
+            with leases.transition(tid) if leases is not None else nullcontext():
+                store.transition(tid, S.ESCALATED, reason="max_attempts reached")
+                emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
+                                            "options": ["human review", "cancel", "re-plan"]})
+                if handoffs is not None:
+                    failed = [h["reason"] for h in store.history(tid) if h["to_state"] == S.FAILED.value]
+                    handoffs.escalated(tid, reason="max_attempts reached"
+                                       + (f"; last failure: {failed[-1]}" if failed and failed[-1] else ""))
+                if leases is not None:
+                    leases.settle(tid)
     return ready
 
 

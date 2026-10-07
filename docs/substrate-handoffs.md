@@ -75,21 +75,28 @@ Sessions: `session_id` is the sender's `<AGENT>@<replica>:<graph_id>`, and for a
 
 `lease_id` is a request field. The server releases with it only after the packet is stored, and records only
 `lease_handover: true`, never the id. A receiver calls `graph_claim` rather than reading the node's state off a packet.
-When the release lands, the lease bridge stops beating the lease and mirrors it as `released` / `handover`. When it
-does not land, `settle` releases as before.
+When the release lands, the lease bridge stops beating the lease and mirrors it as `released` / `handover`. The
+transition, handoff attempt and settlement hold the keeper's per-task lock: a beat cannot release ESCALATED work while
+its packet is in flight. If storage or handover fails, `settle` still attempts the normal fenced release (an unavailable
+substrate leaves the lease to lapse). This is the intentional fail-open fallback, not a stored-packet guarantee on
+failure. FAILED normally releases before max-attempt escalation; that later packet does not recreate a hold.
 
-The runner keeps each packet under 9 kB (goal at most 500 characters; at most 40 files, 24 DoD lines and 16 blockers of
-300 characters each). Over that, it trims files first, then blockers, then DoD, in the server's own order, and says so
-in `notes`. The server's 12 kB fitting would drop `notes` first, and with it the idempotency key.
+The runner fits the complete request, including graph/node/session identifiers and an envelope reserve, within 9 kB
+(goal at most 500 characters; at most 40 files, 24 DoD lines and 16 blockers of 300 characters each). It trims files,
+then blockers, then DoD; if necessary, prose and goal are shortened too, with a trim notice in `notes`. Notes respect
+the server's 1200 UTF-16-unit cap without truncating the first-line key. Routing fields that cannot fit even without
+optional content are refused visibly. The server's 12 kB fitting would otherwise drop `notes` and the idempotency key.
 
 ## Idempotency
 
 The key is `<round>/<part>`: `dispatch@T/dep:D`, `rework<n>@T/gate:<gate>`, `escalated-a<attempt>r<loops>@T/<sender>`.
-The round names one boundary event on one node, and the part one packet of it. Before its first send, a runner process
-reads the graph's packets once with `coord_handoff_list`. It skips a boundary whose key the ledger already holds **from
-that sender's surface**, and keeps the set current as it writes. A re-run, a retried or reworked dispatch, or a runner
-restarted after a crash therefore writes nothing twice. Another agent's packet that quotes the key cannot suppress the
-real one.
+The round names one boundary event on one node, and the part one packet of it. A round or part over 256 UTF-8 bytes is
+represented by `sha256-<digest>`; ordinary keys stay unchanged, and packets in one round still group together.
+Before its first send, a runner reads the graph's packets with `coord_handoff_list`. Only verified entries or explicit
+`ok: false` unsigned/no-keys-configured verdicts with well-formed graph/node/sender/key fields contribute to dedupe.
+It skips a boundary already held **from that sender's surface on that node**, and keeps the set current as it writes.
+A re-run, retry or restarted runner therefore writes no second normal boundary. Rejected, tampered or malformed rows,
+and another agent's packet quoting a key, cannot suppress the real one. Unsigned mode remains explicitly unauthenticated.
 
 Two runner processes reconciling one Task Store cannot both write a gate or escalation packet: the transition behind it
 is a compare-and-swap that only one of them wins. A dependency packet is written by the replica that holds the
@@ -102,7 +109,7 @@ dispatched task's lease.
 | `sent` | stored | the server's `handoff` event (and `handoff.unsigned` once, see below) | |
 | `duplicate` | the ledger already holds the key from this sender | nothing | |
 | `unsent` | no answer, a server error, `stored: false`, the list did not answer, or no Graph ID | `handoff.unsent` (`warning`), once per key | retried by `flush()` at the start of every round and after the last one; a retry never hands a lease over |
-| `refused` | the server refused the call, or the sender has no token of its own | `handoff.refused` (`warning`) | not retried: it is configuration, not an outage |
+| `refused` | the server refused the call, the sender has no token of its own, or immutable routing fields exceed the packet budget | `handoff.refused` (`warning`) | not retried: it is configuration/input, not an outage |
 
 A handoff never changes a transition or stops a dispatch. Every bridge method catches its own failures.
 
