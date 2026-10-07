@@ -99,8 +99,8 @@ _PINNED = {k: v for k, v in sys.modules.items() if k == "swarm" or k.startswith(
 def _env(tmp_path, monkeypatch):
     for k, v in _PINNED.items():
         monkeypatch.setitem(sys.modules, k, v)
-    for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_"))]:
-        monkeypatch.delenv(k)
+    for k in [k for k in os.environ if k.startswith(("SUBSTRATE_", "SWARM_")) or k.lower().endswith("_proxy")]:
+        monkeypatch.delenv(k)  # an ambient HTTP_PROXY/NO_PROXY never leaks into a transport test
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))  # a tmp dir is never mistaken for a checkout's subdir
     substrate_client.reset()
@@ -391,10 +391,8 @@ def test_trickling_headers_are_cut_at_the_deadline_without_lingering_threads(mon
         server_thread.join(1.0)
         if i == 0:  # a network failure: backed off, no new connection
             assert substrate_client.mcp_call("graph_bind", {}) is None and len(conns) == 1
-        until = time.monotonic() + 1.0
-        while threading.active_count() > baseline and time.monotonic() < until:
-            time.sleep(0.01)
-        assert threading.active_count() <= baseline  # no worker or timer thread left behind
+        assert substrate_client._wait_idle(1.0)
+        assert threading.active_count() <= baseline  # no worker thread left behind
     assert len(conns) == 3
 
 
@@ -427,6 +425,107 @@ def test_real_reply_over_the_body_cap_is_a_failure(monkeypatch, http_server):
     assert substrate_client.rest_post("/events", {}) == (200, "x" * 10)
     assert substrate_client.rest_post("/events", {}) is None
     assert substrate_client.rest_post("/events", {}) is None and len(hits) == 2  # backed off
+
+
+@pytest.fixture()
+def fake_dns(monkeypatch):
+    """`*.invalid` never reaches real DNS: it fails at once, except `slow.invalid`, whose lookup blocks until the yielded
+    event is set (then fails). Released and drained on teardown."""
+    release, real = threading.Event(), socket.getaddrinfo
+
+    def getaddrinfo(host, *a, **k):
+        if isinstance(host, str) and host.endswith(".invalid"):
+            if host == "slow.invalid":
+                release.wait()
+            raise socket.gaierror(socket.EAI_NONAME, "test: no such host")
+        return real(host, *a, **k)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    yield release
+    release.set()
+    substrate_client._wait_idle(2.0)
+
+
+def _request_workers() -> int:
+    return sum(t.name == "substrate-request" and t.is_alive() for t in threading.enumerate())
+
+
+def test_stuck_dns_is_bounded_and_lingering_workers_are_capped(monkeypatch, fake_dns):
+    monkeypatch.setenv("SUBSTRATE_URL", "http://slow.invalid:9")
+    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.2)
+    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.1)
+    assert substrate_client._wait_idle(2.0)
+    baseline, cap = threading.active_count(), substrate_client.MAX_IN_FLIGHT
+    for i in range(cap + 2):
+        substrate_client.reset()
+        started = time.monotonic()
+        assert substrate_client.rest_post("/events", {}) is None
+        took = time.monotonic() - started
+        assert took < 0.3 + 0.5  # the caller's deadline holds while DNS is stuck
+        if i >= cap:
+            assert took < 0.1  # every slot is taken: fails at once without starting a thread
+        assert _request_workers() == min(i + 1, cap)  # stuck in DNS, nothing to kill yet; never more than the cap
+    fake_dns.set()
+    assert substrate_client._wait_idle(2.0)
+    assert _request_workers() == 0 and threading.active_count() <= baseline
+
+
+def test_a_connect_finishing_after_the_deadline_is_killed():
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(1)
+    lsock.settimeout(2.0)
+    holder = substrate_client._Holder()
+    holder.kill()  # the caller already gave up
+    conn = substrate_client._TrackedHTTPConnection("127.0.0.1", lsock.getsockname()[1], timeout=2.0, holder=holder)
+    try:
+        with pytest.raises(OSError, match="substrate deadline"):
+            conn.connect()
+        c, _ = lsock.accept()
+        c.settimeout(2.0)
+        assert c.recv(1) == b""  # the server saw the connection closed
+        c.close()
+    finally:
+        conn.close()
+        lsock.close()
+
+
+def _proxy(http_server, seen):
+    class Proxy(_Quiet):
+        def do_POST(self):
+            self._drain()
+            seen.append((self.requestline, dict(self.headers)))
+            body = b'{"accepted":true}'
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return http_server(Proxy)
+
+
+def test_http_proxy_is_honoured_and_only_the_authorization_header_carries_the_bearer(monkeypatch, http_server, fake_dns):
+    seen = []
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{_proxy(http_server, seen).server_address[1]}")
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.invalid:9")  # unresolvable directly
+    monkeypatch.setenv("SUBSTRATE_TOKEN", TOKEN)
+    assert substrate_client.rest_post("/events", {"a": 1}) == (202, '{"accepted":true}')
+    ((line, headers),) = seen
+    assert line == "POST http://substrate.invalid:9/events HTTP/1.1"
+    assert headers["Authorization"] == f"Bearer {TOKEN}"
+    assert [k for k, v in headers.items() if TOKEN in v] == ["Authorization"]
+
+
+def test_no_proxy_bypasses_the_proxy(monkeypatch, http_server, fake_dns):
+    seen = []
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{_proxy(http_server, seen).server_address[1]}")
+    monkeypatch.setenv("NO_PROXY", "substrate.invalid")
+    monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.invalid:9")
+    monkeypatch.setenv("SUBSTRATE_TOKEN", TOKEN)
+    assert substrate_client.rest_post("/events", {"a": 1}) is None  # direct: the name does not resolve
+    assert seen == []
+
 
 
 # --- tables -------------------------------------------------------------------------------------------------

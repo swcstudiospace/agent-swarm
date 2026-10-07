@@ -20,18 +20,22 @@ Tests: `tests/test_substrate_tee.py`.
 | `SUBSTRATE_GRAPH_ID` | Graph ID to offer for a new run (see *Graph ID*). |
 | `SWARM_REPLICA` | Replica name in the session id; default `r0`. |
 
-**Transport and time bounds.** Every request goes through one seam, `substrate_client._open(req, timeout)`, which speaks
-`http.client` directly in the calling thread: no worker thread, no urllib opener. The socket timeout is 1.5 s
-(`TIMEOUT_S`) per socket operation, connect included, but a server that trickles headers or a body would stay under it.
-So a deadline timer of `TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s) is armed before the request is sent; when it fires it
-shuts the socket down (`SHUT_RDWR`) and closes the connection, which ends a blocked connect, header read or body read at
-once and leaves no thread or socket behind. The timer is cancelled and the connection closed when the exchange ends.
-The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is rejected. A deadline hit, socket error or oversized reply
-counts as a network failure: the call returns None and all substrate calls of that process pause for 30 s, so a dead host
-costs one timeout, not one per emitted record.
+**Transport and time bounds.** Every request goes through one seam, `substrate_client._open(req, timeout)`, which builds a
+urllib opener per call: `ProxyHandler()` (so `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`, upper or lower case, are honoured
+as set at that moment), a redirect handler that refuses every redirect, and HTTP/HTTPS handlers whose connections register
+their socket with the request as soon as TCP is up (again before the TLS handshake). The exchange runs on a daemon worker
+thread, one per request; the socket timeout is 1.5 s (`TIMEOUT_S`) per socket operation. The caller waits at most
+`TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s) from entry, over DNS, connect, headers and body alike. At that deadline it
+marks the request dead and shuts the registered socket down (`SHUT_RDWR`), which ends a blocked connect, header read or
+body read in the worker at once; a connect that completes later is shut down and closed on the spot. Only a worker stuck in
+DNS (no socket yet) can outlive its deadline, and at most 4 workers (`MAX_IN_FLIGHT`) exist at once: with none free, a
+request fails immediately without starting a thread. The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is
+rejected. A deadline hit, socket error, no free worker or oversized reply counts as a network failure: the call returns
+None and all substrate calls of that process pause for 30 s, so a dead host costs one timeout, not one per emitted record.
 
 **Redirects.** Redirects are never followed: a 3xx is just a non-2xx answer, so the bearer is never re-sent anywhere. The
-bearer is also added with `Request.add_unredirected_header`.
+bearer is also added with `Request.add_unredirected_header`. Through an HTTP proxy the bearer travels only as the
+`Authorization` header of the forwarded request (never in a proxy `CONNECT`).
 
 ## Tokens
 

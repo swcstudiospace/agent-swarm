@@ -6,24 +6,27 @@ and SUBSTRATE_DISABLED is not ``1``; when off, no socket is opened. Every failur
 bad body, ``isError``) yields ``None``: the caller's behaviour never depends on substrate being reachable.
 A bearer token comes from env SUBSTRATE_TOKEN (or, for an explicit ``surface``, an opted-in SUBSTRATE_TOKEN_<SURFACE>) and is
 only ever placed in the Authorization header, as an unredirected header so a redirect never carries it to another URL:
-it is never logged, printed or returned. Redirects are never followed (a 3xx is a failed answer). One request (connect,
-headers and body) takes at most TIMEOUT_S + DEADLINE_SLACK_S: a timer shuts the socket down at that deadline.
+it is never logged, printed or returned. Redirects are never followed (a 3xx is a failed answer). HTTP_PROXY, HTTPS_PROXY
+and NO_PROXY are honoured. The caller waits at most TIMEOUT_S + DEADLINE_SLACK_S for one request (DNS, connect, headers
+and body, run on a daemon worker); at that deadline the request's socket is shut down.
 """
 from __future__ import annotations
+import functools
 import http.client
+import io
 import json
 import os
+import queue
 import socket
 import ssl
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from typing import Mapping
 
 TIMEOUT_S = 1.5  # per socket operation; the whole request is also bounded, see DEADLINE_SLACK_S
-DEADLINE_SLACK_S = 0.5  # total budget of one request (connect + read) is TIMEOUT_S + this
+DEADLINE_SLACK_S = 0.5  # the caller's total wait for one request (DNS + connect + read) is TIMEOUT_S + this
 MAX_BODY_BYTES = 1 << 20  # a larger reply is a failure
 BACKOFF_S = 30.0  # after a network-level failure this process stops trying for a while, so a dead host costs one timeout
 _down_until = 0.0
@@ -64,44 +67,20 @@ def _token(env: Mapping[str, str], surface: str | None) -> str:
 
 
 class _Response:
-    """One HTTP answer from `_open`; its connection stays under the request deadline until close()."""
+    """One HTTP answer handed back by `_open`: the status and the (already capped) body, held in memory."""
 
-    def __init__(self, conn: http.client.HTTPConnection, resp: http.client.HTTPResponse, timer: threading.Timer,
-                 killed: threading.Event):
-        self._conn, self._resp, self._timer, self._killed = conn, resp, timer, killed
-        self.status = resp.status
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._buf = io.BytesIO(body)
 
     def getcode(self) -> int:
         return self.status
 
-    def read(self, amt: int | None = None) -> bytes:
-        try:
-            if amt is None:
-                data = self._resp.read()
-            else:
-                parts: list[bytes] = []
-                got = 0
-                while got < amt:
-                    chunk = self._resp.read(amt - got)
-                    if not chunk:
-                        break
-                    parts.append(chunk)
-                    got += len(chunk)
-                data = b"".join(parts)
-        except Exception:
-            if self._killed.is_set():
-                raise TimeoutError("substrate request exceeded its deadline") from None
-            raise
-        if self._killed.is_set():
-            raise TimeoutError("substrate request exceeded its deadline")
-        return data
+    def read(self, amt: int | None = -1) -> bytes:
+        return self._buf.read(amt)
 
     def close(self) -> None:
-        self._timer.cancel()
-        try:
-            self._conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+        self._buf.close()
 
     def __enter__(self):
         return self
@@ -110,49 +89,175 @@ class _Response:
         self.close()
 
 
-def _open(req: urllib.request.Request, timeout: float) -> _Response:
-    """Send `req` with http.client in the calling thread; never follows redirects.
-
-    `timeout` bounds each socket operation (connect included); a timer armed before the request shuts the socket down at
-    TIMEOUT_S + DEADLINE_SLACK_S, which ends a blocked connect, header read or body read at once. The timer stays armed
-    until the returned response is closed. Raises on any network failure or deadline hit.
-    """
-    u = urllib.parse.urlsplit(req.full_url)
-    if u.scheme == "https":
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout,
-                                                                       context=ssl.create_default_context())
-    elif u.scheme == "http":
-        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
-    else:
-        raise ValueError("unsupported scheme")
-    killed = threading.Event()
-
-    def kill() -> None:
-        killed.set()
-        sock = conn.sock
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-    timer = threading.Timer(TIMEOUT_S + DEADLINE_SLACK_S, kill)
-    timer.daemon = True  # never keeps the process alive
-    timer.start()
+def _shut(sock: socket.socket) -> None:
     try:
-        conn.request(req.get_method(), req.selector, body=req.data, headers=dict(req.header_items()))
-        resp = conn.getresponse()
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)  # the plain socket call, also on an SSLSocket: ends any blocked I/O
+    except OSError:
+        pass
+
+
+class _Holder:
+    """Per-request record of the live socket; once `dead`, any socket it is handed is killed on the spot."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.sock: socket.socket | None = None
+        self.dead = False
+
+    def adopt(self, sock: socket.socket) -> socket.socket:
+        with self._lock:
+            self.sock = sock
+            dead = self.dead
+        if dead:  # the caller gave up while this connect was still under way
+            _shut(sock)
+            sock.close()
+            raise OSError("substrate deadline")
+        return sock
+
+    def kill(self) -> None:
+        with self._lock:
+            self.dead = True
+            sock = self.sock
+        if sock is not None:  # shut down only: the worker that owns the socket closes it
+            _shut(sock)
+
+
+class _TrackedHTTPConnection(http.client.HTTPConnection):
+    """Registers its socket in `holder` as soon as TCP is up (before any proxy CONNECT) and again once connected."""
+
+    def __init__(self, *args, holder: _Holder, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._holder = holder
+        self._create_connection = self._create_tracked
+
+    def _create_tracked(self, *args, **kwargs) -> socket.socket:
+        return self._holder.adopt(socket.create_connection(*args, **kwargs))
+
+    def connect(self) -> None:
+        super().connect()
+        self._holder.adopt(self.sock)
+
+
+class _TrackedHTTPSConnection(_TrackedHTTPConnection, http.client.HTTPSConnection):
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)  # TCP and any proxy CONNECT tunnel, the raw socket tracked
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host,
+                                              do_handshake_on_connect=False)
+        self._holder.adopt(self.sock)  # tracked before the handshake, so a stalled handshake is killable too
+        self.sock.do_handshake()
+
+
+def _holder_of(req: urllib.request.Request) -> _Holder:
+    holder = getattr(req, "_substrate_holder", None)
+    return holder if isinstance(holder, _Holder) else _Holder()
+
+
+class _TrackingHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(functools.partial(_TrackedHTTPConnection, holder=_holder_of(req)), req)
+
+
+class _TrackingHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(functools.partial(_TrackedHTTPSConnection, holder=_holder_of(req)), req, context=self._context)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # a 3xx surfaces as an HTTPError with that status; nothing is re-sent
+
+
+@functools.lru_cache(maxsize=1)
+def _ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context()
+
+
+MAX_IN_FLIGHT = 4  # workers alive at once; only one stuck in DNS (no socket to kill yet) can outlive its deadline
+_slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
+_workers_lock = threading.Lock()
+_workers: set[threading.Thread] = set()
+
+
+def _read_upto(f, n: int) -> bytes:
+    parts: list[bytes] = []
+    got = 0
+    while got < n:
+        chunk = f.read(n - got)
+        if not chunk:
+            break
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
+
+
+def _exchange(opener: urllib.request.OpenerDirector, req: urllib.request.Request, timeout: float,
+              out: queue.SimpleQueue) -> None:
+    """Worker: the whole exchange, body capped at MAX_BODY_BYTES + 1; hands back a _Response or the exception."""
+    got: object = OSError("substrate request worker stopped")
+    try:
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                got = _Response(int(resp.status), _read_upto(resp, MAX_BODY_BYTES + 1))
+        except urllib.error.HTTPError as e:  # non-2xx (3xx included: never followed) is still an answer
+            try:
+                body = _read_upto(e, MAX_BODY_BYTES + 1)
+            except Exception:  # noqa: BLE001
+                body = b""
+            finally:
+                e.close()
+            got = _Response(int(e.code), b"" if len(body) > MAX_BODY_BYTES else body)
+    except Exception as exc:  # noqa: BLE001 - delivered to the caller, who decides
+        got = exc
+    finally:
+        _slots.release()  # before the hand-off: a caller holding the answer never finds its own slot still taken
+        out.put(got)
+
+
+def _open(req: urllib.request.Request, timeout: float) -> _Response:
+    """Send `req` through a per-call urllib opener on a daemon worker; never follows redirects.
+
+    The opener honours HTTP_PROXY / HTTPS_PROXY / NO_PROXY as they are now. `timeout` bounds each socket operation; the
+    caller waits at most TIMEOUT_S + DEADLINE_SLACK_S from entry over DNS, connect, headers and body, then shuts the
+    request's socket down (ending the worker's blocked I/O) and raises TimeoutError. At most MAX_IN_FLIGHT workers exist;
+    with none free this raises at once without starting one. Raises on any network failure.
+    """
+    started = time.monotonic()
+    if not _slots.acquire(blocking=False):
+        raise OSError("substrate: too many requests still in flight")
+    try:
+        holder = _Holder()
+        req._substrate_holder = holder  # type: ignore[attr-defined]
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect(), _TrackingHTTPHandler(),
+                                             _TrackingHTTPSHandler(context=_ssl_context()))
+        out: queue.SimpleQueue = queue.SimpleQueue()
+        worker = threading.Thread(target=_exchange, args=(opener, req, timeout, out), name="substrate-request", daemon=True)
+        with _workers_lock:
+            _workers.difference_update([t for t in _workers if not t.is_alive()])
+            _workers.add(worker)
+        worker.start()
     except BaseException:
-        timer.cancel()
-        conn.close()
-        if killed.is_set():
-            raise TimeoutError("substrate request exceeded its deadline") from None
+        _slots.release()
         raise
-    return _Response(conn, resp, timer, killed)
+    try:
+        got = out.get(timeout=max(0.0, started + TIMEOUT_S + DEADLINE_SLACK_S - time.monotonic()))
+    except queue.Empty:
+        holder.kill()
+        raise TimeoutError("substrate request exceeded its deadline") from None
+    if isinstance(got, BaseException):
+        raise got
+    return got
+
+
+def _wait_idle(timeout: float) -> bool:
+    """Wait for every request worker to finish (tests); True when none is left alive."""
+    until = time.monotonic() + timeout
+    with _workers_lock:
+        workers = list(_workers)
+    for t in workers:
+        t.join(max(0.0, until - time.monotonic()))
+    with _workers_lock:
+        _workers.difference_update([t for t in _workers if not t.is_alive()])
+        return not _workers
 
 
 def _read_capped(resp) -> bytes:
@@ -180,7 +285,7 @@ def _request(url: str, body: dict, env: Mapping[str, str], accept: str, surface:
                 if status is None:
                     status = resp.getcode()
                 got = (int(status), data.decode("utf-8", errors="replace"))
-        except urllib.error.HTTPError as e:  # an HTTP answer is still an answer: let the caller see the status
+        except urllib.error.HTTPError as e:  # an HTTP answer is still an answer (the real _open returns a non-2xx _Response)
             try:
                 text = _read_capped(e).decode("utf-8", errors="replace")
             except Exception:  # noqa: BLE001
