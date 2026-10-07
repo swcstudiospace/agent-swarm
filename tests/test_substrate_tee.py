@@ -1,17 +1,21 @@
-"""ADR 0001 S1: the swarm -> Agent Substrate tee, Graph ID binding and their fail-open guarantees. No real network."""
+"""ADR 0001 S1: the swarm -> Agent Substrate tee, Graph ID binding and their fail-open guarantees.
+
+Only the transport tests open sockets, and only to servers they start on 127.0.0.1."""
 import ast
+import http.server
 import io
 import importlib.util
 import sys
 import json
 import os
 import re
+import select
+import socket
 import sqlite3
 import time
 import subprocess
 import threading
 import urllib.error
-import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -41,7 +45,7 @@ class _Resp(io.BytesIO):
 
 
 class FakeSubstrate:
-    """Stands in for urllib.request.urlopen: REST /events and a stateless MCP /mcp (graph_bind, graph_register)."""
+    """Stands in for substrate_client._open: REST /events and a stateless MCP /mcp (graph_bind, graph_register)."""
 
     def __init__(self, bindings=None, sse=False, events_status=200):
         self.bindings = dict(bindings or {})
@@ -115,13 +119,13 @@ def on(monkeypatch):
 @pytest.fixture()
 def fake(monkeypatch):
     f = FakeSubstrate()
-    monkeypatch.setattr(urllib.request, "urlopen", f)
+    monkeypatch.setattr(substrate_client, "_open", f)
     return f
 
 
-def _no_urlopen(monkeypatch):
+def _no_open(monkeypatch):
     calls = []
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(OSError("socket")))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(OSError("socket")))
     return calls
 
 
@@ -154,7 +158,7 @@ def _orch_plan(capsys, tmp_path, *args):
 
 # --- off switches: no socket, no sqlite ---------------------------------------------------------------------
 def test_url_unset_is_a_pure_noop(tmp_path, monkeypatch):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     rec = _emit(tmp_path)
     assert calls == []
     assert not _db(tmp_path).exists()
@@ -167,7 +171,7 @@ def test_url_unset_is_a_pure_noop(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("url", ["", "   ", "file:///etc/passwd", "ftp://x"])
 def test_blank_or_non_http_url_is_off(monkeypatch, url):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     assert not substrate_client.enabled({"SUBSTRATE_URL": url})
     assert substrate_client.rest_post("/events", {}, {"SUBSTRATE_URL": url}) is None
     assert calls == []
@@ -175,7 +179,7 @@ def test_blank_or_non_http_url_is_off(monkeypatch, url):
 
 def test_substrate_disabled_wins(tmp_path, monkeypatch, on):
     monkeypatch.setenv("SUBSTRATE_DISABLED", "1")
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     _emit(tmp_path)
     assert calls == [] and not _db(tmp_path).exists()
     assert not substrate_client.enabled()
@@ -194,14 +198,14 @@ def test_rest_post_reports_http_errors_and_swallows_the_rest(on, fake, monkeypat
     fake.events_status = 403
     assert substrate_client.rest_post("/events", {})[0] == 403
     substrate_client.reset()
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(TimeoutError(TOKEN)))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: (_ for _ in ()).throw(TimeoutError(TOKEN)))
     assert substrate_client.rest_post("/events", {}) is None
 
 
 @pytest.mark.parametrize("sse", [False, True])
 def test_mcp_call_json_and_sse(on, monkeypatch, sse):
     f = FakeSubstrate(sse=sse)
-    monkeypatch.setattr(urllib.request, "urlopen", f)
+    monkeypatch.setattr(substrate_client, "_open", f)
     got = substrate_client.mcp_call("graph_bind", {"correlation_id": "c", "graph_id": GID_A})
     assert got == {"status": "created", "correlation_id": "c", "graph_id": GID_A, "conflict": False}
     c = f.calls[0]
@@ -218,26 +222,83 @@ def test_mcp_call_json_and_sse(on, monkeypatch, sse):
     "",
 ])
 def test_mcp_call_failures_are_none(on, monkeypatch, reply):
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(reply))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: _Resp(reply))
     assert substrate_client.mcp_call("graph_bind", {}) is None
 
 
 def test_dead_host_costs_one_attempt_per_backoff(on, monkeypatch):
     n = []
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: n.append(1) or (_ for _ in ()).throw(OSError("down")))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: n.append(1) or (_ for _ in ()).throw(OSError("down")))
     assert substrate_client.rest_post("/events", {}) is None and substrate_client.rest_post("/events", {}) is None
     assert len(n) == 1
 
 
-def test_bearer_is_unredirected_so_a_redirect_drops_it(on, fake):
+def test_bearer_is_unredirected(on, fake):
     substrate_client.rest_post("/events", {"a": 1})
     req = fake.calls[0]["req"]
     assert req.get_header("Authorization") == f"Bearer {TOKEN}"
     assert "Authorization" in req.unredirected_hdrs and "Authorization" not in req.headers
-    # what urllib's redirect handler builds for the next hop (another host, or https -> http) carries no token
-    moved = urllib.request.HTTPRedirectHandler().redirect_request(req, None, 302, "Found", {}, "http://elsewhere.test/events")
-    assert moved is not None and moved.full_url == "http://elsewhere.test/events"
-    assert moved.get_header("Authorization") is None and not any(TOKEN in v for _, v in moved.header_items())
+
+
+@pytest.fixture()
+def http_server():
+    """start(handler_cls) -> a ThreadingHTTPServer on 127.0.0.1:0 serving on a daemon thread; all shut down after."""
+    servers = []
+
+    def start(handler_cls):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        servers.append(srv)
+        return srv
+
+    yield start
+    for srv in servers:
+        srv.shutdown()
+        srv.server_close()
+
+
+class _Quiet(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _drain(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+
+def _point_at(monkeypatch, srv):
+    monkeypatch.setenv("SUBSTRATE_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    monkeypatch.setenv("SUBSTRATE_TOKEN", TOKEN)
+
+
+def test_redirect_is_not_followed(monkeypatch, http_server):
+    hits, seen = [], []
+
+    class Other(_Quiet):
+        def do_POST(self):
+            hits.append(dict(self.headers))
+            self._drain()
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_POST
+
+    other = http_server(Other)
+
+    class Redirect(_Quiet):
+        def do_POST(self):
+            seen.append(self.headers.get("Authorization"))
+            self._drain()
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{other.server_address[1]}/x")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    _point_at(monkeypatch, http_server(Redirect))
+    got = substrate_client.rest_post("/events", {"a": 1})
+    assert got == (302, "")  # a non-2xx answer: the caller treats it as a failure
+    assert seen == [f"Bearer {TOKEN}"] and hits == []  # the other host never heard from us, token or not
 
 
 @pytest.mark.parametrize("own", [None, "", "   "])
@@ -269,50 +330,103 @@ def test_surface_token_override_wins_and_never_leaks(tmp_path, on, fake, monkeyp
         assert tok not in out.out + out.err + logged
 
 
-class _Trickle:
-    """A reply whose read() only returns once the response is closed, like a stream that never finishes."""
+@pytest.fixture()
+def trickle_server():
+    """Raw socket server: per connection, reads the request, sends a status line, then one header byte every 0.05 s for
+    ever. Yields (port, conns); each conns entry is (closed_event, thread), closed_event set once the peer is gone."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(8)
+    lsock.settimeout(0.05)
+    stop, conns = threading.Event(), []
 
-    status = 200
+    def serve(c, closed):
+        try:
+            c.settimeout(2.0)
+            c.recv(65536)
+            c.sendall(b"HTTP/1.1 200 OK\r\n")
+            while not stop.is_set():
+                time.sleep(0.05)
+                if select.select([c], [], [], 0)[0] and c.recv(1) == b"":
+                    break  # the client closed its side
+                c.sendall(b"X")
+        except OSError:
+            pass  # send to a shut-down peer fails
+        finally:
+            closed.set()
+            c.close()
 
-    def __init__(self):
-        self.released = threading.Event()
+    def accept():
+        while not stop.is_set():
+            try:
+                c, _ = lsock.accept()
+            except OSError:
+                continue
+            closed = threading.Event()
+            t = threading.Thread(target=serve, args=(c, closed), daemon=True)
+            conns.append((closed, t))
+            t.start()
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        pass
-
-    def read(self):
-        self.released.wait(10)
-        return b'{"late":true}'
-
-    def close(self):
-        self.released.set()
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    yield lsock.getsockname()[1], conns
+    stop.set()
+    acceptor.join(2)
+    lsock.close()
 
 
-def test_slow_reply_is_cut_at_the_total_deadline_and_backs_off(on, monkeypatch):
-    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.05)
-    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.05)
-    resp, timeouts = _Trickle(), []
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: timeouts.append(timeout) or resp)
-    started = time.monotonic()
-    assert substrate_client.rest_post("/events", {}) is None
-    assert time.monotonic() - started < 1.0
-    assert resp.released.wait(2.0)  # the deadline timer closed the response, which ended the read
-    assert timeouts == [0.05]
-    assert substrate_client.mcp_call("graph_bind", {}) is None and len(timeouts) == 1  # a network failure: back-off
+def test_trickling_headers_are_cut_at_the_deadline_without_lingering_threads(monkeypatch, trickle_server):
+    port, conns = trickle_server
+    monkeypatch.setenv("SUBSTRATE_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.2)
+    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.1)
+    baseline = threading.active_count()
+    for i in range(3):
+        substrate_client.reset()
+        started = time.monotonic()
+        assert substrate_client.rest_post("/events", {}) is None
+        assert time.monotonic() - started < 1.5
+        closed, server_thread = conns[i]
+        assert closed.wait(1.0)  # the server saw the connection go away shortly after the deadline
+        server_thread.join(1.0)
+        if i == 0:  # a network failure: backed off, no new connection
+            assert substrate_client.mcp_call("graph_bind", {}) is None and len(conns) == 1
+        until = time.monotonic() + 1.0
+        while threading.active_count() > baseline and time.monotonic() < until:
+            time.sleep(0.01)
+        assert threading.active_count() <= baseline  # no worker or timer thread left behind
+    assert len(conns) == 3
 
 
 def test_reply_over_the_body_cap_is_a_failure(on, monkeypatch):
     assert substrate_client.MAX_BODY_BYTES == 1 << 20
     monkeypatch.setattr(substrate_client, "MAX_BODY_BYTES", 10)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp("x" * 10))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: _Resp("x" * 10))
     assert substrate_client.rest_post("/events", {}) == (200, "x" * 10)
     n = []
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: n.append(1) or _Resp("x" * 11))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: n.append(1) or _Resp("x" * 11))
     assert substrate_client.rest_post("/events", {}) is None
     assert substrate_client.rest_post("/events", {}) is None and len(n) == 1  # counted as a failure: backed off
+
+
+def test_real_reply_over_the_body_cap_is_a_failure(monkeypatch, http_server):
+    sizes, hits = [10, 11], []
+
+    class Big(_Quiet):
+        def do_POST(self):
+            self._drain()
+            body = b"x" * sizes[len(hits)]
+            hits.append(1)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    _point_at(monkeypatch, http_server(Big))
+    monkeypatch.setattr(substrate_client, "MAX_BODY_BYTES", 10)
+    assert substrate_client.rest_post("/events", {}) == (200, "x" * 10)
+    assert substrate_client.rest_post("/events", {}) is None
+    assert substrate_client.rest_post("/events", {}) is None and len(hits) == 2  # backed off
 
 
 # --- tables -------------------------------------------------------------------------------------------------
@@ -422,7 +536,7 @@ def test_resolve_order_explicit_env_brief_mint():
 
 def test_bind_adopts_the_servers_winner_even_on_conflict(tmp_path, on, monkeypatch):
     f = FakeSubstrate(bindings={CORR: GID_A})
-    monkeypatch.setattr(urllib.request, "urlopen", f)
+    monkeypatch.setattr(substrate_client, "_open", f)
     assert tee_mod.bind_graph(CORR, GID_B, root=tmp_path) == GID_A
     assert f.at("/mcp", "graph_bind")[0]["body"]["params"]["arguments"] == {"correlation_id": CORR, "graph_id": GID_B}
     assert tee_mod.cached_graph_id(CORR, tmp_path) == GID_A
@@ -435,7 +549,7 @@ def test_bind_adopts_the_servers_winner_even_on_conflict(tmp_path, on, monkeypat
 
 
 def test_bind_without_an_answer_caches_nothing(tmp_path, on, monkeypatch):
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
     assert tee_mod.bind_graph(CORR, GID_A, root=tmp_path) is None
     assert tee_mod.lookup_graph_id(CORR, root=tmp_path) is None
     assert tee_mod.cached_graph_id(CORR, tmp_path) is None
@@ -729,7 +843,7 @@ def test_tee_never_raises(tmp_path, on, fake, monkeypatch):
 
 
 def test_runlog_survives_a_dead_substrate(tmp_path, on, monkeypatch, capsys):
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError(TOKEN)))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError(TOKEN)))
     rec = _emit(tmp_path)
     assert rec["type"] == "task.claimed" and len((tmp_path / ".swarm" / "events.jsonl").read_text().splitlines()) == 1
     out = capsys.readouterr()
@@ -739,7 +853,7 @@ def test_runlog_survives_a_dead_substrate(tmp_path, on, monkeypatch, capsys):
 # --- orch_plan end to end -----------------------------------------------------------------------------------
 def test_orch_plan_unchanged_when_substrate_unreachable_in_process(tmp_path, on, capsys, monkeypatch):
     attempts = []
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(substrate_client, "_open",
                         lambda *a, **k: attempts.append(a) or (_ for _ in ()).throw(urllib.error.URLError(f"refused {TOKEN}")))
     rc, out, raw = _orch_plan(capsys, tmp_path, "--brief-text", "billing", "--prefix", "R", "--correlation-id", CORR)
     assert rc == 0 and out["status"] == "ok" and len(out["tasks"]) == 13 and out["correlation_id"] == CORR
@@ -766,7 +880,7 @@ def test_orch_plan_unchanged_when_substrate_unreachable_subprocess(tmp_path):
 
 
 def test_orch_plan_without_substrate_creates_no_tee_state(tmp_path, capsys, monkeypatch):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     rc, out, _ = _orch_plan(capsys, tmp_path, "--brief-text", "billing", "--prefix", "R")
     assert rc == 0 and calls == [] and not _db(tmp_path).exists()
 
@@ -790,7 +904,7 @@ def test_orch_plan_binds_registers_and_tees(tmp_path, on, fake, capsys):
 
 def test_orch_plan_graph_id_flag_and_conflict_adoption(tmp_path, on, monkeypatch, capsys):
     f = FakeSubstrate(bindings={CORR: GID_A})
-    monkeypatch.setattr(urllib.request, "urlopen", f)
+    monkeypatch.setattr(substrate_client, "_open", f)
     rc, out, _ = _orch_plan(capsys, tmp_path, "--brief-text", "billing", "--prefix", "R", "--correlation-id", CORR, "--graph-id", GID_B)
     assert rc == 0
     assert f.at("/mcp", "graph_bind")[0]["body"]["params"]["arguments"]["graph_id"] == GID_B
