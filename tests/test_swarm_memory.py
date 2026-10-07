@@ -15,7 +15,6 @@ import os
 import re
 import sys
 import urllib.error
-import urllib.request
 from urllib.parse import urlparse
 
 import pytest
@@ -45,7 +44,7 @@ class _Resp(io.BytesIO):
 
 
 class FakeSubstrate:
-    """Stands in for urllib.request.urlopen: REST /memory (scripted replies) and /brief, stateless MCP /mcp.
+    """Stands in for substrate_client._open: REST /memory (scripted replies) and /brief, stateless MCP /mcp.
 
     `memory` is a list of `(http_status, body)`; the last reply repeats once the list is used up (an exhausted script must not
     raise: substrate_client swallows every exception, which would turn a test bug into a silent "unreachable").
@@ -149,7 +148,7 @@ def sleeps():
 def serve(monkeypatch, on):
     def _serve(**kw):
         fake = FakeSubstrate(**kw)
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        monkeypatch.setattr(substrate_client, "_open", fake)
         return fake
     return _serve
 
@@ -166,9 +165,9 @@ def write(sleeps):
     return _write
 
 
-def _no_urlopen(monkeypatch):
+def _no_open(monkeypatch):
     calls = []
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(OSError("socket")))
+    monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(OSError("socket")))
     return calls
 
 
@@ -450,7 +449,7 @@ def test_other_conflicts_are_returned_not_retried(serve, write, sleeps):
 
 # --- fail modes: memory write never pretends ------------------------------------------------------------------
 def test_substrate_disabled_sends_nothing_and_is_unavailable(monkeypatch, write):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     out = write()
     assert out.status == mem.UNAVAILABLE and out.reason == "substrate.disabled" and not out.ok and calls == []
 
@@ -462,11 +461,11 @@ def test_lost_reply_is_unknown_and_the_same_write_retried_reuses_the_key(serve, 
         fake(req, timeout)  # the server got the POST and stored the entry ...
         raise TimeoutError("reply lost")  # ... but the answer never came back
 
-    monkeypatch.setattr(urllib.request, "urlopen", reply_lost)
+    monkeypatch.setattr(substrate_client, "_open", reply_lost)
     first = write(subject="db choice")
     assert first.status == mem.UNAVAILABLE and first.reason == "substrate.unreachable" and not first.ok  # unknown, not "not written"
     substrate_client.reset()  # the outage back-off has passed
-    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(substrate_client, "_open", fake)
     second = write(subject="db choice")  # the SAME logical write: same correlation, task, attempt, kind, scope, subject, text
     assert second.ok
     assert len(fake.writes) == 2 and fake.writes[0]["idempotency_key"] == fake.writes[1]["idempotency_key"]
@@ -474,7 +473,7 @@ def test_lost_reply_is_unknown_and_the_same_write_retried_reuses_the_key(serve, 
 
 
 def test_unreachable_substrate_is_unavailable_not_ok_and_not_retried(on, monkeypatch, write, sleeps):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     out = write()
     assert out.status == mem.UNAVAILABLE and out.reason == "substrate.unreachable" and not out.ok
     assert len(calls) == 1 and sleeps == []
@@ -515,7 +514,7 @@ def test_memory_query_is_empty_when_unavailable(serve, monkeypatch):
     serve(entries=None)
     assert mem.memory_query("q") == []
     substrate_client.reset()
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     assert mem.memory_query("q") == [] and len(calls) == 1
     monkeypatch.delenv("SUBSTRATE_URL")
     calls.clear()
@@ -547,7 +546,7 @@ def test_run_start_context_is_empty_when_unavailable(serve, monkeypatch):
     serve(brief=("", 200))
     assert mem.run_start_context(REPO) == ""
     substrate_client.reset()
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     assert mem.run_start_context(REPO) == "" and len(calls) == 1
     monkeypatch.delenv("SUBSTRATE_URL")
     calls.clear()
@@ -579,7 +578,7 @@ def _prompt(mod, tmp_path):
 
 
 def test_assignment_prompt_is_unchanged_when_the_substrate_is_off(tmp_path, monkeypatch):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     mod = _load_swarm_run()
     prompt = _prompt(mod, tmp_path)
     assert prompt.startswith("# task.assign (signed envelope)\n```json\n") and "Substrate memory" not in prompt
@@ -615,7 +614,7 @@ def test_assignment_prompt_is_fail_open(tmp_path, serve, brief):
 
 
 def test_assignment_prompt_survives_a_dead_substrate(tmp_path, on, monkeypatch):
-    calls = _no_urlopen(monkeypatch)
+    calls = _no_open(monkeypatch)
     mod = _load_swarm_run()
     assert _prompt(mod, tmp_path).startswith("# task.assign (signed envelope)") and calls
 
