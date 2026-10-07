@@ -50,6 +50,7 @@ from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
+from swarm import memory as swarm_memory, substrate_client, substrate_tee  # noqa: E402
 
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
@@ -66,6 +67,26 @@ def upstream_context(store: TaskStore, task: dict) -> str:
         parts.append(f"### {dep} — {d['title']} ({d['agent_id']}, {d['state']})\n{outs}\n"
                      + (f"summary: {result.get('summary_md', '')[:1200]}" if result else ""))
     return "\n".join(parts) or "(no upstream tasks)"
+
+
+_SUBSTRATE_CONTEXT: dict[tuple[str, str], str] = {}
+_SUBSTRATE_CONTEXT_LOCK = threading.Lock()
+
+
+def substrate_memory_section(repo: Path, correlation_id: str) -> str:
+    """The `## Substrate memory` block (A01's run-start context), computed once per run and cached; '' when off or down."""
+    if not substrate_client.enabled():
+        return ""
+    key = (str(repo), correlation_id)
+    with _SUBSTRATE_CONTEXT_LOCK:
+        if key not in _SUBSTRATE_CONTEXT:
+            try:
+                graph_id = substrate_tee.lookup_graph_id(correlation_id, root=repo)
+                brief = swarm_memory.run_start_context(substrate_tee.repo_slug(repo), graph_id)
+            except Exception:  # noqa: BLE001 - fail open: memory context never stops a dispatch
+                brief = ""
+            _SUBSTRATE_CONTEXT[key] = f"## Substrate memory\n{brief}\n\n" if brief else ""
+        return _SUBSTRATE_CONTEXT[key]
 
 
 def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path) -> str:
@@ -94,7 +115,7 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path) -> 
                      f"`\"gate\": \"{notes['gate']}\"` and `\"verdicts\": {{\"<target_task_id>\": {{\"verdict\": \"pass|fail\", \"findings\": [...]}}}}` "
                      f"(advisory: fail findings become rework feedback, review findings are passed to the review gate "
                      f"script; only script-written verdicts count).")
-    return f"""# task.assign (signed envelope)
+    return substrate_memory_section(repo, task["correlation_id"]) + f"""# task.assign (signed envelope)
 ```json
 {json.dumps(env, indent=2)}
 ```
