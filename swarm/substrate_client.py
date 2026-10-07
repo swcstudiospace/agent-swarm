@@ -326,8 +326,9 @@ def _rpc_response(text: str) -> dict | None:
     return None
 
 
-def mcp_call(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *, surface: str | None = None) -> dict | None:
-    """Call an MCP tool statelessly; return the JSON object in ``result.content[0].text``, None on any failure.
+def mcp_call_json(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *,
+                  surface: str | None = None) -> dict | list | None:
+    """Call an MCP tool statelessly; return the JSON value (object or array) in ``result.content[0].text``, None on any failure.
 
     `surface` selects the token as in `rest_post`.
     """
@@ -348,6 +349,15 @@ def mcp_call(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *
         if not isinstance(content, list) or not content or not isinstance(content[0], dict):
             return None
         parsed = json.loads(content[0].get("text", ""))
-        return parsed if isinstance(parsed, dict) else None
+        return parsed if isinstance(parsed, (dict, list)) else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def mcp_call(tool: str, arguments: dict, env: Mapping[str, str] | None = None, *, surface: str | None = None) -> dict | None:
+    """Call an MCP tool statelessly; return the JSON object in ``result.content[0].text``, None on any failure or non-object.
+
+    `surface` selects the token as in `rest_post`.
+    """
+    parsed = mcp_call_json(tool, arguments, env, surface=surface)
+    return parsed if isinstance(parsed, dict) else None
