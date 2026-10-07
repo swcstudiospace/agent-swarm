@@ -551,7 +551,7 @@ def test_stuck_dns_is_bounded_and_lingering_workers_are_capped(monkeypatch, fake
         took = time.monotonic() - started
         assert took < 0.3 + 0.5  # the caller's deadline holds while DNS is stuck
         if i >= cap:
-            assert took < 0.1  # every slot is taken: fails at once without starting a thread
+            assert took >= 0.2 and substrate_client._down_until == 0  # waits for capacity, without recording an outage
         assert _request_workers() == min(i + 1, cap)  # stuck in DNS, nothing to kill yet; never more than the cap
     fake_dns.set()
     assert substrate_client._wait_idle(2.0)

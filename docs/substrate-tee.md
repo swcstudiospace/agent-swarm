@@ -180,6 +180,9 @@ rows are pruned at most once per 60 s per process, not on every event.
   unbound correlation: the tee sends nothing more and returns. `rest_post`, `mcp_call`, `tee` and `runlog`'s call to it
   never raise; `orch_plan`'s bind/register block is wrapped as well, so the plan, its output fields and the exit code are
   identical with substrate unreachable.
+- At most four request workers run at once. Waiting for a free slot shares the request's 2 s deadline. If no slot becomes
+  available, `mcp_call_outcome` returns `busy` (the optional clients return `None`) without starting outage back-off.
+  Lease claims defer rather than dispatching unleased; a busy Graph ID lookup is never cached as unbound.
 - Tokens are never logged, printed or returned, and never follow a redirect.
 - `--dry-run` never sends anything to substrate.
 

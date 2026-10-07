@@ -207,6 +207,7 @@ class FakeSubstrate:
 
 # --- fixtures and helpers --------------------------------------------------------------------------------------
 _PINNED = {k: v for k, v in sys.modules.items() if k == "swarm" or k.startswith("swarm.")}
+_REAL_OPEN = substrate_client._open
 
 
 @pytest.fixture(autouse=True)
@@ -234,6 +235,16 @@ def fake(monkeypatch):
     f = FakeSubstrate()
     monkeypatch.setattr(substrate_client, "_open", f)
     return f
+
+
+@pytest.fixture()
+def queued_fake(fake, monkeypatch):
+    """Use the real bounded transport/worker path, with only its urllib exchange faked."""
+    monkeypatch.setattr(substrate_client, "_open", _REAL_OPEN)
+    monkeypatch.setattr(substrate_client.urllib.request, "build_opener", lambda *a: SimpleNamespace(open=fake))
+    monkeypatch.setattr(substrate_client, "_slots", threading.BoundedSemaphore(substrate_client.MAX_IN_FLIGHT))
+    yield fake
+    assert substrate_client._wait_idle(2)
 
 
 def _store(tmp_path, name="tasks.db") -> TaskStore:
@@ -371,6 +382,85 @@ def test_refused_claim_is_not_dispatched(tmp_path, fake, runner, monkeypatch):
     assert _types(events) == ["lease.refused"] and "surface" in events[0][1]["reason"]
 
 
+def test_saturated_slots_wait_then_dispatch_with_a_lease(tmp_path, queued_fake, runner):
+    queued_fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)
+    assert bridge.graph_id() == GID
+    slots = substrate_client._slots
+    for _ in range(substrate_client.MAX_IN_FLIGHT):
+        assert slots.acquire(blocking=False)
+    released = threading.Timer(0.1, slots.release)
+    released.start()
+    started = time.monotonic()
+    try:
+        batch, waiting = runner.select_batch(store, [task], 1, bridge)
+        assert time.monotonic() - started >= 0.08
+        assert len(batch) == 1 and waiting == []
+        assert bridge.held("T-be") is not None
+        assert store.get("T-be")["notes_json"]["lease"]["state"] == "held"
+        assert substrate_client._down_until == 0
+        assert "lease.unleased" not in _types(events)
+    finally:
+        released.join()
+        for _ in range(substrate_client.MAX_IN_FLIGHT - 1):
+            slots.release()
+
+
+@pytest.mark.parametrize("cached_graph", [False, True])
+def test_saturated_slots_defer_claim_without_unleased_dispatch(tmp_path, queued_fake, runner, monkeypatch, cached_graph):
+    queued_fake.register("T-be")
+    # Another replica already holds the node; local congestion must not bypass that fact.
+    claim, _ = lease_mod.claim_node("A05", GID, "T-be", ttl_s=900, env=_replica("other"))
+    assert claim.status == "held"
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)
+    if cached_graph:
+        assert bridge.graph_id() == GID
+    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.1)
+    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.05)
+    slots = substrate_client._slots
+    for _ in range(substrate_client.MAX_IN_FLIGHT):
+        assert slots.acquire(blocking=False)
+    before = len(queued_fake.calls)
+    started = time.monotonic()
+    try:
+        batch, waiting = runner.select_batch(store, [task], 1, bridge)
+        assert 0.1 <= time.monotonic() - started < 1
+        assert batch == [] and waiting == ["T-be: busy"]
+        assert store.get("T-be")["state"] == "PLANNED"
+        assert bridge.held("T-be") is None and "lease.unleased" not in _types(events)
+        assert len(queued_fake.calls) == before and substrate_client._down_until == 0
+        assert CORR not in tee_mod._unbound
+    finally:
+        for _ in range(substrate_client.MAX_IN_FLIGHT):
+            slots.release()
+    # No outage/negative lookup cache was poisoned: the next round reaches the actual holder.
+    batch, waiting = runner.select_batch(store, [task], 1, bridge)
+    assert batch == [] and waiting == [f"T-be: denied (held by A05@other:{GID})"]
+
+
+@pytest.mark.parametrize("tool", ["graph_claim", "coord_handoff"])
+def test_busy_mcp_outcome_and_event_contention_never_back_off(queued_fake, monkeypatch, tool):
+    monkeypatch.setattr(substrate_client, "TIMEOUT_S", 0.05)
+    monkeypatch.setattr(substrate_client, "DEADLINE_SLACK_S", 0.05)
+    slots = substrate_client._slots
+    for _ in range(substrate_client.MAX_IN_FLIGHT):
+        assert slots.acquire(blocking=False)
+    try:
+        started = time.monotonic()
+        assert substrate_client.mcp_call_outcome(tool, {}).status == "busy"
+        assert 0.05 <= time.monotonic() - started < 1
+        assert substrate_client.rest_post("/events", {}) is None
+        assert substrate_client._down_until == 0 and queued_fake.calls == []
+    finally:
+        for _ in range(substrate_client.MAX_IN_FLIGHT):
+            slots.release()
+    assert substrate_client.rest_post("/events", {}) == (200, '{"ok":true}')
+
+
 @pytest.mark.parametrize("failure", ["down", "server-error"])
 def test_unreachable_substrate_dispatches_unleased_and_records_it(tmp_path, fake, runner, monkeypatch, failure):
     fake.register("T-be")
@@ -388,6 +478,12 @@ def test_unreachable_substrate_dispatches_unleased_and_records_it(tmp_path, fake
     assert mirror["state"] == "unleased"
     assert ("unreachable" if failure == "down" else "SUBSTRATE_PG_URL") in mirror["reason"]
     assert _types(events) == ["lease.unleased"]
+    if failure == "down":
+        assert substrate_client._down_until > time.monotonic()
+        fake.down = False
+        before = len(fake.calls)
+        assert substrate_client.mcp_call_outcome("graph_claim", {}).status == "unreachable"
+        assert len(fake.calls) == before  # a real outage, unlike contention, suppresses another request
     seen = {}
     monkeypatch.setattr(runner, "run_agent_headless", _session(seen))
     _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
@@ -700,7 +796,7 @@ def test_a_stopped_session_is_forgotten_only_once_its_whole_group_is_gone(tmp_pa
     tool_pid = int(pidfile.read_text())
     try:
         assert not _alive(tool_pid), "the tool outlived its stopped session"
-        assert groups and not set(groups) & runner._SESSIONS
+        assert groups and not set(groups) & set(runner._SESSIONS)
     finally:
         if _alive(tool_pid):
             os.kill(tool_pid, 9)
@@ -775,6 +871,83 @@ def test_a_lease_lost_while_the_gate_script_runs_stops_it_and_rejects_the_result
     assert outcome == "FAILED" and store.history("S-rel")[-1]["reason"] == lost
     assert "IN_REVIEW" not in [h["to_state"] for h in store.history("S-rel")]
     assert store.get("S-rel")["notes_json"]["meta"]["lease_stopped"] == lost
+
+
+@pytest.mark.parametrize("exit_kind", ["signal", "shell-signal", "shutdown", "findings"])
+def test_interrupted_gate_verdicts_are_not_applied_but_findings_are(tmp_path, runner, monkeypatch, exit_kind):
+    """Commit verdict rows, then terminate before the release plan: only a completed findings exit is accepted."""
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    pidfile, planfile = tmp_path / "gate.pid", tmp_path / "release-plan.json"
+    ending = {
+        "signal": "os.kill(os.getpid(), signal.SIGTERM)",
+        "shell-signal": "sys.exit(128 + signal.SIGTERM)",
+        "shutdown": "time.sleep(60)",
+        "findings": f"open({str(planfile)!r}, 'w').write('{{}}'); sys.exit(1)",
+    }[exit_kind]
+    (root / "scripts" / "rel_plan.py").write_text(
+        "import os, signal, sys, time\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from swarm.taskstore import TaskStore\n"
+        "from swarm.verdicts import record_gate_verdicts, SIM_FINDING\n"
+        "record_gate_verdicts(TaskStore(), gate_task_id='S-rel', gate='release', agent_id='A12@local', "
+        f"findings={'[SIM_FINDING]' if exit_kind == 'findings' else '[]'}, runs={{}}, "
+        f"correlation_id={CORR!r}, expires_s=3600, emit=lambda *a, **k: None)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n{ending}\n")
+    monkeypatch.setattr(runner, "ROOT", root)
+    store, events = _store(tmp_path), []
+    _plan(store, "S-be", gates=["release"])
+    for state in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("S-be", state)
+    gate = _plan(store, "S-rel", agent="A12", gate="release", gate_for=["S-be"])
+    monkeypatch.setattr(runner, "run_agent_headless", lambda *a, **k: (_gate_result("S-rel"), {"returncode": 0}))
+    applied, groups = [], []
+    apply = runner.apply_result
+
+    def apply_result(*args, **kwargs):
+        applied.append(args[1]["task_id"])
+        return apply(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "apply_result", apply_result)
+    killer = None
+    if exit_kind == "shutdown":
+        def shutdown():
+            _wait_for(pidfile)
+            groups.extend(runner._SESSIONS.values())
+            runner.kill_sessions(grace=0)
+        killer = threading.Thread(target=shutdown, daemon=True)
+        killer.start()
+    try:
+        _, _, outcome = _execute(runner, store, gate, None, tmp_path, events)
+    finally:
+        if killer is not None:
+            killer.join(5)
+        runner._STOPPING.clear()
+    assert pidfile.exists() and store.latest_verdicts("S-be")  # verdict committed before interruption
+    assert store.get("S-rel")["notes_json"]["running"] is None
+    if exit_kind == "findings":
+        assert outcome == "IN_REVIEW" and applied == ["S-rel"] and planfile.exists()
+        assert store.latest_verdicts("S-be")["release"]["verdict"] == "fail"
+    else:
+        assert outcome == "FAILED" and applied == [] and not planfile.exists()
+        assert "IN_REVIEW" not in [h["to_state"] for h in store.history("S-rel")]
+        runner.reconcile(store, CORR, lambda *a, **k: None)
+        assert store.get("S-be")["state"] == "IN_REVIEW"
+    if exit_kind == "shutdown":
+        assert groups and all(g.stopped == ["E-TIMEOUT: runner shutdown"] for g in groups)
+        assert not runner._SESSIONS
+
+
+def test_group_spawned_after_shutdown_is_marked_stopped(tmp_path, runner):
+    runner.kill_sessions(grace=0)
+    group = runner.ChildGroup([sys.executable, "-c", "import time; time.sleep(60)"], cwd=tmp_path, env=dict(os.environ))
+    try:
+        group.proc.communicate(timeout=5)
+        assert group.stopped == ["E-TIMEOUT: runner shutdown"]
+    finally:
+        group.close()
+        runner._STOPPING.clear()
+    assert not runner._SESSIONS
 
 
 # --- LEASE-07: DONE, CHANGES_REQUESTED, FAILED, CANCELLED ----------------------------------------------------------

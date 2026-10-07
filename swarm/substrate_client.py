@@ -8,8 +8,8 @@ that must tell a refusal from no answer (the lease bridge) uses ``mcp_call_outco
 A bearer token comes from env SUBSTRATE_TOKEN (or, for an explicit ``surface``, an opted-in SUBSTRATE_TOKEN_<SURFACE>) and is
 only ever placed in the Authorization header, as an unredirected header so a redirect never carries it to another URL:
 it is never logged, printed or returned. Redirects are never followed (a 3xx is a failed answer). HTTP_PROXY, HTTPS_PROXY
-and NO_PROXY are honoured. The caller waits at most TIMEOUT_S + DEADLINE_SLACK_S for one request (DNS, connect, headers
-and body, run on a daemon worker); at that deadline the request's socket is shut down.
+and NO_PROXY are honoured. The caller waits at most TIMEOUT_S + DEADLINE_SLACK_S for one request (slot acquisition,
+DNS, connect, headers and body, run on a daemon worker); at that deadline the request's socket is shut down.
 """
 from __future__ import annotations
 import functools
@@ -179,6 +179,10 @@ _workers_lock = threading.Lock()
 _workers: set[threading.Thread] = set()
 
 
+class RequestBusy(Exception):
+    """The request deadline expired waiting for local capacity; no server outage was observed."""
+
+
 def _read_upto(f, n: int) -> bytes:
     parts: list[bytes] = []
     got = 0
@@ -218,13 +222,17 @@ def _open(req: urllib.request.Request, timeout: float) -> _Response:
     """Send `req` through a per-call urllib opener on a daemon worker; never follows redirects.
 
     The opener honours HTTP_PROXY / HTTPS_PROXY / NO_PROXY as they are now. `timeout` bounds each socket operation; the
-    caller waits at most TIMEOUT_S + DEADLINE_SLACK_S from entry over DNS, connect, headers and body, then shuts the
-    request's socket down (ending the worker's blocked I/O) and raises TimeoutError. At most MAX_IN_FLIGHT workers exist;
-    with none free this raises at once without starting one. Raises on any network failure.
+    caller waits at most TIMEOUT_S + DEADLINE_SLACK_S from entry over slot acquisition, DNS, connect, headers and body,
+    then shuts the request's socket down (ending the worker's blocked I/O) and raises TimeoutError.
+    At most MAX_IN_FLIGHT workers exist; waiting for a free slot shares that deadline and raises RequestBusy if it
+    expires before a worker can start. Raises on any network failure.
     """
-    started = time.monotonic()
-    if not _slots.acquire(blocking=False):
-        raise OSError("substrate: too many requests still in flight")
+    deadline = time.monotonic() + TIMEOUT_S + DEADLINE_SLACK_S
+    if not _slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise RequestBusy("substrate request slots busy")
+    if time.monotonic() >= deadline:
+        _slots.release()
+        raise RequestBusy("substrate request slots busy")
     try:
         holder = _Holder()
         req._substrate_holder = holder  # type: ignore[attr-defined]
@@ -240,7 +248,7 @@ def _open(req: urllib.request.Request, timeout: float) -> _Response:
         _slots.release()
         raise
     try:
-        got = out.get(timeout=max(0.0, started + TIMEOUT_S + DEADLINE_SLACK_S - time.monotonic()))
+        got = out.get(timeout=max(0.0, deadline - time.monotonic()))
     except queue.Empty:
         holder.kill()
         raise TimeoutError("substrate request exceeded its deadline") from None
@@ -288,6 +296,8 @@ def _request(url: str, body: dict, env: Mapping[str, str], accept: str, surface:
                 got = (int(status), data.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as e:  # an HTTP answer is still an answer (the real _open returns a non-2xx _Response)
             got = (int(e.code), _read_capped(e).decode("utf-8", errors="replace"))  # a bad body falls to the except below
+    except RequestBusy:
+        raise  # local contention is not evidence of an outage; classified by the public caller
     except Exception:  # noqa: BLE001 - fail open: nothing may escape this client
         got = None
     if got is None:  # network failure, deadline, oversized or malformed reply: back off
@@ -338,6 +348,7 @@ class Outcome(NamedTuple):
       error       the server answered but could not act: any other non-2xx, an ``isError`` reply that is a thrown server
                   error (no Postgres, unknown node, …), or a reply that is not a tool result;
       unreachable no answer: network failure, deadline, oversized reply, or this process's outage back-off;
+      busy        the deadline expired waiting for a local request slot; nothing was sent and no back-off started;
       off         the integration is off; nothing was sent.
     `detail` is the server's own text for refused/error, capped at DETAIL_MAX; it never carries the token.
     """
@@ -386,6 +397,8 @@ def mcp_call_outcome(tool: str, arguments: dict, env: Mapping[str, str] | None =
         if not isinstance(parsed, (dict, list)):
             return Outcome("error", None, "tool result is not a JSON object or array")
         return Outcome("ok", parsed)
+    except RequestBusy:
+        return Outcome("busy")
     except Exception:  # noqa: BLE001 - fail open: nothing may escape this client
         return Outcome("error", None, "malformed reply")
 

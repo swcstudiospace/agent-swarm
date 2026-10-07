@@ -339,7 +339,7 @@ class DispatchWatch:
 
 # process groups of the running children (agent sessions, the runner's gate scripts): they run in their own session,
 # so a signal to the runner's group misses them
-_SESSIONS: set[int] = set()
+_SESSIONS: dict[int, ChildGroup] = {}
 _SESSIONS_LOCK = threading.Lock()
 _STOPPING = threading.Event()  # the runner is ending its sessions: a session that registers now is killed at once
 _FORWARDED = (signal.SIGTERM, signal.SIGHUP)
@@ -381,9 +381,10 @@ def kill_sessions(grace: float = 5) -> None:
     notes.running, so the next run retries them."""
     with _SESSIONS_LOCK:
         _STOPPING.set()
-        groups = list(_SESSIONS)
-    for pgid in groups:
-        kill_group(pgid, signal.SIGTERM)
+        sessions = list(_SESSIONS.values())
+    for group in sessions:
+        group.stop("E-TIMEOUT: runner shutdown", grace=grace)
+    groups = [group.pgid for group in sessions]
     deadline = time.monotonic() + grace
     while groups and time.monotonic() < deadline:
         time.sleep(0.1)
@@ -433,20 +434,21 @@ class ChildGroup:
         self._killer: threading.Timer | None = None
         self._closed = False
         with _SESSIONS_LOCK:
-            _SESSIONS.add(self.pgid)
+            _SESSIONS[self.pgid] = self
             stopping = _STOPPING.is_set()
         if stopping:  # spawned after kill_sessions took its snapshot (WR-09)
-            kill_group(self.pgid, signal.SIGKILL)
+            self.stop("E-TIMEOUT: runner shutdown", grace=0)
 
-    def stop(self, reason: str) -> None:
+    def stop(self, reason: str, *, grace: float | None = None) -> None:
+        grace = STOP_GRACE_S if grace is None else grace
         with self._lock:
             self.stopped.append(reason)
             if self._deadline is not None or self._closed:  # already stopping, or already gone and forgotten
                 return
-            self._deadline = time.monotonic() + STOP_GRACE_S
+            self._deadline = time.monotonic() + grace
             kill_group(self.pgid, signal.SIGTERM)
             # a process that ignores SIGTERM is killed after the grace even when it no longer holds the child's pipes
-            self._killer = threading.Timer(STOP_GRACE_S, kill_group, (self.pgid, signal.SIGKILL))
+            self._killer = threading.Timer(grace, kill_group, (self.pgid, signal.SIGKILL))
             self._killer.daemon = True
             self._killer.start()
 
@@ -462,7 +464,7 @@ class ChildGroup:
             if killer is not None:
                 killer.cancel()
             with _SESSIONS_LOCK:
-                _SESSIONS.discard(self.pgid)
+                _SESSIONS.pop(self.pgid, None)
 
 
 # omp 18.3.1 `-e`: a package that fails to load is only this stderr line (main.ts formatExtensionLoadNotifications),
@@ -584,8 +586,10 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
         group.close()
     if group.stopped:  # verdicts it wrote before the stop never approve anything: this gate task's result is refused
         raise LeaseStopped(group.stopped[0], "", {"lease_stopped": group.stopped[0]})
-    if group.proc.returncode == 2:
-        raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed: {(out or err)[-400:]}", task_id=task["task_id"])
+    rc = group.proc.returncode
+    if rc == 2 or rc < 0 or rc >= 129:  # 1 means findings; signals must never accept a partially written release plan
+        raise SwarmError(ErrorCode.E_CONTRACT, f"{script.name} failed (exit {rc}): {(out or err)[-400:]}",
+                         task_id=task["task_id"])
 
 
 FINDINGS_GATES = ("review", "quality", "security")
@@ -681,7 +685,7 @@ def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
 def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases) -> tuple[list[tuple[dict, dict]], list[str]]:
     """(task, agent) pairs to dispatch this round, and the tasks left waiting on a lease. The first `max_parallel` ready
     tasks fill the round, as before; with leases on, each must first hold its node (or run unleased when the substrate
-    cannot answer). A denied or refused claim leaves the task where it is (PLANNED/RETRY, or IN_PROGRESS for a rework)
+    cannot answer). A denied, refused or busy claim leaves the task where it is (PLANNED/RETRY, or IN_PROGRESS for a rework)
     without taking a slot, for a later round or run (LEASE-05)."""
     batch, waiting, slots = [], [], max_parallel
     for t in ready:

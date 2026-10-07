@@ -227,11 +227,13 @@ _UNBOUND_TTL_S = 60.0
 _unbound: dict[str, float] = {}  # correlation_id -> monotonic expiry; in-process only, never persisted
 
 
-def lookup_graph_id(correlation_id: str, *, root: str | Path | None = None, env: Mapping[str, str] | None = None) -> str | None:
+def lookup_graph_id(correlation_id: str, *, root: str | Path | None = None, env: Mapping[str, str] | None = None,
+                    defer_busy: bool = False) -> str | None:
     """Graph ID of a correlation: local cache, else a forward `graph_bind` lookup (cached on success), else None.
 
     A correlation substrate calls `unbound` (or does not answer for) is remembered in memory for 60 s, so a burst of
     records for it costs one network call. That negative result is never written to sqlite; `bind_graph` clears it.
+    Local contention is never cached as unbound; lease callers use `defer_busy` to raise RequestBusy and defer dispatch.
     """
     hit = cached_graph_id(correlation_id, root, env=env)
     if hit:
@@ -239,7 +241,12 @@ def lookup_graph_id(correlation_id: str, *, root: str | Path | None = None, env:
     now = time.monotonic()
     if _unbound.get(correlation_id, 0.0) > now:
         return None
-    got = substrate_client.mcp_call("graph_bind", {"correlation_id": correlation_id}, env, surface=ORCH_SURFACE)
+    outcome = substrate_client.mcp_call_outcome("graph_bind", {"correlation_id": correlation_id}, env, surface=ORCH_SURFACE)
+    if outcome.status == "busy":
+        if defer_busy:
+            raise substrate_client.RequestBusy("substrate graph lookup slots busy")
+        return None
+    got = outcome.value if outcome.status == "ok" and isinstance(outcome.value, dict) else None
     gid = got.get("graph_id") if got else None
     if got and got.get("status") == "existing" and is_graph_id(gid):
         _unbound.pop(correlation_id, None)

@@ -71,10 +71,11 @@ which upserts the node and leaves edges alone) and claims once more.
 | `held` | `claimed: true` with a `lease_id` | yes, leased | `notes.lease` `held` |
 | `denied` | another session holds a live lease | **no** | `notes.lease` `denied` with the holder and expiry; run-log `lease.denied` (`note`) |
 | `refused` | the server said no to this caller: HTTP 401/403, or an `isError` reply `{"error": …}` (wrong token for the surface, malformed session) | **no** | `notes.lease` `refused`; `lease.refused` (`warning`) |
+| `busy` | the call deadline expires waiting for a local request slot (including an uncached Graph ID lookup) | **no** | task and lease mirror unchanged; runner reports `waiting on leases` |
 | `unleased` | no answer (network, deadline, back-off), any other server error (no Postgres, a DB outage), or no Graph ID bound to the run | yes, fail-open | `notes.lease` `unleased` with the reason; `lease.unleased` (`warning`) |
 | `off` | integration off | yes, as before | nothing |
 
-A task whose claim is denied or refused stays where it was (PLANNED/RETRY, or IN_PROGRESS for a rework) and takes no
+A task whose claim is denied, refused or busy stays where it was (PLANNED/RETRY, or IN_PROGRESS for a rework) and takes no
 parallel slot. Its attempt counter does not move. When a round has candidates but every one of them is waiting on a
 lease, the run ends with `waiting on leases: […]` in its log instead of spinning through `--max-rounds`. The next round
 or the next run asks again.
@@ -90,9 +91,10 @@ outage back-off, so one blip cannot run the TTL out.
 
 Held leases are not capped by `--max-parallel`: review leases outlive the round that produced them. The keeper therefore
 schedules every lease on its own due time and beats up to `HEARTBEAT_WORKERS` of them at once, on a small thread pool.
-That is `substrate_client.MAX_IN_FLIGHT - 1` (3): one request slot stays free for the run's claims, settlements and tee,
-because a request that finds every slot taken counts as an outage in the client. With 1 s replies and a 30 s TTL, three
-workers renew 30 leases within TTL/3, where one at a time renewed 10.
+That is `substrate_client.MAX_IN_FLIGHT - 1` (3): one request slot stays free for the run's claims, settlements and tee.
+If other calls fill it too, requests wait for capacity within their own deadline; local contention never starts the
+client's outage back-off. With 1 s replies and a 30 s TTL, three workers renew 30 leases within TTL/3, where one at a time
+renewed 10.
 
 Claims, beats, settlements and reworks of one task run one at a time (a per-task lock in the bridge). A worker that
 settles a task while the keeper's re-claim of it is on the wire waits for that claim, then releases the lease it brought
@@ -124,6 +126,11 @@ while a result is being written; that result was written under a held lease. FAI
 runs the existing ladder: RETRY behind a fresh claim, bounded by `max_attempts`, then ESCALATED. A lease that keeps
 slipping therefore escalates rather than looping. A lease lost before the session spawned stops the dispatch before
 it starts.
+
+Runner shutdown marks every signaled child group stopped, including children spawned during teardown, so a gate script
+cannot approve a result after shutdown even if it exits cleanly. Gate scripts terminated by a signal (negative return
+code or a shell's `128 + signal` exit code) are rejected too: committed verdict rows cannot approve a target while a
+release plan is missing or incomplete. Exit 1 remains the normal, accepted findings exit code.
 
 Between rounds no session is running, so nothing is at risk. `expired` and `unheld` re-claim if the task still needs the
 node, and every other refusal drops the lease with a `lease.lost` warning. The task's state is left to A01. If the

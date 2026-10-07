@@ -7,7 +7,8 @@ the Task Store stays A01's record of lifecycle state and keeps only an advisory 
 
 Fail-open like the rest of the integration: off (no SUBSTRATE_URL, --dry-run) means no call and no record; no answer or a
 server error means the task runs unleased and says so. A *refusal* is different: the server answered and said no, so the
-task is not dispatched. Design notes, the refusal table and the event types: docs/substrate-leases.md.
+task is not dispatched. Local request-slot contention also defers dispatch, never masquerading as an outage.
+Design notes, the refusal table and the event types: docs/substrate-leases.md.
 """
 from __future__ import annotations
 import os
@@ -28,7 +29,7 @@ TTL_ENV = "SWARM_LEASE_TTL_S"
 IDLE_POLL_S = 1.0  # the keeper's longest sleep, so a lease taken while it sleeps is never beaten late
 # Heartbeats in flight at once. Held leases are not capped by --max-parallel (review leases outlive their round), so one
 # beat at a time falls behind a TTL/3 deadline once replies are slow. One request slot of substrate_client's is left
-# free for the run's other calls: a request that finds every slot taken counts as an outage there.
+# free for the run's other calls; local contention waits within the request deadline, never starting outage back-off.
 HEARTBEAT_WORKERS = max(1, substrate_client.MAX_IN_FLIGHT - 1)
 
 # Lifecycle states in which the task's node stays leased: from the claim, through review, until DONE completes it.
@@ -41,7 +42,7 @@ LET_GO = frozenset({S.DONE.value, S.FAILED.value, S.BLOCKED.value, S.ESCALATED.v
 REVIEW = frozenset({S.IN_REVIEW.value, S.APPROVED.value})
 
 # Claim.status values
-HELD, DENIED, REFUSED, UNLEASED, OFF = "held", "denied", "refused", "unleased", "off"
+HELD, DENIED, REFUSED, BUSY, UNLEASED, OFF = "held", "denied", "refused", "busy", "unleased", "off"
 
 # What a refused heartbeat does while the task's agent session runs (LEASE-06). `expired` alone re-claims: the lease
 # lapsed but nobody took the node, so the same session takes it back under a new id and the trail shows `reclaimed`.
@@ -145,6 +146,8 @@ def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int,
         got = _call("graph_claim", args, surface, e)
     if got.status == "off":
         return Claim(OFF), None
+    if got.status == "busy":
+        return Claim(BUSY, reason="substrate request slots busy"), None
     if got.status == "unreachable":
         return Claim(UNLEASED, reason="substrate unreachable"), None
     if got.status == "refused":
@@ -322,9 +325,10 @@ class LeaseBridge:
                 lock = self._task_locks[task_id] = threading.RLock()
             return lock
 
-    def graph_id(self) -> str | None:
+    def graph_id(self, *, defer_busy: bool = False) -> str | None:
         if self._graph_id is None:
-            self._graph_id = substrate_tee.lookup_graph_id(self.correlation_id, root=self.root, env=self.env)
+            self._graph_id = substrate_tee.lookup_graph_id(self.correlation_id, root=self.root, env=self.env,
+                                                          defer_busy=defer_busy)
         return self._graph_id
 
     def _moved_on(self, task_id: str) -> bool:
@@ -355,7 +359,8 @@ class LeaseBridge:
     # -- claim
     def acquire(self, task: dict, agent_id: str) -> Claim:
         """Hold the task's node before it is dispatched (LEASE-05). A lease this process already holds (a rework
-        re-claimed by `rework`) is reused. Records every outcome but `held` and `off` as a note and an event."""
+        re-claimed by `rework`) is reused. Denied, refused and unleased outcomes are recorded as a note and an event;
+        local contention defers the task without changing its lease mirror."""
         tid = task["task_id"]
         with self._task_lock(tid):
             with self._lock:
@@ -363,7 +368,10 @@ class LeaseBridge:
                 if lease is not None:
                     return Claim(HELD, lease_s=lease.ttl_s, reason=lease.action)
                 self._lost.pop(tid, None)
-            graph = self.graph_id()
+            try:
+                graph = self.graph_id(defer_busy=True)
+            except substrate_client.RequestBusy:
+                return Claim(BUSY, reason="substrate graph lookup slots busy")
             if graph is None:
                 claim, lease = Claim(UNLEASED, reason="no Graph ID is bound to this run"), None
             else:
