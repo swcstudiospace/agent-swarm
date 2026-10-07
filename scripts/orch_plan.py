@@ -151,8 +151,9 @@ def _bind_graph(args, ctx, corr: str, brief: str, tasks: list[dict]) -> None:
         graph_id = substrate_tee.bind_graph(corr, offered, root=ctx.root)  # the server's winner, even on conflict
         if graph_id:
             substrate_client.mcp_call("graph_register", {
-                "graph_id": graph_id, "repo": substrate_tee.repo_slug(ctx.root), "surface": "swarm-a01-orch", "status": "planned",
-                "nodes": [{"node_id": t["task_id"]} for t in tasks]})
+                "graph_id": graph_id, "repo": substrate_tee.repo_slug(ctx.root), "surface": substrate_tee.ORCH_SURFACE,
+                "status": "planned",
+                "nodes": [{"node_id": t["task_id"]} for t in tasks]}, surface=substrate_tee.ORCH_SURFACE)
     except Exception:  # noqa: BLE001 - substrate never changes the plan's outcome
         pass
 

@@ -15,12 +15,30 @@ Tests: `tests/test_substrate_tee.py`.
 |---|---|
 | `SUBSTRATE_URL` | Base URL of substrate-mcp. Empty/unset (or not `http(s)://`) = the whole integration is off; no socket is opened, no sqlite file is created. |
 | `SUBSTRATE_DISABLED=1` | Force off even when `SUBSTRATE_URL` is set. |
-| `SUBSTRATE_TOKEN` | This process's single bearer token (sent as `Authorization: Bearer …`). The server maps it to a surface via `SUBSTRATE_TOKEN_<SURFACE, '-'→'_', upper>`, e.g. `SUBSTRATE_TOKEN_SWARM_A05_BE`. It is only ever placed in that header; it is never logged, printed or put in an event. |
+| `SUBSTRATE_TOKEN` | This process's bearer token (sent as `Authorization: Bearer …`). The server maps it to a surface via `SUBSTRATE_TOKEN_<SURFACE, '-'→'_', upper>`, e.g. `SUBSTRATE_TOKEN_SWARM_A05_BE`. It is only ever placed in that header; it is never logged, printed or put in an event. |
+| `SUBSTRATE_TOKEN_<SURFACE>` | Optional per-surface override, read by this client under the same name the server uses, e.g. `SUBSTRATE_TOKEN_SWARM_A08_QA`. See *Tokens*. |
 | `SUBSTRATE_GRAPH_ID` | Graph ID to offer for a new run (see *Graph ID*). |
 | `SWARM_REPLICA` | Replica name in the session id; default `r0`. |
 
-Timeout is 1.5 s per request. A network-level failure additionally pauses all substrate calls of that process for 30 s, so
-a dead host costs one timeout, not one per emitted record.
+**Time bounds.** The socket timeout is 1.5 s (`TIMEOUT_S`), but that bounds each socket operation, not the reply: a reply
+that trickles in or streams would keep `read()` going. So the whole request (connect and read) is also bounded to
+`TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s): the exchange runs on a daemon thread the caller waits for at most until that
+deadline, and a timer closes a response still being read at the deadline. A reply body over 1 MiB (`MAX_BODY_BYTES`) is
+rejected. A deadline hit or an oversized reply counts as a network failure. A network-level failure additionally pauses all
+substrate calls of that process for 30 s, so a dead host costs one timeout, not one per emitted record.
+
+**Redirects.** The bearer is added with `Request.add_unredirected_header`, so if substrate answers with a redirect, the
+request urllib follows (to another host, or from https to http) carries no `Authorization` header.
+
+## Tokens
+
+S4 provisions **one `SUBSTRATE_TOKEN` per agent process**: an agent's process holds only its own surface's token, and that
+is all the client needs. The per-surface override exists only for one orchestrating process that was deliberately given
+several tokens, so it can speak as each agent whose events it writes (its gate children `qa_gate` A08, `rev_gate` A09,
+`sec_gate` A10, `rel_plan` A12 inherit its environment). `rest_post` and `mcp_call` take a keyword-only `surface`; when it
+is given, the token is `SUBSTRATE_TOKEN_<SURFACE, '-'→'_', upper>` if that is set and non-blank, else `SUBSTRATE_TOKEN`.
+Without `surface` it is always `SUBSTRATE_TOKEN`. The tee passes the event's `surface`; `graph_bind` (bind and forward
+lookup) and `graph_register` pass `swarm-a01-orch`. No token is ever logged, printed or returned.
 
 ## Identity
 
@@ -106,29 +124,46 @@ correlation first). It then registers the node set: `graph_register {graph_id, r
 exit record are tee'd. Nothing time-varying enters the brief text or `notes_json`, so re-running the same plan still hits the
 reuse path (and does not bind or register again).
 
-**Cache.** The adopted binding is stored in `<swarm dir>/substrate-tee.db` (`bindings(correlation_id PK, graph_id)`), so later
-scripts (separate processes) tee without asking. On a cache miss the tee does a forward lookup
+**Cache.** The adopted binding is stored in `<swarm dir>/substrate-tee.db`, table
+`bindings_by_server(substrate_url, correlation_id, graph_id, created)`, primary key `(substrate_url, correlation_id)`, keyed
+by the normalised `SUBSTRATE_URL` (trimmed, no trailing `/`): only rows for the current server are read or written, so
+pointing the swarm at another server never reuses the old server's Graph ID; it asks the new one. The pre-existing
+`bindings` table (not keyed by server) is left in place and no longer read. Later scripts (separate processes) tee without
+asking. On a cache miss the tee does a forward lookup
 `graph_bind {correlation_id}`; `existing` is cached, `unbound` or no answer means the record is skipped (no event, and no
 Graph ID is ever invented by the tee). Nothing is cached when substrate did not answer a bind. A skipped correlation is
 remembered in process memory for 60 s, so a burst of records for one unbound run costs one forward lookup instead of one per
 record; that negative result is never written to sqlite, and a successful lookup or `bind_graph` clears it.
 
+## Dry runs
+
+A `--dry-run` invocation never tees. `runlog.emit` takes a keyword-only `tee` (default `True`); `Ctx.emit` passes
+`tee=not ctx.dry_run`, and the exit record `AgentScript.main()` writes goes through `Ctx.emit`. So a dry run with an
+explicit (`--correlation-id`) or inherited (`SWARM_CORRELATION_ID`) bound correlation still writes its local JSONL records
+but makes no substrate request at all (no lookup, no event).
+
 ## Dedupe
 
-Same sqlite file, table `seen(surface, msg_id, first_seen)`, primary key `(surface, msg_id)`, 24 h window pruned on every
-write. The tee claims the key with an atomic `INSERT OR IGNORE` before sending, so a republished record (or two processes
-racing it) produces exactly one request. If substrate does not answer 2xx the claim is released so a later republish can try
-again.
+Same sqlite file, table `seen(surface, msg_id, first_seen, state)`, primary key `(surface, msg_id)`, indexed on `first_seen`,
+24 h window. A row is `pending` (claimed, request in flight) or `sent` (substrate answered 2xx). Before sending, the tee
+claims the key in one transaction: an atomic `INSERT OR IGNORE` of a `pending` row, else an `UPDATE` that re-claims (new
+timestamp, `pending`) a `pending` row older than 60 s (its sender was killed between claim and send) or a row past the
+window. A `sent` row inside the window or a `pending` row younger than 60 s is not re-claimable, so a republished record (or
+two processes racing it) produces exactly one request. A 2xx marks the row `sent`; anything else deletes the `pending` row so
+a later republish can try again. A database from before this change gains the `state` column with default `sent`. Expired
+rows are pruned at most once per 60 s per process, not on every event.
 
 ## Fail-open guarantees
 
 - No `SUBSTRATE_URL`, `SUBSTRATE_DISABLED=1`, or a non-http(s) URL: no request, no sqlite file; behaviour and output are
   unchanged (the JSONL record only gains `msg_id`).
-- Timeout (1.5 s), connection error, non-2xx, malformed reply, `isError`, an unmapped type, an unattributable record, an
+- Timeout (1.5 s per socket operation, 2 s for the whole request), connection error, non-2xx, malformed or oversized reply,
+  `isError`, an unmapped type, an unattributable record, an
   unbound correlation: the tee sends nothing more and returns. `rest_post`, `mcp_call`, `tee` and `runlog`'s call to it
   never raise; `orch_plan`'s bind/register block is wrapped as well, so the plan, its output fields and the exit code are
   identical with substrate unreachable.
-- Tokens are never logged, printed or returned.
+- Tokens are never logged, printed or returned, and never follow a redirect.
+- `--dry-run` never sends anything to substrate.
 
 ## Not in S1
 
