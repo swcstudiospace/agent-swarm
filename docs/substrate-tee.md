@@ -26,14 +26,15 @@ urllib opener per call: `ProxyHandler()` (so `HTTP_PROXY` / `HTTPS_PROXY` / `NO_
 as set at that moment), a redirect handler that refuses every redirect, and HTTP/HTTPS handlers whose connections register
 their socket with the request as soon as TCP is up (again before the TLS handshake). The exchange runs on a daemon worker
 thread, one per request; the socket timeout is 1.5 s (`TIMEOUT_S`) per socket operation. The caller waits at most
-`TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s) from entry, over DNS, connect, headers and body alike. At that deadline it
+`TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s) from entry, over slot acquisition, DNS, connect, headers and body alike. At that deadline it
 marks the request dead and shuts the registered socket down (`SHUT_RDWR`), which ends a blocked connect, header read or
 body read in the worker at once; a connect that completes later is shut down and closed on the spot. Only a worker stuck in
-DNS (no socket yet) can outlive its deadline, and at most 4 workers (`MAX_IN_FLIGHT`) exist at once: with none free, a
-request fails immediately without starting a thread. The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is
-rejected. A deadline hit, socket error, no free worker or oversized reply counts as a network failure, whatever the status
-(a non-2xx whose body cannot be read in time or is oversized included): the call returns
-None and all substrate calls of that process pause for 30 s, so a dead host costs one timeout, not one per emitted record.
+DNS (no socket yet) can outlive its deadline, and at most 4 workers (`MAX_IN_FLIGHT`) exist at once. With none free, a
+request waits for a slot within the same deadline. If that wait expires, it raises `RequestBusy` without starting a
+worker or outage back-off: `mcp_call_outcome` returns `busy`, optional tee calls return `None`, and lease dispatch defers.
+The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is rejected. A deadline after a worker starts, socket error
+or oversized reply counts as a network failure, whatever the status (including an unreadable non-2xx body): the call
+returns `None` and all substrate calls of that process pause for 30 s, so a dead host costs one timeout, not one per record.
 
 **Redirects.** Redirects are never followed: a 3xx is just a non-2xx answer, so the bearer is never re-sent anywhere. The
 bearer is also added with `Request.add_unredirected_header`. Through an HTTP proxy the bearer travels only as the
@@ -169,9 +170,11 @@ pointing the swarm at another server never reuses the old server's Graph ID; it 
 `bindings` table (not keyed by server) is left in place and no longer read. Later scripts (separate processes) tee without
 asking. On a cache miss the tee does a forward lookup
 `graph_bind {correlation_id}`; `existing` is cached, `unbound` or no answer means the record is skipped (no event, and no
-Graph ID is ever invented by the tee). Nothing is cached when substrate did not answer a bind. A skipped correlation is
-remembered in process memory for 60 s, so a burst of records for one unbound run costs one forward lookup instead of one per
-record; that negative result is never written to sqlite, and a successful lookup or `bind_graph` clears it.
+Graph ID is ever invented by the tee). Nothing is cached when substrate did not answer a bind. An unbound/unanswered
+lookup is remembered in process memory for 60 s, so a burst of records for one unbound run costs one forward lookup;
+that negative result is never written to sqlite, and a successful lookup or `bind_graph` clears it. Explicit
+authentication/identity refusals skip the optional tee without entering this negative cache. Lease consumers bypass
+negative entries and report such refusals as `lease.refused`, never as permission to dispatch unleased.
 
 ## Dry runs
 

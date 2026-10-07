@@ -22,7 +22,6 @@ Every runtime the install wires must be able to execute a node, and a node is le
 """
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import sys
@@ -58,6 +57,8 @@ class FilePlan:
     status: str  # create | append | current
     before: str | None
     after: str
+    state: workspace.FileState | None = field(default=None, repr=False)
+    backup_state: workspace.FileState | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -69,6 +70,7 @@ class EnvPlan:
     status: str  # write | current | keep | missing | invalid
     token: str | None = field(default=None, repr=False)  # never printed
     problem: str = ""
+    before: workspace.FileState | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -162,10 +164,12 @@ def plan_mcp(ws: Path, runtimes: list[str]) -> list[FilePlan]:
         unsafe = unsafe_destinations(ws, [path])
         if unsafe:
             raise SubstrateInstallError("; ".join(unsafe) + "; the installer never writes through a symlink")
-        before = path.read_text(encoding="utf-8") if path.exists() else None
+        state = workspace.file_state(path)
+        before = state.data.decode("utf-8") if state is not None else None
         fmt = SPEC["runtimes"][runtime]["format"]
         status, after = (_plan_json if fmt == "json" else _plan_toml)(path, before)
-        by_path[rel] = FilePlan(path, rel, fmt, [runtime], status, before, after)
+        backup = workspace.file_state(path.with_name(path.name + ".substrate-backup")) if status == "append" else None
+        by_path[rel] = FilePlan(path, rel, fmt, [runtime], status, before, after, state, backup)
     return list(by_path.values())
 
 
@@ -207,8 +211,9 @@ def plan_env(ws: Path, env: Mapping[str, str]) -> list[EnvPlan]:
         var = workspace.server_var(surface)
         path = workspace.env_file(ws, agent["slug"], env)
         given = (env.get(var) or "").strip()
+        before = workspace.file_state(path, private=True)
         try:
-            held: str | None = workspace.read_token(path)
+            held: str | None = workspace.token_value(path, before)
             problem = ""
         except (workspace.EnvFileProblem, OSError) as e:
             held, problem = None, str(e)
@@ -216,7 +221,8 @@ def plan_env(ws: Path, env: Mapping[str, str]) -> list[EnvPlan]:
             plans.append(EnvPlan(agent["id"], surface, var, path, "invalid",
                                  problem=f"{var} holds whitespace or control characters"))
         elif given:
-            plans.append(EnvPlan(agent["id"], surface, var, path, "current" if held == given else "write", given))
+            plans.append(EnvPlan(agent["id"], surface, var, path, "current" if held == given else "write", given,
+                                 before=before))
         elif held is not None:
             plans.append(EnvPlan(agent["id"], surface, var, path, "keep"))
         else:
@@ -268,10 +274,15 @@ def plan(ws: Path, runtimes: list[str], env: Mapping[str, str]) -> Plan:
             "for swarm_run.py alike, at a directory outside every git checkout and outside the workspace, and re-run. "
             "Nothing was written.")
     try:
+        workspace.check_env_directory(directory)
+    except (workspace.EnvFileProblem, OSError) as exc:
+        raise SubstrateInstallError(f"error: {exc}. Nothing was written.") from None
+    try:
         files = plan_mcp(ws, runtimes)
-    except SubstrateInstallError as e:
-        raise SubstrateInstallError(f"error: cannot add the {SERVER} MCP entry in {ws}: {e}. Nothing was written.") from None
-    return Plan(files, plan_env(ws, env), directory)
+        envs = plan_env(ws, env)
+    except (SubstrateInstallError, workspace.EnvFileProblem, OSError, UnicodeError) as exc:
+        raise SubstrateInstallError(f"error: cannot install {SERVER} in {ws}: {exc}. Nothing was written.") from None
+    return Plan(files, envs, directory)
 
 
 def preflight(ws: Path, runtimes: list[str], env: Mapping[str, str] | None = None, *, tokens: bool = True) -> str | None:
@@ -288,10 +299,9 @@ def preflight(ws: Path, runtimes: list[str], env: Mapping[str, str] | None = Non
 
 
 def _write_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.substrate-tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    with workspace.FileTransaction() as transaction:
+        transaction.stage(path, text.encode("utf-8"))
+        transaction.commit()
 
 
 def install_substrate(ws: Path, runtimes: list[str], dry_run: bool, out: TextIO = sys.stdout,
@@ -327,19 +337,25 @@ def install_substrate(ws: Path, runtimes: list[str], dry_run: bool, out: TextIO 
     if short:
         say(operator_instructions(p.envs, p.env_dir))
         return 2
-    # The env files first: they live outside the workspace, so a failure here leaves the workspace untouched.
-    written = 0
-    for x in p.envs:
-        if x.status != "write":
-            continue
-        try:
-            workspace.write_token(x.path, x.token or "")
-        except OSError as exc:
-            say(f"error: cannot write {x.path}: {exc.strerror or exc}")
-            unwritten = [dataclasses.replace(y, status="missing") for y in p.envs[p.envs.index(x):] if y.status == "write"]
-            say(operator_instructions(unwritten, p.env_dir))
-            return 2
-        written += 1
+    # All new contents and rollback copies are staged before publishing any config, backup or credential.
+    written = sum(x.status == "write" for x in p.envs)
+    try:
+        with workspace.FileTransaction() as transaction:
+            for x in p.envs:
+                if x.status == "write":
+                    transaction.stage(x.path, f"{workspace.TOKEN}={x.token}\n".encode("utf-8"),
+                                      private=True, expected=x.before, check_expected=True)
+            for f in p.files:
+                if f.status == "current":
+                    continue
+                if f.before is not None:
+                    transaction.stage(f.path.with_name(f.path.name + ".substrate-backup"),
+                                      f.before.encode("utf-8"), expected=f.backup_state, check_expected=True)
+                transaction.stage(f.path, f.after.encode("utf-8"), expected=f.state, check_expected=True)
+            transaction.commit()
+    except (OSError, workspace.EnvFileProblem) as exc:
+        say(f"error: substrate install failed: {exc}. Re-run after correcting the problem.")
+        return 2
     say(f"substrate: {written} agent env file(s) written in {p.env_dir}, {len(p.envs) - written} unchanged "
         "(0600, one SUBSTRATE_TOKEN each)")
     for f in p.files:
@@ -347,14 +363,6 @@ def install_substrate(ws: Path, runtimes: list[str], dry_run: bool, out: TextIO 
         if f.status == "current":
             say(f"substrate: {f.path} already has {SERVER} ({who})")
             continue
-        now = f.path.read_text(encoding="utf-8") if f.path.exists() else None
-        if now != f.before:
-            say(f"error: {f.path} changed while the install ran; re-run")
-            return 2
-        backup = ""
-        if f.before is not None:
-            _write_atomic(f.path.with_name(f.path.name + ".substrate-backup"), f.before)
-            backup = f"; backup at {f.path}.substrate-backup"
-        _write_atomic(f.path, f.after)
+        backup = f"; backup at {f.path}.substrate-backup" if f.before is not None else ""
         say(f"substrate: {'created' if f.status == 'create' else 'appended ' + SERVER + ' to'} {f.path} ({who}){backup}")
     return 0

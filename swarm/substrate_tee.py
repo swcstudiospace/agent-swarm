@@ -233,24 +233,35 @@ _UNBOUND_TTL_S = 60.0
 _unbound: dict[str, float] = {}  # correlation_id -> monotonic expiry; in-process only, never persisted
 
 
+class GraphLookupRefused(RuntimeError):
+    """The substrate explicitly refused a graph lookup; a lease must not bypass that refusal."""
+
+
 def lookup_graph_id(correlation_id: str, *, root: str | Path | None = None, env: Mapping[str, str] | None = None,
-                    defer_busy: bool = False) -> str | None:
+                    defer_busy: bool = False, require_auth: bool = False) -> str | None:
     """Graph ID of a correlation: local cache, else a forward `graph_bind` lookup (cached on success), else None.
 
     A correlation substrate calls `unbound` (or does not answer for) is remembered in memory for 60 s, so a burst of
     records for it costs one network call. That negative result is never written to sqlite; `bind_graph` clears it.
     Local contention is never cached as unbound; lease callers use `defer_busy` to raise RequestBusy and defer dispatch.
+    `require_auth` raises GraphLookupRefused on authentication/identity refusals and bypasses negative cache entries:
+    an earlier optional lookup's unbound/outage result must never hide a current refusal from a lease consumer.
     """
     hit = cached_graph_id(correlation_id, root, env=env)
     if hit:
         return hit
     now = time.monotonic()
-    if _unbound.get(correlation_id, 0.0) > now:
+    if not require_auth and _unbound.get(correlation_id, 0.0) > now:
         return None
     outcome = substrate_client.mcp_call_outcome("graph_bind", {"correlation_id": correlation_id}, env, surface=ORCH_SURFACE)
     if outcome.status == "busy":
         if defer_busy:
             raise substrate_client.RequestBusy("substrate graph lookup slots busy")
+        return None
+    if outcome.status == "refused":
+        _unbound.pop(correlation_id, None)
+        if require_auth:
+            raise GraphLookupRefused(outcome.detail or "substrate graph lookup refused")
         return None
     got = outcome.value if outcome.status == "ok" and isinstance(outcome.value, dict) else None
     gid = got.get("graph_id") if got else None

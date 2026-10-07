@@ -53,7 +53,7 @@ without a token of its own sends nothing.
 | Swarm event | Substrate call | Notes |
 |---|---|---|
 | Run start (`run`, before the first reconcile) | `graph_claim` for every IN_REVIEW / APPROVED task of the run (`LeaseBridge.resume`) | Work an earlier runner process left in review (`--once`, `--max-rounds`, a restart) is held again, so the keeper beats it through the gates, DONE completes it and a rework releases it. The same replica's claim on its own live lease is `renewed` and keeps the id. |
-| Task picked for a round (`select_batch`), before `CLAIMED` | `graph_claim {graph_id, node_id: task_id, session_id, ttl_seconds, surface}` | `lease_s` in `task.assign` is the granted TTL: `decision.ttl_seconds`, else the requested TTL. |
+| Task picked for a round (`select_batch`), before `CLAIMED` | `graph_claim {graph_id, node_id: task_id, session_id, ttl_seconds, surface}` | `lease_s` in `task.assign` is the granted TTL: the reply's top-level `ttl_seconds`, else the requested TTL. |
 | Session running, gate script running, and the task waiting in review | `graph_heartbeat` every TTL/3 | One keeper thread per run beats every held lease, not only the leases of running sessions. |
 | `DONE` (`reconcile`, after APPROVED) | `graph_complete`, fenced on the held `lease_id` | A process with no lease in memory claims first as the producer (`renewed` if its lease is live), then completes. |
 | `CHANGES_REQUESTED` → rework (`reconcile`) | `graph_release`, then `graph_claim` | The trail reads `released` then `claim`, so the rework loop is visible. The rework dispatch reuses the new lease. |
@@ -75,7 +75,7 @@ which upserts the node and leaves edges alone) and claims once more.
 |---|---|---|---|
 | `held` | `claimed: true` with a `lease_id` | yes, leased | `notes.lease` `held` |
 | `denied` | another session holds a live lease | **no** | `notes.lease` `denied` with the holder and expiry; run-log `lease.denied` (`note`) |
-| `refused` | the server said no to this caller: HTTP 401/403, or an `isError` reply `{"error": …}` (wrong token for the surface, malformed session) | **no** | `notes.lease` `refused`; `lease.refused` (`warning`) |
+| `refused` | the server said no to graph lookup, dynamic node registration or claim: HTTP 401/403, or an `isError` reply `{"error": …}` (wrong token for the surface, malformed session) | **no** | `notes.lease` `refused`; `lease.refused` (`warning`) |
 | `busy` | the call deadline expires waiting for a local request slot (including an uncached Graph ID lookup) | **no** | task and lease mirror unchanged; runner reports `waiting on leases` |
 | `unleased` | no answer (network, deadline, back-off), any other server error (no Postgres, a DB outage), or no Graph ID bound to the run | yes, fail-open | `notes.lease` `unleased` with the reason; `lease.unleased` (`warning`) |
 | `off` | integration off | yes, as before | nothing |
@@ -84,6 +84,9 @@ A task whose claim is denied, refused or busy stays where it was (PLANNED/RETRY,
 parallel slot. Its attempt counter does not move. When a round has candidates but every one of them is waiting on a
 lease, the run ends with `waiting on leases: […]` in its log instead of spinning through `--max-rounds`. The next round
 or the next run asks again.
+
+Graph lookup refusals are never cached as unbound or as an outage. Lease lookups bypass the tee's negative cache, so a
+previous optional lookup cannot turn a current authorization refusal into an unleased dispatch.
 
 `substrate_client.mcp_call_outcome` makes the "no" versus "no answer" distinction. `mcp_call` / `mcp_call_json`
 still fold everything into `None`, unchanged for their callers.
@@ -104,6 +107,9 @@ renewed 10.
 Claims, beats, settlements and reworks of one task run one at a time (a per-task lock in the bridge). A worker that
 settles a task while the keeper's re-claim of it is on the wire waits for that claim, then releases the lease it brought
 back. A re-claim that can no longer be installed is released at once, so no grant is left held by nobody.
+Escalation transitions, handoff attempts and settlement share that same reentrant task lock, so the keeper cannot
+observe ESCALATED and release the node while the packet is still being written. FAILED normally releases before the
+later max-attempt escalation; that path does not invent or retain a lease just to send a packet.
 
 The keeper watches the whole dispatch, not only the agent session: `execute_one` attaches a `DispatchWatch` before the
 session spawns and detaches it once the result is written. While a dispatch is watched, a refused heartbeat applies this
@@ -117,6 +123,7 @@ table (`substrate_lease.SESSION_REFUSALS`):
 | `lost` (another session holds it) | stop the dispatch | FAILED `E-TIMEOUT: lease lost: …` |
 | `unheld` (released or force-released under it) | stop the dispatch | FAILED `E-TIMEOUT: lease unheld: …` |
 | `not-holder` (the runner's token is not the holder's surface) | stop the dispatch | FAILED `E-POLICY: lease not-holder: …` |
+| `refused` (HTTP 401/403 or an MCP authentication/identity refusal) | stop the dispatch; never treat it as an outage | FAILED `E-POLICY: lease refused: the substrate no longer authorizes this caller` |
 | any other `ok: false` reason | stop the dispatch | FAILED `E-TIMEOUT: lease refused (<reason>)` |
 | no answer, or a server error | keep working; retry sooner | unchanged |
 

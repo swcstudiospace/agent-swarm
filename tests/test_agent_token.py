@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shlex
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -104,6 +105,42 @@ def test_grok_clears_folder_trust_for_the_workspace_it_runs_in(sr, ws, tmp_path)
     assert "--trust" in argv and argv[argv.index("--cwd") + 1] == str(ws) and cwd == ws
 
 
+@pytest.mark.parametrize("config", [
+    'model = "grok-4"\n',
+    '[mcp_servers.other]\nurl = "https://example.invalid/mcp"\n',
+    '[mcp_servers.substrate]\nurl = "https://example.invalid/mcp"\n',
+    workspace.SPEC["toml"]["block"].replace("${SUBSTRATE_TOKEN}", "operator-token"),
+    workspace.SPEC["toml"]["block"].replace("${SUBSTRATE_URL}", "https://example.invalid"),
+    '[mcp_servers.substrate\n',
+    'mcp_servers = "not a table"\n',
+])
+def test_grok_does_not_auto_trust_unrelated_malformed_or_nonprojected_configs(sr, ws, tmp_path, config):
+    path = workspace.mcp_config(ws, "grok")
+    path.parent.mkdir()
+    path.write_text(config)
+    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
+    assert "--trust" not in argv
+
+
+def test_grok_trust_accepts_an_exact_projection_among_other_settings(sr, ws, tmp_path):
+    path = workspace.mcp_config(ws, "grok")
+    path.parent.mkdir()
+    path.write_text('model = "grok-4"\n' + workspace.SPEC["toml"]["block"] +
+                    '\n[mcp_servers.other]\nurl = "https://example.invalid/mcp"\n')
+    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
+    assert "--trust" in argv
+
+
+def test_projected_config_through_a_symlink_does_not_unlock_trust(sr, ws, tmp_path):
+    other = tmp_path / "outside-config.toml"
+    other.write_text(workspace.SPEC["toml"]["block"])
+    path = workspace.mcp_config(ws, "grok")
+    path.parent.mkdir()
+    path.symlink_to(other)
+    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
+    assert "--trust" not in argv
+
+
 def test_omp_runs_where_the_entry_is_and_its_tools_list_names_only_builtins(sr, ws, tmp_path):
     # omp reads <cwd>/.mcp.json; MCP tools are not filtered by --tools (they mount as xd:// devices), so nothing in
     # the argv may restrict them either
@@ -164,3 +201,56 @@ def test_dry_run_names_what_is_stripped_and_where_the_token_comes_from_never_its
     assert set(RUNNER_TOKENS) <= unset
     assert f"dry-run T-one [A05] SUBSTRATE_TOKEN: from {workspace.env_file(ws, 'a05-backend')}" in r.stderr.splitlines()
     assert not any(v in r.stdout + r.stderr for v in (A05_TOKEN, *RUNNER_TOKENS.values()))
+
+
+def test_valid_0600_token_in_nonprivate_directory_refuses_without_environment_fallback(sr, ws, tmp_path):
+    path = workspace.env_file(ws, A05["slug"])
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    path.parent.chmod(0o777)
+    with pytest.raises(workspace.EnvFileProblem, match="private directory"):
+        workspace.read_token(path)
+    token, _, problem = workspace.credential("A05", ws)
+    assert token is None and "0700" in problem
+    _, env, _ = sr.headless_command("omp", A05, ws, tmp_path / ".swarm", _args())
+    assert _tokens(env) == {}
+    assert "SWARM_SUBSTRATE_AGENT" not in env
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o777
+
+
+def test_token_staging_is_private_before_any_byte_and_replaces_atomically(tmp_path, monkeypatch):
+    path = tmp_path / "private" / "a05-backend.env"
+    path.parent.mkdir(mode=0o700)
+    path.write_text("SUBSTRATE_TOKEN=old-token\n")
+    path.chmod(0o600)
+    fdopen = os.fdopen
+    observed_modes = []
+
+    def inspect_before_write(fd, mode, *args, **kwargs):
+        if mode == "wb":
+            observed_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            assert path.read_text() == "SUBSTRATE_TOKEN=old-token\n"
+        return fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(workspace.os, "fdopen", inspect_before_write)
+    workspace.write_token(path, A05_TOKEN)
+    assert observed_modes and set(observed_modes) == {0o600}
+    assert path.read_text() == f"SUBSTRATE_TOKEN={A05_TOKEN}\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("config", [
+    "{}",
+    '{"mcpServers": {"other": {"type": "http", "url": "https://example.invalid/mcp"}}}',
+    '{"mcpServers": {"substrate": {"type": "http", "url": "https://example.invalid/mcp"}}}',
+    json.dumps({"mcpServers": {workspace.SERVER: workspace.SPEC["json"]}}).replace("${SUBSTRATE_TOKEN}", "operator-token"),
+    '{"mcpServers": "not an object"}',
+    "{",
+    "[]",
+])
+def test_claude_does_not_unlock_substrate_flags_for_unrelated_or_invalid_configs(sr, ws, tmp_path, config):
+    workspace.mcp_config(ws, "claude").write_text(config)
+    argv, _, _ = sr.headless_command("claude", A05, ws, tmp_path / ".swarm", _args())
+    assert "--mcp-config" not in argv
+    assert "--strict-mcp-config" not in argv
+    assert workspace.CLAUDE_TOOLS not in argv

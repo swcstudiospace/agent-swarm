@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ from swarm import substrate_client, substrate_handoff as hand_mod, substrate_lea
 from swarm import workspace as ws_mod
 from swarm.manifest import load_manifest
 from swarm.results import reconcile
-from swarm.taskstore import TaskStore
+from swarm.taskstore import MAX_REWORK_LOOPS, TaskStore
 from swarm.verdicts import record_gate_verdicts
 
 from test_substrate_lease import CORR, GID, FakeSubstrate, _args, _iso, _load, _refusal, _store
@@ -344,6 +345,119 @@ def test_the_rework_cap_hands_the_lease_over_with_the_packet(tmp_path, fake):
     assert claim.status == "held"
 
 
+@pytest.mark.parametrize("boundary_kind", ["rework-cap", "max-attempts"])
+@pytest.mark.parametrize("delivery", ["stored", "not-stored", "refused", "unreachable"])
+def test_escalation_keeps_the_lease_until_the_packet_attempt_finishes(
+        tmp_path, fake, runner, monkeypatch, boundary_kind, delivery):
+    """Pause after the transition but before handoff storage; a real keeper must wait on the transition lock."""
+    fake.register("T-be", "T-qa")
+    store, events = _store(tmp_path), []
+    task = _task(store, "T-be", "A05", gates=["quality"], max_attempts=1)
+    leases, handoffs = _bridges(store, events)
+    assert leases.acquire(task, "A05").status == "held"
+    lease_id = fake.node("T-be")["lease_id"]
+    _walk(store, "T-be", "CLAIMED", "IN_PROGRESS")
+    if boundary_kind == "rework-cap":
+        store.transition("T-be", "IN_REVIEW")
+        store.update("T-be", rework_loops=MAX_REWORK_LOOPS)
+        _task(store, "T-qa", "A08", gate="quality", gate_for=["T-be"])
+        _walk(store, "T-qa", "CLAIMED", "IN_PROGRESS")
+        _fail_quality(store, "T-qa", "T-be", "last failure")
+    else:
+        store.transition("T-be", "FAILED", reason="last failure")
+    fake.store_handoffs = delivery != "not-stored"
+    if delivery == "refused":
+        fake.forced["coord_handoff"] = _refusal("handoffs are closed")
+    fake.down = delivery == "unreachable"
+    paused, proceed, keeper_observed = threading.Event(), threading.Event(), threading.Event()
+    task_lock = leases._task_lock("T-be")
+
+    class ObservedLock:
+        def __enter__(self):
+            if not task_lock.acquire(blocking=False):
+                if threading.current_thread().name.startswith("swarm-lease-beat"):
+                    keeper_observed.set()  # keeper is blocked, not merely scheduled
+                task_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            task_lock.release()
+
+    monkeypatch.setitem(leases._task_locks, "T-be", ObservedLock())
+    beat, escalate = leases.beat, handoffs.escalated
+
+    def observed_beat(tid):
+        try:
+            return beat(tid)
+        finally:
+            keeper_observed.set()  # old unlocked code reaches here after prematurely releasing
+
+    def paused_escalation(*args, **kwargs):
+        paused.set()
+        assert proceed.wait(5)
+        return escalate(*args, **kwargs)
+
+    monkeypatch.setattr(leases, "beat", observed_beat)
+    monkeypatch.setattr(handoffs, "escalated", paused_escalation)
+    errors = []
+
+    def transition():
+        local = TaskStore(store.path)
+        try:
+            if boundary_kind == "rework-cap":
+                reconcile(local, CORR, leases.emit, leases=leases, handoffs=handoffs)
+            else:
+                runner.dispatchable(local, CORR, leases.emit, handoffs=handoffs)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            local.conn.close()
+
+    worker = threading.Thread(target=transition)
+    worker.start()
+    try:
+        assert paused.wait(5)
+        assert store.get("T-be")["state"] == "ESCALATED"
+        held = leases.held("T-be")
+        assert held is not None
+        held.due = 0
+        leases.start()
+        assert keeper_observed.wait(5)
+        assert fake.handoffs == [] and fake.at("graph_release") == []
+        assert fake.node("T-be")["lease_id"] == lease_id
+    finally:
+        proceed.set()
+        worker.join(5)
+        leases.close()
+    assert not worker.is_alive() and errors == []
+    assert leases.held("T-be") is None
+    if delivery == "stored":
+        assert fake.trail_of("T-be")[-2:] == [("handoff", "handoff"), ("note", "released")]
+        assert fake.at("graph_release") == []
+        assert _packets(fake)[0]["lease_handover"] is True
+        assert store.get("T-be")["notes_json"]["lease"]["action"] == "handover"
+        assert fake.node("T-be")["lease_id"] is None
+    else:
+        assert fake.handoffs == []
+        assert ("handoff.refused" if delivery == "refused" else "handoff.unsent") in _types(events)
+        if delivery == "unreachable":
+            assert fake.node("T-be")["lease_id"] == lease_id  # remote outage: the lease must lapse, not pretend released
+            assert store.get("T-be")["notes_json"]["lease"]["state"] == "unsettled"
+            assert "lease.unsettled" in _types(events)
+            fake.down = False
+            substrate_client.reset()
+        else:
+            assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [lease_id]
+            assert store.get("T-be")["notes_json"]["lease"]["state"] == "released"
+            assert fake.node("T-be")["lease_id"] is None
+        fake.store_handoffs = True
+        if delivery == "refused":
+            assert handoffs.flush() == 0 and fake.handoffs == []  # deliberate refusals are not queued
+        else:
+            assert handoffs.flush() == 1 and handoffs.flush() == 0
+            assert _packets(fake)[0]["lease_handover"] is False
+
+
 def test_a_task_out_of_attempts_is_handed_to_a01(tmp_path, fake, runner):
     fake.register("T-be")
     store, events = _store(tmp_path), []
@@ -446,7 +560,9 @@ def test_with_no_handoff_key_packets_are_unsigned_say_so_and_the_run_completes(t
 
 
 # --- idempotency -------------------------------------------------------------------------------------------------------
-def test_a_rerun_writes_no_second_packet_for_one_boundary(tmp_path, fake):
+@pytest.mark.parametrize("signing_key", [KEY, None, "no-keys-configured"])
+def test_a_rerun_writes_no_second_packet_for_one_boundary(tmp_path, fake, signing_key):
+    fake.key = KEY if signing_key == "no-keys-configured" else signing_key
     fake.register("T-arch", "T-be")
     store, events = _store(tmp_path), []
     _task(store, "T-arch", "A03")
@@ -457,10 +573,112 @@ def test_a_rerun_writes_no_second_packet_for_one_boundary(tmp_path, fake):
     _, first = _bridges(store, events)
     assert first.dispatched(task, "A05") == ["sent"]
     assert first.dispatched(task, "A05") == ["duplicate"]  # a rework or retry of the task
+    if signing_key == "no-keys-configured":
+        fake.key = None
     _, restarted = _bridges(store, events)  # a new runner process: the ledger, not memory, says it was written
     assert restarted.dispatched(task, "A05") == ["duplicate"]
     ours = [p for p in _packets(fake) if p["from"]["surface"] == "swarm-a03-arch"]
-    assert len(ours) == 1 and events == []
+    assert len(ours) == 1
+    assert _types(events) == ([] if signing_key else ["handoff.unsigned"])
+
+
+@pytest.mark.parametrize("corruption", [
+    "bad-signature", "missing-verdict", "malformed-verdict", "malformed-reason",
+    "malformed-sender", "unhashable-sender", "missing-node", "wrong-graph",
+    "missing-goal", "malformed-lists", "wrong-node",
+])
+def test_rejected_or_malformed_ledger_rows_cannot_suppress_a_real_boundary(tmp_path, fake, corruption):
+    fake.register("T-arch", "T-be")
+    store, events = _store(tmp_path), []
+    _task(store, "T-arch", "A03")
+    task = _task(store, "T-be", "A05", deps=["T-arch"])
+    _, first = _bridges(store, events)
+    assert first.dispatched(task, "A05") == ["sent"]
+    if corruption == "bad-signature":
+        fake.handoffs[0]["packet"]["goal"] = "tampered"
+    else:
+        entry = json.loads(json.dumps(fake.tool_coord_handoff_list({"graph_id": GID}, "swarm-a01-orch")[0]))
+        if corruption == "missing-verdict":
+            entry.pop("verdict")
+        elif corruption == "malformed-verdict":
+            entry["verdict"] = {"reason": "unsigned"}
+        elif corruption == "malformed-reason":
+            entry["verdict"] = {"ok": False, "reason": ["unsigned"]}
+        elif corruption == "malformed-sender":
+            entry["packet"]["from"] = "swarm-a03-arch"
+        elif corruption == "unhashable-sender":
+            entry["packet"]["from"]["surface"] = ["swarm-a03-arch"]
+        elif corruption == "missing-node":
+            entry["packet"].pop("node_id")
+        elif corruption == "missing-goal":
+            entry["packet"].pop("goal")
+        elif corruption == "malformed-lists":
+            entry["packet"]["files"] = "not a file list"
+        elif corruption == "wrong-node":
+            entry["packet"]["node_id"] = "T-other"
+        else:
+            entry["packet"]["graph_id"] = "ut-other-12345678"
+        fake.forced["coord_handoff_list"] = [entry]
+    _, restarted = _bridges(store, events)
+    assert restarted.dispatched(task, "A05") == ["sent"]
+    assert restarted.dispatched(task, "A05") == ["duplicate"]
+    packet = _packets(fake)[-1]
+    assert packet["goal"].startswith("T-be work")
+    assert packet["from"]["surface"] == "swarm-a03-arch"
+    assert hand_mod.boundary_key(packet) == "dispatch@T-be/dep:T-arch"
+    assert len(fake.at("coord_handoff")) == 2
+
+
+@pytest.mark.parametrize("signing_key", [KEY, None])
+def test_large_multibyte_packets_preserve_distinct_boundary_keys_after_restart(tmp_path, fake, monkeypatch, signing_key):
+    fake.key = signing_key
+    monkeypatch.setenv("SWARM_REPLICA", "r" * 64)
+    node = "節" * 300
+    fake.register(node)
+    store, events = _store(tmp_path), []
+    _, first = _bridges(store, events)
+    original = fake.tool_coord_handoff
+
+    def server_notes_cap(args, caller):
+        # The real server caps notes at 1200 UTF-16 units before signing; an oversized key used to be cut in half.
+        notes = args["notes"].encode("utf-16-le")[:2400].decode("utf-16-le", errors="ignore")
+        return original({**args, "notes": notes}, caller)
+
+    monkeypatch.setattr(fake, "tool_coord_handoff", server_notes_cap)
+    boundaries = [
+        hand_mod.boundary(round_=f"dispatch@{node}", part="dep:" + "界" * 2000 + suffix,
+                          sender="A03", receiver="A05", node_id=node, goal="目標" * 250,
+                          files=[f"路{i}/" + "界" * 280 for i in range(50)],
+                          dod=[f"合格{i} " + "試" * 280 for i in range(30)],
+                          blockers=[f"問題{i} " + "難" * 280 for i in range(20)], body="説明" * 450)
+        for suffix in ("first", "second")
+    ]
+    for boundary in boundaries:
+        assert first.send(boundary) == "sent"
+    packets = _packets(fake)
+    assert [hand_mod.boundary_key(p) for p in packets] == [b.key for b in boundaries]
+    assert boundaries[0].key != boundaries[1].key
+    for packet in packets:
+        assert len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 9000
+        assert len(packet["notes"].encode("utf-16-le")) <= 2400
+        assert "trimmed by the runner" in packet["notes"]
+        assert len(packet["files"]) <= 40 and len(packet["dod"]) <= 24 and len(packet["blockers"]) <= 16
+        assert fake.verdict(packet)["ok"] is bool(signing_key)
+    _, restarted = _bridges(store, events)
+    assert [restarted.send(b) for b in boundaries] == ["duplicate", "duplicate"]
+    assert len(fake.at("coord_handoff")) == 2
+
+
+def test_routing_that_cannot_fit_never_sends_a_packet_with_a_lost_key(tmp_path, fake):
+    store, events = _store(tmp_path), []
+    _, handoffs = _bridges(store, events)
+    packet = hand_mod.boundary(round_="dispatch@large", part="dep:T", sender="A03", receiver="A05",
+                               node_id="界" * 9000, goal="work", files=[], dod=[], blockers=[], body="context")
+    assert handoffs.send(packet) == "refused"
+    assert fake.at("coord_handoff") == []
+    assert _types(events) == ["handoff.refused"]
+    assert "packet budget" in events[0][1]["reason"]
+    assert handoffs.flush() == 0
 
 
 # --- fail-open ---------------------------------------------------------------------------------------------------------

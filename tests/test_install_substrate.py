@@ -4,6 +4,7 @@ copy of the checkout into a fresh git workspace, the way an operator runs it.
 The ADR's two scopes are kept apart: no file the install produces names Greptime as an MCP server, wherever it lands;
 no file under the workspace holds a token value; and the one place a token belongs, each agent's env file, is 0600,
 outside the workspace and every git checkout, and holds exactly that agent's SUBSTRATE_TOKEN."""
+import io
 import json
 import os
 import stat
@@ -18,6 +19,7 @@ from install_helpers import _ENV_KEYS, _snapshot, _write
 from swarm import workspace
 from swarm.manifest import load_manifest
 from swarm.substrate_tee import AGENT_SURFACES
+from scripts import _install_substrate as substrate_install
 
 AGENTS = load_manifest()
 # What real tokens look like to every check below: long enough for the tracked-file scan, distinct per agent.
@@ -229,3 +231,163 @@ def test_no_substrate_installs_the_rest_without_tokens(tree, gws, home):
     assert not (gws / ".mcp.json").exists() and not (gws / ".grok" / "config.toml").exists()
     assert not _env_dir(gws, home).exists()
     assert (gws / ".claude" / "agents" / "a05-backend.md").exists()
+
+
+def test_atomic_config_write_ignores_predictable_and_exclusive_staging_symlink_collisions(tmp_path, monkeypatch):
+    target = tmp_path / ".mcp.json"
+    victim = tmp_path / "victim"
+    victim.write_text("untouched")
+    old_tmp = target.with_name(f".{target.name}.substrate-tmp-{os.getpid()}")
+    old_tmp.symlink_to(victim)
+    collision = tmp_path / ".substrate-collision.tmp"
+    collision.symlink_to(victim)
+    names = iter(("collision", "safe"))
+    monkeypatch.setattr(workspace.secrets, "token_hex", lambda _: next(names))
+
+    substrate_install._write_atomic(target, "replacement")
+
+    assert target.read_text() == "replacement"
+    assert victim.read_text() == "untouched"
+    assert old_tmp.is_symlink() and collision.is_symlink()
+    assert set(tmp_path.iterdir()) == {target, victim, old_tmp, collision}
+
+
+@pytest.mark.parametrize("swapped", ["destination", "ancestor"])
+def test_atomic_config_write_rechecks_links_after_staging(tmp_path, monkeypatch, swapped):
+    directory = tmp_path / "configs"
+    directory.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = directory / "config"
+    victim = outside / "config"
+    victim.write_text("untouched")
+    stage = workspace._stage_file
+
+    def stage_and_swap(*args):
+        result = stage(*args)
+        if swapped == "destination":
+            target.symlink_to(victim)
+        else:
+            directory.rename(tmp_path / "original")
+            directory.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(workspace, "_stage_file", stage_and_swap)
+    with pytest.raises((OSError, workspace.EnvFileProblem)):
+        substrate_install._write_atomic(target, "replacement")
+    assert victim.read_text() == "untouched"
+    assert not list(tmp_path.rglob(".substrate-*.tmp"))
+    if swapped == "destination":
+        assert target.is_symlink()
+    else:
+        assert directory.is_symlink()
+        assert not list((tmp_path / "original").iterdir())
+
+
+@pytest.mark.parametrize("unsafe", ["permissions", "owner", "symlink"])
+@pytest.mark.parametrize("held", [False, True])
+def test_private_directory_refusal_precedes_tokens_preflight_and_dry_run(tmp_path, monkeypatch, unsafe, held):
+    ws = tmp_path / "work"
+    ws.mkdir()
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "config"), **TOKENS}
+    directory = workspace.env_dir(ws, env)
+    if held:
+        for agent in AGENTS:
+            workspace.write_token(directory / f"{agent['slug']}.env", TOKENS[workspace.server_var(AGENT_SURFACES[agent["id"]])])
+    else:
+        directory.mkdir(mode=0o700, parents=True)
+    if unsafe == "permissions":
+        directory.chmod(0o777)
+    elif unsafe == "owner":
+        uid = os.getuid()
+        monkeypatch.setattr(workspace.os, "getuid", lambda: uid + 1)
+    else:
+        original = directory.with_name("original")
+        directory.rename(original)
+        directory.symlink_to(original, target_is_directory=True)
+    before = _snapshot(tmp_path)
+
+    for tokens in (True, False):
+        problem = substrate_install.preflight(ws, ["claude", "grok"], env, tokens=tokens)
+        assert problem and "0700" in problem and "XDG_CONFIG_HOME" in problem
+    for dry_run in (True, False):
+        out = io.StringIO()
+        assert substrate_install.install_substrate(ws, ["claude", "grok"], dry_run, out, env) == 2
+        assert "0700" in out.getvalue()
+        assert not any(token in out.getvalue() for token in TOKENS.values())
+    with pytest.raises((workspace.EnvFileProblem, OSError)):
+        workspace.write_token(directory / "a05-backend.env", "replacement")
+    assert _snapshot(tmp_path) == before
+    if unsafe == "permissions":
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o777
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("fail_at", ["a06-frontend.env", "config.toml"])
+def test_later_publish_failure_rolls_back_tokens_configs_and_backups(tmp_path, monkeypatch, existing, fail_at):
+    ws = tmp_path / "work"
+    ws.mkdir()
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "config"), **TOKENS}
+    directory = workspace.env_dir(ws, env)
+    if existing:
+        _write(ws / ".mcp.json", '{"keep": true}\n').chmod(0o640)
+        _write(ws / ".grok" / "config.toml", 'model = "grok-4"\n')
+        _write(ws / ".mcp.json.substrate-backup", "older backup\n")
+        for agent in AGENTS:
+            workspace.write_token(directory / f"{agent['slug']}.env", f"old-{agent['slug']}")
+    before = _snapshot(tmp_path)
+    modes = {p: stat.S_IMODE(p.stat().st_mode) for p in before}
+    replace = os.replace
+    published = []
+
+    def fail_later(src, dst, **kwargs):
+        if Path(dst).name == fail_at:
+            raise OSError("injected later publish failure")
+        published.append(Path(dst).name)
+        return replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(workspace.os, "replace", fail_later)
+    out = io.StringIO()
+    assert substrate_install.install_substrate(ws, ["claude", "grok"], False, out, env) == 2
+    assert "a01-orchestrator.env" in published
+    assert _snapshot(tmp_path) == before
+    assert {p: stat.S_IMODE(p.stat().st_mode) for p in before} == modes
+    assert not list(tmp_path.rglob(".substrate-*.tmp"))
+    if not existing:
+        assert set(tmp_path.iterdir()) == {ws}
+        assert not list(ws.iterdir())
+    assert not any(token in out.getvalue() for token in TOKENS.values())
+
+
+@pytest.mark.parametrize("edit_at", ["staging", "publishing"])
+def test_failed_install_preserves_intervening_operator_config_edits(tmp_path, monkeypatch, edit_at):
+    ws = tmp_path / "work"
+    ws.mkdir()
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "config"), **TOKENS}
+    target = _write(ws / ".mcp.json", '{"before": true}\n')
+    before = _snapshot(tmp_path)
+    external = '{"operator": "changed during install"}\n'
+    if edit_at == "staging":
+        plan = substrate_install.plan
+
+        def plan_and_edit(*args):
+            result = plan(*args)
+            target.write_text(external)
+            return result
+
+        monkeypatch.setattr(substrate_install, "plan", plan_and_edit)
+    else:
+        replace = os.replace
+
+        def edit_and_fail(src, dst, **kwargs):
+            if Path(dst).name == "config.toml":
+                target.write_text(external)
+                raise OSError("injected later publish failure")
+            return replace(src, dst, **kwargs)
+
+        monkeypatch.setattr(workspace.os, "replace", edit_and_fail)
+    out = io.StringIO()
+    assert substrate_install.install_substrate(ws, ["claude", "grok"], False, out, env) == 2
+    assert _snapshot(tmp_path) == {**before, target: external.encode()}
+    assert not list(tmp_path.rglob(".substrate-*.tmp"))
+    assert not workspace.env_dir(ws, env).exists()

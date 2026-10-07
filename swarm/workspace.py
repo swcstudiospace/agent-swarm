@@ -24,7 +24,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
+import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
@@ -57,6 +60,25 @@ def mcp_config(workspace: str | Path, runtime: str) -> Path:
     return Path(workspace) / SPEC["runtimes"][runtime]["path"]
 
 
+def projected_mcp(workspace: str | Path, runtime: str) -> bool:
+    """Only the exact projected server, including its environment references, authorizes automatic MCP flags."""
+    path = mcp_config(workspace, runtime)
+    try:
+        raw = file_state(path)
+        if raw is None:
+            return False
+        if SPEC["runtimes"][runtime]["format"] == "toml":
+            doc = tomllib.loads(raw.data.decode("utf-8"))
+            key, expected = "mcp_servers", SPEC["toml"]["entry"]
+        else:
+            doc = json.loads(raw.data)
+            key, expected = "mcpServers", SPEC["json"]
+        servers = doc.get(key) if isinstance(doc, dict) else None
+        return isinstance(servers, dict) and servers.get(SERVER) == expected
+    except (OSError, ValueError):
+        return False
+
+
 def env_dir(workspace: str | Path, env: Mapping[str, str] | None = None) -> Path:
     """Where the workspace's agent env files live. Keyed by a hash of the workspace's real path, so installing a second
     workspace, which may talk to another substrate, never overwrites the first one's tokens."""
@@ -76,40 +98,246 @@ def valid_token(value: str) -> bool:
     return bool(value) and all(c.isprintable() and not c.isspace() for c in value)
 
 
-def read_token(path: Path) -> str:
-    """The token in an agent env file. EnvFileProblem when it is missing, not a regular file of this user, readable by
-    anyone else, or anything but the one line `SUBSTRATE_TOKEN=<token>`."""
+def _private_directory(path: Path, st: os.stat_result) -> None:
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        raise EnvFileProblem(
+            f"{path} must be a private directory owned by this user (0700); fix its ownership/permissions "
+            "or choose another XDG_CONFIG_HOME, then re-run; the installer never changes existing directory permissions")
+
+
+def _open_directory(path: Path, *, create: bool = False, private: bool = False,
+                    created: list | None = None) -> int:
+    """Walk from the root with pinned, no-follow directory descriptors, never through an ancestor symlink."""
+    path = path.absolute()
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    current = Path(path.anchor)
     try:
-        st = os.lstat(path)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700 if private else 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                else:
+                    if created is not None:
+                        created.append((os.dup(fd), part, os.stat(part, dir_fd=fd, follow_symlinks=False)))
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if private:
+            _private_directory(path, os.fstat(fd))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def check_env_directory(path: Path) -> None:
+    """Read-only preflight; a missing directory can be created, but an existing unsafe directory cannot be repaired."""
+    try:
+        fd = _open_directory(path, private=True)
     except FileNotFoundError:
-        raise EnvFileProblem(f"{path} does not exist") from None
-    if not stat.S_ISREG(st.st_mode):
-        raise EnvFileProblem(f"{path} is not a regular file")
-    if st.st_uid != os.getuid():
+        return
+    except OSError:
+        raise EnvFileProblem(
+            f"{path} cannot be opened without following a symlink; use an accessible, user-owned private directory "
+            "(0700), or choose another XDG_CONFIG_HOME") from None
+    os.close(fd)
+
+
+@dataclass(frozen=True)
+class FileState:
+    identity: tuple[int, ...]
+    mode: int
+    uid: int
+    data: bytes = field(repr=False)
+
+
+def _file_state(fd: int, name: str) -> FileState | None:
+    try:
+        source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(source, "rb") as stream:
+        st = os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise EnvFileProblem(f"{name} is not a regular file")
+        data = stream.read()
+        after = os.fstat(stream.fileno())
+        if (st.st_mtime_ns, st.st_ctime_ns, st.st_size) != (after.st_mtime_ns, after.st_ctime_ns, after.st_size):
+            raise EnvFileProblem(f"{name} changed while being read; re-run")
+    return FileState((st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size), stat.S_IMODE(st.st_mode), st.st_uid, data)
+
+
+def file_state(path: Path, *, private: bool = False) -> FileState | None:
+    try:
+        fd = _open_directory(path.parent, private=private)
+    except FileNotFoundError:
+        return None
+    try:
+        return _file_state(fd, path.name)
+    finally:
+        os.close(fd)
+
+
+def token_value(path: Path, state: FileState | None) -> str:
+    if state is None:
+        raise EnvFileProblem(f"{path} does not exist")
+    if state.uid != os.getuid():
         raise EnvFileProblem(f"{path} is not owned by this user")
-    if stat.S_IMODE(st.st_mode) & 0o077:
-        raise EnvFileProblem(f"{path} is mode {stat.S_IMODE(st.st_mode):04o}; it must be 0600")
-    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if state.mode & 0o077:
+        raise EnvFileProblem(f"{path} is mode {state.mode:04o}; it must be 0600")
+    try:
+        lines = [line for line in state.data.decode("utf-8").splitlines() if line.strip()]
+    except UnicodeError:
+        raise EnvFileProblem(f"{path} must hold a UTF-8 token line") from None
     value = lines[0].removeprefix(f"{TOKEN}=") if len(lines) == 1 and lines[0].startswith(f"{TOKEN}=") else ""
     if not valid_token(value):
         raise EnvFileProblem(f"{path} must hold exactly one line {TOKEN}=<token> and nothing else")
     return value
 
 
+def read_token(path: Path) -> str:
+    """Read only through safe ancestors and a private, user-owned env directory, even for a valid 0600 token."""
+    return token_value(path, file_state(path, private=True))
+
+
+def _stage_file(fd: int, data: bytes, mode: int) -> tuple[str, FileState]:
+    for _ in range(16):
+        name = f".substrate-{secrets.token_hex(16)}.tmp"
+        try:
+            target = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(target, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fchmod(stream.fileno(), mode)
+            state = _file_state(fd, name)
+            if state is None:
+                raise EnvFileProblem("substrate staging file disappeared; re-run")
+            return name, state
+        except BaseException:
+            os.unlink(name, dir_fd=fd)
+            raise
+    raise FileExistsError("cannot allocate an exclusive substrate staging file")
+
+
+@dataclass
+class _Write:
+    path: Path
+    fd: int
+    private: bool
+    before: FileState | None = field(repr=False)
+    staged: str = ""
+    restore: str = ""
+    installed: FileState | None = field(default=None, repr=False)
+    committed: bool = False
+
+
+class FileTransaction:
+    """Bounded install transaction: stage every new/old file first, then publish; roll back only our own versions.
+
+    Directory descriptors pin all I/O, including rollback and secret cleanup, if a pathname is exchanged meanwhile.
+    This is process-failure rollback, not a crash-recovery journal or a multi-file atomic view for concurrent readers.
+    """
+
+    def __init__(self) -> None:
+        self.writes: list[_Write] = []
+        self.created: list[tuple[int, str, os.stat_result]] = []
+        self.complete = False
+
+    def __enter__(self) -> FileTransaction:
+        return self
+
+    def stage(self, path: Path, data: bytes, *, private: bool = False,
+              expected: FileState | None = None, check_expected: bool = False) -> None:
+        fd = _open_directory(path.parent, create=True, private=private, created=self.created)
+        item = _Write(path, fd, private, None)
+        self.writes.append(item)
+        item.before = _file_state(fd, path.name)
+        if check_expected and item.before != expected:
+            raise EnvFileProblem(f"{path} changed while the install ran; re-run")
+        mode = 0o600 if private else item.before.mode if item.before else 0o644
+        item.staged, item.installed = _stage_file(fd, data, mode)
+        if item.before is not None:
+            item.restore, _ = _stage_file(fd, item.before.data, item.before.mode)
+
+    def _check(self, item: _Write) -> None:
+        current = _open_directory(item.path.parent, private=item.private)
+        try:
+            a, b = os.fstat(current), os.fstat(item.fd)
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) or _file_state(item.fd, item.path.name) != item.before:
+                raise EnvFileProblem(f"{item.path} changed while the install ran; re-run")
+            if _file_state(item.fd, item.staged) != item.installed:
+                raise EnvFileProblem(f"{item.path}: staging file changed while the install ran; re-run")
+        finally:
+            os.close(current)
+
+    def commit(self) -> None:
+        for item in self.writes:
+            self._check(item)
+        for item in self.writes:
+            self._check(item)
+            os.replace(item.staged, item.path.name, src_dir_fd=item.fd, dst_dir_fd=item.fd)
+            item.staged = ""
+            item.committed = True
+        self.complete = True
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        problems = []
+        try:
+            if not self.complete:
+                for item in reversed(self.writes):
+                    if not item.committed:
+                        continue
+                    try:
+                        if _file_state(item.fd, item.path.name) != item.installed:
+                            problems.append(f"{item.path}: external intervening change preserved")
+                        elif item.restore:
+                            os.replace(item.restore, item.path.name, src_dir_fd=item.fd, dst_dir_fd=item.fd)
+                            item.restore = ""
+                        else:
+                            os.unlink(item.path.name, dir_fd=item.fd)
+                    except (OSError, EnvFileProblem):
+                        problems.append(f"{item.path}: rollback could not restore this file")
+        finally:
+            for item in self.writes:
+                for name in (item.staged, item.restore):
+                    if name:
+                        try:
+                            os.unlink(name, dir_fd=item.fd)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            problems.append(f"{item.path}: could not remove a staging file")
+                os.close(item.fd)
+            for fd, name, st in reversed(self.created):
+                try:
+                    now = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if not self.complete and (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
+                        os.rmdir(name, dir_fd=fd)  # only empty directories we created
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+        if problems:
+            raise EnvFileProblem("; ".join(problems)) from exc
+
+
 def write_token(path: Path, token: str) -> None:
-    """Write `SUBSTRATE_TOKEN=<token>` at `path`, 0600 from the first byte. The file is created beside the target and
-    renamed over it, so a symlink planted at `path` is replaced rather than followed, and a reader never sees half."""
+    """Publish a token atomically, private from the first byte; never repair an unsafe existing env directory."""
     if not valid_token(token):
         raise EnvFileProblem(f"refusing to write an empty or multi-line token to {path}")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        os.fchmod(fd, 0o600)  # the umask can only narrow the mode; this pins it
-        os.write(fd, f"{TOKEN}={token}\n".encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
+    with FileTransaction() as transaction:
+        transaction.stage(path, f"{TOKEN}={token}\n".encode("utf-8"), private=True)
+        transaction.commit()
 
 
 def credential(agent_id: str | None, workspace: str | Path | None,
@@ -132,9 +360,13 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     path = None
     if workspace is not None:
         try:
-            path = env_file(workspace, get_agent(agent_id)["slug"], e)
+            path = env_file(workspace, get_agent(agent_id or "")["slug"], e)
         except KeyError:
             return None, "", f"no agent {agent_id!r} in the manifest"
+        try:
+            check_env_directory(path.parent)
+        except (EnvFileProblem, OSError) as exc:
+            return None, str(path), str(exc)
         if os.path.lexists(path):
             try:
                 return read_token(path), str(path), ""

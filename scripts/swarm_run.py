@@ -47,7 +47,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -235,20 +235,14 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
                AIO_UPLIFT="0", AIO_SWARM="0")
     model = ["--model", args.model] if args.model else []
     binary = runtime_bin(runtime, args)
-    wired = workspace.mcp_config(repo, runtime).is_file()  # an install with --no-substrate wires nothing
+    wired = workspace.projected_mcp(repo, runtime)
     if runtime == "grok":
         trust = ["--trust"] if wired else []
         return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", *trust, "--cwd", str(repo),
                 *model], env, repo
     if runtime == "omp":
         if wired and env.get(workspace.TOKEN):
-            try:
-                config = json.loads(workspace.mcp_config(repo, runtime).read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                config = None
-            servers = config.get("mcpServers") if isinstance(config, dict) else None
-            if isinstance(servers, dict) and servers.get(workspace.SERVER) == workspace.SPEC["json"]:
-                env["SWARM_SUBSTRATE_AGENT"] = slug
+            env["SWARM_SUBSTRATE_AGENT"] = slug
         tools, body = omp_agent(slug, sdir)
         # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
         margin = min(60, max(5, args.task_timeout // 10))
@@ -715,13 +709,19 @@ def dispatchable(store: TaskStore, corr: str, emit, handoffs=None) -> list[dict]
             store.transition(t["task_id"], S.RETRY, reason="auto-retry")
             ready.append(store.get(t["task_id"]))
         else:
-            store.transition(t["task_id"], S.ESCALATED, reason="max_attempts reached")
-            emit("escalation.request", {"task_id": t["task_id"], "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
-                                        "options": ["human review", "cancel", "re-plan"]})
-            if handoffs is not None:
-                failed = [h["reason"] for h in store.history(t["task_id"]) if h["to_state"] == S.FAILED.value]
-                handoffs.escalated(t["task_id"], reason="max_attempts reached"
-                                   + (f"; last failure: {failed[-1]}" if failed and failed[-1] else ""))
+            tid = t["task_id"]
+            leases = handoffs.leases if handoffs is not None else None
+            # FAILED normally released the lease already. If one remains, keep it until the escalation packet lands.
+            with leases.transition(tid) if leases is not None else nullcontext():
+                store.transition(tid, S.ESCALATED, reason="max_attempts reached")
+                emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
+                                            "options": ["human review", "cancel", "re-plan"]})
+                if handoffs is not None:
+                    failed = [h["reason"] for h in store.history(tid) if h["to_state"] == S.FAILED.value]
+                    handoffs.escalated(tid, reason="max_attempts reached"
+                                       + (f"; last failure: {failed[-1]}" if failed and failed[-1] else ""))
+                if leases is not None:
+                    leases.settle(tid)
     return ready
 
 
