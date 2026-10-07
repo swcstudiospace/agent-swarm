@@ -68,10 +68,10 @@ class FakeSubstrate:
             return self._answer(req, self.brief[1], self.brief[0])
         assert path == "/mcp", path
         name = body["params"]["name"]
-        if name == "memory_search":
-            if self.entries is None:
+        if name == "memory_search":  # `entries` may be a function of the search arguments (query-dependent answers)
+            out = self.entries(body["params"]["arguments"]) if callable(self.entries) else self.entries
+            if out is None:
                 return self._answer(req, 500, "boom")
-            out = self.entries
         else:  # graph_bind forward lookup (assignment_prompt)
             out = {"status": "unbound", "correlation_id": body["params"]["arguments"].get("correlation_id"), "graph_id": None}
         rpc = {"jsonrpc": "2.0", "id": body["id"], "result": {"content": [{"type": "text", "text": json.dumps(out)}]}}
@@ -105,8 +105,9 @@ def unverified():
     return (202, result(reason="ok", verified=False))
 
 
-def version_conflict(reason="version.stale"):
-    return (409, result("conflict", reason, verified=False, conflict_with="mem_old"))
+def version_conflict(reason="version.stale", conflict_with="mem_old"):
+    extra = {"conflict_with": conflict_with} if conflict_with else {}
+    return (409, result("conflict", reason, verified=False, **extra))
 
 
 def decision(version, subject="db choice", entry_id="mem_old", **kw):
@@ -232,10 +233,16 @@ def test_swarm_surfaces_match_the_tee_table():
 
 
 # --- criterion 5: idempotency key ---------------------------------------------------------------------------
-def test_idempotency_key_is_sha256_of_the_six_fields():
-    key = mem.idempotency_key("c1", "T1", 2, "decision", "repo:acme/widgets", "text")
-    assert key == hashlib.sha256(b"c1|T1|2|decision|repo:acme/widgets|text").hexdigest() and re.fullmatch(r"[0-9a-f]{64}", key)
-    assert key == mem.idempotency_key("c1", "T1", 2, "decision", "repo:acme/widgets", "text")  # stable for the same write
+def _key_of(*fields):
+    return hashlib.sha256(json.dumps(list(fields), separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def test_idempotency_key_is_sha256_of_the_json_encoded_fields():
+    key = mem.idempotency_key("c1", "T1", 2, "decision", "repo:acme/widgets", "text", subject="  DB Choice ")
+    assert key == _key_of("c1", "T1", 2, "decision", "repo:acme/widgets", "db choice", "text") and re.fullmatch(r"[0-9a-f]{64}", key)
+    assert key == mem.idempotency_key("c1", "T1", 2, "decision", "repo:acme/widgets", "text", subject="db choice")  # normalised
+    assert mem.idempotency_key("c1", "T1", 2, "decision", "repo:acme/widgets", "tëxt") == _key_of("c1", "T1", 2, "decision",
+                                                                                                 "repo:acme/widgets", "", "tëxt")
 
 
 @pytest.mark.parametrize("other", [("c2", "T1", 2, "decision", "repo:acme/widgets", "text"), ("c1", "T2", 2, "decision", "repo:acme/widgets", "text"),
@@ -243,6 +250,20 @@ def test_idempotency_key_is_sha256_of_the_six_fields():
                                    ("c1", "T1", 2, "decision", "repo:acme/other", "text"), ("c1", "T1", 2, "decision", "repo:acme/widgets", "text2")])
 def test_idempotency_key_differs_per_field(other):
     assert mem.idempotency_key(*other) != mem.idempotency_key("c1", "T1", 2, "decision", "repo:acme/widgets", "text")
+
+
+def test_idempotency_key_differs_per_subject():
+    base = ("c1", "T1", 1, "decision", "repo:acme/widgets", "use postgres")
+    keys = {mem.idempotency_key(*base), mem.idempotency_key(*base, subject="db choice"), mem.idempotency_key(*base, subject="cache")}
+    assert len(keys) == 3
+    assert mem.idempotency_key(*base, subject="  ") == mem.idempotency_key(*base)  # a blank subject is no subject, as on the wire
+
+
+@pytest.mark.parametrize("left,right", [(("a|b", "c"), ("a", "b|c")), (("c1|T1", "1"), ("c1", "T1|1"))])
+def test_idempotency_key_has_no_separator_ambiguity(left, right):
+    assert mem.idempotency_key(*left, 1, "fact", "global", "t") != mem.idempotency_key(*right, 1, "fact", "global", "t")
+    assert mem.idempotency_key("c", "T", 1, "fact", "global", "x|y", subject="s") != mem.idempotency_key("c", "T", 1, "fact", "global",
+                                                                                                        "y", subject="s|x")
 
 
 def test_same_write_same_key_different_attempt_content_scope_or_kind_new_key(serve, write):
@@ -254,6 +275,14 @@ def test_same_write_same_key_different_attempt_content_scope_or_kind_new_key(ser
     assert write(text="x", scope="graph", graph_id=GID).idempotency_key != a.idempotency_key
     assert write(kind="retro", text="x").idempotency_key != a.idempotency_key
     assert len(fake.writes) == 6
+
+
+def test_two_decisions_in_one_attempt_with_different_subjects_get_different_keys(serve, write):
+    fake = serve(memory=[accepted()])
+    a, b = write(text="same text", subject="db choice"), write(text="same text", subject="cache choice")
+    assert a.idempotency_key != b.idempotency_key and fake.writes[0]["idempotency_key"] != fake.writes[1]["idempotency_key"]
+    retry = write(text="same text", subject="db choice", expected_version=3)  # a resubmit that adds expected_version: same write
+    assert retry.idempotency_key == a.idempotency_key and fake.writes[2]["expected_version"] == 3
 
 
 def test_decision_at_agent_scope_denied_by_server_is_e_policy(serve, write):
@@ -345,8 +374,39 @@ def test_version_conflict_rereads_and_resubmits_with_expected_version(serve, wri
     first, second = fake.writes
     assert "expected_version" not in first and second["expected_version"] == 3
     assert first["idempotency_key"] == second["idempotency_key"]  # one write, one key, however many re-submits
-    (search,) = fake.at("/mcp", "memory_search")
-    assert search["body"]["params"]["arguments"] == {"query": "", "limit": 100, "scope": f"repo:{REPO}"}
+    (search,) = fake.at("/mcp", "memory_search")  # the targeted read (subject as query) found it: no scope-wide read
+    assert search["body"]["params"]["arguments"] == {"query": "db choice", "limit": 100, "scope": f"repo:{REPO}"}
+
+
+def _scope_page(n=100):
+    """A full scope-wide page of other decisions: the read limit is used up before the standing decision would appear."""
+    return [decision(1, subject=f"other {i}", entry_id=f"mem_other_{i}") for i in range(n)]
+
+
+def test_standing_decision_beyond_the_scope_page_is_found_by_the_targeted_read(serve, write):
+    fake = serve(memory=[version_conflict(), accepted(version=6)],
+                 entries=lambda args: [decision(5)] if args["query"] == "db choice" else _scope_page())
+    out = write(subject="db choice")
+    assert out.ok and out.version == 6
+    assert [w.get("expected_version") for w in fake.writes] == [None, 5]
+    assert [c["body"]["params"]["arguments"]["query"] for c in fake.at("/mcp", "memory_search")] == ["db choice"]
+
+
+def test_targeted_read_miss_falls_back_to_the_scope_wide_read(serve, write):
+    fake = serve(memory=[version_conflict(), accepted(version=4)],
+                 entries=lambda args: [] if args["query"] else [decision(3)])
+    assert write(subject="db choice").ok
+    assert [w.get("expected_version") for w in fake.writes] == [None, 3]
+    assert [c["body"]["params"]["arguments"]["query"] for c in fake.at("/mcp", "memory_search")] == ["db choice", ""]
+
+
+def test_standing_decision_that_cannot_be_found_is_a_conflict_not_a_version_less_resubmit(serve, write):
+    fake = serve(memory=[version_conflict(), accepted()],
+                 entries=lambda args: [] if args["query"] else _scope_page())
+    out = write(subject="db choice", expected_version=2)
+    assert out.status == mem.CONFLICT and not out.ok and out.reason == "version.stale"
+    assert [w.get("expected_version") for w in fake.writes] == [2]  # never re-submitted, least of all without expected_version
+    assert len(fake.at("/mcp", "memory_search")) == 2
 
 
 def test_stale_expected_version_is_replaced_by_the_current_one(serve, write):
@@ -356,7 +416,7 @@ def test_stale_expected_version_is_replaced_by_the_current_one(serve, write):
 
 
 def test_stale_with_nothing_in_force_resubmits_without_expected_version(serve, write):
-    fake = serve(memory=[version_conflict(), accepted()], entries=[])
+    fake = serve(memory=[version_conflict(conflict_with=None), accepted()], entries=[])  # the server named no standing entry
     assert write(subject="db choice", expected_version=2).ok
     assert [w.get("expected_version") for w in fake.writes] == [2, None]
 
@@ -393,6 +453,24 @@ def test_substrate_disabled_sends_nothing_and_is_unavailable(monkeypatch, write)
     calls = _no_urlopen(monkeypatch)
     out = write()
     assert out.status == mem.UNAVAILABLE and out.reason == "substrate.disabled" and not out.ok and calls == []
+
+
+def test_lost_reply_is_unknown_and_the_same_write_retried_reuses_the_key(serve, write, monkeypatch):
+    fake = serve(memory=[accepted(version=2)])
+
+    def reply_lost(req, timeout=None):
+        fake(req, timeout)  # the server got the POST and stored the entry ...
+        raise TimeoutError("reply lost")  # ... but the answer never came back
+
+    monkeypatch.setattr(urllib.request, "urlopen", reply_lost)
+    first = write(subject="db choice")
+    assert first.status == mem.UNAVAILABLE and first.reason == "substrate.unreachable" and not first.ok  # unknown, not "not written"
+    substrate_client.reset()  # the outage back-off has passed
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    second = write(subject="db choice")  # the SAME logical write: same correlation, task, attempt, kind, scope, subject, text
+    assert second.ok
+    assert len(fake.writes) == 2 and fake.writes[0]["idempotency_key"] == fake.writes[1]["idempotency_key"]
+    assert first.idempotency_key == second.idempotency_key == fake.writes[0]["idempotency_key"]
 
 
 def test_unreachable_substrate_is_unavailable_not_ok_and_not_retried(on, monkeypatch, write, sleeps):
@@ -552,12 +630,25 @@ MEMORY_SIBLINGS = {("substrate_client", None), (None, "errors")}
 MEMORY_CLIENT_CALLS = {"rest_post", "mcp_call_json", "enabled"}
 
 
-def _py_sources():
+SCANNED_DIRS = ("swarm", "scripts", "hooks")
+
+
+def _py_sources(root=ROOT):
+    """repo-relative path -> source of every Python file under swarm/, scripts/ and hooks/, nested packages included."""
     out = {}
-    for d in ("swarm", "scripts", "hooks"):
-        for p in sorted((ROOT / d).glob("*.py")):
-            out[f"{d}/{p.name}"] = p.read_text(encoding="utf-8")
+    for d in SCANNED_DIRS:
+        for p in sorted((root / d).rglob("*.py")):
+            if "__pycache__" not in p.relative_to(root).parts:
+                out[p.relative_to(root).as_posix()] = p.read_text(encoding="utf-8")
     return out
+
+
+# `import ... from "x"`, `export ... from "x"`, side-effect `import "x"`, dynamic `import("x")`, `require("x")`
+TS_IMPORT = re.compile(r"""\b(?:from|import|require)\s*\(?\s*["'`]([^"'`]+)["'`]""")
+
+
+def ts_store_imports(src: str) -> set[str]:
+    return {m.split("/")[0] for m in TS_IMPORT.findall(src)} & FORBIDDEN_STORES
 
 
 def _roots_imported(tree: ast.AST) -> set[str]:
@@ -630,8 +721,7 @@ def test_only_swarm_memory_defines_the_memory_doors():
 def test_no_module_imports_a_vector_store_or_local_kv():
     assert forbidden_store_imports(_py_sources()) == {}
     for ts in sorted((ROOT / "scripts" / "ts").glob("*.ts")):  # the TypeScript twins are held to the same rule
-        found = re.findall(r"""(?:from|require\()\s*["']([^"']+)["']""", ts.read_text(encoding="utf-8"))
-        assert not {m.split("/")[0] for m in found} & FORBIDDEN_STORES, ts.name
+        assert not ts_store_imports(ts.read_text(encoding="utf-8")), ts.name
 
 
 def test_memory_module_reaches_storage_only_through_substrate_client():
@@ -655,3 +745,33 @@ def test_the_scan_would_fail_if_a_second_memory_store_appeared():
     for sneaky in ("import sqlite3\n", "import shelve\n", "import urllib.request\n", "from pathlib import Path\n", "from . import taskstore\n",
                    "from .substrate_tee import repo_slug\n", "import os\n", "open('mem.db', 'w')\n", "substrate_client._request('u', {}, {}, 'a')\n"):
         assert memory_module_violations(base + "\n" + sneaky), sneaky
+
+
+def test_the_scan_reaches_nested_python_modules(tmp_path):
+    nested = tmp_path / "swarm" / "stores" / "vector"
+    nested.mkdir(parents=True)
+    (nested / "kv.py").write_text("import redis\n\ndef memory_query(q):\n    return []\n", encoding="utf-8")
+    (tmp_path / "scripts" / "tools").mkdir(parents=True)
+    (tmp_path / "scripts" / "tools" / "ok.py").write_text("import json\n", encoding="utf-8")
+    (nested / "__pycache__").mkdir()
+    (nested / "__pycache__" / "kv.cpython-312.py").write_text("import chromadb\n", encoding="utf-8")
+    sources = _py_sources(tmp_path)
+    assert set(sources) == {"swarm/stores/vector/kv.py", "scripts/tools/ok.py"}  # full repo-relative paths, __pycache__ skipped
+    assert forbidden_store_imports(sources) == {"swarm/stores/vector/kv.py": {"redis"}}
+    assert memory_door_definers(sources) == {"swarm/stores/vector/kv.py": {"memory_query"}}
+
+
+@pytest.mark.parametrize("src,store", [
+    ('import "redis";\n', "redis"), ("import 'shelve'\n", "shelve"), ('const db = await import("chromadb");\n', "chromadb"),
+    ("const m = import ( 'faiss' )\n", "faiss"), ('export * from "lancedb";\n', "lancedb"), ('export { Q } from "qdrant_client"\n', "qdrant_client"),
+    ('import { createClient } from "redis";\n', "redis"), ("import type {\n  Db,\n} from 'lancedb/arrow'\n", "lancedb"),
+    ('const r = require("redis")\n', "redis"), ('import pg = require("pgvector")\n', "pgvector"),
+])
+def test_the_ts_scan_catches_every_import_form(src, store):
+    assert ts_store_imports(src) == {store}, src
+
+
+def test_the_ts_scan_does_not_flag_allowed_imports():
+    allowed = ('import { createHash } from "node:crypto";\nimport "./substrate";\nexport * from "./memory";\n'
+               'const m = await import("zod");\nconst important = "redis is mentioned in a string";\n')
+    assert ts_store_imports(allowed) == set()

@@ -19,7 +19,7 @@ in the swarm calls `memory_write` on its own yet — the module is the contract 
 | `memory_write(kind, scope, text, *, correlation_id, task_id, attempt=1, graph_id=None, repo=None, surface=None, subject=None, expected_version=None, env=None, sleep=time.sleep)` | `POST /memory` | never pretends (below); raises `SwarmError` `E-INPUT` / `E-POLICY` |
 | `memory_query(query, *, scope=None, limit=10, env=None)` | MCP `memory_search` | fail-open: `[]` |
 | `run_start_context(repo, graph_id=None, env=None)` | `POST /brief` (`memory_brief`) as surface `swarm-a01-orch` | fail-open: `''` |
-| `idempotency_key(correlation_id, task_id, attempt, kind, scope, text)` | — | `E-INPUT` on empty ids / `attempt < 1` |
+| `idempotency_key(correlation_id, task_id, attempt, kind, scope, text, *, subject=None)` | — | `E-INPUT` on empty ids / `attempt < 1` / non-string `subject` |
 
 `memory_write` returns a `WriteOutcome(status, reason, remedy, idempotency_key, verified_persisted, entry_id, version, review_id,
 quarantine_id, attempts)`. **`outcome.ok` is true only when the server said `accepted` and `verified_persisted` is true.**
@@ -59,23 +59,34 @@ Wire status comes from the server's `memoryWriteStatus`; the decision uses the b
 | `denied`, reason `store.*` | 503 | a store outage, not a policy decision: treated as unavailable | `unavailable` | no |
 | `quarantined` (`quarantine.secret` / `.pii` / `.speculative`) | 422 | returned with `reason` and `quarantine_id`; **not retried** | `quarantined` | no |
 | `conflict`, `review.required` | 409 | carried as a proposal (`review_id`); **not retried** | `proposal` | no |
-| `conflict`, `version.required` / `version.stale` (and the race forms `version.raced` / `standing.raced`) on a `decision` with a `subject` | 409 | re-read the version in force (`memory_search` at the scope, newest first, match by `conflict_with` id or subject), re-submit with `expected_version` (or without it when no decision is in force), at most 2 re-submits, same key; still conflicting → give up | `conflict` | no |
+| `conflict`, `version.required` / `version.stale` (and the race forms `version.raced` / `standing.raced`) on a `decision` with a `subject` | 409 | re-read the version in force: first a targeted `memory_search` (the subject as query text, at the scope), then, only if that misses, the scope-wide read (empty query); match by `conflict_with` id or subject. Re-submit with `expected_version` (or without it when no decision is in force and the server named none), at most 2 re-submits, same key; still conflicting → give up | `conflict` | no |
 | `conflict`, `write.in-flight` | 409 | another attempt holds the key: retry with the same key like an unverified write | `conflict` after 3 POSTs | no |
 | any other `conflict` (e.g. `idempotency.reused`) | 409 | returned, not retried | `conflict` | no |
-| no reply: substrate off, unreachable, in the client's 30 s outage back-off | — | nothing was written and nothing says it was; not retried | `unavailable` (`substrate.disabled` / `substrate.unreachable`) | no |
+| no reply: substrate off, unreachable, in the client's 30 s outage back-off, or the reply was lost (timeout, reset) | — | the result is **unknown**: the request may have reached the server and been stored before the reply was lost (only `substrate.disabled` guarantees nothing was sent). Not retried inside the call; recover as below | `unavailable` (`substrate.disabled` / `substrate.unreachable`) | no |
 | a non-result body (401/403 auth refusal) | 401/403 | fail-closed like `denied` | raises `E-POLICY` | — |
 | a non-result body (any other status: audit-gate 5xx, proxy page) | other | not a write result | `unavailable` (`http.<status>`) | no |
 
 A re-read that cannot be answered (`memory_search` down) leaves the conflict as `conflict`; the client never guesses a version.
+The same holds when the server named a standing decision (`conflict_with`) that neither the targeted nor the scope-wide read
+finds: the client stops with `conflict` rather than re-submitting without `expected_version`.
+
+**Recovering from `unavailable`.** Treat it as "unknown", never as "not written". Retry the **same** logical write — same
+`correlation_id`, `task_id`, `attempt`, `kind`, `scope`, `subject` and `text` — so it carries the same idempotency key and the
+server replays the stored result instead of writing a second entry. Never retry under a new `attempt` number just because of a
+network failure: a new attempt is a new key and can duplicate an entry the lost reply had already stored.
 
 ## Idempotency (criterion 5)
 
-`idempotency_key = sha256_hex("<correlation_id>|<task_id>|<attempt>|<kind>|<scope>|<text>")`, where `kind` is the substrate kind
-(after the kind map) and `scope` the resolved substrate scope (e.g. `repo:acme/widgets`). It is sent as `idempotency_key` on
-**every** POST of one write — unverified retries and version re-submits included — so the server's `memory_writes` record dedupes
-at-least-once redelivery: the same write for the same task attempt can never produce two entries, and a different `attempt`,
-text, scope or stored kind is a different key. The server never replays a *refused* key (only an `accepted` one), which is what
-makes a re-submit with a new `expected_version` under the same key legitimate.
+`idempotency_key = sha256_hex(json.dumps([correlation_id, task_id, attempt, kind, scope, subject, text], separators=(",", ":"),
+ensure_ascii=False))` (UTF-8), where `kind` is the substrate kind (after the kind map), `scope` the resolved substrate scope
+(e.g. `repo:acme/widgets`) and `subject` is normalised to `subject.strip().lower()` (`""` when absent or blank). A JSON array is
+unambiguous, so `("a|b", "c")` and `("a", "b|c")` are different keys, and two `decision` writes in one task attempt with the same
+text and scope but different subjects are different writes. `expected_version` is deliberately **not** in the key. The key is
+sent as `idempotency_key` on **every** POST of one write — unverified retries and version re-submits included — so the server's
+`memory_writes` record dedupes at-least-once redelivery and retries after a lost reply: the same write for the same task attempt
+can never produce two entries, and a different `attempt`, text, subject, scope or stored kind is a different key. The server never
+replays a *refused* key (only an `accepted` one), which is what makes a re-submit with a new `expected_version` under the same key
+legitimate.
 
 The substrate gate never grants a `decision` at `agent:` scope (only `graph` and `repo`, and `global` as a review proposal), so a
 swarm `decision` written at scope `agent` comes back denied and raises `E-POLICY`. Use `graph` or `repo` scope for decisions.
@@ -95,8 +106,10 @@ swarm `decision` written at scope `agent` comes back denied and raises `E-POLICY
 
 The substrate repository's `store-lock.test.ts` scans *that* repository's TypeScript for memory-table SQL and `insertEntry`; it
 knows nothing about this repository or any vector store or local key-value store on an agent's context path. The claim is
-therefore proven in this repository, by `tests/test_swarm_memory.py` (an AST/source scan over `swarm/`, `scripts/` and `hooks/`,
-plus the import lines of `scripts/ts/*.ts`):
+therefore proven in this repository, by `tests/test_swarm_memory.py` (an AST/source scan over every `*.py` under `swarm/`,
+`scripts/` and `hooks/`, nested packages included and `__pycache__` skipped, reported by repo-relative path; plus the import
+specifiers of `scripts/ts/*.ts` in every form: `import … from`, `export … from`, side-effect `import "x"`, dynamic `import("x")`
+and `require("x")`):
 
 1. the only module defining `memory_write` / `memory_query` is `swarm/memory.py`;
 2. no module imports `chromadb`, `faiss`, `lancedb`, `qdrant_client`, `pgvector`, `sqlite_vss`, `redis`, `shelve` or `dbm` (also via
@@ -105,4 +118,5 @@ plus the import lines of `scripts/ts/*.ts`):
    `swarm.substrate_client`, calls only `substrate_client.rest_post` / `mcp_call_json` / `enabled`, and never calls `open()`.
 
 The test also feeds the scanner synthetic sources (a second `memory_query`, `import chromadb`, a `sqlite3` import inside the
-memory module, …) and asserts each is caught, so it fails if a second memory store appears.
+memory module, a forbidden import in a nested module of a temporary tree, each TypeScript import form, …) and asserts each is
+caught, so it fails if a second memory store appears.

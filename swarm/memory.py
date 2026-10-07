@@ -47,11 +47,16 @@ ACCEPTED_UNVERIFIED = "accepted-unverified"  # accepted, read-back never confirm
 PROPOSAL = "proposal"                    # review.required: parked until a reviewer releases it: NOT ok
 QUARANTINED = "quarantined"
 CONFLICT = "conflict"
-UNAVAILABLE = "unavailable"              # substrate off, unreachable, or its store is down: NOT ok
+UNAVAILABLE = "unavailable"              # off/unreachable/store down, or the reply was lost: result UNKNOWN, NOT ok
 
 
 @dataclass(frozen=True)
 class WriteOutcome:
+    """The result of one ``memory_write``. Only :attr:`ok` means done.
+
+    ``status == UNAVAILABLE`` means the result is UNKNOWN: the substrate was off or unreachable, or the request reached it and
+    the reply was lost (the entry may be stored). Recover by retrying the SAME logical write, which reuses ``idempotency_key``.
+    """
     status: str
     reason: str = ""
     remedy: str = ""
@@ -75,11 +80,15 @@ def _text(value: object, name: str) -> str:
     return value
 
 
-def idempotency_key(correlation_id: str, task_id: str, attempt: int, kind: str, scope: str, text: str) -> str:
-    """sha256 hex of ``correlation_id|task_id|attempt|kind|scope|text``.
+def idempotency_key(correlation_id: str, task_id: str, attempt: int, kind: str, scope: str, text: str, *,
+                    subject: str | None = None) -> str:
+    """sha256 hex of the compact JSON array ``[correlation_id, task_id, attempt, kind, scope, subject, text]``.
 
-    ``kind`` is the SUBSTRATE kind (after the kind map) and ``scope`` the resolved substrate scope (e.g. ``repo:acme/widgets``).
-    Stable across every retry of one logical write, so bus redelivery cannot double-write; differs when scope or stored kind differs.
+    ``kind`` is the SUBSTRATE kind (after the kind map), ``scope`` the resolved substrate scope (e.g. ``repo:acme/widgets``)
+    and ``subject`` is normalised (``strip().lower()``, ``""`` when absent). A JSON array is unambiguous: no field value can
+    shift into its neighbour the way ``"a|b", "c"`` and ``"a", "b|c"`` would under a joined string. ``expected_version`` is
+    deliberately NOT part of the key, so a version re-submit stays the same write. Stable across every retry of one logical
+    write, so bus redelivery and a retry after a lost reply cannot double-write; any other field differing is a new key.
     """
     _text(correlation_id, "correlation_id")
     _text(task_id, "task_id")
@@ -88,7 +97,10 @@ def idempotency_key(correlation_id: str, task_id: str, attempt: int, kind: str, 
     _text(text, "text")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         raise SwarmError(ErrorCode.E_INPUT, "memory write needs attempt >= 1", field="attempt")
-    return hashlib.sha256(f"{correlation_id}|{task_id}|{attempt}|{kind}|{scope}|{text}".encode("utf-8")).hexdigest()
+    if subject is not None and not isinstance(subject, str):
+        raise SwarmError(ErrorCode.E_INPUT, "memory write subject must be a string", field="subject")
+    fields = [correlation_id, task_id, attempt, kind, scope, (subject or "").strip().lower(), text]
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def resolve_scope(scope: str, *, graph_id: str | None = None, repo: str | None = None, surface: str | None = None) -> str:
@@ -142,16 +154,27 @@ def _current_version(scope: str, subject: str | None, conflict_with: str, env: M
     """Re-read the decision in force for (scope, subject): ``(readable, version)``; version None when none is in force.
 
     The conflict reply names the colliding entry (``conflict_with``) but not its version, so the version comes from
-    ``memory_search`` (empty query = everything in force at the scope; superseded entries are excluded by the server).
+    ``memory_search`` (superseded entries are excluded by the server). One read is capped at 100 entries, so the read is
+    targeted first (the subject as query text at the scope), and only when that does not find it falls back to the
+    scope-wide read (empty query). When the server named a standing entry but neither read finds it, the version is
+    unreadable: ``(False, None)``, never "nothing in force" (that would drop ``expected_version`` and waste the re-submits).
     """
-    entries = _search("", scope, 100, env)
-    if entries is None:
-        return False, None
     want = (subject or "").strip().lower()
-    standing = [e for e in entries if isinstance(e, dict) and e.get("kind") == "decision"
-                and (e.get("id") == conflict_with or (want and str(e.get("subject") or "").strip().lower() == want))]
-    versions = [e["version"] for e in standing if isinstance(e.get("version"), int) and not isinstance(e.get("version"), bool)]
-    return True, (max(versions) if versions else None)
+    answered = True
+    for query in ([subject.strip()] if want else []) + [""]:
+        entries = _search(query, scope, 100, env)
+        if entries is None:
+            answered = False
+            continue
+        versions = [e["version"] for e in entries
+                    if e.get("kind") == "decision"
+                    and (e.get("id") == conflict_with or (want and str(e.get("subject") or "").strip().lower() == want))
+                    and isinstance(e.get("version"), int) and not isinstance(e.get("version"), bool)]
+        if versions:
+            return True, max(versions)
+    if conflict_with or not answered:
+        return False, None
+    return True, None
 
 
 def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_id: str, attempt: int = 1,
@@ -163,11 +186,16 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
     ``subject`` names what a ``decision`` is about: only a decision with a subject is versioned (replacing one needs
     ``expected_version``; on a version conflict the client re-reads the version in force and re-submits, twice at most).
     The same ``idempotency_key`` is sent on every POST of this write.
+
+    ``unavailable`` is an UNKNOWN result, not proof that nothing was written: when the request went out and the reply was
+    lost, the server may have stored the entry. To recover, call again with the SAME logical write (same correlation, task,
+    attempt, kind, scope, subject and text): it reuses the same idempotency key, so the server replays instead of writing a
+    second entry. Never retry under a new ``attempt`` just because of a network failure.
     """
     if kind not in KIND_MAP:
         raise SwarmError(ErrorCode.E_INPUT, f"unknown memory kind {kind!r}; expected one of {', '.join(KIND_MAP)}", field="kind")
     target = resolve_scope(scope, graph_id=graph_id, repo=repo, surface=surface)
-    key = idempotency_key(correlation_id, task_id, attempt, KIND_MAP[kind], target, text)
+    key = idempotency_key(correlation_id, task_id, attempt, KIND_MAP[kind], target, text, subject=subject)
     body: dict = {"scope": target, "kind": KIND_MAP[kind], "text": text, "idempotency_key": key}
     if subject and subject.strip():
         body["subject"] = subject
@@ -182,7 +210,7 @@ def memory_write(kind: str, scope: str, text: str, *, correlation_id: str, task_
     while True:
         got = substrate_client.rest_post("/memory", body, env)
         posts += 1
-        if got is None:  # off, unreachable, or inside the client's outage back-off: nothing was written, say so
+        if got is None:  # off, unreachable, back-off, or the reply was lost after the server got it: result UNKNOWN, not "nothing written"
             why = "substrate.disabled" if not substrate_client.enabled(env) else "substrate.unreachable"
             return WriteOutcome(UNAVAILABLE, reason=why, idempotency_key=key, attempts=posts)
         http, raw = got
