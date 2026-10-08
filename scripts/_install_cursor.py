@@ -437,7 +437,16 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
                 continue
             data = path.read_bytes()
             _save_backup(path, data)
-            path.unlink()
+            try:
+                path.unlink()
+            except OSError:
+                # The live file is still in place, so this backup is unused. Leaving it
+                # would make the next install refuse the path (r4224206191).
+                try:
+                    _drop_backup(path)
+                except (OSError, UnsafeDestination):
+                    pass
+                raise
             removed.append((path, data))
         if STAMP_REL in writes:
             _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced)

@@ -299,3 +299,41 @@ def test_backup_cleanup_failure_reports_completed_install(tmp_path, monkeypatch)
     assert not (other.parent / f".{other.name}.agent-swarm-bak").exists()
     stamp = json.loads((target / cursor_install.STAMP_REL).read_text(encoding="utf-8"))
     assert stamp["files"][agents[0].relative_to(source).as_posix()] == _sha(agents[0].read_text(encoding="utf-8"))
+
+
+def test_failed_retirement_drops_unused_backup_and_retries(tmp_path, monkeypatch):
+    """A delete that fails after its backup is saved must not leave that backup to block the next install."""
+    source = _source_from_export(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    retired = target / ".cursor" / "agents" / "zz-removed.md"
+    retired.write_text("owned\n", encoding="utf-8")
+    stamp_path = target / cursor_install.STAMP_REL
+    stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    stamp["files"][".cursor/agents/zz-removed.md"] = _sha("owned\n")
+    stamp_path.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+    before = _snapshot(target)
+    backup = retired.parent / f".{retired.name}.agent-swarm-bak"
+    real_unlink = Path.unlink
+
+    def wrapped(self, *args, **kwargs):
+        if self.name == retired.name:
+            raise OSError("injected unlink failure")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", wrapped)
+    err = StringIO()
+    rc = cursor_install.install_cursor(target, source=source, err=err)
+    text = err.getvalue()
+    assert rc == 2, text
+    assert "Traceback" not in text
+    assert "backup already exists" not in text
+    assert retired.read_text(encoding="utf-8") == "owned\n"
+    assert not backup.exists()
+    assert _snapshot(target) == before
+
+    monkeypatch.undo()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    assert not retired.exists()
+    assert not backup.exists()
