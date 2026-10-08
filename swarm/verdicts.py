@@ -127,6 +127,28 @@ def gate_risk_class(task_id: str | None, root=None) -> str | None:
     return max(known, key=RISK_ORDER.index) if known else None
 
 
+def _per_target_blocks(per_target: dict[str, list[dict]] | None) -> bool:
+    """True when any target's own findings would fail its verdict."""
+    return any(derive_verdict(items) == "fail" for items in (per_target or {}).values())
+
+
+def _advisory_per_target(per_target: dict[str, list[dict]] | None, *, gate: str, agent_id: str, runs: dict,
+                         expires_s: int, correlation_id: str | None, extra: dict | None, reason: str,
+                         store) -> dict[str, dict]:
+    """Unsigned per-target envelopes. Nothing here is written to the Task Store."""
+    out: dict[str, dict] = {}
+    for target, items in (per_target or {}).items():
+        corr = correlation_id
+        if store is not None:
+            try:
+                corr = store.get(target)["correlation_id"]
+            except SwarmError:
+                pass
+        out[target] = advisory_envelope(gate=gate, task_id=target, agent_id=agent_id, findings=items, runs=runs,
+                                        expires_s=expires_s, correlation_id=corr, extra=extra, reason=reason)
+    return out
+
+
 def gate_verdict(env: dict, recorded: dict[str, dict]) -> str:
     """A gate script's overall verdict: fail when its envelope or any recorded per-target verdict fails."""
     verdicts = [env["payload"]["verdict"], *(e["payload"]["verdict"] for e in recorded.values())]
@@ -239,16 +261,25 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     if keyless_advisory():
         # No implicit dev key. The file is advisory and does not verify; nothing is recorded.
         # An agent session keeps its existing unrecorded reason (WR-15) and still emits no security.dev_key.
+        # Per-target failures stay in the returned map (unsigned) and on the file verdict, so a clean
+        # script check plus a blocking per-target finding still fails the gate.
+        reason = SESSION_UNRECORDED if session else MISSING_KEY_REASON
         env = advisory_envelope(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs,
-                                expires_s=expires_s, correlation_id=corr, extra=extra, reason=MISSING_KEY_REASON)
+                                expires_s=expires_s, correlation_id=corr, extra=extra, reason=reason)
+        if _per_target_blocks(per_target):
+            env["payload"]["verdict"] = "fail"
+        recorded = _advisory_per_target(per_target, gate=gate, agent_id=agent_id, runs=runs, expires_s=expires_s,
+                                        correlation_id=corr, extra=extra, reason=reason, store=store)
         (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
-        ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,
-                                             "reason": SESSION_UNRECORDED if session else MISSING_KEY_REASON})
-        return env, {}
+        ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate, "reason": reason})
+        return env, recorded
     # WR-15: a key-less agent-session preview never records, so it must not raise the security.dev_key
-    # misconfiguration signal; gate.verdict.unrecorded below marks it instead
+    # misconfiguration signal; gate.verdict.unrecorded below marks it instead.
+    # A session that does hold a key still must not report pass when a per-target finding blocks:
+    # the file verdict is set before signing, and no row is recorded.
+    file_verdict = "fail" if session and _per_target_blocks(per_target) else None
     env = make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
-                       correlation_id=corr, extra=extra, root=ctx.root, audit=not session)
+                       correlation_id=corr, extra=extra, root=ctx.root, audit=not session, verdict=file_verdict)
     (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
     if session:
         ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,

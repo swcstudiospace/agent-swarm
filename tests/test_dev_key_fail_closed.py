@@ -193,3 +193,41 @@ def test_agent_session_preview_stays_unrecorded(swarm_dir):
     assert envelope["payload"].get("advisory") is True
     assert verify_envelope(envelope) is False
 
+
+
+@pytest.mark.parametrize("script,gate,gate_id", [
+    ("qa_gate.py", "quality", "K-qa"),
+    ("sec_gate.py", "security", "K-sec"),
+])
+def test_keyless_major_per_target_finding_fails_with_no_rows(tmp_path, swarm_dir, script, gate, gate_id):
+    """A keyless quality or security gate whose own checks are clean still fails on one major
+    per-target finding, writes no verdict rows, and leaves an unsigned advisory envelope."""
+    from swarm.envelope import verify_envelope
+    from swarm.taskstore import TaskStore
+
+    work = tmp_path / "empty"
+    work.mkdir()
+    ts = TaskStore()
+    ts.create(task_id="K-be", correlation_id="c", capability="code.backend", risk_class="low",
+              notes={"gates": [gate]})
+    ts.create(task_id=gate_id, correlation_id="c", capability=f"gate.{gate}", risk_class="low",
+              notes={"gate": gate, "gate_for": ["K-be"], "gates": []})
+    _lease(ts, gate_id)
+    findings = tmp_path / "findings.json"
+    findings.write_text(json.dumps({
+        "K-be": [{"severity": "major", "kind": "functional", "summary": "blocking per-target finding"}],
+    }))
+    extra = ["--risk-class", "low"] if script == "qa_gate.py" else []
+    r = run_script(
+        script, "--task-id", gate_id, "--correlation-id", "c", "--root", str(work),
+        "--per-target-findings", str(findings), *extra, "--json",
+        env={"SWARM_DIR": str(swarm_dir)},
+    )
+    assert r.returncode != 0, r.stdout + r.stderr
+    body = json.loads(r.stdout)
+    assert body["verdict"] == "fail"
+    assert _rows(swarm_dir) == []
+    envelope = json.loads((swarm_dir / "verdicts" / f"{gate_id}.{gate}.json").read_text())
+    assert envelope["payload"].get("advisory") is True
+    assert envelope["payload"]["verdict"] == "fail"
+    assert verify_envelope(envelope) is False
