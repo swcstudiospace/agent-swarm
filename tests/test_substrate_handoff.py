@@ -501,6 +501,146 @@ def test_a_packet_that_does_not_verify_is_listed_but_never_shapes_the_context(tm
     assert "1 packet(s) failed verification and were ignored" in hand_mod.render(ctx)
 
 
+@pytest.mark.parametrize("signing_key", [KEY, None])
+@pytest.mark.parametrize("reworks", [1, 2])
+@pytest.mark.parametrize("delivery", ["flush", "redispatch"])
+def test_late_dispatch_retry_cannot_replace_newer_rework(tmp_path, fake, monkeypatch, signing_key, reworks, delivery):
+    fake.key = signing_key
+    monkeypatch.setattr(time, "time", lambda: fake.now)
+    fake.register("T-arch", "T-be")
+    store, events = _store(tmp_path), []
+    _task(store, "T-arch", "A03")
+    task = _task(store, "T-be", "A05", deps=["T-arch"], acceptance=["fix the endpoint"])
+    _, handoffs = _bridges(store, events)
+    fake.store_handoffs = False
+    assert handoffs.dispatched(task, "A05") == ["unsent"]
+    fake.store_handoffs = True
+    for i in range(1, reworks + 1):
+        fake.now += 1
+        store.update("T-be", rework_loops=i)
+        verdicts = {"quality": {"agent_id": "A08", "findings": [
+            {"severity": "major", "summary": f"failure {i}", "file": "src/endpoint.py"}]}}
+        assert handoffs.gate_failed("T-be", ["quality"], verdicts, i) == ["sent"]
+    if delivery == "flush":
+        assert handoffs.flush() == 1
+    else:
+        assert handoffs.dispatched(store.get("T-be"), "A05") == ["sent"]
+    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    assert f"rework {reworks} of" in ctx.goal
+    assert ctx.blockers == [f"quality [major] failure {reworks} (src/endpoint.py)"]
+    assert ctx.dod == ["fix the endpoint"] and ctx.files == ["src/endpoint.py"]
+    assert ctx.sender == "swarm-a08-qa" and ctx.signed is bool(signing_key)
+    assert ctx.packets[-1]["boundary"] == "dispatch@T-be/dep:T-arch"  # stored last, not the current boundary
+
+
+def test_stored_handoff_with_lost_reply_is_not_written_again(tmp_path, fake, monkeypatch):
+    fake.register("T-arch", "T-be")
+    store, events = _store(tmp_path), []
+    _task(store, "T-arch", "A03")
+    task = _task(store, "T-be", "A05", deps=["T-arch"], acceptance=["fix the endpoint"])
+    _, handoffs = _bridges(store, events)
+    lost = False
+
+    def lose_committed_reply(req, timeout=None):
+        nonlocal lost
+        reply = fake(req, timeout)
+        body = json.loads(req.data) if req.data else {}
+        if body.get("params", {}).get("name") == "coord_handoff" and not lost:
+            lost = True
+            raise TimeoutError("reply lost after storage")
+        return reply
+
+    monkeypatch.setattr(substrate_client, "_open", lose_committed_reply)
+    assert handoffs.dispatched(task, "A05") == ["unsent"]
+    packet_id = _packets(fake)[0]["handoff_id"]
+    substrate_client.reset()  # transport recovered; the bridge's cached ledger set must refresh too
+    assert handoffs.flush() == 0
+    assert [p["handoff_id"] for p in _packets(fake)] == [packet_id]
+    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    assert ctx.goal.startswith("T-be work") and ctx.dod == ["fix the endpoint"]
+    assert [p["packet"]["handoff_id"] for p in ctx.packets] == [packet_id]
+
+
+def test_ledger_refresh_keeps_a_concurrently_confirmed_boundary(tmp_path, fake, monkeypatch):
+    fake.register("T-arch", "T-first", "T-lost")
+    store, events = _store(tmp_path), []
+    _task(store, "T-arch", "A03")
+    first_task = _task(store, "T-first", "A05", deps=["T-arch"])
+    lost_task = _task(store, "T-lost", "A05", deps=["T-arch"])
+    _, handoffs = _bridges(store, events)
+    first_started, release_first = threading.Event(), threading.Event()
+    list_started, release_list, pause_list = threading.Event(), threading.Event(), threading.Event()
+    outcomes = {}
+    lost = False
+
+    def interleave(req, timeout=None):
+        nonlocal lost
+        params = json.loads(req.data).get("params", {}) if req.data else {}
+        name, args = params.get("name"), params.get("arguments", {})
+        if name == "coord_handoff" and args["node_id"] == "T-first":
+            first_started.set()
+            assert release_first.wait(5)
+        reply = fake(req, timeout)
+        if name == "coord_handoff" and args["node_id"] == "T-lost" and not lost:
+            lost = True
+            raise TimeoutError("reply lost after storage")
+        if name == "coord_handoff_list" and pause_list.is_set():
+            list_started.set()  # snapshot excludes the first write, which has not landed yet
+            assert release_list.wait(5)
+        return reply
+
+    monkeypatch.setattr(substrate_client, "_open", interleave)
+    first = threading.Thread(target=lambda: outcomes.update(first=handoffs.dispatched(first_task, "A05")), daemon=True)
+    flush = threading.Thread(target=lambda: outcomes.update(flush=handoffs.flush()), daemon=True)
+    try:
+        first.start()
+        assert first_started.wait(5)
+        assert handoffs.dispatched(lost_task, "A05") == ["unsent"]
+        substrate_client.reset()
+        pause_list.set()
+        flush.start()
+        assert list_started.wait(5)
+        release_first.set()
+        first.join(5)
+        assert outcomes.get("first") == ["sent"]
+        release_list.set()
+        flush.join(5)
+        assert outcomes.get("flush") == 0
+    finally:
+        release_first.set()
+        release_list.set()
+        first.join(5)
+        if flush.ident is not None:
+            flush.join(5)
+    assert not first.is_alive() and not flush.is_alive()
+    assert handoffs.dispatched(first_task, "A05") == ["duplicate"]
+    assert [hand_mod.boundary_key(p) for p in _packets(fake, "T-first")] == ["dispatch@T-first/dep:T-arch"]
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("from", "swarm-a03-arch"), ("to", "swarm-a05-be"),
+    ("from", {"surface": ["swarm-a03-arch"]}), ("dod", "not a criterion list"),
+])
+def test_malformed_receiving_row_cannot_hide_good_handoff(tmp_path, fake, field, value):
+    fake.register("T-arch", "T-be")
+    store, events = _store(tmp_path), []
+    _task(store, "T-arch", "A03")
+    task = _task(store, "T-be", "A05", deps=["T-arch"], acceptance=["fix the endpoint"])
+    _, handoffs = _bridges(store, events)
+    assert handoffs.dispatched(task, "A05") == ["sent"]
+    good = fake.tool_coord_handoff_list({"graph_id": GID}, "swarm-a05-be")[0]
+    bad = json.loads(json.dumps(good))
+    bad["ts"] = "2026-10-08T00:00:00.000Z"
+    bad["packet"][field] = value
+    bad["packet"]["goal"] = "corrupt row must not drive the agent"
+    fake.forced["coord_handoff_list"] = [good, bad]
+    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    assert ctx.goal == good["packet"]["goal"] and ctx.dod == ["fix the endpoint"]
+    assert ctx.sender == "swarm-a03-arch" and ctx.signed is True
+    assert ctx.packets[-1]["trust"] == "rejected"
+    assert "1 packet(s) failed verification and were ignored" in hand_mod.render(ctx)
+
+
 def test_an_unanswered_ledger_rebuilds_nothing(tmp_path, fake):
     fake.down = True
     ctx = hand_mod.reconstruct(GID, "H-patch", agent="A14")
@@ -628,7 +768,7 @@ def test_large_multibyte_packets_preserve_distinct_boundary_keys_after_restart(t
     monkeypatch.setattr(fake, "tool_coord_handoff", server_notes_cap)
     boundaries = [
         hand_mod.boundary(round_=f"dispatch@{node}", part="dep:" + "界" * 2000 + suffix,
-                          sender="A03", receiver="A05", node_id=node, goal="目標" * 250,
+                          sender="A03", receiver="A05", node_id=node, goal="目標" * 250, occurred_at=fake.now,
                           files=[f"路{i}/" + "界" * 280 for i in range(50)],
                           dod=[f"合格{i} " + "試" * 280 for i in range(30)],
                           blockers=[f"問題{i} " + "難" * 280 for i in range(20)], body="説明" * 450)
@@ -654,7 +794,8 @@ def test_routing_that_cannot_fit_never_sends_a_packet_with_a_lost_key(tmp_path, 
     store, events = _store(tmp_path), []
     _, handoffs = _bridges(store, events)
     packet = hand_mod.boundary(round_="dispatch@large", part="dep:T", sender="A03", receiver="A05",
-                               node_id="界" * 9000, goal="work", files=[], dod=[], blockers=[], body="context")
+                               node_id="界" * 9000, goal="work", occurred_at=fake.now,
+                               files=[], dod=[], blockers=[], body="context")
     assert handoffs.send(packet) == "refused"
     assert fake.at("coord_handoff") == []
     assert _types(events) == ["handoff.refused"]
