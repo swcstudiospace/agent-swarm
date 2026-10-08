@@ -20,11 +20,13 @@ and used. Design notes: docs/substrate-handoffs.md.
 from __future__ import annotations
 import hashlib
 import json
+import math
 import os
 import re
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -42,6 +44,7 @@ GATE_AGENTS = {"quality": "A08", "review": "A09", "security": "A10", "release": 
 # The idempotency key rides on the first line of the packet's `notes`. A key is `<round>/<part>`: the round names one
 # boundary event on one node (`dispatch@T`, `rework2@T`, `escalated-a1r2@T`) and the part one packet of it.
 BOUNDARY_PREFIX = "boundary: "
+BOUNDARY_TIME_PREFIX = "boundary-at: "
 # The server drops `notes` first over 12 kB and caps it at 1200 UTF-16 units. Fit the complete request with room for
 # its signed packet envelope before sending, and compact oversized key components without changing ordinary keys.
 PACKET_BUDGET = 9_000
@@ -77,6 +80,38 @@ def boundary_key(packet: Mapping) -> str | None:
 
 def _round(key: str | None) -> str | None:
     return key.rsplit("/", 1)[0] if key and "/" in key else None
+
+
+def _valid_packet(packet: object, graph: str) -> bool:
+    if not isinstance(packet, dict) or packet.get("graph_id") != graph:
+        return False
+    if type(packet.get("version")) is not int or packet["version"] != 1:
+        return False
+    if any(not isinstance(packet.get(name), str) or not packet[name]
+           for name in ("handoff_id", "ts", "goal", "node_id")):
+        return False
+    if any(not isinstance(packet.get(name), list)
+           or not all(isinstance(item, str) for item in packet[name]) for name in ("files", "dod", "blockers")):
+        return False
+    return all(isinstance(packet.get(name), dict)
+               and isinstance(packet[name].get("surface"), str) and packet[name]["surface"] for name in ("from", "to"))
+
+
+def _boundary_time(packet: Mapping) -> float:
+    """Signed logical boundary time, unchanged by delivery; older packets use their signed storage time."""
+    notes = packet.get("notes")
+    lines = notes.splitlines() if isinstance(notes, str) else []
+    if len(lines) > 1 and lines[1].startswith(BOUNDARY_TIME_PREFIX):
+        try:
+            value = float(lines[1][len(BOUNDARY_TIME_PREFIX):])
+            if math.isfinite(value) and value > 0:
+                return value
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(packet["ts"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError, OverflowError):
+        return 0.0
 
 
 def _text(item: object) -> str:
@@ -144,9 +179,9 @@ class Boundary:
 
 
 def boundary(*, round_: str, part: str, sender: str, receiver: str, node_id: str, goal: str, dod: list[str],
-             files: list[str], blockers: list[str], body: str, to_session: bool = True,
+             files: list[str], blockers: list[str], body: str, occurred_at: float, to_session: bool = True,
              lease: substrate_lease.Lease | None = None) -> Boundary:
-    """A bounded packet body with a stable key; final fitting includes routing/session fields in `_fit_packet`."""
+    """A stable key and signed transition time; retries never rewrite when this boundary happened."""
     def key_part(value: str) -> str:
         encoded = value.encode("utf-8")
         return "sha256-" + hashlib.sha256(encoded).hexdigest() if len(encoded) > MAX_KEY_PART_BYTES else value
@@ -154,23 +189,24 @@ def boundary(*, round_: str, part: str, sender: str, receiver: str, node_id: str
     key = f"{key_part(round_)}/{key_part(part)}"
     return Boundary(key, sender, receiver, node_id, goal.strip()[:MAX_GOAL] or node_id[:MAX_GOAL],
                     dod[:MAX_DOD], files[:MAX_FILES], blockers[:MAX_BLOCKERS],
-                    f"{BOUNDARY_PREFIX}{key}\n{body.strip()[:MAX_BODY]}", to_session, lease)
+                    f"{BOUNDARY_PREFIX}{key}\n{BOUNDARY_TIME_PREFIX}{occurred_at:.9f}\n\n{body.strip()[:MAX_BODY]}",
+                    to_session, lease)
 
 
 def _fit_packet(args: dict) -> bool:
-    """Fit payload and routing below the signed-packet budget without ever truncating its boundary key."""
-    header, _, body = args["notes"].partition("\n")
+    """Fit payload below the signed-packet budget without truncating the key or transition time."""
+    header, _, body = args["notes"].partition("\n\n")
     trimmed: dict[str, int] = {}
 
     def notes() -> None:
         suffix = f"\ntrimmed by the runner: {', '.join(f'{k} {v}' for k, v in trimmed.items())}" if trimmed else ""
-        room = MAX_NOTES - len((header + "\n" + suffix).encode("utf-16-le")) // 2
+        room = MAX_NOTES - len((header + "\n\n" + suffix).encode("utf-16-le")) // 2
         if len(body.encode("utf-16-le")) // 2 > room:
             trimmed["notes"] = 1
             suffix = f"\ntrimmed by the runner: {', '.join(f'{k} {v}' for k, v in trimmed.items())}"
-            room = MAX_NOTES - len((header + "\n" + suffix).encode("utf-16-le")) // 2
+            room = MAX_NOTES - len((header + "\n\n" + suffix).encode("utf-16-le")) // 2
         text = body.encode("utf-16-le")[:max(0, room) * 2].decode("utf-16-le", errors="ignore")
-        args["notes"] = header + "\n" + text + suffix
+        args["notes"] = header + "\n\n" + text + suffix
 
     def size() -> int:
         return len(json.dumps(args, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + PACKET_OVERHEAD
@@ -221,6 +257,8 @@ class HandoffBridge:
         self.leases = leases  # substrate_lease.LeaseBridge, for the lease an escalation hands over
         self._lock = threading.Lock()
         self._known: set[tuple[str, str, str]] | None = None  # (sender surface, node, boundary key) in the ledger
+        self._keys_revision, self._loaded_keys_revision = 0, -1
+        self._inflight: set[tuple[str, str, str]] = set()  # reservations survive an uncertain write's cache invalidation
         self._pending: dict[str, Boundary] = {}  # not taken yet; retried by flush()
         self._warned: set[str] = set()
         self._said_unsigned = False
@@ -242,11 +280,12 @@ class HandoffBridge:
         return self._graph_id
 
     def _ledger_keys(self, graph: str) -> set[tuple[str, str, str]] | None:
-        """What this graph's ledger already holds, read once per process: a re-run, or a runner restarted after a
-        crash, finds its earlier packets there and does not write them again. None when the list did not answer."""
+        """Read persisted keys at startup and after uncertain writes, before any retry can append a duplicate.
+        None when the list did not answer."""
         with self._lock:
-            if self._known is not None:
+            if self._known is not None and self._loaded_keys_revision == self._keys_revision:
                 return self._known
+            revision = self._keys_revision
         got = substrate_lease._call("coord_handoff_list", {"graph_id": graph}, ORCH, self.root, self.env)
         if got.status != "ok" or not isinstance(got.value, list):
             return None
@@ -255,23 +294,10 @@ class HandoffBridge:
             if not isinstance(entry, dict) or trust_of(entry.get("verdict")) == REJECTED:
                 continue
             packet = entry.get("packet")
-            if not isinstance(packet, dict) or packet.get("graph_id") != graph:
+            if not _valid_packet(packet, graph):
                 continue
-            if type(packet.get("version")) is not int or packet["version"] != 1:
-                continue
-            if any(not isinstance(packet.get(field), str) or not packet[field]
-                   for field in ("handoff_id", "ts", "goal")):
-                continue
-            if any(not isinstance(packet.get(field), list)
-                   or not all(isinstance(item, str) for item in packet[field]) for field in ("files", "dod", "blockers")):
-                continue
-            destination = packet.get("to")
-            if not isinstance(destination, dict) or not isinstance(destination.get("surface"), str):
-                continue
-            origin, node = packet.get("from"), packet.get("node_id")
-            if not isinstance(origin, dict) or not isinstance(node, str) or not node:
-                continue
-            key, sender = boundary_key(packet), origin.get("surface")
+            node = packet["node_id"]
+            key, sender = boundary_key(packet), packet["from"]["surface"]
             # Only well-formed, accepted entries can reserve a sender's boundary.
             if (key and _round(key)
                     and isinstance(sender, str) and sender in substrate_tee.AGENT_SURFACES.values()):
@@ -279,6 +305,11 @@ class HandoffBridge:
         with self._lock:
             if self._known is None:
                 self._known = keys
+            else:
+                self._known.update(keys)  # keep successful writes confirmed while this read was in flight
+            if revision != self._keys_revision:
+                return None  # another uncertain write occurred during the read; defer until a fresh snapshot
+            self._loaded_keys_revision = revision
             return self._known
 
     def _unsent(self, b: Boundary, reason: str) -> str:
@@ -326,10 +357,18 @@ class HandoffBridge:
             return self._unsent(b, "coord_handoff_list did not answer")
         mark = (sender_surface, b.node_id, b.key)
         with self._lock:
-            if mark in known:
+            if mark in known or mark in self._inflight:
                 self._pending.pop(b.key, None)
                 return "duplicate"
-            known.add(mark)  # reserved, so a concurrent send of the same boundary is a duplicate
+            self._inflight.add(mark)
+        try:
+            return self._write(b, graph, sender_surface, receiver_surface, mark)
+        finally:
+            with self._lock:
+                self._inflight.discard(mark)
+
+    def _write(self, b: Boundary, graph: str, sender_surface: str, receiver_surface: str,
+               mark: tuple[str, str, str]) -> str:
         args = {"to": receiver_surface, "goal": b.goal, "files": b.files, "dod": b.dod, "blockers": b.blockers,
                 "graph_id": graph, "node_id": b.node_id, "notes": b.notes,
                 "session_id": substrate_tee.session_id(b.sender, graph, self.env)}
@@ -338,14 +377,17 @@ class HandoffBridge:
         if b.lease is not None:  # released by the server only once the packet is durable; the packet never holds the id
             args.update(lease_id=b.lease.lease_id, release_lease=True)
         if not _fit_packet(args):
-            with self._lock:
-                known.discard(mark)
             return self._refused(b, "handoff routing fields exceed the packet budget")
-        got = substrate_lease._call("coord_handoff", args, b.sender, self.root, self.env)
+        try:
+            got = substrate_lease._call("coord_handoff", args, b.sender, self.root, self.env)
+        except Exception:
+            with self._lock:
+                self._keys_revision += 1
+            raise
         reply = got.value if got.status == "ok" and isinstance(got.value, dict) else None
         if reply is None or reply.get("stored") is not True:
             with self._lock:
-                known.discard(mark)
+                self._keys_revision += 1
             if got.status == "off":
                 return "off"
             if got.status == "refused":
@@ -353,6 +395,8 @@ class HandoffBridge:
             why = (reply or {}).get("error") or got.detail or got.status
             return self._unsent(b, f"{'not stored' if reply else got.status}: {why}")
         with self._lock:
+            if self._known is not None:
+                self._known.add(mark)
             self._pending.pop(b.key, None)
             say_unsigned = reply.get("signed") is not True and not self._said_unsigned
             self._said_unsigned = self._said_unsigned or say_unsigned
@@ -388,9 +432,10 @@ class HandoffBridge:
                 if not sender or sender == agent_id:
                     continue
                 summary = str((dep["notes_json"].get("result") or {}).get("summary_md") or "").strip()
+                # Initial task context precedes every rework; a redispatch must not give it a newer timestamp.
                 out.append(self.send(boundary(
                     round_=f"dispatch@{task['task_id']}", part=f"dep:{dep_id}", sender=sender, receiver=agent_id,
-                    node_id=task["task_id"],
+                    node_id=task["task_id"], occurred_at=task["created_at"],
                     goal=f"{task['title'] or task['capability']} ({task['capability']}), building on {dep_id} "
                          f"({dep['title'] or dep['capability']}) from {sender}",
                     dod=dod_of(task), files=files_of(dep), blockers=[],
@@ -416,7 +461,7 @@ class HandoffBridge:
                 findings = row.get("findings") or []
                 out.append(self.send(boundary(
                     round_=f"rework{rework}@{task_id}", part=f"gate:{gate}", sender=sender, receiver=producer,
-                    node_id=task_id,
+                    node_id=task_id, occurred_at=task["updated_at"],
                     goal=f"Rework {task['title'] or task_id}: the {gate} gate failed (rework {rework} of "
                          f"{MAX_REWORK_LOOPS})",
                     dod=dod_of(task), files=_merge(files_of(task), _finding_files(findings)),
@@ -445,7 +490,7 @@ class HandoffBridge:
                 lease = self.leases.held(task_id) if self.leases is not None else None
                 return self.send(boundary(
                     round_=f"escalated-a{task['attempt']}r{task['rework_loops']}@{task_id}", part=producer,
-                    sender=producer, receiver=owner, node_id=task_id,
+                    sender=producer, receiver=owner, node_id=task_id, occurred_at=task["updated_at"],
                     goal=f"Take over {task['title'] or task_id}: {reason}",
                     dod=dod_of(task), files=_merge(files_of(task), *(_finding_files(fs) for fs in findings.values())),
                     blockers=blockers,
@@ -471,9 +516,9 @@ class HandoffBridge:
 @dataclass
 class Context:
     """A task's context rebuilt from the ledger. `status` is ok, or the coord_handoff_list outcome that stopped it
-    (unreachable, refused, error, off). goal and dod come from the newest usable packet; blockers from every usable
-    packet of the newest round; files from every usable packet. `packets` lists every packet for the node, oldest
-    first, each with its verdict and trust, rejected ones included."""
+    (unreachable, refused, error, off). goal and dod come from the newest usable boundary by signed transition time,
+    not retry arrival; blockers come from its round and files from all usable packets. `packets` retains storage
+    order, oldest first, with every verdict and trust, rejected rows included."""
     status: str
     graph_id: str
     node_id: str
@@ -510,8 +555,12 @@ def reconstruct(graph_id: str, node_id: str, *, agent: str, workspace: str | Pat
         if not isinstance(packet, dict) or packet.get("node_id") != node_id:
             continue
         verdict = entry.get("verdict") if isinstance(entry.get("verdict"), dict) else {"ok": False, "reason": "malformed"}
+        if not _valid_packet(packet, graph_id):
+            verdict = {"ok": False, "reason": "malformed"}
+        origin, destination = packet.get("from"), packet.get("to")
         packets.append({"event_id": entry.get("event_id"), "ts": str(entry.get("ts") or packet.get("ts") or ""),
-                        "from": (packet.get("from") or {}).get("surface"), "to": (packet.get("to") or {}).get("surface"),
+                        "from": origin.get("surface") if isinstance(origin, dict) else None,
+                        "to": destination.get("surface") if isinstance(destination, dict) else None,
                         "boundary": boundary_key(packet), "trust": trust_of(verdict), "verdict": verdict,
                         "packet": packet})
     packets.sort(key=lambda p: p["ts"])  # stable: the list's own order breaks ties
@@ -519,7 +568,7 @@ def reconstruct(graph_id: str, node_id: str, *, agent: str, workspace: str | Pat
                   detail="" if isinstance(events, list) else f"events_query {queried.status} {queried.detail}".strip())
     usable = [p for p in packets if p["trust"] != REJECTED]
     if usable:
-        newest = usable[-1]
+        newest = max(usable, key=lambda p: (_boundary_time(p["packet"]), p["ts"]))
         rnd = _round(newest["boundary"])
         current = [p for p in usable if rnd is not None and _round(p["boundary"]) == rnd] or [newest]
         ctx.goal = str(newest["packet"].get("goal") or "")

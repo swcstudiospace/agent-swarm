@@ -74,7 +74,7 @@ Sessions: `session_id` is the sender's `<AGENT>@<replica>:<graph_id>`, and for a
 | `blockers` | `[]`, which claims that nothing is known to be in the way | one line per finding: `<gate> [<severity>] <summary> (<file>:<line>)` | the failing findings, and the reason |
 | `graph_id`, `node_id` | the run's Graph ID; the node the receiver works next | | |
 | `to`, `to_session_id` | the receiver's surface and session | | surface only |
-| `notes` | first line `boundary: <key>`, then the upstream's `summary_md` | first line, then the instruction | first line, then attempt and rework counts |
+| `notes` | `boundary: <key>`, then `boundary-at: <Unix seconds>`, a blank line and the upstream summary | same protected header, then the instruction | same protected header, then attempt and rework counts |
 | `lease_id`, `release_lease` | never | never | the producer's lease, when held |
 
 `lease_id` is a request field. The server releases with it only after the packet is stored, and records only
@@ -88,7 +88,7 @@ failure. FAILED normally releases before max-attempt escalation; that later pack
 The runner fits the complete request, including graph/node/session identifiers and an envelope reserve, within 9 kB
 (goal at most 500 characters; at most 40 files, 24 DoD lines and 16 blockers of 300 characters each). It trims files,
 then blockers, then DoD; if necessary, prose and goal are shortened too, with a trim notice in `notes`. Notes respect
-the server's 1200 UTF-16-unit cap without truncating the first-line key. Routing fields that cannot fit even without
+the server's 1200 UTF-16-unit cap without truncating the boundary key or logical-time header. Routing fields that cannot fit even without
 optional content are refused visibly. The server's 12 kB fitting would otherwise drop `notes` and the idempotency key.
 
 ## Idempotency
@@ -101,6 +101,10 @@ Before its first send, a runner reads the graph's packets with `coord_handoff_li
 It skips a boundary already held **from that sender's surface on that node**, and keeps the set current as it writes.
 A re-run, retry or restarted runner therefore writes no second normal boundary. Rejected, tampered or malformed rows,
 and another agent's packet quoting a key, cannot suppress the real one. Unsigned mode remains explicitly unauthenticated.
+
+After an uncertain write, the next send refreshes the ledger keys before retrying. A stored packet whose reply was
+lost is skipped when that read finds it; an unanswered list defers the write. The refresh retains locally confirmed
+packets and in-flight reservations, and a snapshot crossed by another uncertain write is not used to authorize a retry.
 
 Two runner processes reconciling one Task Store cannot both write a gate or escalation packet: the transition behind it
 is a compare-and-swap that only one of them wins. A dependency packet is written by the replica that holds the
@@ -135,7 +139,7 @@ construction, and watching `open` / `sqlite3.connect` with an audit hook.
 | `Context` field | From |
 |---|---|
 | `packets` | every packet for the node, oldest first, each with `from`, `to`, `boundary`, the server's `verdict` and a `trust` |
-| `goal`, `dod`, `sender`, `lease_handover` | the newest usable packet |
+| `goal`, `dod`, `sender`, `lease_handover` | the usable packet with the newest signed logical boundary time, not the latest retry arrival |
 | `blockers` | every usable packet of the newest round, e.g. all gates that failed in one review |
 | `files` | every usable packet |
 | `signed` | every packet of the newest round verified |
@@ -145,6 +149,15 @@ construction, and watching `open` / `sqlite3.connect` with an audit hook.
 Trust comes from the verdict. `verified` (`ok: true`) is used. `unsigned` (`unsigned`, `no-keys-configured`, which the
 server calls unauthenticated rather than forged) is used and flagged. `rejected` (`bad-signature`, `unknown-key`,
 `unknown-alg`, `malformed`) is listed and never shapes the context.
+
+Routing objects, graph/node identity, version, required strings and string lists must also be well formed. A malformed
+row is listed as rejected and cannot throw away healthy handoffs or shape the context even if it claims a good verdict.
+
+`boundary-at` anchors initial dependency context to the receiving task's immutable `created_at`, and gate/escalation
+context to its transition's `updated_at`. Regenerating a dependency packet on redispatch therefore cannot make it newer
+than rework instructions. Queued retries retain that anchor; the timestamp comes from the existing Task Store, not a
+new store or a distributed causal clock. Previously persisted packets without the header use their signed packet time.
+The packet list remains in ledger storage order for the audit trail; only current-boundary selection uses this anchor.
 
 The runner uses it: each assignment carries a `## Handoffs (from the substrate ledger)` section, rendered by
 `render()`, after the Task Store's upstream section, whenever the node has packets. The dependency packets are written
