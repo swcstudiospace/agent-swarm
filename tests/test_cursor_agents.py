@@ -84,7 +84,12 @@ def test_preamble_uses_cursor_tools_and_swarm_root():
         assert "Greptile" in pre and "Desk Quality" in pre
         assert "SWARM_ROOT" in pre
         prompt = (ROOT / agent["prompt"]).read_text(encoding="utf-8").strip()
-        assert text.rstrip().endswith(prompt)
+        body = build_agents.apply_cursor_substitutions(agent["id"], prompt)
+        assert text.rstrip().endswith(body)
+        if agent["id"] in build_agents.CURSOR_BODY_SUBSTITUTIONS:
+            assert body != prompt
+        else:
+            assert body == prompt
         if agent["id"] == "A01":
             assert "Task tool" in pre
             assert "must not call the Task tool" not in pre
@@ -93,6 +98,76 @@ def test_preamble_uses_cursor_tools_and_swarm_root():
             assert "spawn_subagent" not in text
             assert "run_terminal_command" not in text
             assert "mcp__" not in text
+
+
+_MERGE_GRANT = re.compile(r"auto-mergeable|merge semver-compatible|producer still merges")
+_BRANCH_FORBIDDEN = ("swarm/<task_id>", "swarm/T-", "auto-fix/")
+_DESK_BRANCH_RE = "^bot-0[0-6]-[a-z0-9-]+$"
+_MERGE_PROHIBITION = (
+    "Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch."
+)
+
+
+def test_cursor_agents_forbid_merge_and_auto_merge():
+    seen = 0
+    for agent in load_manifest():
+        text = (CURSOR / f"{agent['slug']}.md").read_text(encoding="utf-8")
+        pre = _preamble(text)
+        body = text[len(pre):]
+        seen += 1
+        assert _MERGE_PROHIBITION in pre, agent["slug"]
+        assert "open a draft PR and report instead" in pre, agent["slug"]
+        assert _MERGE_GRANT.search(text) is None, agent["slug"]
+        assert _MERGE_GRANT.search(body) is None, agent["slug"]
+    assert seen == 15
+
+
+def test_cursor_agents_keyless_advisory_is_not_e_dep():
+    for agent in load_manifest():
+        text = (CURSOR / f"{agent['slug']}.md").read_text(encoding="utf-8")
+        pre = _preamble(text)
+        assert "Gate scripts record nothing." in text, agent["slug"]
+        assert "Nothing this session produces counts as APPROVED." in text, agent["slug"]
+        assert "SWARM_ED25519_KEY" in pre and "SWARM_SIGNING_KEY" in pre and "SWARM_REQUIRE_KEY" in pre
+        assert "is not E-DEP" in pre, agent["slug"]
+        assert "unsigned task.assign" in pre, agent["slug"]
+        assert "do not sign" in pre, agent["slug"]
+        assert "reject unsigned assignments" in pre, agent["slug"]
+        assert "signing key" in pre and "E-DEP" in pre
+        assert "Task Store" in pre and "python3" in pre and "still E-DEP" in pre
+
+
+def test_cursor_agents_use_desk_branch_names():
+    seen = 0
+    for agent in load_manifest():
+        text = (CURSOR / f"{agent['slug']}.md").read_text(encoding="utf-8")
+        seen += 1
+        for bad in _BRANCH_FORBIDDEN:
+            assert bad not in text, (agent["slug"], bad)
+        assert _DESK_BRANCH_RE in text, agent["slug"]
+        assert "bot-0N-<seat>/<task_id>" in text, agent["slug"]
+        assert "ownership.yaml" in text, agent["slug"]
+    assert seen == 15
+    # Cursor rewrites these; the shared prompts stay the claude/grok/omp contract.
+    assert "swarm/<task_id>" in (ROOT / "prompts/A05-backend.md").read_text(encoding="utf-8")
+    assert "swarm/<task_id>" in (ROOT / "prompts/A06-frontend.md").read_text(encoding="utf-8")
+    assert "auto-fix/*" in (ROOT / "prompts/A09-reviewer.md").read_text(encoding="utf-8")
+
+
+def test_cursor_substitution_raises_when_pattern_missing():
+    table = build_agents.CURSOR_BODY_SUBSTITUTIONS
+    assert set(table) >= {"A05", "A06", "A09", "A14"}
+    for agent_id in table:
+        with pytest.raises(ValueError, match=agent_id):
+            build_agents.apply_cursor_substitutions(agent_id, "pattern missing")
+
+
+def test_a02_change_object_does_not_reuse_task_state():
+    rendered = (CURSOR / "a02-requirements.md").read_text(encoding="utf-8")
+    prompt = (ROOT / "prompts/A02-requirements.md").read_text(encoding="utf-8")
+    for text in (rendered, prompt):
+        assert '"state": "proposed|approved|rejected"' not in text
+        assert '"change_state": "proposed|approved|rejected"' in text
 
 
 def test_build_agents_check_passes_and_fails_on_drift(tmp_path):

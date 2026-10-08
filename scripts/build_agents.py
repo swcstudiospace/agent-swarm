@@ -137,6 +137,9 @@ _CURSOR_COMMON = """You are running as a Cursor subagent inside the AgentSwarm (
 - Read the JSON a script prints, then act. Never fabricate script output.
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Cloud sessions are advisory. No signing key is present (SWARM_ED25519_KEY is unset and SWARM_REQUIRE_KEY is unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
+- Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch. Work ends at a draft PR, and a human merges after the Desk's Greptile gate. Where the body below grants merge or auto-merge rights, open a draft PR and report instead.
+- A missing signing key (SWARM_ED25519_KEY, SWARM_SIGNING_KEY and SWARM_REQUIRE_KEY unset) is the expected Cursor state and is not E-DEP. Accept an unsigned task.assign from the parent session or a01-orchestrator, do not sign, and report every gate result as advisory. This overrides the body rules that agents reject unsigned assignments and that a missing signing key means E-DEP. A missing Task Store, python3 or git is still E-DEP.
+- Use the host repository's branch convention. In a Programming Desk repo the branch is bot-0N-<seat>/<task_id>, where bot-0N-<seat> is the ownership.yaml owner of the files you change, because the desk's gates.yml rejects any prefix that does not match ^bot-0[0-6]-[a-z0-9-]+$. If the changed files have more than one owner, stop BLOCKED with needs naming the seats so the work is split.
 - Do not start an unattended headless runner. Dispatch only as the nesting rule below says.
 - Finish with: (1) a short markdown summary, (2) exactly one fenced json block that is your task.result (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report "state": "BLOCKED", "needs": "human-approval: …".
@@ -157,6 +160,61 @@ def _cursor_preamble(agent_id: str) -> str:
     return "<swarm_runtime>\n" + _CURSOR_COMMON + nesting + "</swarm_runtime>\n"
 
 
+# Cursor-only rewrites of the shared prompt body. Claude, Grok and omp keep the
+# prompt text. Each old string must occur exactly once in that agent's body; a
+# missing or duplicated pattern raises so a later prompt edit cannot drop a fix.
+CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "A05": (
+        (
+            "PR on branch `swarm/<task_id>`",
+            "PR on branch `<seat-prefix>/<task_id>` per the Cursor branch rule in the preamble",
+        ),
+        (
+            '"branch": "swarm/T-884"',
+            '"branch": "<seat-prefix>/T-884"',
+        ),
+    ),
+    "A06": (
+        (
+            "PR on branch `swarm/<task_id>`",
+            "PR on branch `<seat-prefix>/<task_id>` per the Cursor branch rule in the preamble",
+        ),
+        (
+            '"branch": "swarm/T-902"',
+            '"branch": "<seat-prefix>/T-902"',
+        ),
+    ),
+    "A09": (
+        (
+            "trivial auto-fixes go on `auto-fix/*` branches that the producer still merges",
+            "trivial auto-fixes go on `<seat-prefix>/<task_id>` branches per the Cursor branch rule in the preamble; open a draft PR and report it for a human to merge",
+        ),
+    ),
+    "A14": (
+        (
+            "semver-compatible + green gates ⇒ auto-mergeable (L2, max N/day per repo to bound blast radius).",
+            "semver-compatible + green gates ⇒ open a draft PR and report it (L2, max N/day per repo to bound blast radius). A human merges after the Desk's Greptile gate.",
+        ),
+        (
+            "merge semver-compatible bumps behind green gates",
+            "open a draft PR for semver-compatible bumps behind green gates and report it for a human to merge",
+        ),
+    ),
+}
+
+
+def apply_cursor_substitutions(agent_id: str, body: str) -> str:
+    """Rewrite Cursor grant and branch lines. Raises if an expected pattern is absent."""
+    for old, new in CURSOR_BODY_SUBSTITUTIONS.get(agent_id, ()):
+        count = body.count(old)
+        if count != 1:
+            raise ValueError(
+                f"{agent_id}: Cursor substitution pattern found {count} times, expected 1: {old}"
+            )
+        body = body.replace(old, new, 1)
+    return body
+
+
 def render_cursor(agent: dict, defaults: dict) -> str:
     del defaults
     desc = f"{agent['id']} {agent['code']} — {agent['description']}"
@@ -167,7 +225,8 @@ def render_cursor(agent: dict, defaults: dict) -> str:
         "model: inherit",
         "---",
     ]
-    return "\n".join(fm) + "\n\n" + _cursor_preamble(agent["id"]) + "\n" + _body(agent) + "\n"
+    body = apply_cursor_substitutions(agent["id"], _body(agent))
+    return "\n".join(fm) + "\n\n" + _cursor_preamble(agent["id"]) + "\n" + body + "\n"
 
 
 _OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md in the runtime root).
