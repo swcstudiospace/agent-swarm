@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -154,12 +155,95 @@ def test_cursor_agents_use_desk_branch_names():
     assert "auto-fix/*" in (ROOT / "prompts/A09-reviewer.md").read_text(encoding="utf-8")
 
 
+_GATE_SCRIPTS = ("qa_gate", "rev_gate", "sec_gate", "rel_plan")
+_KEY_ASSIGN = re.compile(r"SWARM_(?:SIGNING_KEY|ED25519_KEY|ALLOW_INSECURE_DEV_KEY)\s*=")
+_STRIPPED_KEYS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
+                  "SWARM_AGENT_SESSION")
+
+
+def test_cursor_gate_scripts_are_non_recording_previews():
+    seen = 0
+    for agent in load_manifest():
+        text = (CURSOR / f"{agent['slug']}.md").read_text(encoding="utf-8")
+        pre = _preamble(text)
+        seen += 1
+        assert "SWARM_AGENT_SESSION=1" in pre, agent["slug"]
+        for script in _GATE_SCRIPTS:
+            assert script in pre, (agent["slug"], script)
+        assert "Never set SWARM_SIGNING_KEY, SWARM_ED25519_KEY or SWARM_ALLOW_INSECURE_DEV_KEY" in pre
+        assert _KEY_ASSIGN.search(text) is None, agent["slug"]
+        assert "never ingest a gate result" in pre, agent["slug"]
+        assert "Gate scripts record nothing." in text
+        assert "Nothing this session produces counts as APPROVED." in text
+    assert seen == 15
+
+
+def _verdict_rows(swarm: Path) -> list[dict]:
+    con = sqlite3.connect(swarm / "tasks.db")
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute("SELECT * FROM verdicts ORDER BY id")]
+    con.close()
+    return rows
+
+
+def _events_of(swarm: Path, etype: str) -> list[dict]:
+    path = swarm / "events.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if f'"{etype}"' in ln]
+
+
+def test_cursor_gate_preview_records_no_rows(tmp_path, swarm_dir):
+    """A leased non-dry-run quality gate records nothing under SWARM_AGENT_SESSION=1.
+
+    On this base (signing still falls back to the dev key) the same call without that
+    variable records verdict rows. That control is what the Cursor rule prevents.
+    """
+    work = tmp_path / "work"
+    (work / "tests").mkdir(parents=True)
+    (work / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_KEYS}
+    env["SWARM_DIR"] = str(swarm_dir)
+    plan = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--brief-text", "x",
+         "--pattern", "feature", "--prefix", "X", "--risk-class", "low", "--repo", str(work), "--json"],
+        capture_output=True, text=True, env=env, cwd=ROOT,
+    )
+    assert plan.returncode == 0, plan.stdout + plan.stderr
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    for state in ("CLAIMED", "IN_PROGRESS"):
+        ts.transition("X-qa", state)
+    assert ts.get("X-qa")["state"] == "IN_PROGRESS"
+    assert "dry_run" not in ts.get("X-qa")["notes_json"]
+    gate = [sys.executable, str(ROOT / "scripts" / "qa_gate.py"),
+            "--root", str(work), "--task-id", "X-qa", "--json"]
+    session = subprocess.run(gate, capture_output=True, text=True, env={**env, "SWARM_AGENT_SESSION": "1"}, cwd=ROOT)
+    assert session.returncode in (0, 1), session.stdout + session.stderr
+    assert _verdict_rows(swarm_dir) == []
+    unrecorded = _events_of(swarm_dir, "gate.verdict.unrecorded")
+    assert unrecorded and any(e["payload"].get("task_id") == "X-qa" for e in unrecorded)
+    assert (swarm_dir / "verdicts" / "X-qa.quality.json").is_file()
+    control = subprocess.run(gate, capture_output=True, text=True, env=env, cwd=ROOT)
+    assert control.returncode in (0, 1), control.stdout + control.stderr
+    assert _verdict_rows(swarm_dir), "keyless gate without SWARM_AGENT_SESSION recorded no rows on this base"
+
+
 def test_cursor_substitution_raises_when_pattern_missing():
     table = build_agents.CURSOR_BODY_SUBSTITUTIONS
     assert set(table) >= {"A05", "A06", "A09", "A14"}
-    for agent_id in table:
+    olds = [old for pairs in table.values() for old, _ in pairs]
+    for new in (new for pairs in table.values() for _, new in pairs):
+        for old in olds:
+            assert old not in new, old
+    for agent_id, substitutions in table.items():
         with pytest.raises(ValueError, match=agent_id):
             build_agents.apply_cursor_substitutions(agent_id, "pattern missing")
+        body = "\n".join(old for old, _ in substitutions)
+        build_agents.apply_cursor_substitutions(agent_id, body)
+        for old, _ in substitutions:
+            with pytest.raises(ValueError, match=agent_id):
+                build_agents.apply_cursor_substitutions(agent_id, f"{body}\n{old}")
 
 
 def test_a02_change_object_does_not_reuse_task_state():

@@ -138,7 +138,8 @@ _CURSOR_COMMON = """You are running as a Cursor subagent inside the AgentSwarm (
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Cloud sessions are advisory. No signing key is present (SWARM_ED25519_KEY is unset and SWARM_REQUIRE_KEY is unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
 - Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch. Work ends at a draft PR, and a human merges after the Desk's Greptile gate. Where the body below grants merge or auto-merge rights, open a draft PR and report instead.
-- A missing signing key (SWARM_ED25519_KEY, SWARM_SIGNING_KEY and SWARM_REQUIRE_KEY unset) is the expected Cursor state and is not E-DEP. Accept an unsigned task.assign from the parent session or a01-orchestrator, do not sign, and report every gate result as advisory. This overrides the body rules that agents reject unsigned assignments and that a missing signing key means E-DEP. A missing Task Store, python3 or git is still E-DEP.
+- A missing signing key (SWARM_ED25519_KEY, SWARM_SIGNING_KEY and SWARM_REQUIRE_KEY unset) is the expected Cursor state and is not E-DEP. Accept an unsigned task.assign from the parent session or a01-orchestrator, and do not sign. A gate call is a non-recording preview under the rule below, so report every gate result as advisory. This overrides the body rules that agents reject unsigned assignments and that a missing signing key means E-DEP. A missing Task Store, python3 or git is still E-DEP.
+- Run every gate script (qa_gate, rev_gate, sec_gate, rel_plan, through python3 or the bun twin) only as a non-recording preview, with SWARM_AGENT_SESSION=1 in its environment, for example SWARM_AGENT_SESSION=1 python3 "$SWARM_ROOT/scripts/qa_gate.py" --root <target repo> --task-id <id> --correlation-id <id> --json. The script then writes an advisory envelope file and records no verdict rows. Never set SWARM_SIGNING_KEY, SWARM_ED25519_KEY or SWARM_ALLOW_INSECURE_DEV_KEY, never sign or record a verdict, and never ingest a gate result or transition any task to APPROVED or DONE. A gate result that fails, is refused or is unrecorded is advisory, never a pass.
 - Use the host repository's branch convention. In a Programming Desk repo the branch is bot-0N-<seat>/<task_id>, where bot-0N-<seat> is the ownership.yaml owner of the files you change, because the desk's gates.yml rejects any prefix that does not match ^bot-0[0-6]-[a-z0-9-]+$. If the changed files have more than one owner, stop BLOCKED with needs naming the seats so the work is split.
 - Do not start an unattended headless runner. Dispatch only as the nesting rule below says.
 - Finish with: (1) a short markdown summary, (2) exactly one fenced json block that is your task.result (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
@@ -164,6 +165,16 @@ def _cursor_preamble(agent_id: str) -> str:
 # prompt text. Each old string must occur exactly once in that agent's body; a
 # missing or duplicated pattern raises so a later prompt edit cannot drop a fix.
 CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "A01": (
+        (
+            "When a subagent returns, apply its result: `orch_status.py --repo <app> --ingest` its task.result, then re-read status. Gate tasks are those with capability `gate.*` and notes.gate set; gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself.",
+            "When a subagent returns, ingest a non-gate task.result with `orch_status.py --repo <app> --ingest`, then re-read status. Never ingest a gate result (capability `gate.*` with notes.gate set) and never transition any task to APPROVED or DONE. Gate scripts are non-recording previews under the Cursor gate rule in the preamble.",
+        ),
+        (
+            "5. Ingest each child's JSON via `orch_status.py --repo <app> --ingest`. Gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself. Apply fail-closed gates and the max-2 rework loop.",
+            "5. Ingest each non-gate child's JSON via `orch_status.py --repo <app> --ingest`. Never ingest a gate result and never transition any task to APPROVED or DONE; the gate result stays advisory under the Cursor gate rule in the preamble. Apply the max-2 rework loop only from verdict rows recorded outside this session.",
+        ),
+    ),
     "A05": (
         (
             "PR on branch `swarm/<task_id>`",
