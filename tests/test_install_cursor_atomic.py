@@ -1,6 +1,7 @@
 """Cursor installer: a failed update leaves the previous export, and installer-owned leftovers are pruned."""
 import hashlib
 import json
+import os
 import sys
 from io import StringIO
 from pathlib import Path
@@ -129,3 +130,99 @@ def test_removed_slug_pruned_and_edited_kept(tmp_path):
     # the manifest slugs are still present
     for agent in load_manifest():
         assert (agents / f"{agent['slug']}.md").is_file()
+
+
+def test_failed_restore_leaves_backup_and_names_unrestored(tmp_path, monkeypatch):
+    """A publish failure followed by a failed restore leaves the backup and names the unrestored file.
+    The success line is printed only when every restore worked."""
+    source = _source_from_export(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    before = _snapshot(target)
+    agents = sorted((source / ".cursor" / "agents").glob("*.md"))
+    assert len(agents) >= 2
+    for path in agents[:2]:
+        path.write_text(path.read_text(encoding="utf-8") + "\n# regenerated\n", encoding="utf-8")
+    first = target / agents[0].relative_to(source)
+    state = {"n": 0, "fail_restore": False}
+    real_write = Path.write_text
+    real_replace = os.replace
+
+    def wrapped_write(self, data, *args, **kwargs):
+        state["n"] += 1
+        if state["n"] == 2:
+            state["fail_restore"] = True
+            raise OSError("injected write failure")
+        return real_write(self, data, *args, **kwargs)
+
+    def wrapped_replace(src, dst, *args, **kwargs):
+        if state["fail_restore"] and Path(dst).name == first.name and not str(dst).endswith(".agent-swarm-bak"):
+            raise OSError("injected restore failure")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", wrapped_write)
+    monkeypatch.setattr(cursor_install.os, "replace", wrapped_replace)
+    err = StringIO()
+    rc = cursor_install.install_cursor(target, source=source, err=err)
+    text = err.getvalue()
+    assert rc == 2
+    assert "Traceback" not in text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert "Restored the previous Cursor export" not in text
+    backup = first.parent / f".{first.name}.agent-swarm-bak"
+    assert backup.is_file()
+    assert first.as_posix() in text and backup.as_posix() in text
+    assert backup.read_bytes() == before[first.relative_to(target).as_posix()]
+    stamp = json.loads((target / cursor_install.STAMP_REL).read_text(encoding="utf-8"))
+    assert stamp == json.loads(before[cursor_install.STAMP_REL].decode())
+
+
+def test_symlinked_agents_dir_is_not_unlinked(tmp_path, monkeypatch):
+    """An export that retires agents must not delete through a symlinked .cursor/agents directory."""
+    source = _source_from_export(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    real = tmp_path / "real-agents"
+    agents = target / ".cursor" / "agents"
+    agents.rename(real)
+    agents.symlink_to(real)
+    held = {p.name: p.read_bytes() for p in real.iterdir() if p.is_file()}
+    assert held
+    original = cursor_install.export_sources
+
+    def rule_only(src=None):
+        files = original(src)
+        return {rel: text for rel, text in files.items() if not rel.startswith(".cursor/agents/")}
+
+    monkeypatch.setattr(cursor_install, "export_sources", rule_only)
+    err = StringIO()
+    rc = cursor_install.install_cursor(target, source=source, err=err)
+    assert rc == 2, err.getvalue()
+    assert "symlink" in err.getvalue().lower()
+    assert "Traceback" not in err.getvalue()
+    after = {p.name: p.read_bytes() for p in real.iterdir() if p.is_file()}
+    assert after == held
+
+
+def test_non_utf8_retired_file_is_a_local_edit(tmp_path):
+    """A retired file that is not valid UTF-8 is kept, named on stderr, and left out of the new stamp."""
+    source = _source_from_export(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    binary = target / ".cursor" / "agents" / "zz-binary.md"
+    payload = b"owned\xff\xfe"
+    binary.write_bytes(payload)
+    stamp_path = target / cursor_install.STAMP_REL
+    stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    stamp["files"][".cursor/agents/zz-binary.md"] = _sha("owned\n")
+    stamp_path.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+    err = StringIO()
+    assert cursor_install.install_cursor(target, source=source, err=err) == 0
+    assert binary.read_bytes() == payload
+    assert ".cursor/agents/zz-binary.md" in err.getvalue()
+    recorded = json.loads(stamp_path.read_text(encoding="utf-8"))["files"]
+    assert ".cursor/agents/zz-binary.md" not in recorded

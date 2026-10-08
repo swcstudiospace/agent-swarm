@@ -13,10 +13,14 @@ with no such record is refused, and nothing is written. Symlinks on the target p
 a destination are refused the same way as ``_install_omp.unsafe_destinations``.
 
 A real install stages each managed file in its own directory, replaces those files, then
-publishes the stamp last with ``os.replace``. If a step fails, files already replaced are
-restored and the previous stamp is left in place. When the stamp is ours, a regular file
+publishes the stamp last with ``os.replace``. Each replaced or removed file's previous
+bytes are kept in a sibling backup until the install succeeds. A failed step restores
+from that backup via a staged ``os.replace`` (never truncating the live file in place)
+and leaves the previous stamp. If one restore fails, the rest still run; backups of
+unrestored files stay, and stderr names them. When the stamp is ours, a regular file
 it records under ``.cursor/agents/`` that this export no longer produces is removed if its
-sha256 still matches; a locally edited file is left in place and named on stderr.
+sha256 still matches; a locally edited file, including one that is not valid UTF-8, is
+left in place and named on stderr.
 
 The target must be an existing directory outside this agent-swarm checkout and not ``$HOME``.
 A follow-up run against swcstudiospace/programming-desk uses this script; that repo does not
@@ -45,6 +49,7 @@ from _install_omp import UnsafeDestination, unsafe_destinations  # noqa: E402
 STAMP_REL = ".cursor/.agent-swarm-cursor.json"
 STAMP_INSTALLER = "agent-swarm-cursor"
 RULE_REL = ".cursor/rules/agent-swarm.mdc"
+_BACKUP_SUFFIX = ".agent-swarm-bak"
 
 
 class CursorInstallError(Exception):
@@ -219,7 +224,8 @@ def plan_install(target: Path, sources: dict[str, str]) -> tuple[dict[str, str],
                 continue
             if not dest.is_file():
                 continue
-            if _sha(dest.read_text(encoding="utf-8")) == prev:
+            # byte hash: matches _sha() for unchanged UTF-8, and treats non-UTF-8 as a local edit
+            if hashlib.sha256(dest.read_bytes()).hexdigest() == prev:
                 removals.append(rel)
             else:
                 kept.append(rel)
@@ -250,36 +256,129 @@ def _stage_text(dest: Path, text: str) -> Path:
     return path
 
 
-def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]]) -> None:
-    """Stage ``text`` and replace ``dest``. ``replaced`` records the previous bytes (None if new)."""
-    prev = dest.read_bytes() if dest.is_file() and not dest.is_symlink() else None
-    if dest.exists() and (dest.is_symlink() or not dest.is_file()):
-        raise UnsafeDestination(f"{dest} is a symlink") if dest.is_symlink() else OSError(f"{dest} is not a regular file")
-    tmp = _stage_text(dest, text)
+def _backup_path(dest: Path) -> Path:
+    return dest.parent / f".{dest.name}{_BACKUP_SUFFIX}"
+
+
+def _stage_bytes(parent: Path, prefix: str, data: bytes) -> Path:
+    """Temp file of ``data`` in ``parent``. Never created through a symlink, and not via write_text."""
+    if parent.is_symlink():
+        raise UnsafeDestination(f"{parent} is a symlink")
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise UnsafeDestination(f"{parent} is a symlink")
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=".part", dir=os.fspath(parent))
+    os.close(fd)
+    path = Path(name)
+    try:
+        path.write_bytes(data)
+    except Exception:
+        if path.exists() and not path.is_symlink():
+            path.unlink()
+        raise
+    return path
+
+
+def _replace_bytes(dest: Path, data: bytes) -> None:
+    """Replace ``dest`` from a staged temp. Does not truncate ``dest`` first."""
+    if dest.is_symlink():
+        raise UnsafeDestination(f"{dest} is a symlink")
+    tmp = _stage_bytes(dest.parent, f".{dest.name}.", data)
     try:
         os.replace(tmp, dest)
     except Exception:
         if tmp.exists() and not tmp.is_symlink():
             tmp.unlink()
         raise
+
+
+def _save_backup(dest: Path, data: bytes) -> None:
+    bak = _backup_path(dest)
+    if bak.is_symlink():
+        raise UnsafeDestination(f"{bak} is a symlink")
+    _replace_bytes(bak, data)
+
+
+def _drop_backup(dest: Path) -> None:
+    bak = _backup_path(dest)
+    if bak.is_symlink():
+        raise UnsafeDestination(f"{bak} is a symlink")
+    if bak.is_file():
+        bak.unlink()
+
+
+class RestoreIncomplete(Exception):
+    """One or more files could not be put back. ``unrestored`` is (live path, backup path)."""
+
+    def __init__(self, unrestored: list[tuple[Path, Path]]):
+        self.unrestored = unrestored
+        super().__init__(unrestored)
+
+
+def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]]) -> None:
+    """Stage ``text`` and replace ``dest``. ``replaced`` records the previous bytes (None if new).
+
+    Previous bytes are copied to a sibling backup before the replace. The backup stays until
+    the install succeeds.
+    """
+    prev = dest.read_bytes() if dest.is_file() and not dest.is_symlink() else None
+    if dest.exists() and (dest.is_symlink() or not dest.is_file()):
+        raise UnsafeDestination(f"{dest} is a symlink") if dest.is_symlink() else OSError(f"{dest} is not a regular file")
+    if prev is not None:
+        _save_backup(dest, prev)
+    try:
+        tmp = _stage_text(dest, text)
+        try:
+            os.replace(tmp, dest)
+        except Exception:
+            if tmp.exists() and not tmp.is_symlink():
+                tmp.unlink()
+            raise
+    except Exception:
+        # dest was not replaced; drop the backup so a failed stage leaves no extra file
+        if prev is not None:
+            _drop_backup(dest)
+        raise
     replaced.append((dest, prev))
 
 
-def _rollback(replaced: list[tuple[Path, bytes | None]], removed: list[tuple[Path, bytes]]) -> None:
-    for path, data in reversed(removed):
-        path.write_bytes(data)
-    for path, prev in reversed(replaced):
-        if prev is None:
-            if path.is_file() and not path.is_symlink():
+def _restore_one(path: Path, data: bytes | None) -> Path | None:
+    """Put ``path`` back. Returns the backup path when this file could not be restored."""
+    bak = _backup_path(path)
+    try:
+        if data is None:
+            if path.is_symlink():
+                raise UnsafeDestination(f"{path} is a symlink")
+            if path.is_file():
                 path.unlink()
         else:
-            path.write_bytes(prev)
+            blob = bak.read_bytes() if bak.is_file() and not bak.is_symlink() else data
+            _replace_bytes(path, blob)
+    except OSError:
+        return bak
+    _drop_backup(path)
+    return None
+
+
+def _rollback(replaced: list[tuple[Path, bytes | None]], removed: list[tuple[Path, bytes]]) -> list[tuple[Path, Path]]:
+    """Restore every file. A failure is recorded and the remaining files are still restored."""
+    unrestored: list[tuple[Path, Path]] = []
+    for path, data in reversed(removed):
+        failed = _restore_one(path, data)
+        if failed is not None:
+            unrestored.append((path, failed))
+    for path, prev in reversed(replaced):
+        failed = _restore_one(path, prev)
+        if failed is not None:
+            unrestored.append((path, failed))
+    return unrestored
 
 
 def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None:
     """Replace managed files, drop installer-owned leftovers, then publish the stamp last.
 
     On failure, restore every file already replaced or removed and leave the old stamp.
+    Raises RestoreIncomplete when a restore itself fails; those backups are left in place.
     """
     replaced: list[tuple[Path, bytes | None]] = []
     removed: list[tuple[Path, bytes]] = []
@@ -293,17 +392,45 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
             if path.is_symlink() or not path.is_file():
                 continue
             data = path.read_bytes()
+            _save_backup(path, data)
             path.unlink()
             removed.append((path, data))
         if STAMP_REL in writes:
             _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced)
-    except (OSError, UnsafeDestination):
-        _rollback(replaced, removed)
+    except (OSError, UnsafeDestination) as exc:
+        unrestored = _rollback(replaced, removed)
+        if unrestored:
+            raise RestoreIncomplete(unrestored) from exc
         raise
+    else:
+        for path, _prev in replaced:
+            _drop_backup(path)
+        for path, _data in removed:
+            _drop_backup(path)
 
 
-def _check_symlinks(target: Path, rels: list[str]) -> None:
+def _recorded_agent_rels(target: Path) -> list[str]:
+    """Agent paths the previous stamp records. Empty when there is no stamp of ours."""
+    try:
+        _raw, stamp = _read_stamp(target / STAMP_REL)
+    except (OSError, UnicodeDecodeError, UnsafeDestination):
+        return []
+    files = stamp.get("files") if isinstance(stamp, dict) else None
+    if not isinstance(files, dict):
+        return []
+    return [rel for rel in files if isinstance(rel, str) and _agents_rel(rel)]
+
+
+def _check_symlinks(target: Path, sources: dict[str, str]) -> None:
+    """Refuse a symlink on a new file, a recorded agent path, or ``.cursor`` / ``.cursor/agents``.
+
+    Recorded agent paths are included so an export that produces no agents still checks the
+    directory it would delete from. Runs before plan_install reads a retirement candidate.
+    """
+    rels = list(sources) + [STAMP_REL, *(_recorded_agent_rels(target))]
     dests = [_dest(target, rel) for rel in rels]
+    dests.append(target / ".cursor")
+    dests.append(target / ".cursor" / "agents")
     reasons = unsafe_destinations(target, dests)
     if reasons:
         raise UnsafeDestination("; ".join(reasons))
@@ -327,7 +454,7 @@ def install_cursor(
     try:
         dest_root = logical_target(os.fspath(target))
         sources = export_sources(source)
-        _check_symlinks(dest_root, list(sources) + [STAMP_REL])
+        _check_symlinks(dest_root, sources)
         writes, refusals, removals, kept = plan_install(dest_root, sources)
     except UnsafeDestination as exc:
         print(
@@ -372,6 +499,13 @@ def install_cursor(
         return 0
     try:
         _apply(dest_root, writes, removals)
+    except RestoreIncomplete as exc:
+        named = ", ".join(f"{path} (backup {bak})" for path, bak in exc.unrestored)
+        print(
+            f"error: restore incomplete: {named}. The stamp was left unchanged.",
+            file=stderr,
+        )
+        return 2
     except UnsafeDestination as exc:
         print(
             f"error: refusing to install into {target}: {exc}; the installer never writes through a symlink. "
