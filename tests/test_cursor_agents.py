@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from swarm.manifest import load_manifest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -262,11 +264,73 @@ def test_skill_frontmatter_is_name_and_description_only():
     assert "SWARM_ROOT" in text
 
 
+_SUBSTRATE_PATHS = ("swarm/substrate_mcp.json", "scripts/_install_substrate.py")
+_BRANCH_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def _git_bytes(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, env=env)
+
+
+def _ref_exists(ref: str) -> bool:
+    return _git_bytes(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"]).returncode == 0
+
+
+def _branch_ok(name: str) -> bool:
+    return bool(name) and not name.startswith("-") and ".." not in name.split("/") and bool(_BRANCH_NAME.fullmatch(name))
+
+
+def _base_names() -> list[str]:
+    """PR base first (GITHUB_BASE_REF), then main. Names only, never a remote URL."""
+    names: list[str] = []
+    env_base = os.environ.get("GITHUB_BASE_REF", "").strip()
+    if _branch_ok(env_base):
+        names.append(env_base)
+    if "main" not in names:
+        names.append("main")
+    return names
+
+
+def _candidate_refs() -> list[str]:
+    refs: list[str] = []
+    for name in _base_names():
+        for ref in (f"origin/{name}", name):
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def _fetch_base(name: str) -> bool:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    proc = _git_bytes(
+        ["fetch", "--depth=1", "origin", f"+refs/heads/{name}:refs/remotes/origin/{name}"],
+        env=env,
+    )
+    return proc.returncode == 0 and _ref_exists(f"origin/{name}")
+
+
+def substrate_base_ref() -> str:
+    """Commit-ish of the PR base. A shallow pull checkout has no local main until fetched."""
+    for ref in _candidate_refs():
+        if _ref_exists(ref):
+            return ref
+    for name in _base_names():
+        if _fetch_base(name):
+            return f"origin/{name}"
+    pytest.skip(
+        "no base ref for the substrate byte compare; "
+        f"none of {', '.join(_candidate_refs())} resolved and "
+        f"git fetch --depth=1 origin of {', '.join(_base_names())} did not create one"
+    )
+
+
 def test_substrate_spec_is_byte_identical_to_main():
-    for rel in ("swarm/substrate_mcp.json", "scripts/_install_substrate.py"):
-        show = subprocess.run(["git", "show", f"main:{rel}"], cwd=ROOT, capture_output=True)
-        assert show.returncode == 0, rel
-        assert (ROOT / rel).read_bytes() == show.stdout
+    ref = substrate_base_ref()
+    for rel in _SUBSTRATE_PATHS:
+        show = _git_bytes(["show", f"{ref}:{rel}"])
+        assert show.returncode == 0, f"{ref}:{rel} is not in the base"
+        assert (ROOT / rel).read_bytes() == show.stdout, rel
 
 
 def test_rule_uses_documented_frontmatter():
