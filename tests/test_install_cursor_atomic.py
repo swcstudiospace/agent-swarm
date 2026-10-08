@@ -226,3 +226,76 @@ def test_non_utf8_retired_file_is_a_local_edit(tmp_path):
     assert ".cursor/agents/zz-binary.md" in err.getvalue()
     recorded = json.loads(stamp_path.read_text(encoding="utf-8"))["files"]
     assert ".cursor/agents/zz-binary.md" not in recorded
+
+
+def test_existing_backup_is_not_overwritten(tmp_path):
+    """A local file already at the backup name blocks the install before any managed file changes."""
+    source = _source_from_export(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    agents = sorted((source / ".cursor" / "agents").glob("*.md"))
+    assert agents
+    agents[0].write_text(agents[0].read_text(encoding="utf-8") + "\n# regenerated\n", encoding="utf-8")
+    live = target / agents[0].relative_to(source)
+    before = _snapshot(target)
+    backup = live.parent / f".{live.name}.agent-swarm-bak"
+    saved = b"user-saved-backup\n"
+    backup.write_bytes(saved)
+    err = StringIO()
+    rc = cursor_install.install_cursor(target, source=source, err=err)
+    text = err.getvalue()
+    assert rc == 2, text
+    assert "Traceback" not in text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert "backup already exists" in text
+    assert backup.as_posix() in text
+    assert "Nothing was written" in text
+    assert "Restored the previous Cursor export" not in text
+    assert backup.read_bytes() == saved
+    assert _snapshot(target) == {**before, backup.relative_to(target).as_posix(): saved}
+    assert not live.read_text(encoding="utf-8").endswith("# regenerated\n")
+
+
+def test_backup_cleanup_failure_reports_completed_install(tmp_path, monkeypatch):
+    """After the new stamp is published, a backup that cannot be deleted is named and the new export stays."""
+    source = _source_from_export(tmp_path)
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert cursor_install.install_cursor(target, source=source) == 0
+    agents = sorted((source / ".cursor" / "agents").glob("*.md"))
+    assert len(agents) >= 2
+    for path in agents[:2]:
+        path.write_text(path.read_text(encoding="utf-8") + "\n# regenerated\n", encoding="utf-8")
+    live = target / agents[0].relative_to(source)
+    previous = live.read_bytes()
+    real_drop = cursor_install._drop_backup
+
+    def wrapped(dest):
+        if Path(dest).name == live.name:
+            raise OSError("injected backup cleanup failure")
+        return real_drop(dest)
+
+    monkeypatch.setattr(cursor_install, "_drop_backup", wrapped)
+    err = StringIO()
+    rc = cursor_install.install_cursor(target, source=source, err=err)
+    text = err.getvalue()
+    assert rc == 2, text
+    assert "Traceback" not in text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert "install completed" in text
+    assert "left backups behind" in text
+    backup = live.parent / f".{live.name}.agent-swarm-bak"
+    assert backup.as_posix() in text
+    assert "Restored the previous Cursor export" not in text
+    assert "stamp was left unchanged" not in text
+    assert backup.is_file()
+    assert backup.read_bytes() == previous
+    assert live.read_text(encoding="utf-8").endswith("# regenerated\n")
+    other = target / agents[1].relative_to(source)
+    assert other.read_text(encoding="utf-8").endswith("# regenerated\n")
+    assert not (other.parent / f".{other.name}.agent-swarm-bak").exists()
+    stamp = json.loads((target / cursor_install.STAMP_REL).read_text(encoding="utf-8"))
+    assert stamp["files"][agents[0].relative_to(source).as_posix()] == _sha(agents[0].read_text(encoding="utf-8"))

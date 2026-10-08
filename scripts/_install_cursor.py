@@ -14,10 +14,13 @@ a destination are refused the same way as ``_install_omp.unsafe_destinations``.
 
 A real install stages each managed file in its own directory, replaces those files, then
 publishes the stamp last with ``os.replace``. Each replaced or removed file's previous
-bytes are kept in a sibling backup until the install succeeds. A failed step restores
+bytes are kept in a sibling backup until the install succeeds. A backup path that
+already exists is refused before any managed file changes. A failed step restores
 from that backup via a staged ``os.replace`` (never truncating the live file in place)
 and leaves the previous stamp. If one restore fails, the rest still run; backups of
-unrestored files stay, and stderr names them. When the stamp is ours, a regular file
+unrestored files stay, and stderr names them. After the new stamp is published, a
+backup that cannot be removed is named on stderr and the new export stays in place.
+When the stamp is ours, a regular file
 it records under ``.cursor/agents/`` that this export no longer produces is removed if its
 sha256 still matches; a locally edited file, including one that is not valid UTF-8, is
 left in place and named on stderr.
@@ -296,6 +299,8 @@ def _save_backup(dest: Path, data: bytes) -> None:
     bak = _backup_path(dest)
     if bak.is_symlink():
         raise UnsafeDestination(f"{bak} is a symlink")
+    if bak.exists():
+        raise ExistingBackup([bak])
     _replace_bytes(bak, data)
 
 
@@ -313,6 +318,22 @@ class RestoreIncomplete(Exception):
     def __init__(self, unrestored: list[tuple[Path, Path]]):
         self.unrestored = unrestored
         super().__init__(unrestored)
+
+
+class ExistingBackup(Exception):
+    """A sibling backup is already present. Nothing is overwritten."""
+
+    def __init__(self, paths: list[Path]):
+        self.paths = paths
+        super().__init__(paths)
+
+
+class BackupCleanupIncomplete(Exception):
+    """The new export is in place, and one or more backups could not be removed."""
+
+    def __init__(self, left: list[Path]):
+        self.left = left
+        super().__init__(left)
 
 
 def _publish(dest: Path, text: str, replaced: list[tuple[Path, bytes | None]]) -> None:
@@ -374,12 +395,35 @@ def _rollback(replaced: list[tuple[Path, bytes | None]], removed: list[tuple[Pat
     return unrestored
 
 
+def _backup_conflicts(dest_root: Path, writes: dict[str, str], removals: list[str]) -> list[Path]:
+    """Backup paths this install would overwrite. Checked before any managed file changes."""
+    dests: list[Path] = [_dest(dest_root, rel) for rel in sorted(r for r in writes if r != STAMP_REL)]
+    dests.extend(_dest(dest_root, rel) for rel in removals if _agents_rel(rel))
+    if STAMP_REL in writes:
+        dests.append(_dest(dest_root, STAMP_REL))
+    found: list[Path] = []
+    for dest in dests:
+        if not (dest.is_file() and not dest.is_symlink()):
+            continue
+        bak = _backup_path(dest)
+        if bak.is_symlink():
+            raise UnsafeDestination(f"{bak} is a symlink")
+        if bak.exists():
+            found.append(bak)
+    return found
+
+
 def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None:
     """Replace managed files, drop installer-owned leftovers, then publish the stamp last.
 
     On failure, restore every file already replaced or removed and leave the old stamp.
     Raises RestoreIncomplete when a restore itself fails; those backups are left in place.
+    An existing backup is refused before the first replace. A backup that cannot be
+    removed after the stamp is published raises BackupCleanupIncomplete and is left behind.
     """
+    conflicts = _backup_conflicts(dest_root, writes, removals)
+    if conflicts:
+        raise ExistingBackup(conflicts)
     replaced: list[tuple[Path, bytes | None]] = []
     removed: list[tuple[Path, bytes]] = []
     try:
@@ -397,16 +441,27 @@ def _apply(dest_root: Path, writes: dict[str, str], removals: list[str]) -> None
             removed.append((path, data))
         if STAMP_REL in writes:
             _publish(_dest(dest_root, STAMP_REL), writes[STAMP_REL], replaced)
-    except (OSError, UnsafeDestination) as exc:
+    except (OSError, UnsafeDestination, ExistingBackup) as exc:
         unrestored = _rollback(replaced, removed)
         if unrestored:
             raise RestoreIncomplete(unrestored) from exc
         raise
     else:
-        for path, _prev in replaced:
-            _drop_backup(path)
+        left: list[Path] = []
+        for path, prev in replaced:
+            if prev is None:
+                continue
+            try:
+                _drop_backup(path)
+            except (OSError, UnsafeDestination):
+                left.append(_backup_path(path))
         for path, _data in removed:
-            _drop_backup(path)
+            try:
+                _drop_backup(path)
+            except (OSError, UnsafeDestination):
+                left.append(_backup_path(path))
+        if left:
+            raise BackupCleanupIncomplete(left)
 
 
 def _recorded_agent_rels(target: Path) -> list[str]:
@@ -499,6 +554,20 @@ def install_cursor(
         return 0
     try:
         _apply(dest_root, writes, removals)
+    except BackupCleanupIncomplete as exc:
+        named = ", ".join(os.fspath(path) for path in exc.left)
+        print(
+            f"error: install completed but left backups behind: {named}. The new export is in place.",
+            file=stderr,
+        )
+        return 2
+    except ExistingBackup as exc:
+        named = ", ".join(os.fspath(path) for path in exc.paths)
+        print(
+            f"error: refusing to install: backup already exists: {named}. Nothing was written.",
+            file=stderr,
+        )
+        return 2
     except RestoreIncomplete as exc:
         named = ", ".join(f"{path} (backup {bak})" for path, bak in exc.unrestored)
         print(
