@@ -846,6 +846,7 @@ describe("HOOK-03 shell twin and D-08", () => {
       { SUBSTRATE_TOKEN: "tok-a05" },
       { SWARM_SUBSTRATE_AGENT: B05 },
       { SWARM_SUBSTRATE_AGENT: A01, SUBSTRATE_TOKEN: "tok-a01" },
+      { SWARM_SUBSTRATE_AGENT: B05, SUBSTRATE_TOKEN: "tok-a05", SUBSTRATE_DISABLED: "1" },
     ]) {
       const inside = facts(B05, { env });
       expect(guardToolCall(call("mcp__substrate_memory_brief"), inside)?.block).toBe(true);

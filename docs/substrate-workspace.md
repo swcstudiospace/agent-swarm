@@ -72,7 +72,7 @@ It also refuses (exit 2, nothing written):
 - everything it refused before: a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any
   destination reached through a symlink.
 
-`--no-substrate` installs the rest without writing the substrate entry or env files. To turn off the runtime integration, unset `SUBSTRATE_URL` or set `SUBSTRATE_DISABLED=1`.
+`--no-substrate` skips installation of the substrate MCP entry and per-agent credential files; rerunning the installer with this flag leaves existing MCP entries and credentials in place. To disable the Python integration (leases and event tee), unset `SUBSTRATE_URL` or set `SUBSTRATE_DISABLED=1`.
 
 ## Run
 

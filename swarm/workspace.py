@@ -308,7 +308,14 @@ class FileTransaction:
                     except (OSError, EnvFileProblem):
                         if item.restore:
                             try:
-                                os.chmod(item.restore, 0o600, dir_fd=item.fd)
+                                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                rfd = os.open(item.restore, flags, dir_fd=item.fd)
+                                try:
+                                    rst = os.fstat(rfd)
+                                    if stat.S_ISREG(rst.st_mode):
+                                        os.fchmod(rfd, 0o600)
+                                finally:
+                                    os.close(rfd)
                             except OSError:
                                 pass
                             recovery = item.path.parent / item.restore
@@ -402,6 +409,9 @@ def child_env(base: Mapping[str, str], workspace: str | Path, agent_id: str) -> 
     """(env, token source, problem) for one agent process: `base` without any variable that carries a token, plus that
     agent's own `SUBSTRATE_TOKEN` from `credential` when it has one."""
     env = {k: v for k, v in base.items() if not carries_token(k)}
+    if (base.get("SUBSTRATE_DISABLED") or "").strip() == "1":
+        env.pop("SUBSTRATE_URL", None)
+        return env, "", "SUBSTRATE_DISABLED is 1"
     token, source, problem = credential(agent_id, workspace, base)
     if token is not None:
         env[TOKEN] = token

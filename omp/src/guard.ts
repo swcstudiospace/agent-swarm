@@ -93,7 +93,9 @@ const SUBSTRATE_TOOL = /^(?:xd:\/\/)?mcp__substrate_(?:memory_(?:brief|write|sea
 function ownSubstrateTool(name: string, facts: GuardFacts): boolean {
   // The runner replaces this marker only after resolving this agent's token and the exact projected MCP entry.
   // Inherited markers cannot authorize a differently named child. A bare operator token is never sufficient.
-  return facts.agent !== undefined && facts.env.SWARM_SUBSTRATE_AGENT === facts.agent &&
+  return facts.agent !== undefined &&
+    facts.env.SUBSTRATE_DISABLED !== "1" &&
+    facts.env.SWARM_SUBSTRATE_AGENT === facts.agent &&
     Boolean(facts.env.SUBSTRATE_TOKEN) && SUBSTRATE_TOOL.test(name);
 }
 

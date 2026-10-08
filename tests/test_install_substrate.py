@@ -427,3 +427,39 @@ def test_failed_rollback_preserves_recovery_copy_mode_0600(tmp_path, monkeypatch
     assert stat.S_IMODE(recovery.stat().st_mode) == 0o600
     assert recovery.read_text() == "SUBSTRATE_TOKEN=old-a01\n"
 
+
+def test_failed_rollback_does_not_follow_symlink_for_recovery_copy(tmp_path, monkeypatch):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("victim data")
+    victim.chmod(0o755)
+
+    ws = tmp_path / "work"
+    ws.mkdir()
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "config"), **TOKENS}
+    directory = workspace.env_dir(ws, env)
+    a01_path = directory / "a01-orchestrator.env"
+    workspace.write_token(a01_path, "old-a01")
+
+    replace = os.replace
+    rollback_attempted = []
+
+    def failing_replace_and_swap_link(src, dst, **kwargs):
+        name = Path(dst).name
+        if not rollback_attempted and name == "a06-frontend.env":
+            rollback_attempted.append(True)
+            # Attacker replaces recovery files with symlink to victim before rollback restore runs
+            for rec in directory.glob(".substrate-*.tmp"):
+                rec.unlink()
+                rec.symlink_to(victim)
+            raise OSError("injected publish failure on a06")
+        if rollback_attempted and name == "a01-orchestrator.env":
+            raise OSError("injected rollback failure on a01")
+        return replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(workspace.os, "replace", failing_replace_and_swap_link)
+    out = io.StringIO()
+    assert substrate_install.install_substrate(ws, ["claude"], False, out, env) == 2
+    # Victim file must remain untouched with original mode 0755 (not chmodded to 0600)
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+
+

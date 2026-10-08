@@ -239,6 +239,8 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
     wired = (not disabled) and workspace.projected_mcp(repo, runtime)
     if disabled:
         env.pop(workspace.TOKEN, None)
+        env.pop("SUBSTRATE_URL", None)
+        env.pop("SWARM_SUBSTRATE_AGENT", None)
     if runtime == "grok":
         trust = ["--trust"] if wired else []
         return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", *trust, "--cwd", str(repo),
@@ -559,21 +561,26 @@ def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) ->
     The token's value is never printed: a replay sources the agent's env file for it."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
+    slug = agent["slug"]
     # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06, INST-03).
-    # Keep SUBSTRATE_TOKEN when the child received one so an operator replaying with that variable keeps it.
+    # SUBSTRATE_TOKEN is not unset: the operator sources the agent's env file for it before replay.
     stripped = [*AGENT_SESSION_STRIPPED, *sorted(
         k for k in os.environ
-        if workspace.carries_token(k) and not (k == workspace.TOKEN and env.get(workspace.TOKEN))
+        if workspace.carries_token(k) and k != workspace.TOKEN
     )]
     unset = " ".join(f"-u {k}" for k in stripped)
+    clean_base = {k: v for k, v in os.environ.items() if not workspace.carries_token(k)}
+    token, source, problem = workspace.credential(agent["id"], repo, clean_base)
+    disabled = (env.get("SUBSTRATE_DISABLED") or "").strip() == "1"
+    if runtime == "omp" and not disabled and workspace.projected_mcp(repo, runtime) and token is not None:
+        env["SWARM_SUBSTRATE_AGENT"] = slug
     keys = [*CHILD_ENV_KEYS, *(["SWARM_SUBSTRATE_AGENT"] if "SWARM_SUBSTRATE_AGENT" in env else [])]
     deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in keys if k in env)
     stdin = sdir / "assignments" / f"{task['task_id']}.a{task['attempt']}.md"
     print(f"dry-run {task['task_id']} [{agent['id']}]: env {unset} {deltas} {shlex.join(cmd)} < {shlex.quote(str(stdin))}",
           file=sys.stderr, flush=True)
-    token, source, problem = workspace.credential(agent["id"], repo)
-    source = f"from {source}" if token is not None else f"none ({problem})"
-    print(f"dry-run {task['task_id']} [{agent['id']}] SUBSTRATE_TOKEN: {source}", file=sys.stderr, flush=True)
+    source_str = f"from {source}" if token is not None else f"none ({problem})"
+    print(f"dry-run {task['task_id']} [{agent['id']}] SUBSTRATE_TOKEN: {source_str}", file=sys.stderr, flush=True)
     return {"dry_run": True, "runtime": runtime, "argv": cmd}
 
 

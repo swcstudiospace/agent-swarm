@@ -288,32 +288,49 @@ def test_credential_in_child_session_resolves_own_session_token():
     assert tok is None and not src and "unset" in prob
 
 
-def test_dry_run_strips_token_when_child_gets_no_token_and_includes_omp_agent(ws, tmp_path, capsys, monkeypatch):
+def test_dry_run_invocation_wired_workspace(ws, tmp_path, capsys, monkeypatch):
     _wire(ws)
+    secret = "secret-super-tok-12345"
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    ef = workspace.env_file(ws, "a05-backend", {"HOME": str(home)})
+    ef.parent.mkdir(parents=True, exist_ok=True)
+    ef.write_text(f"SUBSTRATE_TOKEN={secret}\n")
+
     task = {"task_id": "T-two", "attempt": 1}
     agent = {"slug": "a10-security", "id": "A10"}
     sdir = tmp_path / ".swarm"
     (sdir / "assignments").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("SUBSTRATE_TOKEN", "runner-tok")
+    monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A05_BE", "inherited-secret")
 
     spec = importlib.util.spec_from_file_location("sr_mod", ROOT / "scripts" / "swarm_run.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # 1. A10 gets no token -> -u SUBSTRATE_TOKEN is stripped
+    # 1. Runner export of SUBSTRATE_TOKEN is not unset with -u (so sourcing agent env file works for replay)
+    #    Inherited sibling token SUBSTRATE_TOKEN_SWARM_A05_BE IS unset with -u
+    #    A10 has no token -> SWARM_SUBSTRATE_AGENT not in deltas
     capsys.readouterr()
     mod.dry_run_invocation(task, agent, ws, sdir, _args(runtime="omp"))
     err = capsys.readouterr().err
     tokens_a10 = shlex.split(err.splitlines()[0].split(": ", 1)[1])
     unset_a10 = {tokens_a10[i + 1] for i, t in enumerate(tokens_a10) if t == "-u"}
-    assert "SUBSTRATE_TOKEN" in unset_a10
+    assert "SUBSTRATE_TOKEN" not in unset_a10
+    assert "SUBSTRATE_TOKEN_SWARM_A05_BE" in unset_a10
     assert "SWARM_SUBSTRATE_AGENT" not in err
 
-    # 2. A05 gets a token and is wired -> SUBSTRATE_TOKEN not stripped, SWARM_SUBSTRATE_AGENT in deltas
+    # 2. A05 gets token from env file in wired workspace -> SWARM_SUBSTRATE_AGENT in deltas for omp
+    #    Secret token value is NEVER printed in replay command or stderr
     mod.dry_run_invocation({"task_id": "T-one", "attempt": 1}, A05, ws, sdir, _args(runtime="omp"))
     err = capsys.readouterr().err
     tokens_a05 = shlex.split(err.splitlines()[0].split(": ", 1)[1])
     unset_a05 = {tokens_a05[i + 1] for i, t in enumerate(tokens_a05) if t == "-u"}
     assert "SUBSTRATE_TOKEN" not in unset_a05
+    assert "SUBSTRATE_TOKEN_SWARM_A05_BE" in unset_a05
     assert "SWARM_SUBSTRATE_AGENT=a05-backend" in err
+    assert secret not in err
+    assert "inherited-secret" not in err
+    assert "from " in err
 

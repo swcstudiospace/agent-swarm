@@ -96,7 +96,7 @@ agent whose token it cannot deliver; for the last it prints what you must create
 python3 scripts/build_agents.py --install-workspace /path/to/ws                  # omp link mode (default)
 python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # omp agents + skills only
 python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print the plan, config diff and env files, write nothing
-python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # without substrate-mcp (integration off)
+python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # skip substrate-mcp install writes
 ```
 
 - **Link** (default) adds this checkout's `omp/` realpath to `extensions:` in `<ws>/.omp/config.yml`, so that file
