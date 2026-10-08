@@ -12,7 +12,39 @@ import os
 from typing import Callable
 
 from .errors import SwarmError, ErrorCode
-from .gates import SEVERITIES, make_finding, make_verdict
+from .envelope import insecure_dev_key, real_key_configured, signing_config_error
+from .gates import SEVERITIES, derive_verdict, make_finding, make_verdict
+
+# Names the missing key. Advisory envelopes carry this; it is not a verifying signature.
+MISSING_KEY_REASON = (
+    "fail-closed: no signing key configured "
+    "(SWARM_ED25519_KEY and SWARM_SIGNING_KEY are unset; "
+    "SWARM_ALLOW_INSECURE_DEV_KEY=1 opts into the dev key)"
+)
+SESSION_UNRECORDED = "agent session: the runner records this gate after the session"
+
+
+def keyless_advisory() -> bool:
+    """True when a verdict signed now would need the implicit dev key, which is refused.
+
+    SWARM_REQUIRE_KEY=1 and an unloadable SWARM_ED25519_KEY stay on signing_config_error
+    (the gate script exits 2). Those are not this advisory path.
+    """
+    if signing_config_error():
+        return False
+    return not real_key_configured() and insecure_dev_key() is None
+
+
+def advisory_envelope(*, gate: str, task_id: str, agent_id: str, findings: list[dict], runs: dict,
+                      expires_s: int, correlation_id: str | None, extra: dict | None, reason: str) -> dict:
+    """Unsigned gate envelope marked advisory. It does not verify and is not a verdict row."""
+    import time
+    from .envelope import build_envelope
+    payload = {"gate": gate, "task_id": task_id, "verdict": derive_verdict(findings or []),
+               "findings": findings or [], "runs": runs or {}, "expires_s": expires_s,
+               "issued_at": time.time(), "advisory": True, "advisory_reason": reason, **(extra or {})}
+    return build_envelope(source=agent_id, target="A01", msg_type="gate.verdict", payload=payload,
+                           correlation_id=correlation_id, priority="P1")
 
 GATE_SCRIPTS = {"quality": "qa_gate", "review": "rev_gate", "security": "sec_gate", "release": "rel_plan"}
 SIM_FINDING = {"id": "SIM-1", "severity": "major", "kind": "functional", "summary": "simulated gate failure",
@@ -156,6 +188,9 @@ def record_gate_verdicts(store, *, gate_task_id: str | None, gate: str, agent_id
         emit("gate.verdict.unrecorded", {"task_id": gate_task_id, "gate": gate,
                                          "reason": "not a gate task" if targets is None else "empty gate_for"})
         return {}
+    if keyless_advisory():
+        emit("gate.verdict.unrecorded", {"task_id": gate_task_id, "gate": gate, "reason": MISSING_KEY_REASON})
+        return {}
     out = {}
     with store.transaction():
         for target in targets:
@@ -195,12 +230,25 @@ def issue_gate(ctx, *, gate: str, agent_id: str, findings: list[dict], runs: dic
     from .script_base import check_task_id
     task = check_task_id(ctx.task_id or ("T-dry" if simulate else "T-unassigned"))
     session = os.environ.get("SWARM_AGENT_SESSION") == "1"
+    out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if signing_config_error():
+        # REQUIRE_KEY or an unloadable Ed25519 seed: same E-POLICY as before, no file, no row.
+        make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
+                     correlation_id=corr, extra=extra, root=ctx.root, audit=not session)
+    if keyless_advisory():
+        # No implicit dev key. The file is advisory and does not verify; nothing is recorded.
+        # An agent session keeps its existing unrecorded reason (WR-15) and still emits no security.dev_key.
+        env = advisory_envelope(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs,
+                                expires_s=expires_s, correlation_id=corr, extra=extra, reason=MISSING_KEY_REASON)
+        (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
+        ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,
+                                             "reason": SESSION_UNRECORDED if session else MISSING_KEY_REASON})
+        return env, {}
     # WR-15: a key-less agent-session preview never records, so it must not raise the security.dev_key
     # misconfiguration signal; gate.verdict.unrecorded below marks it instead
     env = make_verdict(gate=gate, task_id=task, agent_id=agent_id, findings=findings, runs=runs, expires_s=expires_s,
                        correlation_id=corr, extra=extra, root=ctx.root, audit=not session)
-    out_dir = swarm_dir(ctx.root, create=True) / "verdicts"
-    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{task}.{gate}.json").write_text(json.dumps(env, indent=2))
     if session:
         ctx.emit("gate.verdict.unrecorded", {"task_id": ctx.task_id, "gate": gate,

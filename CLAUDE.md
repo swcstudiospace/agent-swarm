@@ -133,7 +133,7 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 - Fail-closed gates by risk class — low: review · medium: review+quality · high: +security+release.
 - Most restrictive verdict wins; a failing gate ⇒ CHANGES_REQUESTED with findings, max 2 rework
   loops, then ESCALATED with an `escalation.request` event. Verdicts issued before a rework are stale.
-- `task.assign` and gate verdicts are signed (`SWARM_ED25519_KEY` hex seed, or HMAC via `SWARM_SIGNING_KEY`).
+- `task.assign` and gate verdicts are signed (`SWARM_ED25519_KEY` hex seed, or HMAC via `SWARM_SIGNING_KEY`). With neither set, `SWARM_ALLOW_INSECURE_DEV_KEY=1` opts into the dev key; otherwise gates stay advisory and APPROVED fails closed.
 - Destructive/L3+/L4 actions: agents stop and report `BLOCKED` with `needs: human-approval`.
 
 ## Editing

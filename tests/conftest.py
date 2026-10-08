@@ -15,6 +15,18 @@ sys.path.insert(0, str(ROOT))
 from install_helpers import _ENV_KEYS, _yaml  # noqa: E402  (after ROOT is on sys.path, as the installer expects)
 
 
+@pytest.fixture(autouse=True)
+def allow_insecure_dev_key(monkeypatch):
+    """Suites written before the dev key became opt-in keep that behaviour.
+
+    tests/test_dev_key_fail_closed.py depends on this fixture and then clears
+    SWARM_ALLOW_INSECURE_DEV_KEY. A real key still wins; SWARM_REQUIRE_KEY=1 and
+    SWARM_ED25519_KEY still forbid the dev key.
+    """
+    if os.environ.get("SWARM_ALLOW_INSECURE_DEV_KEY") is None:
+        monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
+
+
 @pytest.fixture()
 def swarm_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))

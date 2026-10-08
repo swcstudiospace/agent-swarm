@@ -169,14 +169,21 @@ def test_dev_key_event_follows_root(tmp_path):
     assert not (other / ".swarm").exists()
 
 
-def test_empty_signing_key_signs_and_verifies_as_unset(swarm_dir, monkeypatch):
-    """An exported but empty SWARM_SIGNING_KEY is the dev key for signing and verifying alike, so a verdict signed
-    under it still verifies (it was signed with b"" and verified with the dev key before)."""
-    from swarm.gates import make_verdict
+def test_empty_signing_key_is_not_an_implicit_dev_key(swarm_dir, monkeypatch):
+    """An exported but empty SWARM_SIGNING_KEY is unset. Without SWARM_ALLOW_INSECURE_DEV_KEY it is not the
+    dev key. With the opt-in, empty still signs and verifies as the dev key, and unsetting the opt-in stops that."""
     from swarm.envelope import verify_envelope
+    from swarm.errors import SwarmError
+    from swarm.gates import make_verdict
     _clear_keys(monkeypatch)
+    monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY", raising=False)
     monkeypatch.setenv("SWARM_SIGNING_KEY", "")
+    with pytest.raises(SwarmError, match="fail-closed: no signing key configured"):
+        make_verdict(gate="review", task_id="K-9", agent_id="A09", correlation_id="c")
+    monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
     env = make_verdict(gate="review", task_id="K-9", agent_id="A09", correlation_id="c")
     assert verify_envelope(env)
     monkeypatch.delenv("SWARM_SIGNING_KEY")
     assert verify_envelope(env)
+    monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY")
+    assert verify_envelope(env) is False
