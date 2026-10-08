@@ -742,6 +742,25 @@ def test_bind_without_an_answer_caches_nothing(tmp_path, on, monkeypatch):
     assert tee_mod.cached_graph_id(CORR, tmp_path) is None
 
 
+@pytest.mark.parametrize("refusal", [401, 403, "identity"])
+def test_refused_graph_lookup_keeps_local_logs_and_does_not_cache_the_refusal(tmp_path, on, monkeypatch, refusal):
+    def denied(req, timeout=None):
+        if refusal != "identity":
+            return _Resp('{"error":"unauthorized"}', refusal)
+        return _Resp(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+            "isError": True, "content": [{"type": "text", "text": '{"error":"caller identity rejected"}'}]}}))
+
+    monkeypatch.setattr(substrate_client, "_open", denied)
+    refused = _emit(tmp_path)
+    assert runlog.read_events(correlation_id=CORR, root=tmp_path) == [refused]
+    assert tee_mod.cached_graph_id(CORR, tmp_path) is None
+    recovered = FakeSubstrate(bindings={CORR: GID_A})
+    monkeypatch.setattr(substrate_client, "_open", recovered)
+    later = _emit(tmp_path)
+    assert runlog.read_events(correlation_id=CORR, root=tmp_path) == [refused, later]
+    assert [event["graph_id"] for event in recovered.events] == [GID_A]
+
+
 def test_binding_cache_is_per_server(tmp_path, on, fake, monkeypatch):
     fake.bindings[CORR] = GID_A
     assert tee_mod.bind_graph(CORR, GID_A, root=tmp_path) == GID_A

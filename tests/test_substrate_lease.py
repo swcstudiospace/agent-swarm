@@ -12,8 +12,10 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.message import Message
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -52,6 +54,21 @@ class Err:
 
 def _refusal(msg: str) -> Err:
     return Err(json.dumps({"error": msg}))
+
+
+def _refuse_tool(fake, monkeypatch, tool, refusal):
+    """Exercise the HTTP and MCP identity-refusal paths without replacing their outcome classification."""
+    if refusal == "identity":
+        monkeypatch.setitem(fake.forced, tool, _refusal("caller identity is not authorized"))
+        return
+
+    def denied(req, timeout=None):
+        if urlparse(req.full_url).path == "/mcp" and json.loads(req.data)["params"]["name"] == tool:
+            raise urllib.error.HTTPError(req.full_url, refusal, "denied", Message(), io.BytesIO(b'{"error":"unauthorized"}'))
+        return fake(req, timeout)
+
+    monkeypatch.setattr(substrate_client, "_open", denied)
+
 
 
 def _iso(t: float) -> str:
@@ -382,6 +399,47 @@ def test_refused_claim_is_not_dispatched(tmp_path, fake, runner, monkeypatch):
     assert _types(events) == ["lease.refused"] and "surface" in events[0][1]["reason"]
 
 
+@pytest.mark.parametrize("refusal", [401, 403, "identity"])
+@pytest.mark.parametrize("negative_cache", [False, True])
+def test_graph_lookup_refusal_never_dispatches_unleased(tmp_path, fake, runner, monkeypatch, refusal, negative_cache):
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    if negative_cache:
+        fake.forced["graph_bind"] = {"status": "unbound", "graph_id": None}
+        assert tee_mod.lookup_graph_id(CORR, root=tmp_path) is None
+        del fake.forced["graph_bind"]
+    bridge = _bridge(store, events, root=tmp_path)
+    with monkeypatch.context() as patch:
+        _refuse_tool(fake, patch, "graph_bind", refusal)
+        batch, waiting = runner.select_batch(store, [task], 1, bridge)
+        assert batch == [] and waiting == ["T-be: refused"]
+        mirror = store.get("T-be")["notes_json"]["lease"]
+        assert mirror["state"] == "refused"
+        assert ("identity" if refusal == "identity" else f"HTTP {refusal}") in mirror["reason"]
+        assert store.get("T-be")["state"] == "PLANNED"
+        assert _types(events) == ["lease.refused"] and fake.at("graph_claim") == []
+    # Neither a preceding tee lookup nor the refusal itself may suppress recovery after credentials are repaired.
+    batch, waiting = runner.select_batch(store, [task], 1, bridge)
+    assert [t["task_id"] for t, _ in batch] == ["T-be"] and waiting == []
+    assert bridge.held("T-be") is not None
+
+
+@pytest.mark.parametrize("failure", ["unbound", "down", "server-error"])
+def test_graph_lookup_without_auth_refusal_still_dispatches_unleased(tmp_path, fake, runner, failure):
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    if failure == "down":
+        fake.down = True
+    else:
+        fake.forced["graph_bind"] = ({"status": "unbound", "graph_id": None} if failure == "unbound"
+                                     else Err("database unavailable"))
+    batch, waiting = runner.select_batch(store, [task], 1, _bridge(store, events))
+    assert [t["task_id"] for t, _ in batch] == ["T-be"] and waiting == []
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "unleased"
+    assert _types(events) == ["lease.unleased"]
+
+
 def test_saturated_slots_wait_then_dispatch_with_a_lease(tmp_path, queued_fake, runner):
     queued_fake.register("T-be")
     store, events = _store(tmp_path), []
@@ -551,6 +609,21 @@ def test_a_refusal_stops_the_session_with_its_tabled_reason(tmp_path, fake, monk
     assert events == [("lease.lost", {"task_id": "T-be", "agent": "A05", "reason": reason, "session_stopped": True})]
 
 
+@pytest.mark.parametrize("refusal", [401, 403, "identity"])
+def test_auth_refused_heartbeat_stops_dispatch_instead_of_retrying(tmp_path, fake, monkeypatch, refusal):
+    events, stops = [], []
+    store, bridge = _held(tmp_path, fake, events)
+    bridge.watch("T-be", stops.append)
+    _refuse_tool(fake, monkeypatch, "graph_heartbeat", refusal)
+    assert bridge.beat("T-be") == "stopped"
+    assert stops == [lease_mod.SESSION_REFUSALS[lease_mod.REFUSED]]
+    assert bridge.held("T-be") is None
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "lost"
+    assert events == [("lease.lost", {"task_id": "T-be", "agent": "A05", "reason": "refused",
+                                     "session_stopped": True})]
+    assert len(fake.at("graph_claim")) == 1  # authorization failures never re-claim
+
+
 def test_expired_reclaims_instead_of_beating_and_the_session_carries_on(tmp_path, fake):
     events = []
     store, bridge = _held(tmp_path, fake, events)
@@ -610,6 +683,20 @@ def test_expired_whose_reclaim_is_denied_stops_the_session(tmp_path, fake):
     assert bridge.beat("T-be") == "stopped"
     assert stops == [lease_mod.RECLAIM_NOT_GRANTED]
     assert events[-1][1]["reason"] == "expired; re-claim denied"
+
+
+@pytest.mark.parametrize("refusal", [401, 403, "identity"])
+def test_expired_lease_whose_reclaim_is_refused_stops_dispatch(tmp_path, fake, monkeypatch, refusal):
+    events, stops = [], []
+    store, bridge = _held(tmp_path, fake, events)
+    bridge.watch("T-be", stops.append)
+    fake.now += lease_mod.DEFAULT_TTL_S + 1
+    _refuse_tool(fake, monkeypatch, "graph_claim", refusal)
+    assert bridge.beat("T-be") == "stopped"
+    assert stops == [lease_mod.RECLAIM_NOT_GRANTED]
+    assert bridge.held("T-be") is None
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "lost"
+    assert events[-1][1]["reason"] == "expired; re-claim refused"
 
 
 def test_no_answer_keeps_the_session_and_retries_sooner(tmp_path, fake):
@@ -784,6 +871,41 @@ def test_the_keeper_stops_a_real_session_whose_node_was_taken(tmp_path, fake, ru
     assert store.history("T-be")[-1]["reason"] == lease_mod.SESSION_REFUSALS["lost"]
     assert store.get("T-be")["notes_json"]["meta"]["lease_stopped"] == lease_mod.SESSION_REFUSALS["lost"]
     assert ("lease.lost" in _types(events)) and fake.node("T-be")["session"] == f"A05@r2:{GID}"  # never released by us
+
+
+@pytest.mark.parametrize("refusal", [401, 403, "identity"])
+def test_auth_refusal_kills_the_process_group_and_rejects_its_result(tmp_path, fake, runner, monkeypatch, refusal):
+    pidfile = tmp_path / "session.pid"
+    result = "```json\n" + json.dumps({"task_id": "T-be", "state": "IN_REVIEW",
+                                     "summary_md": "untrusted after revocation"}) + "\n```"
+    child = [sys.executable, "-c",
+             "import os, sys, time; sys.stdin.read(); "
+             f"print({result!r}, flush=True); open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(10)"]
+    monkeypatch.setattr(runner, "headless_command", lambda runtime, agent, repo, sdir, args: (child, dict(os.environ), repo))
+    monkeypatch.setattr(lease_mod, "heartbeat_interval", lambda ttl: 0.01)
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    bridge = _bridge(store, events)
+    assert bridge.acquire(task, "A05").status == "held"
+    _refuse_tool(fake, monkeypatch, "graph_heartbeat", refusal)
+    beat = bridge.beat
+
+    def after_spawn(tid):
+        _wait_for(pidfile)
+        return beat(tid)
+
+    monkeypatch.setattr(bridge, "beat", after_spawn)
+    bridge.start()
+    try:
+        _, _, outcome = _execute(runner, store, task, bridge, tmp_path, events)
+    finally:
+        bridge.close()
+    assert outcome == "FAILED"
+    assert not _alive(int(pidfile.read_text())) and not runner._SESSIONS
+    assert store.history("T-be")[-1]["reason"] == lease_mod.SESSION_REFUSALS[lease_mod.REFUSED]
+    assert "IN_REVIEW" not in [h["to_state"] for h in store.history("T-be")]
+    assert store.get("T-be")["notes_json"]["meta"]["lease_stopped"] == lease_mod.SESSION_REFUSALS[lease_mod.REFUSED]
 
 
 def _alive(pid: int) -> bool:
@@ -1051,6 +1173,36 @@ def test_failed_releases(tmp_path, fake, runner, monkeypatch):
     assert store.get("T-be")["notes_json"]["lease"]["state"] == "released" and bridge.held("T-be") is None
 
 
+@pytest.mark.parametrize("terminal", ["BLOCKED", "ESCALATED"])
+def test_blocked_and_rework_cap_escalated_tasks_release_their_held_lease(tmp_path, fake, terminal):
+    store, bridge = _held(tmp_path, fake, [], state="IN_REVIEW" if terminal == "ESCALATED" else "IN_PROGRESS")
+    lease_id = fake.node("T-be")["lease_id"]
+    if terminal == "ESCALATED":
+        from swarm.taskstore import MAX_REWORK_LOOPS
+        store.update("T-be", rework_loops=MAX_REWORK_LOOPS)
+        store.transition("T-be", "CHANGES_REQUESTED", reason="rework exhausted")
+    else:
+        store.transition("T-be", "BLOCKED", reason="needs human approval")
+    assert store.get("T-be")["state"] == terminal
+    assert bridge.settle("T-be") == "released"
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [lease_id]
+    assert fake.node("T-be")["lease_id"] is None and bridge.held("T-be") is None
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "released"
+
+
+def test_a_stale_mirror_cannot_release_a_successor_lease(tmp_path, fake):
+    store, bridge = _held(tmp_path, fake, [])
+    stale = fake.node("T-be")["lease_id"]
+    _steal(fake)
+    successor = dict(fake.node("T-be"))
+    store.transition("T-be", "FAILED", reason="old runner ended")
+    assert lease_mod.settle_mirrored(store, "T-be", emit=lambda *a: None) == "not-ours"
+    assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [stale]
+    assert fake.node("T-be") == successor
+    assert successor["lease_id"] != stale and successor["session"] == f"A05@r2:{GID}"
+    assert fake.trail_of("T-be") == [("claim", "granted"), ("warning", "stolen")]
+
+
 def test_cancelled_by_orch_status_releases_the_mirrored_lease(tmp_path, fake):
     events = []
     store, bridge = _held(tmp_path, fake, events, state="IN_PROGRESS")
@@ -1159,6 +1311,7 @@ def test_run_resumes_review_leases_before_the_first_reconcile(tmp_path, monkeypa
             calls.append("close")
 
     monkeypatch.setattr(runner, "lease_bridge", lambda *a, **k: Bridge())
+    monkeypatch.setattr(runner, "handoff_bridge", lambda *a, **k: None)  # handoffs are not what this test is about
     monkeypatch.setattr(runner, "reconcile", lambda *a, **k: calls.append("reconcile") or [])
     store = _store(tmp_path)
     _plan(store)
@@ -1168,6 +1321,63 @@ def test_run_resumes_review_leases_before_the_first_reconcile(tmp_path, monkeypa
                            claude_bin="claude", omp_bin="omp", max_parallel=1, once=True, max_rounds=1)
     runner.run(args, SimpleNamespace(correlation_id=CORR, emit=lambda *a, **k: None))
     assert calls[:3] == ["resume", "start", "reconcile"]
+
+
+def test_full_non_dry_run_outage_preserves_the_disabled_dag_budgets_and_results(tmp_path, fake, runner, monkeypatch):
+    from swarm import runlog
+    child = (
+        "import json, pathlib, re, sys\n"
+        "prompt = sys.stdin.read()\n"
+        "assignment = json.loads(re.search(r'```json\\n(.*?)\\n```', prompt, re.S).group(1))['payload']\n"
+        "tid = assignment['task_id']\n"
+        "pathlib.Path(tid + '.assignment.json').write_text(json.dumps(assignment))\n"
+        "print('```json\\n' + json.dumps({'task_id': tid, 'state': 'IN_REVIEW', 'summary_md': 'finished'}) + '\\n```')\n"
+    )
+    monkeypatch.setattr(runner, "headless_command",
+                        lambda runtime, agent, repo, sdir, args: ([sys.executable, "-c", child], dict(os.environ), repo))
+    snapshots = []
+    for mode in ("disabled", "outage"):
+        substrate_client.reset()
+        tee_mod.reset()
+        repo = tmp_path / mode
+        repo.mkdir()
+        monkeypatch.setenv("SWARM_DIR", str(repo / ".swarm"))
+        monkeypatch.setenv("SUBSTRATE_DISABLED", "1" if mode == "disabled" else "0")
+        fake.down = mode == "outage"
+        store = _store(repo)
+        _plan(store, "T-first", agent="A05")
+        _plan(store, "T-next", agent="A06")
+        store.update("T-next", depends_on=["T-first"])
+        for tid in ("T-first", "T-next"):
+            store.update(tid, budget={**store.get(tid)["budget"], "max_wall_s": 15})
+
+        def emit(kind, payload, **kwargs):
+            return runlog.emit(kind, payload, source="A01@swarm_run", correlation_id=CORR,
+                               task_id=payload.get("task_id"), root=repo)
+
+        args = _args(repo=str(repo), max_parallel=1, once=False, max_rounds=5)
+        args.runtime, args.grok_bin = "grok", sys.executable
+        result = runner.run(args, SimpleNamespace(correlation_id=CORR, emit=emit))
+        assert result["complete"] is True and result["counts"] == {"DONE": 2}
+        tasks = store.list(correlation_id=CORR)
+        records = runlog.read_events(correlation_id=CORR, root=repo)
+        snapshots.append({
+            "tasks": [(t["task_id"], t["state"], t["depends_on"], t["budget"], t["attempt"],
+                       t["notes_json"]["result"]) for t in tasks],
+            "histories": [[h["to_state"] for h in store.history(t["task_id"])] for t in tasks],
+            "records": [(r["type"], r["task_id"]) for r in records
+                        if not r["type"].startswith(("lease.", "handoff."))],
+        })
+        for tid in ("T-first", "T-next"):
+            assignment = json.loads((repo / f"{tid}.assignment.json").read_text())
+            assert assignment["budget"] == store.get(tid)["budget"]
+            assert assignment["lease_s"] == 15
+        if mode == "outage":
+            assert [(r["type"], r["task_id"]) for r in records if r["type"] == "lease.unleased"] == [
+                ("lease.unleased", "T-first"), ("lease.unleased", "T-next")]
+            assert all(t["notes_json"]["lease"]["state"] == "unleased" for t in tasks)
+        store.conn.close()
+    assert snapshots[0] == snapshots[1]
 
 
 # --- LEASE-08: two replicas, one node -----------------------------------------------------------------------------
@@ -1293,3 +1503,15 @@ def test_mcp_call_outcome_classifies_and_mcp_call_json_is_unchanged(monkeypatch,
 def test_mcp_call_outcome_is_off_without_a_url(monkeypatch):
     monkeypatch.setattr(substrate_client, "_open", lambda *a, **k: pytest.fail("no socket when off"))
     assert substrate_client.mcp_call_outcome("graph_claim", {}).status == "off"
+
+
+@pytest.mark.parametrize("refusal", [401, 403, "identity"])
+def test_refused_registration_never_turns_an_unknown_node_into_unleased_work(tmp_path, fake, runner, monkeypatch, refusal):
+    store, events = _store(tmp_path), []
+    task = _plan(store)
+    _refuse_tool(fake, monkeypatch, "graph_register", refusal)
+    batch, waiting = runner.select_batch(store, [task], 1, _bridge(store, events))
+    assert batch == [] and waiting == ["T-be: refused"]
+    assert store.get("T-be")["notes_json"]["lease"]["state"] == "refused"
+    assert _types(events) == ["lease.refused"]
+    assert len(fake.at("graph_claim")) == 1

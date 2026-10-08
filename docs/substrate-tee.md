@@ -26,14 +26,15 @@ urllib opener per call: `ProxyHandler()` (so `HTTP_PROXY` / `HTTPS_PROXY` / `NO_
 as set at that moment), a redirect handler that refuses every redirect, and HTTP/HTTPS handlers whose connections register
 their socket with the request as soon as TCP is up (again before the TLS handshake). The exchange runs on a daemon worker
 thread, one per request; the socket timeout is 1.5 s (`TIMEOUT_S`) per socket operation. The caller waits at most
-`TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s) from entry, over DNS, connect, headers and body alike. At that deadline it
+`TIMEOUT_S + DEADLINE_SLACK_S` (1.5 s + 0.5 s) from entry, over slot acquisition, DNS, connect, headers and body alike. At that deadline it
 marks the request dead and shuts the registered socket down (`SHUT_RDWR`), which ends a blocked connect, header read or
 body read in the worker at once; a connect that completes later is shut down and closed on the spot. Only a worker stuck in
-DNS (no socket yet) can outlive its deadline, and at most 4 workers (`MAX_IN_FLIGHT`) exist at once: with none free, a
-request fails immediately without starting a thread. The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is
-rejected. A deadline hit, socket error, no free worker or oversized reply counts as a network failure, whatever the status
-(a non-2xx whose body cannot be read in time or is oversized included): the call returns
-None and all substrate calls of that process pause for 30 s, so a dead host costs one timeout, not one per emitted record.
+DNS (no socket yet) can outlive its deadline, and at most 4 workers (`MAX_IN_FLIGHT`) exist at once. With none free, a
+request waits for a slot within the same deadline. If that wait expires, it raises `RequestBusy` without starting a
+worker or outage back-off: `mcp_call_outcome` returns `busy`, optional tee calls return `None`, and lease dispatch defers.
+The body is read up to `MAX_BODY_BYTES` + 1 (1 MiB cap); more is rejected. A deadline after a worker starts, socket error
+or oversized reply counts as a network failure, whatever the status (including an unreadable non-2xx body): the call
+returns `None` and all substrate calls of that process pause for 30 s, so a dead host costs one timeout, not one per record.
 
 **Redirects.** Redirects are never followed: a 3xx is just a non-2xx answer, so the bearer is never re-sent anywhere. The
 bearer is also added with `Request.add_unredirected_header`. Through an HTTP proxy the bearer travels only as the
@@ -112,13 +113,17 @@ type at runtime is skipped, never downgraded to `note`. The exact swarm type alw
 | `gate.findings.synthesized` | `swarm_run` | `warning` | Findings were synthesized rather than reported. |
 | `gate.findings.unattributed` | `swarm_run` | `warning` | Findings named no known gate target. |
 | `task.result.rejected` | `results.reject`, `orch_status` | `warning` | A result failed validation; the task is failed or left as is. |
-| `escalation.request` | `results.reconcile`, `swarm_run` | `warning` | Rework/attempts exhausted; a human is needed. (`handoff` is reserved for the substrate's own lease handoffs and Phase 13's packets.) |
+| `escalation.request` | `results.reconcile`, `swarm_run` | `warning` | Rework/attempts exhausted; a human is needed. (`handoff` is the substrate's own kind for `coord_handoff` packets, which the server writes; the swarm never emits it.) |
 | `security.dev_key` | `swarm.envelope` | `warning` | An envelope was signed with the development key. |
 | `lease.denied` | `substrate_lease` (runner) | `note` | Another session holds the task's node; the task waits. |
 | `lease.unleased` | `substrate_lease` (runner) | `warning` | Dispatched without a lease because the substrate could not answer (fail-open). |
 | `lease.refused` | `substrate_lease` (runner) | `warning` | The substrate refused this agent's claim; the task is not dispatched. |
 | `lease.lost` | `substrate_lease` (runner) | `warning` | A refused heartbeat stopped a session or dropped a held lease. |
 | `lease.unsettled` | `substrate_lease`, `orch_status` | `warning` | A release or completion did not land. |
+| `handoff.unsent` | `substrate_handoff` (runner) | `warning` | The substrate did not take a boundary's packet; it is retried on later rounds. |
+| `handoff.refused` | `substrate_handoff` (runner) | `warning` | The packet was refused, or its sender has no token of its own; not written, not retried. |
+| `handoff.unsigned` | `substrate_handoff` (runner) | `warning` | The substrate has no `SUBSTRATE_HANDOFF_KEY`: packets are recorded unsigned. Once per run. |
+| `handoff.misattributed` | `substrate_handoff` (runner) | `warning` | The ledger recorded a packet under another surface than its sender's: a token configured under the wrong name. |
 | `script.<name>` (prefix) | `AgentScript.main` | `tool.call` | Exit record of one agent script run. |
 | `script.<name>.error` (prefix) | `AgentScript.main` | `tool.call` | Same, for a failed run; `payload.status` is `error`. |
 
@@ -149,9 +154,11 @@ pointing the swarm at another server never reuses the old server's Graph ID; it 
 `bindings` table (not keyed by server) is left in place and no longer read. Later scripts (separate processes) tee without
 asking. On a cache miss the tee does a forward lookup
 `graph_bind {correlation_id}`; `existing` is cached, `unbound` or no answer means the record is skipped (no event, and no
-Graph ID is ever invented by the tee). Nothing is cached when substrate did not answer a bind. A skipped correlation is
-remembered in process memory for 60 s, so a burst of records for one unbound run costs one forward lookup instead of one per
-record; that negative result is never written to sqlite, and a successful lookup or `bind_graph` clears it.
+Graph ID is ever invented by the tee). Nothing is cached when substrate did not answer a bind. An unbound/unanswered
+lookup is remembered in process memory for 60 s, so a burst of records for one unbound run costs one forward lookup;
+that negative result is never written to sqlite, and a successful lookup or `bind_graph` clears it. Explicit
+authentication/identity refusals skip the optional tee without entering this negative cache. Lease consumers bypass
+negative entries and report such refusals as `lease.refused`, never as permission to dispatch unleased.
 
 ## Dry runs
 
@@ -189,8 +196,9 @@ rows are pruned at most once per 60 s per process, not on every event.
 ## Not in S1
 
 - Fetching a brief from substrate before planning (S2+), and any consumption of other agents' briefs.
-- Leases (S2): the runner's `graph_claim` / `graph_heartbeat` / `graph_release` / `graph_complete` are documented in
-  [substrate-leases.md](substrate-leases.md). `coord_handoff` packets and `handoff` events are Phase 13.
+- Leases and handoffs (S2): the runner's `graph_claim` / `graph_heartbeat` / `graph_release` / `graph_complete` are
+  documented in [substrate-leases.md](substrate-leases.md), its `coord_handoff` packets in
+  [substrate-handoffs.md](substrate-handoffs.md).
 - Tee'ing signed `swarm.v1` envelopes that are not run-log records (verdict files, `task.assign`).
 - `trace_id`/`causation_id` production in the run log (they are forwarded when a record carries them).
 - A `--graph-id` entry in the omp extension's `orch_plan` tool schema (`omp/src/tools.ts`); the CLI flag and the

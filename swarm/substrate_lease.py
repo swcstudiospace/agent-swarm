@@ -54,6 +54,7 @@ SESSION_REFUSALS: dict[str, str] = {
     "lost": "E-TIMEOUT: lease lost: another session holds the node",
     "unheld": "E-TIMEOUT: lease unheld: the node was released while the session ran",
     "not-holder": "E-POLICY: lease not-holder: the runner's token is not the holder's surface",
+    REFUSED: "E-POLICY: lease refused: the substrate no longer authorizes this caller",
 }
 RECLAIM_NOT_GRANTED = "E-TIMEOUT: lease expired and the re-claim was not granted"
 
@@ -120,10 +121,18 @@ class Lease:
 
 
 def _call(tool: str, arguments: dict, surface: str, env: Mapping[str, str]) -> substrate_client.Outcome:
-    """Every lease call goes through here, as `surface`, so it carries that agent's token. Today the token is
-    SUBSTRATE_TOKEN_<SURFACE> from the runner's own environment (substrate_client._token). Phase 14 (INST-04) changes only
-    this function, to take it from the agent's env file."""
+    """Every lease call, and every handoff call (substrate_handoff.py), goes through here as `surface`, so it carries
+    that agent's token. Today the token is SUBSTRATE_TOKEN_<SURFACE> from the runner's own environment
+    (substrate_client._token). Phase 14 (INST-04) changes only this function and `has_own_token`, to take it from the
+    agent's env file."""
     return substrate_client.mcp_call_outcome(tool, arguments, env, surface=surface)
+
+
+def has_own_token(surface: str, env: Mapping[str, str]) -> bool:
+    """Whether `_call` as `surface` carries that surface's own token rather than the fallback SUBSTRATE_TOKEN, which
+    is the runner's (A01's). A claim made on the fallback is refused by the server, because the claim names its
+    surface; a handoff names none (the sender is whoever the token says), so a handoff checks this first."""
+    return bool(substrate_client.own_token(env, surface))
 
 
 # --- the four calls, one node at a time ---------------------------------------------------------------------
@@ -141,8 +150,11 @@ def claim_node(agent_id: str, graph_id: str, node_id: str, *, ttl_s: int,
     if got.status == "error" and "unknown node" in got.detail:
         # a task created after orch_plan registered the node set (a gate rerun): register the node as A01, which upserts
         # nodes and leaves the edges alone when none are sent, then ask once more
-        substrate_client.mcp_call_outcome("graph_register", {"graph_id": graph_id, "nodes": [{"node_id": node_id}]}, e,
-                                          surface=substrate_tee.ORCH_SURFACE)
+        registered = substrate_client.mcp_call_outcome(
+            "graph_register", {"graph_id": graph_id, "nodes": [{"node_id": node_id}]}, e,
+            surface=substrate_tee.ORCH_SURFACE)
+        if registered.status == "refused":
+            return Claim(REFUSED, reason=registered.detail or "graph registration refused"), None
         got = _call("graph_claim", args, surface, e)
     if got.status == "off":
         return Claim(OFF), None
@@ -178,8 +190,8 @@ OK, UNANSWERED = "ok", "unanswered"
 def heartbeat(lease: Lease, env: Mapping[str, str] | None = None) -> str:
     """`graph_heartbeat`: OK, UNANSWERED (no answer or a server error: keep working, try again), or the refusal reason.
 
-    Only an answer about the lease itself (`ok: false` with a reason, or a `not-holder` refusal) counts as a refusal.
-    A server that cannot answer is the fail-open case, not a statement that the lease is gone."""
+    A lease-level rejection or an explicit authentication/identity refusal stops work. A server that cannot answer
+    is the fail-open case, not a statement that the lease is gone."""
     e = os.environ if env is None else env
     got = _call("graph_heartbeat", {"graph_id": lease.graph_id, "node_id": lease.task_id, "lease_id": lease.lease_id,
                                     "ttl_seconds": lease.ttl_s}, lease.surface, e)
@@ -187,6 +199,8 @@ def heartbeat(lease: Lease, env: Mapping[str, str] | None = None) -> str:
         return OK if got.value.get("ok") is True else str(got.value.get("reason") or "unknown")
     if got.status in ("refused", "error") and "not-holder" in got.detail:
         return "not-holder"
+    if got.status == "refused":
+        return REFUSED
     return UNANSWERED
 
 
@@ -325,10 +339,18 @@ class LeaseBridge:
                 lock = self._task_locks[task_id] = threading.RLock()
             return lock
 
+    def transition(self, task_id: str) -> threading.RLock:
+        """Guard a lifecycle transition, its handoff and its settlement against the keeper.
+
+        Reentrant so handoff acknowledgement, `settle` and `rework` may use the same task lock. Never hold a Task
+        Store transaction while acquiring it: keeper beats also read and update the store under this lock.
+        """
+        return self._task_lock(task_id)
+
     def graph_id(self, *, defer_busy: bool = False) -> str | None:
         if self._graph_id is None:
             self._graph_id = substrate_tee.lookup_graph_id(self.correlation_id, root=self.root, env=self.env,
-                                                          defer_busy=defer_busy)
+                                                          defer_busy=defer_busy, require_auth=True)
         return self._graph_id
 
     def _moved_on(self, task_id: str) -> bool:
@@ -372,10 +394,13 @@ class LeaseBridge:
                 graph = self.graph_id(defer_busy=True)
             except substrate_client.RequestBusy:
                 return Claim(BUSY, reason="substrate graph lookup slots busy")
-            if graph is None:
-                claim, lease = Claim(UNLEASED, reason="no Graph ID is bound to this run"), None
+            except substrate_tee.GraphLookupRefused as exc:
+                claim, lease = Claim(REFUSED, reason=str(exc)), None
             else:
-                claim, lease = claim_node(agent_id, graph, tid, ttl_s=self.ttl_s, env=self.env)
+                if graph is None:
+                    claim, lease = Claim(UNLEASED, reason="no Graph ID is bound to this run"), None
+                else:
+                    claim, lease = claim_node(agent_id, graph, tid, ttl_s=self.ttl_s, env=self.env)
             if lease is not None:
                 self._hold(lease)
             elif claim.status == DENIED:
@@ -398,8 +423,11 @@ class LeaseBridge:
         rework would renew the old hold instead of releasing it. Called before the first reconcile and gate dispatch.
         The same replica's claim on its own live lease is `renewed` and keeps its id; denied, refused and unleased
         claims are recorded as for a dispatch. Returns the tasks now held."""
-        if self.graph_id() is None:  # no Graph ID bound: nothing was leased, so nothing to hold again
-            return []
+        try:
+            if self.graph_id() is None:  # no Graph ID bound: nothing was leased, so nothing to hold again
+                return []
+        except substrate_tee.GraphLookupRefused:
+            pass  # acquire records the refusal for each review task; none may run unleased
         held = []
         for t in self._store().list(correlation_id=self.correlation_id):
             if t["state"] not in REVIEW or self.held(t["task_id"]) is not None:
@@ -585,6 +613,16 @@ class LeaseBridge:
         except Exception as exc:  # noqa: BLE001
             self.emit("lease.unsettled", {"task_id": task_id, "op": "settle", "reason": f"internal: {exc}"[:300]})
             return "error"
+
+    def handed_over(self, task_id: str) -> None:
+        """A `coord_handoff` with `release_lease` released this task's lease once its packet was durable (Phase 13).
+        Stop beating it and record the release, so `settle` does not release it a second time."""
+        with self._task_lock(task_id):
+            with self._lock:
+                lease = self._held.pop(task_id, None)
+                self._lost.pop(task_id, None)
+            if lease is not None:
+                _mirror(self._store(), task_id, state="released", action="handover", **_ident(lease))
 
     def rework(self, task_id: str) -> Claim:
         """CHANGES_REQUESTED (LEASE-07): release the producer's lease and claim the node again, so the rework loop reads

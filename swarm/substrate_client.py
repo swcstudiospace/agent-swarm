@@ -58,13 +58,15 @@ def enabled(env: Mapping[str, str] | None = None) -> bool:
     return base_url(env) is not None
 
 
+def own_token(env: Mapping[str, str], surface: str) -> str:
+    """SUBSTRATE_TOKEN_<SURFACE> (`-` → `_`, upper case), stripped; '' when it is unset or blank."""
+    return (env.get("SUBSTRATE_TOKEN_" + surface.upper().replace("-", "_")) or "").strip()
+
+
 def _token(env: Mapping[str, str], surface: str | None) -> str:
     """SUBSTRATE_TOKEN_<SURFACE> when `surface` is given and that variable is set and non-blank, else SUBSTRATE_TOKEN."""
-    if surface:
-        own = (env.get("SUBSTRATE_TOKEN_" + surface.upper().replace("-", "_")) or "").strip()
-        if own:
-            return own
-    return (env.get("SUBSTRATE_TOKEN") or "").strip()
+    own = own_token(env, surface) if surface else ""
+    return own or (env.get("SUBSTRATE_TOKEN") or "").strip()
 
 
 class _Response:

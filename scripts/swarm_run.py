@@ -22,6 +22,9 @@ With SUBSTRATE_URL set (never on --dry-run) each task is worked under a substrat
 claimed before dispatch (a denied claim waits), beaten every TTL/3 while the session runs and through review, completed at
 DONE, released and re-claimed on CHANGES_REQUESTED, released otherwise; work left in review by an earlier run is claimed
 again at start (swarm/substrate_lease.py, docs/substrate-leases.md).
+Each boundary that changes the accountable agent (a dependency owned by another agent, a failing gate, an escalation) is
+written as a `coord_handoff` packet by its sender, and each assignment carries the task's context rebuilt from the
+ledger (swarm/substrate_handoff.py, docs/substrate-handoffs.md).
 
   python3 scripts/swarm_run.py                          # run latest plan to completion
   python3 scripts/swarm_run.py --runtime omp            # run it on omp (needs only `omp` on PATH)
@@ -40,7 +43,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -56,7 +59,7 @@ from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
-from swarm import memory as swarm_memory, substrate_client, substrate_lease, substrate_tee  # noqa: E402
+from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee  # noqa: E402
 
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
@@ -95,9 +98,11 @@ def substrate_memory_section(repo: Path, correlation_id: str) -> str:
         return _SUBSTRATE_CONTEXT[key]
 
 
-def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path, lease_s: int | None = None) -> str:
+def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path, lease_s: int | None = None,
+                      handoffs: str = "") -> str:
     """The session's stdin. `lease_s` is the granted TTL of the task's substrate lease (LEASE-05); a task dispatched
-    unleased keeps the old meaning, its wall-clock budget."""
+    unleased keeps the old meaning, its wall-clock budget. `handoffs` is the task's context rebuilt from the substrate
+    ledger (substrate_handoff.render), after the Task Store's upstream section; '' leaves the prompt as it was."""
     assign = {"task_id": task["task_id"], "correlation_id": task["correlation_id"], "agent_id": agent["id"],
               "capability": task["capability"], "title": task["title"],
               "lease_s": lease_s if lease_s is not None else task["budget"].get("max_wall_s", 1800),
@@ -137,7 +142,7 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path, lea
 Swarm runtime lives at {ROOT} (scripts: `python3 {ROOT}/scripts/<script>.py --root {repo} --task-id {task['task_id']} --correlation-id {task['correlation_id']} --json`).
 
 ## Upstream artifacts
-{upstream_context(store, task)}
+{upstream_context(store, task)}{handoffs}
 {gate_note}{rework}
 
 Execute the task per your agent instructions and finish with your summary and the single ```json result block."""
@@ -665,7 +670,7 @@ def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     return path
 
 
-def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
+def dispatchable(store: TaskStore, corr: str, emit, handoffs=None) -> list[dict]:
     ready = store.ready(corr)
     # rework tasks sit in IN_PROGRESS with no running session; treat them as ready too
     for t in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
@@ -676,9 +681,19 @@ def dispatchable(store: TaskStore, corr: str, emit) -> list[dict]:
             store.transition(t["task_id"], S.RETRY, reason="auto-retry")
             ready.append(store.get(t["task_id"]))
         else:
-            store.transition(t["task_id"], S.ESCALATED, reason="max_attempts reached")
-            emit("escalation.request", {"task_id": t["task_id"], "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
-                                        "options": ["human review", "cancel", "re-plan"]})
+            tid = t["task_id"]
+            leases = handoffs.leases if handoffs is not None else None
+            # FAILED normally released the lease already. If one remains, keep it until the escalation packet lands.
+            with leases.transition(tid) if leases is not None else nullcontext():
+                store.transition(tid, S.ESCALATED, reason="max_attempts reached")
+                emit("escalation.request", {"task_id": tid, "reason_code": "E-CONTRACT", "evidence": ["max_attempts reached"],
+                                            "options": ["human review", "cancel", "re-plan"]})
+                if handoffs is not None:
+                    failed = [h["reason"] for h in store.history(tid) if h["to_state"] == S.FAILED.value]
+                    handoffs.escalated(tid, reason="max_attempts reached"
+                                       + (f"; last failure: {failed[-1]}" if failed and failed[-1] else ""))
+                if leases is not None:
+                    leases.settle(tid)
     return ready
 
 
@@ -708,18 +723,19 @@ def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases)
     return batch, waiting
 
 
-def execute_one(store_path, task, agent, args, ctx, repo, leases=None):
+def execute_one(store_path, task, agent, args, ctx, repo, leases=None, handoffs=None):
     """Dispatch one task to its agent and apply the result. With leases on, the dispatch is watched by the lease keeper
     and the task's lease is settled from its final state, whatever happened on the way (LEASE-07): only after the
-    session's and the gate script's process groups are gone."""
+    session's and the gate script's process groups are gone. With handoffs on, the task's dependency packets are written
+    first and its assignment carries the context rebuilt from them (HAND-01/02)."""
     try:
-        return _execute_one(store_path, task, agent, args, ctx, repo, leases)
+        return _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs)
     finally:
         if leases is not None:
             leases.settle(task["task_id"])
 
 
-def _execute_one(store_path, task, agent, args, ctx, repo, leases):
+def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
     store = TaskStore(store_path)  # sqlite: one connection per thread
     sdir = store.path.parent
     tid = task["task_id"]
@@ -737,7 +753,12 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases):
     text, meta, raw_recorded = "", {}, False
     try:
         task = store.get(tid)
-        prompt = assignment_prompt(store, task, agent, repo, lease_s=leases.lease_s(tid) if leases is not None else None)
+        context = ""
+        if handoffs is not None:  # sent before the session starts, so its own context already holds them
+            handoffs.dispatched(task, agent["id"])
+            context = handoffs.context(tid, agent["id"])
+        prompt = assignment_prompt(store, task, agent, repo, lease_s=leases.lease_s(tid) if leases is not None else None,
+                                   handoffs=context)
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
         (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
         if args.dry_run:
@@ -823,6 +844,14 @@ def lease_bridge(args, store_path: Path, corr: str, repo: Path, ctx):
         raise SwarmError(ErrorCode.E_INPUT, str(e)) from e
 
 
+def handoff_bridge(store_path: Path, corr: str, repo: Path, ctx, leases):
+    """The run's handoff packets (ADR 0001 S2 criteria 7-9), on exactly when its leases are: never on --dry-run, off
+    means off."""
+    if leases is None:
+        return None
+    return substrate_handoff.HandoffBridge(store_path, corr, root=repo, emit=ctx.emit, env=leases.env, leases=leases)
+
+
 def run(args, ctx) -> dict:
     repo = Path(args.repo).resolve()
     sdir = swarm_dir(repo, create=True)
@@ -855,6 +884,7 @@ def run(args, ctx) -> dict:
         if args.runtime == "claude":
             preflight_auth(binary)
     leases = lease_bridge(args, store_path, corr, repo, ctx)
+    handoffs = handoff_bridge(store_path, corr, repo, ctx, leases)
     log, rounds = [], 0
     # T-06-12: a SIGTERM/SIGHUP to the runner's group ends the sessions too, then the previous handlers come back.
     # WR-10: a signal inherited as ignored (nohup, a parent's SIG_IGN) stays ignored.
@@ -868,8 +898,10 @@ def run(args, ctx) -> dict:
             leases.start()
         while True:
             rounds += 1
-            log += reconcile(store, corr, ctx.emit, leases=leases)
-            ready = dispatchable(store, corr, ctx.emit)
+            log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
+            if handoffs is not None:
+                handoffs.flush()  # what the substrate did not take last round
+            ready = dispatchable(store, corr, ctx.emit, handoffs=handoffs)
             if not ready:
                 remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
                 if remaining:
@@ -881,7 +913,7 @@ def run(args, ctx) -> dict:
                 break
             with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
                 try:
-                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo, leases) for t, a in batch]
+                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo, leases, handoffs) for t, a in batch]
                     for f in as_completed(futs):
                         tid, aid, outcome = f.result()
                         log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
@@ -896,7 +928,9 @@ def run(args, ctx) -> dict:
             signal.signal(s, signal.SIG_DFL if handler is None else handler)
         if leases is not None:
             leases.close()  # the keeper stops; settling below needs no thread
-    log += reconcile(store, corr, ctx.emit, leases=leases)
+    log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
+    if handoffs is not None:
+        handoffs.flush()
     tasks = store.list(correlation_id=corr)
     counts: dict[str, int] = {}
     for t in tasks:
