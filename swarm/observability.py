@@ -29,12 +29,30 @@ def emit_stale(kind: str, reason: str, *, task_id: str | None = None, corr: str 
 def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None) -> dict:
     """Build 6-state projection (n5)."""
     store = get_swarm_state_store(root=root)
-    events = read_events(correlation_id=corr, root=root) if corr else []
-    # simple aggregate from events + task db counts (stub; real from TaskStore)
-    done = sum(1 for e in events if "DONE" in str(e))
-    total = max(1, len(events))
+    done = 0
+    total = 0
+    state = "RUNNING"
+    try:
+        from .taskstore import TaskStore
+        ts = TaskStore(root=root)
+        tasks = ts.list_tasks(correlation_id=corr) if corr else ts.list_tasks()
+        total = len(tasks)
+        if total > 0:
+            done = sum(1 for t in tasks if t.get("state") in ("DONE", "APPROVED"))
+            failures = sum(1 for t in tasks if t.get("state") in ("FAILED", "ESCALATED"))
+            if done == total:
+                state = "COMPLETE"
+            elif failures > 0:
+                state = "PARTIAL_FAILURE" if done > 0 else "FAILED"
+            else:
+                state = "RUNNING"
+    except Exception:
+        events = read_events(correlation_id=corr, root=root) if corr else []
+        done = sum(1 for e in events if isinstance(e, dict) and e.get("type") in ("task.done", "task.approved", "task_done"))
+        total = max(1, len(events))
+        state = "COMPLETE" if done >= total else "RUNNING"
+
     progress = {"done": done, "total": total}
-    state = "COMPLETE" if done >= total else "RUNNING"
     data = store.update(state, corr=corr, progress=progress)
     # gsd append
     store.append_gsd_line(f"{corr or 'no-corr'} {state} {done}/{total}", root=root)

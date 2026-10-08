@@ -43,13 +43,14 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
     ss.update("FIRED", corr=corr, extra={"last_trigger": tid})
     try:
         import subprocess
+        target_repo = Path(root).resolve() if root else Path.cwd().resolve()
         hook_path = Path(__file__).resolve().parent.parent / "hooks" / "autonomous_run.py"
         env = dict(os.environ)
         env["SWARM_CHILD"] = "0"
         env["AIO_SWARM_AFTER_ORCH"] = "1"
         subprocess.Popen(
-            ["python3", str(hook_path), "--brief", f"gsd-autonomous follow-on after a01 {corr or ''}"],
-            cwd=str(Path(__file__).resolve().parent.parent),
+            ["python3", str(hook_path), "--cwd", str(target_repo), "--brief", f"implement gsd-autonomous follow-on after a01 {corr or ''}"],
+            cwd=str(target_repo),
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

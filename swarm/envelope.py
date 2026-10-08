@@ -113,13 +113,15 @@ def _ed25519_key():
 
 def real_key_configured() -> bool:
     """True when a non-dev signing key is configured (loadable Ed25519 seed or HMAC secret)."""
-    return _ed25519_key() is not None or bool(os.environ.get("SWARM_SIGNING_KEY"))
+    hmac_key = os.environ.get("SWARM_SIGNING_KEY")
+    valid_hmac = bool(hmac_key and hmac_key != "dev-insecure-key")
+    return _ed25519_key() is not None or valid_hmac
 
 
 def _dev_key_forbidden() -> bool:
     """The public dev key must not verify once a real key is configured (even an unloadable
     Ed25519 seed: misconfiguration fails closed) or required via SWARM_REQUIRE_KEY=1."""
-    return bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1"
+    return bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1" or os.environ.get("SWARM_SIGNING_KEY") == "dev-insecure-key"
 
 
 def signing_config_error() -> str | None:
@@ -145,6 +147,10 @@ def _warn_dev_key(env: dict, root: str | Path | None) -> None:
 def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = True) -> dict:
     """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10).
     audit=False skips that event for a key-less agent-session preview that can never record (WR-15)."""
+    err = signing_config_error()
+    if err and _dev_key_forbidden() and not real_key_configured():
+        from .errors import SwarmError
+        raise SwarmError(f"E-POLICY {err}")
     key = _ed25519_key()
     if key is not None:
         sig = key.sign(_canonical(env))

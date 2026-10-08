@@ -261,21 +261,28 @@ def merge_claude_settings(settings_path: Path, hook_cmd: str) -> None:
     # n3/n8: register Stop for a01-orchestrator completion / ultrathink end (on_a01_complete.py)
     # This makes the opt-in AIO_SWARM_AFTER_ORCH trigger reachable for gsd-autonomous parallel.
     complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
-    hooks["Stop"] = [
-        {"hooks": [{"type": "command", "command": complete_cmd}]}
-    ]
+    stop_hooks = hooks.setdefault("Stop", [])
+    complete_hook = {"hooks": [{"type": "command", "command": complete_cmd}]}
+    if complete_hook not in stop_hooks:
+        stop_hooks.append(complete_hook)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def write_grok_hooks(path: Path, hook_cmd: str) -> None:
     complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
-    payload = {
-        "hooks": {
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": hook_cmd}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": complete_cmd}]}]
-        }
-    }
+    payload: dict = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            payload = {}
+    hooks = payload.setdefault("hooks", {})
+    hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": hook_cmd}]}]
+    stop_hooks = hooks.setdefault("Stop", [])
+    complete_hook = {"hooks": [{"type": "command", "command": complete_cmd}]}
+    if complete_hook not in stop_hooks:
+        stop_hooks.append(complete_hook)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n")
 

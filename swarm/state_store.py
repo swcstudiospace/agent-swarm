@@ -80,7 +80,7 @@ class SwarmStateStore:
     def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
         self.root = Path(root) if root else Path(".")
         self.claude_path = self.root / ".claude" / "swarm-state.json"
-        self.swarm_path = (swarm_dir(root, create=True) / "swarm-state.json") if root else (Path(".swarm") / "swarm-state.json")
+        self.swarm_path = swarm_dir(root, create=True) / "swarm-state.json"
         self.claude_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.claude_path.exists():
             self._write(self.claude_path, {"version": "1.0", "swarm_state": "PENDING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
