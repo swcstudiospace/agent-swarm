@@ -332,13 +332,13 @@ class TaskStore:
             return "mismatch"
         if p.get("dry_run") and not task["notes_json"].get("dry_run"):
             return "dry-run"
-        if p["verdict"] not in ("pass", "waive"):
-            return "fail"
         try:
             if not float(p["issued_at"]) + float(p["expires_s"]) > now:
                 return "expired"
         except (KeyError, TypeError, ValueError):
             return "mismatch"
+        if p["verdict"] not in ("pass", "waive"):
+            return "fail"
         return "ok"
 
     def missing_gate_reasons(self, task_id: str) -> dict[str, str]:
