@@ -477,47 +477,6 @@ def test_graph_lookup_without_auth_refusal_still_dispatches_unleased(tmp_path, f
     assert _types(events) == ["lease.unleased"]
 
 
-@pytest.mark.parametrize("refusal", [401, 403, "identity"])
-@pytest.mark.parametrize("negative_cache", [False, True])
-def test_graph_lookup_refusal_never_dispatches_unleased(tmp_path, fake, runner, monkeypatch, refusal, negative_cache):
-    fake.register("T-be")
-    store, events = _store(tmp_path), []
-    task = _plan(store)
-    if negative_cache:
-        fake.forced["graph_bind"] = {"status": "unbound", "graph_id": None}
-        assert tee_mod.lookup_graph_id(CORR, root=tmp_path) is None
-        del fake.forced["graph_bind"]
-    bridge = _bridge(store, events, root=tmp_path)
-    with monkeypatch.context() as patch:
-        _refuse_tool(fake, patch, "graph_bind", refusal)
-        batch, waiting = runner.select_batch(store, [task], 1, bridge)
-        assert batch == [] and waiting == ["T-be: refused"]
-        mirror = store.get("T-be")["notes_json"]["lease"]
-        assert mirror["state"] == "refused"
-        assert ("identity" if refusal == "identity" else f"HTTP {refusal}") in mirror["reason"]
-        assert store.get("T-be")["state"] == "PLANNED"
-        assert _types(events) == ["lease.refused"] and fake.at("graph_claim") == []
-    # Neither a preceding tee lookup nor the refusal itself may suppress recovery after credentials are repaired.
-    batch, waiting = runner.select_batch(store, [task], 1, bridge)
-    assert [t["task_id"] for t, _ in batch] == ["T-be"] and waiting == []
-    assert bridge.held("T-be") is not None
-
-
-@pytest.mark.parametrize("failure", ["unbound", "down", "server-error"])
-def test_graph_lookup_without_auth_refusal_still_dispatches_unleased(tmp_path, fake, runner, failure):
-    store, events = _store(tmp_path), []
-    task = _plan(store)
-    if failure == "down":
-        fake.down = True
-    else:
-        fake.forced["graph_bind"] = ({"status": "unbound", "graph_id": None} if failure == "unbound"
-                                     else Err("database unavailable"))
-    batch, waiting = runner.select_batch(store, [task], 1, _bridge(store, events))
-    assert [t["task_id"] for t, _ in batch] == ["T-be"] and waiting == []
-    assert store.get("T-be")["notes_json"]["lease"]["state"] == "unleased"
-    assert _types(events) == ["lease.unleased"]
-
-
 def test_saturated_slots_wait_then_dispatch_with_a_lease(tmp_path, queued_fake, runner):
     queued_fake.register("T-be")
     store, events = _store(tmp_path), []

@@ -115,6 +115,13 @@ every caller that speaks for that agent uses it: its session's environment, the 
 The runner's own calls (`graph_bind`, `graph_register`, its memory brief) still use its `SUBSTRATE_TOKEN`. Its records are
 teed under the workspace (`--repo`), so their repo slug and the env files the tee reads are the workspace's.
 
+Standalone handoff recovery also supplies the installed workspace:
+`substrate_handoff.reconstruct(graph_id, node_id, agent="A14", workspace=ws)`, with the same
+`XDG_CONFIG_HOME` used at install time. That selects A14's private env-file token; the runner's
+`SUBSTRATE_TOKEN` is not a receiver fallback. The workspace identifies credentials only: task context
+still comes from exactly `coord_handoff_list` and `events_query`, not a Task Store or local run log
+([substrate-handoffs.md](substrate-handoffs.md)).
+
 ## Who owns which variable
 
 | Variable | Side | Owner | Where |

@@ -543,7 +543,7 @@ def test_late_dispatch_retry_cannot_replace_newer_rework(tmp_path, fake, monkeyp
         assert handoffs.flush() == 1
     else:
         assert handoffs.dispatched(store.get("T-be"), "A05") == ["sent"]
-    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05", workspace=fake.workspace)
     assert f"rework {reworks} of" in ctx.goal
     assert ctx.blockers == [f"quality [major] failure {reworks} (src/endpoint.py)"]
     assert ctx.dod == ["fix the endpoint"] and ctx.files == ["src/endpoint.py"]
@@ -574,7 +574,7 @@ def test_stored_handoff_with_lost_reply_is_not_written_again(tmp_path, fake, mon
     substrate_client.reset()  # transport recovered; the bridge's cached ledger set must refresh too
     assert handoffs.flush() == 0
     assert [p["handoff_id"] for p in _packets(fake)] == [packet_id]
-    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05", workspace=fake.workspace)
     assert ctx.goal.startswith("T-be work") and ctx.dod == ["fix the endpoint"]
     assert [p["packet"]["handoff_id"] for p in ctx.packets] == [packet_id]
 
@@ -652,7 +652,7 @@ def test_malformed_receiving_row_cannot_hide_good_handoff(tmp_path, fake, field,
     bad["packet"][field] = value
     bad["packet"]["goal"] = "corrupt row must not drive the agent"
     fake.forced["coord_handoff_list"] = [good, bad]
-    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05")
+    ctx = hand_mod.reconstruct(GID, "T-be", agent="A05", workspace=fake.workspace)
     assert ctx.goal == good["packet"]["goal"] and ctx.dod == ["fix the endpoint"]
     assert ctx.sender == "swarm-a03-arch" and ctx.signed is True
     assert ctx.packets[-1]["trust"] == "rejected"
