@@ -51,7 +51,7 @@ def yaml_mode(request, monkeypatch):
     return request.param
 
 
-_TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", "omp", "skills", "hooks")
+_TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", ".cursor", "omp", "skills", "hooks")
 
 
 @pytest.fixture()

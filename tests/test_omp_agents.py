@@ -327,7 +327,7 @@ def test_omp_wiring():
     assert pkg["omp"]["extensions"] == ["./src/index.ts"]
 
 
-_TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", "omp")
+_TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", ".cursor", "omp")
 
 
 @pytest.fixture()

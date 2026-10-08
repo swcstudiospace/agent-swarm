@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Generate Claude Code and Grok Build subagent definitions from agents.json + prompts/.
+"""Generate Claude Code, Grok Build, omp and Cursor subagent definitions from agents.json + prompts/.
 
 Claude: .claude/agents/<slug>.md  (name, description, tools incl. mcp__substrate, model: inherit)
 Grok:   .grok/agents/<slug>.md    (prompt_mode, permission_mode, agents_md)
 omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, output)
         omp/skills/<slug>/SKILL.md
         omp/skills/swarm-orchestrate/SKILL.md  (with A01)
+Cursor: .cursor/agents/<slug>.md  (name, description, model: inherit; body is the prompt plus a Cursor preamble)
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
                                [--runtimes claude,grok,omp | --no-substrate]
 The install also wires substrate-mcp (scripts/_install_substrate.py): the `substrate` MCP entry for each runtime and one
 0600 env file per agent holding its SUBSTRATE_TOKEN, read from SUBSTRATE_TOKEN_<SURFACE> (docs/substrate-workspace.md).
+Copy Cursor agents only (no substrate, no MCP, no env files):
+                               python3 scripts/build_agents.py --install-cursor <repo> [--dry-run]
+                               python3 scripts/_install_cursor.py --target <repo> [--dry-run|--check]
 """
 from __future__ import annotations
 import argparse
@@ -25,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
 from _write_skills import omp_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
+import _install_cursor  # noqa: E402
 import _install_omp  # noqa: E402
 import _install_substrate  # noqa: E402
 from swarm.workspace import CLAUDE_TOOLS  # noqa: E402
@@ -33,6 +38,7 @@ CLAUDE_DIR = ROOT / ".claude" / "agents"
 GROK_DIR = ROOT / ".grok" / "agents"
 OMP_AGENTS_DIR = ROOT / "omp" / "agents"
 OMP_SKILLS_DIR = ROOT / "omp" / "skills"
+CURSOR_DIR = ROOT / ".cursor" / "agents"
 SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
 TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
 BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
@@ -118,6 +124,50 @@ def render_grok(agent: dict, defaults: dict) -> str:
         "---",
     ]
     return "\n".join(fm) + "\n\n" + GROK_PREAMBLE + "\n" + _body(agent) + "\n"
+
+
+# Cursor subagent frontmatter is name, description, model, readonly, is_background
+# (https://cursor.com/docs/subagents). Generated files set name, description and model
+# only: readonly would block the shell calls the scripts need, and is_background defaults off.
+_CURSOR_COMMON = """You are running as a Cursor subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
+- Cursor tools: Read, Grep, Glob, Write, StrReplace, and Shell. Where the shared prompt below names a tool from another runtime, use this list. Do not call MCP tools.
+- Runtime root: when SWARM_ROOT is set, it is the absolute path of a pinned agent-swarm checkout. Call swarm tools as python3 "$SWARM_ROOT/scripts/<tool>.py" --root <target repo> --json (bun twin: bun "$SWARM_ROOT/scripts/ts/<tool>.ts" --root <target repo> --json). <target repo> is the git toplevel of the repository you are editing. Every scripts/ path in the body below is relative to that checkout.
+- When SWARM_ROOT is unset, repo-local scripts/ are swarm tools only inside the agent-swarm checkout itself (this working tree contains swarm/taskstore.py and scripts/orch_plan.py). Then call python3 scripts/<tool>.py --root <target repo> --json. In any other repository, stop: those scripts/ directories are unrelated. Finish with state BLOCKED and needs "SWARM_ROOT".
+- The assignment you receive is a task.assign payload: task_id, correlation_id, capability, inputs[], acceptance[], budget, risk_class. Echo task_id and correlation_id in every script call (--task-id, --correlation-id) and in your final JSON.
+- Read the JSON a script prints, then act. Never fabricate script output.
+- Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
+- Cloud sessions are advisory. No signing key is present (SWARM_ED25519_KEY is unset and SWARM_REQUIRE_KEY is unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
+- Do not start an unattended headless runner. Dispatch only as the nesting rule below says.
+- Finish with: (1) a short markdown summary, (2) exactly one fenced json block that is your task.result (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
+- Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report "state": "BLOCKED", "needs": "human-approval: …".
+"""
+_CURSOR_ORCH = (
+    "- Nesting: Cursor allows two levels. You may spawn specialists with the Task tool, setting subagent_type "
+    "to the slug (a02-requirements through a15-docs). Launch independent specialists in parallel. A specialist "
+    "is the second level and must not spawn further subagents. Do not spawn a01-orchestrator.\n"
+)
+_CURSOR_SPEC = (
+    "- Nesting: Cursor allows two levels. You are a specialist, so you must not spawn subagents and you must "
+    "not call the Task tool. If you need another slug, finish BLOCKED with needs set to that slug so A01 can spawn it.\n"
+)
+
+
+def _cursor_preamble(agent_id: str) -> str:
+    nesting = _CURSOR_ORCH if agent_id == "A01" else _CURSOR_SPEC
+    return "<swarm_runtime>\n" + _CURSOR_COMMON + nesting + "</swarm_runtime>\n"
+
+
+def render_cursor(agent: dict, defaults: dict) -> str:
+    del defaults
+    desc = f"{agent['id']} {agent['code']} — {agent['description']}"
+    fm = [
+        "---",
+        f"name: {agent['slug']}",
+        f"description: {yaml_str(desc)}",
+        "model: inherit",
+        "---",
+    ]
+    return "\n".join(fm) + "\n\n" + _cursor_preamble(agent["id"]) + "\n" + _body(agent) + "\n"
 
 
 _OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md in the runtime root).
@@ -241,6 +291,19 @@ def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
             (removable if _contained(skill, OMP_SKILLS_DIR) else unsafe).append(skill)
     return sorted(removable), sorted(unsafe)
 
+
+def _cursor_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
+    """(removable, unsafe) .cursor/agents entries the manifest no longer produces."""
+    removable: list[Path] = []
+    unsafe: list[Path] = []
+    if not CURSOR_DIR.is_dir():
+        return removable, unsafe
+    for p in CURSOR_DIR.glob("*.md"):
+        if p.stem not in slugs:
+            (removable if _contained(p, CURSOR_DIR) else unsafe).append(p)
+    return sorted(removable), sorted(unsafe)
+
+
 def _copy_file(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
@@ -340,16 +403,26 @@ def main() -> int:
     ap.add_argument("--only", help="comma list of agent ids/slugs")
     ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, the omp package, and the substrate-mcp wiring")
     ap.add_argument("--omp-mode", choices=("link", "copy"), help="omp step of --install-workspace: link the package (default) or copy agents and skills only (no tools, no guard)")
-    ap.add_argument("--dry-run", action="store_true", help="with --install-workspace: print the plan and the config diff, write nothing")
+    ap.add_argument("--install-cursor", help="copy .cursor/agents and .cursor/rules/agent-swarm.mdc into this existing repo; no substrate, no MCP, no env files")
+    ap.add_argument("--dry-run", action="store_true", help="with --install-workspace or --install-cursor: print the plan, write nothing")
     ap.add_argument("--runtimes", help="with --install-workspace: the runtimes that will execute swarm nodes here, each wired to "
                                        f"substrate-mcp (default {','.join(_install_substrate.RUNTIMES)}); a runtime that cannot call MCP is refused")
     ap.add_argument("--no-substrate", action="store_true", help="with --install-workspace: no substrate-mcp entries and no agent env files "
                                                                 "(the swarm then runs with the substrate integration off)")
     args = ap.parse_args()
-    if (args.omp_mode or args.dry_run or args.runtimes or args.no_substrate) and not args.install_workspace:
-        ap.error("--omp-mode, --dry-run, --runtimes and --no-substrate need --install-workspace")
+    if (args.omp_mode or args.runtimes or args.no_substrate) and not args.install_workspace:
+        ap.error("--omp-mode, --runtimes and --no-substrate need --install-workspace")
+    if args.dry_run and not args.install_workspace and not args.install_cursor:
+        ap.error("--dry-run needs --install-workspace or --install-cursor")
+    if args.install_cursor and args.install_workspace:
+        ap.error("--install-cursor cannot be combined with --install-workspace")
+    if args.install_cursor and (args.omp_mode or args.runtimes or args.no_substrate or args.check or args.only):
+        ap.error("--install-cursor only combines with --dry-run")
     if args.runtimes and args.no_substrate:
         ap.error("--runtimes wires substrate-mcp; it cannot be combined with --no-substrate")
+    if args.install_cursor:
+        # Copies the already generated files. It does not regenerate and it does not call _install_substrate.
+        return _install_cursor.install_cursor(args.install_cursor, dry_run=args.dry_run)
     runtimes = ([r.strip() for r in args.runtimes.split(",") if r.strip()] if args.runtimes
                 else list(_install_substrate.RUNTIMES))
     workspace = Path(args.install_workspace).expanduser().resolve() if args.install_workspace else None
@@ -394,13 +467,18 @@ def main() -> int:
             continue
         _write_or_check(CLAUDE_DIR / f"{agent['slug']}.md", render_claude(agent, defaults), args.check, changed, written)
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
+        _write_or_check(CURSOR_DIR / f"{agent['slug']}.md", render_cursor(agent, defaults), args.check, changed, written)
         _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
         _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
         if agent["id"] == "A01":
             _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written)
     refused = []
     if not only:
-        removable, refused = _omp_orphans({a["slug"] for a in agents})
+        slugs = {a["slug"] for a in agents}
+        removable, refused = _omp_orphans(slugs)
+        cursor_removable, cursor_refused = _cursor_orphans(slugs)
+        removable += cursor_removable
+        refused += cursor_refused
         for orphan in removable:
             changed.append(str(orphan.relative_to(ROOT)))
             if not args.check:
@@ -415,7 +493,7 @@ def main() -> int:
     print(f"wrote {len(written)} agent file(s): {', '.join(written) or '(none changed)'}")
     if refused:
         # Symlinked or out-of-tree orphans are never deleted; fail so a human removes them.
-        print("refused to remove (symlink or outside omp/): " + ", ".join(str(p.relative_to(ROOT)) for p in refused), file=sys.stderr)
+        print("refused to remove (symlink or outside the generated dir): " + ", ".join(str(p.relative_to(ROOT)) for p in refused), file=sys.stderr)
         return 1
     if workspace:
         # the substrate step first: its env files live outside the workspace, so a failure there writes nothing in it
