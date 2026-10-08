@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * TypeScript twin of scripts/build_agents.py.
- * Delegates render logic to the Python generator so dialects cannot drift.
+ * Delegates render logic to the Python generator so dialects cannot drift,
+ * including the Cursor agents under .cursor/agents. A second writer would drift.
  */
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";

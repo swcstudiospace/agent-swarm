@@ -71,7 +71,8 @@ python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern
 python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>; --runtime omp [--omp-bin omp] for headless omp -p
 python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
-python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, omp/agents, omp/skills (--check)
+python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, .cursor/agents, omp/agents, omp/skills (--check)
+python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # list the Cursor files a target repo would gain; writes nothing
 python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, the omp package and substrate-mcp (see below)
 python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
 python3 -m pytest -q                                                # runtime + orchestration tests
@@ -126,6 +127,31 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate  
 
 A relocated `omp/` package needs `SWARM_ROOT` pointing at an agent-swarm checkout, since its tools run the
 Python scripts there.
+
+## Cursor cloud agents
+
+`.cursor/agents/` holds one generated subagent per slug (`a01-orchestrator` … `a15-docs`). `python3 scripts/build_agents.py` writes them from `prompts/` plus a Cursor preamble, and `--check` fails if a file drifts. Frontmatter is `name`, `description`, and `model: inherit` ([Cursor subagents](https://cursor.com/docs/subagents)).
+
+Cursor cloud sessions are advisory. No signing key is present, so gate scripts record nothing and nothing from that session counts as APPROVED. The merge gate is Greptile, run by Desk Quality. Nesting stops at two levels: the parent may spawn `a01-orchestrator`, A01 may spawn the other slugs, and those specialists must not spawn further.
+
+A target repo does not need to vendor this runtime. Pin a checkout of agent-swarm and point `SWARM_ROOT` at it (absolute path). The agents then call:
+
+```bash
+python3 "$SWARM_ROOT/scripts/<tool>.py" --root <target repo> --json
+```
+
+`<target repo>` is the git toplevel of the repo being edited. Repo-local `scripts/` is used only when `SWARM_ROOT` is unset and the working tree is this agent-swarm checkout. In any other repo, including one that already has its own `scripts/` directory, the agents stop until `SWARM_ROOT` is set. That is the setup a follow-up install into `swcstudiospace/programming-desk` depends on.
+
+The installer copies only `.cursor/` (the 15 agents, `.cursor/rules/agent-swarm.mdc`, and a provenance stamp). It does not write MCP config or env files and it does not wire substrate.
+
+```bash
+python3 scripts/_install_cursor.py --target /path/to/repo            # copy
+python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # paths only, write nothing
+python3 scripts/_install_cursor.py --target /path/to/repo --check    # exit 1 if the copy would change
+python3 scripts/build_agents.py --install-cursor /path/to/repo       # same copy, no regeneration, no substrate
+```
+
+It refuses a symlink on the way, a target inside this checkout or equal to `$HOME`, and any differing file it did not previously write. A second run against an unchanged tree writes nothing. `grokbot/skills/swarm-cloud-dispatch/SKILL.md` is the Grok Bot side of the same handoff: install in a pull request, then brief a Cursor cloud agent to run `a01-orchestrator`. The result comes back as a draft pull request.
 
 ## Suggested reading order
 
