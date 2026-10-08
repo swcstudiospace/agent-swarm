@@ -308,7 +308,7 @@ class FileTransaction:
                     except (OSError, EnvFileProblem):
                         if item.restore:
                             try:
-                                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
                                 rfd = os.open(item.restore, flags, dir_fd=item.fd)
                                 try:
                                     rst = os.fstat(rfd)

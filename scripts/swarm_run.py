@@ -562,18 +562,20 @@ def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) ->
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
     slug = agent["slug"]
+    token, source, problem = workspace.credential(agent["id"], repo, os.environ)
     # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06, INST-03).
-    # SUBSTRATE_TOKEN is not unset: the operator sources the agent's env file for it before replay.
+    # SUBSTRATE_TOKEN is not unset only when the agent has an own credential: the operator sources the agent's env file
+    # for it before replay. When the agent has no credential, the runner's token is unset so replay does not borrow it.
     stripped = [*AGENT_SESSION_STRIPPED, *sorted(
         k for k in os.environ
-        if workspace.carries_token(k) and k != workspace.TOKEN
+        if workspace.carries_token(k) and (token is not None and k != workspace.TOKEN or token is None)
     )]
     unset = " ".join(f"-u {k}" for k in stripped)
-    clean_base = {k: v for k, v in os.environ.items() if not workspace.carries_token(k)}
-    token, source, problem = workspace.credential(agent["id"], repo, clean_base)
     disabled = (env.get("SUBSTRATE_DISABLED") or "").strip() == "1"
     if runtime == "omp" and not disabled and workspace.projected_mcp(repo, runtime) and token is not None:
         env["SWARM_SUBSTRATE_AGENT"] = slug
+    else:
+        env.pop("SWARM_SUBSTRATE_AGENT", None)
     keys = [*CHILD_ENV_KEYS, *(["SWARM_SUBSTRATE_AGENT"] if "SWARM_SUBSTRATE_AGENT" in env else [])]
     deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in keys if k in env)
     stdin = sdir / "assignments" / f"{task['task_id']}.a{task['attempt']}.md"

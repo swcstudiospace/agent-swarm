@@ -309,7 +309,7 @@ def test_dry_run_invocation_wired_workspace(ws, tmp_path, capsys, monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    # 1. Runner export of SUBSTRATE_TOKEN is not unset with -u (so sourcing agent env file works for replay)
+    # 1. Runner export of SUBSTRATE_TOKEN is unset with -u when agent has no credential
     #    Inherited sibling token SUBSTRATE_TOKEN_SWARM_A05_BE IS unset with -u
     #    A10 has no token -> SWARM_SUBSTRATE_AGENT not in deltas
     capsys.readouterr()
@@ -317,7 +317,7 @@ def test_dry_run_invocation_wired_workspace(ws, tmp_path, capsys, monkeypatch):
     err = capsys.readouterr().err
     tokens_a10 = shlex.split(err.splitlines()[0].split(": ", 1)[1])
     unset_a10 = {tokens_a10[i + 1] for i, t in enumerate(tokens_a10) if t == "-u"}
-    assert "SUBSTRATE_TOKEN" not in unset_a10
+    assert "SUBSTRATE_TOKEN" in unset_a10
     assert "SUBSTRATE_TOKEN_SWARM_A05_BE" in unset_a10
     assert "SWARM_SUBSTRATE_AGENT" not in err
 
@@ -333,4 +333,18 @@ def test_dry_run_invocation_wired_workspace(ws, tmp_path, capsys, monkeypatch):
     assert secret not in err
     assert "inherited-secret" not in err
     assert "from " in err
+
+    # 3. Agent with token in os.environ (SUBSTRATE_TOKEN_<SURFACE>) -> SUBSTRATE_TOKEN not unset, SWARM_SUBSTRATE_AGENT set
+    monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A10_SEC", "a10-secret-tok")
+    capsys.readouterr()
+    mod.dry_run_invocation(task, agent, ws, sdir, _args(runtime="omp"))
+    err = capsys.readouterr().err
+    tokens_a10_env = shlex.split(err.splitlines()[0].split(": ", 1)[1])
+    unset_a10_env = {tokens_a10_env[i + 1] for i, t in enumerate(tokens_a10_env) if t == "-u"}
+    assert "SUBSTRATE_TOKEN" not in unset_a10_env
+    assert "SUBSTRATE_TOKEN_SWARM_A10_SEC" in unset_a10_env
+    assert "SWARM_SUBSTRATE_AGENT=a10-security" in err
+    assert "a10-secret-tok" not in err
+    assert "from $SUBSTRATE_TOKEN_SWARM_A10_SEC" in err
+
 
