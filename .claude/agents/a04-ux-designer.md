@@ -1,7 +1,7 @@
 ---
 name: a04-ux-designer
 description: "A04 UXD — Owns design tokens, wireframes, UX specs and accessibility (WCAG) requirements. Use for any UI-facing feature before frontend implementation."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

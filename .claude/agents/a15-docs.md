@@ -1,7 +1,7 @@
 ---
 name: a15-docs
 description: "A15 DOC — Owns docs bundles, API references, runbooks and changelogs. Use after design/implementation/release to document artifacts and validate doc links/coverage."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

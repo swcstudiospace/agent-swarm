@@ -1,7 +1,7 @@
 ---
 name: a11-devops
 description: "A11 DEVOPS — Owns IaC, CI pipelines, build artifacts and environments. Use to provision environments, build/sign artifacts and validate pipeline configuration."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

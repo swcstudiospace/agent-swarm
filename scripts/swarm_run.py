@@ -2,8 +2,9 @@
 """A01 — autonomous swarm runner: executes a planned task DAG with headless agent sessions.
 
 Each ready task is dispatched to its agent as a headless session, run with the task.assign prompt on stdin:
-    claude -p --agent <slug> --output-format json --permission-mode <mode> …                (--runtime claude)
-    grok -p --agent <slug> --output-format json --yolo --cwd <repo>                          (--runtime grok)
+    claude -p --agent <slug> --output-format json --permission-mode <mode> …
+        [--mcp-config <repo>/.mcp.json --strict-mcp-config] --allowedTools … [mcp__substrate]   (--runtime claude)
+    grok -p --agent <slug> --output-format json --yolo [--trust] --cwd <repo>               (--runtime grok)
     omp -p --mode json --no-session --no-title --no-extensions -e <agent-swarm>/omp --cwd <repo>
         --approval-mode yolo --tools <frontmatter tools>,yield
         --append-system-prompt $SWARM_DIR/agents/<slug>.md --max-time <n>s                   (--runtime omp)
@@ -25,6 +26,9 @@ again at start (swarm/substrate_lease.py, docs/substrate-leases.md).
 Each boundary that changes the accountable agent (a dependency owned by another agent, a failing gate, an escalation) is
 written as a `coord_handoff` packet by its sender, and each assignment carries the task's context rebuilt from the
 ledger (swarm/substrate_handoff.py, docs/substrate-handoffs.md).
+Each session, each of its lease calls and each packet it sends carries the agent's own SUBSTRATE_TOKEN, from that agent's
+env file for the workspace (<repo>); no other SUBSTRATE_TOKEN* reaches the session. The bracketed flags appear when the
+install wired the substrate MCP entry into <repo> (swarm/workspace.py, docs/substrate-workspace.md).
 
   python3 scripts/swarm_run.py                          # run latest plan to completion
   python3 scripts/swarm_run.py --runtime omp            # run it on omp (needs only `omp` on PATH)
@@ -59,7 +63,7 @@ from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
-from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee  # noqa: E402
+from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee, workspace  # noqa: E402
 
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
@@ -211,19 +215,39 @@ def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
 
 
 def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) -> tuple[list[str], dict, Path]:
-    """(argv, env, cwd) of one agent session; the prompt goes on stdin. Shared by the live path and --dry-run."""
+    """(argv, env, cwd) of one agent session; the prompt goes on stdin. Shared by the live path and --dry-run.
+
+    `repo` is the installed workspace (ADR 0001 S4). The child's environment holds no token but its own: every
+    SUBSTRATE_TOKEN* the runner has is dropped, and SUBSTRATE_TOKEN is set from the agent's env file, the one the lease
+    calls use too (swarm/workspace.py). Each runtime reads the `substrate` MCP entry the install wrote:
+    - claude runs in this checkout, where a workspace `.mcp.json` is never read, so it is passed as --mcp-config
+      (strict: the agent's tools list admits no other server anyway) and its tools are added to --allowedTools;
+    - grok reads `.grok/config.toml` only in a trusted folder, so it gets --trust, which a --yolo session implies;
+    - omp reads `.mcp.json` from its --cwd, and its --tools list does not hide MCP tools (they are xd:// devices)."""
     slug = agent["slug"]
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
-    env = {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}
+    env, _source, _problem = workspace.child_env(
+        {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}, repo, agent["id"])
+    env.pop("SWARM_SUBSTRATE_AGENT", None)  # never inherit another process's MCP authorization marker
     # SWARM_AGENT: the session's agent identity; the omp swarm_gate tool runs only that agent's gate (WR-03)
     env.update(SWARM_DIR=str(sdir), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=slug,
                AIO_UPLIFT="0", AIO_SWARM="0")
     model = ["--model", args.model] if args.model else []
     binary = runtime_bin(runtime, args)
+    disabled = (env.get("SUBSTRATE_DISABLED") or "").strip() == "1"
+    wired = (not disabled) and workspace.projected_mcp(repo, runtime)
+    if disabled:
+        env.pop(workspace.TOKEN, None)
+        env.pop("SUBSTRATE_URL", None)
+        env.pop("SWARM_SUBSTRATE_AGENT", None)
     if runtime == "grok":
-        return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", "--cwd", str(repo), *model], env, repo
+        trust = ["--trust"] if wired else []
+        return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", *trust, "--cwd", str(repo),
+                *model], env, repo
     if runtime == "omp":
+        if wired and env.get(workspace.TOKEN):
+            env["SWARM_SUBSTRATE_AGENT"] = slug
         tools, body = omp_agent(slug, sdir)
         # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
         margin = min(60, max(5, args.task_timeout // 10))
@@ -235,8 +259,12 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
     cmd = [binary, "-p", "--agent", slug, "--output-format", "json",
            "--permission-mode", args.permission_mode, "--max-turns", str(args.max_turns),
            "--add-dir", str(ROOT), *model]
-    if args.allowed_tools:
-        cmd += ["--allowedTools", *[t.strip() for t in args.allowed_tools.split(",") if t.strip()]]
+    allowed = [t.strip() for t in (args.allowed_tools or "").split(",") if t.strip()]
+    if wired:
+        cmd += ["--mcp-config", str(workspace.mcp_config(repo, runtime)), "--strict-mcp-config"]
+        allowed.append(workspace.CLAUDE_TOOLS)
+    if allowed:
+        cmd += ["--allowedTools", *allowed]
     return cmd + ["--add-dir", str(repo)], env, ROOT  # cwd ROOT: .claude/agents resolves
 
 
@@ -529,15 +557,32 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
 
 def dry_run_invocation(task: dict, agent: dict, repo: Path, sdir: Path, args) -> dict:
     """--dry-run: print the exact session invocation (key-var unsets, env deltas, argv, stdin file) to stderr as a
-    replayable `env -u … K=V … argv < file` line; spawn nothing."""
+    replayable `env -u … K=V … argv < file` line, then where the session's SUBSTRATE_TOKEN comes from; spawn nothing.
+    The token's value is never printed: a replay sources the agent's env file for it."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, _cwd = headless_command(runtime, agent, repo, sdir, args)
-    # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06)
-    unset = " ".join(f"-u {k}" for k in AGENT_SESSION_STRIPPED)
-    deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in CHILD_ENV_KEYS)
+    slug = agent["slug"]
+    token, source, problem = workspace.credential(agent["id"], repo, os.environ)
+    # names only: the live child env drops these, so a replay from the runner's shell must too (WR-06, INST-03).
+    # SUBSTRATE_TOKEN is not unset only when the agent has an own credential: the operator sources the agent's env file
+    # for it before replay. When the agent has no credential, the runner's token is unset so replay does not borrow it.
+    stripped = [*AGENT_SESSION_STRIPPED, *sorted(
+        k for k in os.environ
+        if workspace.carries_token(k) and (token is not None and k != workspace.TOKEN or token is None)
+    )]
+    unset = " ".join(f"-u {k}" for k in stripped)
+    disabled = (env.get("SUBSTRATE_DISABLED") or "").strip() == "1"
+    if runtime == "omp" and not disabled and workspace.projected_mcp(repo, runtime) and token is not None:
+        env["SWARM_SUBSTRATE_AGENT"] = slug
+    else:
+        env.pop("SWARM_SUBSTRATE_AGENT", None)
+    keys = [*CHILD_ENV_KEYS, *(["SWARM_SUBSTRATE_AGENT"] if "SWARM_SUBSTRATE_AGENT" in env else [])]
+    deltas = " ".join(f"{k}={shlex.quote(env[k])}" for k in keys if k in env)
     stdin = sdir / "assignments" / f"{task['task_id']}.a{task['attempt']}.md"
     print(f"dry-run {task['task_id']} [{agent['id']}]: env {unset} {deltas} {shlex.join(cmd)} < {shlex.quote(str(stdin))}",
           file=sys.stderr, flush=True)
+    source_str = f"from {source}" if token is not None else f"none ({problem})"
+    print(f"dry-run {task['task_id']} [{agent['id']}] SUBSTRATE_TOKEN: {source_str}", file=sys.stderr, flush=True)
     return {"dry_run": True, "runtime": runtime, "argv": cmd}
 
 
@@ -854,6 +899,9 @@ def handoff_bridge(store_path: Path, corr: str, repo: Path, ctx, leases):
 
 def run(args, ctx) -> dict:
     repo = Path(args.repo).resolve()
+    # the runner's records belong to the workspace it works: their repo slug, and the agent env files the event tee
+    # takes each record's token from (workspace.credential), are the workspace's, not those of the cwd it started in
+    ctx.root = repo
     sdir = swarm_dir(repo, create=True)
     # one absolute state dir for this process and every child it spawns (D-10)
     os.environ["SWARM_DIR"] = str(sdir)

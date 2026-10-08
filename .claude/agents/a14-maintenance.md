@@ -1,7 +1,7 @@
 ---
 name: a14-maintenance
 description: "A14 MAINT — Owns patch tasks, dependency bumps, tech-debt register and EOL tracking. Use for hotfix root-cause analysis, CVE-driven patching and debt triage."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

@@ -399,7 +399,7 @@ def test_install_workspace_has_no_repo_side_effect(tree, ws, home):
     hook = tree / ".grok" / "hooks" / "agent-swarm.json"
     hook_before = hook.read_bytes()
     before = _snapshot(tree)
-    r = _cli(tree, ws, home)
+    r = _cli(tree, ws, home, "--no-substrate")  # the substrate step has its own tests (test_install_substrate.py)
     assert r.returncode == 0, r.stdout + r.stderr
     assert hook.read_bytes() == hook_before
     assert _snapshot(tree) == before
@@ -413,7 +413,7 @@ def test_install_workspace_has_no_repo_side_effect(tree, ws, home):
 @pytest.mark.parametrize("mode", ["link", "copy"])
 def test_install_workspace_dry_run_writes_nothing(tree, ws, home, mode):
     before = _snapshot(tree, ws, home)
-    r = _cli(tree, ws, home, "--omp-mode", mode, "--dry-run")
+    r = _cli(tree, ws, home, "--omp-mode", mode, "--dry-run", "--no-substrate")
     assert r.returncode == 0, r.stdout + r.stderr
     assert _snapshot(tree, ws, home) == before
     assert list(ws.iterdir()) == []

@@ -1,7 +1,7 @@
 ---
 name: a05-backend
 description: "A05 BE — Implements backend services against A03 contracts and A07 data contracts, with unit tests. Use for server-side code, APIs, business logic and hotfix patches."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

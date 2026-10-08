@@ -23,8 +23,9 @@ import pytest
 
 from conftest import ROOT
 
-from swarm import substrate_client, substrate_lease as lease_mod, substrate_tee as tee_mod
+from swarm import substrate_client, substrate_lease as lease_mod, substrate_tee as tee_mod, workspace as ws_mod
 from swarm.errors import ErrorCode, SwarmError
+from swarm.manifest import load_manifest
 from swarm.taskstore import TaskStore
 
 GID = "ut-mabc123-0123abcd"
@@ -244,12 +245,15 @@ def _env(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def fake(monkeypatch):
+def fake(monkeypatch, tmp_path):
     monkeypatch.setenv("SUBSTRATE_URL", "http://substrate.test:8787")
     monkeypatch.setenv("SUBSTRATE_TOKEN", "tok-swarm-a01-orch")  # the orchestrator's own token
-    for surface in tee_mod.AGENT_SURFACES.values():  # and, as S4 will deliver them, each agent's
-        monkeypatch.setenv("SUBSTRATE_TOKEN_" + surface.upper().replace("-", "_"), f"tok-{surface}")
+    # and each agent's, where S4 delivers it: its env file for the workspace (here tmp_path), never the runner's env
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    for agent in load_manifest():
+        ws_mod.write_token(ws_mod.env_file(tmp_path, agent["slug"]), f"tok-{tee_mod.AGENT_SURFACES[agent['id']]}")
     f = FakeSubstrate()
+    f.workspace = tmp_path
     monkeypatch.setattr(substrate_client, "_open", f)
     return f
 
@@ -277,6 +281,7 @@ def _plan(store, tid="T-be", agent="A05", gates=(), **notes) -> dict:
 
 
 def _bridge(store, events, env=None, **kw) -> lease_mod.LeaseBridge:
+    kw.setdefault("root", store.path.parent.parent)  # the workspace whose agent env files the fixture wrote
     return lease_mod.LeaseBridge(store.path, CORR, emit=lambda t, p: events.append((t, p)), env=env, **kw)
 
 
@@ -388,15 +393,47 @@ def test_a_denied_task_does_not_take_a_parallel_slot(tmp_path, fake, runner):
 
 
 def test_refused_claim_is_not_dispatched(tmp_path, fake, runner, monkeypatch):
-    # A05's token was never delivered: the client falls back to SUBSTRATE_TOKEN (A01's) and the server refuses the claim.
-    # Running it unleased would be exactly the misconfigured-but-looks-healthy agent the ADR warns about.
-    monkeypatch.delenv("SUBSTRATE_TOKEN_SWARM_A05_BE")
+    # A05's token was never delivered: no env file and no SUBSTRATE_TOKEN_SWARM_A05_BE. The runner's own SUBSTRATE_TOKEN
+    # (A01's) does not stand in, so nothing reaches the server and the task is not run as the
+    # misconfigured-but-looks-healthy agent the ADR warns about.
+    ws_mod.env_file(tmp_path, "a05-backend").unlink()
     fake.register("T-be")
     store, events = _store(tmp_path), []
     batch, waiting = runner.select_batch(store, [_plan(store)], 3, _bridge(store, events))
     assert batch == [] and waiting == ["T-be: refused"]
+    assert fake.at("graph_claim") == []
     assert store.get("T-be")["state"] == "PLANNED" and store.get("T-be")["notes_json"]["lease"]["state"] == "refused"
-    assert _types(events) == ["lease.refused"] and "surface" in events[0][1]["reason"]
+    assert _types(events) == ["lease.refused"]
+    assert "a05-backend.env does not exist" in events[0][1]["reason"]
+
+
+def test_without_an_env_file_the_agents_own_server_side_variable_is_used(tmp_path, fake, monkeypatch):
+    # a pre-S4 runner given every agent's token under the server's names still claims as A05: the same secret, the
+    # second step of the one lookup (workspace.credential) that the session, the handoff and the tee share
+    ws_mod.env_file(tmp_path, "a05-backend").unlink()
+    monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A05_BE", "tok-swarm-a05-be")
+    fake.register("T-be")
+    store = _store(tmp_path)
+    assert _bridge(store, []).acquire(_plan(store), "A05").status == "held"
+    assert [c["caller"] for c in fake.at("graph_claim")] == ["swarm-a05-be"]
+
+
+def test_lease_calls_carry_the_token_in_the_agents_env_file(tmp_path, fake):
+    # INST-03: the runner's environment holds only A01's token, yet the claim arrives as A05, because the lease call
+    # reads A05's env file for the workspace, the same file A05's own session gets its SUBSTRATE_TOKEN from
+    assert not [k for k in os.environ if k.startswith("SUBSTRATE_TOKEN_")]
+    fake.register("T-be")
+    store = _store(tmp_path)
+    assert _bridge(store, []).acquire(_plan(store), "A05").status == "held"
+    assert [c["caller"] for c in fake.at("graph_claim")] == ["swarm-a05-be"]
+
+
+def test_an_env_file_others_can_read_is_not_used(tmp_path, fake):
+    ws_mod.env_file(tmp_path, "a05-backend").chmod(0o644)
+    fake.register("T-be")
+    store, events = _store(tmp_path), []
+    assert _bridge(store, events).acquire(_plan(store), "A05").status == "refused"
+    assert fake.at("graph_claim") == [] and "must be 0600" in events[0][1]["reason"]
 
 
 @pytest.mark.parametrize("refusal", [401, 403, "identity"])
@@ -470,7 +507,7 @@ def test_saturated_slots_wait_then_dispatch_with_a_lease(tmp_path, queued_fake, 
 def test_saturated_slots_defer_claim_without_unleased_dispatch(tmp_path, queued_fake, runner, monkeypatch, cached_graph):
     queued_fake.register("T-be")
     # Another replica already holds the node; local congestion must not bypass that fact.
-    claim, _ = lease_mod.claim_node("A05", GID, "T-be", ttl_s=900, env=_replica("other"))
+    claim, _ = lease_mod.claim_node("A05", GID, "T-be", ttl_s=900, workspace=queued_fake.workspace, env=_replica("other"))
     assert claim.status == "held"
     store, events = _store(tmp_path), []
     task = _plan(store)
@@ -574,7 +611,7 @@ def _held(tmp_path, fake, events, tid="T-be", state="IN_PROGRESS", **kw):
 def _steal(fake, tid="T-be", replica="r2", ttl=lease_mod.DEFAULT_TTL_S, agent="A05"):
     """The runner's lease lapses and another replica of the same agent class takes the node."""
     fake.now += ttl + 1
-    claim = lease_mod.claim_node(agent, GID, tid, ttl_s=ttl, env=_replica(replica))[0]
+    claim = lease_mod.claim_node(agent, GID, tid, ttl_s=ttl, workspace=fake.workspace, env=_replica(replica))[0]
     assert claim.status == "held" and claim.reason == "stolen"
 
 
@@ -599,8 +636,8 @@ def test_a_refusal_stops_the_session_with_its_tabled_reason(tmp_path, fake, monk
         _steal(fake)
     elif reason == "unheld":
         fake.force_release("T-be")  # an operator prised it loose: the session must not carry on
-    else:  # the runner's A05 token now names another surface
-        monkeypatch.setenv("SUBSTRATE_TOKEN_SWARM_A05_BE", "tok-swarm-a06-fe")
+    else:  # A05's env file now holds a token that names another surface
+        ws_mod.write_token(ws_mod.env_file(fake.workspace, "a05-backend"), "tok-swarm-a06-fe")
     assert bridge.beat("T-be") == "stopped"
     assert stops == [lease_mod.SESSION_REFUSALS[reason]]
     assert stops[0].startswith("E-POLICY" if reason == "not-holder" else "E-TIMEOUT")
@@ -763,9 +800,10 @@ def test_the_fake_expires_on_the_granted_ttl(tmp_path, fake, monkeypatch):
     fake.now = granted_at + 30
     assert bridge.beat("T-be") == "ok" and fake.node("T-be")["expires"] == granted_at + 30 + 90
     fake.now = granted_at + 30 + 89  # unbeaten from here: still held one second before the granted TTL runs out
-    assert lease_mod.claim_node("A05", GID, "T-be", ttl_s=120, env=_replica("r2"))[0].status == "denied"
+    r2 = _replica("r2")
+    assert lease_mod.claim_node("A05", GID, "T-be", ttl_s=120, workspace=fake.workspace, env=r2)[0].status == "denied"
     fake.now = granted_at + 30 + 90  # and free on the granted clock, 30 s before the requested one
-    assert lease_mod.claim_node("A05", GID, "T-be", ttl_s=120, env=_replica("r2"))[0].reason == "stolen"
+    assert lease_mod.claim_node("A05", GID, "T-be", ttl_s=120, workspace=fake.workspace, env=r2)[0].reason == "stolen"
 
 
 def test_many_held_leases_are_all_renewed_within_a_third_of_the_ttl(tmp_path, fake, monkeypatch):
@@ -1196,7 +1234,7 @@ def test_a_stale_mirror_cannot_release_a_successor_lease(tmp_path, fake):
     _steal(fake)
     successor = dict(fake.node("T-be"))
     store.transition("T-be", "FAILED", reason="old runner ended")
-    assert lease_mod.settle_mirrored(store, "T-be", emit=lambda *a: None) == "not-ours"
+    assert lease_mod.settle_mirrored(store, "T-be", emit=lambda *a: None, workspace=fake.workspace) == "not-ours"
     assert [c["args"]["lease_id"] for c in fake.at("graph_release")] == [stale]
     assert fake.node("T-be") == successor
     assert successor["lease_id"] != stale and successor["session"] == f"A05@r2:{GID}"
@@ -1341,6 +1379,8 @@ def test_full_non_dry_run_outage_preserves_the_disabled_dag_budgets_and_results(
         tee_mod.reset()
         repo = tmp_path / mode
         repo.mkdir()
+        for agent in load_manifest():
+            ws_mod.write_token(ws_mod.env_file(repo, agent["slug"]), f"tok-{tee_mod.AGENT_SURFACES[agent['id']]}")
         monkeypatch.setenv("SWARM_DIR", str(repo / ".swarm"))
         monkeypatch.setenv("SUBSTRATE_DISABLED", "1" if mode == "disabled" else "0")
         fake.down = mode == "outage"

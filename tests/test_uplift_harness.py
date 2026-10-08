@@ -5,7 +5,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_build_agents_writes_grok_and_claude():
-    import subprocess, sys
+    import subprocess
+    import sys
 
     r = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "build_agents.py"), "--check"],
@@ -25,7 +26,9 @@ def test_build_agents_writes_grok_and_claude():
 
 
 def test_ts_script_base_dry_run_json():
-    import os, shutil, subprocess
+    import os
+    import shutil
+    import subprocess
 
     ts = ROOT / "scripts" / "ts" / "script_base.ts"
     assert ts.exists()

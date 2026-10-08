@@ -1,7 +1,7 @@
 ---
 name: a02-requirements
 description: "A02 REQ — Turns briefs into a requirements spec, user stories and machine-checkable acceptance criteria (Given/When/Then). Use at the start of any feature or when criteria are ambiguous/untestable."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

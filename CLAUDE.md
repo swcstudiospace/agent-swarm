@@ -88,10 +88,12 @@ Install into another workspace (omp targets: `omp/agents/`, `omp/skills/` and th
 ```bash
 python3 scripts/build_agents.py --install-workspace /path/to/ws                  # link (default)
 python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # agents + skills only
-python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print plan + config diff, write nothing
+python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print plan + config diff + env files, write nothing
+python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # skip the substrate-mcp wiring
 ```
 
-- It regenerates, copies the Claude/Grok agents, skills and hooks, then runs the omp step. It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
+- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and hooks, then runs the omp step. It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
+- substrate-mcp ([docs/substrate-workspace.md](docs/substrate-workspace.md)): the `substrate` entry in `<ws>/.mcp.json` and `<ws>/.grok/config.toml` names `${SUBSTRATE_TOKEN}`, never a value; each agent's token goes to a 0600 env file outside the workspace, from `SUBSTRATE_TOKEN_<SURFACE>` in your environment. A missing token prints what to create and exits 2.
 - `link` merges the package realpath into `<ws>/.omp/config.yml` `extensions:` (a host path by design). Start omp at `<ws>`: the config is read from the cwd only. If that file has no `extensions` key, the inherited list is carried over, because a project array replaces the user array: `<ws>/.omp/settings.json`, else `config.yml|config.yaml` in the omp user agent dir (profile dir via `OMP_PROFILE`/`PI_PROFILE`, else `PI_CODING_AGENT_DIR`, else `~/.omp/agent`), else that dir's `settings.json`. A user YAML without `extensions` suppresses the legacy `settings.json`.
 - `copy` copies agents and skills into `<ws>/.omp/agents|skills`: no tools, no guard, no `/swarm`, no context hook. Re-run it after regenerating.
 - Both modes print a `WARNING shadow:` line per same-`name` agent or skill that omp resolves first: project `.omp/agents|skills` in `<ws>` or its ancestors, the user `agents|skills` dirs (profile-aware), earlier `extensions:` entries, `skills.customDirectories`. Only files omp would load count (agents need `name` + `description`; skills need `description` and are skipped on `enabled: false`). `.claude/*` and `.agents/skills` do not shadow.

@@ -1,7 +1,7 @@
 ---
 name: a06-frontend
 description: "A06 FE — Implements UI against A04 tokens/UX specs and A03 API contracts, with component tests and a11y checks. Use for client-side code."
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__substrate
 model: inherit
 ---
 

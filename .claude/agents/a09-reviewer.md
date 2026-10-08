@@ -1,7 +1,7 @@
 ---
 name: a09-reviewer
 description: "A09 REV — Review gate. Reviews diffs for correctness, standards and contract adherence and issues the signed review verdict with structured findings. Read-only on product code."
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, mcp__substrate
 model: inherit
 ---
 

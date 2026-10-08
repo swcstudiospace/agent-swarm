@@ -13,10 +13,12 @@ import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
 
-isolateEnv("SWARM_AGENT", "SWARM_TASK_ID");
+isolateEnv("SWARM_AGENT", "SWARM_TASK_ID", "SWARM_SUBSTRATE_AGENT", "SUBSTRATE_TOKEN");
 beforeEach(() => {
   delete process.env.SWARM_AGENT;
   delete process.env.SWARM_TASK_ID;
+  delete process.env.SWARM_SUBSTRATE_AGENT;
+  delete process.env.SUBSTRATE_TOKEN;
 });
 
 const A01 = "a01-orchestrator";
@@ -826,13 +828,57 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(call("write", { path: "xd://lsp", content: "{}" }), facts(B05))).toBeUndefined();
   });
 
-  /** T-06-07: MCP tools and their `xd://mcp__…` devices act with the operator's credentials; every swarm session is closed to them. */
+  test("S4 scoped substrate: the registered guard admits own-token calls but not another agent or operator MCP", () => {
+    process.env.SWARM_AGENT = B05;
+    process.env.SWARM_SUBSTRATE_AGENT = B05;
+    process.env.SUBSTRATE_TOKEN = "tok-a05";
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const own = fakeCtx(CWD);
+    expect(run(call("mcp__substrate_memory_brief", {}), own)).toBeUndefined();
+    expect(run(call("write", { path: "xd://mcp__substrate_events_emit", content: "{}" }), own)).toBeUndefined();
+    expect(run(call("mcp__substrate_graph_get", {}), agentCtx(CWD, A01, [], false))?.block).toBe(true);
+    expect(run(call("mcp__linear_save_issue", {}), own)?.block).toBe(true);
+    expect(run(call("write", { path: "xd://mcp__notion_update_page", content: "{}" }), own)?.block).toBe(true);
+  });
+
+  test("S4 scoped substrate: a token alone, missing token, or mismatched scope never unlocks MCP", () => {
+    for (const env of [
+      { SUBSTRATE_TOKEN: "tok-a05" },
+      { SWARM_SUBSTRATE_AGENT: B05 },
+      { SWARM_SUBSTRATE_AGENT: A01, SUBSTRATE_TOKEN: "tok-a01" },
+      { SWARM_SUBSTRATE_AGENT: B05, SUBSTRATE_TOKEN: "tok-a05", SUBSTRATE_DISABLED: "1" },
+    ]) {
+      const inside = facts(B05, { env });
+      expect(guardToolCall(call("mcp__substrate_memory_brief"), inside)?.block).toBe(true);
+      expect(guardToolCall(call("write", { path: "xd://mcp__substrate_events_emit" }), inside)?.block).toBe(true);
+    }
+  });
+
+  test("S4 scoped substrate: namespace lookalikes and mixed device targets remain blocked", () => {
+    const inside = facts(B05, { env: { SWARM_SUBSTRATE_AGENT: B05, SUBSTRATE_TOKEN: "tok-a05" } });
+    for (const path of [
+      "xd://mcp__substrate_admin_delete",
+      "xd://mcp__substrate_graph_get/other",
+      "xd://mcp__substrate_graph_get?server=linear",
+      "xd://mcp__substrate_other_graph_get",
+    ]) expect(guardToolCall(call("write", { path }), inside)?.block).toBe(true);
+    expect(guardToolCall(call("write", {
+      path: "xd://mcp__substrate_graph_get", file_path: "xd://mcp__linear_save_issue",
+    }), inside)?.block).toBe(true);
+  });
+
+  test("S4 scoped substrate: A01's depth cap still precedes the own-token exception", () => {
+    const inside = { ...capped, env: { SWARM_SUBSTRATE_AGENT: A01, SUBSTRATE_TOKEN: "tok-a01" } };
+    expect(guardToolCall(call("mcp__substrate_graph_get"), inside)?.reason).toStartWith(DEPTH_PREFIX);
+  });
+
+  /** T-06-07: operator-credential MCP tools and their devices remain closed to every swarm session. */
   const MCP_TOOLS = ["mcp__linear_save_issue", "mcp__notion_update_page", "mcp__linear__delete_comment", "MCP__Greptile_Review"];
   const MCP_DEVICES = ["xd://mcp__linear_save_issue", "XD://MCP__Notion_Create_Pages", "xd://mcp__linear_save_issue?x=1", "xd://mcp__relume_get_component/sub", "  xd://mcp__aio_status  "];
   const headless = (): GuardFacts => facts(undefined, { env: { SWARM_AGENT: B05 } });
   const inSwarm: [string, () => GuardFacts][] = [["a05", () => facts(B05)], ["a01", () => facts(A01)], ["headless SWARM_AGENT", headless]];
 
-  test.each(inSwarm)("T-06-07: %s blocks every MCP tool and MCP device write", (_, inside) => {
+  test.each(inSwarm)("T-06-07: %s blocks operator-credential MCP tools and device writes", (_, inside) => {
     for (const name of MCP_TOOLS) {
       expect(guardToolCall(call(name, { id: "x" }), inside())).toEqual({ block: true, reason: `BLOCKED needs: human-approval (mcp: ${name})` });
     }
