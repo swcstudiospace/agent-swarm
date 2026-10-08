@@ -1,17 +1,20 @@
 /** Integration: tools → real bridge → real python scripts → tmp Task Store (never the repo's .swarm/). */
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, runPy, SwarmToolError } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry } from "../src/omp-api.ts";
-import { agentCtx, callTool, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
+import { agentCtx, callTool, ephemeralSigningKey, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
 
 isolateEnv(
   "SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION", "SWARM_AGENT",
-  "SWARM_ALLOW_INSECURE_DEV_KEY",
+  "SWARM_SIGNING_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
 );
+beforeEach(() => {
+  process.env.SWARM_SIGNING_KEY = ephemeralSigningKey();
+});
 
 /** All tools over the real bridge, counting bridge calls. */
 function swarm() {
@@ -201,7 +204,6 @@ test("plan mode store unchanged", async () => {
 test("gate signed rows: one verdict per gate_for target, derived from its findings", async () => {
   const { ctx, sdir } = tmpStore();
   delete process.env.SWARM_AGENT_SESSION; // in-session, swarm_gate is the recorder
-  process.env.SWARM_ALLOW_INSECURE_DEV_KEY = "1"; // keyless tests opt into the dev key; it is no longer implicit
   const { tool } = swarm();
   await callTool(tool("swarm_plan"), { brief: "add search", pattern: "feature", risk_class: "low", prefix: "F", correlation_id: "c-feat" }, ctx);
   await lease(tool, ctx, "F-rev");
@@ -240,7 +242,6 @@ function jsonAt(value: unknown, ...path: string[]): unknown {
 test("gate dry run end to end: canned pass reaches the agent and satisfies no real gate", async () => {
   const { ctx, sdir } = tmpStore();
   delete process.env.SWARM_AGENT_SESSION; // in-session, swarm_gate is the recorder
-  process.env.SWARM_ALLOW_INSECURE_DEV_KEY = "1"; // keyless tests opt into the dev key; it is no longer implicit
   const { tool } = swarm();
   await callTool(tool("swarm_plan"), { brief: "add search", pattern: "feature", risk_class: "low", prefix: "F", correlation_id: "c-feat" }, ctx);
   await lease(tool, ctx, "F-rev");

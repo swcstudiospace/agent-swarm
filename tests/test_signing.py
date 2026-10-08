@@ -24,8 +24,10 @@ def _in_review(ts, tid, gates=("review",)):
 
 
 def _dev_key_verdict(ts, tid):
-    """Record a review pass signed with the public dev key (no key configured while signing)."""
+    """Record a review pass signed with the public dev key (opt-in, no real key configured)."""
     from swarm.gates import make_verdict
+    os.environ.pop("SWARM_SIGNING_KEY", None)
+    os.environ["SWARM_ALLOW_INSECURE_DEV_KEY"] = "1"
     ts.record_verdict(tid, make_verdict(gate="review", task_id=tid, agent_id="A09", correlation_id="c"))
 
 
@@ -63,6 +65,7 @@ def test_dev_key_hmac_rejected_under_ed25519_only(swarm_dir, monkeypatch):
 def test_dev_key_hmac_rejected_when_ed25519_seed_unloadable(swarm_dir, monkeypatch):
     from swarm.envelope import build_envelope, sign_envelope, verify_envelope
     _clear_keys(monkeypatch)
+    monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
     env = sign_envelope(build_envelope(source="A09", target="A01", msg_type="gate.verdict",
                                        payload={"gate": "review"}, correlation_id="c"))
     assert env["sig"].startswith("hmac:") and verify_envelope(env)
@@ -127,7 +130,9 @@ def test_malformed_envelope_rows_are_bad_sig(swarm_dir, monkeypatch):
     from swarm.taskstore import TaskStore
     from swarm.gates import make_verdict
     from swarm.results import reconcile
-    _clear_keys(monkeypatch)
+    # the throwaway HMAC key from the fixture signs the envelope; this test is not the dev-key path
+    monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    monkeypatch.delenv("SWARM_REQUIRE_KEY", raising=False)
     ts = TaskStore()
     _in_review(ts, "W-1")
     env = make_verdict(gate="review", task_id="W-1", agent_id="A09", correlation_id="c")
@@ -145,7 +150,8 @@ def test_record_verdict_bad_base64_is_taxonomy_error(swarm_dir, monkeypatch, sig
     from swarm.taskstore import TaskStore
     from swarm.gates import make_verdict
     from swarm.errors import SwarmError, ErrorCode
-    _clear_keys(monkeypatch)
+    monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    monkeypatch.delenv("SWARM_REQUIRE_KEY", raising=False)
     ts = TaskStore()
     _in_review(ts, "W-2")
     env = {**make_verdict(gate="review", task_id="W-2", agent_id="A09", correlation_id="c"), "sig": sig}
@@ -160,6 +166,7 @@ def test_dev_key_event_follows_root(tmp_path):
     app.mkdir()
     other.mkdir()
     env = {k: v for k, v in os.environ.items() if k not in ("SWARM_DIR", *KEY_VARS)}
+    env["SWARM_ALLOW_INSECURE_DEV_KEY"] = "1"
     # cwd=other on purpose (not conftest.run_script, whose cwd is the repo and its real .swarm)
     r = subprocess.run([sys.executable, str(ROOT / "scripts" / "rev_gate.py"), "--root", str(app), "--dry-run",
                         "--task-id", "R-rev", "--json"], capture_output=True, text=True, cwd=other, env=env)

@@ -27,7 +27,7 @@ KEY_REASON = "fail-closed: no signing key configured"
 
 
 @pytest.fixture(autouse=True)
-def _clear_signing_env(monkeypatch, allow_insecure_dev_key):
+def _clear_signing_env(monkeypatch, ephemeral_signing_key):
     for name in _KEY_VARS:
         monkeypatch.delenv(name, raising=False)
 
@@ -192,3 +192,4 @@ def test_agent_session_preview_stays_unrecorded(swarm_dir):
     envelope = json.loads((swarm_dir / "verdicts" / "X-qa.quality.json").read_text())
     assert envelope["payload"].get("advisory") is True
     assert verify_envelope(envelope) is False
+

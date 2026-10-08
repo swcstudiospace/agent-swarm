@@ -36,7 +36,14 @@ def sr(tmp_path, monkeypatch):
 
 
 def _env(swarm, **extra) -> dict:
-    return {**{k: v for k, v in os.environ.items() if k not in _ENV_NOISE}, "SWARM_DIR": str(swarm), **extra}
+    # the runner signs task.assign. Keep this test's throwaway HMAC key; extra may replace it.
+    key = os.environ.get("SWARM_SIGNING_KEY")
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_NOISE}
+    env["SWARM_DIR"] = str(swarm)
+    if key and "SWARM_SIGNING_KEY" not in extra:
+        env["SWARM_SIGNING_KEY"] = key
+    env.update(extra)
+    return env
 
 
 def _plan(tmp_path, env, plan=ONE_TASK, *extra) -> Path:

@@ -1,5 +1,6 @@
 /** Shared bun:test helpers: tmp git repos and SWARM_DIRs (never the repo's .swarm/), fake pi and ctx. */
 import { afterEach, beforeEach } from "bun:test";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -33,6 +34,11 @@ export function gitRepo(...subdirs: string[]): string {
   if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`);
   for (const sub of subdirs) mkdirSync(join(dir, sub), { recursive: true });
   return dir;
+}
+
+/** A throwaway HMAC key for one test. Callers must not print or persist it. */
+export function ephemeralSigningKey(): string {
+  return randomBytes(32).toString("hex");
 }
 
 /** Save these env vars before each test and restore them after it; also removes tmp dirs. */

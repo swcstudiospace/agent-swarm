@@ -318,6 +318,7 @@ def test_dev_key_event_and_require_key(swarm_dir, monkeypatch):
     from swarm.errors import SwarmError
     monkeypatch.delenv("SWARM_SIGNING_KEY", raising=False)
     monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
     ts = TaskStore()
     _in_review(ts, "K-1")
     ts.record_verdict("K-1", make_verdict(gate="review", task_id="K-1", agent_id="A09", correlation_id="c"))

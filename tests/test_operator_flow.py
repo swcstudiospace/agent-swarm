@@ -9,9 +9,10 @@ from conftest import ROOT
 
 def _env():
     # no SWARM_DIR (state must follow --repo) and no other ambient swarm settings.
-    # A keyless dry-run signs task.assign; that uses the dev key only with an explicit opt-in.
+    # A dry-run signs task.assign. Pass this test's throwaway HMAC key; do not opt into the dev key.
+    key = os.environ["SWARM_SIGNING_KEY"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("SWARM_")}
-    env["SWARM_ALLOW_INSECURE_DEV_KEY"] = "1"
+    env["SWARM_SIGNING_KEY"] = key
     return env
 
 

@@ -1,6 +1,7 @@
 """Shared fixtures: isolated SWARM_DIR, script runner, stub claude and omp CLIs, omp workspace-install dirs."""
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -16,15 +17,16 @@ from install_helpers import _ENV_KEYS, _yaml  # noqa: E402  (after ROOT is on sy
 
 
 @pytest.fixture(autouse=True)
-def allow_insecure_dev_key(monkeypatch):
-    """Suites written before the dev key became opt-in keep that behaviour.
+def ephemeral_signing_key(monkeypatch):
+    """Each test gets a throwaway HMAC key. The dev-key opt-in stays off unless that test sets it.
 
-    tests/test_dev_key_fail_closed.py depends on this fixture and then clears
-    SWARM_ALLOW_INSECURE_DEV_KEY. A real key still wins; SWARM_REQUIRE_KEY=1 and
-    SWARM_ED25519_KEY still forbid the dev key.
+    The value is generated here and is not printed, logged, or written down. A test that needs
+    another configuration sets or clears the variables itself.
     """
-    if os.environ.get("SWARM_ALLOW_INSECURE_DEV_KEY") is None:
-        monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
+    monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY", raising=False)
+    monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    monkeypatch.delenv("SWARM_REQUIRE_KEY", raising=False)
+    monkeypatch.setenv("SWARM_SIGNING_KEY", secrets.token_hex(32))
 
 
 @pytest.fixture()
