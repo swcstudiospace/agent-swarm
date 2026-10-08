@@ -306,7 +306,16 @@ class FileTransaction:
                         else:
                             os.unlink(item.path.name, dir_fd=item.fd)
                     except (OSError, EnvFileProblem):
-                        problems.append(f"{item.path}: rollback could not restore this file")
+                        if item.restore:
+                            try:
+                                os.chmod(item.restore, 0o600, dir_fd=item.fd)
+                            except OSError:
+                                pass
+                            recovery = item.path.parent / item.restore
+                            item.restore = ""  # retain on disk: do not unlink in cleanup
+                            problems.append(f"{item.path}: rollback could not restore this file; recovery copy retained at {recovery}")
+                        else:
+                            problems.append(f"{item.path}: rollback could not restore this file")
         finally:
             for item in self.writes:
                 for name in (item.staged, item.restore):
@@ -349,7 +358,9 @@ def credential(agent_id: str | None, workspace: str | Path | None,
        refuses: the operator put it there and it is wrong, so nothing else is tried.
     2. Else `SUBSTRATE_TOKEN_<SURFACE>` in `env`: the same secret under the server's name, deliberately given to this
        process (a pre-S4 runner holding every agent's token).
-    3. Else nothing. Never `SUBSTRATE_TOKEN`: in the runner that is A01's, and a claim or a run-log row of another
+    3. Else `SUBSTRATE_TOKEN` in `env` only when running inside this agent's own child session (`SWARM_AGENT_SESSION == "1"`
+       and `SWARM_AGENT == slug`), where `child_env` stripped the server-specific variables.
+    4. Else nothing. Never `SUBSTRATE_TOKEN` in the runner: that is A01's, and a claim or a run-log row of another
        agent sent with it would be misattributed, or refused for naming another surface."""
     from .substrate_tee import AGENT_SURFACES  # lazy: the tee imports this module
 
@@ -376,6 +387,14 @@ def credential(agent_id: str | None, workspace: str | Path | None,
     given = (e.get(var) or "").strip()
     if valid_token(given):
         return given, f"${var}", ""
+    try:
+        slug = get_agent(agent_id or "")["slug"]
+    except KeyError:
+        slug = ""
+    if (e.get("SWARM_AGENT_SESSION") or "").strip() == "1" and slug and (e.get("SWARM_AGENT") or "").strip() == slug:
+        session_token = (e.get(TOKEN) or "").strip()
+        if valid_token(session_token):
+            return session_token, f"${TOKEN}", ""
     return None, "", f"{path or 'no workspace'}{' does not exist' if path else ''} and {var} is unset"
 
 

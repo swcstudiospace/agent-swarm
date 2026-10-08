@@ -198,7 +198,10 @@ def test_dry_run_names_what_is_stripped_and_where_the_token_comes_from_never_its
     line = next(ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: "))
     tokens = shlex.split(line.removeprefix("dry-run T-one [A05]: "))
     unset = {tokens[i + 1] for i, t in enumerate(tokens) if t == "-u"}
-    assert set(RUNNER_TOKENS) <= unset
+    # The runner's foreign tokens are stripped; the child's own SUBSTRATE_TOKEN is kept in replay
+    expected_stripped = {k for k in RUNNER_TOKENS if k != "SUBSTRATE_TOKEN"}
+    assert expected_stripped <= unset
+    assert "SUBSTRATE_TOKEN" not in unset
     assert f"dry-run T-one [A05] SUBSTRATE_TOKEN: from {workspace.env_file(ws, 'a05-backend')}" in r.stderr.splitlines()
     assert not any(v in r.stdout + r.stderr for v in (A05_TOKEN, *RUNNER_TOKENS.values()))
 
@@ -254,3 +257,63 @@ def test_claude_does_not_unlock_substrate_flags_for_unrelated_or_invalid_configs
     assert "--mcp-config" not in argv
     assert "--strict-mcp-config" not in argv
     assert workspace.CLAUDE_TOOLS not in argv
+
+
+@pytest.mark.parametrize("runtime", ["claude", "grok", "omp"])
+def test_substrate_disabled_turns_off_child_mcp_and_strips_token(sr, ws, tmp_path, monkeypatch, runtime):
+    _wire(ws)
+    monkeypatch.setenv("SUBSTRATE_DISABLED", "1")
+    argv, env, _ = sr.headless_command(runtime, A05, ws, tmp_path / ".swarm", _args())
+    assert _tokens(env) == {}
+    if runtime == "claude":
+        assert "--mcp-config" not in argv
+        assert workspace.CLAUDE_TOOLS not in argv
+    elif runtime == "grok":
+        assert "--trust" not in argv
+    elif runtime == "omp":
+        assert "SWARM_SUBSTRATE_AGENT" not in env
+
+
+def test_credential_in_child_session_resolves_own_session_token():
+    session_env = {"SWARM_AGENT_SESSION": "1", "SWARM_AGENT": "a05-backend", "SUBSTRATE_TOKEN": "child-tok"}
+    tok, src, prob = workspace.credential("A05", None, session_env)
+    assert tok == "child-tok" and src == "$SUBSTRATE_TOKEN" and not prob
+
+    # Another agent identity cannot claim this session's token
+    tok, src, prob = workspace.credential("A09", None, session_env)
+    assert tok is None and not src and "unset" in prob
+
+    # Outside an agent session (e.g. runner), SUBSTRATE_TOKEN is never used as fallback
+    tok, src, prob = workspace.credential("A05", None, {"SUBSTRATE_TOKEN": "child-tok"})
+    assert tok is None and not src and "unset" in prob
+
+
+def test_dry_run_strips_token_when_child_gets_no_token_and_includes_omp_agent(ws, tmp_path, capsys, monkeypatch):
+    _wire(ws)
+    task = {"task_id": "T-two", "attempt": 1}
+    agent = {"slug": "a10-security", "id": "A10"}
+    sdir = tmp_path / ".swarm"
+    (sdir / "assignments").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SUBSTRATE_TOKEN", "runner-tok")
+
+    spec = importlib.util.spec_from_file_location("sr_mod", ROOT / "scripts" / "swarm_run.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # 1. A10 gets no token -> -u SUBSTRATE_TOKEN is stripped
+    capsys.readouterr()
+    mod.dry_run_invocation(task, agent, ws, sdir, _args(runtime="omp"))
+    err = capsys.readouterr().err
+    tokens_a10 = shlex.split(err.splitlines()[0].split(": ", 1)[1])
+    unset_a10 = {tokens_a10[i + 1] for i, t in enumerate(tokens_a10) if t == "-u"}
+    assert "SUBSTRATE_TOKEN" in unset_a10
+    assert "SWARM_SUBSTRATE_AGENT" not in err
+
+    # 2. A05 gets a token and is wired -> SUBSTRATE_TOKEN not stripped, SWARM_SUBSTRATE_AGENT in deltas
+    mod.dry_run_invocation({"task_id": "T-one", "attempt": 1}, A05, ws, sdir, _args(runtime="omp"))
+    err = capsys.readouterr().err
+    tokens_a05 = shlex.split(err.splitlines()[0].split(": ", 1)[1])
+    unset_a05 = {tokens_a05[i + 1] for i, t in enumerate(tokens_a05) if t == "-u"}
+    assert "SUBSTRATE_TOKEN" not in unset_a05
+    assert "SWARM_SUBSTRATE_AGENT=a05-backend" in err
+

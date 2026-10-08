@@ -391,3 +391,39 @@ def test_failed_install_preserves_intervening_operator_config_edits(tmp_path, mo
     assert _snapshot(tmp_path) == {**before, target: external.encode()}
     assert not list(tmp_path.rglob(".substrate-*.tmp"))
     assert not workspace.env_dir(ws, env).exists()
+
+
+def test_failed_rollback_preserves_recovery_copy_mode_0600(tmp_path, monkeypatch):
+    ws = tmp_path / "work"
+    ws.mkdir()
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "config"), **TOKENS}
+    directory = workspace.env_dir(ws, env)
+    a01_path = directory / "a01-orchestrator.env"
+    workspace.write_token(a01_path, "old-a01")
+
+    replace = os.replace
+    published = []
+    rollback_attempted = []
+
+    def failing_replace(src, dst, **kwargs):
+        name = Path(dst).name
+        # During initial commit: fail on a06-frontend.env
+        if not rollback_attempted and name == "a06-frontend.env":
+            rollback_attempted.append(True)
+            raise OSError("injected publish failure on a06")
+        # During rollback: fail restoring a01-orchestrator.env
+        if rollback_attempted and name == "a01-orchestrator.env":
+            raise OSError("injected rollback failure on a01")
+        published.append(name)
+        return replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(workspace.os, "replace", failing_replace)
+    out = io.StringIO()
+    assert substrate_install.install_substrate(ws, ["claude"], False, out, env) == 2
+    assert "recovery copy retained at" in out.getvalue()
+    recovery_files = list(directory.glob(".substrate-*.tmp"))
+    assert len(recovery_files) == 1
+    recovery = recovery_files[0]
+    assert stat.S_IMODE(recovery.stat().st_mode) == 0o600
+    assert recovery.read_text() == "SUBSTRATE_TOKEN=old-a01\n"
+

@@ -72,7 +72,7 @@ It also refuses (exit 2, nothing written):
 - everything it refused before: a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any
   destination reached through a symlink.
 
-`--no-substrate` installs the rest without the entry or the env files; the swarm then runs with the integration off.
+`--no-substrate` installs the rest without writing the substrate entry or env files. To turn off the runtime integration, unset `SUBSTRATE_URL` or set `SUBSTRATE_DISABLED=1`.
 
 ## Run
 
