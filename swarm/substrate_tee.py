@@ -92,6 +92,11 @@ TYPE_KINDS: dict[str, str] = {
     "handoff.refused": "warning",              # refused, or the sender has no token of its own: not written, not retried
     "handoff.unsigned": "warning",             # the substrate has no handoff key: packets are recorded unsigned (once a run)
     "handoff.misattributed": "warning",        # the ledger recorded the packet under another surface than its sender's
+    # hook and watchdog observability events
+    "hook-fired": "note",                      # hook trigger fired
+    "per-unit": "note",                        # per-unit progress update
+    "batch-end": "note",                       # batch execution round completed
+    "stale": "warning",                        # watchdog detected stale state or lease
 }
 # `script.<name>` and `script.<name>.error` are the exit record of one agent script run -> tool.call.
 PREFIX_KINDS: tuple[tuple[str, str], ...] = (("script.", "tool.call"),)

@@ -825,7 +825,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
             result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent yielded an error: {meta['yield_error']}"[:500],
                                            task_id=tid)
         elif meta.get("is_error") or meta.get("returncode"):
-            result, err = None, SwarmError(ErrorCode.E_EXEC, f"agent session reported error (rc={meta.get('returncode')})",
+            result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent session reported error (rc={meta.get('returncode')})",
                                            task_id=tid)
         if meta.get("extension_error"):  # T-06-06: an unguarded session's result is never applied, nor its gate recorded
             result, err = None, SwarmError(ErrorCode.E_DEP, "omp ran the session without the swarm guard: "
