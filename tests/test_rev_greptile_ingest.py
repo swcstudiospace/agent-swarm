@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,38 @@ def test_link_text_with_escaped_brackets_is_flattened(tmp_path):
     assert f["evidence"] == "See [n6] seat map now."
 
 
+def test_markdown_code_is_never_cleaned(tmp_path):
+    """Greptile quotes code in its explanations. Markup removal must not touch inline code or fenced blocks, and a
+    backticked <details> must not swallow the rest of the comment."""
+    rest = ('Use `<a href="/settings">` and `<details>` carefully.\n\n```html\n<details>\n<b>x</b> [a](b)\n```\n\n'
+            "~~~\n<img alt='P1'>\n~~~\n\nDone, see [docs](https://e.test/d).")
+    f = _one(tmp_path, _badged(2, "T", rest))
+    assert f["evidence"] == ('Use `<a href="/settings">` and `<details>` carefully.\n\n```html\n<details>\n<b>x</b> [a](b)\n```\n\n'
+                             "~~~\n<img alt='P1'>\n~~~\n\nDone, see docs.")
+
+
+def test_double_backtick_span_and_unterminated_fence_are_kept(tmp_path):
+    f = _one(tmp_path, _badged(2, "T", "Write ``a ` <b>`` here.\n\n```py\nprint('<b>')"))
+    assert f["evidence"] == "Write ``a ` <b>`` here.\n\n```py\nprint('<b>')"
+
+
+def test_a_fence_inside_the_prompt_block_is_removed_with_it(tmp_path):
+    rest = "Visible.\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nhidden <b>\n`````\n</details>\n\nAfter."
+    assert _one(tmp_path, _badged(2, "T", rest))["evidence"] == "Visible.\n\nAfter."
+
+
+def test_pathological_markup_stays_fast():
+    """A body that is mostly brackets made the link pattern quadratic (10,000 of them took 2 s)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rev_greptile_ingest_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for body in ("[" * 30000 + "a" + "]" * 10, "`" * 30000, "<details>" * 5000, "```\n" * 8000, "[a](" * 8000):
+        start = time.perf_counter()
+        mod._clean(body)
+        assert time.perf_counter() - start < 2, body[:12]
+
+
 def test_unterminated_details_block_is_dropped_to_the_end(tmp_path):
     f = _one(tmp_path, _badged(2, "T", "Visible.\n\n<details><summary>Prompt</summary>\n\nsecret-looking tail without a close"))
     assert f["evidence"] == "Visible."
@@ -338,6 +371,33 @@ def _bad_text(tmp_path: Path, text: str) -> Path:
 ])
 def test_malformed_threads_are_e_input(tmp_path, text):
     _input_error(_run(tmp_path, "--threads", str(_bad_text(tmp_path, text)), "--target", "T-be"))
+
+
+_NODE = {"id": "x", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 1, "originalLine": 1,
+         "comments": {"nodes": [{"author": None, "body": "lost author lookup"}]}}
+
+
+def _response(**extra) -> str:
+    threads = {"pageInfo": {"hasNextPage": False}, "nodes": [_NODE]}
+    return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": threads}}}, **extra})
+
+
+@pytest.mark.parametrize("errors", [[{"message": "Could not resolve to a User"}], "boom", {"message": "x"}])
+def test_a_response_with_errors_is_not_a_complete_export(tmp_path, errors):
+    """Partial data plus errors (a failed author lookup leaves author null) must not pass as a clean export, or a
+    real finding would be dropped as 'not Greptile' and a successful findings file written."""
+    _input_error(_run(tmp_path, "--threads", str(_bad_text(tmp_path, _response(errors=errors))), "--target", "T-be"))
+
+
+def test_an_empty_errors_list_is_fine(tmp_path):
+    data = _ok(_run(tmp_path, "--threads", str(_bad_text(tmp_path, _response(errors=[]))), "--target", "T-be"))
+    assert data["counts"]["dropped"]["not_greptile"] == 1
+
+
+def test_pr_mode_rejects_a_response_with_errors(tmp_path):
+    bindir, _ = _fake_gh(tmp_path, stdout=_response(errors=[{"message": "Could not resolve to a User"}]))
+    env = _env(tmp_path, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    _input_error(_run(tmp_path, "--pr", "o/r#1", "--target", "T-be", env=env))
 
 
 def test_wrong_shape_fixture_and_missing_file_are_e_input(tmp_path):

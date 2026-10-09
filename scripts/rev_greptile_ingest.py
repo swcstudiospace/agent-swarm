@@ -34,6 +34,7 @@ from swarm.script_base import AgentScript, check_task_id  # noqa: E402
 DEFAULT_AUTHORS = ("greptile-apps", "greptile-apps[bot]")
 SUMMARY_MAX = 200
 EVIDENCE_MAX = 1000
+MAX_BODY = 20_000
 GH_TIMEOUT_S = 60
 UNBADGED = "no severity badge; treated as major"
 _BY_PRIORITY = ("blocker", "major", "minor")  # P0, P1, P2; P3 and lower are info
@@ -46,7 +47,12 @@ _META_LINES = re.compile(r"^[ \t]*\*\*(?:Knowledge Base|Sources?) Used:?\*\*:?[^
 # source carry the trailing "Fix in ..." buttons; their anchors hold long percent-encoded prompt URLs.
 _HTML = re.compile(r"</?(?:a|img|picture|source|br|hr|p|b|i|em|strong|code|pre|sub|sup|summary|div|span|ul|ol|li|h[1-6]|"
                    r"blockquote|table|thead|tbody|tr|td|th)\b[^>]*>", re.I)
-_LINK = re.compile(r"\[((?:\\.|[^\]\\\n])+)\]\([^)\n]*\)")  # link text may hold escaped brackets: [\[n6\] title](url)
+# link text may hold escaped brackets: [\[n6\] title](url). Both parts are bounded: an unbounded text scan from every "["
+# is quadratic on a body that is mostly brackets (10,000 of them took 2 s).
+_LINK = re.compile(r"\[((?:\\.|[^\]\\\n]){1,300})\]\([^)\n]{0,2000}\)")
+_FENCE_OPEN = re.compile(r"[ \t]*(`{3,}|~{3,})")
+_INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")  # one line; a run of backticks closes with the same run
+_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 _TITLE = re.compile(r"\*\*(.+?)\*\*", re.S)
 _PR = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([0-9]+)")
 _TOKEN = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")
@@ -115,6 +121,9 @@ def _thread_nodes(data: object) -> list:
              "or a bare list of review-thread nodes")
     if not isinstance(data, dict):
         raise _fail(shape)
+    if data.get("errors"):  # partial data plus errors (a failed author lookup leaves author null) is not a complete export
+        raise _fail("the GraphQL response contains errors: export a complete, successful response; "
+                    "a partial one could hide review threads")
     try:
         threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
     except (KeyError, TypeError):
@@ -167,16 +176,48 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
+def _protect_code(text: str) -> tuple[str, list[str]]:
+    """`text` with every fenced block (``` or ~~~, an unterminated one to the end) and every inline code span replaced by
+    a \\x00N\\x00 placeholder, and the originals. Greptile quotes code in its explanations; markup removal must not touch
+    it (a backticked <details> would swallow the rest of the comment)."""
+    saved: list[str] = []
+
+    def keep(chunk: str) -> str:
+        saved.append(chunk)
+        return f"\x00{len(saved) - 1}\x00"
+
+    out: list[str] = []
+    fence, block = "", []
+    for line in text.split("\n"):
+        bare = line.strip(" \t")
+        if not fence:
+            opening = _FENCE_OPEN.match(line)
+            if opening:
+                fence, block = opening.group(1), [line]
+            else:
+                out.append(line)
+            continue
+        block.append(line)
+        if bare and set(bare) == {fence[0]} and len(bare) >= len(fence):  # the closing fence: the same character, as long
+            out.append(keep("\n".join(block)))
+            fence, block = "", []
+    if fence:
+        out.append(keep("\n".join(block)))
+    return _INLINE_CODE.sub(lambda m: keep(m.group(0)), "\n".join(out)), saved
+
+
 def _clean(body: str) -> str:
     """The comment text without the badge, details blocks, Knowledge Base/Source lines, HTML, link targets and control
-    or zero-width/bidi characters."""
+    or zero-width/bidi characters. Code (fenced or inline) is kept verbatim."""
     text = "".join(ch for ch in body if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf"))
+    text, saved = _protect_code(text)  # after the filter: no real \x00 is left to collide with a placeholder
     text = _DETAILS.sub("", text)
     text = _META_LINES.sub("", text)
     text = _HTML.sub("", text)
     text = _LINK.sub(lambda m: re.sub(r"\\([\[\]])", r"\1", m.group(1)), text)
     text = re.sub(r"[ \t]+\n", "\n", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return _PLACEHOLDER.sub(lambda m: saved[int(m.group(1))], text).strip()
 
 
 def _finding(number: int, thread: _Thread) -> dict:
@@ -186,7 +227,7 @@ def _finding(number: int, thread: _Thread) -> dict:
         severity = _BY_PRIORITY[priority] if priority < len(_BY_PRIORITY) else "info"
     else:
         severity = "major"
-    cleaned = _clean(thread.body)
+    cleaned = _clean(thread.body[:MAX_BODY])  # only the head can reach the 1000-char evidence, and the work stays bounded
     title = _TITLE.match(cleaned)
     if title:
         heading, rest = title.group(1), cleaned[title.end():]
