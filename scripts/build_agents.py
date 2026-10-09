@@ -12,7 +12,7 @@ Grok Bot: grokbot/swarm/seat-map.json and grokbot/skills/swarm-<lane>/SKILL.md
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
-                               [--runtimes claude,grok,omp | --no-substrate] [--with-a01-complete-hook]
+                               [--runtimes claude,grok,omp | --no-substrate] [--with-a01-complete-hook] [--allow-shadowed-copy]
 The install also wires substrate-mcp (scripts/_install_substrate.py): the `substrate` MCP entry for each runtime and one
 0600 env file per agent holding its SUBSTRATE_TOKEN, read from SUBSTRATE_TOKEN_<SURFACE> (docs/substrate-workspace.md).
 Copy Cursor agents only (no substrate, no MCP, no env files):
@@ -1084,6 +1084,7 @@ def main() -> int:
     ap.add_argument("--only", help="comma list of agent ids/slugs")
     ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, the omp package, and the substrate-mcp wiring")
     ap.add_argument("--omp-mode", choices=("link", "copy"), help="omp step of --install-workspace: link the package (default) or copy agents and skills only (no tools, no guard)")
+    ap.add_argument("--allow-shadowed-copy", action="store_true", help="with --install-workspace --omp-mode copy: proceed when an ancestor workspace shadows the package (the copies still carry no tools and no guard)")
     ap.add_argument("--install-cursor", help="copy .cursor/agents and .cursor/rules/agent-swarm.mdc into this existing repo; no substrate, no MCP, no env files")
     ap.add_argument("--dry-run", action="store_true", help="with --install-workspace or --install-cursor: print the plan, write nothing")
     ap.add_argument("--runtimes", help="with --install-workspace: the runtimes that will execute swarm nodes here, each wired to "
@@ -1095,8 +1096,8 @@ def main() -> int:
                          "can detach the unattended runner, which itself needs a real signing key and SWARM_ALLOW_AUTONOMOUS=1); "
                          "a reinstall without this flag removes an earlier registration")
     args = ap.parse_args()
-    if (args.omp_mode or args.runtimes or args.no_substrate or args.with_a01_complete_hook) and not args.install_workspace:
-        ap.error("--omp-mode, --runtimes, --no-substrate and --with-a01-complete-hook need --install-workspace")
+    if (args.omp_mode or args.allow_shadowed_copy or args.runtimes or args.no_substrate or args.with_a01_complete_hook) and not args.install_workspace:
+        ap.error("--omp-mode, --allow-shadowed-copy, --runtimes, --no-substrate and --with-a01-complete-hook need --install-workspace")
     if args.dry_run and not args.install_workspace and not args.install_cursor:
         ap.error("--dry-run needs --install-workspace or --install-cursor")
     if args.install_cursor and args.install_workspace:
@@ -1105,6 +1106,8 @@ def main() -> int:
         ap.error("--install-cursor only combines with --dry-run")
     if args.runtimes and args.no_substrate:
         ap.error("--runtimes wires substrate-mcp; it cannot be combined with --no-substrate")
+    if args.allow_shadowed_copy and args.omp_mode != "copy":
+        ap.error("--allow-shadowed-copy needs --omp-mode copy")
     if args.install_cursor:
         # Copies the already generated files. It does not regenerate and it does not call _install_substrate.
         return _install_cursor.install_cursor(args.install_cursor, dry_run=args.dry_run)
@@ -1118,7 +1121,7 @@ def main() -> int:
         if not workspace.is_dir():
             print(f"error: workspace {workspace} is not an existing directory", file=sys.stderr)
             return 2
-        problem = _install_omp.preflight(workspace, mode)
+        problem = _install_omp.preflight(workspace, mode, allow_shadowed_copy=args.allow_shadowed_copy)
         if not problem:
             # CR-01: no Claude/Grok write may follow a symlink; refuse before generation or any copy.
             dests = [d for _, d in _workspace_copies(workspace)] + list(_workspace_hooks(workspace))
@@ -1146,7 +1149,7 @@ def main() -> int:
             print("dry-run: skipping generation; the files below are copied as they are on disk")
             install_workspace(workspace, dry_run=True, with_a01_complete_hook=args.with_a01_complete_hook)
             substrate = 0 if args.no_substrate else _install_substrate.install_substrate(workspace, runtimes, True, sys.stdout)
-            return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout))
+            return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout, allow_shadowed_copy=args.allow_shadowed_copy))
     link = _generated_symlink()
     if link is not None:
         try:
@@ -1220,7 +1223,7 @@ def main() -> int:
             return 2
         install_workspace(workspace, with_a01_complete_hook=args.with_a01_complete_hook)
         print(f"installed Claude/Grok agents, skills and hook into {workspace}")
-        return _install_omp.install_omp(workspace, mode, False, sys.stdout)
+        return _install_omp.install_omp(workspace, mode, False, sys.stdout, allow_shadowed_copy=args.allow_shadowed_copy)
     return 0
 
 

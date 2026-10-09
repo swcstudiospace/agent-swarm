@@ -3,7 +3,9 @@
 link (default, D-01..D-04): merge the realpath of this checkout's `omp/` package into `<ws>/.omp/config.yml`
 `extensions:` line by line; every other line stays byte-for-byte. copy (D-06): copy the generated agents and
 skills into `<ws>/.omp/` and leave the config alone. Both modes print one WARNING per same-name agent or skill that
-shadows the package (D-05); warnings never change the exit code. Nothing here writes into this repo or `~/.omp`.
+shadows the package (D-05); warnings never change the exit code. Copy mode additionally refuses when a strict
+ancestor of the workspace shadows the package (T-07-20): the copies would run guard-less with shadowed skills;
+pass `allow_shadowed_copy=True` to proceed with the warnings. Nothing here writes into this repo or `~/.omp`.
 """
 from __future__ import annotations
 
@@ -527,6 +529,7 @@ class _Plan:
     replaced: list[str] = field(default_factory=list)  # inherited entries spelling the package differently
     copies: list[tuple[Path, Path]] = field(default_factory=list)
     shadows: list[Shadow] = field(default_factory=list)
+    copy_blockers: list[Shadow] = field(default_factory=list)  # copy mode only: strict-ancestor shadows (T-07-20)
     dest_state: dict[str, list[tuple[str, tuple[int, int] | None]]] = field(default_factory=dict)
 
 
@@ -928,9 +931,13 @@ def _plan(ws: Path, mode: str, home: Path, env: Mapping[str, str]) -> _Plan:
         plan.linked = next((e for e in entries or [] if _resolve_entry(e, ws, home) == PKG), None)
         dests = {d for _, d in plan.copies}
         own = ws / ".omp"
-        plan.shadows = [
-            s for s in shadow_scan(ws, home, (), env, agents, skills)
-            if s.custom or (s.path.is_relative_to(own) and s.path not in dests)
+        found = shadow_scan(ws, home, (), env, agents, skills)
+        plan.shadows = [s for s in found if s.custom or (s.path.is_relative_to(own) and s.path not in dests)]
+        # T-07-20: project-level shadows outside `ws/.omp` live in a strict ancestor. The copies below would
+        # resolve ahead of that ancestor's package wiring, so the workspace would run guard-less with shadowed
+        # skills while looking installed; the copy path refuses them unless the caller opts in.
+        plan.copy_blockers = [
+            s for s in found if s.level == "project" and not s.custom and not s.path.is_relative_to(own)
         ]
         return plan
     bom = _BOM if (plan.old or "").startswith(_BOM) else ""
@@ -977,16 +984,37 @@ def _error(ws: Path, exc: InstallError) -> str:
     )
 
 
-def preflight(ws: Path, mode: str, home: Path | None = None, env: Mapping[str, str] | None = None) -> str | None:
+def _copy_shadow_error(ws: Path, blockers: list[Shadow]) -> str:
+    """Refusal for a copy-install under a shadowing ancestor (T-07-20): names the workspace, the ancestor
+    shadows, the guard-less consequence, and the two ways forward. Writes nothing."""
+    names = ", ".join(f"{s.kind} {s.name} at {s.path}" for s in blockers)
+    return (
+        f"error: refusing copy mode into {ws}: {names} shadow the agent-swarm package from an ancestor "
+        f"workspace, so the copies in {ws / '.omp'} would run guard-less (no tools (swarm_*), no guard "
+        f"(tool_call)) with shadowed skills while looking installed. Nothing was written. "
+        f"Re-run with --allow-shadowed-copy to proceed anyway, or use link mode to keep tools and guard."
+    )
+
+
+def preflight(
+    ws: Path,
+    mode: str,
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    allow_shadowed_copy: bool = False,
+) -> str | None:
     """The error `install_omp` would stop on (exit 2), or None. Reads only."""
     ws, home = Path(ws).resolve(), Path.home() if home is None else Path(home)
     problem = workspace_problem(ws, home)
     if problem:
         return problem
     try:
-        _plan(ws, mode, home, os.environ if env is None else env)
+        plan = _plan(ws, mode, home, os.environ if env is None else env)
     except InstallError as exc:
         return _error(ws, exc)
+    if mode == "copy" and plan.copy_blockers and not allow_shadowed_copy:
+        return _copy_shadow_error(ws, plan.copy_blockers)
     return None
 
 
@@ -997,6 +1025,8 @@ def install_omp(
     out: TextIO = sys.stdout,
     home: Path | None = None,
     env: Mapping[str, str] | None = None,
+    *,
+    allow_shadowed_copy: bool = False,
 ) -> int:
     """Link (default) or copy the omp package into `ws`; 0 on success, 2 on an unsupported workspace state."""
     ws = Path(ws).resolve()
@@ -1021,6 +1051,9 @@ def install_omp(
     except InstallError as exc:
         say(_error(ws, exc))
         return 2
+    if mode == "copy" and plan.copy_blockers and not allow_shadowed_copy:
+        say(_copy_shadow_error(ws, plan.copy_blockers))
+        return 2
     if plan.carried or plan.replaced:
         what = ", ".join(plan.carried) or "(none)"
         extra = f"; replaced {', '.join(plan.replaced)} with the package realpath" if plan.replaced else ""
@@ -1032,6 +1065,9 @@ def install_omp(
         say(f"WARNING copy mode: {plan.config} also links the package ({plan.linked}); the copies in {ws / '.omp'} shadow it")
     for shadow in plan.shadows:
         say(shadow.line())
+    if mode == "copy":
+        for shadow in plan.copy_blockers:
+            say(shadow.line())
     if mode == "copy":
         say(COPY_WARNING)
         changed = 0
