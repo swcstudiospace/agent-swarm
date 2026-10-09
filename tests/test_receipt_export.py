@@ -373,7 +373,8 @@ def test_dry_run_gate_event_is_a_simulation(swarm_dir, tmp_path):
         {"task_id": "T-qa", "capability": "gate.quality", "agent_id": "A08", "title": "Quality",
          "notes": {"gate": "quality", "gate_for": ["T-be"], "gates": []}},
     ], [
-        {"type": "script.qa_gate", "task_id": "T-qa", "payload": {"status": "ok", "dry_run": True}},
+        {"type": "script.qa_gate", "task_id": "T-qa", "payload": {
+            "status": "ok", "dry_run": True, "cmd": "python3 scripts/qa_gate.py"}},
     ])
     receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
     _assert_desk_shape(receipt)
@@ -383,6 +384,69 @@ def test_dry_run_gate_event_is_a_simulation(swarm_dir, tmp_path):
     claim = next(c["claim"] for c in receipt["claims"] if "quality" in c["claim"])
     assert "simulation" in claim
     assert "not run" not in claim
+
+
+def test_gate_event_without_a_command_is_not_invented(swarm_dir, tmp_path):
+    corr = "corr-nocmd"
+    _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+        {"task_id": "T-qa", "capability": "gate.quality", "agent_id": "A08", "title": "Quality",
+         "notes": {"gate": "quality", "gate_for": ["T-be"], "gates": []}},
+    ], [
+        {"type": "script.qa_gate", "task_id": "T-qa", "payload": {
+            "status": "ok",
+            "executed": [{"runner": "pytest", "returncode": 0}],
+            "summary": "quality gate PASS — runners: ['pytest']"}},
+    ])
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    assert receipt["claims"] == []
+    assert all("python3 scripts/qa_gate.py" not in c["cmd"] for c in receipt["commands"])
+    quality = [line for line in receipt["unverified"] if "T-qa" in line]
+    assert quality
+    assert any("no recorded cmd" in line for line in receipt["unverified"])
+    assert any("command line was not recorded" in line and "advisory" in line for line in quality)
+    assert all("not run" not in line for line in quality)
+
+
+def test_status_summary_with_approved_still_exports(swarm_dir, tmp_path):
+    corr = "corr-status"
+    _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Finished",
+         "notes": {"gates": []}},
+    ], [
+        {"type": "script.orch_status", "task_id": "T-be", "payload": {
+            "status": "ok",
+            "cmd": "python3 scripts/orch_status.py --correlation-id corr-status",
+            "exit_code": 0,
+            "summary": "T-be          A05   APPROVED           1   0      -"}},
+    ], stop="APPROVED")
+    out = tmp_path / "receipt.json"
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr, "--out", str(out)))
+    assert out.is_file()
+    tail = receipt["commands"][0]["output_tail"]
+    assert "APPROVED" not in tail
+    assert "advisory-complete" in tail
+    assert "APPROVED" not in json.dumps(receipt)
+
+
+def test_image_artifact_is_not_a_changed_file(swarm_dir, tmp_path):
+    corr = "corr-image"
+    store = _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+    ])
+    image = "example.com/app@sha256:" + ("ab" * 32)
+    store.add_artifact("T-be", kind="code", uri="src/feature.py", producer="A05")
+    store.add_artifact("T-be", kind="build.artifact", uri=".swarm/artifacts/record.json", producer="A11")
+    store.add_artifact("T-be", kind="build.artifact", uri=image, producer="A11")
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    assert receipt["files_changed"] == [".swarm/artifacts/record.json", "src/feature.py"]
+    blob = json.dumps(receipt)
+    assert image in blob
+    assert any(image in line and "non-file artifact" in line for line in receipt["unverified"])
 
 
 def test_in_progress_task_is_not_completed(swarm_dir, tmp_path):

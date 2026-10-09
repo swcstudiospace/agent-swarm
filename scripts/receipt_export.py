@@ -69,13 +69,23 @@ def _credential(value) -> bool:
     return any(rx.search(text) for text in _strings(value) for rx in patterns)
 
 
+_APPROVAL_TOKEN = re.compile(r"\bAPPROVED\b")
+
+
+def _withhold_approval(value: str) -> str:
+    """Same label as a task state. Status tables copy the stored word; the receipt must not."""
+    return _APPROVAL_TOKEN.sub("advisory-complete", value)
+
+
 def _free_text(value) -> str:
     """Redact lease ids before any prefix. A prefix makes the string invalid JSON, so a later
     redact_leases pass would leave the token in place."""
     if not isinstance(value, str):
         return ""
     redacted = redact_leases(value)
-    return redacted if isinstance(redacted, str) else ""
+    if not isinstance(redacted, str):
+        return ""
+    return _withhold_approval(redacted)
 
 
 def _state_label(state) -> str:
@@ -248,12 +258,15 @@ def _evidence(store: TaskStore, task_id: str) -> str:
     return ", ".join(uris)
 
 
-def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | None], int], list[str], list[dict]]:
+def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | None], int], list[str], list[dict],
+                                         dict[tuple[str, str | None], dict]]:
     """Recorded script runs, latest event per (script, task). A dry-run event keeps --dry-run.
 
-    An event with no exit_code and no status is not given a passing exit.
+    An event with no recorded cmd is not given an invented command line. An event with no
+    exit_code and no status is not given a passing exit.
     """
     commands, index, skipped, meta = [], {}, [], []
+    bare: dict[tuple[str, str | None], dict] = {}
     for event in events:
         kind = event.get("type") or ""
         if not isinstance(kind, str) or not kind.startswith("script.") or kind.endswith(".error"):
@@ -262,7 +275,16 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | Non
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         dry = payload.get("dry_run") is True
         recorded = payload.get("cmd")
-        cmd = recorded if isinstance(recorded, str) and recorded else f"python3 scripts/{name}.py"
+        owner = event.get("task_id") if isinstance(event.get("task_id"), str) else None
+        if not isinstance(recorded, str) or not recorded.strip():
+            # Gate scripts record status and executed runners, not the argv the runner used.
+            note = f"{kind} has no recorded cmd"
+            if dry:
+                note += "; dry-run"
+            skipped.append(note + "; it was not turned into a command")
+            bare[(name, owner)] = {"dry": dry, "commit": _sha_field(payload)}
+            continue
+        cmd = recorded
         if dry and "--dry-run" not in cmd.split():
             cmd = f"{cmd} --dry-run"
         code = payload.get("exit_code")
@@ -281,20 +303,34 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | Non
             entry["output_tail"] = _free_text(summary)
         slot = len(commands)
         commands.append(entry)
-        owner = event.get("task_id") if isinstance(event.get("task_id"), str) else None
         index[(name, owner)] = slot
         meta.append({"dry": dry, "commit": _sha_field(payload)})
-    return commands, index, skipped, meta
+    return commands, index, skipped, meta, bare
 
 
-def _files(tasks: list[dict]) -> list[str]:
-    found = []
+def _image_ref(uri: str) -> bool:
+    """OCI refs from devops_build_record --image. Recorded file paths in the task store have neither."""
+    return "://" in uri or "@" in uri or ":" in uri
+
+
+def _files(tasks: list[dict]) -> tuple[list[str], list[str]]:
+    """File paths for files_changed, and non-file build artifacts kept out of that list."""
+    found, other = [], []
     for task in tasks:
         for output in task.get("outputs") or []:
-            uri = output.get("uri") if isinstance(output, dict) else None
-            if isinstance(uri, str) and uri not in found:
+            if not isinstance(output, dict):
+                continue
+            uri = output.get("uri")
+            if not isinstance(uri, str) or not uri:
+                continue
+            if output.get("kind") == "build.artifact" and _image_ref(uri):
+                line = f"non-file artifact {task['task_id']} build.artifact: {uri}"
+                if line not in other:
+                    other.append(line)
+                continue
+            if uri not in found:
                 found.append(uri)
-    return sorted(found)
+    return sorted(found), other
 
 
 def _canned() -> dict:
@@ -332,7 +368,7 @@ def _checked_commit(info: dict, row: dict | None, advisory: dict | None, store: 
 
 def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id: str, root: Path) -> dict:
     sdir = swarm_dir(root, create=False)
-    commands, index, skipped, meta = _commands(events)
+    commands, index, skipped, meta, bare = _commands(events)
     unverified_extra = list(skipped)
     claims: list[dict] = []
     unverified = [
@@ -349,14 +385,21 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
             continue
         targets = [t for t in (notes.get("gate_for") or []) if isinstance(t, str)]
         script = GATE_EVENT.get(gate)
-        slot = index.get((script, task["task_id"])) if script else None
-        info = meta[slot] if slot is not None else {"dry": False, "commit": None}
+        key = (script, task["task_id"]) if script else None
+        slot = index.get(key) if key is not None else None
+        if slot is not None:
+            info = meta[slot]
+        elif key is not None and key in bare:
+            info = bare[key]
+        else:
+            info = {"dry": False, "commit": None}
+        ran = slot is not None or (key is not None and key in bare)
         for target in targets:
             covered.add((target, gate))
             siblings = _siblings(tasks, target, gate)
             row = _pick_row(store, target, gate, task["task_id"], siblings)
             advisory = None if row is not None else _advisory_file(sdir, task["task_id"], target, gate)
-            signature, recorded = _describe(store, target, gate, row, advisory, ran=slot is not None)
+            signature, recorded = _describe(store, target, gate, row, advisory, ran=ran)
             commit = _checked_commit(info, row, advisory, store, target)
             evidence = _evidence(store, target)
             tail = f"; evidence {evidence}" if evidence else ""
@@ -368,7 +411,8 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
             sentence = (f"{gate} gate task {task['task_id']} for {target} is advisory;{sim} "
                         f"signature {signature}; recorded {recorded}; commit {commit}{tail}")
             if slot is None:
-                unverified.append(sentence + "; no script run recorded")
+                missing = "command line was not recorded" if ran else "no script run recorded"
+                unverified.append(sentence + f"; {missing}")
                 continue
             claims.append({"claim": sentence, "evidence_command_index": slot})
     for task in tasks:
@@ -401,6 +445,8 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
                 summary = finding.get("summary") if isinstance(finding, dict) else None
                 if isinstance(summary, str) and summary:
                     unverified.append(f"finding {task['task_id']} {gate}: {_free_text(summary)}")
+    files_changed, non_files = _files(tasks)
+    unverified.extend(non_files)
     unverified.extend(unverified_extra)
     for i, command in enumerate(commands):
         if "duration_s" not in command:
@@ -420,7 +466,7 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
         "commands": commands,
         "claims": claims,
         "unverified": unverified,
-        "files_changed": _files(tasks),
+        "files_changed": files_changed,
         "contract_changes": [],
         "rollback_plan": None,
         "approvals": [],
@@ -439,13 +485,24 @@ def _open_store(root: Path) -> TaskStore:
     return TaskStore(path=db)
 
 
+def _rewrite(value):
+    if isinstance(value, str):
+        return _withhold_approval(value)
+    if isinstance(value, dict):
+        return {key: _rewrite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rewrite(item) for item in value]
+    return value
+
+
 def _guard(receipt: dict) -> dict:
-    """Redact, then refuse rather than write a credential or an approval token."""
+    """Redact, rename stored approval words, then refuse a leftover credential or approval token."""
     redacted = redact_leases(receipt)
     if not isinstance(redacted, dict) or list(redacted.keys()) != list(DESK_FIELDS):
         raise SwarmError(ErrorCode.E_INTERNAL, "redaction changed the receipt shape")
     if _credential(redacted) or _credential(json.dumps(redacted)):
         raise SwarmError(ErrorCode.E_POLICY, REFUSAL)
+    redacted = _rewrite(redacted)
     if any("APPROVED" in text for text in _strings(redacted)):
         raise SwarmError(ErrorCode.E_POLICY, "refusing to write a receipt that contains APPROVED")
     return redacted
