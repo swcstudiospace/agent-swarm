@@ -66,6 +66,14 @@ _OWNER_CAPABILITY = {
 }
 _MEDIUM = frozenset({"A05", "A06", "A07", "A11"})
 _UI_DIRS = frozenset({"components", "frontend", "ui"})
+# orch_plan stores "{prefix}-{id}". The default prefix is "T" + 4 hex + "-"
+# (6 characters). A collision fallback uses 6 hex (8 characters); the default
+# is what a fresh plan gets. A split appends "-aNN" (4). check_task_id allows
+# 128, so a node id has 118 characters left. A longer id converts and then
+# AgentScript rejects the stored id before the assigned agent can run.
+_PLANNER_PREFIX_CHARS = 6
+_OWNER_SUFFIX_CHARS = 4
+_MAX_NODE_ID = 128 - _PLANNER_PREFIX_CHARS - _OWNER_SUFFIX_CHARS
 
 
 def _int(value: object) -> bool:
@@ -130,6 +138,12 @@ def _nodes(data: dict) -> list[dict]:
         if not isinstance(node_id, str):
             raise SwarmError(ErrorCode.E_INPUT, f"invalid node id {node_id!r}")
         check_task_id(node_id, "node id")
+        if len(node_id) > _MAX_NODE_ID:
+            raise SwarmError(
+                ErrorCode.E_INPUT,
+                f"node id {node_id!r} is {len(node_id)} characters; at most {_MAX_NODE_ID} "
+                "so the planner prefix and an owner suffix still fit in 128",
+            )
         if node_id in seen:
             raise SwarmError(ErrorCode.E_INPUT, f"duplicate node id {node_id}")
         seen.add(node_id)
@@ -356,6 +370,11 @@ def convert(data: dict, summary_sha256: str) -> dict:
         ids = [f"{node['id']}-{agent.lower()}" if multi else node["id"] for agent, _cap in agents]
         for task_id in ids:
             check_task_id(task_id, "task id")
+            if len(task_id) + _PLANNER_PREFIX_CHARS > 128:
+                raise SwarmError(
+                    ErrorCode.E_INPUT,
+                    f"task id {task_id!r} leaves no room for the planner prefix",
+                )
         id_of[node["id"]] = ids
         emitted.extend(ids)
     if len(emitted) != len(set(emitted)):

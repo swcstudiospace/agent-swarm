@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from swarm.script_base import check_task_id
+
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "graph"
 SUMMARY = FIXTURES / "summary.json"
@@ -310,6 +312,33 @@ def test_mixed_owner_step_names_only_that_agents_files(tmp_path):
     assert tasks["A15"]["acceptance"] == ["Edit docs/GUIDE.md"]
 
 
+def test_node_id_leaves_room_for_prefix_and_owner_suffix(tmp_path):
+    """orch_plan's default prefix is six characters ("T" + 4 hex + "-") and a split adds "-aNN"."""
+    legal = "n" + "x" * 117  # 118: 128 - 6 - 4
+    assert len(legal) == 118
+    path = _write_summary(tmp_path, [
+        _node(legal, "generate", ["Edit src/api.py and docs/GUIDE.md"]),
+    ])
+    tasks = _plan(tmp_path, path)["tasks"]
+    assert [task["agent"] for task in tasks] == ["A05", "A15"]
+    for task in tasks:
+        stored = f"T0000-{task['id']}"
+        assert len(stored) == 128
+        assert check_task_id(stored) == stored
+
+    for length in (119, 128):
+        too_long = "n" + "y" * (length - 1)
+        out = tmp_path / f"long-{length}.json"
+        proc = _run(tmp_path, "--summary", str(_write_summary(tmp_path, [
+            _node(too_long, "generate", ["Edit src/api.py"]),
+        ])), "--out", str(out))
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        body = json.loads(proc.stdout)
+        assert body["error"]["code"] == "E-INPUT"
+        assert "118" in body["error"]["message"]
+        assert not out.exists()
+
+
 def test_node_id_with_parent_segment_is_refused(tmp_path):
     path = _write_summary(tmp_path, [_node("a..b", "understand", ["Pin it"])])
     out = tmp_path / "plan.json"
@@ -338,6 +367,42 @@ def test_deep_chain_and_cycle_stay_within_e_input(tmp_path):
     assert body["error"]["code"] == "E-INPUT"
     assert "RecursionError" not in proc.stderr
     assert not (tmp_path / "cycle.json").exists()
+
+
+@pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
+def test_bun_preserves_symlink_parents_and_empty_out(tmp_path):
+    """Python opens /ws/link/../summary.json through the symlink. Bun must not collapse that first."""
+    other = tmp_path / "other"
+    (other / "child").mkdir(parents=True)
+    (other / "summary.json").write_bytes(SUMMARY.read_bytes())
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "link").symlink_to(other / "child")
+    (ws / "summary.json").write_text("{not-the-graph}", encoding="utf-8")
+    summary_arg = f"{ws / 'link'}/../summary.json"
+    env = _env(tmp_path)
+    py = subprocess.run(
+        [sys.executable, str(SCRIPT), "--summary", summary_arg, "--json"],
+        cwd=tmp_path, capture_output=True, text=True, env=env,
+    )
+    ts = subprocess.run(
+        [BUN, str(TWIN), "--summary", summary_arg, "--json"],
+        cwd=tmp_path, capture_output=True, text=True, env=env,
+    )
+    assert py.returncode == 0, py.stdout + py.stderr
+    assert ts.returncode == 0, ts.stdout + ts.stderr
+    assert json.loads(py.stdout)["summary_sha256"] == json.loads(ts.stdout)["summary_sha256"]
+    assert json.loads(ts.stdout)["task_count"] == 11
+
+    before = {path.name for path in tmp_path.iterdir()}
+    for argv0 in ([sys.executable, str(SCRIPT)], [BUN, str(TWIN)]):
+        empty = subprocess.run(
+            [*argv0, "--summary", str(SUMMARY), "--out=", "--json"],
+            cwd=tmp_path, capture_output=True, text=True, env=env,
+        )
+        assert empty.returncode == 0, empty.stdout + empty.stderr
+        assert json.loads(empty.stdout)["out"] is None
+    assert {path.name for path in tmp_path.iterdir()} == before
 
 
 @pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
