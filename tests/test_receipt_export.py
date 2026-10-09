@@ -162,8 +162,14 @@ def test_finished_gates_are_advisory(swarm_dir):
     assert cmds["python3 -m pytest -q tests/test_feature.py"]["duration_s"] == 1.25
     assert "lease-token-should-vanish" not in blob
     assert "4 passed" in blob
+    assert receipt["completed_at"]
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
-    assert head.stdout.strip() in blob
+    sha = head.stdout.strip()
+    for claim in receipt["claims"]:
+        assert "commit not recorded" in claim["claim"]
+        assert sha not in claim["claim"]
+    assert any("not the commit the gates checked" in line and sha in line for line in receipt["unverified"])
+    assert any("state: IN_REVIEW" in line for line in receipt["unverified"])
 
 
 def test_credential_shape_refuses_to_write(swarm_dir, tmp_path):
@@ -236,6 +242,232 @@ def test_credential_patterns_match_review_gate():
     rev = _load(ROOT / "scripts" / "rev_gate.py", "rev_gate_for_receipt")
     export = _load(SCRIPT, "receipt_export_for_patterns")
     assert [p.pattern for p in export.CREDENTIAL_RES] == [p.pattern for p in rev.SECRET_RES]
+
+
+def _seed(corr: str, tasks: list[dict], events: list[dict] | None = None, *, stop: str = "IN_REVIEW"):
+    from swarm.runlog import emit
+    from swarm.taskstore import TaskStore
+
+    store = TaskStore()
+    path = ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW", "APPROVED")
+    states = path[:path.index(stop) + 1]
+    for task in tasks:
+        store.create(
+            task_id=task["task_id"], correlation_id=corr, capability=task["capability"],
+            agent_id=task["agent_id"], title=task.get("title") or "", risk_class=task.get("risk_class", "low"),
+            notes=task.get("notes") or {})
+        for state in states:
+            store.transition(task["task_id"], state)
+    for event in events or []:
+        emit(event["type"], event["payload"], source="fixture", correlation_id=corr,
+             task_id=event["task_id"], tee=False)
+    (store.path.parent / "latest_correlation").write_text(corr, encoding="utf-8")
+    return store
+
+
+def test_json_credential_shape_refuses_to_write(swarm_dir, tmp_path):
+    spec = json.loads(json.dumps(CREDENTIAL))
+    spec["events"][0]["payload"]["summary"] = '{"api_key":"notarealsecretkey"}'
+    materialize(spec, signing_key=os.environ["SWARM_SIGNING_KEY"])
+    out = tmp_path / "receipt.json"
+    proc = run_export(tmp_path, "--correlation-id", spec["correlation_id"], "--out", str(out))
+    assert proc.returncode != 0
+    assert "E-POLICY" in proc.stdout
+    assert SECRET_TEXT not in proc.stdout
+    assert SECRET_TEXT not in proc.stderr
+    assert not out.exists()
+
+
+def test_prefixed_finding_redacts_lease_token(swarm_dir):
+    materialize(SAMPLE, signing_key=os.environ["SWARM_SIGNING_KEY"])
+    from swarm.taskstore import TaskStore
+
+    store = TaskStore()
+    summary = json.dumps({"lease_id": "lease-token-should-vanish", "note": "finding-kept"})
+    store.conn.execute(
+        "UPDATE verdicts SET findings=? WHERE task_id=? AND gate=?",
+        (json.dumps([{"id": "F1", "summary": summary}]), "T-be", "quality"))
+    store.conn.commit()
+    store.update("T-be", title=json.dumps({"lease_id": "lease-token-should-vanish", "note": "title-kept"}))
+    receipt = _receipt(run_export(ROOT, "--correlation-id", SAMPLE["correlation_id"]))
+    blob = json.dumps(receipt)
+    assert "lease-token-should-vanish" not in blob
+    assert "finding-kept" in blob
+    assert "title-kept" in blob
+    assert any(line.startswith("finding T-be quality:") for line in receipt["unverified"])
+
+
+def test_rerun_claims_bind_their_own_command_and_verdict(swarm_dir, tmp_path):
+    from swarm.gates import make_verdict
+
+    corr = "corr-rerun"
+    store = _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+        {"task_id": "T-rev", "capability": "gate.review", "agent_id": "A09", "title": "Review",
+         "notes": {"gate": "review", "gate_for": ["T-be"], "gates": []}},
+        {"task_id": "T-rev.r1", "capability": "gate.review", "agent_id": "A09", "title": "Review rerun",
+         "notes": {"gate": "review", "gate_for": ["T-be"], "gates": []}},
+    ], [
+        {"type": "script.rev_gate", "task_id": "T-rev", "payload": {
+            "status": "fail", "cmd": "python3 scripts/rev_gate.py --attempt 1",
+            "exit_code": 1, "duration_s": 0.1, "summary": "first fail"}},
+        {"type": "script.rev_gate", "task_id": "T-rev.r1", "payload": {
+            "status": "ok", "cmd": "python3 scripts/rev_gate.py --attempt 2",
+            "exit_code": 0, "duration_s": 0.2, "summary": "second pass"}},
+    ])
+    fail = make_verdict(gate="review", task_id="T-be", agent_id="A09", verdict="fail",
+                        correlation_id=corr, extra={"gate_task": "T-rev"}, audit=False)
+    passed = make_verdict(gate="review", task_id="T-be", agent_id="A09", verdict="pass",
+                          correlation_id=corr, extra={"gate_task": "T-rev.r1"}, audit=False)
+    store.record_verdict("T-be", fail)
+    store.record_verdict("T-be", passed)
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    first = next(c for c in receipt["claims"] if "gate task T-rev for" in c["claim"])
+    second = next(c for c in receipt["claims"] if "gate task T-rev.r1 for" in c["claim"])
+    assert first["evidence_command_index"] != second["evidence_command_index"]
+    assert "attempt 1" in receipt["commands"][first["evidence_command_index"]]["cmd"]
+    assert "attempt 2" in receipt["commands"][second["evidence_command_index"]]["cmd"]
+    assert "recorded fail" in first["claim"]
+    assert "recorded pass" in second["claim"]
+    assert "signature signed" in first["claim"]
+    assert "signature signed" in second["claim"]
+
+
+def test_keyless_advisory_file_is_not_reported_missing(swarm_dir, tmp_path):
+    from swarm.verdicts import advisory_envelope
+
+    corr = "corr-keyless"
+    _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+        {"task_id": "T-qa", "capability": "gate.quality", "agent_id": "A08", "title": "Quality",
+         "notes": {"gate": "quality", "gate_for": ["T-be"], "gates": []}},
+    ], [
+        {"type": "script.qa_gate", "task_id": "T-qa", "payload": {
+            "status": "ok", "cmd": "python3 scripts/qa_gate.py", "exit_code": 0,
+            "duration_s": 0.3, "summary": "advisory preview"}},
+    ])
+    env = advisory_envelope(
+        gate="quality", task_id="T-qa", agent_id="A08", findings=[], runs={}, expires_s=86400,
+        correlation_id=corr, extra=None, reason="fail-closed: no signing key configured")
+    vdir = swarm_dir / "verdicts"
+    vdir.mkdir()
+    (vdir / "T-qa.quality.json").write_text(json.dumps(env), encoding="utf-8")
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    claim = next(c["claim"] for c in receipt["claims"] if "quality" in c["claim"] and "T-qa" in c["claim"])
+    assert "advisory" in claim
+    assert "unsigned keyless" in claim
+    assert "not run" not in claim
+    assert "signature signed" not in claim
+    assert receipt["approved_by"] == ""
+
+
+def test_dry_run_gate_event_is_a_simulation(swarm_dir, tmp_path):
+    corr = "corr-sim"
+    _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+        {"task_id": "T-qa", "capability": "gate.quality", "agent_id": "A08", "title": "Quality",
+         "notes": {"gate": "quality", "gate_for": ["T-be"], "gates": []}},
+    ], [
+        {"type": "script.qa_gate", "task_id": "T-qa", "payload": {"status": "ok", "dry_run": True}},
+    ])
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    cmd = next(c for c in receipt["commands"] if "qa_gate.py" in c["cmd"])
+    assert cmd["cmd"] == "python3 scripts/qa_gate.py --dry-run"
+    assert cmd["exit_code"] == 0
+    claim = next(c["claim"] for c in receipt["claims"] if "quality" in c["claim"])
+    assert "simulation" in claim
+    assert "not run" not in claim
+
+
+def test_in_progress_task_is_not_completed(swarm_dir, tmp_path):
+    corr = "corr-open"
+    _seed(corr, [
+        {"task_id": "T-open", "capability": "code.backend", "agent_id": "A05", "title": "Still going",
+         "notes": {"gates": []}},
+    ], stop="IN_PROGRESS")
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    assert receipt["completed_at"] is None
+    assert any("T-open" in line and "IN_PROGRESS" in line for line in receipt["unverified"])
+    assert "APPROVED" not in json.dumps(receipt)
+
+
+def test_approved_state_is_withheld(swarm_dir, tmp_path):
+    corr = "corr-done"
+    _seed(corr, [
+        {"task_id": "T-done", "capability": "code.backend", "agent_id": "A05", "title": "Finished",
+         "notes": {"gates": []}},
+    ], stop="APPROVED")
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    assert receipt["completed_at"]
+    blob = json.dumps(receipt)
+    assert "APPROVED" not in blob
+    assert any("T-done" in line and "advisory-complete" in line for line in receipt["unverified"])
+
+
+def test_verdict_without_gate_task_is_not_called_absent(swarm_dir, tmp_path):
+    corr = "corr-row"
+    store = _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "risk_class": "low", "notes": {}},
+    ])
+    now = time.time()
+    store.conn.execute(
+        "INSERT INTO verdicts (task_id, gate, verdict, agent_id, findings, expires_at, ts,"
+        " envelope_json, sig) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("T-be", "review", "pass", "A09", "[]", now + 86400, now, None, None))
+    store.conn.commit()
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    review = [line for line in receipt["unverified"] if "review" in line]
+    assert review
+    assert all("no verdict row" not in line for line in review)
+    assert any("signature unsigned" in line and "no gate task" in line for line in review)
+
+
+def test_recorded_event_commit_is_the_checked_commit(swarm_dir):
+    spec = json.loads(json.dumps(SAMPLE))
+    recorded = "a" * 40
+    spec["events"][0]["payload"]["commit"] = recorded
+    materialize(spec, signing_key=os.environ["SWARM_SIGNING_KEY"])
+    receipt = _receipt(run_export(ROOT, "--correlation-id", SAMPLE["correlation_id"]))
+    quality = next(c["claim"] for c in receipt["claims"] if "quality" in c["claim"])
+    review = next(c["claim"] for c in receipt["claims"] if "gate task T-rev for" in c["claim"])
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+    assert recorded in quality
+    assert head.stdout.strip() not in quality
+    assert "commit not recorded" in review
+    assert recorded not in review
+
+
+def test_concurrent_writes_do_not_share_a_temp_file(tmp_path):
+    import threading
+
+    export = _load(SCRIPT, "receipt_export_for_write")
+    dest = tmp_path / "receipt.json"
+    bodies = [{"n": i, "pad": "y" * 4000} for i in range(2)]
+    errors: list[BaseException] = []
+
+    def go(body: dict) -> None:
+        try:
+            export._write(str(dest), body)
+        except BaseException as exc:  # noqa: BLE001 - the test records a race failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=go, args=(body,)) for body in bodies]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert json.loads(dest.read_text(encoding="utf-8")) in bodies
+    assert list(dest.parent.glob("*.tmp")) == []
 
 
 @pytest.mark.skipif(_bun() is None, reason="bun not installed")

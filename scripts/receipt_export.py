@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -29,6 +31,12 @@ CREDENTIAL_RES = [re.compile(p) for p in (
     r"AKIA[0-9A-Z]{16}", r"\bgh[pousr]_[A-Za-z0-9]{36,}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     r"\bxox[baprs]-[0-9A-Za-z-]{10,}", r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
     r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd)\b\s*[:=]\s*['\"]([^'\"\s]{16,})['\"]")]
+# Quoted JSON keys never match SECRET_RES: a quote sits between the name and the colon.
+JSON_CREDENTIAL_RES = [re.compile(
+    r'(?i)"(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd)"'
+    r'\s*:\s*"([^"\\]{16,})"')]
+_SHA = re.compile(r"[0-9a-f]{40}")
+_FINISHED = frozenset({"IN_REVIEW", "APPROVED", "DONE"})
 
 BOT = "agent-swarm"
 DESK_FIELDS = (
@@ -57,7 +65,33 @@ def _strings(value):
 
 
 def _credential(value) -> bool:
-    return any(rx.search(text) for text in _strings(value) for rx in CREDENTIAL_RES)
+    patterns = (*CREDENTIAL_RES, *JSON_CREDENTIAL_RES)
+    return any(rx.search(text) for text in _strings(value) for rx in patterns)
+
+
+def _free_text(value) -> str:
+    """Redact lease ids before any prefix. A prefix makes the string invalid JSON, so a later
+    redact_leases pass would leave the token in place."""
+    if not isinstance(value, str):
+        return ""
+    redacted = redact_leases(value)
+    return redacted if isinstance(redacted, str) else ""
+
+
+def _state_label(state) -> str:
+    if state == "APPROVED":
+        return "advisory-complete"
+    return state if isinstance(state, str) else ""
+
+
+def _sha_field(obj) -> str | None:
+    if not isinstance(obj, dict):
+        return None
+    for key in ("commit", "sha", "git_sha", "head"):
+        val = obj.get(key)
+        if isinstance(val, str) and _SHA.fullmatch(val):
+            return val
+    return None
 
 
 def _observed_commit(root: Path) -> str:
@@ -75,27 +109,73 @@ def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _signature(store: TaskStore, task_id: str, gate: str) -> tuple[str, str]:
-    """(signature label, recorded verdict word). Never the approval token."""
-    try:
-        row = store.latest_verdicts(task_id).get(gate)
-    except SwarmError:
-        return "not run", "none"
-    if row is None:
-        return "not run", "none"
-    recorded = row.get("verdict") or "none"
-    if not isinstance(recorded, str) or recorded == "APPROVED":
-        recorded = "untrusted"
-    raw = row.get("envelope_json")
-    if not raw:
-        return "unsigned", recorded
+def _recorded_word(verdict) -> str:
+    if not isinstance(verdict, str) or verdict == "APPROVED":
+        return "untrusted"
+    return verdict
+
+
+def _payload(env) -> dict:
+    if not isinstance(env, dict):
+        return {}
+    payload = env.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_env(raw) -> dict | None:
+    if not isinstance(raw, str) or not raw:
+        return None
     try:
         env = json.loads(raw)
     except json.JSONDecodeError:
+        return None
+    return env if isinstance(env, dict) else None
+
+
+def _gate_task_of(row: dict) -> str | None:
+    payload = _payload(_load_env(row.get("envelope_json")))
+    gate_task = payload.get("gate_task")
+    return gate_task if isinstance(gate_task, str) else None
+
+
+def _rows(store: TaskStore, task_id: str, gate: str) -> list[dict]:
+    try:
+        store.get(task_id)
+    except SwarmError:
+        return []
+    out = []
+    for record in store.conn.execute(
+            "SELECT * FROM verdicts WHERE task_id=? AND gate=? ORDER BY id", (task_id, gate)):
+        row = dict(record)
+        raw = row.get("findings")
+        if isinstance(raw, str):
+            try:
+                row["findings"] = json.loads(raw)
+            except json.JSONDecodeError:
+                row["findings"] = []
+        out.append(row)
+    return out
+
+
+def _pick_row(store: TaskStore, target: str, gate: str, gate_task_id: str, siblings: list[str]) -> dict | None:
+    """The verdict this gate task issued. A row with no gate_task is used only when this is the only attempt."""
+    rows = _rows(store, target, gate)
+    bound = [row for row in rows if _gate_task_of(row) == gate_task_id]
+    if bound:
+        return bound[-1]
+    if len(siblings) != 1:
+        return None
+    loose = [row for row in rows if _gate_task_of(row) is None]
+    return loose[-1] if loose else None
+
+
+def _classify_row(store: TaskStore, task_id: str, gate: str, row: dict) -> tuple[str, str]:
+    """(signature label, recorded verdict word). Never the approval token."""
+    recorded = _recorded_word(row.get("verdict") or "none")
+    env = _load_env(row.get("envelope_json"))
+    if env is None:
         return "unsigned", recorded
-    if not isinstance(env, dict):
-        return "unsigned", recorded
-    payload = env.get("payload") if isinstance(env.get("payload"), dict) else {}
+    payload = _payload(env)
     try:
         task = store.get(task_id)
     except SwarmError:
@@ -109,6 +189,55 @@ def _signature(store: TaskStore, task_id: str, gate: str) -> tuple[str, str]:
     return "unsigned", recorded
 
 
+def _advisory_file(sdir: Path, gate_task_id: str, target: str, gate: str) -> dict | None:
+    """Keyless gate scripts write verdicts/<gate task>.<gate>.json and record no row."""
+    for name in (f"{gate_task_id}.{gate}.json", f"{target}.{gate}.json"):
+        if "/" in name or ".." in name:
+            continue
+        path = sdir / "verdicts" / name
+        env = _load_env(path.read_text(encoding="utf-8")) if path.is_file() else None
+        if env is not None:
+            return env
+    return None
+
+
+def _describe(store: TaskStore, target: str, gate: str, row: dict | None, advisory: dict | None, *,
+              ran: bool) -> tuple[str, str]:
+    if row is not None:
+        return _classify_row(store, target, gate, row)
+    if advisory is not None or ran:
+        # A file or a script event with no row is an unsigned run, not a missing run, and not a signature.
+        payload = _payload(advisory)
+        recorded = _recorded_word(payload.get("verdict") or "none") if advisory is not None else "none"
+        return "unsigned keyless", recorded
+    return "not run", "none"
+
+
+def _siblings(tasks: list[dict], target: str, gate: str) -> list[str]:
+    found = []
+    for task in tasks:
+        notes = task.get("notes_json") or {}
+        targets = notes.get("gate_for") or []
+        if notes.get("gate") == gate and target in targets:
+            found.append(task["task_id"])
+    return found
+
+
+def _artifact_commit(store: TaskStore, task_id: str) -> str | None:
+    try:
+        task = store.get(task_id)
+    except SwarmError:
+        return None
+    for output in task.get("outputs") or []:
+        if not isinstance(output, dict) or output.get("kind") not in ("commit", "git"):
+            continue
+        for key in ("uri", "digest", "version"):
+            val = output.get(key)
+            if isinstance(val, str) and _SHA.fullmatch(val):
+                return val
+    return None
+
+
 def _evidence(store: TaskStore, task_id: str) -> str:
     try:
         task = store.get(task_id)
@@ -119,17 +248,23 @@ def _evidence(store: TaskStore, task_id: str) -> str:
     return ", ".join(uris)
 
 
-def _commands(events: list[dict]) -> tuple[list[dict], dict[str, int], list[str]]:
-    """Recorded script runs. An event with no exit_code and no status is not given a passing exit."""
-    commands, index, skipped = [], {}, []
+def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | None], int], list[str], list[dict]]:
+    """Recorded script runs, latest event per (script, task). A dry-run event keeps --dry-run.
+
+    An event with no exit_code and no status is not given a passing exit.
+    """
+    commands, index, skipped, meta = [], {}, [], []
     for event in events:
         kind = event.get("type") or ""
         if not isinstance(kind, str) or not kind.startswith("script.") or kind.endswith(".error"):
             continue
         name = kind.removeprefix("script.")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        dry = payload.get("dry_run") is True
         recorded = payload.get("cmd")
         cmd = recorded if isinstance(recorded, str) and recorded else f"python3 scripts/{name}.py"
+        if dry and "--dry-run" not in cmd.split():
+            cmd = f"{cmd} --dry-run"
         code = payload.get("exit_code")
         if isinstance(code, bool) or not isinstance(code, int):
             status = payload.get("status")
@@ -143,10 +278,13 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[str, int], list[str]
             entry["duration_s"] = duration
         summary = payload.get("summary")
         if isinstance(summary, str):
-            entry["output_tail"] = summary
+            entry["output_tail"] = _free_text(summary)
+        slot = len(commands)
         commands.append(entry)
-        index.setdefault(name, len(commands) - 1)
-    return commands, index, skipped
+        owner = event.get("task_id") if isinstance(event.get("task_id"), str) else None
+        index[(name, owner)] = slot
+        meta.append({"dry": dry, "commit": _sha_field(payload)})
+    return commands, index, skipped, meta
 
 
 def _files(tasks: list[dict]) -> list[str]:
@@ -185,8 +323,16 @@ def _canned() -> dict:
     }
 
 
-def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id: str, commit: str) -> dict:
-    commands, index, skipped = _commands(events)
+def _checked_commit(info: dict, row: dict | None, advisory: dict | None, store: TaskStore, target: str) -> str:
+    """A sha recorded on the event, the verdict, or a commit artifact. Never the export-time HEAD."""
+    found = info.get("commit") or _sha_field(_payload(_load_env((row or {}).get("envelope_json"))))
+    found = found or _sha_field(_payload(advisory)) or _artifact_commit(store, target)
+    return found or "not recorded"
+
+
+def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id: str, root: Path) -> dict:
+    sdir = swarm_dir(root, create=False)
+    commands, index, skipped, meta = _commands(events)
     unverified_extra = list(skipped)
     claims: list[dict] = []
     unverified = [
@@ -203,42 +349,69 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
             continue
         targets = [t for t in (notes.get("gate_for") or []) if isinstance(t, str)]
         script = GATE_EVENT.get(gate)
-        cmd_index = index.get(script) if script else None
+        slot = index.get((script, task["task_id"])) if script else None
+        info = meta[slot] if slot is not None else {"dry": False, "commit": None}
         for target in targets:
             covered.add((target, gate))
-            signature, recorded = _signature(store, target, gate)
+            siblings = _siblings(tasks, target, gate)
+            row = _pick_row(store, target, gate, task["task_id"], siblings)
+            advisory = None if row is not None else _advisory_file(sdir, task["task_id"], target, gate)
+            signature, recorded = _describe(store, target, gate, row, advisory, ran=slot is not None)
+            commit = _checked_commit(info, row, advisory, store, target)
             evidence = _evidence(store, target)
             tail = f"; evidence {evidence}" if evidence else ""
             if signature == "not run":
                 unverified.append(
                     f"{gate} gate task {task['task_id']} for {target} was not run; commit {commit}")
                 continue
-            sentence = (f"{gate} gate task {task['task_id']} for {target} is advisory; "
+            sim = " simulation;" if info["dry"] else ""
+            sentence = (f"{gate} gate task {task['task_id']} for {target} is advisory;{sim} "
                         f"signature {signature}; recorded {recorded}; commit {commit}{tail}")
-            if cmd_index is None:
+            if slot is None:
                 unverified.append(sentence + "; no script run recorded")
                 continue
-            claims.append({"claim": sentence, "evidence_command_index": cmd_index})
+            claims.append({"claim": sentence, "evidence_command_index": slot})
     for task in tasks:
         if (task.get("notes_json") or {}).get("gate"):
             continue
         for gate in store.required_gates(task["task_id"]):
             if (task["task_id"], gate) in covered:
                 continue
-            unverified.append(f"{gate} gate on {task['task_id']} was not run; no verdict row")
+            row = None
+            try:
+                row = store.latest_verdicts(task["task_id"]).get(gate)
+            except SwarmError:
+                row = None
+            if row is None:
+                unverified.append(f"{gate} gate on {task['task_id']} was not run; no verdict row")
+                continue
+            signature, recorded = _classify_row(store, task["task_id"], gate, row)
+            unverified.append(
+                f"{gate} gate on {task['task_id']} recorded signature {signature}; recorded {recorded}; "
+                "execution evidence is missing (no gate task)")
     for task in tasks:
-        unverified.append(f"task {task['task_id']} title: {task.get('title') or ''}")
-        for gate, row in store.latest_verdicts(task["task_id"]).items():
+        unverified.append(f"task {task['task_id']} state: {_state_label(task.get('state'))}")
+        unverified.append(f"task {task['task_id']} title: {_free_text(task.get('title') or '')}")
+        try:
+            verdicts = store.latest_verdicts(task["task_id"])
+        except SwarmError:
+            verdicts = {}
+        for gate, row in verdicts.items():
             for finding in row.get("findings") or []:
                 summary = finding.get("summary") if isinstance(finding, dict) else None
                 if isinstance(summary, str) and summary:
-                    unverified.append(f"finding {task['task_id']} {gate}: {summary}")
+                    unverified.append(f"finding {task['task_id']} {gate}: {_free_text(summary)}")
     unverified.extend(unverified_extra)
     for i, command in enumerate(commands):
         if "duration_s" not in command:
             unverified.append(f"command {i} ({command['cmd']}) has no recorded duration_s")
+    observed = _observed_commit(root)
+    if observed != "not recorded":
+        unverified.append(
+            f"export observed HEAD {observed}; this is not the commit the gates checked")
     started = _iso(min(t["created_at"] for t in tasks)) if tasks else None
-    completed = _iso(max(t["updated_at"] for t in tasks)) if tasks else None
+    completed = (_iso(max(t["updated_at"] for t in tasks))
+                 if tasks and all(t.get("state") in _FINISHED for t in tasks) else None)
     return {
         "task_id": task_id,
         "bot": BOT,
@@ -290,9 +463,17 @@ def _clip_tails(receipt: dict, limit: int = 500) -> dict:
 def _write(path: str, receipt: dict) -> None:
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    tmp.write_text(json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(dest)
+    fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(receipt, indent=2, ensure_ascii=False) + "\n")
+        os.replace(name, dest)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
 
 
 def run(args, ctx) -> dict:
@@ -305,7 +486,7 @@ def run(args, ctx) -> dict:
     tasks = store.list(correlation_id=corr)
     events = read_events(correlation_id=corr, root=ctx.root)
     receipt = _clip_tails(_guard(_receipt(
-        store, tasks, events, task_id=corr or "unscoped", commit=_observed_commit(ctx.root))))
+        store, tasks, events, task_id=corr or "unscoped", root=ctx.root)))
     if args.out:
         _write(args.out, receipt)
     return {"status": "ok", "receipt": receipt,
