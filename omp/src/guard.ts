@@ -1482,6 +1482,8 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
       const name = /(?:^|\.)([A-Za-z0-9_]+)$/.exec(mod[1] === "" ? (words[at] ?? "") : mod[1]);
       return name === null ? undefined : { stem: name[1], args: words.slice(at + 1) };
     }
+    // `python3 -` names stdin as the program. The next word is an argument, not the script file.
+    if (i > 0 && STDIN_FILE.test(words[i])) return undefined;
     if (INTERPRETER_VALUE_FLAG.test(words[i])) i++; // `python -X dev`, `bun --cwd dir`, `node -r mod` take a value
     i++;
   }
@@ -1550,12 +1552,45 @@ function isStdinFileWord(plain: string): boolean {
   return rest === undefined || (rest !== "<" && rest !== ">" && rest !== "&");
 }
 
-/** Outer `< file` / `0<file` words of a shell command, as written, to append to a literal `-c` payload. */
+/** True when `match` hits a character outside quotes and not backslash-escaped. Indexes stay on `word`. */
+function hasUnquoted(word: string, match: (ch: string) => boolean): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < word.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      continue;
+    }
+    if (c === "$" && word[i + 1] === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c === "\\" && i + 1 < word.length) {
+      i++;
+      continue;
+    }
+    if (match(c)) return true;
+  }
+  return false;
+}
+
+/** Outer `< file` / `0<file` words of a shell command, as written, to append to a literal `-c` payload.
+ *
+ * The operator has to be unquoted. `bash -c 'python3 -' '<scripts/rev_gate.py'` names `$0`; it does not open that file. */
 function stdinFileSuffix(text: string): string {
   const words = shellWords(text);
   const kept: string[] = [];
   for (let i = 0; i < words.length; i++) {
-    const plain = unquote(words[i]);
+    const raw = words[i];
+    // `-<file` stays one shell word here; splitStdinRedirect handles it on the interpreter argv, not as a `-c` suffix.
+    if (splitStdinRedirect(raw).length !== 1 || !hasUnquoted(raw, (c) => c === "<")) continue;
+    const plain = unquote(raw);
     if (!isStdinFileWord(plain)) continue;
     const op = plain.startsWith("0<") ? 2 : 1;
     if (plain.length > op) kept.push(words[i]);
@@ -1581,7 +1616,9 @@ function stdinTargets(marked: string): string[] {
   const words = shellWords(marked).flatMap(splitStdinRedirect);
   const out: string[] = [];
   for (let i = 0; i < words.length; i++) {
-    const plain = unquote(words[i]);
+    const raw = words[i];
+    if (!hasUnquoted(raw, (c) => c === "<")) continue;
+    const plain = unquote(raw);
     const op = STDIN_REDIRECT.exec(plain);
     if (op === null) continue;
     const attached = plain.slice(op[0].length);
@@ -1599,9 +1636,33 @@ function stdinTargets(marked: string): string[] {
  * `-Wonce` and `-Xtracemalloc` are not), and other letters are flags. `-c` and `-m` name the program, so a pipe into
  * those is data and is not this.
  */
+/** Interpreter argv with quotes still in force: an unquoted `<` splits, a quoted one stays inside the option value.
+ *
+ * `seg.words` is already unquoted, so `python3 -W 'ignore:<x' - < scripts/rev_gate.py` used to become `ignore:` and
+ * `<x`. `<x` looked like a script name and the real redirect was never seen. */
+function programWords(text: string): string[] {
+  const raw = shellWords(text);
+  const all: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op !== null) {
+      if (op[0] === raw[i]) i++;
+      continue;
+    }
+    for (const part of splitStdinRedirect(raw[i])) {
+      const plain = unquote(part);
+      // A quoted `<` is an argument (`-W '<x'`). Only an unquoted operator is a redirect.
+      if (hasUnquoted(part, (c) => c === "<") && STDIN_REDIRECT.test(plain)) continue;
+      all.push(plain);
+    }
+  }
+  if (all.length > 0) all[0] = posix.basename(all[0]);
+  return all.filter((w, i) => i === 0 || !/^(?:\u0001[\uE000-\uF8FF]?)+$/.test(w));
+}
+
 function readsProgramFromStdin(seg: Segment): boolean {
   const { marked, piped } = seg;
-  const words = seg.words.flatMap(splitStdinRedirect);
+  const words = programWords(seg.text);
   let i = 0;
   let saw = false;
   while (i < words.length) {
@@ -1641,7 +1702,7 @@ function readsProgramFromStdin(seg: Segment): boolean {
     return false; // a real script word: stdin is data, not the program
   }
   if (!saw) return false;
-  return piped || shellWords(marked).flatMap(splitStdinRedirect).some((w) => STDIN_REDIRECT.test(unquote(w)));
+  return piped || shellWords(marked).flatMap(splitStdinRedirect).some((w) => hasUnquoted(w, (c) => c === "<") && STDIN_REDIRECT.test(unquote(w)));
 }
 
 /** The stem of the file an interpreter is reading as its program, when that file is named by a stdin redirect. */
@@ -1733,14 +1794,33 @@ function globOperandMatches(path: string, stems: Record<string, true>): boolean 
   return false;
 }
 
-/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand, a glob basename included): the copy is how a renamed run used to get past the stem check. */
+/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand, a glob basename included): the copy is how a renamed run used to get past the stem check.
+ *
+ * A `[` `*` or `?` inside quotes is a literal (`cp 'scripts/re[v]_gate.py'` copies that name). An unquoted one is a glob. */
 function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
-  const cmd = seg.words[0] ?? "";
+  const raw = shellWords(seg.text);
+  if (raw.length === 0) return false;
+  const cmd = posix.basename(unquote(raw[0]));
   if (!/^(?:cp|mv|install|ln)$/.test(cmd)) return false;
-  return operands(seg.words.slice(1)).some((arg) => {
-    const stem = scriptStemOf(arg);
+  const args: { raw: string; plain: string }[] = [];
+  for (let i = 1; i < raw.length; i++) {
+    const word = raw[i];
+    const op = REDIRECT_WORD.exec(word);
+    if (op !== null) {
+      if (op[0] === word) i++;
+      continue;
+    }
+    const plain = unquote(word);
+    const plains = /["'\\]/.test(word) ? [plain] : (braceAlternatives(plain) ?? [plain]);
+    for (const item of plains) args.push({ raw: word, plain: item });
+  }
+  const cut = args.findIndex((a) => a.plain === "--");
+  const head = cut === -1 ? args : args.slice(0, cut);
+  const tail = cut === -1 ? [] : args.slice(cut + 1);
+  return [...head.filter((a) => !a.plain.startsWith("-")), ...tail].some(({ raw: source, plain }) => {
+    const stem = scriptStemOf(plain);
     if (stem !== undefined && Object.hasOwn(stems, stem)) return true;
-    return globOperandMatches(arg, stems);
+    return hasUnquoted(source, (c) => c === "*" || c === "?" || c === "[") && globOperandMatches(plain, stems);
   });
 }
 

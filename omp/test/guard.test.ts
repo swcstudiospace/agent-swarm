@@ -770,9 +770,13 @@ describe("HOOK-03 shell twin and D-08", () => {
   test.each([
     ["python3 -<scripts/rev_gate.py --task-id T", GATE],
     ["bash -c 'python3 -' < scripts/rev_gate.py", GATE],
+    ["python3 -W 'ignore:<x' - --task-id T --root /workspace < scripts/rev_gate.py", GATE],
+    ["python3 -W '<x' - < scripts/rev_gate.py", GATE],
     ["cp scripts/re[v]_gate.py /tmp/r.py", GATE],
+    ["cp 'scripts/rev_gate.py' /tmp/r.py", GATE],
     ["printf 'print(1)\\n' | bash -c 'python3 -'", INTERP],
     ["echo x | python3 -Wonce", INTERP],
+    ["echo x | python3 - '<scripts/rev_gate.py'", INTERP],
     ["echo x | python3 -Xtracemalloc", INTERP],
     ["python3 < /dev/null", INTERP],
   ])("stdin and copy hardening: %s blocks as %s", (command, reason) => {
@@ -787,6 +791,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     "python3 --help < /dev/null",
     "python3 -V < /dev/null",
     "python3 -h < /dev/null",
+    "bash -c 'python3 -' '<scripts/rev_gate.py'",
+    "python3 - '<scripts/rev_gate.py'",
+    "cp 'scripts/re[v]_gate.py' /tmp/r.py",
     "cp notes.txt /tmp/n.txt",
     "cp .swarm/tasks.db /tmp/tasks.db",
     "printf 'print(1)\\n' | bash -c \"$VAR\"",
