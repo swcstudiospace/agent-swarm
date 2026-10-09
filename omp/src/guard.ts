@@ -496,14 +496,12 @@ function shellDashC(words: string[]): string[] | undefined {
 }
 
 /**
- * The command lines a segment hands to a shell, now or later: a shell's `-c` line (shellDashC), the `-c` value of
- * `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE` value, the `trap` action, and an `env -S`
- * line (its string split, the remaining words appended). eval/watch/parallel/`sudo -s`, which join all their
- * arguments, are normalizeSegments' (JOINS_ARGS).
+ * Command lines a segment hands to something other than a shell's own `-c` (that unwrap, and the stdin it inherits,
+ * is normalizeSegments'): the `-c` value of `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE`
+ * value, the `trap` action, and an `env -S` line (its string split, the remaining words appended). eval/watch/parallel/
+ * `sudo -s`, which join all their arguments, are normalizeSegments' (JOINS_ARGS).
  */
-function commandLines(seg: string): string[] {
-  const shell = shellDashC(shellWords(seg));
-  if (shell !== undefined) return shell;
+function otherCommandLines(seg: string): string[] {
   const split = SPLIT_STRING.exec(seg);
   if (split !== null) {
     const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
@@ -700,8 +698,9 @@ const COMPOUND_WORD = /^(?:(while|until|for|select)|(if)|(case)|(fi|done|esac))(
  * split on `;`, `&&`, `||`, `|`, `&` (outside quotes), plain quoted words are unquoted, and each segment loses leading
  * `env X=…`, `X=…`, `sudo`, `command`, wrapper words and shell keywords (`if`, `then`, `do`, `!` …). What a segment
  * runs in a child shell is normalized in turn and its segments appended (the outer segment stays too): a literal
- * `sh -c "…"` / `eval "…"` / `su -c` / `env -S` line and `find -exec` commands. A script fed to a shell's stdin is
- * not unwrapped (the `shell-stdin` row blocks it); `bash -c "$VAR"` is opaque by design (the documented residual).
+ * `sh -c "…"` / `eval "…"` / `su -c` / `env -S` line and `find -exec` commands. A literal shell `-c` payload inherits
+ * that segment's pipe and its `<` / `0<` files. A script fed to a shell's stdin is not unwrapped (the `shell-stdin`
+ * row blocks it); `bash -c "$VAR"` is opaque by design (the documented residual) and inherits neither.
  */
 export function normalize(command: string): string[] {
   const texts: string[] = [];
@@ -770,7 +769,23 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
-      for (const line of [...commandLines(seg), ...(joined === undefined ? [] : [joined])]) payload.push(...normalizeSegments(line, depth + 1, cuts));
+      const shellLines = shellDashC(shellWords(seg));
+      if (shellLines !== undefined) {
+        // a literal `-c` body runs with the shell's stdin: the pipe, and `< file` / `0<file` (not `bash -c "$VAR"`)
+        const suffix = stdinFileSuffix(`${prefix} ${seg}`);
+        for (const line of shellLines) {
+          if (!literalShellLine(line)) {
+            payload.push(...normalizeSegments(line, depth + 1, cuts));
+            continue;
+          }
+          const text = suffix === "" ? line : `${line}${suffix}`;
+          const inner = normalizeSegments(text, depth + 1, cuts);
+          payload.push(...(pipeIn ? inheritPipe(inner) : inner));
+        }
+      } else {
+        for (const line of otherCommandLines(seg)) payload.push(...normalizeSegments(line, depth + 1, cuts));
+      }
+      if (joined !== undefined) payload.push(...normalizeSegments(joined, depth + 1, cuts));
       if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth, cuts));
     }
     const runtime = info?.runtime;
@@ -1467,6 +1482,8 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
       const name = /(?:^|\.)([A-Za-z0-9_]+)$/.exec(mod[1] === "" ? (words[at] ?? "") : mod[1]);
       return name === null ? undefined : { stem: name[1], args: words.slice(at + 1) };
     }
+    // `python3 -` names stdin as the program. The next word is an argument, not the script file.
+    if (i > 0 && STDIN_FILE.test(words[i])) return undefined;
     if (INTERPRETER_VALUE_FLAG.test(words[i])) i++; // `python -X dev`, `bun --cwd dir`, `node -r mod` take a value
     i++;
   }
@@ -1475,22 +1492,365 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
   return m === null ? undefined : { stem: m[1], args: words.slice(i + 1) };
 }
 
+const ORCH_STEMS: Record<string, true> = { orch_plan: true, orch_status: true };
+const SCRIPT_STEM = /(?:^|\/)([A-Za-z0-9_-]+)\.(?:py|ts)$/;
+
+function scriptStemOf(path: string): string | undefined {
+  return SCRIPT_STEM.exec(path)?.[1];
+}
+
+/**
+ * Bash ends a word at an unquoted `<`. `-<file` is the two words `-` and `<file`; a redirect that already begins
+ * at the operator (`0<file`, `<file`, `<<EOF`) stays one word. A quoted or backslash-escaped `<` stays inside the word.
+ */
+function splitStdinRedirect(word: string): string[] {
+  let quote: string | undefined;
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < word.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      continue;
+    }
+    if (c === "$" && word[i + 1] === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c === "\\" && i + 1 < word.length) {
+      i++;
+      continue;
+    }
+    if (c !== "<") continue;
+    const before = word.slice(0, i);
+    let fd = before.length === 0;
+    if (!fd) {
+      fd = true;
+      for (let j = 0; j < before.length; j++) {
+        const d = before[j];
+        if (d < "0" || d > "9") {
+          fd = false;
+          break;
+        }
+      }
+    }
+    if (fd) return [word];
+    return [before, word.slice(i)];
+  }
+  return [word];
+}
+
+/** A `< file` or `0<file` word (a bare `<` / `0<` included), not a heredoc, here-string, `<>`, or fd copy (`<&`). */
+function isStdinFileWord(plain: string): boolean {
+  const at = plain.startsWith("0<") ? 2 : plain.startsWith("<") ? 1 : -1;
+  if (at < 0) return false;
+  const rest = plain[at];
+  return rest === undefined || (rest !== "<" && rest !== ">" && rest !== "&");
+}
+
+/** True when `match` hits a character outside quotes and not backslash-escaped. Indexes stay on `word`. */
+function hasUnquoted(word: string, match: (ch: string) => boolean): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < word.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      continue;
+    }
+    if (c === "$" && word[i + 1] === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c === "\\" && i + 1 < word.length) {
+      i++;
+      continue;
+    }
+    if (match(c)) return true;
+  }
+  return false;
+}
+
+/** Outer `< file` / `0<file` words of a shell command, as written, to append to a literal `-c` payload.
+ *
+ * The operator has to be unquoted. `bash -c 'python3 -' '<scripts/rev_gate.py'` names `$0`; it does not open that file. */
+function stdinFileSuffix(text: string): string {
+  const words = shellWords(text);
+  const kept: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const raw = words[i];
+    // `-<file` stays one shell word here; splitStdinRedirect handles it on the interpreter argv, not as a `-c` suffix.
+    if (splitStdinRedirect(raw).length !== 1 || !hasUnquoted(raw, (c) => c === "<")) continue;
+    const plain = unquote(raw);
+    if (!isStdinFileWord(plain)) continue;
+    const op = plain.startsWith("0<") ? 2 : 1;
+    if (plain.length > op) kept.push(words[i]);
+    else if (words[i + 1] !== undefined) kept.push(words[i], words[++i]);
+  }
+  return kept.length === 0 ? "" : ` ${kept.join(" ")}`;
+}
+
+/** The `-c` line names its command (`python3 -`). An expansion (`$VAR`, a cut, a glob) is the opaque residual. */
+function literalShellLine(line: string): boolean {
+  const first = unquote(shellWords(line)[0] ?? "");
+  if (first === "") return false;
+  return !first.includes("$") && !first.includes("`") && !first.includes("\u0001") && !first.includes("*") && !first.includes("?") && !first.includes("[");
+}
+
+/** The outer shell's pipe is the payload's stdin too, including a `-c` line unwrapped inside the payload. */
+function inheritPipe(items: Normalized[]): Normalized[] {
+  return items.map((item) => ({ ...item, piped: true, payload: inheritPipe(item.payload) }));
+}
+
+/** Targets of stdin redirections (`< file`, `0<file`, `<<EOF`, `<<< '…'`, and `-<file` split into `-` and `<file`), unquoted. */
+function stdinTargets(marked: string): string[] {
+  const words = shellWords(marked).flatMap(splitStdinRedirect);
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const raw = words[i];
+    if (!hasUnquoted(raw, (c) => c === "<")) continue;
+    const plain = unquote(raw);
+    const op = STDIN_REDIRECT.exec(plain);
+    if (op === null) continue;
+    const attached = plain.slice(op[0].length);
+    if (attached !== "") out.push(attached);
+    else if (words[i + 1] !== undefined) out.push(unquote(words[++i]));
+  }
+  return out;
+}
+
+/**
+ * The interpreter's program is stdin: no script file, no `-c`/`--command` and no `-m`, no `--version`/`--help`/`-V`/`-h`
+ * before a script, and stdin is a pipe or a redirect (`echo x | python3`, `python3 < scripts/rev_gate.py`,
+ * `python3 -<scripts/rev_gate.py`). A short cluster is read left to right: `c` and `m` name the program, `h` and `V`
+ * are help and version, `W` and `X` take the rest of the cluster (or the next word) as their value (`-Bc` is `-c`;
+ * `-Wonce` and `-Xtracemalloc` are not), and other letters are flags. `-c` and `-m` name the program, so a pipe into
+ * those is data and is not this.
+ */
+/** Interpreter argv with quotes still in force: an unquoted `<` splits, a quoted one stays inside the option value.
+ *
+ * `seg.words` is already unquoted, so `python3 -W 'ignore:<x' - < scripts/rev_gate.py` used to become `ignore:` and
+ * `<x`. `<x` looked like a script name and the real redirect was never seen. */
+function programWords(text: string): string[] {
+  const raw = shellWords(text);
+  const all: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op !== null) {
+      if (op[0] === raw[i]) i++;
+      continue;
+    }
+    for (const part of splitStdinRedirect(raw[i])) {
+      const plain = unquote(part);
+      // A quoted `<` is an argument (`-W '<x'`). Only an unquoted operator is a redirect.
+      if (hasUnquoted(part, (c) => c === "<") && STDIN_REDIRECT.test(plain)) continue;
+      all.push(plain);
+    }
+  }
+  if (all.length > 0) all[0] = posix.basename(all[0]);
+  return all.filter((w, i) => i === 0 || !/^(?:\u0001[\uE000-\uF8FF]?)+$/.test(w));
+}
+
+function readsProgramFromStdin(seg: Segment): boolean {
+  const { marked, piped } = seg;
+  const words = programWords(seg.text);
+  let i = 0;
+  let saw = false;
+  while (i < words.length) {
+    const w = words[i];
+    if (INTERPRETER.test(w) || (saw && w === "run")) {
+      saw = true;
+      i++;
+      continue;
+    }
+    if (!saw) return false;
+    if (MODULE_OPTION.test(w) || w === "-c" || w.startsWith("-c") || w === "--command" || w.startsWith("--command=")) return false;
+    if (w === "--version" || w === "--help" || w.startsWith("--version=") || w.startsWith("--help=")) return false;
+    if (INTERPRETER_VALUE_FLAG.test(w)) {
+      i += 2;
+      continue;
+    }
+    if (/^-[A-Za-z]+$/.test(w)) {
+      let rest = w.slice(1);
+      let consumeNext = false;
+      while (rest !== "") {
+        const flag = rest[0];
+        rest = rest.slice(1);
+        if (flag === "c" || flag === "m" || flag === "h" || flag === "V") return false;
+        if (flag === "W" || flag === "X") {
+          consumeNext = rest === "";
+          break;
+        }
+      }
+      i += consumeNext ? 2 : 1;
+      continue;
+    }
+    if (STDIN_FILE.test(w)) break; // `python3 -`: the program is stdin, and the rest are its arguments
+    if (w.startsWith("-")) {
+      i++;
+      continue;
+    }
+    return false; // a real script word: stdin is data, not the program
+  }
+  if (!saw) return false;
+  return piped || shellWords(marked).flatMap(splitStdinRedirect).some((w) => hasUnquoted(w, (c) => c === "<") && STDIN_REDIRECT.test(unquote(w)));
+}
+
+/** The stem of the file an interpreter is reading as its program, when that file is named by a stdin redirect. */
+function stdinScriptStem(seg: Segment): string | undefined {
+  if (!readsProgramFromStdin(seg)) return undefined;
+  for (const target of stdinTargets(seg.marked)) {
+    const stem = scriptStemOf(target);
+    if (stem !== undefined) return stem;
+  }
+  return undefined;
+}
+
+/** A glob basename longer than this is not matched (the command is left alone, not failed closed). */
+const GLOB_PATTERN_MAX = 256;
+
+/** `ch` is in the class body `pattern[start, end)`, a linear `[abc]` / `[a-z]` scan. */
+function classMatches(pattern: string, start: number, end: number, ch: string): boolean {
+  let i = start;
+  while (i < end) {
+    const a = pattern[i];
+    if (i + 2 < end && pattern[i + 1] === "-" && a !== "-" && pattern[i + 2] !== "-") {
+      const b = pattern[i + 2];
+      const lo = a < b ? a : b;
+      const hi = a < b ? b : a;
+      if (ch >= lo && ch <= hi) return true;
+      i += 3;
+    } else {
+      if (a === ch) return true;
+      i++;
+    }
+  }
+  return false;
+}
+
+/** Linear `*` / `?` / `[abc]` / `[a-z]` match. No RegExp. A pattern longer than GLOB_PATTERN_MAX does not match. */
+function globMatch(pattern: string, text: string): boolean {
+  if (pattern.length > GLOB_PATTERN_MAX) return false;
+  let pi = 0;
+  let ti = 0;
+  let starP = -1;
+  let starT = -1;
+  while (ti < text.length) {
+    if (pi < pattern.length && pattern[pi] === "*") {
+      starP = pi;
+      starT = ti;
+      pi++;
+      continue;
+    }
+    if (pi < pattern.length && pattern[pi] === "?") {
+      pi++;
+      ti++;
+      continue;
+    }
+    if (pi < pattern.length && pattern[pi] === "[") {
+      let end = pi + 1;
+      while (end < pattern.length && pattern[end] !== "]") end++;
+      if (end < pattern.length && classMatches(pattern, pi + 1, end, text[ti])) {
+        pi = end + 1;
+        ti++;
+        continue;
+      }
+    } else if (pi < pattern.length && pattern[pi] === text[ti]) {
+      pi++;
+      ti++;
+      continue;
+    }
+    if (starP === -1) return false;
+    pi = starP + 1;
+    ti = ++starT;
+  }
+  while (pi < pattern.length && pattern[pi] === "*") pi++;
+  return pi === pattern.length;
+}
+
+/** A `cp`/`mv`/`install`/`ln` basename glob (`*`, `?`, `[`) that names a guarded `stem.py` or `stem.ts`. */
+function globOperandMatches(path: string, stems: Record<string, true>): boolean {
+  const slash = path.lastIndexOf("/");
+  const base = slash === -1 ? path : path.slice(slash + 1);
+  if (base.length === 0 || base.length > GLOB_PATTERN_MAX) return false;
+  let glob = false;
+  for (let i = 0; i < base.length && !glob; i++) {
+    const c = base[i];
+    glob = c === "*" || c === "?" || c === "[";
+  }
+  if (!glob) return false;
+  for (const stem of Object.keys(stems)) {
+    if (globMatch(base, `${stem}.py`) || globMatch(base, `${stem}.ts`)) return true;
+  }
+  return false;
+}
+
+/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand, a glob basename included): the copy is how a renamed run used to get past the stem check.
+ *
+ * A `[` `*` or `?` inside quotes is a literal (`cp 'scripts/re[v]_gate.py'` copies that name). An unquoted one is a glob. */
+function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
+  const raw = shellWords(seg.text);
+  if (raw.length === 0) return false;
+  const cmd = posix.basename(unquote(raw[0]));
+  if (!/^(?:cp|mv|install|ln)$/.test(cmd)) return false;
+  const args: { raw: string; plain: string }[] = [];
+  for (let i = 1; i < raw.length; i++) {
+    const word = raw[i];
+    const op = REDIRECT_WORD.exec(word);
+    if (op !== null) {
+      if (op[0] === word) i++;
+      continue;
+    }
+    const plain = unquote(word);
+    const plains = /["'\\]/.test(word) ? [plain] : (braceAlternatives(plain) ?? [plain]);
+    for (const item of plains) args.push({ raw: word, plain: item });
+  }
+  const cut = args.findIndex((a) => a.plain === "--");
+  const head = cut === -1 ? args : args.slice(0, cut);
+  const tail = cut === -1 ? [] : args.slice(cut + 1);
+  return [...head.filter((a) => !a.plain.startsWith("-")), ...tail].some(({ raw: source, plain }) => {
+    const stem = scriptStemOf(plain);
+    if (stem !== undefined && Object.hasOwn(stems, stem)) return true;
+    return hasUnquoted(source, (c) => c === "*" || c === "?" || c === "[") && globOperandMatches(plain, stems);
+  });
+}
+
 /**
  * A direct run of a gate script (qa/quality/rev/review/sec/security/release_gate, rel_plan) by any swarm agent, the
  * gate's owner included: a shell run scores whatever tree cwd points at and can overwrite its own verdict, so gates
- * are recorded only through swarm_gate (Phase 5 D-1).
+ * are recorded only through swarm_gate (Phase 5 D-1). A stdin redirect of the script file is the same run
+ * (`python3 < scripts/rev_gate.py`), and so is copying the file aside (`cp scripts/rev_gate.py /tmp/r.py`).
  */
 const gateScriptRun = (seg: Segment): boolean => {
   const run = executedScript(seg);
-  return run !== undefined && Object.hasOwn(GATE_STEMS, run.stem);
+  if (run !== undefined && Object.hasOwn(GATE_STEMS, run.stem)) return true;
+  const stem = stdinScriptStem(seg);
+  return (stem !== undefined && Object.hasOwn(GATE_STEMS, stem)) || relocatesStem(seg, GATE_STEMS);
 };
 
 /** A run of `orch_plan.py|ts` (or module), or of `orch_status.py|ts` (or module) with `--ingest`/`--transition`. */
 function orchStateScript(seg: Segment): boolean {
   const run = executedScript(seg);
-  if (run === undefined) return false;
-  return run.stem === "orch_plan" || (run.stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a)));
+  if (run !== undefined && (run.stem === "orch_plan" || (run.stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))))) {
+    return true;
+  }
+  const stem = stdinScriptStem(seg);
+  if (stem === "orch_plan") return true;
+  if (stem === "orch_status" && seg.words.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))) return true;
+  return relocatesStem(seg, ORCH_STEMS);
 }
+
+/** `claude` / `grok` / `omp` (a path's basename too): a nested agent CLI has no swarm guard and still reaches MCP. */
+const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(seg.words[0] ?? "");
 
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
@@ -1507,17 +1867,13 @@ export const RULES: readonly Rule[] = [
       "bun scripts/ts/orch_plan.ts",
       "scripts/ts/orch_status.ts --ingest x",
       "sqlite3 .swarm/tasks.db \"UPDATE tasks SET state='DONE'\"",
+      "python3 - --ingest x.json < scripts/orch_status.py",
+      "cp scripts/orch_plan.py /tmp/plan.py",
     ],
   },
-  // gates are recorded only through swarm_gate, never through the shell, the gate's owner included (Phase 5 D-1)
-  {
-    id: "gate-script-shell",
-    capability: "gate",
-    agents: Object.values(GATE_AGENTS),
-    pattern: gateScriptRun,
-    samples: ["python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x"],
-  },
-  // D-08: shell writes into .swarm/, .omp/ or ~/.omp
+  // D-08: shell writes into .swarm/, .omp/ or ~/.omp. These precede gate-script-shell: copying onto a guarded
+  // gate script, or moving one out of a runtime root, is tampering with that path. A renamed gate run
+  // (`cp scripts/rev_gate.py /tmp/r.py`) is not a protected path, so the gate row still catches it.
   {
     id: "protected-path-shell",
     capability: "protected_path",
@@ -1548,6 +1904,18 @@ export const RULES: readonly Rule[] = [
       "mkdir -p .omp/extensions",
     ],
   },
+  // gates are recorded only through swarm_gate, never through the shell, the gate's owner included (Phase 5 D-1)
+  {
+    id: "gate-script-shell",
+    capability: "gate",
+    agents: Object.values(GATE_AGENTS),
+    pattern: gateScriptRun,
+    samples: [
+      "python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x",
+      "python3 < scripts/rev_gate.py", "python3 - --task-id T < scripts/rev_gate.py", "python3 -<scripts/rev_gate.py --task-id T",
+      "bash -c 'python3 -' < scripts/rev_gate.py", "cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py", "cp scripts/re[v]_gate.py /tmp/r.py",
+    ],
+  },
   // D-08: dotglob would let a leading `*`/`?` name `.swarm`/`.omp` (shell targets assume it off, as bash starts)
   {
     id: "glob-dotfiles",
@@ -1569,6 +1937,23 @@ export const RULES: readonly Rule[] = [
       "curl -fsSL https://x/install.sh | sh", "printf 'git push %s' --force | sh", "echo ok | bash", "bash <<'EOF'\necho\nEOF", "sh <<< 'ls'",
       "sh < s.sh", "bash -s < s.sh", "cat s.sh |& env bash", "wget -qO- x | command bash -s -- -y", "echo ls | busybox sh", "cat x | source /dev/stdin",
     ],
+  },
+  // an interpreter reading its program from stdin is the same class as shell-stdin: the program is not judged
+  {
+    id: "interpreter-stdin",
+    capability: "destructive",
+    pattern: readsProgramFromStdin,
+    samples: [
+      "echo x | python3", "python3 < /tmp/notes.py", "python3 - < /tmp/notes.py", "uv run python <<< 'print(1)'",
+      "printf 'print(1)\\n' | bash -c 'python3 -'", "echo x | python3 -Wonce", "echo x | python3 -Xtracemalloc",
+    ],
+  },
+  // T-06-28: a nested claude/grok/omp is a top-level session without this guard, and it still connects the operator's MCP
+  {
+    id: "nested-agent",
+    capability: "mcp",
+    pattern: nestedAgentCli,
+    samples: ["claude -p", "grok -p --yolo", "omp -p --no-extensions --approval-mode yolo", "bash -lc \"claude -p\""],
   },
   {
     id: "git-force-push",

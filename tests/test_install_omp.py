@@ -438,3 +438,151 @@ def test_install_workspace_refuses_symlinked_claude_and_grok_destinations(tree, 
     assert _snapshot(tree, outside, ws) == before
     assert sorted(p.name for p in outside.iterdir()) == ["victim.json"]
     assert not (ws / ".omp").exists()
+
+
+def test_hook_command_quotes_a_checkout_path_with_spaces():
+    import importlib.util
+    import shlex
+
+    spec = importlib.util.spec_from_file_location("build_agents_under_test", ROOT / "scripts" / "build_agents.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    script = Path("/tmp/my swarm/hooks/user_prompt_submit.py")
+    cmd = mod.hook_command(script)
+    assert shlex.split(cmd) == ["python3", str(script)]
+    assert "python3 /tmp/my" not in cmd
+
+
+@pytest.mark.parametrize("rel", [".claude/settings.json", ".grok/hooks/agent-swarm.json"])
+def test_invalid_hook_config_is_left_in_place(tree, ws, home, rel):
+    path = _write(ws / rel, "{ not json\n")
+    before = path.read_bytes()
+    snap = _snapshot(tree, ws)
+    r = _cli(tree, ws, home, "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "not valid JSON" in r.stderr
+    assert path.read_bytes() == before
+    assert _snapshot(tree, ws) == snap
+
+
+def test_device_and_fifo_configs_are_not_read(tmp_path):
+    """T-07-09: /dev/zero and a FIFO must not block, and must not look like an empty config.
+
+    Both reads run in a child. A regression that drains `/dev/zero` or blocks on the FIFO fails on the
+    timeout instead of hanging the suite; a non-None result fails too."""
+    fifo = tmp_path / "config.yml"
+    os.mkfifo(fifo)
+    code = (
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "spec = importlib.util.spec_from_file_location('_install_omp', root / 'scripts' / '_install_omp.py')\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['_install_omp'] = mod\n"
+        "spec.loader.exec_module(mod)\n"
+        "for raw in ('/dev/zero', sys.argv[2]):\n"
+        "    if mod._read(Path(raw)) is not None:\n"
+        "        raise SystemExit(1)\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(ROOT), str(fifo)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("reading /dev/zero or a FIFO did not finish within 2s")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_read_reassembles_short_reads_under_the_cap(tmp_path, monkeypatch):
+    """A regular file under the cap comes back whole even when each os.read returns one byte."""
+    path = _write(tmp_path / "settings.json", '{"extensions": ["/opt/keep"]}\n')
+    real_read = inst.os.read
+
+    def one_byte(fd, n):
+        return real_read(fd, 1)
+
+    monkeypatch.setattr(inst.os, "read", one_byte)
+    assert inst._read(path) == path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("source", ["project-settings", "user-yaml", "user-settings"])
+@pytest.mark.parametrize("kind", ["oversize", "fifo"])
+def test_present_inheritance_source_that_cannot_be_read_is_not_skipped(ws, home, monkeypatch, source, kind):
+    """A settings.json over the read cap (the 1 MiB branch; the cap is pointed at a few bytes) or a FIFO user
+    YAML must fail the install and leave the source unchanged, not write a project list that dropped it."""
+    if source == "project-settings":
+        path = ws / ".omp" / "settings.json"
+    elif source == "user-yaml":
+        path = home / ".omp" / "agent" / "config.yml"
+    else:
+        path = home / ".omp" / "agent" / "settings.json"
+    legacy = None
+    if source == "user-yaml":
+        legacy = _write(home / ".omp" / "agent" / "settings.json", '{"extensions": ["/opt/legacy"]}\n')
+        legacy_before = legacy.read_bytes()
+    if kind == "oversize":
+        monkeypatch.setattr(inst, "_READ_LIMIT", 8)
+        body = "extensions:\n  - /opt/keep\n" if source == "user-yaml" else '{"extensions": ["/opt/keep"]}\n'
+        _write(path, body)
+        before = path.read_bytes()
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(path)
+        before = None
+    rc, out = _run(ws)
+    assert rc == 2
+    assert str(path) in out
+    if before is not None:
+        assert path.read_bytes() == before
+    assert not _cfg(ws).exists()
+    if legacy is not None:
+        assert legacy.read_bytes() == legacy_before
+
+
+def test_load_hook_config_reassembles_short_reads(tmp_path, monkeypatch):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_agents_short_read", ROOT / "scripts" / "build_agents.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    path = _write(tmp_path / "settings.json", '{"keep": true}\n')
+    real_read = mod.os.read
+
+    def one_byte(fd, n):
+        return real_read(fd, 1)
+
+    monkeypatch.setattr(mod.os, "read", one_byte)
+    assert mod._load_hook_config(path) == {"keep": True}
+
+
+@pytest.mark.parametrize("rel", [".claude/settings.json", ".grok/hooks/agent-swarm.json"])
+def test_unquoted_stop_hook_is_removed_unless_the_flag_replaces_it(tree, ws, home, rel):
+    """An unquoted on_a01_complete.py path still matches. Without the flag it is removed; with the flag this
+    checkout's quoted command replaces it. The unrelated hook stays either way."""
+    import shlex
+
+    old = "python3 /old checkout/hooks/on_a01_complete.py"
+    unrelated = "python3 /opt/hooks/check_on_a01_complete.py"
+    payload = {
+        "hooks": {
+            "Stop": [
+                {"hooks": [{"type": "command", "command": old}]},
+                {"hooks": [{"type": "command", "command": unrelated}]},
+            ]
+        }
+    }
+    path = _write(ws / rel, json.dumps(payload))
+    r = _cli(tree, ws, home, "--no-substrate")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads(path.read_text(encoding="utf-8"))
+    commands = [entry["command"] for group in data["hooks"]["Stop"] for entry in group["hooks"]]
+    assert commands == [unrelated]
+    r = _cli(tree, ws, home, "--no-substrate", "--with-a01-complete-hook")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads(path.read_text(encoding="utf-8"))
+    commands = [entry["command"] for group in data["hooks"]["Stop"] for entry in group["hooks"]]
+    expected = f"python3 {shlex.quote(str(tree / 'hooks' / 'on_a01_complete.py'))}"
+    assert commands == [unrelated, expected]
