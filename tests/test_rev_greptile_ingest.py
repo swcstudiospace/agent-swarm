@@ -245,6 +245,42 @@ def test_a_long_link_keeps_its_label_and_the_following_explanation(tmp_path):
     assert "https://" not in evidence
 
 
+def test_a_nested_label_and_a_parenthesis_in_the_url_keep_the_explanation(tmp_path):
+    """Stopping at the first ] and the first ) left the address in the evidence and hid the explanation."""
+    rest = "[the [build] report](https://example/report_(1)) then the explanation"
+    evidence = _one(tmp_path, _badged(2, "T", rest))["evidence"]
+    assert evidence == "the [build] report then the explanation"
+    assert "the [build] report" in evidence and "then the explanation" in evidence
+    assert "report_(1)" not in evidence and "https://" not in evidence
+
+
+def test_a_url_longer_than_2000_characters_is_still_removed(tmp_path):
+    """A 2,000-character URL cap left the tail of the address in the evidence and cut off the explanation."""
+    url = "https://artifacts.example/" + ("b" * 2001)
+    assert len(url) > 2000
+    rest = f"See [the artifact]({url}) and then the explanation that must survive."
+    evidence = _one(tmp_path, _badged(2, "T", rest))["evidence"]
+    assert evidence == "See the artifact and then the explanation that must survive."
+    assert "the artifact" in evidence and "and then the explanation that must survive." in evidence
+    assert "https://" not in evidence
+
+
+def test_an_escaped_bracket_does_not_end_the_label(tmp_path):
+    """An escaped \\] is literal. Ending the label there would leave the URL in the evidence."""
+    rest = "See [pre\\] post](https://example.com/secret) then the explanation"
+    evidence = _one(tmp_path, _badged(2, "T", rest))["evidence"]
+    assert evidence == "See pre] post then the explanation"
+    assert "https://" not in evidence and "secret" not in evidence
+
+
+def test_an_escaped_parenthesis_does_not_end_the_url(tmp_path):
+    """An escaped \\) is literal. Ending the URL there would leave the tail of the address in the evidence."""
+    rest = "See [the report](https://example.com/a\\)b) then the explanation"
+    evidence = _one(tmp_path, _badged(2, "T", rest))["evidence"]
+    assert evidence == "See the report then the explanation"
+    assert "https://" not in evidence and "a\\)b" not in evidence and "b)" not in evidence
+
+
 def test_a_backtick_on_the_opening_line_is_inline_code_not_a_fence(tmp_path):
     """```a ` <b>``` is one inline span. Reading it as a fence kept the prompt block that follows."""
     rest = ("Before ```a ` <b>``` after.\n\n"

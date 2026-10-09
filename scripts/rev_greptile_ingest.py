@@ -47,9 +47,10 @@ _META_LINES = re.compile(r"^[ \t]*\*\*(?:Knowledge Base|Sources?) Used:?\*\*:?[^
 # source carry the trailing "Fix in ..." buttons; their anchors hold long percent-encoded prompt URLs.
 _HTML = re.compile(r"</?(?:a|img|picture|source|br|hr|p|b|i|em|strong|code|pre|sub|sup|summary|div|span|ul|ol|li|h[1-6]|"
                    r"blockquote|table|thead|tbody|tr|td|th)\b[^>]*>", re.I)
-# link text may hold escaped brackets: [\[n6\] title](url). The label is at most 300 tokens: an unbounded text scan
-# from every "[" is quadratic on a body that is mostly brackets (10,000 of them took 2 s). The URL is not capped.
-# A 2,000-character cap left the tail of a long artifact URL in the evidence and cut off the explanation after it.
+# Link text may hold escaped brackets and nested labels: [\[n6\] title](url), [the [build] report](url). The label
+# is at most 300 tokens (one character, or a backslash plus the next). An unbounded scan from every "[" is quadratic
+# on a body that is mostly brackets (10,000 of them took 2 s). The URL is not capped, and parentheses in it nest:
+# a 2,000-character cap left the tail of a long artifact URL in the evidence and cut off the explanation after it.
 _LABEL_TOKENS = 300
 # A backtick fence whose opening line contains a backtick is inline code (```a ` <b>```), not a block. Treating it as
 # a fence saved every following line, including the <details> prompt, as code. Tilde fences may name a backtick language.
@@ -180,55 +181,93 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
-def _label_open(text: str, i: int) -> int | None:
-    """Index just after `](` if `text[i]` opens a link label of 1..300 tokens, else None.
-
-    A token is one ordinary character or a backslash escape (two characters). A newline ends the label. The bound is
-    what keeps a body of brackets linear."""
-    n = len(text)
-    if i >= n or text[i] != "[":
-        return None
-    j, tokens = i + 1, 0
-    while j < n and tokens < _LABEL_TOKENS:
-        if text[j] == "\\" and j + 1 < n:
-            j += 2
-        elif text[j] in "]\n":
-            break
+def _unescape_label(label: str) -> str:
+    """`\\[` and `\\]` in a link label are literal brackets. One pass, and only those two escapes."""
+    parts: list[str] = []
+    i = start = 0
+    n = len(label)
+    while i < n:
+        if label[i] == "\\" and i + 1 < n and label[i + 1] in "[]":
+            if start < i:
+                parts.append(label[start:i])
+            parts.append(label[i + 1])
+            i += 2
+            start = i
         else:
-            j += 1
-        tokens += 1
-    if tokens == 0 or j + 1 >= n or text[j] != "]" or text[j + 1] != "(":
-        return None
-    return j + 2
+            i += 1
+    if start == 0:
+        return label
+    if start < n:
+        parts.append(label[start:n])
+    return "".join(parts)
 
 
 def _strip_links(text: str) -> str:
-    """Markdown links become their label, escaped brackets included. The URL is consumed through its `)` or the end of
-    the line, with no character cap: a long artifact URL must not survive into the evidence. When a `](` has no closer
-    before the newline, nothing else on that line is a closed link either, so the rest of the line is copied once."""
+    """Markdown links become their label, in one forward scan. The URL is not read again.
+
+    A label opens at `[`. A token is one character, or a backslash plus the next character, and the label holds at most
+    300 tokens. A newline ends the candidate: it is not a link. Nested `[` raises the depth and an unescaped `]` lowers
+    it. Depth 0 on `]` with `(` next opens the URL. A `]` at depth 0 without `(` is not a link, so that `[` is copied
+    and the scan continues after it. `\\[` and `\\]` in the label are written back without the backslash.
+
+    The URL starts after `](`. Parenthesis depth starts at 1; an unescaped `(` raises it and an unescaped `)` lowers
+    it, and there is no length cap. A newline means the link is not closed, so that line is copied once from the `[`.
+    When the depth hits 0, only the label is emitted and the scan continues after the closing `)`."""
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
         bracket = text.find("[", i)
-        if bracket == -1:
+        if bracket < 0:
             out.append(text[i:])
             break
         out.append(text[i:bracket])
-        opened = _label_open(text, bracket)
-        if opened is None:
+        j = bracket + 1
+        depth, tokens = 1, 0
+        while j < n and depth > 0:
+            ch = text[j]
+            if ch == "\\" and j + 1 < n:  # one token; the next character is not structural, newline included
+                if tokens >= _LABEL_TOKENS:
+                    break
+                j += 2
+                tokens += 1
+                continue
+            if ch == "\n":
+                break
+            if ch == "]" and depth == 1:  # the delimiter sits past the token cap and is not itself a token
+                depth = 0
+                break
+            if tokens >= _LABEL_TOKENS:
+                break
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            j += 1
+            tokens += 1
+        if depth != 0 or tokens == 0 or j + 1 >= n or text[j + 1] != "(":
             out.append("[")
             i = bracket + 1
             continue
-        k = opened
-        while k < n and text[k] not in ")\n":
+        k, paren = j + 2, 1
+        while k < n and paren > 0:
+            ch = text[k]
+            if ch == "\\" and k + 1 < n and text[k + 1] != "\n":  # \) and \( are literal; a newline still ends the URL
+                k += 2
+                continue
+            if ch == "\n":
+                break
+            if ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren -= 1
             k += 1
-        if k < n and text[k] == ")":
-            out.append(re.sub(r"\\([\[\]])", r"\1", text[bracket + 1:opened - 2]))
-            i = k + 1
+        if paren != 0:
+            end = k if k < n else n  # k is the newline, or the end: copy this line once, do not scan it again
+            out.append(text[bracket:end])
+            i = end
             continue
-        end = k if k < n else n
-        out.append(text[bracket:end])
-        i = end
+        out.append(_unescape_label(text[bracket + 1:j]))
+        i = k  # k already stepped past the closing ")"
     return "".join(out)
 
 
