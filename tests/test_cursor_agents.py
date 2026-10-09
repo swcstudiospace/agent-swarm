@@ -340,6 +340,47 @@ def test_cursor_advisory_ingest_skips_approval(tmp_path, monkeypatch):
     assert any("advisory, approval not attempted" in line for line in body["reconcile"])
 
 
+def test_advisory_skip_events_use_each_task_id(tmp_path, swarm_dir):
+    """A second --advisory ingest must not stamp the first task's skip event with --task-id."""
+    env = os.environ.copy()
+    env["SWARM_DIR"] = str(swarm_dir)
+    plan = {
+        "tasks": [
+            {"id": "one", "capability": "req.spec", "agent": "A02", "title": "one", "depends_on": [], "gates": []},
+            {"id": "two", "capability": "req.spec", "agent": "A02", "title": "two", "depends_on": [], "gates": []},
+        ]
+    }
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    planned = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--plan", str(plan_path),
+         "--prefix", "T", "--json", "--repo", str(tmp_path)],
+        capture_output=True, text=True, env=env, cwd=ROOT,
+    )
+    assert planned.returncode == 0, planned.stdout + planned.stderr
+
+    def ingest(tid: str, *extra: str) -> subprocess.CompletedProcess[str]:
+        result = tmp_path / f"{tid}.json"
+        result.write_text(json.dumps({"task_id": tid, "state": "IN_REVIEW", "summary_md": tid}), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "orch_status.py"), "--ingest", str(result),
+             "--advisory", "--json", *extra],
+            capture_output=True, text=True, env=env, cwd=ROOT,
+        )
+
+    first = ingest("T-one")
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = ingest("T-two", "--task-id", "T-two")
+    assert second.returncode == 0, second.stdout + second.stderr
+    skipped = _events_of(swarm_dir, "task.approval.skipped")
+    by_task = {}
+    for event in skipped:
+        by_task.setdefault(event["task_id"], []).append(event["payload"]["task_id"])
+    assert by_task["T-one"] == ["T-one", "T-one"]
+    assert by_task["T-two"] == ["T-two"]
+    assert all(event["task_id"] == event["payload"]["task_id"] for event in skipped)
+
+
 def test_cursor_substitution_raises_when_pattern_missing():
     table = build_agents.CURSOR_BODY_SUBSTITUTIONS
     assert set(table) >= {"A05", "A06", "A09", "A14"}

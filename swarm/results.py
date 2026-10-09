@@ -350,7 +350,8 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
         reasons.update(_unaccepted_gates(store, tid, reasons))
         if not reasons:
             if not approve:
-                emit("task.approval.skipped", {"task_id": tid, "reason": "advisory ingest: approval not attempted"})
+                emit("task.approval.skipped", {"task_id": tid, "reason": "advisory ingest: approval not attempted"},
+                     task_id=tid)
                 notes_log.append(f"{tid}: advisory, approval not attempted")
                 continue
             store.transition(tid, S.APPROVED, reason="all required gates pass")
