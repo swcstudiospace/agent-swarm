@@ -173,9 +173,15 @@ def test_cursor_gate_scripts_are_non_recording_previews():
         assert "Never set SWARM_SIGNING_KEY, SWARM_ED25519_KEY or SWARM_ALLOW_INSECURE_DEV_KEY" in pre
         assert _KEY_ASSIGN.search(text) is None, agent["slug"]
         assert "never ingest a gate result" in pre, agent["slug"]
+        assert "advisory preview recorded no verdict rows; human records the gate" in pre, agent["slug"]
+        assert "stops the scheduling loop" in pre, agent["slug"]
         assert "Gate scripts record nothing." in text
         assert "Nothing this session produces counts as APPROVED." in text
     assert seen == 15
+    a01 = (CURSOR / "a01-orchestrator.md").read_text(encoding="utf-8")
+    assert a01.count('--transition <id> BLOCKED --reason "advisory preview recorded no verdict rows; human records the gate"') == 2
+    assert a01.count("stop the scheduling loop and do not spawn tasks that depend on it") == 2
+    assert "the task stays leased" not in a01
 
 
 def _verdict_rows(swarm: Path) -> list[dict]:
@@ -238,6 +244,36 @@ def test_cursor_gate_preview_records_no_rows(tmp_path, swarm_dir):
     assert any("no signing key configured" in e["payload"].get("reason", "") for e in control_events)
     control_env = _advisory_file(swarm_dir)
     assert control_env["payload"]["advisory"] is True and control_env["sig"] is None
+
+
+def test_cursor_blocked_gate_stops_downstream_without_approving(tmp_path, swarm_dir):
+    """The handoff A01 is told to make: a leased gate moved to BLOCKED records no rows,
+    leaves the producer unapproved, and keeps build unscheduled."""
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_KEYS}
+    env["SWARM_DIR"] = str(swarm_dir)
+    plan = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--brief-text", "x",
+         "--pattern", "feature", "--prefix", "H", "--risk-class", "medium", "--repo", str(work), "--json"],
+        capture_output=True, text=True, env=env, cwd=ROOT,
+    )
+    assert plan.returncode == 0, plan.stdout + plan.stderr
+    from swarm.results import reconcile
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    for tid in ("H-req", "H-arch", "H-data", "H-be"):
+        for state in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+            ts.transition(tid, state)
+    for tid in ("H-qa", "H-rev", "H-sec"):
+        for state in ("CLAIMED", "IN_PROGRESS", "BLOCKED"):
+            ts.transition(tid, state, reason="advisory preview recorded no verdict rows; human records the gate")
+    ready = {t["task_id"] for t in ts.ready()}
+    assert "H-build" not in ready
+    reconcile(ts, ts.get("H-be")["correlation_id"], lambda *a, **k: None)
+    assert ts.get("H-be")["state"] == "IN_REVIEW"
+    assert ts.get("H-qa")["state"] == "BLOCKED"
+    assert _verdict_rows(swarm_dir) == []
 
 
 def test_cursor_substitution_raises_when_pattern_missing():
