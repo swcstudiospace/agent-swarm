@@ -1,0 +1,83 @@
+#!/usr/bin/env bun
+/** Pass-through to scripts/rev_greptile_ingest.py — the findings are built in Python.
+
+Relative --threads, --map and --out are prefixed with this process's cwd, including a filename that is a negative number (`--out -2`).
+passthrough then runs Python with cwd at the runtime checkout, so a relative
+path would otherwise name a different file than a direct python3 invocation.
+
+Absolute paths and empty values are left unchanged. The join does not call
+path.resolve: that collapses ".." before Python follows a symlink, so
+`/ws/link/../threads.json` (link → /other/child) would read /ws/threads.json
+instead of /other/threads.json, and `--out=` would become the cwd.
+
+passthrough also runs Python with cwd at the checkout, and AgentScript resolves
+`--root` and a relative `SWARM_DIR` from that cwd. Both are pinned to the
+caller first (a missing `--root` becomes the caller cwd) so events land in the
+caller's workspace.
+*/
+import { passthrough } from "./passthrough.ts";
+
+const FILE_FLAGS = new Set(["--threads", "--map", "--out"]);
+
+function joinCaller(cwd: string, value: string): string {
+  if (value === "" || value.startsWith("/")) return value;
+  const base = cwd === "/" ? "" : cwd.replace(/\/+$/, "");
+  return `${base}/${value}`;
+}
+
+function pinRoot(value: string, cwd: string): string {
+  if (value === "") return cwd;
+  return joinCaller(cwd, value);
+}
+
+/** A filename that is only a negative number (`--out -2`). A flag (`--json`) is not a value. */
+function isNumericPath(value: string): boolean {
+  return /^-\d+(?:\.\d+)?$/.test(value);
+}
+
+function isValue(next: string | undefined): next is string {
+  return next !== undefined && (!next.startsWith("-") || isNumericPath(next));
+}
+
+function absolutize(argv: string[], cwd: string): string[] {
+  const dir = process.env.SWARM_DIR;
+  if (dir && !dir.startsWith("/")) process.env.SWARM_DIR = joinCaller(cwd, dir);
+
+  const out: string[] = [];
+  let sawRoot = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const eq = arg.indexOf("=");
+    const flag = eq === -1 ? arg : arg.slice(0, eq);
+    if (FILE_FLAGS.has(flag) && eq !== -1) {
+      out.push(`${flag}=${joinCaller(cwd, arg.slice(eq + 1))}`);
+      continue;
+    }
+    if (flag === "--root" && eq !== -1) {
+      sawRoot = true;
+      out.push(`--root=${pinRoot(arg.slice(eq + 1), cwd)}`);
+      continue;
+    }
+    const next = argv[i + 1];
+    if (FILE_FLAGS.has(arg) && isValue(next)) {
+      out.push(arg, joinCaller(cwd, next));
+      i++;
+      continue;
+    }
+    if (arg === "--root" && isValue(next)) {
+      sawRoot = true;
+      out.push(arg, pinRoot(next, cwd));
+      i++;
+      continue;
+    }
+    out.push(arg);
+  }
+  if (!sawRoot) out.push("--root", cwd);
+  return out;
+}
+
+export { absolutize };
+
+if (import.meta.main) {
+  process.exit(passthrough("rev_greptile_ingest", absolutize(process.argv.slice(2), process.cwd())));
+}

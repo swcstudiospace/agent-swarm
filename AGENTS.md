@@ -43,6 +43,7 @@ flowchart LR
 **4. Gates** — `qa_gate.py` (quality), `rev_gate.py` (review), `sec_gate.py` (security), `rel_plan.py` (release)
 - Each calls `make_verdict`, which signs the verdict.
 - Each writes `verdicts/<task>.<gate>.json` and calls `TaskStore.record_verdict`.
+- `rev_greptile_ingest.py` (A09, advisory) turns the open Greptile threads of a PR (`--threads FILE` export, or `--pr OWNER/REPO#N` through one read-only `gh api graphql` query) into the `{target: [finding]}` file that `rev_gate.py --per-target-findings` takes. P0 blocker, P1 major, P2 minor, P3 and lower info, no badge major (fail closed); resolved, outdated and non-Greptile threads are dropped and counted; `--map FILE` attributes findings to targets by path glob and an unmatched finding goes to every target. It never writes to GitHub, the Task Store or a verdict.
 
 **5. Reconcile**
 - If any required gate fails: CHANGES_REQUESTED, then a rework back to IN_PROGRESS. Each gate lineage is re-created once per rework as `<base>.r<N>` (base = the gate id without trailing `.rN`; N = the latest member's rerun sequence + 1, counted per lineage, not the target's rework count), from its latest member only, and added to the dependencies of anything that depended on the lineage. A release-gate rerun also waits for the other gate reruns of the same rework.
