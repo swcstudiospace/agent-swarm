@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Detached AgentSwarm runner used after the all-in-one Prompt Uplift hook.
 
-Fail-open. Dedupes concurrent kicks with a lock file. Always writes a log under
-$SWARM_DIR/autonomous.log.
+Fail-open. Dedupes concurrent kicks with an exclusive lock held for the whole run, plus a
+120s mtime debounce after it finishes. Always writes a log under $SWARM_DIR/autonomous.log.
+
+The run step is capped (SWARM_AUTONOMOUS_RUN_CAP_S, default 3600). On expiry the runner is
+SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_RUN_GRACE_S
+(default 15). subprocess.run's timeout SIGKILLs immediately, which orphans those sessions.
 """
 from __future__ import annotations
 import argparse
+import fcntl
 import hashlib
 import json
+import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -21,15 +28,21 @@ NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 
 
 def classify(prompt: str) -> bool:
-    low = prompt.lower()
-    if any(n in low for n in NEGATIVE):
-        return False
-    trimmed = prompt.strip()
-    if not trimmed:
-        return False
-    if trimmed.startswith("/"):
-        return False
-    return True
+    """Thin delegate to swarm.signal_detector for parity (n8 plan). Fail-open."""
+    try:
+        from swarm.signal_detector import classify as _sd_classify
+        return _sd_classify(prompt) == "sdlc"
+    except Exception:
+        # original fallback
+        low = prompt.lower()
+        if any(n in low for n in NEGATIVE):
+            return False
+        trimmed = prompt.strip()
+        if not trimmed:
+            return False
+        if trimmed.startswith("/"):
+            return False
+        return True
 
 
 def pattern_for(brief: str) -> str:
@@ -41,13 +54,73 @@ def pattern_for(brief: str) -> str:
     return "feature"
 
 
-def acquire(lock: Path) -> bool:
+def _env_seconds(name: str, default: float) -> float:
+    """A positive finite number of seconds from the environment, else `default`. Blank, non-numeric, non-finite
+    and non-positive values are the default: a typo must not disable the cap or the grace."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: float) -> subprocess.CompletedProcess:
+    """Run `cmd`, capturing stdout and stderr. `subprocess.run(timeout=)` SIGKILLs on expiry, which orphans the
+    runner's sessions: they sit in their own OS session, so the kill never reaches them and their tasks stay
+    IN_PROGRESS (T-06-26). Ask the runner to stop with SIGTERM first — its handler ends those sessions — and
+    SIGKILL only what ignores that for `grace` seconds. `Popen.communicate` does not kill on timeout; `run` does,
+    which is why this does not call `run`."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _signal_pid(proc.pid, signal.SIGTERM)
+        try:
+            out, err = proc.communicate(timeout=grace)
+        except subprocess.TimeoutExpired:
+            _signal_pid(proc.pid, signal.SIGKILL)
+            out, err = proc.communicate()
+    return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, out or "", err or "")
+
+
+def _stamp_lock(fd: int) -> None:
+    """Rewrite the lock so its mtime is now. acquire stamps acquisition; main stamps release."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(time.time()).encode())
+
+
+def acquire(lock: Path) -> int | None:
+    """An fd holding the exclusive kickoff lock, or None when this brief must not start.
+
+    The fd stays open for the whole run, so a second process cannot pass the check while the first
+    is still planning or running (T-06-18). The stamp written here is the acquisition time. main
+    rewrites the fd on release, and the 120s debounce is measured from that release mtime. A crash
+    that skips finally keeps this acquisition mtime."""
     lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
     now = time.time()
-    if lock.exists() and now - lock.stat().st_mtime < 120:
-        return False
-    lock.write_text(str(now))
-    return True
+    info = os.fstat(fd)
+    if info.st_size > 0 and now - info.st_mtime < 120:
+        os.close(fd)
+        return None
+    _stamp_lock(fd)
+    return fd
 
 
 def main() -> int:
@@ -70,7 +143,8 @@ def main() -> int:
     digest = hashlib.sha256(f"{repo}|{args.brief}".encode()).hexdigest()[:16]
     lock = swarm_dir / "kickoffs" / f"{digest}.lock"
     log = swarm_dir / "autonomous.log"
-    if not acquire(lock):
+    held = acquire(lock)
+    if held is None:
         log.write_text((log.read_text() if log.exists() else "") + f"skip duplicate {digest}\n")
         return 0
     env = {**os.environ, "SWARM_DIR": str(swarm_dir), "SWARM_CHILD": "1", "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
@@ -103,7 +177,13 @@ def main() -> int:
             }, indent=2))
             return 0
         run += ["--correlation-id", plan_json["correlation_id"]]
-        p2 = subprocess.run(run, cwd=str(root), env=env, capture_output=True, text=True, timeout=3600)
+        # SWARM_AUTONOMOUS_RUN_CAP_S bounds the run (default 3600). The grace is how long the runner has to end
+        # its sessions after SIGTERM before this process SIGKILLs it (T-06-26).
+        p2 = run_capped(
+            run, cwd=str(root), env=env,
+            timeout=_env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600),
+            grace=_env_seconds("SWARM_AUTONOMOUS_RUN_GRACE_S", 15),
+        )
         log.write_text(
             json.dumps({
                 "brief": args.brief[:500],
@@ -120,6 +200,10 @@ def main() -> int:
     except Exception as exc:
         log.write_text(json.dumps({"error": str(exc)}))
         return 0
+    finally:
+        # Debounce from release. A crash that skips this finally keeps the acquisition mtime.
+        _stamp_lock(held)
+        os.close(held)
 
 
 if __name__ == "__main__":

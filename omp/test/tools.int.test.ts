@@ -1,14 +1,20 @@
 /** Integration: tools → real bridge → real python scripts → tmp Task Store (never the repo's .swarm/). */
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, runPy, SwarmToolError } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry } from "../src/omp-api.ts";
-import { agentCtx, callTool, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
+import { agentCtx, callTool, ephemeralSigningKey, type FakePi, fakeCtx, fakePi, gitRepo, isolateEnv, runPython, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION", "SWARM_AGENT");
+isolateEnv(
+  "SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION", "SWARM_AGENT",
+  "SWARM_SIGNING_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
+);
+beforeEach(() => {
+  process.env.SWARM_SIGNING_KEY = ephemeralSigningKey();
+});
 
 /** All tools over the real bridge, counting bridge calls. */
 function swarm() {

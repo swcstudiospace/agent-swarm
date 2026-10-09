@@ -38,7 +38,7 @@ Your final message MUST contain exactly one fenced `json` block with this shape 
   "nfrs": [ { "id": "NFR-P1", "kind": "perf", "target": "p95<300ms @ 50rps", "verified_by": "A08.load" } ],
   "ambiguity_score": 0.12, "manual_only_pct": 0, "assumptions": [], "provisional": false }
 ```
-When you raise a change, use `{ "change_id": "RC-…", "affected": ["US-…","NFR-…"], "impact_estimate": { "tasks_at_risk": n }, "approved_by": "human:pm | null", "state": "proposed|approved|rejected" }` instead. Precede the block with a short markdown summary (stories written, criteria count, open clarifications).
+When you raise a change, use `{ "change_id": "RC-…", "affected": ["US-…","NFR-…"], "impact_estimate": { "tasks_at_risk": n }, "approved_by": "human:pm | null", "change_state": "proposed|approved|rejected" }` instead. Precede the block with a short markdown summary (stories written, criteria count, open clarifications).
 </output_format>
 
 <tools>

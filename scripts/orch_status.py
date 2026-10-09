@@ -18,12 +18,17 @@ from swarm.taskstore import TaskStore  # noqa: E402
 from swarm.runlog import read_events  # noqa: E402
 from swarm.paths import latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
-from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
+from swarm.results import parse_result, validate_result, apply_result, reconcile, reject, check_manual_transition  # noqa: E402
 from swarm import substrate_lease  # noqa: E402
 
 
-def ingest(store: TaskStore, path: Path, ctx) -> dict:
-    """task.result file → shared swarm.results path (same as the headless runner)."""
+def ingest(store: TaskStore, path: Path, ctx, *, approve: bool = True) -> dict:
+    """task.result file → shared swarm.results path (same as the headless runner).
+
+    approve=False (--advisory) saves the result and skips the APPROVED/DONE step. A keyless
+    Cursor session uses it so a task with no required gates stays IN_REVIEW instead of
+    raising E-POLICY after the result is already stored.
+    """
     result = parse_result(path.read_text(encoding="utf-8"))
     tid = ctx.task_id or (result or {}).get("task_id")
     if not isinstance(tid, str):
@@ -39,9 +44,9 @@ def ingest(store: TaskStore, path: Path, ctx) -> dict:
                              meta={"ingest": str(path)}, emit=ctx.emit, mode="ingest")
     except SwarmError as e:
         if e.code is ErrorCode.E_CONTRACT:
-            reject(store, tid, reason=str(e), mode="ingest", emit=ctx.emit)
+            reject(store, tid, attempt=task["attempt"], reason=str(e), mode="ingest", emit=ctx.emit)
         raise
-    log = reconcile(store, task["correlation_id"], ctx.emit)
+    log = reconcile(store, task["correlation_id"], ctx.emit, approve=approve)
     t = store.get(tid)
     return {"status": "ok", "task": t, "reconcile": log, "summary": f"ingested task.result for {tid} → {state} (now {t['state']})"}
 
@@ -59,6 +64,7 @@ def run(args, ctx) -> dict:
         tid, state = args.transition
         if ctx.dry_run:
             return {"status": "ok", "summary": f"dry-run: would transition {tid} → {state}"}
+        check_manual_transition(store, tid, state)  # T-05-31: a gate task reaches IN_REVIEW only through an ingest
         store.transition(tid, state, actor="A01", reason=args.reason or "manual")
         # a lease the runner mirrored in notes.lease is released (CANCELLED, FAILED, …) or completed (DONE) now, by its
         # lease_id and with the agent's token for this workspace (--root, the runner's --repo), rather than left to
@@ -71,7 +77,7 @@ def run(args, ctx) -> dict:
         return {"status": "ok", "task": t, "summary": f"{tid} → {t['state']}"}
 
     if args.ingest:
-        return ingest(store, Path(args.ingest), ctx)
+        return ingest(store, Path(args.ingest), ctx, approve=not args.advisory)
 
     tasks = store.list(correlation_id=corr)
     where = {"db": str(store.path), "swarm_dir": str(store.path.parent)}  # D-04: absolute, cwd-independent
@@ -106,6 +112,8 @@ def add_args(p):
     p.add_argument("--transition", nargs=2, metavar=("TASK_ID", "STATE"), help="A01-only legal transition")
     p.add_argument("--reason", default="")
     p.add_argument("--ingest", help="path to a task.result JSON (swarm/schemas/task.result.v1.json) from an agent")
+    p.add_argument("--advisory", action="store_true",
+                   help="with --ingest, save the result and do not transition it to APPROVED or DONE")
     p.add_argument("--history", metavar="TASK_ID")
 
 

@@ -71,11 +71,15 @@ python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern
 python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>; --runtime omp [--omp-bin omp] for headless omp -p
 python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
-python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, omp/agents, omp/skills (--check)
+python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, .cursor/agents, omp/agents, omp/skills (--check)
+python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # list the Cursor files a target repo would gain; writes nothing
 python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, the omp package and substrate-mcp (see below)
 python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
+python3 scripts/receipt_export.py --repo /path/to/codebase --json  # desk verification receipt; swarm verdicts stay advisory
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
+
+`scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
 
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
 `a02-requirements` … `a15-docs` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
@@ -87,7 +91,7 @@ UserPromptSubmit hook into the workspace, then installs the omp targets (`omp/ag
 `omp/` extension package). It also wires substrate-mcp: the `substrate` MCP entry in `<ws>/.mcp.json` (Claude, omp)
 and `<ws>/.grok/config.toml` (Grok), naming `${SUBSTRATE_TOKEN}` and never a value, plus one 0600 env file per agent
 outside the workspace holding that agent's `SUBSTRATE_TOKEN`, taken from `SUBSTRATE_TOKEN_<SURFACE>` in your
-environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). It never writes into this repo or `~/.omp`.
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files.
 It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, any
 destination reached through a symlink (the file or a parent dir under `<ws>`), a runtime that cannot call MCP, and an
 agent whose token it cannot deliver; for the last it prints what you must create.
@@ -97,7 +101,17 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws                 
 python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # omp agents + skills only
 python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print the plan, config diff and env files, write nothing
 python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # skip substrate-mcp install writes
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
 ```
+
+- **A01-complete Stop hook** (`hooks/on_a01_complete.py`): not registered by default, because it can detach the
+  unattended runner. `--with-a01-complete-hook` registers it for Claude and Grok; a reinstall without the flag removes
+  an earlier registration of it and leaves any other Stop hook alone. Registered, it detaches the runner only when
+  opt-in is on (`AIO_SWARM_AFTER_ORCH` or `SWARM_AFTER_ORCH` set to `1`, `true`, `yes`, or `on`), a real signing key
+  is configured, `SWARM_ALLOW_AUTONOMOUS=1` is set and no cloud-agent marker (`CURSOR_AGENT`, `CURSOR_CLOUD_AGENT`,
+  `CLOUD_AGENT`) is set. Once that opt-in is on and a completion signal was detected, any other case records the
+  reason on the hook-fired event and spawns nothing. With opt-in off, or with no completion signal, the hook returns
+  without writing that event.
 
 - **Link** (default) adds this checkout's `omp/` realpath to `extensions:` in `<ws>/.omp/config.yml`, so that file
   holds a host path by design. omp reads it from the cwd only: start omp at `<ws>`. When the file has no
@@ -127,6 +141,51 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate  
 A relocated `omp/` package needs `SWARM_ROOT` pointing at an agent-swarm checkout, since its tools run the
 Python scripts there.
 
+## Cursor cloud agents
+
+`.cursor/agents/` holds one generated subagent per slug (`a01-orchestrator` … `a15-docs`). `python3 scripts/build_agents.py` writes them from `prompts/` plus a Cursor preamble, and `--check` fails if a file drifts. Frontmatter is `name`, `description`, and `model: inherit` ([Cursor subagents](https://cursor.com/docs/subagents)).
+
+Cursor cloud sessions are advisory. No signing key is present (`SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY` and `SWARM_REQUIRE_KEY` unset), so gate scripts record nothing and nothing from that session counts as APPROVED. A missing signing key is the expected Cursor state and is not E-DEP: the agent accepts an unsigned `task.assign` from the parent session or `a01-orchestrator` and does not sign. Every gate script (`qa_gate`, `rev_gate`, `sec_gate`, `rel_plan`) runs only as a non-recording preview through python3 with `SWARM_AGENT_SESSION=1` in its environment. The bun twin `scripts/ts/sec_gate.ts` is not that preview. Non-gate results use `orch_status.py --ingest --advisory`, which saves the result and does not attempt APPROVED or DONE. The script writes an advisory envelope file and records no verdict rows. The agent never sets `SWARM_SIGNING_KEY`, `SWARM_ED25519_KEY` or `SWARM_ALLOW_INSECURE_DEV_KEY`, never signs or records a verdict, and never ingests a gate result or transitions a task to APPROVED or DONE. A gate result that fails, is refused or is unrecorded is advisory, never a pass. `render_cursor` rewrites A01's in-session ingest lines so a gate result is not ingested: A01 transitions that gate task to BLOCKED (`advisory preview recorded no verdict rows; human records the gate`), stops the scheduling loop, and leaves dependents unscheduled. A missing Task Store, `python3` or git is still E-DEP. The merge gate is Greptile, run by Desk Quality. A Cursor agent never merges a pull request, enables auto-merge, pushes to a protected branch or deletes a branch. Work ends at a draft PR, and a human merges after that gate. Where the shared prompt grants a merge or an auto-merge, `render_cursor` rewrites the line into draft-PR wording (A14 and A09). Worker branches follow the host repository. In a Programming Desk repo that is `bot-0N-<seat>/<task_id>`, where `bot-0N-<seat>` is the `ownership.yaml` owner of the files being changed, because the desk `gates.yml` rejects any prefix other than `^bot-0[0-6]-[a-z0-9-]+$`. `render_cursor` rewrites `swarm/<task_id>` (A05, A06) and `auto-fix/*` (A09) to `<seat-prefix>/<task_id>`. The substitution table raises if an expected pattern is missing from the prompt body. Those rewrites are Cursor-only; the Claude, Grok and omp renders keep the shared prompt. Nesting stops at two levels: the parent may spawn `a01-orchestrator`, A01 may spawn the other slugs, and those specialists must not spawn further.
+
+A target repo does not need to vendor this runtime. Pin a checkout of agent-swarm and point `SWARM_ROOT` at it (absolute path). The agents then call:
+
+```bash
+python3 "$SWARM_ROOT/scripts/<tool>.py" --root <target repo> --json
+```
+
+`<target repo>` is the git toplevel of the repo being edited. Repo-local `scripts/` is used only when `SWARM_ROOT` is unset and the working tree is this agent-swarm checkout. In any other repo, including one that already has its own `scripts/` directory, the agents stop until `SWARM_ROOT` is set. That is the setup a follow-up install into `swcstudiospace/programming-desk` depends on.
+
+The installer copies only `.cursor/` (the 15 agents, `.cursor/rules/agent-swarm.mdc`, and a provenance stamp). It does not write MCP config or env files and it does not wire substrate.
+
+```bash
+python3 scripts/_install_cursor.py --target /path/to/repo            # copy
+python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # paths only, write nothing
+python3 scripts/_install_cursor.py --target /path/to/repo --check    # exit 1 if the copy would change
+python3 scripts/build_agents.py --install-cursor /path/to/repo       # same copy, no regeneration, no substrate
+```
+
+It refuses a symlink on the way, a target inside this checkout or equal to `$HOME`, and any differing file it did not previously write. A second run against an unchanged tree writes nothing. `grokbot/skills/swarm-cloud-dispatch/SKILL.md` is the Grok Bot side of the same handoff: install in a pull request, then brief a Cursor cloud agent to run `a01-orchestrator`. The result comes back as a draft pull request.
+
+## Grok Bot seat map
+
+`python3 scripts/build_agents.py` also writes `grokbot/swarm/seat-map.json` and one `grokbot/skills/swarm-<lane>/SKILL.md` per manifest lane (`control`, `delivery`, `code`, `verify`, `ops`, `sustain`). `--check` fails if those files drift. The generator does not write under `.grok/` and does not touch the hand-written `grokbot/skills/swarm-cloud-dispatch/SKILL.md`. There is no sixteenth role.
+
+The map lists each of the 15 roles with a home (`desk-lead`, a desk seat, `executor`, `routine` or `cloud`), the seat that verifies the work, path globs, that seat's verification tools, and the autonomy ceiling from `agents.json`. Android, iOS and desktop are routing rules, because the swarm has no mobile or desktop role: `android/**` (and Kotlin/Gradle) to `bot-03-android`, `ios/**` (and Swift/Xcode) to `bot-04-ios`, desktop shells (`desktop/**`, `electron/**`, `tauri/**`) to `bot-02-web-edge`. A routing rule wins over a role path glob. When two roles both match, the longest path glob wins, and an equal length goes to the lowest role id, so the shared `scripts/code_checks.py` and `scripts/ts/code_checks.ts` (A05 and A06) resolve to A05. A lead-owned doc stays with Desk Lead when its literal glob is longer than `docs/**`. UX design paths stay with `bot-01-systems-backend`, matching `design/**` in the desk ownership manifest.
+
+Each lane skill reads prompts and runs scripts from `$SWARM_ROOT`, the pinned agent-swarm checkout, and passes `--root` for the target repo. A target such as programming-desk does not contain the swarm runtime.
+
+```bash
+python3 scripts/build_agents.py                                          # regenerate the seat map and lane skills
+python3 scripts/build_agents.py --check                                  # fail if the export drifts
+python3 scripts/_install_grokbot.py --target /path/to/dest --dry-run     # list grokbot/** paths; write nothing
+python3 scripts/_install_grokbot.py --target /path/to/dest               # copy, then write the sha256 stamp
+python3 scripts/_install_grokbot.py --target /path/to/dest --check       # exit 1 if the copy would change
+```
+
+The installer writes a stamp at `grokbot/.agent-swarm-grokbot.json` with the sha256 of each file it wrote, including the dispatch skill. It refuses a symlink on the way, a target inside this checkout or equal to `$HOME`, and any differing file it did not previously write. It also refuses a source whose seat map names a lane with no skill file, so a partial export cannot delete an installed lane skill. It never deletes a file the stamp does not record. A failed install restores the previous files through the same staged replace the Cursor installer uses.
+
+Desk Lead installs this onto the box and onto programming-desk only after Ming approves that copy. This repository does not run the installer against either of those trees.
+
 ## Suggested reading order
 
 Operators: 01 → 04 → 05 → 06 · Agent developers: 02 → your agent spec in 03/ → 07 · Auditors/security: agent §7 sections + 06 §S · Integration work: 02 → 04.
@@ -152,3 +211,62 @@ python3 -m pytest tests/test_trae_agents.py -q
 This native-session adapter does not invoke Claude/Grok hooks, the headless runner,
 or the signed Task Store protocol. It preserves approval gates and single-writer
 ownership without claiming that XML alone enforces runtime permissions.
+
+⚠ 3 unresolved conflicts detected
+- ours = HEAD
+- theirs = origin/main
+NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
+`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
+Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
+Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
+
+──── #2  L74-79 ────
+<<< ours
+python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, omp/agents, omp/skills (--check)
+>>> theirs
+python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, .cursor/agents, omp/agents, omp/skills (--check)
+python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # list the Cursor files a target repo would gain; writes nothing
+
+──── #3  L98-102 ────
+<<< ours
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). It never writes into this repo or `~/.omp`.
+>>> theirs
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files.
+
+──── #4  L112-115 ────
+<<< ours
+(empty)
+>>> theirs
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
+⚠ 2 unresolved conflicts detected
+- ours = HEAD
+- theirs = origin/main
+NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
+`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
+Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
+Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
+
+──── #11  L94-98 ────
+<<< ours
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). It never writes into this repo or `~/.omp`.
+>>> theirs
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files.
+
+──── #12  L108-111 ────
+<<< ours
+(empty)
+>>> theirs
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
+⚠ 1 unresolved conflict detected
+- ours = HEAD
+- theirs = origin/main
+NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
+`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
+Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
+Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
+
+──── #13  L104-107 ────
+<<< ours
+(empty)
+>>> theirs
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)

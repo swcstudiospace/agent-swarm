@@ -1,13 +1,14 @@
 """swarm.envelope.v1 — build, validate, sign and verify inter-agent messages.
 
 Signing: ed25519 via `cryptography` when SWARM_ED25519_KEY (hex seed) is set;
-otherwise HMAC-SHA256 with SWARM_SIGNING_KEY (default dev key). Signatures are
-REQUIRED for task.assign, gate verdicts and promote/rollback commands.
+otherwise HMAC-SHA256 with SWARM_SIGNING_KEY. There is no implicit dev key.
+Signatures are REQUIRED for task.assign, gate verdicts and promote/rollback commands.
 
-Every signing with the dev-insecure-key fallback emits a `security.dev_key` event, except a gate-script
-preview inside a key-less agent session (SWARM_AGENT_SESSION=1), which never records (WR-15).
-Verification accepts the dev key only when neither SWARM_ED25519_KEY nor
-SWARM_REQUIRE_KEY=1 is set; otherwise a dev-key `hmac:` signature never verifies.
+The public dev key is used only when SWARM_ALLOW_INSECURE_DEV_KEY=1, and not while
+SWARM_ED25519_KEY or SWARM_REQUIRE_KEY=1 is set. That signing emits a `security.dev_key`
+event, except a gate-script preview inside a key-less agent session (SWARM_AGENT_SESSION=1),
+which never records (WR-15). Without a real key and without the opt-in, sign_envelope
+refuses, dev-key hmac signatures do not verify, and APPROVED fails closed.
 SWARM_REQUIRE_KEY=1 makes APPROVED fail closed (E-POLICY) unless SWARM_ED25519_KEY
 (loadable) or SWARM_SIGNING_KEY is configured, and `signing_config_error()` lets
 verdict signing fail fast on a missing or unloadable key.
@@ -111,15 +112,59 @@ def _ed25519_key():
         return None
 
 
+# sha256 of the public dev key. Recognition only; the value itself is returned
+# from insecure_dev_key() and only after the opt-in check.
+_DEV_KEY_SHA256 = "0c324e01315f4b0cec3ac05a605b9463fb3550d2e1a95b707091328c56cf4ea7"
+
+
+def _is_public_dev_value(value: str | None) -> bool:
+    """True when `value` is the public dev key. Does not sign or verify."""
+    if not value:
+        return False
+    return hashlib.sha256(value.encode()).hexdigest() == _DEV_KEY_SHA256
+
+
+def insecure_dev_key() -> str | None:
+    """The public dev key, or None.
+
+    Returned only when SWARM_ALLOW_INSECURE_DEV_KEY=1 and neither SWARM_ED25519_KEY
+    nor SWARM_REQUIRE_KEY=1 is set. Callers must not invent another fallback.
+    """
+    if os.environ.get("SWARM_ALLOW_INSECURE_DEV_KEY") != "1":
+        return None
+    if os.environ.get("SWARM_ED25519_KEY") or os.environ.get("SWARM_REQUIRE_KEY") == "1":
+        return None
+    return "dev-insecure-key"
+
+
 def real_key_configured() -> bool:
     """True when a non-dev signing key is configured (loadable Ed25519 seed or HMAC secret)."""
-    return _ed25519_key() is not None or bool(os.environ.get("SWARM_SIGNING_KEY"))
+    hmac_key = os.environ.get("SWARM_SIGNING_KEY")
+    valid_hmac = bool(hmac_key) and not _is_public_dev_value(hmac_key)
+    return _ed25519_key() is not None or valid_hmac
 
 
 def _dev_key_forbidden() -> bool:
     """The public dev key must not verify once a real key is configured (even an unloadable
     Ed25519 seed: misconfiguration fails closed) or required via SWARM_REQUIRE_KEY=1."""
-    return bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1"
+    return (bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1"
+            or _is_public_dev_value(os.environ.get("SWARM_SIGNING_KEY")))
+
+
+def _signing_hmac() -> tuple[bytes, bool] | None:
+    """(secret, implicit_dev_fallback), or None when nothing may sign or verify.
+
+    A configured HMAC secret that is not the public dev key always wins. The dev key
+    is reached only through insecure_dev_key(). implicit_dev_fallback is true only for
+    the unset or empty SWARM_SIGNING_KEY opt-in path, which emits security.dev_key.
+    """
+    raw = os.environ.get("SWARM_SIGNING_KEY") or ""
+    if raw and not _is_public_dev_value(raw):
+        return raw.encode(), False
+    dev = insecure_dev_key()
+    if dev is None:
+        return None
+    return dev.encode(), not bool(raw)
 
 
 def signing_config_error() -> str | None:
@@ -145,17 +190,24 @@ def _warn_dev_key(env: dict, root: str | Path | None) -> None:
 def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = True) -> dict:
     """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10).
     audit=False skips that event for a key-less agent-session preview that can never record (WR-15)."""
+    err = signing_config_error()
+    if err and _dev_key_forbidden() and not real_key_configured():
+        raise SwarmError(ErrorCode.E_POLICY, err)
     key = _ed25519_key()
     if key is not None:
         sig = key.sign(_canonical(env))
         env["sig"] = "ed25519:" + base64.b64encode(sig).decode()
-    else:
-        # an empty SWARM_SIGNING_KEY counts as unset, exactly as verify_envelope treats it
-        secret = (os.environ.get("SWARM_SIGNING_KEY") or "dev-insecure-key").encode()
-        if audit and not os.environ.get("SWARM_SIGNING_KEY"):
-            _warn_dev_key(env, root)
-        mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
-        env["sig"] = "hmac:" + base64.b64encode(mac).decode()
+        return env
+    material = _signing_hmac()
+    if material is None:
+        # Refuse rather than emit an hmac that can never verify. The dev-key literal
+        # is reached only inside insecure_dev_key(), after the opt-in check.
+        raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured")
+    secret, implicit_dev = material
+    if audit and implicit_dev:
+        _warn_dev_key(env, root)
+    mac = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
+    env["sig"] = "hmac:" + base64.b64encode(mac).decode()
     return env
 
 
@@ -171,15 +223,14 @@ def verify_envelope(env: dict) -> bool:
     if not isinstance(sig, str):
         return False
     if sig.startswith("hmac:"):
-        secret = os.environ.get("SWARM_SIGNING_KEY")
-        if not secret:
-            if _dev_key_forbidden():
-                return False
-            secret = "dev-insecure-key"
+        material = _signing_hmac()
+        if material is None:
+            return False
+        secret, _implicit = material
         given = _b64(sig[5:])
         if given is None:
             return False
-        expected = hmac.new(secret.encode(), _canonical(env), hashlib.sha256).digest()
+        expected = hmac.new(secret, _canonical(env), hashlib.sha256).digest()
         return hmac.compare_digest(expected, given)
     if sig.startswith("ed25519:"):
         key = _ed25519_key()

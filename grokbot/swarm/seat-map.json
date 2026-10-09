@@ -1,0 +1,432 @@
+{
+  "precedence": "routing-before-roles; longest role glob wins; equal length: lowest role id",
+  "roles": [
+    {
+      "autonomy_ceiling": {
+        "accept_risk": "L4",
+        "budget": "L3",
+        "kill_release": "L3",
+        "schedule": "L2"
+      },
+      "code": "ORCH",
+      "home": "desk-lead",
+      "id": "A01",
+      "lane": "control",
+      "path_globs": [
+        ".claude/agents/**",
+        ".claude/commands/**",
+        ".claude/hooks/**",
+        ".planning/**",
+        "docs/desk-operating-model.md",
+        "docs/github-sot-orchestration.md",
+        "docs/gotxcot-cloud-pipeline.md",
+        "docs/intake-e2e-runbook.md",
+        "docs/vps-agent-bus.md",
+        "grokbot/**",
+        "prompts/bot-00-programming-lead.xml",
+        "scripts/orch_plan.py",
+        "scripts/orch_status.py",
+        "scripts/swarm_run.py",
+        "scripts/ts/orch_plan.ts",
+        "scripts/ts/orch_status.ts",
+        "scripts/ts/swarm_run.ts",
+        "skills/agent-bus/**",
+        "skills/desk-bootstrap/**",
+        "skills/gotxcot-uplift/**",
+        "skills/trackplan-dispatch/**",
+        "vendor/ultrathink-policy/**"
+      ],
+      "seat": "bot-00-programming-lead",
+      "slug": "a01-orchestrator",
+      "verification_tools": [
+        "desk_receipt_check"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "scope_change": "L3",
+        "spec": "L2"
+      },
+      "code": "REQ",
+      "home": "executor",
+      "id": "A02",
+      "lane": "delivery",
+      "path_globs": [
+        "scripts/req_lint.py",
+        "scripts/ts/req_lint.ts"
+      ],
+      "seat": "bot-00-programming-lead",
+      "slug": "a02-requirements",
+      "verification_tools": [
+        "desk_receipt_check"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "adr": "L2",
+        "breaking_contract": "L3"
+      },
+      "code": "ARCH",
+      "home": "bot-01-systems-backend",
+      "id": "A03",
+      "lane": "delivery",
+      "path_globs": [
+        "ARCHITECTURE.md",
+        "scripts/arch_adr.py",
+        "scripts/arch_contract_check.py",
+        "scripts/ts/arch_adr.ts",
+        "scripts/ts/arch_contract_check.ts"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a03-architect",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "brand_change": "L3",
+        "spec": "L2"
+      },
+      "code": "UXD",
+      "home": "bot-01-systems-backend",
+      "id": "A04",
+      "lane": "delivery",
+      "path_globs": [
+        "design/**",
+        "docs/design/**",
+        "scripts/ts/ux_tokens.ts",
+        "scripts/ux_tokens.py"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a04-ux-designer",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "code": "L2",
+        "contract_deviation": "L3"
+      },
+      "code": "BE",
+      "home": "bot-01-systems-backend",
+      "id": "A05",
+      "lane": "code",
+      "path_globs": [
+        "**/*.py",
+        "**/*.rs",
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/**",
+        "pyproject.toml",
+        "scripts/be_contract_conformance.py",
+        "scripts/code_checks.py",
+        "scripts/ts/be_contract_conformance.ts",
+        "scripts/ts/code_checks.ts",
+        "services/**",
+        "uv.lock"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a05-backend",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "code": "L2",
+        "design_deviation": "L3"
+      },
+      "code": "FE",
+      "home": "bot-02-web-edge",
+      "id": "A06",
+      "lane": "code",
+      "path_globs": [
+        "**/*.ts",
+        "**/*.tsx",
+        "apps/web/**",
+        "deno.json",
+        "deno.lock",
+        "edge/**",
+        "package.json",
+        "scripts/code_checks.py",
+        "scripts/fe_a11y_check.py",
+        "scripts/ts/code_checks.ts",
+        "scripts/ts/fe_a11y_check.ts",
+        "vercel.json",
+        "web/**"
+      ],
+      "seat": "bot-02-web-edge",
+      "slug": "a06-frontend",
+      "verification_tools": [
+        "bun",
+        "deno"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "destructive_ddl": "L4",
+        "migration": "L2"
+      },
+      "code": "DATA",
+      "home": "bot-01-systems-backend",
+      "id": "A07",
+      "lane": "code",
+      "path_globs": [
+        "migrations/**",
+        "scripts/data_migration_check.py",
+        "scripts/ts/data_migration_check.ts"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a07-data",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "block_merge": "L2",
+        "run_suites": "L2",
+        "waive": "L3"
+      },
+      "code": "QA",
+      "home": "bot-06-quality-security",
+      "id": "A08",
+      "lane": "verify",
+      "path_globs": [
+        "ci/gates/**",
+        "ci/hooks/**",
+        "ci/tests/**",
+        "scripts/qa_gate.py",
+        "scripts/ts/qa_gate.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a08-qa",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "verdict": "L2",
+        "waive": "L3"
+      },
+      "code": "REV",
+      "home": "bot-06-quality-security",
+      "id": "A09",
+      "lane": "verify",
+      "path_globs": [
+        ".gitignore",
+        ".pre-commit-config.yaml",
+        "ownership.yaml",
+        "scripts/rev_gate.py",
+        "scripts/ts/rev_gate.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a09-reviewer",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "accept_risk": "L4",
+        "block_release": "L2",
+        "verdict": "L2"
+      },
+      "code": "SEC",
+      "home": "bot-06-quality-security",
+      "id": "A10",
+      "lane": "verify",
+      "path_globs": [
+        "**/*.proto",
+        ".github/workflows/security-*.yml",
+        "SECURITY.md",
+        "ci/security/**",
+        "contracts/**",
+        "scripts/sec_gate.py",
+        "scripts/ts/sec_gate.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a10-security",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "non_prod": "L2",
+        "prod_infra": "L3"
+      },
+      "code": "DEVOPS",
+      "home": "bot-05-infrastructure",
+      "id": "A11",
+      "lane": "ops",
+      "path_globs": [
+        "**/*.tf",
+        "**/*.tfvars",
+        ".github/workflows/**",
+        ".mcp.json",
+        "Dockerfile*",
+        "docker-compose*.yml",
+        "infra/**",
+        "k8s/**",
+        "scripts/devops_build_record.py",
+        "scripts/devops_ci_check.py",
+        "scripts/ts/devops_build_record.ts",
+        "scripts/ts/devops_ci_check.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a11-devops",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "canary": "L2",
+        "prod_high_risk": "L4",
+        "rollback": "L2"
+      },
+      "code": "REL",
+      "home": "cloud",
+      "id": "A12",
+      "lane": "ops",
+      "path_globs": [
+        "deploy/**",
+        "scripts/rel_plan.py",
+        "scripts/ts/rel_plan.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a12-release",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "alerting": "L2",
+        "incident_declare": "L2",
+        "page_humans": "L2"
+      },
+      "code": "OBS",
+      "home": "bot-05-infrastructure",
+      "id": "A13",
+      "lane": "ops",
+      "path_globs": [
+        "scripts/obs_slo.py",
+        "scripts/ts/obs_slo.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a13-observability",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "major_bump": "L3",
+        "patch_task": "L2"
+      },
+      "code": "MAINT",
+      "home": "routine",
+      "id": "A14",
+      "lane": "sustain",
+      "path_globs": [
+        "scripts/maint_deps.py",
+        "scripts/ts/maint_deps.ts"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a14-maintenance",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "docs": "L2",
+        "public_docs": "L3"
+      },
+      "code": "DOC",
+      "home": "executor",
+      "id": "A15",
+      "lane": "sustain",
+      "path_globs": [
+        "README.md",
+        "docs/**",
+        "scripts/docs_bundle.py",
+        "scripts/ts/docs_bundle.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a15-docs",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    }
+  ],
+  "routing": [
+    {
+      "kind": "android",
+      "path_globs": [
+        "**/*.kt",
+        "**/*.kts",
+        "**/build.gradle",
+        "android/**"
+      ],
+      "seat": "bot-03-android",
+      "verification_tools": [
+        "gradle"
+      ]
+    },
+    {
+      "kind": "desktop",
+      "path_globs": [
+        "apps/desktop/**",
+        "desktop/**",
+        "electron/**",
+        "tauri/**"
+      ],
+      "seat": "bot-02-web-edge",
+      "verification_tools": [
+        "bun",
+        "deno"
+      ]
+    },
+    {
+      "kind": "ios",
+      "path_globs": [
+        "**/*.swift",
+        "**/*.xcodeproj/**",
+        "**/Package.swift",
+        "ios/**"
+      ],
+      "seat": "bot-04-ios",
+      "verification_tools": [
+        "xcodebuild"
+      ]
+    }
+  ],
+  "schema": "grokbot.seat-map.v1"
+}

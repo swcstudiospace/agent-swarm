@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -137,3 +138,117 @@ def test_autonomous_forwards_runtime_omp(tmp_path):
     assert "--dry-run" in run_argv
     log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
     assert log["plan_rc"] == 0 and log["run_rc"] == 0
+
+
+def _load_hook():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("autonomous_run_under_test", RUNNER)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_kickoff_lock_is_held_until_released_and_then_debounced(tmp_path):
+    """T-06-18: a second kick cannot start while the first holds the lock, nor within 120s of the release mtime.
+
+    main rewrites the fd on the way out. A release stamp blocks the next acquire immediately, even when the
+    acquisition mtime is already older than 120s, and allows it once that release mtime is itself that old."""
+    import os
+    import time
+    mod = _load_hook()
+    lock = tmp_path / "kickoffs" / "same.lock"
+    held = mod.acquire(lock)
+    assert held is not None
+    assert mod.acquire(lock) is None
+    os.utime(lock, (time.time() - 121, time.time() - 121))
+    mod._stamp_lock(held)  # what main's finally does before close: the debounce starts at release
+    os.close(held)
+    assert mod.acquire(lock) is None
+    os.utime(lock, (time.time() - 121, time.time() - 121))
+    again = mod.acquire(lock)
+    assert again is not None
+    os.close(again)
+
+
+def test_env_seconds_falls_back_on_blank_or_non_positive(monkeypatch):
+    mod = _load_hook()
+    monkeypatch.delenv("SWARM_AUTONOMOUS_RUN_CAP_S", raising=False)
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "  ")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "nope")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "0")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "-4")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "inf")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "1e309")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "12.5")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 12.5
+
+
+def _stub_root(tmp_path, body: str):
+    import shutil
+    root = tmp_path / "swarm-root"
+    shutil.copytree(ROOT / "swarm", root / "swarm")
+    (root / "scripts").mkdir()
+    (root / "scripts" / "orch_plan.py").write_text(
+        "import json, sys\n"
+        "print(json.dumps({'status': 'ok', 'correlation_id': 'corr-cap'}))\n")
+    (root / "scripts" / "swarm_run.py").write_text(body)
+    return root
+
+
+def test_run_cap_sigterms_the_runner_before_killing_it(tmp_path):
+    """T-06-26: the cap must not SIGKILL a runner that still needs to end its sessions."""
+    import time
+    marker = tmp_path / "got-sigterm"
+    root = _stub_root(tmp_path, f"""import json, signal, sys, time
+def stop(signum, _frame):
+    open({str(marker)!r}, "w").write(str(signum))
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+print(json.dumps({{"status": "ok"}}))
+sys.stdout.flush()
+time.sleep(30)
+""")
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm"),
+           "SWARM_AUTONOMOUS_RUN_CAP_S": "1", "SWARM_AUTONOMOUS_RUN_GRACE_S": "5"}
+    started = time.monotonic()
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement a billing feature",
+         "--swarm-root", str(root)],
+        capture_output=True, text=True, env=env, timeout=20,
+    )
+    elapsed = time.monotonic() - started
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert marker.read_text() == str(signal.SIGTERM)
+    assert elapsed < 8, elapsed
+    log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
+    assert log["run_rc"] == 0
+
+
+def test_run_cap_sigkills_a_runner_that_ignores_sigterm(tmp_path):
+    """The grace is finite: a runner that ignores SIGTERM is then SIGKILLed, and the log shows that signal."""
+    import time
+    root = _stub_root(tmp_path, """import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+""")
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm"),
+           "SWARM_AUTONOMOUS_RUN_CAP_S": "1", "SWARM_AUTONOMOUS_RUN_GRACE_S": "1"}
+    started = time.monotonic()
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "implement a billing feature",
+         "--swarm-root", str(root)],
+        capture_output=True, text=True, env=env, timeout=20,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 8, elapsed
+    log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
+    assert log["run_rc"] == -signal.SIGKILL
+    assert r.returncode in (-signal.SIGKILL, 256 - signal.SIGKILL)

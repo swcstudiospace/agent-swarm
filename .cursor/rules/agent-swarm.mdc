@@ -1,0 +1,18 @@
+---
+description: Apply when this repo is running AgentSwarm through the Cursor subagents in .cursor/agents (a01-orchestrator and a02-requirements through a15-docs).
+alwaysApply: false
+---
+
+# AgentSwarm on Cursor
+
+`SWARM_ROOT` is the absolute path of a pinned agent-swarm checkout. Swarm tools are:
+
+`python3 "$SWARM_ROOT/scripts/<tool>.py" --root <this repo> --json`
+
+`<this repo>` is the git toplevel of the repository you are editing. If `SWARM_ROOT` is unset, repo-local `scripts/` are swarm tools only inside the agent-swarm checkout itself (it contains `swarm/taskstore.py` and `scripts/orch_plan.py`). In any other repo, including one that already has a `scripts/` directory, stop and report `BLOCKED` with `needs` `SWARM_ROOT`. Do not run that repo's `scripts/` as swarm tools.
+
+Cursor cloud sessions are advisory. No signing key is present (`SWARM_ED25519_KEY` and `SWARM_REQUIRE_KEY` are unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
+
+Nesting stops at two levels. The parent session may spawn `a01-orchestrator`. A01 may spawn the other fourteen slugs with the Task tool (`subagent_type` is the slug). Those specialists must not spawn further subagents.
+
+Do not start an unattended headless runner. Dispatch by spawning the Cursor subagents above.

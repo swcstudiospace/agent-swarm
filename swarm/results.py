@@ -12,11 +12,19 @@ The ONE intended mode difference:
     `orch_status.py --transition` after approval. Invalid input is rejected with E-CONTRACT and no transition
     (never consumes an attempt).
 Both modes accept a gate task's IN_REVIEW only when its gate script recorded a verdict on every gate_for target
-during the current lease (WR-08); otherwise "E-CONTRACT: gate script not run" (headless FAILED, ingest exit 2).
+during the current lease (WR-08); otherwise "E-CONTRACT: gate script not run" (headless FAILED on that attempt, ingest exit 2).
 A review gate task's IN_REVIEW is also refused when its verdicts{} fails a target (agent_failed) whose review row from
-this lease is not `fail`: "E-CONTRACT: review verdict mismatch: ..." (headless FAILED, ingest exit 2, no transition).
-reconcile approves a target only from rows whose gate task (the signed gate_task) has an accepted result (IN_REVIEW,
+this lease is not `fail`: "E-CONTRACT: review verdict mismatch: ..." (headless FAILED on that attempt, ingest exit 2, no transition).
+A target is approved only from rows whose gate task (the signed gate_task) has an accepted result (IN_REVIEW,
 APPROVED or DONE), so a refused gate task's rows hold its targets even after it leaves the lease FAILED or BLOCKED.
+reconcile holds such a target, and TaskStore.transition refuses its APPROVED on every other path too (E-POLICY, T-05-31).
+A gate task that is still PLANNED or RETRY holds no lease, so an ingest cannot be satisfied by a row of its previous
+lease (T-05-30): every gate_for target counts as missing.
+A headless rejection fails the row only inside one write transaction, and only while that row is still IN_PROGRESS
+on the attempt that produced the result (`task["attempt"]` on the snapshot passed to apply_result, not the attempt
+re-read after a race). TaskStore.transition increments attempt when PLANNED, RETRY or BLOCKED moves to CLAIMED, so a
+retry that lands between the script check and the locked recheck is a different attempt: the rejection event is
+emitted and the new lease is left as it stands. Ingest still raises and does not claim or fail that lease.
 Rejections on both paths emit task.result.rejected {task_id, mode, reason}.
 """
 from __future__ import annotations
@@ -26,7 +34,7 @@ from contextlib import nullcontext
 from typing import Callable
 
 from .errors import SwarmError, ErrorCode
-from .gates import BLOCKING_SEVERITY, SEVERITIES, validate_verdict
+from .gates import BLOCKING_SEVERITY, SEVERITIES
 from .schema import load_schema, validate
 from .taskstore import TaskStore, TaskState as S
 
@@ -62,13 +70,37 @@ def validate_result(result, *, task_id: str) -> dict:
     return result
 
 
-def reject(store: TaskStore, task_id: str, *, reason: str, mode: str, emit: Emit) -> str:
-    """Record a rejected result. Headless: FAILED (counts as an attempt). Ingest: event only."""
+def reject(store: TaskStore, task_id: str, *, attempt: int, reason: str, mode: str, emit: Emit) -> str:
+    """Record a rejected result.
+
+    Headless moves the row to FAILED (counts as an attempt) only inside one write transaction, and only
+    when it is still IN_PROGRESS on `attempt` — the attempt that produced the result. A different attempt,
+    or a row that has left IN_PROGRESS, is left unchanged; the rejection event is emitted either way.
+    Ingest emits the event and does not transition.
+    """
     emit("task.result.rejected", {"task_id": task_id, "mode": mode, "reason": reason})
     if mode == "headless":
-        store.transition(task_id, S.FAILED, reason=reason[:500])
-        return S.FAILED.value
+        with store.transaction():
+            current = store.get(task_id)
+            if current["state"] == S.IN_PROGRESS.value and current["attempt"] == attempt:
+                store.transition(task_id, S.FAILED, reason=reason[:500])
+                return S.FAILED.value
+            return current["state"]
     return store.get(task_id)["state"]
+
+
+def check_manual_transition(store: TaskStore, task_id: str, to_state: str) -> None:
+    """Refuse a manual (`orch_status --transition`, the omp swarm_transition tool) move that skips a check only the
+    ingest path makes (T-05-31). A gate task reaches IN_REVIEW only through apply_result, which checks that its gate
+    script ran during this lease and that the agent's verdicts agree with the rows; moving it by hand would bypass both.
+    A manual APPROVED needs no check here: TaskStore.transition applies the missing and unaccepted gate rules to it.
+    Raises E-INPUT for an unknown task, as the transition itself would."""
+    task = store.get(task_id)
+    if to_state == S.IN_REVIEW.value and task["notes_json"].get("gate"):
+        raise SwarmError(ErrorCode.E_POLICY,
+                         f"{task_id} is a gate task: only a task.result ingest may move it to IN_REVIEW (it checks that the "
+                         "gate script ran during this lease and that the agent's verdicts match the recorded rows)",
+                         task_id=task_id)
 
 
 def _lease_start(store: TaskStore, task_id: str) -> float | None:
@@ -79,9 +111,13 @@ def _lease_start(store: TaskStore, task_id: str) -> float | None:
 
 def _gate_script_missing(store: TaskStore, task: dict) -> list[str]:
     """gate_for targets of a gate task lacking a verifying row that its gate script issued during the current lease
-    (since the latest CLAIMED). With no CLAIMED row the lease start is unknown, so every target counts as missing."""
+    (since the latest CLAIMED). With no CLAIMED row the lease start is unknown, so every target counts as missing.
+    A PLANNED or RETRY gate task holds no lease at all (T-05-30): "the latest CLAIMED" would be its PREVIOUS lease, and an
+    ingest that claims it would be satisfied by a row that lease's script issued. Every target counts as missing then."""
     notes = task["notes_json"]
     targets = list(notes.get("gate_for") or [])
+    if task["state"] in (S.PLANNED.value, S.RETRY.value):
+        return targets
     since = _lease_start(store, task["task_id"])
     if since is None:
         return targets
@@ -167,31 +203,59 @@ def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
         store.append_feedback(target, {"gate": gate, "source": "agent", "findings": agent_findings(v)[0]})
 
 
+class _GateRefused(SwarmError):
+    """A gate result that must be refused. A different SwarmError from the same write, such as an illegal
+    transition, is not one of these and must keep propagating."""
+
+
+def _gate_result_error(store: TaskStore, task: dict, result: dict) -> _GateRefused | None:
+    """Why this gate task's IN_REVIEW result must be refused, or None when the script's rows from this lease agree.
+
+    Measured on `task` as it stands now, including lease history read from the store. A caller holding the write lock
+    on a row it has just re-read therefore sees a re-lease that landed after an earlier check (T-05-30): the latest
+    CLAIMED is the new lease, and a row the previous lease's script issued no longer counts."""
+    notes = task["notes_json"]
+    if not notes.get("gate"):
+        return None
+    tid = task["task_id"]
+    missing = _gate_script_missing(store, task)
+    if missing:
+        return _GateRefused(ErrorCode.E_CONTRACT, f"gate script not run for {missing}", task_id=tid)
+    if notes["gate"] != "review":
+        return None
+    mismatch = _review_verdict_mismatch(store, task, result)
+    if not mismatch:
+        return None
+    return _GateRefused(
+        ErrorCode.E_CONTRACT,
+        f"review verdict mismatch: agent verdicts fail {mismatch} but the review rows recorded this "
+        f"lease do not; re-run swarm_gate with a major finding for each of {mismatch}",
+        task_id=tid, targets=mismatch)
+
+
+def _refuse_gate(store: TaskStore, tid: str, err: SwarmError, mode: str, emit: Emit, *, attempt: int) -> str:
+    """Refuse a gate result. Headless rejects `attempt`; ingest raises and does not claim or fail a new lease."""
+    if mode == "headless":
+        return reject(store, tid, attempt=attempt, reason=str(err), mode=mode, emit=emit)
+    raise err
+
+
 def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, meta: dict, emit: Emit, mode: str) -> str:
     """Apply a validated result to the assigned task only; returns the task's new state."""
     tid = task["task_id"]
     state = result["state"]
     if mode == "headless" and state == S.IN_PROGRESS.value:
-        return reject(store, tid, reason="E-CONTRACT: session ended in IN_PROGRESS", mode=mode, emit=emit)
+        return reject(store, tid, attempt=task["attempt"], reason="E-CONTRACT: session ended in IN_PROGRESS",
+                      mode=mode, emit=emit)
     if mode == "ingest" and task["state"] == S.BLOCKED.value:
         raise SwarmError(ErrorCode.E_CONTRACT, f"{tid} is BLOCKED; A01 releases it with orch_status --transition after approval",
                          task_id=tid)
+    # Before a PLANNED/RETRY ingest claims a new lease: a refusal must leave that task unclaimed. The same check runs
+    # again under the write lock at the transition, which is what closes the race below.
     if state == S.IN_REVIEW.value and task["notes_json"].get("gate"):
-        missing = _gate_script_missing(store, task)  # D-12: only script rows satisfy a gate; checked before any transition
-        if missing:
-            err = SwarmError(ErrorCode.E_CONTRACT, f"gate script not run for {missing}", task_id=tid)
-            if mode == "headless":
-                return reject(store, tid, reason=str(err), mode=mode, emit=emit)
-            raise err
-        mismatch = _review_verdict_mismatch(store, task, result) if task["notes_json"]["gate"] == "review" else []
-        if mismatch:
-            err = SwarmError(ErrorCode.E_CONTRACT,
-                             f"review verdict mismatch: agent verdicts fail {mismatch} but the review rows recorded this "
-                             f"lease do not; re-run swarm_gate with a major finding for each of {mismatch}",
-                             task_id=tid, targets=mismatch)
-            if mode == "headless":
-                return reject(store, tid, reason=str(err), mode=mode, emit=emit)
-            raise err
+        err = _gate_result_error(store, task, result)  # D-12: only script rows satisfy a gate
+        if err is not None:
+            return _refuse_gate(store, tid, err, mode, emit, attempt=task["attempt"])
     if mode == "ingest" and task["state"] in (S.PLANNED.value, S.RETRY.value):
         with store.transaction():  # the dependency check and the claim see one snapshot
             if not store.deps_satisfied(store.get(tid)):
@@ -210,14 +274,42 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
         target, reason = None, ""
         if current != S.IN_PROGRESS.value:
             raise SwarmError(ErrorCode.E_CONTRACT, f"illegal transition {current} → IN_PROGRESS for {tid}", task_id=tid)
+    # The transition and its provenance (notes, artifact rows, gate-target feedback) commit in one
+    # transaction: transition/set_notes/append_feedback join the outer block (TaskStore.transaction
+    # nests) and add_artifact's INSERT + outputs UPDATE ride along, so a crash at any point leaves a
+    # fully-applied or fully-rolled-back result — never a new state with stale notes or missing
+    # artifacts. Lock order matches TaskStore.transition: state row + audit row first, provenance after.
     if target is not None:
-        store.transition(tid, target, actor=agent_id, reason=reason)
-    store.set_notes(tid, result=result, meta=meta)
-    for o in result.get("outputs", []) or []:
-        store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""), version=str(o.get("version", "1")),
-                           digest=o.get("digest", ""), producer=agent_id)
-    if target is S.IN_REVIEW:
-        _agent_verdict_feedback(store, task, result)
+        # Re-read under the same write lock as the transition. Between the check above and here another caller can
+        # move a gate task through RETRY → CLAIMED → IN_PROGRESS; the state is IN_PROGRESS again, so the move to
+        # IN_REVIEW would be legal, and the previous lease's row would approve the target (T-05-30).
+        try:
+            with store.transaction():
+                fresh = store.get(tid)
+                if target is S.IN_REVIEW:
+                    err = _gate_result_error(store, fresh, result)
+                    if err is not None:
+                        raise err
+                store.transition(tid, target, actor=agent_id, reason=reason)
+                store.set_notes(tid, result=result, meta=meta)
+                for o in result.get("outputs", []) or []:
+                    store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
+                                       version=str(o.get("version", "1")),
+                                       digest=o.get("digest", ""), producer=agent_id)
+                if target is S.IN_REVIEW:
+                    _agent_verdict_feedback(store, fresh, result)
+        except _GateRefused as err:
+            # `task["attempt"]` is the attempt that produced this result. A retry increments attempt on the
+            # way back to CLAIMED; failing the re-read row would kill that replacement lease.
+            return _refuse_gate(store, tid, err, mode, emit, attempt=task["attempt"])
+    else:
+        # Heartbeat: no transition, but notes + artifacts still commit together.
+        with store.transaction():
+            store.set_notes(tid, result=result, meta=meta)
+            for o in result.get("outputs", []) or []:
+                store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
+                                   version=str(o.get("version", "1")),
+                                   digest=o.get("digest", ""), producer=agent_id)
     return store.get(tid)["state"]
 
 
@@ -240,31 +332,7 @@ def _rerun_index(task: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
-# A gate task in one of these states had its result accepted by apply_result (never refused, FAILED or BLOCKED).
-ACCEPTED_ISSUER_STATES = frozenset({S.IN_REVIEW.value, S.APPROVED.value, S.DONE.value})
-
-
-def _unaccepted_gates(store: TaskStore, tid: str, reasons: dict[str, str]) -> dict[str, str]:
-    """T-05-11: required gates of `tid` whose current row passes (not in `reasons`) but was recorded by a gate task
-    (the signed `gate_task`) whose result has not been accepted — leased, refused (review verdict mismatch), FAILED,
-    BLOCKED, RETRY, ESCALATED or CANCELLED — → "unaccepted". Such a row may be contradicted by its own gate agent, so
-    it never approves the target. Fails closed on an unreadable envelope or unknown gate task."""
-    latest = store.latest_verdicts(tid)
-    out = {}
-    for g in store.required_gates(tid):
-        if g in reasons or g not in latest:
-            continue
-        try:
-            issuer = validate_verdict(json.loads(latest[g]["envelope_json"])).get("gate_task")
-            accepted = issuer is None or store.get(issuer)["state"] in ACCEPTED_ISSUER_STATES
-        except Exception:
-            accepted = False
-        if not accepted:
-            out[g] = "unaccepted"
-    return out
-
-
-def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None) -> list[str]:
+def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None, *, approve: bool = True) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates.
 
     `leases` is the runner's substrate_lease.LeaseBridge, or None (ingest, dry runs, substrate off). It is told about
@@ -347,8 +415,13 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
         # accepted result, so a refused gate task ingested FAILED/BLOCKED, or moved FAILED → RETRY, never approves
         # its targets; its live lineage waits (no stall), an ESCALATED/CANCELLED issuer escalates below
         reasons = store.missing_gate_reasons(tid)
-        reasons.update(_unaccepted_gates(store, tid, reasons))
+        reasons.update(store.unaccepted_gates(tid, reasons))
         if not reasons:
+            if not approve:
+                emit("task.approval.skipped", {"task_id": tid, "reason": "advisory ingest: approval not attempted"},
+                     task_id=tid)
+                notes_log.append(f"{tid}: advisory, approval not attempted")
+                continue
             store.transition(tid, S.APPROVED, reason="all required gates pass")
             store.transition(tid, S.DONE, reason="approved")
             notes_log.append(f"{tid}: DONE")

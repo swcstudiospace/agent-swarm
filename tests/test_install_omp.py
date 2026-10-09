@@ -371,6 +371,167 @@ def test_link_refuses_a_symlinked_config(ws, home, tmp_path):
     assert _cfg(ws).is_symlink()
 
 
+# ---------------------------------------------------------------- write-time re-validation (T-07-05 TOCTOU)
+
+
+def _first_copy_dest(ws):
+    agents, _ = inst.package_names()
+    return ws / ".omp" / "agents" / f"{sorted(agents)[0]}.md"
+
+
+def _real_files(ws):
+    return [p for p in ws.rglob("*") if p.is_file() and not p.is_symlink()]
+
+
+def test_copy_mode_refuses_hardlink_at_destination(ws, home, tmp_path):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    dest.parent.mkdir(parents=True)
+    os.link(victim, dest)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "hardlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == [dest]
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_copy_mode_write_time_refuses_symlink_at_destination(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(victim)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == []
+
+
+def test_copy_mode_write_time_refuses_symlink_at_path_component(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        (ws / ".omp").symlink_to(outside)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+    assert _real_files(ws) == []
+
+
+def test_copy_mode_write_time_refuses_hardlink_at_destination(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.link(victim, dest)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "hardlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == [dest]
+
+
+def test_link_write_time_refuses_planted_config(ws, home, tmp_path, monkeypatch):
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        _write(_cfg(ws), "theme: planted\n")
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws)
+    assert rc == 2
+    assert "after the plan check" in out
+    assert _cfg(ws).read_text(encoding="utf-8") == "theme: planted\n"
+
+
+def test_copy_mode_parent_swap_between_check_and_write_cannot_escape(ws, home, tmp_path, monkeypatch):
+    """A `.omp/agents` swap after the parent check must not redirect a new-file write outside the
+    workspace: the write goes through the pinned parent directory, so it refuses (or lands in the
+    pinned directory) instead of following the planted symlink."""
+    import shutil
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    real_write = inst._safe_write_bytes
+    swapped = False
+
+    def swapping(dest, data, before, mode=None, dir_fd=None):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target = ws / ".omp" / "agents"
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            target.symlink_to(outside)
+        return real_write(dest, data, before, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inst, "_safe_write_bytes", swapping)
+    rc, out = _run(ws, "copy")
+    assert swapped
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_copy_mode_partial_failure_reports_written_and_failed(ws, home, tmp_path, monkeypatch):
+    """When a later destination fails after earlier copies saved, the error names the written files
+    and the failed destination instead of claiming nothing was written."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    real_write = inst._safe_write_bytes
+    calls = 0
+
+    def planting(dest, data, before, mode=None, dir_fd=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # plant a symlink at this destination after it verified absent; the pinned write refuses
+            os.symlink(str(victim), dest.name, dir_fd=dir_fd)
+        return real_write(dest, data, before, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inst, "_safe_write_bytes", planting)
+    rc, out = _run(ws, "copy")
+    assert calls >= 2
+    assert rc == 2
+    assert "Nothing was written" not in out
+    assert "partial install" in out
+    first = _first_copy_dest(ws)
+    assert first.is_file()
+    assert str(first) in out
+    assert "failed" in out
+    assert victim.read_bytes() == b"keep\n"
+
+
 @pytest.mark.parametrize("where", ["home", "omp-dir", "checkout"])
 def test_install_omp_refuses_home_omp_dir_and_checkout(home, tmp_path, monkeypatch, where):
     fake = tmp_path / "checkout"  # stands in for the checkout, so no test ever targets the real one
@@ -438,3 +599,264 @@ def test_install_workspace_refuses_symlinked_claude_and_grok_destinations(tree, 
     assert _snapshot(tree, outside, ws) == before
     assert sorted(p.name for p in outside.iterdir()) == ["victim.json"]
     assert not (ws / ".omp").exists()
+
+
+def test_hook_command_quotes_a_checkout_path_with_spaces():
+    import importlib.util
+    import shlex
+
+    spec = importlib.util.spec_from_file_location("build_agents_under_test", ROOT / "scripts" / "build_agents.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    script = Path("/tmp/my swarm/hooks/user_prompt_submit.py")
+    cmd = mod.hook_command(script)
+    assert shlex.split(cmd) == ["python3", str(script)]
+    assert "python3 /tmp/my" not in cmd
+
+
+@pytest.mark.parametrize("rel", [".claude/settings.json", ".grok/hooks/agent-swarm.json"])
+def test_invalid_hook_config_is_left_in_place(tree, ws, home, rel):
+    path = _write(ws / rel, "{ not json\n")
+    before = path.read_bytes()
+    snap = _snapshot(tree, ws)
+    r = _cli(tree, ws, home, "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "not valid JSON" in r.stderr
+    assert path.read_bytes() == before
+    assert _snapshot(tree, ws) == snap
+
+
+def test_device_and_fifo_configs_are_not_read(tmp_path):
+    """T-07-09: /dev/zero and a FIFO must not block, and must not look like an empty config.
+
+    Both reads run in a child. A regression that drains `/dev/zero` or blocks on the FIFO fails on the
+    timeout instead of hanging the suite; a non-None result fails too."""
+    fifo = tmp_path / "config.yml"
+    os.mkfifo(fifo)
+    code = (
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "spec = importlib.util.spec_from_file_location('_install_omp', root / 'scripts' / '_install_omp.py')\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['_install_omp'] = mod\n"
+        "spec.loader.exec_module(mod)\n"
+        "for raw in ('/dev/zero', sys.argv[2]):\n"
+        "    if mod._read(Path(raw)) is not None:\n"
+        "        raise SystemExit(1)\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(ROOT), str(fifo)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("reading /dev/zero or a FIFO did not finish within 2s")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_read_reassembles_short_reads_under_the_cap(tmp_path, monkeypatch):
+    """A regular file under the cap comes back whole even when each os.read returns one byte."""
+    path = _write(tmp_path / "settings.json", '{"extensions": ["/opt/keep"]}\n')
+    real_read = inst.os.read
+
+    def one_byte(fd, n):
+        return real_read(fd, 1)
+
+    monkeypatch.setattr(inst.os, "read", one_byte)
+    assert inst._read(path) == path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("source", ["project-settings", "user-yaml", "user-settings"])
+@pytest.mark.parametrize("kind", ["oversize", "fifo"])
+def test_present_inheritance_source_that_cannot_be_read_is_not_skipped(ws, home, monkeypatch, source, kind):
+    """A settings.json over the read cap (the 1 MiB branch; the cap is pointed at a few bytes) or a FIFO user
+    YAML must fail the install and leave the source unchanged, not write a project list that dropped it."""
+    if source == "project-settings":
+        path = ws / ".omp" / "settings.json"
+    elif source == "user-yaml":
+        path = home / ".omp" / "agent" / "config.yml"
+    else:
+        path = home / ".omp" / "agent" / "settings.json"
+    legacy = None
+    if source == "user-yaml":
+        legacy = _write(home / ".omp" / "agent" / "settings.json", '{"extensions": ["/opt/legacy"]}\n')
+        legacy_before = legacy.read_bytes()
+    if kind == "oversize":
+        monkeypatch.setattr(inst, "_READ_LIMIT", 8)
+        body = "extensions:\n  - /opt/keep\n" if source == "user-yaml" else '{"extensions": ["/opt/keep"]}\n'
+        _write(path, body)
+        before = path.read_bytes()
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(path)
+        before = None
+    rc, out = _run(ws)
+    assert rc == 2
+    assert str(path) in out
+    if before is not None:
+        assert path.read_bytes() == before
+    assert not _cfg(ws).exists()
+    if legacy is not None:
+        assert legacy.read_bytes() == legacy_before
+
+
+def test_load_hook_config_reassembles_short_reads(tmp_path, monkeypatch):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_agents_short_read", ROOT / "scripts" / "build_agents.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    path = _write(tmp_path / "settings.json", '{"keep": true}\n')
+    real_read = mod.os.read
+
+    def one_byte(fd, n):
+        return real_read(fd, 1)
+
+    monkeypatch.setattr(mod.os, "read", one_byte)
+    assert mod._load_hook_config(path) == {"keep": True}
+
+
+@pytest.mark.parametrize("rel", [".claude/settings.json", ".grok/hooks/agent-swarm.json"])
+def test_unquoted_stop_hook_is_removed_unless_the_flag_replaces_it(tree, ws, home, rel):
+    """An unquoted on_a01_complete.py path still matches. Without the flag it is removed; with the flag this
+    checkout's quoted command replaces it. The unrelated hook stays either way."""
+    import shlex
+
+    old = "python3 /old checkout/hooks/on_a01_complete.py"
+    unrelated = "python3 /opt/hooks/check_on_a01_complete.py"
+    payload = {
+        "hooks": {
+            "Stop": [
+                {"hooks": [{"type": "command", "command": old}]},
+                {"hooks": [{"type": "command", "command": unrelated}]},
+            ]
+        }
+    }
+    path = _write(ws / rel, json.dumps(payload))
+    r = _cli(tree, ws, home, "--no-substrate")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads(path.read_text(encoding="utf-8"))
+    commands = [entry["command"] for group in data["hooks"]["Stop"] for entry in group["hooks"]]
+    assert commands == [unrelated]
+    r = _cli(tree, ws, home, "--no-substrate", "--with-a01-complete-hook")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads(path.read_text(encoding="utf-8"))
+    commands = [entry["command"] for group in data["hooks"]["Stop"] for entry in group["hooks"]]
+    expected = f"python3 {shlex.quote(str(tree / 'hooks' / 'on_a01_complete.py'))}"
+    assert commands == [unrelated, expected]
+
+
+# ---------------------------------------------------------------- copy mode under a shadowing ancestor (T-07-20)
+
+
+def _pkg_skill():
+    _, skills = inst.package_names()
+    return sorted(skills)[0]
+
+
+def _pkg_agent():
+    agents, _ = inst.package_names()
+    return sorted(agents)[0]
+
+
+def _ancestor_skill(parent, name):
+    return _write(
+        parent / ".omp" / "skills" / name / "SKILL.md",
+        f"---\nname: {name}\ndescription: ancestor copy\n---\nancestor\n",
+    )
+
+
+def _ancestor_agent(parent, slug):
+    return _write(
+        parent / ".omp" / "agents" / f"{slug}.md",
+        f"---\nname: {slug}\ndescription: ancestor copy\n---\nancestor\n",
+    )
+
+
+def test_copy_mode_refuses_under_shadowing_ancestor_skill(ws, home):
+    skill = _pkg_skill()
+    planted = _ancestor_skill(ws.parent, skill)
+    before = _snapshot(ws, home)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "guard-less" in out and skill in out and "--allow-shadowed-copy" in out
+    assert "Nothing was written" in out
+    assert not (ws / ".omp").exists()
+    assert _snapshot(ws, home) == before
+    assert planted.read_text(encoding="utf-8").endswith("ancestor\n")
+    problem = inst.preflight(ws, "copy")
+    assert problem is not None and "guard-less" in problem
+
+
+def test_copy_mode_refuses_under_shadowing_ancestor_agent(ws, home):
+    slug = _pkg_agent()
+    _ancestor_agent(ws.parent, slug)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "guard-less" in out and slug in out
+    assert not (ws / ".omp").exists()
+
+
+def test_copy_mode_dry_run_refuses_under_shadowing_ancestor(ws, home):
+    _ancestor_skill(ws.parent, _pkg_skill())
+    rc, out = _run(ws, "copy", dry_run=True)
+    assert rc == 2
+    assert "guard-less" in out
+    assert not (ws / ".omp").exists()
+
+
+def test_copy_mode_opt_in_proceeds_with_loud_warnings(ws, home):
+    skill = _pkg_skill()
+    _ancestor_skill(ws.parent, skill)
+    buf = io.StringIO()
+    rc = inst.install_omp(ws, "copy", False, buf, home, allow_shadowed_copy=True)
+    assert rc == 0
+    out = buf.getvalue()
+    assert "no tools" in out and "no guard" in out  # the COPY_WARNING stays loud on opt-in
+    assert any(
+        line.startswith("WARNING shadow:") and skill in line and "(project)" in line
+        for line in out.splitlines()
+    )
+    assert (ws / ".omp" / "skills" / skill / "SKILL.md").is_file()
+
+
+def test_copy_mode_opt_in_preflight_passes(ws, home):
+    _ancestor_skill(ws.parent, _pkg_skill())
+    assert inst.preflight(ws, "copy", home, allow_shadowed_copy=True) is None
+
+
+def test_link_mode_under_shadowing_ancestor_warns_only(ws, home):
+    """Link mode keeps full tools/guard, so an ancestor shadow stays a warning, never a refusal."""
+    skill = _pkg_skill()
+    _ancestor_skill(ws.parent, skill)
+    rc, out = _run(ws)
+    assert rc == 0
+    assert any(skill in line and "(project)" in line for line in _warnings(out))
+    assert _cfg(ws).exists()
+
+
+def test_install_workspace_copy_refusal_and_opt_in_flag(tree, ws, home):
+    skill = _pkg_skill()
+    _ancestor_skill(ws.parent, skill)
+    before = _snapshot(tree, ws)
+    r = _cli(tree, ws, home, "--omp-mode", "copy", "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "guard-less" in (r.stdout + r.stderr)
+    assert _snapshot(tree, ws) == before
+    assert not (ws / ".omp").exists()
+    r = _cli(tree, ws, home, "--omp-mode", "copy", "--no-substrate", "--allow-shadowed-copy")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (ws / ".omp" / "skills" / skill / "SKILL.md").is_file()
+
+
+def test_allow_shadowed_copy_flag_usage_errors(tree, ws, home):
+    before = _snapshot(tree, ws, home)
+    r = _cli(tree, ws, home, "--allow-shadowed-copy")
+    assert r.returncode == 2, r.stdout + r.stderr
+    r = _cli(tree, ws, home, "--install-workspace", str(ws), "--allow-shadowed-copy", "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "needs --omp-mode copy" in (r.stdout + r.stderr)
+    assert _snapshot(tree, ws, home) == before

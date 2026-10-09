@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 
-from .envelope import real_key_configured
+from .envelope import insecure_dev_key, real_key_configured
 from .errors import SwarmError, ErrorCode
 from .paths import swarm_dir
 from .gates import validate_verdict
@@ -55,6 +55,8 @@ LEGAL_TRANSITIONS: dict[TaskState, set[TaskState]] = {
 }
 MAX_REWORK_LOOPS = 2
 SATISFIED_STATES = {S.IN_REVIEW.value, S.APPROVED.value, S.DONE.value}
+# A gate task in one of these states had its result accepted by apply_result (never refused, FAILED or BLOCKED).
+ACCEPTED_ISSUER_STATES = frozenset({S.IN_REVIEW.value, S.APPROVED.value, S.DONE.value})
 DEFAULT_MAX_ATTEMPTS = 3
 GATES_BY_RISK = {"low": ["review"], "medium": ["review", "quality"],
                  "high": ["review", "quality", "security", "release"]}
@@ -216,15 +218,27 @@ class TaskStore:
             extra = {}
             if to_state is S.CHANGES_REQUESTED:
                 loops = task["rework_loops"] + 1
+                notes = task["notes_json"]
+                # T-06-10: the next dispatch replaces notes result/meta and reuses the same attempt
+                # number, so stash this attempt's failing evidence before rework supersedes it. One
+                # entry per rework loop, bounded by MAX_REWORK_LOOPS. Inside this transaction, so the
+                # stash commits or rolls back with the state change itself.
+                prior = {k: notes[k] for k in ("result", "meta") if notes.get(k)}
+                if prior:
+                    history = notes.get("rework_evidence")
+                    if not isinstance(history, list):
+                        history = notes["rework_evidence"] = []
+                    history.append(prior)
                 if loops > MAX_REWORK_LOOPS:
                     to_state, reason = S.ESCALATED, f"rework loops exhausted ({loops-1}); {reason}"
+                    if prior:
+                        extra["notes"] = json.dumps(notes)
                     if S.ESCALATED not in LEGAL_TRANSITIONS[from_state]:
                         # IN_REVIEW → CHANGES_REQUESTED → ESCALATED in one audited step
                         self._apply(task_id, from_state, S.CHANGES_REQUESTED, actor, "rework cap reached")
                         from_state = S.CHANGES_REQUESTED
                 else:
                     extra["rework_loops"] = loops
-                    notes = task["notes_json"]
                     notes["verdicts_since"] = time.time() + 0.001
                     extra["notes"] = json.dumps(notes)
             if to_state in (S.CLAIMED,) and from_state in (S.PLANNED, S.RETRY, S.BLOCKED):
@@ -236,10 +250,18 @@ class TaskStore:
                 if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
                     raise SwarmError(ErrorCode.E_POLICY,
                                      "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
+                if not real_key_configured() and insecure_dev_key() is None:
+                    raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured", task_id=task_id)
                 missing = self.missing_gates(task_id)
                 if missing:
                     raise SwarmError(ErrorCode.E_POLICY,
                                      f"fail-closed: {task_id} lacks passing gates {missing}", task_id=task_id)
+                # T-05-31: every path (reconcile, `orch_status --transition`, the runner) applies the issuer rule, not
+                # only reconcile: a passing row whose gate task's result was never accepted approves nothing
+                unaccepted = self.unaccepted_gates(task_id)
+                if unaccepted:
+                    raise SwarmError(ErrorCode.E_POLICY,
+                                     f"fail-closed: {task_id} has unaccepted gates {sorted(unaccepted)}", task_id=task_id)
             self._apply(task_id, from_state, to_state, actor, reason, **extra)
         return self.get(task_id)
 
@@ -332,13 +354,13 @@ class TaskStore:
             return "mismatch"
         if p.get("dry_run") and not task["notes_json"].get("dry_run"):
             return "dry-run"
-        if p["verdict"] not in ("pass", "waive"):
-            return "fail"
         try:
             if not float(p["issued_at"]) + float(p["expires_s"]) > now:
                 return "expired"
         except (KeyError, TypeError, ValueError):
             return "mismatch"
+        if p["verdict"] not in ("pass", "waive"):
+            return "fail"
         return "ok"
 
     def missing_gate_reasons(self, task_id: str) -> dict[str, str]:
@@ -355,6 +377,29 @@ class TaskStore:
 
     def missing_gates(self, task_id: str) -> list[str]:
         return list(self.missing_gate_reasons(task_id))
+
+    def unaccepted_gates(self, task_id: str, reasons: dict[str, str] | None = None) -> dict[str, str]:
+        """T-05-11/T-05-31: required gates of `task_id` whose current row passes (a gate in `reasons`, default
+        missing_gate_reasons, is already reported as missing and skipped) but was recorded by a gate task (the signed
+        `gate_task`) whose result has not been accepted: leased, refused (review verdict mismatch), FAILED, BLOCKED, RETRY,
+        ESCALATED or CANCELLED. → {gate: "unaccepted"}. Such a row may be contradicted by its own gate agent, so it never
+        approves the target. A row with no `gate_task` (written outside a gate task) counts as accepted; an unreadable
+        envelope or a gate task that does not exist fails closed."""
+        if reasons is None:
+            reasons = self.missing_gate_reasons(task_id)
+        latest = self.latest_verdicts(task_id)
+        out = {}
+        for g in self.required_gates(task_id):
+            if g in reasons or g not in latest:
+                continue
+            try:
+                issuer = validate_verdict(json.loads(latest[g]["envelope_json"])).get("gate_task")
+                accepted = issuer is None or self.get(issuer)["state"] in ACCEPTED_ISSUER_STATES
+            except Exception:  # noqa: BLE001 - any unreadable envelope or unknown issuer is untrusted
+                accepted = False
+            if not accepted:
+                out[g] = "unaccepted"
+        return out
 
     def gate_verdict_since(self, target: str, *, gate: str, gate_task_id: str, since: float) -> bool:
         """True when a `gate` row on `target` holds a verifying signed envelope for that gate and target that

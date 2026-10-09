@@ -36,6 +36,7 @@ install wired the substrate MCP entry into <repo> (swarm/workspace.py, docs/subs
   python3 scripts/swarm_run.py --once --max-parallel 3  # a single scheduling round
 """
 from __future__ import annotations
+import codecs
 import json
 import os
 import re
@@ -68,7 +69,12 @@ from swarm import memory as swarm_memory, substrate_client, substrate_handoff, s
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
 # three; it performs every APPROVED transition and the recorded gate run.
-AGENT_SESSION_STRIPPED = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+# SWARM_TASK_ID and SWARM_CORRELATION_ID are the runner's own defaults for script flags. A child that
+# inherits them binds its gate scripts to the parent's task (T-06-19).
+AGENT_SESSION_STRIPPED = (
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY",
+    "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+)
 
 
 def upstream_context(store: TaskStore, task: dict) -> str:
@@ -150,6 +156,21 @@ Swarm runtime lives at {ROOT} (scripts: `python3 {ROOT}/scripts/<script>.py --ro
 {gate_note}{rework}
 
 Execute the task per your agent instructions and finish with your summary and the single ```json result block."""
+
+
+def preflight_signing() -> None:
+    """Refuse before any task is claimed when task.assign cannot be signed.
+
+    Same messages as sign_envelope. A REQUIRE_KEY or unloadable-Ed25519 misconfiguration
+    is reported first; otherwise a keyless run raises ``fail-closed: no signing key configured``.
+    ``--dry-run`` signs task.assign too, so it takes the same check. Nothing here claims a task.
+    """
+    from swarm.envelope import insecure_dev_key, real_key_configured, signing_config_error
+    err = signing_config_error()
+    if err:
+        raise SwarmError(ErrorCode.E_POLICY, err)
+    if not real_key_configured() and insecure_dev_key() is None:
+        raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured")
 
 
 def preflight_auth(claude_bin: str) -> None:
@@ -457,9 +478,11 @@ class ChildGroup:
     lease keeper's handle: SIGTERM the group and SIGKILL what is left STOP_GRACE_S later. `close()` forgets the group only
     once every process in a stopped group has exited, so a stopped session leaves no tool running (LEASE-06)."""
 
-    def __init__(self, cmd: list[str], *, cwd, env: dict, stdin=subprocess.PIPE):
-        self.proc = subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                     cwd=cwd, env=env, start_new_session=True)
+    def __init__(self, cmd: list[str], *, cwd, env: dict, stdin=subprocess.PIPE, text: bool = True):
+        # text streams are block-buffered, so a short stderr line is invisible until the child exits. The agent
+        # session is read unbuffered (text=False) so an extension-load failure can stop it while it is still running.
+        self.proc = subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text,
+                                     bufsize=-1 if text else 0, cwd=cwd, env=env, start_new_session=True)
         self.pgid = self.proc.pid
         self.stopped: list[str] = []
         self._lock = threading.Lock()
@@ -473,17 +496,35 @@ class ChildGroup:
             self.stop("E-TIMEOUT: runner shutdown", grace=0)
 
     def stop(self, reason: str, *, grace: float | None = None) -> None:
-        grace = STOP_GRACE_S if grace is None else grace
+        """Lease keeper / runner shutdown: record `reason` (so the result is never applied) and end the group."""
         with self._lock:
             self.stopped.append(reason)
-            if self._deadline is not None or self._closed:  # already stopping, or already gone and forgotten
-                return
-            self._deadline = time.monotonic() + grace
-            kill_group(self.pgid, signal.SIGTERM)
-            # a process that ignores SIGTERM is killed after the grace even when it no longer holds the child's pipes
-            self._killer = threading.Timer(grace, kill_group, (self.pgid, signal.SIGKILL))
-            self._killer.daemon = True
-            self._killer.start()
+            self._kill_locked(grace)
+
+    def kill(self, grace: float | None = None) -> None:
+        """End the group without recording a lease stop. The runner classifies the result itself (task timeout, an
+        extension that failed to load). A second call, or one after `close`, does not restart the grace. `grace=0`
+        while a stop is already in progress SIGKILLs now: the timer's backstop must not no-op."""
+        with self._lock:
+            self._kill_locked(grace)
+
+    def _kill_locked(self, grace: float | None) -> None:
+        grace = STOP_GRACE_S if grace is None else grace
+        if self._closed:
+            return
+        if self._deadline is not None:
+            if grace == 0:
+                kill_group(self.pgid, signal.SIGKILL)
+            return
+        self._deadline = time.monotonic() + grace
+        kill_group(self.pgid, signal.SIGTERM)
+        if grace == 0:
+            kill_group(self.pgid, signal.SIGKILL)
+            return
+        # a process that ignores SIGTERM is killed after the grace even when it no longer holds the child's pipes
+        self._killer = threading.Timer(grace, kill_group, (self.pgid, signal.SIGKILL))
+        self._killer.daemon = True
+        self._killer.start()
 
     def close(self) -> None:
         """After the leader has been reaped: wait out a stopped group (SIGKILL at the grace), then forget it."""
@@ -501,8 +542,78 @@ class ChildGroup:
 
 
 # omp 18.3.1 `-e`: a package that fails to load is only this stderr line (main.ts formatExtensionLoadNotifications),
-# rc 0, and the session runs on without it — for ours, without the swarm guard, in yolo (T-06-06)
+# rc 0, and the session runs on without it — for ours, without the swarm guard, in yolo (T-06-06).
+# T-06-27: the runner watches stderr while the session runs and stops the group on this line, before the unguarded
+# session does any work. The pattern matches a line that has not been newline-terminated yet, so a chunk that ends
+# on the message is enough; a match split across reads still hits once both halves are in the window.
 OMP_EXTENSION_LOAD_ERROR = re.compile(r"^(?:\x1b\[[0-9;]*m)*(Failed to load extension .*?)(?:\x1b\[[0-9;]*m)*$", re.M)
+STRANDED_STALE_S = 6 * 3600  # a legacy IN_PROGRESS row with notes.running but no deadline, older than this, is stranded
+RUNNING_DEADLINE_GRACE_S = 30  # past --task-timeout: the live runner's own SIGTERM window, so a peer does not steal it
+
+
+class StderrScan:
+    """Find one omp extension-load failure in a stderr stream that arrives in pieces."""
+
+    def __init__(self, pattern: re.Pattern[str] = OMP_EXTENSION_LOAD_ERROR, window: int = 8192):
+        self._pattern = pattern
+        self._window = window
+        self._buf = ""
+        self._message: str | None = None
+        self._lock = threading.Lock()
+        self.hit = threading.Event()
+
+    @property
+    def message(self) -> str | None:
+        with self._lock:
+            return self._message
+
+    def feed(self, chunk: str) -> str | None:
+        with self._lock:
+            if self._message is not None or not chunk:
+                return self._message
+            self._buf = (self._buf + chunk)[-self._window:]
+            found = self._pattern.search(self._buf)
+            if found:
+                self._message = found.group(1)[:500]
+                self.hit.set()
+            return self._message
+
+
+def _write_stdin(proc: subprocess.Popen, prompt: str) -> None:
+    """stdin is the unbuffered binary pipe of an agent session."""
+    try:
+        if prompt and proc.stdin is not None:
+            proc.stdin.write(prompt.encode())
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except (BrokenPipeError, ValueError, OSError):
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, ValueError, OSError):
+                pass
+
+
+def _drain(stream, parts: list[str], scan: StderrScan | None) -> None:
+    """Read an unbuffered binary pipe and append decoded text as it arrives, not when the child exits."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            if text:
+                parts.append(text)
+                if scan is not None:
+                    scan.feed(text)
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            parts.append(tail)
+            if scan is not None:
+                scan.feed(tail)
+    except (ValueError, OSError):
+        pass
 
 
 def session_output(runtime: str, stdout: str, stderr: str, returncode) -> tuple[str, dict]:
@@ -528,28 +639,82 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
     """Run one agent session. `on_session(stop)` is called once the session is spawned and `on_session(None)` once it
     has ended; `stop(reason)` ends the session's process group and makes this raise LeaseStopped (the lease keeper's
     handle on a session whose node the runner no longer holds). A stopped session returns only once its whole process
-    group is gone."""
+    group is gone. The leader exiting is not the end of the session: a tool child can keep the pipes open, so the
+    drains are waited out until they finish or the task deadline. A deadline that arrives with a drain still blocked
+    is a timeout, and close reaps the group because that kill set a deadline."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
     try:
         # own session: a timeout kills the whole group, omp's tool processes and MCP servers included (WR-04)
-        group = ChildGroup(cmd, cwd=cwd, env=env)
+        group = ChildGroup(cmd, cwd=cwd, env=env, text=False)
     except OSError as e:
         raise SwarmError(ErrorCode.E_DEP, f"cannot spawn {cmd[0]} ({e.strerror or e})") from e
     proc = group.proc
+    out_parts: list[str] = []
+    err_parts: list[str] = []
+    # omp only: a load failure is a stderr line while the session keeps going. Read it as it arrives and stop the
+    # group then, so the unguarded session does not get as far as a tool call (T-06-27).
+    scan = StderrScan() if runtime == "omp" else None
+    pumps = [
+        threading.Thread(target=_write_stdin, args=(proc, prompt), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stdout, out_parts, None), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err_parts, scan), daemon=True),
+    ]
+    timed_out = False
+    drains = pumps[1:]  # stdout and stderr; the leader's exit does not finish either while a tool holds the pipe
     try:
         if on_session is not None:
             on_session(group.stop)
+        for pump in pumps:
+            pump.start()
+        deadline = time.monotonic() + args.task_timeout
+        while True:
+            if scan is not None and scan.hit.is_set():
+                group.kill()  # not stop(): this is not a lost lease, and the result is refused as E-DEP below
+                break
+            if group.stopped:  # the lease keeper already signalled the group
+                break
+            leader_done = proc.poll() is not None
+            drains_done = not any(pump.is_alive() for pump in drains)
+            # A tool that outlived the leader still holds the pipes. Wait for both drains, and if the task deadline
+            # arrives first, kill the group so close() reaps it instead of forgetting a live child.
+            if time.monotonic() >= deadline and not (leader_done and drains_done):
+                timed_out = True
+                group.kill()
+                break
+            if leader_done and drains_done:
+                break
+            if scan is not None:
+                scan.hit.wait(0.05)
+            else:
+                time.sleep(0.05)
         try:
-            out, err = proc.communicate(prompt, timeout=args.task_timeout)
+            proc.wait(timeout=STOP_GRACE_S + 2)
         except subprocess.TimeoutExpired:
-            text, meta = session_output(runtime, *reap_group(proc), proc.returncode)
-            raise AgentTimeout(cmd, args.task_timeout, text, {**meta, "timed_out": True}) from None
+            group.kill(grace=0)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
     finally:
+        for pump in pumps:
+            if pump.ident is not None:  # join() raises on a thread that was never started
+                pump.join(timeout=STOP_GRACE_S + 2)
         if on_session is not None:
             on_session(None)
         group.close()
+    out, err = "".join(out_parts), "".join(err_parts)
+    # T-06-10: the live path records the producing runtime and argv like --dry-run does, so a stored
+    # result names what produced it. Last so a session payload can never clobber the runner's own keys.
+    live = {"runtime": runtime, "argv": cmd}
+    if timed_out:
+        text, meta = session_output(runtime, out, err, proc.returncode)
+        raise AgentTimeout(cmd, args.task_timeout, text, {**meta, **live, "timed_out": True})
     text, meta = session_output(runtime, out, err, proc.returncode)
+    meta = {**meta, **live}
+    if scan is not None and scan.message:
+        meta.setdefault("extension_error", scan.message)
+        meta["is_error"] = True
     if group.stopped:  # a result finished under a lease the runner no longer holds is never applied
         raise LeaseStopped(group.stopped[0], text, {**meta, "lease_stopped": group.stopped[0]})
     return text, meta
@@ -645,6 +810,45 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
 FINDINGS_GATES = ("review", "quality", "security")
 
 
+def _evidence_candidates(results: Path, tid: str, attempt: int, suffix: str):
+    """Candidate evidence paths in order: the canonical name first, then `.r<n>` suffixes."""
+    yield results / f"{tid}.a{attempt}{suffix}"
+    n = 1
+    while True:
+        yield results / f"{tid}.a{attempt}.r{n}{suffix}"
+        n += 1
+
+
+def evidence_path(sdir, tid: str, attempt: int, suffix: str = ".md") -> Path:
+    """Evidence path that never overwrites: `results/<tid>.a<attempt><suffix>` on first write,
+    `results/<tid>.a<attempt>.r<n><suffix>` once a same-attempt redispatch finds it taken, so the
+    prior attempt's file stays readable (T-06-10). No reader depends on the exact name: post-mortem
+    and debug tooling list the directory. Single-threaded probe only: concurrent writers MUST use
+    write_evidence, which reserves the path with O_EXCL instead of check-then-write."""
+    results = Path(sdir) / "results"
+    for path in _evidence_candidates(results, tid, attempt, suffix):
+        if not path.exists():
+            return path
+    raise AssertionError("unreachable")
+
+
+def write_evidence(sdir, tid: str, attempt: int, text: str | None, suffix: str = ".md") -> Path:
+    """Atomically reserve a fresh evidence path and write through the reserving handle, so two
+    runners on the same IN_PROGRESS rework task (same attempt) never share a path: the loser of
+    the O_EXCL race takes the next suffix. Uncontended writes keep the canonical name."""
+    results = Path(sdir) / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    for path in _evidence_candidates(results, tid, attempt, suffix):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text or "")
+        return path
+    raise AssertionError("unreachable")
+
+
 def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     """Review, quality and security gates: write {target: [findings]} — what the agent reported under verdicts{}
     for each gate_for target — to results/<tid>.a<N>.findings.json for the gate script's --per-target-findings, so
@@ -710,8 +914,8 @@ def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     if stray:
         emit("gate.findings.unattributed", {"task_id": task["task_id"], "keys": stray, "applied_to": gate_for,
                                             "findings": len(unattributed)})
-    path = Path(sdir) / "results" / f"{task['task_id']}.a{task['attempt']}.findings.json"
-    path.write_text(json.dumps(per_target, indent=2))
+    path = write_evidence(sdir, task['task_id'], task['attempt'], json.dumps(per_target, indent=2),
+                           ".findings.json")
     return path
 
 
@@ -789,7 +993,16 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         store.transition(tid, S.IN_PROGRESS, reason="lease started")
     # A01 is the only writer of notes.dry_run: dry-run gate rows record and count only on flagged tasks,
     # and a real dispatch clears a flag left by an earlier dry-run
-    store.set_notes(tid, running=time.time(), dry_run=bool(args.dry_run))
+    # running_deadline is wall-clock time a later process can see. While it is in the future the task is live and
+    # another run leaves it alone; once it passes with notes.running still set, the runner that held it is gone
+    # (T-06-26) and recover_stranded fails it so the retry ladder can pick it up.
+    # A gate task spends one task_timeout in the session and a second in run_gate_script. Its deadline covers both,
+    # plus the grace. Every other task is one timeout plus the grace.
+    started = time.time()
+    timeouts = 2 if task["notes_json"].get("gate") else 1
+    store.set_notes(tid, running=started,
+                    running_deadline=started + timeouts * args.task_timeout + RUNNING_DEADLINE_GRACE_S,
+                    dry_run=bool(args.dry_run))
     # LEASE-06: the keeper watches the whole dispatch, from before the session spawns until its result is written, so
     # a lease lost (or a task moved on elsewhere) at any point stops the session or gate script and rejects the result
     watch = DispatchWatch()
@@ -814,8 +1027,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         else:
             watch.check(text, meta)  # lost before the session spawned: it never starts
             text, meta = run_agent_headless(agent, prompt, repo, args, on_session=watch.attach)
-        (sdir / "results").mkdir(parents=True, exist_ok=True)
-        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        write_evidence(sdir, tid, task['attempt'], text or "")
         result, err = None, None
         try:
             result = validate_result(parse_result(text), task_id=tid)
@@ -823,6 +1035,9 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
             err = e
         if meta.get("yield_error"):  # D-02: an error yield is E-CONTRACT, whatever json the text carries (WR-02)
             result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent yielded an error: {meta['yield_error']}"[:500],
+                                           task_id=tid)
+        elif meta.get("is_error") or meta.get("returncode"):
+            result, err = None, SwarmError(ErrorCode.E_CONTRACT, f"agent session reported error (rc={meta.get('returncode')})",
                                            task_id=tid)
         if meta.get("extension_error"):  # T-06-06: an unguarded session's result is never applied, nor its gate recorded
             result, err = None, SwarmError(ErrorCode.E_DEP, "omp ran the session without the swarm guard: "
@@ -839,14 +1054,13 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         raw_recorded = True
         with watch.applying(text, meta):
             if result is None:
-                outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
+                outcome = reject(store, tid, attempt=task["attempt"], reason=str(err), mode="headless", emit=ctx.emit)
             else:
                 outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit,
                                        mode="headless")
     except AgentTimeout as e:
         # WR-04: keep what the session wrote before its process group was killed
-        (sdir / "results").mkdir(parents=True, exist_ok=True)
-        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(e.text or "")
+        write_evidence(sdir, tid, task['attempt'], e.text or "")
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": e.meta})
         store.set_notes(tid, meta=e.meta)
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
@@ -855,8 +1069,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         # LEASE-06: the substrate says another session (or nobody) holds the node, or the task moved on elsewhere, so
         # this result is never applied, whether the stop came during the session, the gate script or before the write
         text, meta = e.text or text, {**meta, **e.meta}
-        (sdir / "results").mkdir(parents=True, exist_ok=True)
-        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        write_evidence(sdir, tid, task['attempt'], text or "")
         if not raw_recorded:
             ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)
@@ -875,7 +1088,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
     finally:
         if leases is not None:
             leases.watch(tid, None)
-        store.set_notes(tid, running=None)
+        store.set_notes(tid, running=None, running_deadline=None)
     return tid, agent["id"], outcome
 
 
@@ -895,6 +1108,75 @@ def handoff_bridge(store_path: Path, corr: str, repo: Path, ctx, leases):
     if leases is None:
         return None
     return substrate_handoff.HandoffBridge(store_path, corr, root=repo, emit=ctx.emit, env=leases.env, leases=leases)
+
+
+def _running_mark(notes: dict, key: str):
+    """A wall-clock mark written by set_notes, or None. Bool is an int and is never a timestamp."""
+    value = notes.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _expired_running(notes: dict, now: float, stale_s: float) -> tuple[float, float | None] | None:
+    """`(running, deadline)` when that mark is stranded at `now`, else None.
+
+    A `running_deadline` still in the future is a live session. A legacy row with `running` and no deadline is
+    stranded only once the mark is `stale_s` old. A cleared running mark is not stranded."""
+    running = _running_mark(notes, "running")
+    if running is None:
+        return None
+    deadline = _running_mark(notes, "running_deadline")
+    if deadline is not None:
+        if deadline > now:
+            return None
+    elif now - running < stale_s:
+        return None
+    return running, deadline
+
+
+def recover_stranded(store: TaskStore, corr: str, *, now: float | None = None, stale_s: float = STRANDED_STALE_S,
+                     emit=None) -> list[str]:
+    """Fail IN_PROGRESS tasks whose runner died before it could clear notes.running (T-06-26).
+
+    A task with `running_deadline` still in the future is a live session and is left alone. A legacy row that has
+    `running` but no deadline is stranded only once that mark is `stale_s` old (6 h), so a long session started by a
+    runner from before this field existed is not failed on the next kick. Anything else in IN_PROGRESS — rework, which
+    has no running mark — is not this function's business. The FAILED row is retryable: dispatchable's ladder applies
+    on this same run when attempts remain.
+
+    The list is a candidate set. Fail and clear `running` / `running_deadline` in one transaction, and only after a
+    re-read still shows that same IN_PROGRESS attempt with the deadline (or the legacy stale mark) still expired.
+    A peer that already moved the row — FAILED, RETRY, a new attempt, a future deadline, a cleared running mark — is
+    skipped. A SwarmError from the transition skips that row and does not abort the run."""
+    now = time.time() if now is None else now
+    recovered: list[str] = []
+    for task in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
+        if _expired_running(task["notes_json"], now, stale_s) is None:
+            continue
+        tid = task["task_id"]
+        attempt = task["attempt"]
+        try:
+            with store.transaction():
+                current = store.get(tid)
+                expired = _expired_running(current["notes_json"], now, stale_s)
+                if current["state"] != S.IN_PROGRESS.value or current["attempt"] != attempt or expired is None:
+                    continue
+                running, deadline = expired
+                store.transition(tid, S.FAILED,
+                                 reason="E-TIMEOUT: stranded, the runner left it IN_PROGRESS past its deadline")
+                store.set_notes(tid, running=None, running_deadline=None)
+        except SwarmError:
+            continue
+        if emit is not None:
+            emit("task.stranded", {"task_id": tid, "running": running, "running_deadline": deadline})
+        recovered.append(tid)
+    return recovered
+
+
+def _extension_failed(store: TaskStore, tid: str) -> bool:
+    meta = store.get(tid)["notes_json"].get("meta") or {}
+    return bool(isinstance(meta, dict) and meta.get("extension_error"))
 
 
 def run(args, ctx) -> dict:
@@ -931,6 +1213,8 @@ def run(args, ctx) -> dict:
         setattr(args, f"{args.runtime}_bin", binary)
         if args.runtime == "claude":
             preflight_auth(binary)
+    # before lease_bridge and any claim, including --dry-run (it signs task.assign)
+    preflight_signing()
     leases = lease_bridge(args, store_path, corr, repo, ctx)
     handoffs = handoff_bridge(store_path, corr, repo, ctx, leases)
     log, rounds = [], 0
@@ -939,16 +1223,27 @@ def run(args, ctx) -> dict:
     _STOPPING.clear()
     previous = ({s: signal.signal(s, _terminate) for s in _FORWARDED if signal.getsignal(s) is not signal.SIG_IGN}
                 if threading.current_thread() is threading.main_thread() else {})
+    extension_down = False
     try:
         if leases is not None:
             # work an earlier process left in review is held (and beaten) again before reconcile or any gate dispatch
             leases.resume()
             leases.start()
+        if not args.dry_run:
+            # a dry-run must not fail a task a live runner still holds (T-06-26)
+            recovered = recover_stranded(store, corr, emit=ctx.emit)
+            if recovered:
+                log.append(f"recovered stranded: {recovered}")
         while True:
             rounds += 1
             log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
             if handoffs is not None:
                 handoffs.flush()  # what the substrate did not take last round
+            if extension_down:
+                # the package did not load, so every further session this run would be unguarded (T-06-27).
+                # Checked before dispatchable, which would otherwise retry the FAILED task at once.
+                log.append("stopped: omp extension failed to load; no further sessions this run")
+                break
             ready = dispatchable(store, corr, ctx.emit, handoffs=handoffs)
             if not ready:
                 remaining = [t for t in store.list(correlation_id=corr) if t["state"] not in (S.DONE.value, S.CANCELLED.value, S.ESCALATED.value)]
@@ -966,6 +1261,8 @@ def run(args, ctx) -> dict:
                         tid, aid, outcome = f.result()
                         log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
                         print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
+                        if _extension_failed(store, tid):
+                            extension_down = True
                 except BaseException:  # Ctrl-C, SIGTERM, SIGHUP: sessions run in their own session, so it missed them
                     kill_sessions()
                     raise

@@ -9,6 +9,8 @@ from pathlib import Path
 from conftest import ROOT, omp_calls, run_script, stub_omp
 
 KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+# T-06-19: the dry-run line also unsets the runner's task and correlation ids, matching the live child env.
+SESSION_UNSET = (*KEY_VARS, "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
 _ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
               "SWARM_DRYRUN_FAIL", "SWARM_RUNTIME", "ANTHROPIC_API_KEY")
 KEYS = {"SWARM_SIGNING_KEY": "runner-secret", "SWARM_ED25519_KEY": "11" * 32, "SWARM_REQUIRE_KEY": "1"}
@@ -66,7 +68,7 @@ def test_dry_run_invocation_matches_live_omp_call(tmp_path):
 
     assert argv == call["argv"]
     assert {k: call["env"].get(k) for k in deltas} == deltas
-    assert sorted(unset) == sorted(KEY_VARS)
+    assert sorted(unset) == sorted(SESSION_UNSET)
     assert not set(unset) & set(call["env"])  # the runner had them all; the child has none
     assert Path(argv[argv.index("--cwd") + 1]).resolve() == Path(call["cwd"]).resolve() == work_b.resolve()
     assert Path(stdin) == b / ".swarm" / "assignments" / "T-one.a1.md"

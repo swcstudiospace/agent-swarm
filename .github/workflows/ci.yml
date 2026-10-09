@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -17,7 +18,9 @@ jobs:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
       - name: install pytest
-        run: python3 -m pip install pytest
+        run: python3 -m pip install pytest ruff
+      - name: ruff
+        run: ruff check .
       - name: pytest
         run: python3 -m pytest
       - name: build_agents check

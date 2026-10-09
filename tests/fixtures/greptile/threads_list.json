@@ -1,0 +1,286 @@
+[
+  {
+    "id": "PRRT_A",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "scripts/build_agents.py",
+    "line": 508,
+    "originalLine": 508,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228621598,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P1\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9\" align=\"top\"></a> **Installed skills use wrong paths**\n\nThe lane skills tell the agent to read `prompts/...` and run `python3 scripts/<script>.py --json` from the target tree, but the installer ships only `grokbot/`. The dispatch skill explicitly says programming-desk does not contain the swarm runtime. The lane therefore cannot find its files or may run unrelated target scripts.\n\nUse the pinned `SWARM_ROOT` for prompts and scripts, and pass `--root` for the target repo.\n\n**Knowledge Base Used:**\n- [Agent artifact generation](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-artifact-generation.md)\n- [Agent roles and skills](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-roles-and-skills.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/build_agents.py\nLine: 508\n\nComment:\n**Installed skills use wrong paths**\n\nThe lane skills tell the agent to read `prompts/...` and run `python3 scripts/<script>.py --json` from the target tree, but the installer ships only `grokbot/`. The dispatch skill explicitly says programming-desk does not contain the swarm runtime. The lane therefore cannot find its files or may run unrelated target scripts.\n\nUse the pinned `SWARM_ROOT` for prompts and scripts, and pass `--root` for the target repo.\n\n**Knowledge Base Used:**\n- [Agent artifact generation](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-artifact-generation.md)\n- [Agent roles and skills](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-roles-and-skills.md)\n\n---\n\nFor each issue above, determine whether it is valid and should be fixed. If so, fix it directly.\n`````\n</details>\n\n<a href=\"https://app.greptile.com/ide/claude-code?prompt=This%20is%20a%20comment%20left%20during%20a%20code%20review.%0APath%3A%20scripts%2Fbuild_agents.py%0ALine%3A%20508%0A%0AComment%3A%0A**Installed%20skills%20use%20wrong%20paths**%0A%0AThe%20lane%20skills%20tell%20the%20agent%20to%20read%20%60prompts%2F...%60%20and%20run%20%60python3%20scripts%2F%3Cscript%3E.py%20--json%60%20from%20the%20target%20tree%2C%20but%20the%20installer%20ships%20only%20%60grokbot%2F%60.%20The%20dispatch%20skill%20explicitly%20says%20programming-desk%20does%20not%20contain%20the%20swarm%20runtime.%20The%20lane%20therefore%20cannot%20find%20its%20files%20or%20may%20run%20unrelated%20target%20scripts.%0A%0AUse%20the%20pinned%20%60SWARM_ROOT%60%20for%20prompts%20and%20scripts%2C%20and%20pass%20%60--root%60%20for%20the%20target%20repo.%0A%0A**Knowledge%20Base%20Used%3A**%0A-%20%5BAgent%20artifact%20generation%5D%28https%3A%2F%2Fapp.greptile.com%2Fswcstudio%2F-%2Fcustom-context%2Fknowledge-base%2Fswcstudiospace%2Fagent-swarm%2F-%2Fdocs%2Fagent-artifact-generation.md%29%0A-%20%5BAgent%20roles%20and%20skills%5D%28https%3A%2F%2Fapp.greptile.com%2Fswcstudio%2F-%2Fcustom-context%2Fknowledge-base%2Fswcstudiospace%2Fagent-swarm%2F-%2Fdocs%2Fagent-roles-and-skills.md%29%0A%0A---%0A%0AFor%20each%20issue%20above%2C%20determine%20whether%20it%20is%20valid%20and%20should%20be%20fixed.%20If%20so%2C%20fix%20it%20directly.&repo=swcstudiospace%2Fagent-swarm&pr=19&platform=github\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaudeDark.svg?v=7\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"><img alt=\"Fix in Claude Code\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"></picture></a>",
+          "createdAt": "2026-10-09T09:23:54Z"
+        },
+        {
+          "databaseId": 4228714195,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. Lane skills now read `$SWARM_ROOT/<prompt>` and run `python3 \"$SWARM_ROOT/scripts/<script>.py\" --root <target repo> --json` (the bun twin uses the same root and `--root`). The target tree is not used as the script location.",
+          "createdAt": "2026-10-09T09:35:18Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_B",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "scripts/_install_grokbot.py",
+    "line": 116,
+    "originalLine": 97,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228621605,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P1\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9\" align=\"top\"></a> **Missing exports delete working skills**\n\n`export_sources` silently accepts a missing lane skill because it collects only files that exist. After a complete install, deleting `swarm-code/SKILL.md` from the source makes the next install delete its unchanged target copy and remove it from the stamp, even though the seat map still declares the `code` lane.\n\nRequire a skill for every lane declared in the seat map before planning writes or removals. Greptile automatically discovered a related ticket stating that the export must include a skill for each lane, which informed this comment.\n\n**Knowledge Base Used:** [Agent artifact generation](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-artifact-generation.md)\n\n**Source Used:** Linear — [\\[n6\\] B5: generate and test the Grok Bot seat map](https://linear.app/swcstudio/issue/SPE-8535/n6-b5-generate-and-test-the-grok-bot-seat-map)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/_install_grokbot.py\nLine: 90-97\n\nComment:\n**Missing exports delete working skills**\n\n`export_sources` silently accepts a missing lane skill because it collects only files that exist. After a complete install, deleting `swarm-code/SKILL.md` from the source makes the next install delete its unchanged target copy and remove it from the stamp, even though the seat map still declares the `code` lane.\n\nRequire a skill for every lane declared in the seat map before planning writes or removals. Greptile automatically discovered a related ticket stating that the export must include a skill for each lane, which informed this comment.\n\n**Knowledge Base Used:** [Agent artifact generation](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-artifact-generation.md)\n\n**Source Used:** Linear — [\\[n6\\] B5: generate and test the Grok Bot seat map](https://linear.app/swcstudio/issue/SPE-8535/n6-b5-generate-and-test-the-grok-bot-seat-map)\n\n---\n\nFor each issue above, determine whether it is valid and should be fixed. If so, fix it directly.\n`````\n</details>\n\n<a href=\"https://app.greptile.com/ide/claude-code?prompt=This%20is%20a%20comment%20left%20during%20a%20code%20review.%0APath%3A%20scripts%2F_install_grokbot.py%0ALine%3A%2090-97%0A%0AComment%3A%0A**Missing%20exports%20delete%20working%20skills**%0A%0A%60export_sources%60%20silently%20accepts%20a%20missing%20lane%20skill%20because%20it%20collects%20only%20files%20that%20exist.%20After%20a%20complete%20install%2C%20deleting%20%60swarm-code%2FSKILL.md%60%20from%20the%20source%20makes%20the%20next%20install%20delete%20its%20unchanged%20target%20copy%20and%20remove%20it%20from%20the%20stamp%2C%20even%20though%20the%20seat%20map%20still%20declares%20the%20%60code%60%20lane.%0A%0ARequire%20a%20skill%20for%20every%20lane%20declared%20in%20the%20seat%20map%20before%20planning%20writes%20or%20removals.%20Greptile%20automatically%20discovered%20a%20related%20ticket%20stating%20that%20the%20export%20must%20include%20a%20skill%20for%20each%20lane%2C%20which%20informed%20this%20comment.%0A%0A**Knowledge%20Base%20Used%3A**%20%5BAgent%20artifact%20generation%5D%28https%3A%2F%2Fapp.greptile.com%2Fswcstudio%2F-%2Fcustom-context%2Fknowledge-base%2Fswcstudiospace%2Fagent-swarm%2F-%2Fdocs%2Fagent-artifact-generation.md%29%0A%0A**Source%20Used%3A**%20Linear%20%E2%80%94%20%5B%5C%5Bn6%5C%5D%20B5%3A%20generate%20and%20test%20the%20Grok%20Bot%20seat%20map%5D%28https%3A%2F%2Flinear.app%2Fswcstudio%2Fissue%2FSPE-8535%2Fn6-b5-generate-and-test-the-grok-bot-seat-map%29%0A%0A---%0A%0AFor%20each%20issue%20above%2C%20determine%20whether%20it%20is%20valid%20and%20should%20be%20fixed.%20If%20so%2C%20fix%20it%20directly.&repo=swcstudiospace%2Fagent-swarm&pr=19&platform=github\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaudeDark.svg?v=7\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"><img alt=\"Fix in Claude Code\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"></picture></a>",
+          "createdAt": "2026-10-09T09:23:54Z"
+        },
+        {
+          "databaseId": 4228714202,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. `export_sources` requires a skill for every lane named in the seat map before it plans writes or removals. `test_installer_refuses_a_source_missing_a_declared_lane` drops `swarm-code/SKILL.md` from an otherwise complete source and checks that the installed copy and stamp stay unchanged.",
+          "createdAt": "2026-10-09T09:35:18Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_C",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "scripts/build_agents.py",
+    "line": null,
+    "originalLine": 442,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228621612,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Runner routes to wrong seats**\n\nFiltering `_RUNNER_SCRIPTS` here removes `scripts/swarm_run.py` and its TypeScript twin from A01's `path_globs`. The broad language globs then send the Python file to A05 and the TypeScript file to A06, rather than the orchestrator seat described by the comment above.\n\nKeep the execution filter in `_lane_skill`, but include both owned paths in `_script_globs`.\n\n```suggestion\n\n```\n\n**Knowledge Base Used:** [Agent roles and skills](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-roles-and-skills.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/build_agents.py\nLine: 441-442\n\nComment:\n**Runner routes to wrong seats**\n\nFiltering `_RUNNER_SCRIPTS` here removes `scripts/swarm_run.py` and its TypeScript twin from A01's `path_globs`. The broad language globs then send the Python file to A05 and the TypeScript file to A06, rather than the orchestrator seat described by the comment above.\n\nKeep the execution filter in `_lane_skill`, but include both owned paths in `_script_globs`.\n\n```suggestion\n\n```\n\n**Knowledge Base Used:** [Agent roles and skills](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-roles-and-skills.md)\n\n---\n\nFor each issue above, determine whether it is valid and should be fixed. If so, fix it directly.\n`````\n</details>\n\n<a href=\"https://app.greptile.com/ide/claude-code?prompt=This%20is%20a%20comment%20left%20during%20a%20code%20review.%0APath%3A%20scripts%2Fbuild_agents.py%0ALine%3A%20441-442%0A%0AComment%3A%0A**Runner%20routes%20to%20wrong%20seats**%0A%0AFiltering%20%60_RUNNER_SCRIPTS%60%20here%20removes%20%60scripts%2Fswarm_run.py%60%20and%20its%20TypeScript%20twin%20from%20A01's%20%60path_globs%60.%20The%20broad%20language%20globs%20then%20send%20the%20Python%20file%20to%20A05%20and%20the%20TypeScript%20file%20to%20A06%2C%20rather%20than%20the%20orchestrator%20seat%20described%20by%20the%20comment%20above.%0A%0AKeep%20the%20execution%20filter%20in%20%60_lane_skill%60%2C%20but%20include%20both%20owned%20paths%20in%20%60_script_globs%60.%0A%0A%60%60%60suggestion%0A%0A%60%60%60%0A%0A**Knowledge%20Base%20Used%3A**%20%5BAgent%20roles%20and%20skills%5D%28https%3A%2F%2Fapp.greptile.com%2Fswcstudio%2F-%2Fcustom-context%2Fknowledge-base%2Fswcstudiospace%2Fagent-swarm%2F-%2Fdocs%2Fagent-roles-and-skills.md%29%0A%0A---%0A%0AFor%20each%20issue%20above%2C%20determine%20whether%20it%20is%20valid%20and%20should%20be%20fixed.%20If%20so%2C%20fix%20it%20directly.&repo=swcstudiospace%2Fagent-swarm&pr=19&platform=github\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaudeDark.svg?v=7\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"><img alt=\"Fix in Claude Code\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"></picture></a>",
+          "createdAt": "2026-10-09T09:23:54Z"
+        },
+        {
+          "databaseId": 4228714177,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. `_script_globs` keeps `scripts/swarm_run.py` and `scripts/ts/swarm_run.ts` on A01. `_lane_skill` still omits the runner from the procedure. `resolve_owner` sends both paths to bot-00-programming-lead.",
+          "createdAt": "2026-10-09T09:35:18Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_D",
+    "isResolved": true,
+    "isOutdated": false,
+    "path": "scripts/build_agents.py",
+    "line": 475,
+    "originalLine": 475,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228621629,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Shared scripts have two seats**\n\n“Longest role glob wins” cannot resolve `scripts/code_checks.py` or `scripts/ts/code_checks.ts`. A05 and A06 claim the same literal paths but name different seats and verification tools. Desk Lead cannot use the map alone to choose between them.\n\nChoose one owner for each shared script or define a tie-break, then test these equal-length matches.\n\n**Knowledge Base Used:** [Agent roles and skills](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-roles-and-skills.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/build_agents.py\nLine: 475\n\nComment:\n**Shared scripts have two seats**\n\n“Longest role glob wins” cannot resolve `scripts/code_checks.py` or `scripts/ts/code_checks.ts`. A05 and A06 claim the same literal paths but name different seats and verification tools. Desk Lead cannot use the map alone to choose between them.\n\nChoose one owner for each shared script or define a tie-break, then test these equal-length matches.\n\n**Knowledge Base Used:** [Agent roles and skills](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-roles-and-skills.md)\n\n---\n\nFor each issue above, determine whether it is valid and should be fixed. If so, fix it directly.\n`````\n</details>\n\n<a href=\"https://app.greptile.com/ide/claude-code?prompt=This%20is%20a%20comment%20left%20during%20a%20code%20review.%0APath%3A%20scripts%2Fbuild_agents.py%0ALine%3A%20475%0A%0AComment%3A%0A**Shared%20scripts%20have%20two%20seats**%0A%0A%E2%80%9CLongest%20role%20glob%20wins%E2%80%9D%20cannot%20resolve%20%60scripts%2Fcode_checks.py%60%20or%20%60scripts%2Fts%2Fcode_checks.ts%60.%20A05%20and%20A06%20claim%20the%20same%20literal%20paths%20but%20name%20different%20seats%20and%20verification%20tools.%20Desk%20Lead%20cannot%20use%20the%20map%20alone%20to%20choose%20between%20them.%0A%0AChoose%20one%20owner%20for%20each%20shared%20script%20or%20define%20a%20tie-break%2C%20then%20test%20these%20equal-length%20matches.%0A%0A**Knowledge%20Base%20Used%3A**%20%5BAgent%20roles%20and%20skills%5D%28https%3A%2F%2Fapp.greptile.com%2Fswcstudio%2F-%2Fcustom-context%2Fknowledge-base%2Fswcstudiospace%2Fagent-swarm%2F-%2Fdocs%2Fagent-roles-and-skills.md%29%0A%0A---%0A%0AFor%20each%20issue%20above%2C%20determine%20whether%20it%20is%20valid%20and%20should%20be%20fixed.%20If%20so%2C%20fix%20it%20directly.&repo=swcstudiospace%2Fagent-swarm&pr=19&platform=github\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaudeDark.svg?v=7\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"><img alt=\"Fix in Claude Code\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"></picture></a>",
+          "createdAt": "2026-10-09T09:23:54Z"
+        },
+        {
+          "databaseId": 4228714204,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. Precedence is `routing-before-roles; longest role glob wins; equal length: lowest role id`. A05 and A06 still both list the two literals. `resolve_owner` sends `scripts/code_checks.py` and `scripts/ts/code_checks.ts` to A05 (`bot-01-systems-backend`).",
+          "createdAt": "2026-10-09T09:35:18Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_E",
+    "isResolved": false,
+    "isOutdated": true,
+    "path": "scripts/build_agents.py",
+    "line": null,
+    "originalLine": 861,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228621636,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Rejected builds leave changed files**\n\n`render_grokbot` checks the roster after the other generated files have already been written. If `SWARM_AGENTS_FILE` names a roster that fails the intended 15-role check, the build raises with the Claude, Grok, Cursor and OMP outputs changed but the seat map still old.\n\nCompute and validate `grok_files` before the first write so a rejected roster does not leave a partial build.\n\n**Knowledge Base Used:** [Agent artifact generation](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-artifact-generation.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/build_agents.py\nLine: 861\n\nComment:\n**Rejected builds leave changed files**\n\n`render_grokbot` checks the roster after the other generated files have already been written. If `SWARM_AGENTS_FILE` names a roster that fails the intended 15-role check, the build raises with the Claude, Grok, Cursor and OMP outputs changed but the seat map still old.\n\nCompute and validate `grok_files` before the first write so a rejected roster does not leave a partial build.\n\n**Knowledge Base Used:** [Agent artifact generation](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/agent-artifact-generation.md)\n\n---\n\nFor each issue above, determine whether it is valid and should be fixed. If so, fix it directly.\n`````\n</details>\n\n<a href=\"https://app.greptile.com/ide/claude-code?prompt=This%20is%20a%20comment%20left%20during%20a%20code%20review.%0APath%3A%20scripts%2Fbuild_agents.py%0ALine%3A%20861%0A%0AComment%3A%0A**Rejected%20builds%20leave%20changed%20files**%0A%0A%60render_grokbot%60%20checks%20the%20roster%20after%20the%20other%20generated%20files%20have%20already%20been%20written.%20If%20%60SWARM_AGENTS_FILE%60%20names%20a%20roster%20that%20fails%20the%20intended%2015-role%20check%2C%20the%20build%20raises%20with%20the%20Claude%2C%20Grok%2C%20Cursor%20and%20OMP%20outputs%20changed%20but%20the%20seat%20map%20still%20old.%0A%0ACompute%20and%20validate%20%60grok_files%60%20before%20the%20first%20write%20so%20a%20rejected%20roster%20does%20not%20leave%20a%20partial%20build.%0A%0A**Knowledge%20Base%20Used%3A**%20%5BAgent%20artifact%20generation%5D%28https%3A%2F%2Fapp.greptile.com%2Fswcstudio%2F-%2Fcustom-context%2Fknowledge-base%2Fswcstudiospace%2Fagent-swarm%2F-%2Fdocs%2Fagent-artifact-generation.md%29%0A%0A---%0A%0AFor%20each%20issue%20above%2C%20determine%20whether%20it%20is%20valid%20and%20should%20be%20fixed.%20If%20so%2C%20fix%20it%20directly.&repo=swcstudiospace%2Fagent-swarm&pr=19&platform=github\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaudeDark.svg?v=7\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"><img alt=\"Fix in Claude Code\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"></picture></a>",
+          "createdAt": "2026-10-09T09:23:54Z"
+        },
+        {
+          "databaseId": 4228714203,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. `render_grokbot` runs before the first generated write. `test_rejected_roster_writes_nothing` points `SWARM_AGENTS_FILE` at a 16-role manifest and checks that `.claude`, `.grok`, `.cursor`, `omp`, and `grokbot` stay byte-identical.",
+          "createdAt": "2026-10-09T09:35:18Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_F",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "swarm/taskstore.py",
+    "line": 212,
+    "originalLine": 212,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 9001,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P0\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p0.svg?v=9\" align=\"top\"></a> **Manual APPROVED skips the issuer check**\n\nA manual `--transition APPROVED` bypasses the issuer rule that reconcile applies, so a target can be approved while the gate task that issued its row was refused.\n\nApply the same check inside `TaskStore.transition`.\n\n**Knowledge Base Used:**\n- [Task store](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/task-store.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: swarm/taskstore.py\nLine: 212\n\nComment:\n**Manual APPROVED skips the issuer check**\n\nA manual `--transition APPROVED` bypasses the issuer rule that reconcile applies, so a target can be approved while the gate task that issued its row was refused.\n\nApply the same check inside `TaskStore.transition`.\n`````\n</details>\n",
+          "createdAt": "2026-10-09T09:24:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_G",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "README.md",
+    "line": 12,
+    "originalLine": 12,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 9002,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "Consider documenting why this flag defaults to off.",
+          "createdAt": "2026-10-09T09:24:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_H",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "tests/test_grokbot_export.py",
+    "line": 236,
+    "originalLine": 236,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228714185,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. `--only` now selects lane skills as well as role files. `test_only_leaves_unselected_lanes_untouched` keeps a drifted `swarm-code` skill in place under `--only a01-orchestrator`, and `--check --only a01-orchestrator` does not report that lane.",
+          "createdAt": "2026-10-09T09:35:18Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_I",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "scripts/build_agents.py",
+    "line": 948,
+    "originalLine": 863,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 4228621647,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Selective builds include unrelated lanes**\n\nThis loop ignores `--only`. With `--only a01-orchestrator`, the existing loop skips other roles, but the new loop still regenerates all six Grok Bot lanes. It can rewrite `swarm-code` after an unrelated prompt change, and `--check --only ...` can fail on unrelated lane drift.\n\nApply the selector to lane outputs too and test that unselected lanes stay untouched.\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/build_agents.py\nLine: 862-863\n\nComment:\n**Selective builds include unrelated lanes**\n\nThis loop ignores `--only`. With `--only a01-orchestrator`, the existing loop skips other roles, but the new loop still regenerates all six Grok Bot lanes. It can rewrite `swarm-code` after an unrelated prompt change, and `--check --only ...` can fail on unrelated lane drift.\n\nApply the selector to lane outputs too and test that unselected lanes stay untouched.\n\n---\n\nFor each issue above, determine whether it is valid and should be fixed. If so, fix it directly.\n`````\n</details>\n\n<a href=\"https://app.greptile.com/ide/claude-code?prompt=This%20is%20a%20comment%20left%20during%20a%20code%20review.%0APath%3A%20scripts%2Fbuild_agents.py%0ALine%3A%20862-863%0A%0AComment%3A%0A**Selective%20builds%20include%20unrelated%20lanes**%0A%0AThis%20loop%20ignores%20%60--only%60.%20With%20%60--only%20a01-orchestrator%60%2C%20the%20existing%20loop%20skips%20other%20roles%2C%20but%20the%20new%20loop%20still%20regenerates%20all%20six%20Grok%20Bot%20lanes.%20It%20can%20rewrite%20%60swarm-code%60%20after%20an%20unrelated%20prompt%20change%2C%20and%20%60--check%20--only%20...%60%20can%20fail%20on%20unrelated%20lane%20drift.%0A%0AApply%20the%20selector%20to%20lane%20outputs%20too%20and%20test%20that%20unselected%20lanes%20stay%20untouched.%0A%0A---%0A%0AFor%20each%20issue%20above%2C%20determine%20whether%20it%20is%20valid%20and%20should%20be%20fixed.%20If%20so%2C%20fix%20it%20directly.&repo=swcstudiospace%2Fagent-swarm&pr=19&platform=github\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaudeDark.svg?v=7\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"><img alt=\"Fix in Claude Code\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/FixInClaude.svg?v=7\"></picture></a>",
+          "createdAt": "2026-10-09T09:23:54Z"
+        },
+        {
+          "databaseId": 4228714185,
+          "author": {
+            "login": "cursor"
+          },
+          "body": "Fixed in a60fb36. `--only` now selects lane skills as well as role files. `test_only_leaves_unselected_lanes_untouched` keeps a drifted `swarm-code` skill in place under `--only a01-orchestrator`, and `--check --only a01-orchestrator` does not report that lane.",
+          "createdAt": "2026-10-09T09:35:18Z"
+        },
+        {
+          "databaseId": 9005,
+          "author": {
+            "login": "SomeRandmGuyy"
+          },
+          "body": "Agreed, fixing.",
+          "createdAt": "2026-10-09T09:24:00Z"
+        },
+        {
+          "databaseId": 9006,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "Thanks. Resolved on re-review.",
+          "createdAt": "2026-10-09T09:24:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_J",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": "scripts/swarm_run.py",
+    "line": 40,
+    "originalLine": 40,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 9003,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P3\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p3.svg?v=9\" align=\"top\"></a> **Prefer a named constant**\n\nThe grace period is a bare number here; a named constant would document it.\n\n**Knowledge Base Used:**\n- [Task store](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/task-store.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: scripts/swarm_run.py\nLine: 40\n\nComment:\n**Prefer a named constant**\n\nThe grace period is a bare number here; a named constant would document it.\n`````\n</details>\n",
+          "createdAt": "2026-10-09T09:24:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "PRRT_K",
+    "isResolved": false,
+    "isOutdated": false,
+    "path": null,
+    "line": null,
+    "originalLine": null,
+    "comments": {
+      "nodes": [
+        {
+          "databaseId": 9004,
+          "author": {
+            "login": "greptile-apps"
+          },
+          "body": "<a href=\"#\"><img alt=\"P2\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9\" align=\"top\"></a> **Cross-file naming drift**\n\nThe same option is spelled two ways across the scripts.\n\n**Knowledge Base Used:**\n- [Task store](https://app.greptile.com/swcstudio/-/custom-context/knowledge-base/swcstudiospace/agent-swarm/-/docs/task-store.md)\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nThis is a comment left during a code review.\nPath: None\nLine: None\n\nComment:\n**Cross-file naming drift**\n\nThe same option is spelled two ways across the scripts.\n`````\n</details>\n",
+          "createdAt": "2026-10-09T09:24:00Z"
+        }
+      ]
+    }
+  }
+]

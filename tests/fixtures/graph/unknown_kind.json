@@ -1,0 +1,12 @@
+{
+  "graphId": "ut-mv00tcgl-d8215d3e",
+  "nodes": [
+    {
+      "id": "n1",
+      "kind": "explore",
+      "title": "A kind the fifteen agents do not map",
+      "depends_on": [],
+      "steps": ["Step 1: no owned file"]
+    }
+  ]
+}

@@ -454,26 +454,127 @@ describe("HOOK-02", () => {
     expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
-  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups normalizes well under a second (WR-09)", () => {
-    const big: [string, string[]][] = [
-      [`${"A=1 ".repeat(250_000)}git status`, ["git status"]],
-      [`${"sudo ".repeat(200_000)}git status`, ["git status"]],
-      [`${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
-      [`sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
-      [`${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
-      [`${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
-      [`A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 30_000 }, () => {
+    // Same-size differential per shape: [name, adversarial input, expected for adversarial].
+    // Adversarial keeps the original 1 MB inputs, so full-scale correctness coverage is unchanged.
+    const shapes: [string, string, string[] | undefined][] = [
+      ["assignment prefixes", `${"A=1 ".repeat(250_000)}git status`, ["git status"]],
+      ["sudo stacking", `${"sudo ".repeat(200_000)}git status`, ["git status"]],
+      ["timeout stacking", `${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
+      ["sudo -u flags", `sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
+      ["env stacking", `${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
+      ["long path word", `${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
+      ["long value", `A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+      ["quoted pairs", "'a b' ".repeat(150_000), undefined],
+      ["brace groups", "x { ".repeat(200_000), undefined],
+      ["heredoc lines", `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`, undefined],
     ];
-    for (const [command, expected] of big) {
-      const t0 = performance.now();
-      expect(normalize(command)).toEqual(expected);
-      expect(performance.now() - t0).toBeLessThan(1000);
+    // Same-shape builder for the scaling leg: rebuilds each adversarial shape
+    // at an arbitrary byte size with the same repeat unit, so the small and
+    // large inputs exercise the identical code path at two sizes. Prefix
+    // shapes keep their trailing `git status` (never sliced); repeated-token
+    // shapes are truncated to the exact size (a cut token is still the same
+    // class); heredoc keeps its 1000-line header and scales the body.
+    const scalingFor = (name: string, bytes: number): string => {
+      switch (name) {
+        case "assignment prefixes": return `${"A=1 ".repeat(Math.max(1, Math.ceil((bytes - 10) / 4)))}git status`;
+        case "sudo stacking": return `${"sudo ".repeat(Math.max(1, Math.ceil((bytes - 10) / 5)))}git status`;
+        case "timeout stacking": return `${"timeout 1 ".repeat(Math.max(1, Math.ceil((bytes - 10) / 10)))}git status`;
+        case "sudo -u flags": return `sudo ${"-u ".repeat(Math.max(1, Math.ceil((bytes - 15) / 3)))}git status`;
+        case "env stacking": return `${"/usr/bin/env ".repeat(Math.max(1, Math.ceil((bytes - 10) / 13)))}git status`;
+        case "long path word": return `${"/".repeat(Math.max(1, bytes - 2))} x`;
+        case "long value": return `A=${"b".repeat(Math.max(1, bytes - 2))}`;
+        case "quoted pairs": return "'a b' ".repeat(Math.max(1, Math.ceil(bytes / 6))).slice(0, bytes);
+        case "brace groups": return "x { ".repeat(Math.max(1, Math.ceil(bytes / 4))).slice(0, bytes);
+        case "heredoc lines": {
+          const header = "cat <<EOF\n".repeat(1000);
+          return header + "x\n".repeat(Math.max(1, Math.ceil((bytes - header.length) / 2)));
+        }
+        default: throw new Error(`scalingFor: unknown shape ${name}`);
+      }
+    };
+    // Scaling, not wall-clock: each adversarial input is compared against a
+    // benign reference of EQUAL byte length (repeated `git status ;` units,
+    // truncated to the exact length), so fixed overhead, JIT/GC regime, and
+    // heap state cancel out instead of inflating the ratio. The old cross-size
+    // ratio compared a small input below normalize's ~200 KB regime knee
+    // against a large input above it, which made the ratio inherently
+    // environment-sensitive (isolation passed, full suite failed: 43.0x vs the
+    // 40x cap on `sudo -u flags`). Equal-size inputs have no knee to straddle.
+    // Reps interleave back-to-back (A,B,A,B...) in this process, so CI load
+    // slows both sides together and the ratio cannot flake; best-of-N takes
+    // the min each side. Linear work costs ~1x against its equal-size
+    // reference; the WR-09 backtracking class costs ~1000x or more, so a 40x
+    // cap catches a genuine regression decisively with wide headroom. No
+    // absolute wall-clock bound is asserted. The { timeout } above is a
+    // runaway budget, not a correctness assertion: a genuine superlinear hang
+    // still fails fast (via the ratio or the timeout) instead of hanging CI,
+    // and normal runs never approach it. Best-of-3 keeps the full-suite cost
+    // at ~2-4s even under contention from the ~1400 preceding tests.
+    const LINEAR_CAP = 40;
+    const REPS = 3;
+    const BENIGN_UNIT = "git status ; ";
+    const referenceFor = (bytes: number): string =>
+      BENIGN_UNIT.repeat(Math.ceil(bytes / BENIGN_UNIT.length)).slice(0, bytes);
+    normalize("git status"); // warm up (JIT) before measuring
+    const over: string[] = [];
+    for (const [name, adversarial, expected] of shapes) {
+      // Correctness at the original 1 MB scale is unchanged.
+      if (expected !== undefined) expect(normalize(adversarial)).toEqual(expected);
+      // The reference must exercise normalize() genuinely, not be skipped.
+      const reference = referenceFor(adversarial.length);
+      expect(reference.length).toBe(adversarial.length);
+      expect(normalize(reference).length).toBeGreaterThan(0);
+      let adversarialMs = Infinity;
+      let referenceMs = Infinity;
+      for (let i = 0; i < REPS; i++) {
+        let t = performance.now();
+        normalize(adversarial);
+        const advMs = performance.now() - t;
+        if (advMs < adversarialMs) adversarialMs = advMs;
+        t = performance.now();
+        normalize(reference);
+        const refMs = performance.now() - t;
+        if (refMs < referenceMs) referenceMs = refMs;
+      }
+      const ratio = adversarialMs / referenceMs;
+      if (ratio >= LINEAR_CAP) over.push(`${name}: ${ratio.toFixed(1)}x (adversarial ${adversarialMs.toFixed(1)}ms / reference ${referenceMs.toFixed(1)}ms, best of ${REPS})`);
     }
-    for (const command of ["'a b' ".repeat(150_000), "x { ".repeat(200_000), `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`]) {
-      const t0 = performance.now();
-      normalize(command);
-      expect(performance.now() - t0).toBeLessThan(1000);
+    expect(over).toEqual([]);
+    // Same-shape scaling leg: the differential above cannot catch shared-path
+    // quadratic work, because both sides of an equal-size comparison grow
+    // together and their ratio stays flat (~1x) even when absolute cost is
+    // superlinear. So each adversarial shape is also timed against ITSELF at
+    // two sizes, both above the measured ~200 KB regime knee: SMALL ~400 KB
+    // vs LARGE ~800 KB, i.e. a size ratio of ~2x. Linear work scales with
+    // size (~2x time); shared-path quadratic work scales ~4x. SCALING_CAP 3x
+    // is the size ratio (2x) with 1.5x headroom: linear passes with margin,
+    // pure quadratic fails decisively. Same interleaved best-of-N protocol as
+    // the differential leg, and likewise no absolute wall-clock assertion.
+    const SMALL_BYTES = 400_000;
+    const LARGE_BYTES = 800_000;
+    const SCALING_CAP = 3;
+    const scalingOver: string[] = [];
+    for (const [name] of shapes) {
+      const small = scalingFor(name, SMALL_BYTES);
+      const large = scalingFor(name, LARGE_BYTES);
+      let smallMs = Infinity;
+      let largeMs = Infinity;
+      for (let i = 0; i < REPS; i++) {
+        let t = performance.now();
+        normalize(small);
+        const sMs = performance.now() - t;
+        if (sMs < smallMs) smallMs = sMs;
+        t = performance.now();
+        normalize(large);
+        const lMs = performance.now() - t;
+        if (lMs < largeMs) largeMs = lMs;
+      }
+      const sizeRatio = large.length / small.length;
+      const timeRatio = largeMs / smallMs;
+      if (timeRatio >= SCALING_CAP) scalingOver.push(`${name}: ${timeRatio.toFixed(2)}x time for ${sizeRatio.toFixed(2)}x size (large ${largeMs.toFixed(1)}ms @ ${large.length}B / small ${smallMs.toFixed(1)}ms @ ${small.length}B, best of ${REPS}, cap ${SCALING_CAP}x)`);
     }
+    expect(scalingOver).toEqual([]);
   });
 
   test.each([
@@ -749,11 +850,57 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["/usr/bin/python3.11 -X dev scripts/qa_gate.py", "a08-qa", true],
     ["python3 -m scripts.unknown_gate", "a09-reviewer", false],
     ["python3.12 -m pytest tests/test_rev_gate.py", "a09-reviewer", false],
+    // T-05-22: the program is the redirected script, or the script was copied aside in the same command
+    ["python3 < scripts/rev_gate.py", "a09-reviewer", true],
+    ["python3 - --task-id T < scripts/rev_gate.py", "a09-reviewer", true],
+    ["cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py", "a05-backend", true],
+    ["pypy3 scripts/rev_gate.py", "a09-reviewer", true],
+    ["uv run --with pyyaml python scripts/rev_gate.py", "a09-reviewer", true],
+    ["uv run --python 3.12 scripts/rev_gate.py", "a09-reviewer", true],
+    ["python3 \"/srv/my swarm/scripts/sec_gate.py\"", "a10-security", true],
+    ["echo x | python3 -c 'print(1)'", "a09-reviewer", false],
   ])("gate script: %s from %s blocks=%p", (command, agent, blocks) => {
     const res = guardToolCall(bash(command), facts(agent));
     if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-shell)" });
     else expect(res).toBeUndefined();
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  const GATE = "BLOCKED needs: human-approval (gate: gate-script-shell)";
+  const INTERP = "BLOCKED needs: human-approval (destructive: interpreter-stdin)";
+  test.each([
+    ["python3 -<scripts/rev_gate.py --task-id T", GATE],
+    ["bash -c 'python3 -' < scripts/rev_gate.py", GATE],
+    ["python3 -W 'ignore:<x' - --task-id T --root /workspace < scripts/rev_gate.py", GATE],
+    ["python3 -W '<x' - < scripts/rev_gate.py", GATE],
+    ["cp scripts/re[v]_gate.py /tmp/r.py", GATE],
+    ["cp 'scripts/rev_gate.py' /tmp/r.py", GATE],
+    ["printf 'print(1)\\n' | bash -c 'python3 -'", INTERP],
+    ["echo x | python3 -Wonce", INTERP],
+    ["echo x | python3 - '<scripts/rev_gate.py'", INTERP],
+    ["echo x | python3 -Xtracemalloc", INTERP],
+    ["python3 < /dev/null", INTERP],
+  ])("stdin and copy hardening: %s blocks as %s", (command, reason) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([
+    "echo x | python3 -c 'print(1)'",
+    "echo x | python3 -Bc 'print(1)'",
+    "python3 --version < /dev/null",
+    "python3 --help < /dev/null",
+    "python3 -V < /dev/null",
+    "python3 -h < /dev/null",
+    "bash -c 'python3 -' '<scripts/rev_gate.py'",
+    "python3 - '<scripts/rev_gate.py'",
+    "cp 'scripts/re[v]_gate.py' /tmp/r.py",
+    "cp notes.txt /tmp/n.txt",
+    "cp .swarm/tasks.db /tmp/tasks.db",
+    "printf 'print(1)\\n' | bash -c \"$VAR\"",
+    "bash -c \"$VAR\" < scripts/rev_gate.py",
+  ])("stdin and copy hardening: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });
 
   /** WR-02: each gate stem, run by its owner or another agent through each spelling, is a run. */
@@ -1124,6 +1271,7 @@ describe("HOOK-03 shell twin and D-08", () => {
   const MUTATE = "protected_path: protected-path-mutate";
   const SHELL = "protected_path: protected-path-shell";
   const RM = "destructive: rm-rf-protected";
+  const STDIN = "destructive: shell-stdin";
   /** Lexical spellings bash reads as the plain command: quoting, escapes, ANSI-C `$'…'`, `${IFS}`, brace lists, redirection placement. */
   test.each([
     ["echo x \\> | tee .swarm/tasks.db", SHELL],
@@ -1225,9 +1373,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["alias ls='rm -rf .swarm'", RM],
     ["trap 'touch .swarm/x' EXIT", MUTATE],
     ["bash -o pipefail -c 'touch .swarm/x'", MUTATE],
-    ["bash <<EOF\ntouch .swarm/x\nEOF", MUTATE],
-    ["sh <<< 'touch .swarm/x'", MUTATE],
-    ["echo 'touch .swarm/x' | sh", MUTATE],
+    ["bash <<EOF\ntouch .swarm/x\nEOF", STDIN],
+    ["sh <<< 'touch .swarm/x'", STDIN],
+    ["echo 'touch .swarm/x' | sh", STDIN],
     ["sudo -e .omp/config.yml", MUTATE],
     ["perl -pi -e 's/a/b/' .omp/config.yml", MUTATE],
     ["awk -i inplace '{print}' .omp/config.yml", MUTATE],
@@ -1288,7 +1436,7 @@ describe("HOOK-03 shell twin and D-08", () => {
     "git add -A", 'git commit -m "feat: x"', "git status --short", "git diff HEAD~1 -- src/", "git checkout -b feat/x", "git switch main",
     "git stash", "git pull --rebase", "git push -u origin feat/x", "make -j8 test", "cargo build --release", "cargo test", "go test ./...",
     "go build -o bin/app ./cmd/app", "docker build -t app .", "docker compose up -d", "ls -la > files.txt", "echo done | tee -a log.txt",
-    "mkdir -p dist && cp -r src/* dist/", "rm -rf node_modules dist", "find . -name '*.ts' | xargs grep -l foo", "tar -czf dist.tgz dist",
+    "mkdir -p dist && cp -r src/*.md dist/", "rm -rf node_modules dist", "find . -name '*.ts' | xargs grep -l foo", "tar -czf dist.tgz dist",
     "curl -o /tmp/x.json https://x", "uvicorn app:app --reload &", "export NODE_ENV=test && bun test", "ruff check . --fix", "tsc -p tsconfig.json",
     "cd omp && bun run test 2>&1 | tail -20", "for f in src/*.ts; do echo $f; done", "wc -l $(git ls-files '*.py')", "date > build/stamp.txt",
   ])("common: %s passes", (command) => {
@@ -1324,13 +1472,15 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["bash -cl 'git push -f'", FORCE],
     ["sh -c -- 'git push -f'", FORCE],
     ["/bin/zsh -o pipefail -c 'git push -f'", FORCE],
-    // echo/printf by basename, fed to a shell's stdin
-    ["/bin/echo 'touch .swarm/x' | sh", MUTATE],
-    ["/usr/bin/printf '%s\\n' 'git push --force' | bash", FORCE],
-    ["command echo 'git push -f' | sh", FORCE],
-    ["builtin printf 'git push -f\\n' | bash", FORCE],
-    ["echo -e 'touch .swarm/x' | sh", MUTATE],
-    ["cat <<< 'git push -f' | sh", FORCE],
+    // a shell reading its script from stdin is blocked whatever the script: it may be built at run time
+    ["/bin/echo 'touch .swarm/x' | sh", STDIN],
+    ["/usr/bin/printf '%s\\n' 'git push --force' | bash", STDIN],
+    ["command echo 'ls' | sh", STDIN],
+    ["echo -e 'touch .swarm/x' | sh", STDIN],
+    ["cat <<< 'git push -f' | sh", STDIN],
+    ["(echo ls) | { bash; }", STDIN],
+    ["sh -s -- -y", STDIN],
+    ["bash /dev/stdin < s.sh", STDIN],
     // a command that really reassigns HOME makes `~` unknowable
     ["HOME=.swarm; echo x > ~/tasks.db", SHELL],
     ["export HOME=/x; echo > ~/y", SHELL],
@@ -1345,6 +1495,9 @@ describe("HOOK-03 shell twin and D-08", () => {
     "bash -c 'echo ok' 'git push -f'", 'eval "echo ok"', "watch -n 5 ls", "alias ll='ls -la'", "trap 'rm -f /tmp/lock' EXIT",
     "echo HOME > ~/results.txt", "grep HOME .env > /tmp/x", "echo $HOME > ~/y", "bash -lc 'echo ok'", "/bin/echo 'git push -f'",
     "printf 'git push -f\\n' > notes.txt", "echo 'touch .swarm/x' | cat",
+    // a shell with its own script or `-c` line, and non-shells ending in `sh`, may take stdin
+    "bash script.sh < in.txt", "echo x | bash -c 'cat'", "echo x | ssh host cat", "mosh host < /dev/null", "source env.sh",
+    "echo ls | bash -cl 'cat'",
   ])("joined lines: %s passes", (command) => {
     expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
   });

@@ -100,6 +100,25 @@ test("gate argv: whitelisted flags, GATE_SCRIPTS mapping, bridge-owned findings 
   }
 });
 
+test("gate scripts match swarm/verdicts.py GATE_SCRIPTS (parity)", async () => {
+  const py = Bun.spawnSync(["python3", "-c",
+    "import json\nfrom swarm.verdicts import GATE_SCRIPTS\nprint(json.dumps(GATE_SCRIPTS))"],
+  { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" });
+  expect(py.exitCode).toBe(0);
+  const expected = JSON.parse(py.stdout.toString()) as Record<string, string>;
+  // The schema enum pins the key set: a gate added on either side without the other fails here.
+  const tsGates = (gateWith().gate.parameters.properties as Record<string, { enum: string[] }>).gate.enum;
+  expect([...tsGates].sort()).toEqual(Object.keys(expected).sort());
+  // The bridged script per gate pins the values: drift routes a gate to the wrong script in one runtime.
+  process.env.SWARM_DIR = tmpDir("swarm-omp-dir-");
+  const repo = gitRepo();
+  const { calls, gate } = gateWith();
+  for (const [g, script] of Object.entries(expected)) {
+    await callTool(gate, { gate: g, task_id: "F-x", correlation_id: "c1" }, agentCtx(repo, GATE_AGENTS[g as keyof typeof GATE_AGENTS]));
+    expect(calls[calls.length - 1].script).toBe(script);
+  }
+});
+
 test("gate extra keys never reach python", async () => {
   const repo = gitRepo();
   const { calls, gate } = gateWith();

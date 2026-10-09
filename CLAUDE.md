@@ -22,7 +22,7 @@ a Claude Code and Grok Build subagent, an omp task agent and a Trae SOLO prompt,
 | `skills/<slug>/SKILL.md` | Per-agent + `orchestrate` skills (copy with `--install-workspace`) |
 | `scripts/ts/` | TypeScript twins of every `scripts/*.py` tool |
 | `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier: injects swarm context only on SDLC-shaped prompts (`tests/fixtures/classifier_prompts.json` pins it together with the omp hook) |
-| `hooks/autonomous_run.py` | Plan + run in one detached process (120 s dedupe lock, log at `$SWARM_DIR/autonomous.log`); started by an external plugin, `--runtime` forwarded to `swarm_run.py` |
+| `hooks/autonomous_run.py` | Plan + run in one detached process (120 s dedupe lock, log at `$SWARM_DIR/autonomous.log`). The run cap (`SWARM_AUTONOMOUS_RUN_CAP_S`, default 3600) SIGTERMs the runner so it can end its sessions, and SIGKILLs only after `SWARM_AUTONOMOUS_RUN_GRACE_S` (default 15). Started by an external plugin; `--runtime` forwarded to `swarm_run.py` |
 | `swarm/` | Runtime toolkit: envelope (signed `swarm.v1`), Task Store (SQLite state machine), gates, manifest, run log |
 | `scripts/` | Per-agent tools (see table below) + orchestration (`orch_plan.py`, `orch_status.py`, `swarm_run.py`) + generators (`build_agents.py`, `build_trae_agents.py`, `_write_skills.py`, `_install_omp.py`) |
 | `.swarm/` | Runtime state (task DB, plans, verdicts, assignments, results, `events.jsonl`). Resolved per call: `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. Created with its own `.gitignore` of `*`. |
@@ -90,13 +90,14 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws                 
 python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # agents + skills only
 python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print plan + config diff + env files, write nothing
 python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # skip the substrate-mcp wiring
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
 ```
 
-- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and hooks, then runs the omp step. It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
+- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and the UserPromptSubmit hook (the A01-complete Stop hook only with `--with-a01-complete-hook`), then runs the omp step. The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
 - substrate-mcp ([docs/substrate-workspace.md](docs/substrate-workspace.md)): the `substrate` entry in `<ws>/.mcp.json` and `<ws>/.grok/config.toml` names `${SUBSTRATE_TOKEN}`, never a value; each agent's token goes to a 0600 env file outside the workspace, from `SUBSTRATE_TOKEN_<SURFACE>` in your environment. A missing token prints what to create and exits 2.
 - `link` merges the package realpath into `<ws>/.omp/config.yml` `extensions:` (a host path by design). Start omp at `<ws>`: the config is read from the cwd only. If that file has no `extensions` key, the inherited list is carried over, because a project array replaces the user array: `<ws>/.omp/settings.json`, else `config.yml|config.yaml` in the omp user agent dir (profile dir via `OMP_PROFILE`/`PI_PROFILE`, else `PI_CODING_AGENT_DIR`, else `~/.omp/agent`), else that dir's `settings.json`. A user YAML without `extensions` suppresses the legacy `settings.json`.
 - `copy` copies agents and skills into `<ws>/.omp/agents|skills`: no tools, no guard, no `/swarm`, no context hook. Re-run it after regenerating.
-- Both modes print a `WARNING shadow:` line per same-`name` agent or skill that omp resolves first: project `.omp/agents|skills` in `<ws>` or its ancestors, the user `agents|skills` dirs (profile-aware), earlier `extensions:` entries, `skills.customDirectories`. Only files omp would load count (agents need `name` + `description`; skills need `description` and are skipped on `enabled: false`). `.claude/*` and `.agents/skills` do not shadow.
+- Both modes print a `WARNING shadow:` line per same-`name` agent or skill that omp resolves first: project `.omp/agents|skills` in `<ws>` or its ancestors, the user `agents|skills` dirs (profile-aware), earlier `extensions:` entries, `skills.customDirectories`. Only files omp would load count (agents need `name` + `description`; skills need `description` and are skipped on `enabled: false`). `.claude/*` and `.agents/skills` do not shadow. Copy mode refuses (exit 2, nothing written) when a strict ancestor of `<ws>` shadows the package — the copies would run guard-less with shadowed skills; re-run with `--allow-shadowed-copy` to proceed anyway, or use link mode to keep the tools and guard.
 - Start a fresh omp session after every install or `build_agents.py` regeneration.
 - `task.maxRecursionDepth`: the default 2 is enough (main → `a01-orchestrator`, which keeps `task` → specialists, which never get `task` at any depth). Set 3 only when A01 is itself spawned by another subagent; otherwise it yields `BLOCKED needs: depth`. Never use a negative (unlimited) value.
 
@@ -133,7 +134,7 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 - Fail-closed gates by risk class — low: review · medium: review+quality · high: +security+release.
 - Most restrictive verdict wins; a failing gate ⇒ CHANGES_REQUESTED with findings, max 2 rework
   loops, then ESCALATED with an `escalation.request` event. Verdicts issued before a rework are stale.
-- `task.assign` and gate verdicts are signed (`SWARM_ED25519_KEY` hex seed, or HMAC via `SWARM_SIGNING_KEY`).
+- `task.assign` and gate verdicts are signed (`SWARM_ED25519_KEY` hex seed, or HMAC via `SWARM_SIGNING_KEY`). With neither set, `SWARM_ALLOW_INSECURE_DEV_KEY=1` opts into the dev key; otherwise gates stay advisory, APPROVED fails closed, and `swarm_run` (including `--dry-run`) refuses before any task is claimed. A keyless gate still fails when a per-target finding is blocking, and records no verdict row.
 - Destructive/L3+/L4 actions: agents stop and report `BLOCKED` with `needs: human-approval`.
 
 ## Editing
@@ -143,3 +144,22 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
   `python3 scripts/build_trae_agents.py` (`.trae/`), and commit the regenerated files.
 - New agent: add to `agents.json`, write `prompts/`, scripts, regenerate. See `07-scalability.md`.
 - Keep scripts stdlib-only; optional tools must degrade to `skipped:tool-missing`.
+
+⚠ 1 unresolved conflict detected
+- ours = HEAD
+- theirs = origin/main
+NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
+`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
+Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
+Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
+
+──── #1  L93-102 ────
+<<< ours
+```
+
+- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and hooks, then runs the omp step. It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
+>>> theirs
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
+```
+
+- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and the UserPromptSubmit hook (the A01-complete Stop hook only with `--with-a01-complete-hook`), then runs the omp step. The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
