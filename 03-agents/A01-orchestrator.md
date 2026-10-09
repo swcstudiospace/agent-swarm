@@ -34,7 +34,7 @@ Key payloads:
 **Artifacts:** owns Task Store rows, `plan.updated` snapshots, arbitration records (append-only audit).
 
 ## 4. Decision logic & autonomy boundaries
-1. **Decomposition:** brief → DAG using stored decomposition patterns (memory); a task is splittable if it has >1 independent acceptance criterion and estimated effort > budget.quantum (default 30 min).
+1. **Decomposition:** brief → DAG using stored decomposition patterns (memory). Two or more disjoint blast radii (separate paths, owners, or acceptance criteria that do not share files) become a `parallel` plan: one short lane per radius, the same agent class repeated up to its `max_parallel`, each lane on its own branch and worktree. Lanes do not review themselves. A join merges the branches, then one Greptile review covers the merged result. A task is also splittable if it has >1 independent acceptance criterion and estimated effort > budget.quantum (default 30 min).
 2. **Assignment:** award to lowest `load + λ·eta_norm` valid bid (λ=0.5); require `confidence ≥ 0.5`; P0 tasks are pushed directly (no bidding).
 3. **Gate enforcement:** task cannot reach `APPROVED` without `pass` (or human `waive`) verdicts from every gate required by its `risk_class` (low: review; medium: review+quality; high: review+quality+security+release sign-off).
 4. **Rework loop:** `CHANGES_REQUESTED` back to producer, max 2 loops; 3rd failure ⇒ arbitration or `ESCALATED`.

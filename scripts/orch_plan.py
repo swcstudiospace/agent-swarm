@@ -5,6 +5,10 @@ Patterns encode the reference event flows of 04-integration-plan.md §3:
   feature     brief → REQ → (ARCH ∥ UXD) → DATA → (BE ∥ FE) → (QA ∥ REV ∥ SEC gates) → DEVOPS → REL → (OBS ∥ DOC)
   hotfix      incident → MAINT rca → BE patch → gates → REL → OBS
   dependency  SEC scan → MAINT patch.task → BE bumps → gates → REL
+  parallel    one short lane per disjoint blast radius (same agent allowed more than once, each on its own
+              branch and worktree) → join merges the branches → one Greptile review of the merged branch,
+              plus the rest of the risk-class gates once. Slices come from a ```blast-radii``` block, --slices,
+              or --slices-json. A fence or either flag selects this pattern even when --pattern is feature.
   custom      --plan plan.json  { "tasks": [ {id, capability, agent, title, depends_on[], gates[], risk_class?} ] }
 
 Writes a plan snapshot to .swarm/plans/<correlation_id>.json and emits plan.updated.
@@ -25,6 +29,7 @@ from swarm.manifest import by_capability  # noqa: E402
 from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm import substrate_client, substrate_tee  # noqa: E402
+from swarm.blast_radius import lane_notes, load_slices, parallel_rows  # noqa: E402
 
 # (suffix, capability, agent, title, depends_on suffixes, gate spec)
 # gate spec: None = derive from risk class; [] = no gates; {"gate": "quality", "for": [...]} = this IS a gate task
@@ -87,6 +92,33 @@ def load_custom(path: Path) -> list[tuple]:
         rows.append((t["id"], t["capability"], agent, t.get("title", t["id"]), t.get("depends_on", []), gates,
                      t.get("risk_class"), t.get("acceptance", [])))
     return rows
+
+
+def _as_row(row: tuple) -> tuple:
+    """Pad a pattern or custom row to 9 fields. The last field is the blast-radius lane, or None."""
+    row = tuple(row)
+    if len(row) == 6:
+        return row + (None, [], None)
+    if len(row) == 8:
+        return row + (None,)
+    if len(row) != 9:
+        raise SwarmError(ErrorCode.E_INPUT, f"plan row has {len(row)} fields, expected 6, 8 or 9")
+    return row
+
+
+def _plan_sha_rows(rows: list[tuple]) -> list[list]:
+    """Rows as hashed by older plans: eight fields, plus the lane only when this plan has one.
+
+    A feature/hotfix/dependency/custom row therefore keeps the sha it had before lanes existed,
+    so re-planning that same brief still reuses.
+    """
+    hashed = []
+    for row in rows:
+        base = list(row[:8])
+        if row[8]:
+            base.append(row[8])
+        hashed.append(base)
+    return hashed
 
 
 def _derived_prefix(corr: str, n: int) -> str:
@@ -172,16 +204,29 @@ def run(args, ctx) -> dict:
         brief = "(dry-run placeholder brief)"
 
     corr = ctx.correlation_id or str(uuid.uuid4())
+    if args.plan and (args.slices or args.slices_json or "```blast-radii" in brief):
+        raise SwarmError(ErrorCode.E_INPUT, "--plan is a custom DAG; it cannot be combined with blast-radius slices")
     if args.plan:
         args.pattern = "custom"
-    rows = load_custom(Path(args.plan)) if args.plan else [r + (None, []) for r in PATTERNS[args.pattern]]
+        rows = [_as_row(row) for row in load_custom(Path(args.plan))]
+    else:
+        slices = load_slices(brief=brief, slices_json=args.slices_json, slices_path=args.slices)
+        if slices is not None:
+            args.pattern = "parallel"
+            rows = parallel_rows(slices, args.risk_class)
+        elif args.pattern == "parallel":
+            raise SwarmError(ErrorCode.E_INPUT, "pattern parallel needs a ```blast-radii``` block, --slices, or --slices-json")
+        else:
+            rows = [_as_row(row) for row in PATTERNS[args.pattern]]
+    lanes = sum(1 for row in rows if row[8] and row[8].get("role") == "slice")
     brief_sha = hashlib.sha256(brief.encode("utf-8")).hexdigest()
-    plan_sha = hashlib.sha256(json.dumps([list(r) for r in rows], sort_keys=True).encode("utf-8")).hexdigest()
+    plan_sha = hashlib.sha256(json.dumps(_plan_sha_rows(rows), sort_keys=True).encode("utf-8")).hexdigest()
     if ctx.dry_run:
         prefix = args.prefix or _derived_prefix(corr, 4)
+        lead = f"parallel blast radii: {lanes} lanes, Greptile review after merge; " if lanes else ""
         return {"status": "ok", "correlation_id": corr, "pattern": args.pattern, "dry_run": True,
                 "tasks": [{"task_id": f"{prefix}-{r[0]}", "capability": r[1], "agent": r[2], "depends_on": r[4]} for r in rows],
-                "summary": f"dry-run: would create {len(rows)} tasks"}
+                "summary": f"dry-run: {lead}would create {len(rows)} tasks"}
 
     store = TaskStore(root=ctx.root)
     created = []
@@ -206,7 +251,7 @@ def run(args, ctx) -> dict:
                                      f"brief/pattern/plan/risk-class/priority/acceptance; {hint}")
             else:
                 reused = None
-                for suffix, cap, agent, title, deps, gates, risk_override, acceptance in rows:
+                for suffix, cap, agent, title, deps, gates, risk_override, acceptance, lane in rows:
                     tid = f"{prefix}-{suffix}"
                     risk = risk_override or args.risk_class
                     depth[suffix] = 1 + max((depth[d] for d in deps), default=-1)
@@ -218,6 +263,8 @@ def run(args, ctx) -> dict:
                         notes["gates"] = []
                     elif gates is not None:
                         notes["gates"] = gates
+                    if lane:
+                        notes.update(lane_notes(lane, prefix, suffix))
                     store.create(task_id=tid, correlation_id=corr, capability=cap, title=title, agent_id=agent,
                                  dag_depth=depth[suffix], depends_on=[f"{prefix}-{d}" for d in deps],
                                  acceptance=acceptance or args.acceptance, budget=_budget(risk), risk_class=risk,
@@ -243,9 +290,10 @@ def run(args, ctx) -> dict:
     _bind_graph(args, ctx, corr, brief, plan["tasks"])  # before plan.updated, so that event and the exit record are tee'd
     ctx.emit("plan.updated", {"pattern": args.pattern, "task_count": len(created)})
     lines = [f"{t['task_id']:<14} {t['agent_id']:<4} d={t['dag_depth']} ← {','.join(t['depends_on']) or '-'}" for t in created]
+    lead = f"parallel blast radii: {lanes} lanes, Greptile review after merge\n" if lanes else ""
     return {"status": "ok", "correlation_id": corr, "pattern": args.pattern, "tasks": plan["tasks"],
             "plan_file": str(plans / f"{corr}.json"),
-            "summary": f"created {len(created)} tasks for correlation {corr}\n" + "\n".join(lines)}
+            "summary": lead + f"created {len(created)} tasks for correlation {corr}\n" + "\n".join(lines)}
 
 
 def add_args(p):
@@ -253,7 +301,9 @@ def add_args(p):
                    help="alias of --root (same flag as swarm_run.py --repo)")
     p.add_argument("--brief", help="path to brief markdown")
     p.add_argument("--brief-text", help="inline brief text")
-    p.add_argument("--pattern", choices=list(PATTERNS) + ["custom"], default="feature")
+    p.add_argument("--pattern", choices=list(PATTERNS) + ["custom", "parallel"], default="feature")
+    p.add_argument("--slices", help="JSON file of disjoint blast radii; selects the parallel plan")
+    p.add_argument("--slices-json", help="JSON array of disjoint blast radii; selects the parallel plan")
     p.add_argument("--plan", help="custom DAG json (implies --pattern custom)")
     p.add_argument("--risk-class", choices=list(GATES_BY_RISK), default="medium")
     p.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], default="P2")

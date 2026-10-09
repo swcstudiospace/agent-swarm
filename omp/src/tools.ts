@@ -25,7 +25,7 @@ const STATES = [
 
 /** orch_plan.py choices: --pattern (PATTERNS only: `custom` needs --plan <path>, which no tool exposes), --risk-class
  * (taskstore.py GATES_BY_RISK), --priority. */
-export const PATTERNS = ["feature", "hotfix", "dependency"] as const;
+export const PATTERNS = ["feature", "hotfix", "dependency", "parallel"] as const;
 export const RISK_CLASSES = ["low", "medium", "high"] as const;
 const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 
@@ -73,6 +73,8 @@ export type PlanParams = {
   priority?: (typeof PRIORITIES)[number];
   acceptance?: string[];
   dry_run?: boolean;
+  /** Disjoint blast radii. Present on a parallel plan; also selects parallel when the pattern is feature. */
+  slices?: Array<{ id: string; paths: string[]; agent?: string; capability?: string; title?: string; acceptance?: string[] }>;
 };
 export type IngestParams = { task_id: string; result: Record<string, unknown> };
 export type Finding = { severity: (typeof SEVERITIES)[number]; summary: string } & Partial<
@@ -133,6 +135,7 @@ export function planArgs(ctx: ExtensionContext, params: PlanParams): string[] {
   if (params.correlation_id) args.push(`--correlation-id=${params.correlation_id}`);
   if (params.priority) args.push(`--priority=${params.priority}`);
   for (const item of params.acceptance ?? []) args.push(`--acceptance=${item}`);
+  if (params.slices?.length) args.push(`--slices-json=${JSON.stringify(params.slices)}`);
   if (params.dry_run) args.push("--dry-run");
   return args;
 }
@@ -180,7 +183,30 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       type: "object",
       properties: {
         brief: { type: "string", minLength: 1, description: "The brief text (not a path)" },
-        pattern: { type: "string", enum: PATTERNS, description: "DAG pattern: feature (13 tasks), hotfix (8), dependency (8)" },
+        pattern: {
+          type: "string",
+          enum: PATTERNS,
+          description:
+            "DAG pattern: feature (13 tasks), hotfix (8), dependency (8), parallel (one lane per slices[] entry, then one Greptile review). parallel requires slices.",
+        },
+        slices: {
+          type: "array",
+          minItems: 2,
+          description: "Disjoint blast radii for pattern parallel. The same agent may own more than one slice. Paths must not overlap.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", pattern: "^[a-z][a-z0-9-]{0,31}$" },
+              paths: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1 },
+              agent: { type: "string", description: "Implementer id or slug, for example A05. Omit only when capability names an implementer." },
+              capability: { type: "string" },
+              title: { type: "string" },
+              acceptance: { type: "array", items: { type: "string", minLength: 1 } },
+            },
+            required: ["id", "paths"],
+            additionalProperties: false,
+          },
+        },
         risk_class: { type: "string", enum: RISK_CLASSES, description: "Decides the required gates per task" },
         prefix: { ...ID, description: "Task id prefix (default: T + 4 hex of the correlation id)" },
         correlation_id: { ...ID, description: "Correlation id (default: a new uuid); reuse it to make a re-run idempotent" },
