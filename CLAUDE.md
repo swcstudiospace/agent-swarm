@@ -144,3 +144,22 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
   `python3 scripts/build_trae_agents.py` (`.trae/`), and commit the regenerated files.
 - New agent: add to `agents.json`, write `prompts/`, scripts, regenerate. See `07-scalability.md`.
 - Keep scripts stdlib-only; optional tools must degrade to `skipped:tool-missing`.
+
+⚠ 1 unresolved conflict detected
+- ours = HEAD
+- theirs = origin/main
+NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.
+`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\n@ours\n@theirs"` literally writes the comment, then ours, then theirs.
+Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\n2: @theirs\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.
+Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.
+
+──── #1  L93-102 ────
+<<< ours
+```
+
+- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and hooks, then runs the omp step. It never writes into this repo or `~/.omp`. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
+>>> theirs
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
+```
+
+- It regenerates, wires substrate-mcp, copies the Claude/Grok agents, skills and the UserPromptSubmit hook (the A01-complete Stop hook only with `--with-a01-complete-hook`), then runs the omp step. The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files. It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, and any destination reached through a symlink (the file or a parent dir under `<ws>`).
