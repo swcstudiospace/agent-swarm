@@ -7,6 +7,7 @@ risk class, parses pass/fail, and writes a signed `gate.verdict` envelope to
 row is recorded on each target in its Task Store notes.gate_for (swarm.verdicts).
 """
 from __future__ import annotations
+import importlib.util
 import json
 import re
 import sys
@@ -24,7 +25,8 @@ TIERS_BY_RISK = {"low": ["unit"], "medium": ["unit", "integration"],
 def detect_runners(root: Path) -> list[dict]:
     runners = []
     if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or list(root.glob("tests/test_*.py")):
-        if which("pytest"):
+        # Same interpreter that runs `sys.executable -m pytest`. A pytest binary on PATH is not required.
+        if importlib.util.find_spec("pytest") is not None:
             runners.append({"name": "pytest", "cmd": [sys.executable, "-m", "pytest", "-q", "--maxfail=50", "-p", "no:cacheprovider"],
                             "pass_re": r"(\d+) passed", "fail_re": r"(\d+) failed|(\d+) error"})
     pkg = root / "package.json"
