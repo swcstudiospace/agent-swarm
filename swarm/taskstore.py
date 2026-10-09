@@ -55,6 +55,8 @@ LEGAL_TRANSITIONS: dict[TaskState, set[TaskState]] = {
 }
 MAX_REWORK_LOOPS = 2
 SATISFIED_STATES = {S.IN_REVIEW.value, S.APPROVED.value, S.DONE.value}
+# A gate task in one of these states had its result accepted by apply_result (never refused, FAILED or BLOCKED).
+ACCEPTED_ISSUER_STATES = frozenset({S.IN_REVIEW.value, S.APPROVED.value, S.DONE.value})
 DEFAULT_MAX_ATTEMPTS = 3
 GATES_BY_RISK = {"low": ["review"], "medium": ["review", "quality"],
                  "high": ["review", "quality", "security", "release"]}
@@ -242,6 +244,12 @@ class TaskStore:
                 if missing:
                     raise SwarmError(ErrorCode.E_POLICY,
                                      f"fail-closed: {task_id} lacks passing gates {missing}", task_id=task_id)
+                # T-05-31: every path (reconcile, `orch_status --transition`, the runner) applies the issuer rule, not
+                # only reconcile: a passing row whose gate task's result was never accepted approves nothing
+                unaccepted = self.unaccepted_gates(task_id)
+                if unaccepted:
+                    raise SwarmError(ErrorCode.E_POLICY,
+                                     f"fail-closed: {task_id} has unaccepted gates {sorted(unaccepted)}", task_id=task_id)
             self._apply(task_id, from_state, to_state, actor, reason, **extra)
         return self.get(task_id)
 
@@ -357,6 +365,29 @@ class TaskStore:
 
     def missing_gates(self, task_id: str) -> list[str]:
         return list(self.missing_gate_reasons(task_id))
+
+    def unaccepted_gates(self, task_id: str, reasons: dict[str, str] | None = None) -> dict[str, str]:
+        """T-05-11/T-05-31: required gates of `task_id` whose current row passes (a gate in `reasons`, default
+        missing_gate_reasons, is already reported as missing and skipped) but was recorded by a gate task (the signed
+        `gate_task`) whose result has not been accepted: leased, refused (review verdict mismatch), FAILED, BLOCKED, RETRY,
+        ESCALATED or CANCELLED. → {gate: "unaccepted"}. Such a row may be contradicted by its own gate agent, so it never
+        approves the target. A row with no `gate_task` (written outside a gate task) counts as accepted; an unreadable
+        envelope or a gate task that does not exist fails closed."""
+        if reasons is None:
+            reasons = self.missing_gate_reasons(task_id)
+        latest = self.latest_verdicts(task_id)
+        out = {}
+        for g in self.required_gates(task_id):
+            if g in reasons or g not in latest:
+                continue
+            try:
+                issuer = validate_verdict(json.loads(latest[g]["envelope_json"])).get("gate_task")
+                accepted = issuer is None or self.get(issuer)["state"] in ACCEPTED_ISSUER_STATES
+            except Exception:  # noqa: BLE001 - any unreadable envelope or unknown issuer is untrusted
+                accepted = False
+            if not accepted:
+                out[g] = "unaccepted"
+        return out
 
     def gate_verdict_since(self, target: str, *, gate: str, gate_task_id: str, since: float) -> bool:
         """True when a `gate` row on `target` holds a verifying signed envelope for that gate and target that

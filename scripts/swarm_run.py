@@ -857,7 +857,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         raw_recorded = True
         with watch.applying(text, meta):
             if result is None:
-                outcome = reject(store, tid, reason=str(err), mode="headless", emit=ctx.emit)
+                outcome = reject(store, tid, attempt=task["attempt"], reason=str(err), mode="headless", emit=ctx.emit)
             else:
                 outcome = apply_result(store, task, agent_id=agent["id"], result=result, meta=meta, emit=ctx.emit,
                                        mode="headless")
