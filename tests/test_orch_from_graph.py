@@ -405,6 +405,64 @@ def test_bun_preserves_symlink_parents_and_empty_out(tmp_path):
     assert {path.name for path in tmp_path.iterdir()} == before
 
 
+def _caller_env() -> dict:
+    env = os.environ.copy()
+    env.pop("SWARM_DIR", None)
+    for key in list(env):
+        if key.startswith("SUBSTRATE"):
+            env.pop(key)
+    return env
+
+
+def _event_count(log: Path) -> int:
+    if not log.exists():
+        return 0
+    return sum(
+        1 for line in log.read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("type") == "script.orch_from_graph"
+    )
+
+
+@pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
+def test_bun_logs_events_in_the_caller_workspace(tmp_path):
+    """passthrough runs Python in the checkout. State paths must still be the caller's."""
+    work = tmp_path / "work"
+    work.mkdir()
+    env = _caller_env()
+    for argv0 in ([sys.executable, str(SCRIPT)], [BUN, str(TWIN)]):
+        proc = subprocess.run(
+            [*argv0, "--summary", str(SUMMARY), "--dry-run", "--json"],
+            cwd=work, capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _event_count(work / ".swarm" / "events.jsonl") == 2
+
+    env["SWARM_DIR"] = "link/../caller-state"
+    other = tmp_path / "other"
+    (other / "child").mkdir(parents=True)
+    (work / "link").symlink_to(other / "child")
+    for argv0 in ([sys.executable, str(SCRIPT)], [BUN, str(TWIN)]):
+        proc = subprocess.run(
+            [*argv0, "--summary", str(SUMMARY), "--dry-run", "--json"],
+            cwd=work, capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _event_count(other / "caller-state" / "events.jsonl") == 2
+    assert not (work / "caller-state").exists()
+
+    parent = tmp_path / "parent"
+    repo = parent / "repo"
+    repo.mkdir(parents=True)
+    rooted = _caller_env()
+    for argv0 in ([sys.executable, str(SCRIPT)], [BUN, str(TWIN)]):
+        proc = subprocess.run(
+            [*argv0, "--summary", str(SUMMARY), "--root", "repo", "--dry-run", "--json"],
+            cwd=parent, capture_output=True, text=True, env=rooted,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _event_count(repo / ".swarm" / "events.jsonl") == 2
+
+
 @pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
 def test_twins_agree_on_relative_paths_outside_the_checkout(tmp_path):
     (tmp_path / "summary.json").write_bytes(SUMMARY.read_bytes())
