@@ -220,12 +220,13 @@ def test_dry_run_prints_omp_invocation(tmp_path):
     lines = [ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: ")]
     assert len(lines) == 1
     tokens = shlex.split(lines[0].removeprefix("dry-run T-one [A05]: "))
-    # WR-06: a replay from the runner's shell drops the key vars, as the live child env does
-    assert tokens[:7] == ["env", "-u", "SWARM_SIGNING_KEY", "-u", "SWARM_ED25519_KEY", "-u", "SWARM_REQUIRE_KEY"]
-    assert dict(t.split("=", 1) for t in tokens[7:13]) == {
+    # WR-06 / T-06-19: a replay from the runner's shell drops the key vars and the parent's task ids.
+    assert tokens[:11] == ["env", "-u", "SWARM_SIGNING_KEY", "-u", "SWARM_ED25519_KEY", "-u", "SWARM_REQUIRE_KEY",
+                           "-u", "SWARM_TASK_ID", "-u", "SWARM_CORRELATION_ID"]
+    assert dict(t.split("=", 1) for t in tokens[11:17]) == {
         "SWARM_DIR": str(swarm), "SWARM_CHILD": "1", "SWARM_AGENT_SESSION": "1", "SWARM_AGENT": "a05-backend",
         "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
-    argv, (redirect, stdin) = tokens[13:-2], tokens[-2:]
+    argv, (redirect, stdin) = tokens[17:-2], tokens[-2:]
     assert argv[0] == "omp" and "--no-extensions" in argv
     opt = lambda k: argv[argv.index(k) + 1]  # noqa: E731
     assert opt("-e") == str(ROOT / "omp")
@@ -250,11 +251,14 @@ def test_dry_run_line_replays_without_keys(tmp_path):
                    "--json", env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     line = next(ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: "))
+    # The shell that replays the line still has the runner's keys and the parent's task ids.
+    replay_env = {**env, "SWARM_TASK_ID": "T-parent", "SWARM_CORRELATION_ID": "corr-parent"}
     p = subprocess.run(["/bin/sh", "-c", line.removeprefix("dry-run T-one [A05]: ")], capture_output=True, text=True,
-                       env=env, cwd=work, timeout=60)
+                       env=replay_env, cwd=work, timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
     (call,) = omp_calls(stub)
     assert not set(KEY_VARS) & set(call["env"])
+    assert "SWARM_TASK_ID" not in call["env"] and "SWARM_CORRELATION_ID" not in call["env"]
     assert call["env"]["SWARM_AGENT"] == "a05-backend" and call["env"]["SWARM_AGENT_SESSION"] == "1"
 
 
