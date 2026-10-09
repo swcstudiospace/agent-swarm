@@ -1,0 +1,12 @@
+{
+  "graphId": "ut-mv00tcgl-d8215d3",
+  "nodes": [
+    {
+      "id": "n1",
+      "kind": "understand",
+      "title": "Graph id is one hex digit short",
+      "depends_on": [],
+      "steps": ["Step 1: no owned file"]
+    }
+  ]
+}
