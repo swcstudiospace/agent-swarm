@@ -188,6 +188,42 @@ def _agent_verdict_feedback(store: TaskStore, task: dict, result: dict) -> None:
         store.append_feedback(target, {"gate": gate, "source": "agent", "findings": agent_findings(v)[0]})
 
 
+class _GateRefused(SwarmError):
+    """A gate result that must be refused. A different SwarmError from the same write, such as an illegal
+    transition, is not one of these and must keep propagating."""
+
+
+def _gate_result_error(store: TaskStore, task: dict, result: dict) -> _GateRefused | None:
+    """Why this gate task's IN_REVIEW result must be refused, or None when the script's rows from this lease agree.
+
+    Measured on `task` as it stands now, including lease history read from the store. A caller holding the write lock
+    on a row it has just re-read therefore sees a re-lease that landed after an earlier check (T-05-30): the latest
+    CLAIMED is the new lease, and a row the previous lease's script issued no longer counts."""
+    notes = task["notes_json"]
+    if not notes.get("gate"):
+        return None
+    tid = task["task_id"]
+    missing = _gate_script_missing(store, task)
+    if missing:
+        return _GateRefused(ErrorCode.E_CONTRACT, f"gate script not run for {missing}", task_id=tid)
+    if notes["gate"] != "review":
+        return None
+    mismatch = _review_verdict_mismatch(store, task, result)
+    if not mismatch:
+        return None
+    return _GateRefused(
+        ErrorCode.E_CONTRACT,
+        f"review verdict mismatch: agent verdicts fail {mismatch} but the review rows recorded this "
+        f"lease do not; re-run swarm_gate with a major finding for each of {mismatch}",
+        task_id=tid, targets=mismatch)
+
+
+def _refuse_gate(store: TaskStore, tid: str, err: SwarmError, mode: str, emit: Emit) -> str:
+    if mode == "headless":
+        return reject(store, tid, reason=str(err), mode=mode, emit=emit)
+    raise err
+
+
 def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, meta: dict, emit: Emit, mode: str) -> str:
     """Apply a validated result to the assigned task only; returns the task's new state."""
     tid = task["task_id"]
@@ -197,22 +233,12 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
     if mode == "ingest" and task["state"] == S.BLOCKED.value:
         raise SwarmError(ErrorCode.E_CONTRACT, f"{tid} is BLOCKED; A01 releases it with orch_status --transition after approval",
                          task_id=tid)
+    # Before a PLANNED/RETRY ingest claims a new lease: a refusal must leave that task unclaimed. The same check runs
+    # again under the write lock at the transition, which is what closes the race below.
     if state == S.IN_REVIEW.value and task["notes_json"].get("gate"):
-        missing = _gate_script_missing(store, task)  # D-12: only script rows satisfy a gate; checked before any transition
-        if missing:
-            err = SwarmError(ErrorCode.E_CONTRACT, f"gate script not run for {missing}", task_id=tid)
-            if mode == "headless":
-                return reject(store, tid, reason=str(err), mode=mode, emit=emit)
-            raise err
-        mismatch = _review_verdict_mismatch(store, task, result) if task["notes_json"]["gate"] == "review" else []
-        if mismatch:
-            err = SwarmError(ErrorCode.E_CONTRACT,
-                             f"review verdict mismatch: agent verdicts fail {mismatch} but the review rows recorded this "
-                             f"lease do not; re-run swarm_gate with a major finding for each of {mismatch}",
-                             task_id=tid, targets=mismatch)
-            if mode == "headless":
-                return reject(store, tid, reason=str(err), mode=mode, emit=emit)
-            raise err
+        err = _gate_result_error(store, task, result)  # D-12: only script rows satisfy a gate
+        if err is not None:
+            return _refuse_gate(store, tid, err, mode, emit)
     if mode == "ingest" and task["state"] in (S.PLANNED.value, S.RETRY.value):
         with store.transaction():  # the dependency check and the claim see one snapshot
             if not store.deps_satisfied(store.get(tid)):
@@ -232,7 +258,19 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
         if current != S.IN_PROGRESS.value:
             raise SwarmError(ErrorCode.E_CONTRACT, f"illegal transition {current} → IN_PROGRESS for {tid}", task_id=tid)
     if target is not None:
-        store.transition(tid, target, actor=agent_id, reason=reason)
+        # Re-read under the same write lock as the transition. Between the check above and here another caller can
+        # move a gate task through RETRY → CLAIMED → IN_PROGRESS; the state is IN_PROGRESS again, so the move to
+        # IN_REVIEW would be legal, and the previous lease's row would approve the target (T-05-30).
+        try:
+            with store.transaction():
+                fresh = store.get(tid)
+                if target is S.IN_REVIEW:
+                    err = _gate_result_error(store, fresh, result)
+                    if err is not None:
+                        raise err
+                store.transition(tid, target, actor=agent_id, reason=reason)
+        except _GateRefused as err:
+            return _refuse_gate(store, tid, err, mode, emit)
     store.set_notes(tid, result=result, meta=meta)
     for o in result.get("outputs", []) or []:
         store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""), version=str(o.get("version", "1")),

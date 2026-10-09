@@ -93,6 +93,37 @@ def test_a_re_lease_without_a_new_script_run_is_still_refused(tmp_path, swarm_di
     _not_run(_ingest(swarm, {"P-be": _PASS}))  # unchanged behaviour: the row is from the previous lease
 
 
+def test_a_re_lease_that_lands_after_the_script_check_is_still_refused(tmp_path, swarm_dir, monkeypatch):
+    """The check used to run on the caller's snapshot. A retry that reached IN_PROGRESS again before the transition
+    made that transition legal, and the previous lease's row then approved the target. Ingest is a subprocess, so
+    the interleaving is injected where the check returns, which is the window the race uses."""
+    from swarm import results
+    from swarm.errors import SwarmError
+
+    ts, swarm, work, corr = _setup(tmp_path)
+    _rev_gate(swarm, work, corr, {"P-be": []})
+    snapshot = ts.get("P-rev")
+    original = results._gate_script_missing
+
+    def after_the_check(store, task):
+        missing = original(store, task)
+        if not after_the_check.done:
+            after_the_check.done = True
+            store.transition("P-rev", "FAILED", reason="session died")
+            store.transition("P-rev", "RETRY", reason="requeue")
+            _lease(store, "P-rev")  # a new lease, and the script has not run in it
+        return missing
+
+    after_the_check.done = False
+    monkeypatch.setattr(results, "_gate_script_missing", after_the_check)
+    result = {"task_id": "P-rev", "state": "IN_REVIEW", "gate": "review", "verdicts": {"P-be": _PASS}}
+    with pytest.raises(SwarmError, match=r"gate script not run for \['P-be'\]"):
+        results.apply_result(ts, snapshot, agent_id="A09", result=result, meta={}, emit=lambda *a: None, mode="ingest")
+    assert ts.get("P-rev")["state"] == "IN_PROGRESS"  # the new lease stands; the result was not accepted
+    assert ts.get("P-be")["state"] == "IN_REVIEW"
+    assert "IN_REVIEW" not in [h["to_state"] for h in ts.history("P-rev")]
+
+
 def test_gate_script_missing_counts_every_target_before_a_lease_exists(tmp_path, swarm_dir, runner_key):
     from swarm import results
     ts, swarm, work, corr = _setup(tmp_path)
