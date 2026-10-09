@@ -98,7 +98,15 @@ python3 scripts/build_agents.py --install-workspace /path/to/ws                 
 python3 scripts/build_agents.py --install-workspace /path/to/ws --omp-mode copy  # omp agents + skills only
 python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run        # print the plan, config diff and env files, write nothing
 python3 scripts/build_agents.py --install-workspace /path/to/ws --no-substrate   # skip substrate-mcp install writes
+python3 scripts/build_agents.py --install-workspace /path/to/ws --with-a01-complete-hook  # also register the A01-complete Stop hook (off by default)
 ```
+
+- **A01-complete Stop hook** (`hooks/on_a01_complete.py`): not registered by default, because it can detach the
+  unattended runner. `--with-a01-complete-hook` registers it for Claude and Grok; a reinstall without the flag removes
+  an earlier registration of it and leaves any other Stop hook alone. Registered, it still detaches the runner only
+  when `AIO_SWARM_AFTER_ORCH=1`, a real signing key is configured, `SWARM_ALLOW_AUTONOMOUS=1` is set and no cloud-agent
+  marker (`CURSOR_AGENT`, `CURSOR_CLOUD_AGENT`, `CLOUD_AGENT`) is set; any other case records the reason on the
+  hook-fired event and spawns nothing.
 
 - **Link** (default) adds this checkout's `omp/` realpath to `extensions:` in `<ws>/.omp/config.yml`, so that file
   holds a host path by design. omp reads it from the cwd only: start omp at `<ws>`. When the file has no

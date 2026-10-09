@@ -12,7 +12,7 @@ Grok Bot: grokbot/swarm/seat-map.json and grokbot/skills/swarm-<lane>/SKILL.md
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
-                               [--runtimes claude,grok,omp | --no-substrate]
+                               [--runtimes claude,grok,omp | --no-substrate] [--with-a01-complete-hook]
 The install also wires substrate-mcp (scripts/_install_substrate.py): the `substrate` MCP entry for each runtime and one
 0600 env file per agent holding its SUBSTRATE_TOKEN, read from SUBSTRATE_TOKEN_<SURFACE> (docs/substrate-workspace.md).
 Copy Cursor agents only (no substrate, no MCP, no env files):
@@ -61,6 +61,16 @@ ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transit
 GATES = {"A08": ("quality", "qa_gate"), "A09": ("review", "rev_gate"), "A10": ("security", "sec_gate"), "A12": ("release", "rel_plan")}
 GATE_AGENTS = set(GATES)
 
+# One rule block for every render. Claude, Grok, omp (all three preambles) and Cursor embed it verbatim, so the merge,
+# branch, keyless-advisory and no-bypass rules cannot drift apart (tests/test_render_rules.py pins it). It must stay
+# short: omp/agents/a01-orchestrator.md is the largest agent and is capped at 24 KB (tests/test_omp_agents.py).
+# It must not contain the literal pre-change branch text: tests/test_cursor_agents.py forbids it in Cursor output.
+SHARED_RULES = """- Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch. Work ends at a draft PR and a report; a human merges. Where the body below grants merge or auto-merge rights, open a draft PR and report instead.
+- Branches are `<seat-prefix>/<task_id>`. In a Programming Desk repo `<seat-prefix>` is the ownership.yaml owner of the files you change, so the branch is bot-0N-<seat>/<task_id> (gates.yml rejects any prefix not matching ^bot-0[0-6]-[a-z0-9-]+$); with more than one owner, stop BLOCKED with needs naming the seats. In any other repo `<seat-prefix>` is swarm.
+- Without a real signing key (SWARM_ED25519_KEY and SWARM_SIGNING_KEY unset) gate scripts record no verdict rows and nothing counts as APPROVED: report such results as advisory, never as a pass. Never set a signing key or SWARM_ALLOW_INSECURE_DEV_KEY, never sign or hand-write a verdict, never move a task to APPROVED or DONE yourself.
+- Never start scripts/swarm_run.py or hooks/autonomous_run.py unless the operator's assignment tells you to (specialists never do). Never use or ask for a permission-bypass mode (bypassPermissions, --dangerously-skip-permissions, --yolo).
+"""
+
 CLAUDE_PREAMBLE = """<swarm_runtime>
 You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
 - Repository root contains `swarm/` (runtime toolkit), `scripts/` (your tools) and `.swarm/` (task store, verdicts, event log).
@@ -70,8 +80,7 @@ You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 
 - Finish with: (1) a short markdown summary, (2) exactly one fenced ```json block that is your `task.result` (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
 - Spawn sibling agents with the Agent tool, `subagent_type` = their slug (a02-requirements … a15-docs).
-</swarm_runtime>
-"""
+""" + SHARED_RULES + "</swarm_runtime>\n"
 
 GROK_PREAMBLE = """You are running as a Grok Build subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
 
@@ -83,7 +92,7 @@ GROK_PREAMBLE = """You are running as a Grok Build subagent inside the AgentSwar
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Finish with: (1) a short markdown summary, (2) exactly one fenced json block that is your `task.result` (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
-"""
+""" + SHARED_RULES
 
 
 def _body(agent: dict) -> str:
@@ -111,7 +120,7 @@ def render_claude(agent: dict, defaults: dict) -> str:
         "model: inherit",
         "---",
     ]
-    return "\n".join(fm) + "\n\n" + CLAUDE_PREAMBLE + "\n" + _body(agent) + "\n"
+    return "\n".join(fm) + "\n\n" + CLAUDE_PREAMBLE + "\n" + apply_shared_substitutions(agent["id"], _body(agent)) + "\n"
 
 
 def render_grok(agent: dict, defaults: dict) -> str:
@@ -128,7 +137,7 @@ def render_grok(agent: dict, defaults: dict) -> str:
         "agents_md: true",
         "---",
     ]
-    return "\n".join(fm) + "\n\n" + GROK_PREAMBLE + "\n" + _body(agent) + "\n"
+    return "\n".join(fm) + "\n\n" + GROK_PREAMBLE + "\n" + apply_shared_substitutions(agent["id"], _body(agent)) + "\n"
 
 
 # Cursor subagent frontmatter is name, description, model, readonly, is_background
@@ -142,10 +151,8 @@ _CURSOR_COMMON = """You are running as a Cursor subagent inside the AgentSwarm (
 - Read the JSON a script prints, then act. Never fabricate script output.
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Cloud sessions are advisory. No signing key is present (SWARM_ED25519_KEY is unset and SWARM_REQUIRE_KEY is unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
-- Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch. Work ends at a draft PR, and a human merges after the Desk's Greptile gate. Where the body below grants merge or auto-merge rights, open a draft PR and report instead.
 - A missing signing key (SWARM_ED25519_KEY, SWARM_SIGNING_KEY and SWARM_REQUIRE_KEY unset) is the expected Cursor state and is not E-DEP. Accept an unsigned task.assign from the parent session or a01-orchestrator, and do not sign. A gate call is a non-recording preview under the rule below, so report every gate result as advisory. This overrides the body rules that agents reject unsigned assignments and that a missing signing key means E-DEP. A missing Task Store, python3 or git is still E-DEP.
 - Run every gate script (qa_gate, rev_gate, sec_gate, rel_plan) only as a non-recording preview through python3, with SWARM_AGENT_SESSION=1 in its environment, for example SWARM_AGENT_SESSION=1 python3 "$SWARM_ROOT/scripts/qa_gate.py" --root <target repo> --task-id <id> --correlation-id <id> --json. The script then writes an advisory envelope file and records no verdict rows. Do not use bun scripts/ts/sec_gate.ts for this preview: that twin returns scan JSON and appends a script.sec_gate event, and it does not write the advisory envelope. The security preview is python3 "$SWARM_ROOT/scripts/sec_gate.py". Never set SWARM_SIGNING_KEY, SWARM_ED25519_KEY or SWARM_ALLOW_INSECURE_DEV_KEY, never sign or record a verdict, and never ingest a gate result or transition any task to APPROVED or DONE. A gate result that fails, is refused or is unrecorded is advisory, never a pass. When a gate child returns, A01 does not leave that task leased: A01 transitions it to BLOCKED with reason "advisory preview recorded no verdict rows; human records the gate", stops the scheduling loop, and does not spawn tasks that depend on it. Those dependents stay unscheduled. The handoff records no verdict rows and is not APPROVED.
-- Use the host repository's branch convention. In a Programming Desk repo the branch is bot-0N-<seat>/<task_id>, where bot-0N-<seat> is the ownership.yaml owner of the files you change, because the desk's gates.yml rejects any prefix that does not match ^bot-0[0-6]-[a-z0-9-]+$. If the changed files have more than one owner, stop BLOCKED with needs naming the seats so the work is split.
 - Do not start an unattended headless runner. Dispatch only as the nesting rule below says.
 - Finish with: (1) a short markdown summary, (2) exactly one fenced json block that is your task.result (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report "state": "BLOCKED", "needs": "human-approval: …".
@@ -163,27 +170,18 @@ _CURSOR_SPEC = (
 
 def _cursor_preamble(agent_id: str) -> str:
     nesting = _CURSOR_ORCH if agent_id == "A01" else _CURSOR_SPEC
-    return "<swarm_runtime>\n" + _CURSOR_COMMON + nesting + "</swarm_runtime>\n"
+    return "<swarm_runtime>\n" + _CURSOR_COMMON + SHARED_RULES + nesting + "</swarm_runtime>\n"
 
 
-# Cursor-only rewrites of the shared prompt body. Claude, Grok and omp keep the
-# prompt text. Each old string must occur exactly once in that agent's body; a
-# missing or duplicated pattern raises so a later prompt edit cannot drop a fix.
-CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
-    "A01": (
-        (
-            "When a subagent returns, apply its result: `orch_status.py --repo <app> --ingest` its task.result, then re-read status. Gate tasks are those with capability `gate.*` and notes.gate set; gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself.",
-            "When a subagent returns, ingest a non-gate task.result with `orch_status.py --repo <app> --ingest --advisory`, then re-read status. `--advisory` saves the result and does not attempt APPROVED or DONE, so a keyless requirements result stays IN_REVIEW and the command exits 0. When a gate child returns (capability `gate.*` with notes.gate set), do not ingest its result and do not record a verdict. Transition that gate task to BLOCKED: `orch_status.py --repo <app> --transition <id> BLOCKED --reason \"advisory preview recorded no verdict rows; human records the gate\"`. Then stop the scheduling loop and do not spawn tasks that depend on it; name those unscheduled dependents in the final swarm.status next_actions. Never transition any task to APPROVED or DONE. Gate scripts are non-recording previews under the Cursor gate rule in the preamble.",
-        ),
-        (
-            "5. Ingest each child's JSON via `orch_status.py --repo <app> --ingest`. Gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself. Apply fail-closed gates and the max-2 rework loop.",
-            "5. Ingest each non-gate child's JSON via `orch_status.py --repo <app> --ingest --advisory`, which saves the result and does not attempt APPROVED or DONE. When a gate child returns, do not ingest it. Transition it to BLOCKED: `orch_status.py --repo <app> --transition <id> BLOCKED --reason \"advisory preview recorded no verdict rows; human records the gate\"`, then stop the scheduling loop and do not spawn tasks that depend on it. Never transition any task to APPROVED or DONE. Apply the max-2 rework loop only from verdict rows recorded outside this session.",
-        ),
-    ),
+# Rewrites of the shared prompt body. SHARED_BODY_SUBSTITUTIONS apply to every render (Claude, Grok, omp, Cursor): they
+# turn the merge, auto-merge and branch grants of A05, A06, A09 and A14 into the shared rule block's wording. The
+# Cursor-only rewrites (A01 and A10 gate handling) apply to Cursor alone. Each old string must occur exactly once in
+# that agent's body; a missing or duplicated pattern raises so a later prompt edit cannot drop a fix.
+SHARED_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "A05": (
         (
             "PR on branch `swarm/<task_id>`",
-            "PR on branch `<seat-prefix>/<task_id>` per the Cursor branch rule in the preamble",
+            "PR on branch `<seat-prefix>/<task_id>` per the branch rule in the preamble",
         ),
         (
             '"branch": "swarm/T-884"',
@@ -193,7 +191,7 @@ CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "A06": (
         (
             "PR on branch `swarm/<task_id>`",
-            "PR on branch `<seat-prefix>/<task_id>` per the Cursor branch rule in the preamble",
+            "PR on branch `<seat-prefix>/<task_id>` per the branch rule in the preamble",
         ),
         (
             '"branch": "swarm/T-902"',
@@ -203,7 +201,29 @@ CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "A09": (
         (
             "trivial auto-fixes go on `auto-fix/*` branches that the producer still merges",
-            "trivial auto-fixes go on `<seat-prefix>/<task_id>` branches per the Cursor branch rule in the preamble; open a draft PR and report it for a human to merge",
+            "trivial auto-fixes go on `<seat-prefix>/<task_id>` branches per the branch rule in the preamble; open a draft PR and report it for a human to merge",
+        ),
+    ),
+    "A14": (
+        (
+            "semver-compatible + green gates ⇒ auto-mergeable (L2, max N/day per repo to bound blast radius).",
+            "semver-compatible + green gates ⇒ open a draft PR and report it (L2, max N/day per repo to bound blast radius). A human merges after the repository's review gate.",
+        ),
+        (
+            "merge semver-compatible bumps behind green gates",
+            "open a draft PR for semver-compatible bumps behind green gates and report it for a human to merge",
+        ),
+    ),}
+
+_CURSOR_ONLY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "A01": (
+        (
+            "When a subagent returns, apply its result: `orch_status.py --repo <app> --ingest` its task.result, then re-read status. Gate tasks are those with capability `gate.*` and notes.gate set; gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself.",
+            "When a subagent returns, ingest a non-gate task.result with `orch_status.py --repo <app> --ingest --advisory`, then re-read status. `--advisory` saves the result and does not attempt APPROVED or DONE, so a keyless requirements result stays IN_REVIEW and the command exits 0. When a gate child returns (capability `gate.*` with notes.gate set), do not ingest its result and do not record a verdict. Transition that gate task to BLOCKED: `orch_status.py --repo <app> --transition <id> BLOCKED --reason \"advisory preview recorded no verdict rows; human records the gate\"`. Then stop the scheduling loop and do not spawn tasks that depend on it; name those unscheduled dependents in the final swarm.status next_actions. Never transition any task to APPROVED or DONE. Gate scripts are non-recording previews under the Cursor gate rule in the preamble.",
+        ),
+        (
+            "5. Ingest each child's JSON via `orch_status.py --repo <app> --ingest`. Gate agents' scripts record the signed verdicts on their gate_for targets; never record or hand-write verdicts yourself. Apply fail-closed gates and the max-2 rework loop.",
+            "5. Ingest each non-gate child's JSON via `orch_status.py --repo <app> --ingest --advisory`, which saves the result and does not attempt APPROVED or DONE. When a gate child returns, do not ingest it. Transition it to BLOCKED: `orch_status.py --repo <app> --transition <id> BLOCKED --reason \"advisory preview recorded no verdict rows; human records the gate\"`, then stop the scheduling loop and do not spawn tasks that depend on it. Never transition any task to APPROVED or DONE. Apply the max-2 rework loop only from verdict rows recorded outside this session.",
         ),
     ),
     "A10": (
@@ -224,29 +244,31 @@ CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "2. Run python3 scripts/sec_gate.py for the security gate. The bun security twin does not write the advisory envelope.",
         ),
     ),
-    "A14": (
-        (
-            "semver-compatible + green gates ⇒ auto-mergeable (L2, max N/day per repo to bound blast radius).",
-            "semver-compatible + green gates ⇒ open a draft PR and report it (L2, max N/day per repo to bound blast radius). A human merges after the Desk's Greptile gate.",
-        ),
-        (
-            "merge semver-compatible bumps behind green gates",
-            "open a draft PR for semver-compatible bumps behind green gates and report it for a human to merge",
-        ),
-    ),
+}
+
+# Everything the Cursor render rewrites: the shared rewrites first, then the Cursor-only ones.
+CURSOR_BODY_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    agent: SHARED_BODY_SUBSTITUTIONS.get(agent, ()) + _CURSOR_ONLY_SUBSTITUTIONS.get(agent, ())
+    for agent in sorted({*SHARED_BODY_SUBSTITUTIONS, *_CURSOR_ONLY_SUBSTITUTIONS})
 }
 
 
-def apply_cursor_substitutions(agent_id: str, body: str) -> str:
-    """Rewrite Cursor grant and branch lines. Raises if an expected pattern is absent."""
-    for old, new in CURSOR_BODY_SUBSTITUTIONS.get(agent_id, ()):
+def _apply_substitutions(table: dict[str, tuple[tuple[str, str], ...]], runtime: str, agent_id: str, body: str) -> str:
+    """Rewrite grant and branch lines. Raises if an expected pattern is absent or duplicated."""
+    for old, new in table.get(agent_id, ()):
         count = body.count(old)
         if count != 1:
-            raise ValueError(
-                f"{agent_id}: Cursor substitution pattern found {count} times, expected 1: {old}"
-            )
+            raise ValueError(f"{agent_id}: {runtime} substitution pattern found {count} times, expected 1: {old}")
         body = body.replace(old, new, 1)
     return body
+
+
+def apply_shared_substitutions(agent_id: str, body: str) -> str:
+    return _apply_substitutions(SHARED_BODY_SUBSTITUTIONS, "shared", agent_id, body)
+
+
+def apply_cursor_substitutions(agent_id: str, body: str) -> str:
+    return _apply_substitutions(CURSOR_BODY_SUBSTITUTIONS, "Cursor", agent_id, body)
 
 
 def render_cursor(agent: dict, defaults: dict) -> str:
@@ -270,7 +292,7 @@ _OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Finish by calling the `yield` tool with your `task.result` (or gate verdict) payload as defined in <output_format> as `data`; under omp this replaces any fenced-json finish instruction in the body below. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
-"""
+""" + SHARED_RULES
 
 OMP_PREAMBLE = "<swarm_runtime>\n" + _OMP_COMMON + "</swarm_runtime>\n"
 
@@ -338,7 +360,7 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
         preamble = _omp_gate_preamble(agent["id"])
     else:
         preamble = OMP_PREAMBLE
-    return "\n".join(fm) + "\n\n" + preamble + "\n" + _body(agent) + "\n"
+    return "\n".join(fm) + "\n\n" + preamble + "\n" + apply_shared_substitutions(agent["id"], _body(agent)) + "\n"
 
 
 # Grok Bot homes. The seat ids match programming-desk ownership.yaml (bot-00 lead through
@@ -763,7 +785,38 @@ def _copy_file(src: Path, dest: Path) -> None:
     shutil.copy2(src, dest)
 
 
-def merge_claude_settings(settings_path: Path, hook_cmd: str) -> None:
+def _is_a01_complete(hook: object) -> bool:
+    """True for a hook whose command runs hooks/on_a01_complete.py (the entry this installer registers)."""
+    return isinstance(hook, dict) and any(tok.endswith("on_a01_complete.py") for tok in str(hook.get("command", "")).split())
+
+
+def _set_a01_complete_hook(hooks: dict, complete_cmd: str, enabled: bool) -> None:
+    """Make the `Stop` entry of a hooks mapping match the request: with `enabled` exactly one a01-complete hook (this
+    checkout's path) is registered, otherwise none. Other Stop hooks are never touched."""
+    complete_hook = {"hooks": [{"type": "command", "command": complete_cmd}]}
+    stop = hooks.get("Stop")
+    if not isinstance(stop, list):
+        if enabled:
+            hooks["Stop"] = [complete_hook]
+        return
+    kept = []
+    for entry in stop:
+        inner = entry.get("hooks") if isinstance(entry, dict) else None
+        if not isinstance(inner, list) or not any(_is_a01_complete(h) for h in inner):
+            kept.append(entry)
+            continue
+        rest = [h for h in inner if not _is_a01_complete(h)]
+        if rest:
+            kept.append({**entry, "hooks": rest})
+    if enabled:
+        kept.append(complete_hook)
+    if kept:
+        hooks["Stop"] = kept
+    else:
+        hooks.pop("Stop", None)
+
+
+def merge_claude_settings(settings_path: Path, hook_cmd: str, with_a01_complete_hook: bool = False) -> None:
     data: dict = {}
     if settings_path.exists():
         try:
@@ -775,19 +828,14 @@ def merge_claude_settings(settings_path: Path, hook_cmd: str) -> None:
     hooks["UserPromptSubmit"] = [
         {"hooks": [{"type": "command", "command": hook_cmd}]}
     ]
-    # n3/n8: register Stop for a01-orchestrator completion / ultrathink end (on_a01_complete.py)
-    # This makes the opt-in AIO_SWARM_AFTER_ORCH trigger reachable for gsd-autonomous parallel.
-    complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
-    stop_hooks = hooks.setdefault("Stop", [])
-    complete_hook = {"hooks": [{"type": "command", "command": complete_cmd}]}
-    if complete_hook not in stop_hooks:
-        stop_hooks.append(complete_hook)
+    # n3/n8: the Stop hook that fires the after-orchestrate trigger (on_a01_complete.py, which can detach an unattended
+    # runner) is registered only on request; a reinstall without the flag removes an earlier registration of it.
+    _set_a01_complete_hook(hooks, hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py"), with_a01_complete_hook)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def write_grok_hooks(path: Path, hook_cmd: str) -> None:
-    complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
+def write_grok_hooks(path: Path, hook_cmd: str, with_a01_complete_hook: bool = False) -> None:
     payload: dict = {}
     if path.exists():
         try:
@@ -796,12 +844,10 @@ def write_grok_hooks(path: Path, hook_cmd: str) -> None:
             payload = {}
     hooks = payload.setdefault("hooks", {})
     hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": hook_cmd}]}]
-    stop_hooks = hooks.setdefault("Stop", [])
-    complete_hook = {"hooks": [{"type": "command", "command": complete_cmd}]}
-    if complete_hook not in stop_hooks:
-        stop_hooks.append(complete_hook)
+    _set_a01_complete_hook(hooks, hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py"), with_a01_complete_hook)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n")
+
 
 def _workspace_hooks(workspace: Path) -> tuple[Path, Path]:
     """(Claude settings, Grok hook file) the workspace install writes."""
@@ -824,7 +870,7 @@ def _workspace_copies(workspace: Path) -> list[tuple[Path, Path]]:
     return pairs
 
 
-def install_workspace(workspace: Path, dry_run: bool = False) -> None:
+def install_workspace(workspace: Path, dry_run: bool = False, with_a01_complete_hook: bool = False) -> None:
     """Copy the Claude/Grok agents, skills and hooks into `workspace`; never writes into this repo (D-08).
 
     Skill copies get the literal `$SWARM_ROOT` replaced by this checkout's realpath, and the workspace hooks call
@@ -838,8 +884,13 @@ def install_workspace(workspace: Path, dry_run: bool = False) -> None:
         for src, dest in pairs:
             print(f"dry-run: would copy {src.relative_to(ROOT)} -> {dest}")
         print(f"dry-run: would set the UserPromptSubmit hook in {settings} (replacing existing ones): {hook_cmd}")
-        print(f"dry-run: would set the Stop (a01-complete) hook in {settings}: {complete_cmd}")
-        print(f"dry-run: would write {grok_hook}: {hook_cmd} + Stop for on_a01_complete")
+        if with_a01_complete_hook:
+            print(f"dry-run: would set the Stop (a01-complete) hook in {settings}: {complete_cmd}")
+            print(f"dry-run: would write {grok_hook}: {hook_cmd} + Stop for on_a01_complete")
+        else:
+            print(f"dry-run: would write {grok_hook}: {hook_cmd}")
+            print("dry-run: the Stop (a01-complete) hook is not installed (--with-a01-complete-hook opts in); "
+                  "an earlier registration of it would be removed")
         return
     skills_src = ROOT / "skills"
     for src, dest in pairs:
@@ -848,8 +899,8 @@ def install_workspace(workspace: Path, dry_run: bool = False) -> None:
             dest.write_text(src.read_text(encoding="utf-8").replace("$SWARM_ROOT", str(root)), encoding="utf-8")
         else:
             _copy_file(src, dest)
-    merge_claude_settings(settings, hook_cmd)
-    write_grok_hooks(grok_hook, hook_cmd)
+    merge_claude_settings(settings, hook_cmd, with_a01_complete_hook)
+    write_grok_hooks(grok_hook, hook_cmd, with_a01_complete_hook)
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -863,14 +914,18 @@ def main() -> int:
                                        f"substrate-mcp (default {','.join(_install_substrate.RUNTIMES)}); a runtime that cannot call MCP is refused")
     ap.add_argument("--no-substrate", action="store_true", help="with --install-workspace: no substrate-mcp entries and no agent env files "
                                                                 "(the swarm then runs with the substrate integration off)")
+    ap.add_argument("--with-a01-complete-hook", action="store_true",
+                    help="with --install-workspace: also register hooks/on_a01_complete.py as a Claude/Grok Stop hook (off by default: it "
+                         "can detach the unattended runner, which itself needs a real signing key and SWARM_ALLOW_AUTONOMOUS=1); "
+                         "a reinstall without this flag removes an earlier registration")
     args = ap.parse_args()
-    if (args.omp_mode or args.runtimes or args.no_substrate) and not args.install_workspace:
-        ap.error("--omp-mode, --runtimes and --no-substrate need --install-workspace")
+    if (args.omp_mode or args.runtimes or args.no_substrate or args.with_a01_complete_hook) and not args.install_workspace:
+        ap.error("--omp-mode, --runtimes, --no-substrate and --with-a01-complete-hook need --install-workspace")
     if args.dry_run and not args.install_workspace and not args.install_cursor:
         ap.error("--dry-run needs --install-workspace or --install-cursor")
     if args.install_cursor and args.install_workspace:
         ap.error("--install-cursor cannot be combined with --install-workspace")
-    if args.install_cursor and (args.omp_mode or args.runtimes or args.no_substrate or args.check or args.only):
+    if args.install_cursor and (args.omp_mode or args.runtimes or args.no_substrate or args.with_a01_complete_hook or args.check or args.only):
         ap.error("--install-cursor only combines with --dry-run")
     if args.runtimes and args.no_substrate:
         ap.error("--runtimes wires substrate-mcp; it cannot be combined with --no-substrate")
@@ -906,7 +961,7 @@ def main() -> int:
             return 2
         if args.dry_run:
             print("dry-run: skipping generation; the files below are copied as they are on disk")
-            install_workspace(workspace, dry_run=True)
+            install_workspace(workspace, dry_run=True, with_a01_complete_hook=args.with_a01_complete_hook)
             substrate = 0 if args.no_substrate else _install_substrate.install_substrate(workspace, runtimes, True, sys.stdout)
             return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout))
     link = _generated_symlink()
@@ -980,7 +1035,7 @@ def main() -> int:
         # the substrate step first: its env files live outside the workspace, so a failure there writes nothing in it
         if not args.no_substrate and _install_substrate.install_substrate(workspace, runtimes, False, sys.stdout):
             return 2
-        install_workspace(workspace)
+        install_workspace(workspace, with_a01_complete_hook=args.with_a01_complete_hook)
         print(f"installed Claude/Grok agents, skills and hook into {workspace}")
         return _install_omp.install_omp(workspace, mode, False, sys.stdout)
     return 0
