@@ -18,7 +18,7 @@ from swarm.taskstore import TaskStore  # noqa: E402
 from swarm.runlog import read_events  # noqa: E402
 from swarm.paths import latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
-from swarm.results import parse_result, validate_result, apply_result, reconcile, reject  # noqa: E402
+from swarm.results import parse_result, validate_result, apply_result, reconcile, reject, check_manual_transition  # noqa: E402
 from swarm import substrate_lease  # noqa: E402
 
 
@@ -64,6 +64,7 @@ def run(args, ctx) -> dict:
         tid, state = args.transition
         if ctx.dry_run:
             return {"status": "ok", "summary": f"dry-run: would transition {tid} → {state}"}
+        check_manual_transition(store, tid, state)  # T-05-31: a gate task reaches IN_REVIEW only through an ingest
         store.transition(tid, state, actor="A01", reason=args.reason or "manual")
         # a lease the runner mirrored in notes.lease is released (CANCELLED, FAILED, …) or completed (DONE) now, by its
         # lease_id and with the agent's token for this workspace (--root, the runner's --repo), rather than left to
