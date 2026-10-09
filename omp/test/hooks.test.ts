@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { SWARM_SLUGS } from "../src/guard.ts";
-import { classifiedText, RUNTIME_HEADING, runtimeContext, runtimePart, shellQuote, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
+import { classifiedText, classifyPrompt, RUNTIME_HEADING, runtimeContext, runtimePart, shellQuote, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
@@ -115,6 +115,13 @@ describe("uplift XML: HOOK-01 classifies the user's ORIGINAL (WR-01)", () => {
   test("entities inside ORIGINAL are unescaped, and amp last", () => {
     const prompt = "<BUILD_PROMPT><ORIGINAL>a &lt;b&gt; &amp;lt; &quot;c&quot;</ORIGINAL></BUILD_PROMPT>";
     expect(classifiedText(prompt)).toBe(`a <b> &lt; "c"`);
+  });
+  test("a dotted capital I inside ORIGINAL does not shift the closing tag", () => {
+    const original = "Deploy the \u0130stanbul app?";
+    const prompt = `<RESEARCH_PROMPT><ORIGINAL>${original}</ORIGINAL></RESEARCH_PROMPT>`;
+    const text = classifiedText(prompt);
+    expect(text).toBe(original);
+    expect(classifyPrompt(text)).toBe(false);
   });
   test("a runtime root with spaces or a quote is one shell word on the command line", () => {
     const root = "/tmp/my swarm/o'clock";

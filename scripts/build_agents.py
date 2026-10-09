@@ -804,7 +804,8 @@ def _load_hook_config(path: Path) -> dict:
     """The JSON object at `path`, or {} when the file is absent.
 
     A present file that is not a JSON object, not a regular file, or larger than the cap is an error. Replacing it
-    with {} would drop every other setting. The open is non-blocking, so a FIFO cannot stall the install."""
+    with {} would drop every other setting. The open is non-blocking, so a FIFO cannot stall the install. `os.read`
+    may return short; the read loops until EOF or the buffer exceeds the cap (still too big)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -817,7 +818,15 @@ def _load_hook_config(path: Path) -> dict:
             raise HookConfigError(f"{path} is not a regular file")
         if info.st_size > _HOOK_JSON_CAP:
             raise HookConfigError(f"{path} is larger than {_HOOK_JSON_CAP} bytes")
-        raw = os.read(fd, _HOOK_JSON_CAP + 1)
+        parts: list[bytes] = []
+        total = 0
+        while total <= _HOOK_JSON_CAP:
+            chunk = os.read(fd, _HOOK_JSON_CAP + 1 - total)
+            if chunk == b"":
+                break
+            parts.append(chunk)
+            total += len(chunk)
+        raw = b"".join(parts)
     except OSError as exc:
         raise HookConfigError(f"{path} could not be read ({exc.strerror})") from exc
     finally:
