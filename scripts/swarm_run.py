@@ -704,10 +704,14 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
             on_session(None)
         group.close()
     out, err = "".join(out_parts), "".join(err_parts)
+    # T-06-10: the live path records the producing runtime and argv like --dry-run does, so a stored
+    # result names what produced it. Last so a session payload can never clobber the runner's own keys.
+    live = {"runtime": runtime, "argv": cmd}
     if timed_out:
         text, meta = session_output(runtime, out, err, proc.returncode)
-        raise AgentTimeout(cmd, args.task_timeout, text, {**meta, "timed_out": True})
+        raise AgentTimeout(cmd, args.task_timeout, text, {**meta, **live, "timed_out": True})
     text, meta = session_output(runtime, out, err, proc.returncode)
+    meta = {**meta, **live}
     if scan is not None and scan.message:
         meta.setdefault("extension_error", scan.message)
         meta["is_error"] = True
@@ -806,6 +810,21 @@ def run_gate_script(task, repo, sdir, *, dry_run, per_target_findings=None, time
 FINDINGS_GATES = ("review", "quality", "security")
 
 
+def evidence_path(sdir, tid: str, attempt: int, suffix: str = ".md") -> Path:
+    """Evidence path that never overwrites: `results/<tid>.a<attempt><suffix>` on first write,
+    `results/<tid>.a<attempt>.r<n><suffix>` once a same-attempt redispatch finds it taken, so the
+    prior attempt's file stays readable (T-06-10). No reader depends on the exact name: post-mortem
+    and debug tooling list the directory."""
+    results = Path(sdir) / "results"
+    first = results / f"{tid}.a{attempt}{suffix}"
+    if not first.exists():
+        return first
+    n = 1
+    while (results / f"{tid}.a{attempt}.r{n}{suffix}").exists():
+        n += 1
+    return results / f"{tid}.a{attempt}.r{n}{suffix}"
+
+
 def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     """Review, quality and security gates: write {target: [findings]} — what the agent reported under verdicts{}
     for each gate_for target — to results/<tid>.a<N>.findings.json for the gate script's --per-target-findings, so
@@ -871,7 +890,7 @@ def gate_findings_file(task: dict, text: str, sdir: Path, emit) -> Path | None:
     if stray:
         emit("gate.findings.unattributed", {"task_id": task["task_id"], "keys": stray, "applied_to": gate_for,
                                             "findings": len(unattributed)})
-    path = Path(sdir) / "results" / f"{task['task_id']}.a{task['attempt']}.findings.json"
+    path = evidence_path(sdir, task['task_id'], task['attempt'], ".findings.json")
     path.write_text(json.dumps(per_target, indent=2))
     return path
 
@@ -985,7 +1004,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
             watch.check(text, meta)  # lost before the session spawned: it never starts
             text, meta = run_agent_headless(agent, prompt, repo, args, on_session=watch.attach)
         (sdir / "results").mkdir(parents=True, exist_ok=True)
-        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        evidence_path(sdir, tid, task['attempt']).write_text(text or "")
         result, err = None, None
         try:
             result = validate_result(parse_result(text), task_id=tid)
@@ -1019,7 +1038,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
     except AgentTimeout as e:
         # WR-04: keep what the session wrote before its process group was killed
         (sdir / "results").mkdir(parents=True, exist_ok=True)
-        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(e.text or "")
+        evidence_path(sdir, tid, task['attempt']).write_text(e.text or "")
         ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": e.meta})
         store.set_notes(tid, meta=e.meta)
         store.transition(tid, S.FAILED, reason="E-TIMEOUT: task_timeout exceeded")
@@ -1029,7 +1048,7 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
         # this result is never applied, whether the stop came during the session, the gate script or before the write
         text, meta = e.text or text, {**meta, **e.meta}
         (sdir / "results").mkdir(parents=True, exist_ok=True)
-        (sdir / "results" / f"{tid}.a{task['attempt']}.md").write_text(text or "")
+        evidence_path(sdir, tid, task['attempt']).write_text(text or "")
         if not raw_recorded:
             ctx.emit("task.result.raw", {"task_id": tid, "agent": agent["id"], "meta": meta})
         store.set_notes(tid, meta=meta)

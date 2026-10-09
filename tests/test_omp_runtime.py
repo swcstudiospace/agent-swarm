@@ -555,3 +555,70 @@ def test_low_risk_plan_done_on_omp(tmp_path):
         assert Path(c["cwd"]) == work
         assert c["argv"][1:4] == ["-p", "--mode", "json"]
 
+
+
+# ---------------------------------------------------------------- (f) T-06-10 rework evidence
+def test_live_result_meta_records_runtime_and_argv(tmp_path):
+    """Live (non-dry-run) dispatches store the producing runtime and argv in notes meta and the
+    task.result.raw event, matching what --dry-run records."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT)
+    r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(stub), "--repo", str(work),
+                   "--once", "--json", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (call,) = omp_calls(stub)
+    con = sqlite3.connect(swarm / "tasks.db")
+    (notes_raw,) = con.execute("SELECT notes FROM tasks WHERE task_id='T-one'").fetchone()
+    con.close()
+    stored = json.loads(notes_raw)["meta"]
+    assert stored["runtime"] == "omp" and stored["argv"] == call["argv"]
+    assert stored["argv"][0] == str(stub)
+    raw = [json.loads(ln) for ln in (swarm / "events.jsonl").read_text().splitlines() if '"task.result.raw"' in ln]
+    event_meta = raw[-1]["payload"]["meta"]
+    assert event_meta["runtime"] == "omp" and event_meta["argv"] == call["argv"]
+    assert (swarm / "results" / "T-one.a1.md").is_file()
+
+
+def test_same_attempt_redispatch_preserves_evidence_file(sr, tmp_path):
+    """A second write of the same attempt namespaces instead of overwriting: the prior file stays readable."""
+    sdir = tmp_path / ".swarm"
+    (sdir / "results").mkdir(parents=True)
+    first = sr.evidence_path(sdir, "T-one", 1)
+    assert first.name == "T-one.a1.md"
+    first.write_text("first attempt output")
+    second = sr.evidence_path(sdir, "T-one", 1)
+    assert second.name == "T-one.a1.r1.md"
+    second.write_text("redispatch output")
+    assert first.read_text() == "first attempt output"
+    assert second.read_text() == "redispatch output"
+    assert sr.evidence_path(sdir, "T-one", 1).name == "T-one.a1.r2.md"
+
+
+def test_rework_stashes_failing_evidence(tmp_path):
+    """CHANGES_REQUESTED stashes the failing attempt's result/meta under notes.rework_evidence, so a
+    later dispatch replacing them leaves the failing evidence reachable; with no prior result only
+    verdicts_since is stamped."""
+    from swarm.taskstore import TaskStore
+    store = TaskStore(tmp_path / "tasks.db")
+    failing_result = {"task_id": "T-one", "state": "IN_REVIEW", "summary_md": "bad"}
+    failing_meta = {"runtime": "omp", "argv": ["omp", "-p"]}
+    store.create(task_id="T-one", correlation_id="c", capability="code.backend")
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("T-one", state)
+    store.set_notes("T-one", result=failing_result, meta=failing_meta)
+    store.transition("T-one", "CHANGES_REQUESTED", reason="gate failed")
+    notes = store.get("T-one")["notes_json"]
+    assert notes["verdicts_since"] > 0
+    assert notes["rework_evidence"] == [{"result": failing_result, "meta": failing_meta}]
+    store.set_notes("T-one", result={"task_id": "T-one", "state": "IN_REVIEW", "summary_md": "retry"},
+                    meta={"runtime": "omp", "argv": ["omp", "-p", "--retry"]})
+    assert store.get("T-one")["notes_json"]["rework_evidence"] == [
+        {"result": failing_result, "meta": failing_meta}]
+    store.create(task_id="T-two", correlation_id="c", capability="code.backend")
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("T-two", state)
+    store.transition("T-two", "CHANGES_REQUESTED", reason="manual")
+    bare = store.get("T-two")["notes_json"]
+    assert "rework_evidence" not in bare and bare["verdicts_since"] > 0
