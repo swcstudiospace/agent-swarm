@@ -83,9 +83,39 @@ def tree(tmp_path):
     return t.resolve()
 
 
+# Inheritable env for run_script children: platform vars the interpreter and
+# tools need (PATH, HOME, tmp dirs, SYSTEMROOT-class Windows vars, locale and
+# codec vars), plus SWARM_DIR routing and the fixture-managed signing-key vars.
+# Every other parent var — SWARM_* session vars (AGENT_SESSION, TASK_ID,
+# CORRELATION_ID, ...), SUBSTRATE_* tokens, ANTHROPIC_API_KEY, *_PROXY and any
+# other host contamination — is scrubbed. Callers pass what the child needs
+# explicitly via `env`, which is applied on top untouched. Host signing keys
+# still cannot leak: the autouse ephemeral_signing_key fixture overwrites
+# SWARM_SIGNING_KEY for every test, and fail-closed tests clear the key vars,
+# so an allowlisted key is always test-controlled, never ambient.
+_BASE_ENV_ALLOW = frozenset({
+    "PATH", "HOME",
+    "TMPDIR", "TEMP", "TMP",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "LANG", "LANGUAGE", "LC_ALL",
+    "LC_MESSAGES", "LC_CTYPE", "LC_NUMERIC", "LC_TIME",
+    "LC_COLLATE", "LC_MONETARY",
+    "PYTHONIOENCODING", "PYTHONUTF8", "TZ",
+    "SWARM_DIR",
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY",
+    "SWARM_ALLOW_INSECURE_DEV_KEY",
+})
+
+
+def _scrubbed_base_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k in _BASE_ENV_ALLOW or k.startswith("LC_")}
+
+
 def run_script(name, *args, env=None):
     cmd = [sys.executable, str(ROOT / "scripts" / name), *args]
-    return subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **(env or {})}, cwd=ROOT)
+    child_env = _scrubbed_base_env()
+    child_env.update(env or {})
+    return subprocess.run(cmd, capture_output=True, text=True, env=child_env, cwd=ROOT)
 
 
 def stub_claude(tmp_path, result: dict) -> Path:

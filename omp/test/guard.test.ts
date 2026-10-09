@@ -454,26 +454,69 @@ describe("HOOK-02", () => {
     expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
-  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups normalizes well under a second (WR-09)", () => {
-    const big: [string, string[]][] = [
-      [`${"A=1 ".repeat(250_000)}git status`, ["git status"]],
-      [`${"sudo ".repeat(200_000)}git status`, ["git status"]],
-      [`${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
-      [`sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
-      [`${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
-      [`${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
-      [`A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 30_000 }, () => {
+    // Same-size differential per shape: [name, adversarial input, expected for adversarial].
+    // Adversarial keeps the original 1 MB inputs, so full-scale correctness coverage is unchanged.
+    const shapes: [string, string, string[] | undefined][] = [
+      ["assignment prefixes", `${"A=1 ".repeat(250_000)}git status`, ["git status"]],
+      ["sudo stacking", `${"sudo ".repeat(200_000)}git status`, ["git status"]],
+      ["timeout stacking", `${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
+      ["sudo -u flags", `sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
+      ["env stacking", `${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
+      ["long path word", `${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
+      ["long value", `A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+      ["quoted pairs", "'a b' ".repeat(150_000), undefined],
+      ["brace groups", "x { ".repeat(200_000), undefined],
+      ["heredoc lines", `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`, undefined],
     ];
-    for (const [command, expected] of big) {
-      const t0 = performance.now();
-      expect(normalize(command)).toEqual(expected);
-      expect(performance.now() - t0).toBeLessThan(1000);
+    // Scaling, not wall-clock: each adversarial input is compared against a
+    // benign reference of EQUAL byte length (repeated `git status ;` units,
+    // truncated to the exact length), so fixed overhead, JIT/GC regime, and
+    // heap state cancel out instead of inflating the ratio. The old cross-size
+    // ratio compared a small input below normalize's ~200 KB regime knee
+    // against a large input above it, which made the ratio inherently
+    // environment-sensitive (isolation passed, full suite failed: 43.0x vs the
+    // 40x cap on `sudo -u flags`). Equal-size inputs have no knee to straddle.
+    // Reps interleave back-to-back (A,B,A,B...) in this process, so CI load
+    // slows both sides together and the ratio cannot flake; best-of-N takes
+    // the min each side. Linear work costs ~1x against its equal-size
+    // reference; the WR-09 backtracking class costs ~1000x or more, so a 40x
+    // cap catches a genuine regression decisively with wide headroom. No
+    // absolute wall-clock bound is asserted. The { timeout } above is a
+    // runaway budget, not a correctness assertion: a genuine superlinear hang
+    // still fails fast (via the ratio or the timeout) instead of hanging CI,
+    // and normal runs never approach it. Best-of-3 keeps the full-suite cost
+    // at ~2-4s even under contention from the ~1400 preceding tests.
+    const LINEAR_CAP = 40;
+    const REPS = 3;
+    const BENIGN_UNIT = "git status ; ";
+    const referenceFor = (bytes: number): string =>
+      BENIGN_UNIT.repeat(Math.ceil(bytes / BENIGN_UNIT.length)).slice(0, bytes);
+    normalize("git status"); // warm up (JIT) before measuring
+    const over: string[] = [];
+    for (const [name, adversarial, expected] of shapes) {
+      // Correctness at the original 1 MB scale is unchanged.
+      if (expected !== undefined) expect(normalize(adversarial)).toEqual(expected);
+      // The reference must exercise normalize() genuinely, not be skipped.
+      const reference = referenceFor(adversarial.length);
+      expect(reference.length).toBe(adversarial.length);
+      expect(normalize(reference).length).toBeGreaterThan(0);
+      let adversarialMs = Infinity;
+      let referenceMs = Infinity;
+      for (let i = 0; i < REPS; i++) {
+        let t = performance.now();
+        normalize(adversarial);
+        const advMs = performance.now() - t;
+        if (advMs < adversarialMs) adversarialMs = advMs;
+        t = performance.now();
+        normalize(reference);
+        const refMs = performance.now() - t;
+        if (refMs < referenceMs) referenceMs = refMs;
+      }
+      const ratio = adversarialMs / referenceMs;
+      if (ratio >= LINEAR_CAP) over.push(`${name}: ${ratio.toFixed(1)}x (adversarial ${adversarialMs.toFixed(1)}ms / reference ${referenceMs.toFixed(1)}ms, best of ${REPS})`);
     }
-    for (const command of ["'a b' ".repeat(150_000), "x { ".repeat(200_000), `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`]) {
-      const t0 = performance.now();
-      normalize(command);
-      expect(performance.now() - t0).toBeLessThan(1000);
-    }
+    expect(over).toEqual([]);
   });
 
   test.each([
