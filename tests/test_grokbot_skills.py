@@ -54,10 +54,11 @@ REQUIRED = (
 # ("Set the SWARM_SIGNING_KEY environment variable"), and a bare assignment
 # ("SWARM_SIGNING_KEY=...") is an instruction with no verb at all.
 _KEY = r"(?:SWARM_SIGNING_KEY|SWARM_ED25519_KEY|SUBSTRATE_TOKEN(?:_[A-Za-z0-9]+)?)"
+_OPEN_QUOTE = "\"'`"
 _ASSIGNMENT = re.compile(rf"(?im)(?:^|[\s;\"'`]){_KEY}\s*=")
 _IMPERATIVE = re.compile(
     rf"(?i)(?<!never )(?<!not )(?<!don't )\b(?:set|export|configure|store|provide|add|put|commit)\b"
-    rf"(?:\s+\w+){{0,6}}\s+`?{_KEY}"
+    rf"(?:\s+\w+){{0,6}}\s+[{_OPEN_QUOTE}]?{_KEY}"
 )
 
 
@@ -98,6 +99,9 @@ def test_no_forbidden_runner_or_permission_bypass():
     "export SWARM_SIGNING_KEY=abc",
     'SUBSTRATE_TOKEN="tok"',
     "SWARM_ED25519_KEY = seed",
+    'Set "SWARM_SIGNING_KEY" environment variable',
+    "Set 'SWARM_ED25519_KEY' environment variable",
+    'Configure "SUBSTRATE_TOKEN" for the cloud session',
 ])
 def test_secret_instruction_forms(sample):
     assert secret_instruction(sample), sample
@@ -108,6 +112,8 @@ def test_secret_instruction_forms(sample):
     "Never set SWARM_SIGNING_KEY.",
     "Do not export SWARM_ED25519_KEY.",
     "Do not set the SUBSTRATE_TOKEN environment variable.",
+    'Never set "SWARM_SIGNING_KEY".',
+    "Do not export 'SWARM_ED25519_KEY'.",
 ])
 def test_prohibition_is_not_a_secret_instruction(sample):
     assert secret_instruction(sample) is None, sample
