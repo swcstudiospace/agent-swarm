@@ -1,0 +1,28 @@
+{
+  "source": "programming-desk skills/verification-receipts/SKILL.md §2",
+  "source_url": "https://raw.githubusercontent.com/swcstudiospace/programming-desk/main/skills/verification-receipts/SKILL.md",
+  "pinned_commits": {
+    "main": "9f6d2b64addd2970fcdf5632321d17c7d349852c",
+    "prompt_cited": "48b3098"
+  },
+  "note": "Required keys are the §2 receipt object. Command and claim keys match that example. Swarm exports keep approved_by empty and approvals empty; a reviewer, not this script, is the only writer of approved_by.",
+  "required_fields": [
+    "task_id",
+    "bot",
+    "started_at",
+    "completed_at",
+    "commands",
+    "claims",
+    "unverified",
+    "files_changed",
+    "contract_changes",
+    "rollback_plan",
+    "approvals",
+    "loop_acks",
+    "approved_by"
+  ],
+  "command_required": ["cmd", "exit_code"],
+  "command_optional": ["duration_s", "output_tail"],
+  "claim_required": ["claim", "evidence_command_index"],
+  "claim_optional": ["expects_failure"]
+}
