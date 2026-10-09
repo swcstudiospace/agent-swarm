@@ -175,13 +175,20 @@ def test_cursor_gate_scripts_are_non_recording_previews():
         assert "never ingest a gate result" in pre, agent["slug"]
         assert "advisory preview recorded no verdict rows; human records the gate" in pre, agent["slug"]
         assert "stops the scheduling loop" in pre, agent["slug"]
+        assert "Do not use bun scripts/ts/sec_gate.ts" in pre, agent["slug"]
+        assert "through python3 or the bun twin" not in pre, agent["slug"]
         assert "Gate scripts record nothing." in text
         assert "Nothing this session produces counts as APPROVED." in text
     assert seen == 15
     a01 = (CURSOR / "a01-orchestrator.md").read_text(encoding="utf-8")
     assert a01.count('--transition <id> BLOCKED --reason "advisory preview recorded no verdict rows; human records the gate"') == 2
     assert a01.count("stop the scheduling loop and do not spawn tasks that depend on it") == 2
+    assert a01.count("--ingest --advisory") == 2
     assert "the task stays leased" not in a01
+    sec = (CURSOR / "a10-security.md").read_text(encoding="utf-8")
+    sec_body = sec.split("</swarm_runtime>", 1)[1]
+    assert "bun scripts/ts/sec_gate.ts" not in sec_body
+    assert "python3 scripts/sec_gate.py" in sec_body
 
 
 def _verdict_rows(swarm: Path) -> list[dict]:
@@ -274,6 +281,63 @@ def test_cursor_blocked_gate_stops_downstream_without_approving(tmp_path, swarm_
     assert ts.get("H-be")["state"] == "IN_REVIEW"
     assert ts.get("H-qa")["state"] == "BLOCKED"
     assert _verdict_rows(swarm_dir) == []
+
+
+def _task_states(swarm: Path, tid: str) -> tuple[str, list[str]]:
+    con = sqlite3.connect(swarm / "tasks.db")
+    state = con.execute("SELECT state FROM tasks WHERE task_id=?", (tid,)).fetchone()[0]
+    hist = [row[0] for row in con.execute(
+        "SELECT to_state FROM transitions WHERE task_id=? ORDER BY id", (tid,))]
+    con.close()
+    return state, hist
+
+
+def test_cursor_advisory_ingest_skips_approval(tmp_path, monkeypatch):
+    """A keyless requirements result exits 2 on plain ingest and stays IN_REVIEW under --advisory.
+
+    The parent process's signing keys are cleared before either subprocess starts.
+    """
+    for key in _STRIPPED_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    assert "SWARM_SIGNING_KEY" not in os.environ
+    assert "SWARM_ED25519_KEY" not in os.environ
+
+    def run(prefix: str, advisory: bool) -> subprocess.CompletedProcess[str]:
+        swarm = tmp_path / prefix
+        env = os.environ.copy()
+        env["SWARM_DIR"] = str(swarm)
+        plan = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--brief-text", "x",
+             "--pattern", "feature", "--prefix", prefix, "--risk-class", "low", "--repo", str(tmp_path), "--json"],
+            capture_output=True, text=True, env=env, cwd=ROOT,
+        )
+        assert plan.returncode == 0, plan.stdout + plan.stderr
+        result = tmp_path / f"{prefix}.json"
+        result.write_text(json.dumps({"task_id": f"{prefix}-req", "state": "IN_REVIEW", "summary_md": "spec"}),
+                          encoding="utf-8")
+        cmd = [sys.executable, str(ROOT / "scripts" / "orch_status.py"), "--ingest", str(result), "--json"]
+        if advisory:
+            cmd.append("--advisory")
+        got = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=ROOT)
+        got.swarm = swarm  # type: ignore[attr-defined]
+        return got
+
+    plain = run("P", False)
+    assert plain.returncode == 2, plain.stdout + plain.stderr
+    assert "E-POLICY" in plain.stdout
+    state, hist = _task_states(plain.swarm, "P-req")  # type: ignore[attr-defined]
+    assert state == "IN_REVIEW"
+    assert "APPROVED" not in hist and "DONE" not in hist
+
+    saved = run("A", True)
+    assert saved.returncode == 0, saved.stdout + saved.stderr
+    body = json.loads(saved.stdout)
+    assert body["status"] == "ok"
+    assert body["task"]["state"] == "IN_REVIEW"
+    state, hist = _task_states(saved.swarm, "A-req")  # type: ignore[attr-defined]
+    assert state == "IN_REVIEW"
+    assert "APPROVED" not in hist and "DONE" not in hist
+    assert any("advisory, approval not attempted" in line for line in body["reconcile"])
 
 
 def test_cursor_substitution_raises_when_pattern_missing():

@@ -264,7 +264,7 @@ def _unaccepted_gates(store: TaskStore, tid: str, reasons: dict[str, str]) -> di
     return out
 
 
-def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None) -> list[str]:
+def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None, *, approve: bool = True) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates.
 
     `leases` is the runner's substrate_lease.LeaseBridge, or None (ingest, dry runs, substrate off). It is told about
@@ -349,6 +349,10 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
         reasons = store.missing_gate_reasons(tid)
         reasons.update(_unaccepted_gates(store, tid, reasons))
         if not reasons:
+            if not approve:
+                emit("task.approval.skipped", {"task_id": tid, "reason": "advisory ingest: approval not attempted"})
+                notes_log.append(f"{tid}: advisory, approval not attempted")
+                continue
             store.transition(tid, S.APPROVED, reason="all required gates pass")
             store.transition(tid, S.DONE, reason="approved")
             notes_log.append(f"{tid}: DONE")
