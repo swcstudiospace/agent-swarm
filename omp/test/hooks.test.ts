@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { SWARM_SLUGS } from "../src/guard.ts";
-import { RUNTIME_HEADING, runtimeContext, runtimePart, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
+import { classifiedText, RUNTIME_HEADING, runtimeContext, runtimePart, shellQuote, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
@@ -106,6 +106,24 @@ describe("uplift XML: HOOK-01 classifies the user's ORIGINAL (WR-01)", () => {
     const bare = "<UPLIFTED_PROMPT>\n<TASK>implement the billing module</TASK>\n</UPLIFTED_PROMPT>";
     expect(hook()({ prompt: bare, systemPrompt: PRIOR }, top())).toBeUndefined();
   });
+  test("an unclosed run of ORIGINAL tags is classified whole without scanning once per opener", () => {
+    const prompt = `<BUILD_PROMPT>${"<ORIGINAL>".repeat(20000)}implement the billing module</BUILD_PROMPT>`;
+    const started = performance.now();
+    expect(classifiedText(prompt)).toBe(prompt);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
+  test("entities inside ORIGINAL are unescaped, and amp last", () => {
+    const prompt = "<BUILD_PROMPT><ORIGINAL>a &lt;b&gt; &amp;lt; &quot;c&quot;</ORIGINAL></BUILD_PROMPT>";
+    expect(classifiedText(prompt)).toBe(`a <b> &lt; "c"`);
+  });
+  test("a runtime root with spaces or a quote is one shell word on the command line", () => {
+    const root = "/tmp/my swarm/o'clock";
+    const part = runtimePart(root);
+    expect(part).toContain(`${RUNTIME_HEADING}`);
+    expect(part).toContain(`Runtime root: ${root}`);
+    expect(part).toContain("python3 '/tmp/my swarm/o'\"'\"'clock'/scripts/<script>.py");
+    expect(part).not.toContain("python3 /tmp/my swarm/");
+  });
   test("a plain prompt that quotes an ORIGINAL element is classified whole", () => {
     const prompt = "implement a parser for <ORIGINAL>what is a monad</ORIGINAL> tags";
     expect(parts(hook()({ prompt, systemPrompt: PRIOR }, top()))).toEqual([...PRIOR, SWARM_CONTEXT]);
@@ -203,7 +221,7 @@ describe("runtime part", () => {
       expect(out).toEqual([...PRIOR, runtimePart(root())]);
       expect(isAbsolute(root())).toBe(true);
       expect(out.at(-1)).toContain(`\nRuntime root: ${root()}\n`);
-      expect(out.at(-1)).toContain(`python3 ${root()}/scripts/<script>.py … --root <repo> --json`);
+      expect(out.at(-1)).toContain(`python3 ${shellQuote(root())}/scripts/<script>.py … --root <repo> --json`);
     }
   });
 

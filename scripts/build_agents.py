@@ -22,8 +22,11 @@ Copy Cursor agents only (no substrate, no MCP, no env files):
 from __future__ import annotations
 import argparse
 import json
+import os
 import re
+import shlex
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -763,13 +766,59 @@ def _copy_file(src: Path, dest: Path) -> None:
     shutil.copy2(src, dest)
 
 
+def hook_command(script: Path) -> str:
+    """A shell command that runs `script`. Quoted, so a checkout path with spaces stays one argument (T-07-19)."""
+    return f"python3 {shlex.quote(str(script))}"
+
+
+_HOOK_JSON_CAP = 1_048_576
+
+
+class HookConfigError(Exception):
+    """A workspace hook file is present but cannot be merged without destroying it (T-07-18)."""
+
+
+def _load_hook_config(path: Path) -> dict:
+    """The JSON object at `path`, or {} when the file is absent.
+
+    A present file that is not a JSON object, not a regular file, or larger than the cap is an error. Replacing it
+    with {} would drop every other setting. The open is non-blocking, so a FIFO cannot stall the install."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise HookConfigError(f"{path} could not be read ({exc.strerror})") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise HookConfigError(f"{path} is not a regular file")
+        if info.st_size > _HOOK_JSON_CAP:
+            raise HookConfigError(f"{path} is larger than {_HOOK_JSON_CAP} bytes")
+        raw = os.read(fd, _HOOK_JSON_CAP + 1)
+    except OSError as exc:
+        raise HookConfigError(f"{path} could not be read ({exc.strerror})") from exc
+    finally:
+        os.close(fd)
+    if len(raw) > _HOOK_JSON_CAP:
+        raise HookConfigError(f"{path} is larger than {_HOOK_JSON_CAP} bytes")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HookConfigError(f"{path} is not valid UTF-8") from exc
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HookConfigError(f"{path} is not valid JSON ({exc.msg})") from exc
+    if not isinstance(data, dict):
+        raise HookConfigError(f"{path} is not a JSON object")
+    return data
+
+
 def merge_claude_settings(settings_path: Path, hook_cmd: str) -> None:
-    data: dict = {}
-    if settings_path.exists():
-        try:
-            data = json.loads(settings_path.read_text())
-        except json.JSONDecodeError:
-            data = {}
+    data = _load_hook_config(settings_path)
     data.setdefault("enabledPlugins", data.get("enabledPlugins", {}))
     hooks = data.setdefault("hooks", {})
     hooks["UserPromptSubmit"] = [
@@ -788,12 +837,7 @@ def merge_claude_settings(settings_path: Path, hook_cmd: str) -> None:
 
 def write_grok_hooks(path: Path, hook_cmd: str) -> None:
     complete_cmd = hook_cmd.replace("user_prompt_submit.py", "on_a01_complete.py")
-    payload: dict = {}
-    if path.exists():
-        try:
-            payload = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            payload = {}
+    payload = _load_hook_config(path)
     hooks = payload.setdefault("hooks", {})
     hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": hook_cmd}]}]
     stop_hooks = hooks.setdefault("Stop", [])
@@ -830,8 +874,8 @@ def install_workspace(workspace: Path, dry_run: bool = False) -> None:
     Skill copies get the literal `$SWARM_ROOT` replaced by this checkout's realpath, and the workspace hooks call
     the hook script by absolute path; the tracked repo files stay path-free (OPEN-4)."""
     root = ROOT.resolve()
-    hook_cmd = f"python3 {root / 'hooks' / 'user_prompt_submit.py'}"
-    complete_cmd = f"python3 {root / 'hooks' / 'on_a01_complete.py'}"
+    hook_cmd = hook_command(root / "hooks" / "user_prompt_submit.py")
+    complete_cmd = hook_command(root / "hooks" / "on_a01_complete.py")
     settings, grok_hook = _workspace_hooks(workspace)
     pairs = _workspace_copies(workspace)
     if dry_run:
@@ -897,6 +941,13 @@ def main() -> int:
                     f"error: refusing to install into {workspace}: {'; '.join(unsafe)}; "
                     "the installer never writes through a symlink. Nothing was written."
                 )
+        if not problem:
+            # T-07-18: a present hook file that is not a JSON object must not be replaced with {}.
+            try:
+                for path in _workspace_hooks(workspace):
+                    _load_hook_config(path)
+            except HookConfigError as exc:
+                problem = f"error: refusing to install into {workspace}: {exc}; nothing was written"
         if not problem and not args.no_substrate:
             # INST-03/04: a refused runtime, an unreadable config or a missing token stops the install here, before
             # generation or any write; a dry run prints its plan and the missing tokens instead

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -397,10 +398,33 @@ def _skill_ancestors(ws: Path, home: Path) -> list[Path]:
     return out
 
 
-def _read(path: Path) -> str | None:
+_READ_LIMIT = 1_048_576  # a config or agent file larger than this is not one this installer will load
+
+
+def _read(path: Path, *, limit: int = _READ_LIMIT) -> str | None:
+    """Text of a regular file, or None when it is missing, not a regular file, or over `limit`.
+
+    The open is non-blocking. `read_text` on `/dev/zero` or a FIFO `config.yml` never returns, and a caller that
+    treats that as "no config" can then overwrite a real file (T-07-09). Size is taken from `fstat` before the
+    read, and the read itself stops at `limit + 1`."""
     try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        data = os.read(fd, limit + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
         return None
 
 

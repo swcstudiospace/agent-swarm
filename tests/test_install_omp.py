@@ -438,3 +438,40 @@ def test_install_workspace_refuses_symlinked_claude_and_grok_destinations(tree, 
     assert _snapshot(tree, outside, ws) == before
     assert sorted(p.name for p in outside.iterdir()) == ["victim.json"]
     assert not (ws / ".omp").exists()
+
+
+def test_hook_command_quotes_a_checkout_path_with_spaces():
+    import importlib.util
+    import shlex
+
+    spec = importlib.util.spec_from_file_location("build_agents_under_test", ROOT / "scripts" / "build_agents.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    script = Path("/tmp/my swarm/hooks/user_prompt_submit.py")
+    cmd = mod.hook_command(script)
+    assert shlex.split(cmd) == ["python3", str(script)]
+    assert "python3 /tmp/my" not in cmd
+
+
+@pytest.mark.parametrize("rel", [".claude/settings.json", ".grok/hooks/agent-swarm.json"])
+def test_invalid_hook_config_is_left_in_place(tree, ws, home, rel):
+    path = _write(ws / rel, "{ not json\n")
+    before = path.read_bytes()
+    snap = _snapshot(tree, ws)
+    r = _cli(tree, ws, home, "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "not valid JSON" in r.stderr
+    assert path.read_bytes() == before
+    assert _snapshot(tree, ws) == snap
+
+
+def test_device_and_fifo_configs_are_not_read(tmp_path):
+    """T-07-09: /dev/zero and a FIFO must not block, and must not look like an empty config."""
+    import time
+
+    started = time.monotonic()
+    assert inst._read(Path("/dev/zero")) is None
+    fifo = tmp_path / "config.yml"
+    os.mkfifo(fifo)
+    assert inst._read(fifo) is None
+    assert time.monotonic() - started < 2

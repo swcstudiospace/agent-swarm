@@ -41,19 +41,41 @@ export function classifyPrompt(prompt: string): boolean {
 
 /** Root elements of an Ultrathink/Prompt-Uplift XML; omp replaces the user's prompt with that XML. */
 const UPLIFT_ROOT = /^<(BUILD_PROMPT|FIX_PROMPT|RESEARCH_PROMPT|CHANGE_PROMPT|UPLIFTED_PROMPT|uplifted|ultrathink)\b/i;
-const ORIGINAL_EL = /<ORIGINAL\b[^>]*>([\s\S]*?)<\/ORIGINAL>/i;
 
-/** The user's own words: the unescaped <ORIGINAL> of an uplift XML, else the prompt unchanged. */
+/** The user's own words: the unescaped <ORIGINAL> of an uplift XML, else the prompt unchanged.
+ *
+ * One forward scan. A regex over every `<ORIGINAL` opener is quadratic: a few hundred kilobytes of unclosed
+ * openers used to take seconds (T-06-25). `&amp;` is decoded last so `&amp;lt;` stays `&lt;`. */
 export function classifiedText(prompt: string): string {
   const t = prompt.trim();
-  const m = UPLIFT_ROOT.test(t) ? ORIGINAL_EL.exec(t) : null;
-  if (!m) return prompt;
-  return m[1]
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&");
+  if (!UPLIFT_ROOT.test(t)) return prompt;
+  const lower = t.toLowerCase();
+  let from = 0;
+  while (from < lower.length) {
+    const open = lower.indexOf("<original", from);
+    if (open < 0) return prompt;
+    const boundary = lower[open + "<original".length];
+    if (boundary !== undefined && /[a-z0-9_]/.test(boundary)) {
+      from = open + "<original".length;
+      continue;
+    }
+    const gt = t.indexOf(">", open);
+    if (gt < 0 || lower.indexOf("</original>", gt + 1) < 0) return prompt;
+    const close = lower.indexOf("</original>", gt + 1);
+    return t
+      .slice(gt + 1, close)
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&amp;/g, "&");
+  }
+  return prompt;
+}
+
+/** A POSIX single-quoted word. A runtime root with spaces or quotes stays one shell word (T-07-15). */
+export function shellQuote(text: string): string {
+  return `'${text.replace(/'/g, `'"'"'`)}'`;
 }
 
 /**
@@ -84,12 +106,14 @@ export const RUNTIME_HEADING = "## AgentSwarm runtime";
 /** The label of the runtime part's root line; the omp preamble tells specialists to read that line. */
 export const RUNTIME_ROOT_LABEL = "Runtime root:";
 
-/** The runtime part for an absolute runtime root; the omp preamble reads its RUNTIME_ROOT_LABEL line. */
+/** The runtime part for an absolute runtime root; the omp preamble reads its RUNTIME_ROOT_LABEL line.
+ * The command quotes the root, so a path containing spaces is one shell word and the guard can see the script. */
 export function runtimePart(root: string): string {
+  const scripts = `${shellQuote(root)}/scripts/<script>.py`;
   return `${RUNTIME_HEADING}
 
 ${RUNTIME_ROOT_LABEL} ${root}
-Run swarm scripts as \`python3 ${root}/scripts/<script>.py … --root <repo> --json\`, where \`<repo>\` is the git toplevel of your working directory.
+Run swarm scripts as \`python3 ${scripts} … --root <repo> --json\`, where \`<repo>\` is the git toplevel of your working directory.
 `;
 }
 
