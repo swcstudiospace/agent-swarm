@@ -1,8 +1,13 @@
 """Hook trigger core (n3/n2). Opt-in, ID hash, dedup, fire context or detached, thin.
 
-hooks/autonomous_run.py is detached only when a real signing key is configured,
-SWARM_ALLOW_AUTONOMOUS=1, and no cloud-agent marker is set. Any other case records
-the refusal reason on the hook-fired event and does not spawn.
+Opt-in is AIO_SWARM_AFTER_ORCH or SWARM_AFTER_ORCH set to 1, true, yes, or on.
+Any other value, including unset, is off. When opt-in is off, or the payload has
+no completion signal, fire_if_ready returns without writing a hook-fired event.
+
+hooks/autonomous_run.py is detached only when opt-in is on, a completion signal
+was detected, a real signing key is configured, SWARM_ALLOW_AUTONOMOUS=1, and no
+cloud-agent marker is set. Once those first two hold, any other case records the
+refusal reason on the hook-fired event and does not spawn.
 """
 
 from __future__ import annotations
