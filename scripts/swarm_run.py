@@ -639,7 +639,9 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
     """Run one agent session. `on_session(stop)` is called once the session is spawned and `on_session(None)` once it
     has ended; `stop(reason)` ends the session's process group and makes this raise LeaseStopped (the lease keeper's
     handle on a session whose node the runner no longer holds). A stopped session returns only once its whole process
-    group is gone."""
+    group is gone. The leader exiting is not the end of the session: a tool child can keep the pipes open, so the
+    drains are waited out until they finish or the task deadline. A deadline that arrives with a drain still blocked
+    is a timeout, and close reaps the group because that kill set a deadline."""
     runtime = resolve_runtime(getattr(args, "runtime", "auto"))
     cmd, env, cwd = headless_command(runtime, agent, repo, swarm_dir(repo), args)
     try:
@@ -659,21 +661,28 @@ def run_agent_headless(agent: dict, prompt: str, repo: Path, args, *, on_session
         threading.Thread(target=_drain, args=(proc.stderr, err_parts, scan), daemon=True),
     ]
     timed_out = False
+    drains = pumps[1:]  # stdout and stderr; the leader's exit does not finish either while a tool holds the pipe
     try:
         if on_session is not None:
             on_session(group.stop)
         for pump in pumps:
             pump.start()
         deadline = time.monotonic() + args.task_timeout
-        while proc.poll() is None:
+        while True:
             if scan is not None and scan.hit.is_set():
                 group.kill()  # not stop(): this is not a lost lease, and the result is refused as E-DEP below
                 break
             if group.stopped:  # the lease keeper already signalled the group
                 break
-            if time.monotonic() >= deadline:
+            leader_done = proc.poll() is not None
+            drains_done = not any(pump.is_alive() for pump in drains)
+            # A tool that outlived the leader still holds the pipes. Wait for both drains, and if the task deadline
+            # arrives first, kill the group so close() reaps it instead of forgetting a live child.
+            if time.monotonic() >= deadline and not (leader_done and drains_done):
                 timed_out = True
                 group.kill()
+                break
+            if leader_done and drains_done:
                 break
             if scan is not None:
                 scan.hit.wait(0.05)
@@ -944,8 +953,12 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
     # running_deadline is wall-clock time a later process can see. While it is in the future the task is live and
     # another run leaves it alone; once it passes with notes.running still set, the runner that held it is gone
     # (T-06-26) and recover_stranded fails it so the retry ladder can pick it up.
+    # A gate task spends one task_timeout in the session and a second in run_gate_script. Its deadline covers both,
+    # plus the grace. Every other task is one timeout plus the grace.
     started = time.time()
-    store.set_notes(tid, running=started, running_deadline=started + args.task_timeout + RUNNING_DEADLINE_GRACE_S,
+    timeouts = 2 if task["notes_json"].get("gate") else 1
+    store.set_notes(tid, running=started,
+                    running_deadline=started + timeouts * args.task_timeout + RUNNING_DEADLINE_GRACE_S,
                     dry_run=bool(args.dry_run))
     # LEASE-06: the keeper watches the whole dispatch, from before the session spawns until its result is written, so
     # a lease lost (or a task moved on elsewhere) at any point stops the session or gate script and rejects the result
@@ -1065,6 +1078,23 @@ def _running_mark(notes: dict, key: str):
     return float(value)
 
 
+def _expired_running(notes: dict, now: float, stale_s: float) -> tuple[float, float | None] | None:
+    """`(running, deadline)` when that mark is stranded at `now`, else None.
+
+    A `running_deadline` still in the future is a live session. A legacy row with `running` and no deadline is
+    stranded only once the mark is `stale_s` old. A cleared running mark is not stranded."""
+    running = _running_mark(notes, "running")
+    if running is None:
+        return None
+    deadline = _running_mark(notes, "running_deadline")
+    if deadline is not None:
+        if deadline > now:
+            return None
+    elif now - running < stale_s:
+        return None
+    return running, deadline
+
+
 def recover_stranded(store: TaskStore, corr: str, *, now: float | None = None, stale_s: float = STRANDED_STALE_S,
                      emit=None) -> list[str]:
     """Fail IN_PROGRESS tasks whose runner died before it could clear notes.running (T-06-26).
@@ -1073,23 +1103,31 @@ def recover_stranded(store: TaskStore, corr: str, *, now: float | None = None, s
     `running` but no deadline is stranded only once that mark is `stale_s` old (6 h), so a long session started by a
     runner from before this field existed is not failed on the next kick. Anything else in IN_PROGRESS — rework, which
     has no running mark — is not this function's business. The FAILED row is retryable: dispatchable's ladder applies
-    on this same run when attempts remain."""
+    on this same run when attempts remain.
+
+    The list is a candidate set. Fail and clear `running` / `running_deadline` in one transaction, and only after a
+    re-read still shows that same IN_PROGRESS attempt with the deadline (or the legacy stale mark) still expired.
+    A peer that already moved the row — FAILED, RETRY, a new attempt, a future deadline, a cleared running mark — is
+    skipped. A SwarmError from the transition skips that row and does not abort the run."""
     now = time.time() if now is None else now
     recovered: list[str] = []
     for task in store.list(correlation_id=corr, state=S.IN_PROGRESS.value):
-        notes = task["notes_json"]
-        running = _running_mark(notes, "running")
-        if running is None:
-            continue
-        deadline = _running_mark(notes, "running_deadline")
-        if deadline is not None:
-            if deadline > now:
-                continue
-        elif now - running < stale_s:
+        if _expired_running(task["notes_json"], now, stale_s) is None:
             continue
         tid = task["task_id"]
-        store.transition(tid, S.FAILED, reason="E-TIMEOUT: stranded, the runner left it IN_PROGRESS past its deadline")
-        store.set_notes(tid, running=None, running_deadline=None)
+        attempt = task["attempt"]
+        try:
+            with store.transaction():
+                current = store.get(tid)
+                expired = _expired_running(current["notes_json"], now, stale_s)
+                if current["state"] != S.IN_PROGRESS.value or current["attempt"] != attempt or expired is None:
+                    continue
+                running, deadline = expired
+                store.transition(tid, S.FAILED,
+                                 reason="E-TIMEOUT: stranded, the runner left it IN_PROGRESS past its deadline")
+                store.set_notes(tid, running=None, running_deadline=None)
+        except SwarmError:
+            continue
         if emit is not None:
             emit("task.stranded", {"task_id": tid, "running": running, "running_deadline": deadline})
         recovered.append(tid)

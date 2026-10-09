@@ -151,6 +151,117 @@ def test_recover_stranded_skips_live_rework_other_plans_and_bools(tmp_path):
     assert flagged.get("T-three")["state"] == "IN_PROGRESS"
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_gate_dispatch_deadline_covers_session_and_script(tmp_path, monkeypatch):
+    """A gate task records running_deadline as 2 * task_timeout + the 30s grace: the session, then the gate script."""
+    mod = _runner()
+    db = tmp_path / "tasks.db"
+    store = _store_with(db, tid="T-rev")
+    store.set_notes("T-rev", gate="review", gate_for=["T-be"])
+    task = store.get("T-rev")
+    seen = {}
+
+    def headless(agent, prompt, repo, args, on_session=None):
+        notes = TaskStore(db).get("T-rev")["notes_json"]
+        seen["span"] = notes["running_deadline"] - notes["running"]
+        raise mod.AgentTimeout(["omp"], args.task_timeout, "", {"timed_out": True})
+
+    monkeypatch.setattr(mod, "assignment_prompt", lambda *a, **k: "prompt")
+    monkeypatch.setattr(mod, "run_agent_headless", headless)
+
+    class Ctx:
+        def emit(self, *args, **kwargs):
+            return None
+
+    mod._execute_one(db, task, {"id": "A09", "slug": "a09-reviewer"},
+                     type("A", (), {"task_timeout": 90, "dry_run": False})(), Ctx(), tmp_path, None, None)
+    assert abs(seen["span"] - (2 * 90 + 30)) < 1e-6
+
+
+def test_recover_stranded_leaves_a_restarted_attempt(tmp_path, monkeypatch):
+    """The attempt can change after the list and before the write. The fresh IN_PROGRESS row keeps its deadline."""
+    mod = _runner()
+    store = _store_with(tmp_path / "tasks.db")
+    store.set_notes("T-one", running=100.0, running_deadline=1_000.0)
+    listed = store.get("T-one")["attempt"]
+    fresh_deadline = 50_000.0
+    original = store.get
+
+    def get_once(task_id):
+        store.get = original
+        row = original(task_id)
+        notes = dict(row["notes_json"])
+        notes["running"] = 40_000.0
+        notes["running_deadline"] = fresh_deadline
+        store.conn.execute(
+            "UPDATE tasks SET attempt=?, notes=? WHERE task_id=?",
+            (row["attempt"] + 1, json.dumps(notes), task_id),
+        )
+        return original(task_id)
+
+    monkeypatch.setattr(store, "get", get_once)
+    assert mod.recover_stranded(store, "c1", now=1_000.0) == []
+    fresh = original("T-one")
+    assert fresh["state"] == "IN_PROGRESS"
+    assert fresh["attempt"] == listed + 1
+    assert fresh["notes_json"]["running"] == 40_000.0
+    assert fresh["notes_json"]["running_deadline"] == fresh_deadline
+
+
+def test_exited_leader_with_a_live_tool_is_a_timeout(tmp_path, monkeypatch):
+    """The leader exits immediately; a child keeps stdout open. That is a task timeout, and the child is reaped."""
+    mod = _runner()
+    pidfile = tmp_path / "tool.pid"
+    script = tmp_path / "leader.py"
+    script.write_text(
+        "import os, signal, sys, time\n"
+        "r, w = os.pipe()\n"
+        "if os.fork() == 0:\n"
+        "    os.close(r)\n"
+        "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+        f"    open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "    os.write(w, b'1')\n"
+        "    os.close(w)\n"
+        "    time.sleep(60)\n"
+        "    os._exit(0)\n"
+        "os.close(w)\n"
+        "os.read(r, 1)\n"
+        "os._exit(0)\n"
+    )
+    monkeypatch.setattr(
+        mod, "headless_command",
+        lambda runtime, agent, repo, sdir, args: ([sys.executable, str(script)], dict(os.environ), repo),
+    )
+    args = type("A", (), {"runtime": "claude", "task_timeout": 1})()
+    pid = 0
+    try:
+        try:
+            mod.run_agent_headless({"slug": "a05-backend", "id": "A05"}, "go", tmp_path, args)
+        except mod.AgentTimeout:
+            pass
+        else:
+            raise AssertionError("a tool holding stdout after the leader exited returned a result")
+        assert pidfile.is_file()
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and _alive(pid):
+            time.sleep(0.05)
+        assert not _alive(pid)
+        assert not mod._SESSIONS
+    finally:
+        if pid and _alive(pid):
+            os.kill(pid, 9)
+
+
 def test_dispatch_records_a_deadline_and_clears_it(tmp_path):
     swarm = tmp_path / ".swarm"
     env = _env(swarm)

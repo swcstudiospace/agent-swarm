@@ -150,7 +150,10 @@ def _load_hook():
 
 
 def test_kickoff_lock_is_held_until_released_and_then_debounced(tmp_path):
-    """T-06-18: a second kick cannot start while the first holds the lock, nor within 120s after release."""
+    """T-06-18: a second kick cannot start while the first holds the lock, nor within 120s of the release mtime.
+
+    main rewrites the fd on the way out. A release stamp blocks the next acquire immediately, even when the
+    acquisition mtime is already older than 120s, and allows it once that release mtime is itself that old."""
     import os
     import time
     mod = _load_hook()
@@ -158,6 +161,8 @@ def test_kickoff_lock_is_held_until_released_and_then_debounced(tmp_path):
     held = mod.acquire(lock)
     assert held is not None
     assert mod.acquire(lock) is None
+    os.utime(lock, (time.time() - 121, time.time() - 121))
+    mod._stamp_lock(held)  # what main's finally does before close: the debounce starts at release
     os.close(held)
     assert mod.acquire(lock) is None
     os.utime(lock, (time.time() - 121, time.time() - 121))
@@ -177,6 +182,10 @@ def test_env_seconds_falls_back_on_blank_or_non_positive(monkeypatch):
     monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "0")
     assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
     monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "-4")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "inf")
+    assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
+    monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "1e309")
     assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 3600
     monkeypatch.setenv("SWARM_AUTONOMOUS_RUN_CAP_S", "12.5")
     assert mod._env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600) == 12.5

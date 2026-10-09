@@ -13,6 +13,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -54,8 +55,8 @@ def pattern_for(brief: str) -> str:
 
 
 def _env_seconds(name: str, default: float) -> float:
-    """A positive number of seconds from the environment, else `default`. Blank, non-numeric and non-positive
-    values are the default: a typo must not disable the cap or the grace."""
+    """A positive finite number of seconds from the environment, else `default`. Blank, non-numeric, non-finite
+    and non-positive values are the default: a typo must not disable the cap or the grace."""
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
@@ -63,7 +64,7 @@ def _env_seconds(name: str, default: float) -> float:
         value = float(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 def _signal_pid(pid: int, sig: int) -> None:
@@ -92,13 +93,20 @@ def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: fl
     return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, out or "", err or "")
 
 
+def _stamp_lock(fd: int) -> None:
+    """Rewrite the lock so its mtime is now. acquire stamps acquisition; main stamps release."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(time.time()).encode())
+
+
 def acquire(lock: Path) -> int | None:
     """An fd holding the exclusive kickoff lock, or None when this brief must not start.
 
     The fd stays open for the whole run, so a second process cannot pass the check while the first
-    is still planning or running (T-06-18). The mtime is when the lock was taken. After the fd is
-    closed, a kick inside 120s is still a duplicate. A crash releases the lock with the process;
-    the file's mtime then keeps the 120s debounce."""
+    is still planning or running (T-06-18). The stamp written here is the acquisition time. main
+    rewrites the fd on release, and the 120s debounce is measured from that release mtime. A crash
+    that skips finally keeps this acquisition mtime."""
     lock.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -111,9 +119,7 @@ def acquire(lock: Path) -> int | None:
     if info.st_size > 0 and now - info.st_mtime < 120:
         os.close(fd)
         return None
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.ftruncate(fd, 0)
-    os.write(fd, str(now).encode())
+    _stamp_lock(fd)
     return fd
 
 
@@ -195,6 +201,8 @@ def main() -> int:
         log.write_text(json.dumps({"error": str(exc)}))
         return 0
     finally:
+        # Debounce from release. A crash that skips this finally keeps the acquisition mtime.
+        _stamp_lock(held)
         os.close(held)
 
 
