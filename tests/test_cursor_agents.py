@@ -193,11 +193,16 @@ def _events_of(swarm: Path, etype: str) -> list[dict]:
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if f'"{etype}"' in ln]
 
 
+def _advisory_file(swarm: Path) -> dict:
+    return json.loads((swarm / "verdicts" / "X-qa.quality.json").read_text(encoding="utf-8"))
+
+
 def test_cursor_gate_preview_records_no_rows(tmp_path, swarm_dir):
     """A leased non-dry-run quality gate records nothing under SWARM_AGENT_SESSION=1.
 
-    On this base (signing still falls back to the dev key) the same call without that
-    variable records verdict rows. That control is what the Cursor rule prevents.
+    #14 (892a8e1) is on main: a keyless gate without that variable also records no rows.
+    It writes an unsigned advisory envelope and emits gate.verdict.unrecorded. The session
+    run keeps the agent-session reason.
     """
     work = tmp_path / "work"
     (work / "tests").mkdir(parents=True)
@@ -221,12 +226,18 @@ def test_cursor_gate_preview_records_no_rows(tmp_path, swarm_dir):
     session = subprocess.run(gate, capture_output=True, text=True, env={**env, "SWARM_AGENT_SESSION": "1"}, cwd=ROOT)
     assert session.returncode in (0, 1), session.stdout + session.stderr
     assert _verdict_rows(swarm_dir) == []
-    unrecorded = _events_of(swarm_dir, "gate.verdict.unrecorded")
-    assert unrecorded and any(e["payload"].get("task_id") == "X-qa" for e in unrecorded)
-    assert (swarm_dir / "verdicts" / "X-qa.quality.json").is_file()
+    session_events = _events_of(swarm_dir, "gate.verdict.unrecorded")
+    assert any(e["payload"].get("task_id") == "X-qa" and "agent session" in e["payload"].get("reason", "")
+               for e in session_events)
+    session_env = _advisory_file(swarm_dir)
+    assert session_env["payload"]["advisory"] is True and session_env["sig"] is None
     control = subprocess.run(gate, capture_output=True, text=True, env=env, cwd=ROOT)
     assert control.returncode in (0, 1), control.stdout + control.stderr
-    assert _verdict_rows(swarm_dir), "keyless gate without SWARM_AGENT_SESSION recorded no rows on this base"
+    assert _verdict_rows(swarm_dir) == []
+    control_events = _events_of(swarm_dir, "gate.verdict.unrecorded")
+    assert any("no signing key configured" in e["payload"].get("reason", "") for e in control_events)
+    control_env = _advisory_file(swarm_dir)
+    assert control_env["payload"]["advisory"] is True and control_env["sig"] is None
 
 
 def test_cursor_substitution_raises_when_pattern_missing():
