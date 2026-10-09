@@ -469,6 +469,69 @@ def test_link_write_time_refuses_planted_config(ws, home, tmp_path, monkeypatch)
     assert _cfg(ws).read_text(encoding="utf-8") == "theme: planted\n"
 
 
+def test_copy_mode_parent_swap_between_check_and_write_cannot_escape(ws, home, tmp_path, monkeypatch):
+    """A `.omp/agents` swap after the parent check must not redirect a new-file write outside the
+    workspace: the write goes through the pinned parent directory, so it refuses (or lands in the
+    pinned directory) instead of following the planted symlink."""
+    import shutil
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    real_write = inst._safe_write_bytes
+    swapped = False
+
+    def swapping(dest, data, before, mode=None, dir_fd=None):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target = ws / ".omp" / "agents"
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            target.symlink_to(outside)
+        return real_write(dest, data, before, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inst, "_safe_write_bytes", swapping)
+    rc, out = _run(ws, "copy")
+    assert swapped
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_copy_mode_partial_failure_reports_written_and_failed(ws, home, tmp_path, monkeypatch):
+    """When a later destination fails after earlier copies saved, the error names the written files
+    and the failed destination instead of claiming nothing was written."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    real_write = inst._safe_write_bytes
+    calls = 0
+
+    def planting(dest, data, before, mode=None, dir_fd=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # plant a symlink at this destination after it verified absent; the pinned write refuses
+            os.symlink(str(victim), dest.name, dir_fd=dir_fd)
+        return real_write(dest, data, before, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inst, "_safe_write_bytes", planting)
+    rc, out = _run(ws, "copy")
+    assert calls >= 2
+    assert rc == 2
+    assert "Nothing was written" not in out
+    assert "partial install" in out
+    first = _first_copy_dest(ws)
+    assert first.is_file()
+    assert str(first) in out
+    assert "failed" in out
+    assert victim.read_bytes() == b"keep\n"
+
+
 @pytest.mark.parametrize("where", ["home", "omp-dir", "checkout"])
 def test_install_omp_refuses_home_omp_dir_and_checkout(home, tmp_path, monkeypatch, where):
     fake = tmp_path / "checkout"  # stands in for the checkout, so no test ever targets the real one
