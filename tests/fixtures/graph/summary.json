@@ -1,0 +1,181 @@
+{
+"graphId": "ut-mv00tcgl-d8215d3e",
+"root": "CHANGE_PROMPT",
+"nodes": [
+ {
+  "id": "n1",
+  "kind": "understand",
+  "title": "Pin the substrate optimisation contract",
+  "depends_on": [],
+  "steps": [
+   "Step 1: Baseline: agent-substrate main is 6417c92; the VPS serves ab62c91 from\u2026",
+   "Step 2: Gateway (programming-desk 479d627, services/desk-gateway, bot-01-system\u2026",
+   "Step 3: Substrate: anonymous callers may name any surface on /events and handof\u2026",
+   "Step 4: Ops: herdr.ts and muse.ts are on neither disk nor main, skills-sync and\u2026",
+   "Step 5: Reload (infra/desk-gateway, bot-05-infrastructure): reload-nginx-gatewa\u2026",
+   "Step 6: v1.3 mapping: pinned releases extend Phase 16; the identity bridge prec\u2026",
+   "Step 7: Fixed rules: plan only, keyless cloud runs, no merges without Ming, rea\u2026"
+  ]
+ },
+ {
+  "id": "n2",
+  "kind": "refine",
+  "title": "Gateway memory mirror that reports the truth",
+  "depends_on": [
+   "n1"
+  ],
+  "steps": [
+   "Step 1: Write red tests first in services/desk-gateway/tests (new test_memory_r\u2026",
+   "Step 2: Change memory_retain (tools/core.py:84-106) to pick the kind from the s\u2026",
+   "Step 3: Change Substrate.call_tool (upstreams.py:274-316) or a small helper nex\u2026",
+   "Step 4: Make the retain reply carry a per-plane verdict list (plane, state stor\u2026",
+   "Step 5: Log every non-stored plane at warning level with seat, plane, reason an\u2026",
+   "Step 6: Add tests for the denied path (fake substrate returns outcome denied, r\u2026",
+   "Step 7: Verify with cd services/desk-gateway and uv run pytest -q tests/test_me\u2026"
+  ]
+ },
+ {
+  "id": "n4",
+  "kind": "refine",
+  "title": "Identity bridge and refused-emit visibility in the substrate",
+  "depends_on": [
+   "n1"
+  ],
+  "steps": [
+   "Step 1: Red tests first in packages/mcp-server/src/config.test.ts and http.test\u2026",
+   "Step 2: Add SUBSTRATE_ALLOW_ANONYMOUS to loadConfig: unset keeps today's rule,\u2026",
+   "Step 3: A recognised token always wins: its surface sets writer, event surface\u2026",
+   "Step 4: Narrow anonymous claims while the bridge is on: an untokened /handoff n\u2026",
+   "Step 5: Report anonymous callers by route and claimed surface in /metrics plus\u2026",
+   "Step 6: Count refused /events posts by reason (auth, validation, attribution, g\u2026",
+   "Step 7: Make grok.ts log non-ok responses (status and server error, never paylo\u2026",
+   "Step 8: Verify with bun test in packages/mcp-server, observability and collecto\u2026"
+  ]
+ },
+ {
+  "id": "n5",
+  "kind": "generate",
+  "title": "Pinned releases and the missing code on main",
+  "depends_on": [
+   "n1"
+  ],
+  "steps": [
+   "Step 1: Add infra/vps/deploy-release.sh: build /opt/agent-substrate/releases/SH\u2026",
+   "Step 2: Point the substrate units in infra/vps at /opt/agent-substrate/current,\u2026",
+   "Step 3: Add a unit-entry doctor (scripts/doctor-units.ts) that resolves each un\u2026",
+   "Step 4: Test the deploy script on a temp root with stub systemctl and git (depl\u2026",
+   "Step 5: Recover code through v1.3, not around it: herdr.ts and muse.ts via Phas\u2026",
+   "Step 6: List interim operator steps for Ming: pause the skills-sync and skills-\u2026",
+   "Step 7: Hand the cutover to Phase 16's parity runbook: the operator installs th\u2026",
+   "Step 8: Verify with bun test, shellcheck on deploy-release.sh and a doctor dry-\u2026"
+  ]
+ },
+ {
+  "id": "n6",
+  "kind": "refine",
+  "title": "Reload script and staging test that cannot touch production",
+  "depends_on": [
+   "n1"
+  ],
+  "steps": [
+   "Step 1: Write the red test first in infra/tests/test_staging_deployment.py: put\u2026",
+   "Step 2: Change reload-nginx-gateway.sh so the gateway step targets only DESK_SE\u2026",
+   "Step 3: Make the nginx step opt-in: DESK_RELOAD_NGINX defaults to false in test\u2026",
+   "Step 4: Rewrite test_reload_nginx_gateway_execution (lines 118-132) to use the\u2026",
+   "Step 5: Add a guard fixture in infra/tests/conftest.py that fails any test whos\u2026",
+   "Step 6: Note in infra/desk-gateway/INSTALL.md that the reload script never sign\u2026",
+   "Step 7: Verify with uv run pytest -q infra/tests (or the repo's infra test comm\u2026"
+  ]
+ },
+ {
+  "id": "n7",
+  "kind": "critique",
+  "title": "Surface gaps and open decisions",
+  "depends_on": [
+   "n1"
+  ],
+  "steps": [
+   "Step 1: Ownership gap: v1.3 (gsd/v1.3-p16, p17 and p18 on the VPS, not yet on G\u2026",
+   "Step 2: Policy conflict: v1.3's recorded decisions include auto-merge, while Mi\u2026",
+   "Step 3: Plane-routing conflict: Phases 25 and 26 move docs and Hindsight behind\u2026",
+   "Step 4: Operator-window gap: the token step, the two timers, the dispatcher loo\u2026",
+   "Step 5: Gateway checkout gap: production desk-gateway runs from an editable ins\u2026",
+   "Step 6: Test-pollution gap: 168 live events carry fixture graph ut-abc-12345678\u2026",
+   "Step 7: Not gaps (settled): no merges without Ming, keyless cloud runs, seat-ow\u2026"
+  ]
+ },
+ {
+  "id": "n3",
+  "kind": "refine",
+  "title": "Fast desk_docs_search and recall",
+  "depends_on": [
+   "n2"
+  ],
+  "steps": [
+   "Step 1: Write red tests first in services/desk-gateway/tests/test_plane_budgets\u2026",
+   "Step 2: Add a dataset name-to-id cache to RAGFlow in upstreams.py (TTL 600 s, r\u2026",
+   "Step 3: Give HttpUpstream one long-lived httpx.AsyncClient per upstream, create\u2026",
+   "Step 4: Run memory_recall bank queries with asyncio.gather, each under its own\u2026",
+   "Step 5: Budget docs_search inside the 20 s tool deadline (config.py _SEC): data\u2026",
+   "Step 6: Remove or clearly gate the substrate docs_search fallback at core.py:54\u2026",
+   "Step 7: Verify with uv run pytest -q in services/desk-gateway including test_pl\u2026"
+  ]
+ },
+ {
+  "id": "n8",
+  "kind": "synthesize",
+  "title": "Ordered wave plan for the substrate stream",
+  "depends_on": [
+   "n3",
+   "n4",
+   "n5",
+   "n6",
+   "n7"
+  ],
+  "steps": [
+   "Step 1: Wave 1 runs three file-disjoint units in parallel: G1 on programming-de\u2026",
+   "Step 2: S2 also joins Wave 1 because it touches only agent-substrate infra/vps\u2026",
+   "Step 3: Wave 2 is G2 alone: it edits the same core.py and upstreams.py as G1, s\u2026",
+   "Step 4: Each unit is draft-only, red tests first, ends with green tests, a rece\u2026",
+   "Step 5: Operator steps are a separate ordered list for Ming, run only in approv\u2026",
+   "Step 6: herdr, muse, skills-sync and the miner reach main inside v1.3 Phases 19\u2026",
+   "Step 7: The end state is proven by the gateway's retain reporting substrate sto\u2026"
+  ]
+ }
+],
+"totalSteps": 58,
+"waves": [
+ {
+  "wave": 1,
+  "parallel": false,
+  "ids": [
+   "n1"
+  ]
+ },
+ {
+  "wave": 2,
+  "parallel": true,
+  "ids": [
+   "n2",
+   "n4",
+   "n5",
+   "n6",
+   "n7"
+  ]
+ },
+ {
+  "wave": 3,
+  "parallel": false,
+  "ids": [
+   "n3"
+  ]
+ },
+ {
+  "wave": 4,
+  "parallel": false,
+  "ids": [
+   "n8"
+  ]
+ }
+]
+}

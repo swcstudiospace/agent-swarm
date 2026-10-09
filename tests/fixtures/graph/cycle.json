@@ -1,0 +1,19 @@
+{
+  "graphId": "ut-mv00tcgl-d8215d3e",
+  "nodes": [
+    {
+      "id": "n1",
+      "kind": "understand",
+      "title": "Depends on the node that depends on this one",
+      "depends_on": ["n2"],
+      "steps": ["Step 1: no owned file"]
+    },
+    {
+      "id": "n2",
+      "kind": "generate",
+      "title": "Closes the cycle",
+      "depends_on": ["n1"],
+      "steps": ["Step 1: describe the design without a path"]
+    }
+  ]
+}
