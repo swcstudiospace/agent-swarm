@@ -70,6 +70,7 @@ TYPE_KINDS: dict[str, str] = {
     # plan / lifecycle bookkeeping -> note
     "plan.updated": "note",              # A01 wrote a plan snapshot (orch_plan)
     "task.transition": "note",           # A01 moved a task between states (orch_status --transition)
+    "task.approval.skipped": "note",     # advisory ingest saved a result and did not attempt APPROVED
     "task.result.raw": "note",           # runner captured a raw agent result before validation
     # a task changing hands -> claim
     "task.claimed": "claim",             # an agent took a task (ingest of a task.result that skipped the claim)
