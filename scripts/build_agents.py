@@ -21,6 +21,7 @@ Copy Cursor agents only (no substrate, no MCP, no env files):
 """
 from __future__ import annotations
 import argparse
+import errno
 import json
 import os
 import re
@@ -669,20 +670,125 @@ def _generated_symlink() -> Path | None:
     return None
 
 
+def _classify_target_stat(st: os.stat_result, target: Path) -> str | None:
+    """Why `target` must not be written through (T-07-05): a symlink, a directory, a non-regular file,
+    or a hardlink (shared inode, which `is_symlink()` misses). None when `st` is a singly-linked file."""
+    if stat.S_ISLNK(st.st_mode):
+        return f"{target} is a symlink"
+    if stat.S_ISDIR(st.st_mode):
+        return f"{target} is a directory"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{target} is not a regular file"
+    if st.st_nlink > 1:
+        return f"{target} is a hardlink (nlink={st.st_nlink})"
+    return None
+
+
+def _target_refusal(target: Path) -> str | None:
+    """Why `target` must not be written right now (T-07-05): `_classify_target_stat` at it, or a
+    symlink/non-directory at its parent. Reads only; `lstat` never follows a swapped-in symlink."""
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return f"{target} is unreadable ({exc.strerror})"
+    else:
+        refusal = _classify_target_stat(st, target)
+        if refusal is not None:
+            return refusal
+    try:
+        pst = os.lstat(target.parent)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"{target.parent} is unreadable ({exc.strerror})"
+    if stat.S_ISLNK(pst.st_mode):
+        return f"{target.parent} is a symlink"
+    if not stat.S_ISDIR(pst.st_mode):
+        return f"{target.parent} is not a directory"
+    return None
+
+
+def _read_target(target: Path) -> str | None:
+    """Current text of `target`, or None when absent or unreadable (T-07-05). The open uses `O_NOFOLLOW`
+    so a swapped-in symlink is never followed; only the exact opened inode counts."""
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _safe_write_text(target: Path, content: str) -> str | None:
+    """Write `content` to `target` without following a symlink and without truncating a swapped file
+    (T-07-05). A swapped-in symlink fails the `O_NOFOLLOW` open with `ELOOP`; when the destination did
+    not exist the open uses `O_EXCL`, otherwise the opened file's `fstat` (dev, ino) must equal the
+    pre-open `lstat` and a hardlink refuses — all before any truncation. Returns a refusal reason,
+    or None on success; writes nothing on refusal."""
+    try:
+        before = os.lstat(target)
+    except FileNotFoundError:
+        before = None
+    except OSError as exc:
+        return f"{target} is unreadable ({exc.strerror})"
+    if before is not None:
+        refusal = _classify_target_stat(before, target)
+        if refusal is not None:
+            return refusal
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | (0 if before is not None else os.O_EXCL), 0o666)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return f"{target} is a symlink"
+        if exc.errno == errno.EEXIST:
+            return f"{target} changed after the check"
+        return f"{target} cannot be opened ({exc.strerror})"
+    refusal = None
+    try:
+        after = os.fstat(fd)
+        refusal = _classify_target_stat(after, target)
+        if refusal is None and before is not None and (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            refusal = f"{target} changed after the check"
+        if refusal is None:
+            os.ftruncate(fd, 0)
+            data = content.encode("utf-8")
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+    except OSError as exc:
+        refusal = f"{target} cannot be written ({exc.strerror})"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return refusal
+
+
 def _write_or_check(target: Path, content: str, check: bool, changed: list, written: list, blocked: list) -> None:
-    if target.is_symlink() or target.parent.is_symlink():
+    if _target_refusal(target) is not None:
         changed.append(str(target.relative_to(ROOT)))
         blocked.append(str(target.relative_to(ROOT)))
         return
-    if target.exists() and target.read_text(encoding="utf-8") == content:
+    if _read_target(target) == content:
         return
     changed.append(str(target.relative_to(ROOT)))
     if not check:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.parent.is_symlink() or target.is_symlink():
+        if _target_refusal(target) is not None:
             blocked.append(str(target.relative_to(ROOT)))
             return
-        target.write_text(content, encoding="utf-8")
+        refusal = _safe_write_text(target, content)
+        if refusal is not None:
+            blocked.append(str(target.relative_to(ROOT)))
+            print(f"error: refusing to write {target.relative_to(ROOT)} ({refusal})", file=sys.stderr)
+            return
         written.append(str(target.relative_to(ROOT)))
 
 
@@ -1080,9 +1186,9 @@ def main() -> int:
         _write_or_check(ROOT / rel, grok_files[rel], args.check, changed, written, blocked)
     refused = []
     if blocked and not args.check:
-        # A symlinked file was in the write set. Do not prune; the directory check above
-        # already refused a symlinked export dir before any write.
-        print("refused to write through symlink: " + ", ".join(blocked), file=sys.stderr)
+        # A symlinked, hardlinked or swapped file was in the write set. Do not prune; the directory
+        # check above already refused a symlinked export dir before any write.
+        print("refused to write through symlink or hardlink: " + ", ".join(blocked), file=sys.stderr)
         return 1
     if not only:
         slugs = {a["slug"] for a in agents}

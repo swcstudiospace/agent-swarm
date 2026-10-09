@@ -371,6 +371,104 @@ def test_link_refuses_a_symlinked_config(ws, home, tmp_path):
     assert _cfg(ws).is_symlink()
 
 
+# ---------------------------------------------------------------- write-time re-validation (T-07-05 TOCTOU)
+
+
+def _first_copy_dest(ws):
+    agents, _ = inst.package_names()
+    return ws / ".omp" / "agents" / f"{sorted(agents)[0]}.md"
+
+
+def _real_files(ws):
+    return [p for p in ws.rglob("*") if p.is_file() and not p.is_symlink()]
+
+
+def test_copy_mode_refuses_hardlink_at_destination(ws, home, tmp_path):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    dest.parent.mkdir(parents=True)
+    os.link(victim, dest)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "hardlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == [dest]
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_copy_mode_write_time_refuses_symlink_at_destination(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(victim)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == []
+
+
+def test_copy_mode_write_time_refuses_symlink_at_path_component(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        (ws / ".omp").symlink_to(outside)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+    assert _real_files(ws) == []
+
+
+def test_copy_mode_write_time_refuses_hardlink_at_destination(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.link(victim, dest)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "hardlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == [dest]
+
+
+def test_link_write_time_refuses_planted_config(ws, home, tmp_path, monkeypatch):
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        _write(_cfg(ws), "theme: planted\n")
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws)
+    assert rc == 2
+    assert "after the plan check" in out
+    assert _cfg(ws).read_text(encoding="utf-8") == "theme: planted\n"
+
+
 @pytest.mark.parametrize("where", ["home", "omp-dir", "checkout"])
 def test_install_omp_refuses_home_omp_dir_and_checkout(home, tmp_path, monkeypatch, where):
     fake = tmp_path / "checkout"  # stands in for the checkout, so no test ever targets the real one
