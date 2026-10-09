@@ -596,6 +596,46 @@ def test_same_attempt_redispatch_preserves_evidence_file(sr, tmp_path):
     assert sr.evidence_path(sdir, "T-one", 1).name == "T-one.a1.r2.md"
 
 
+def test_concurrent_same_attempt_writes_never_share_path(sr, tmp_path):
+    """Two runners on the same IN_PROGRESS rework task (same attempt) race for the evidence file:
+    O_EXCL reservation gives each a distinct path — the loser takes the next suffix — and neither
+    output overwrites or mixes with the other."""
+    import threading
+    sdir = tmp_path / ".swarm"
+    (sdir / "results").mkdir(parents=True)
+    (sdir / "results" / "T-one.a1.md").write_text("prior attempt output")
+    barrier = threading.Barrier(2)
+    paths: list = [None, None]
+    errors: list = []
+
+    def run(i, body):
+        try:
+            barrier.wait(timeout=10)
+            paths[i] = sr.write_evidence(sdir, "T-one", 1, body)
+        except Exception as e:  # noqa: BLE001 — surfaced below via assert
+            errors.append(e)
+
+    bodies = ("runner-a output", "runner-b output")
+    threads = [threading.Thread(target=run, args=(i, body)) for i, body in enumerate(bodies)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors
+    assert all(t is not None for t in paths)
+    assert sorted(p.name for p in paths) == ["T-one.a1.r1.md", "T-one.a1.r2.md"]
+    assert sorted(p.read_text() for p in paths) == sorted(bodies)
+    assert (sdir / "results" / "T-one.a1.md").read_text() == "prior attempt output"
+
+
+def test_write_evidence_keeps_canonical_name_when_uncontended(sr, tmp_path):
+    """Single-runner behavior is unchanged: the first write of an attempt takes the canonical name."""
+    sdir = tmp_path / ".swarm"
+    path = sr.write_evidence(sdir, "T-one", 1, "only output")
+    assert path.name == "T-one.a1.md"
+    assert path.read_text() == "only output"
+
+
 def test_rework_stashes_failing_evidence(tmp_path):
     """CHANGES_REQUESTED stashes the failing attempt's result/meta under notes.rework_evidence, so a
     later dispatch replacing them leaves the failing evidence reachable; with no prior result only
