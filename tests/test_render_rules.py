@@ -195,6 +195,36 @@ def test_reinstall_without_the_flag_drops_an_empty_stop_key(tree, ws, home):
     assert "Stop" not in _claude(ws)["hooks"] and "Stop" not in _grok(ws)["hooks"]
 
 
+@pytest.mark.parametrize("command, match", [
+    ("python3 /old/checkout/hooks/on_a01_complete.py", True),
+    ('python3 "/old checkout/hooks/on_a01_complete.py"', True),
+    ("python3 '/old checkout/hooks/on_a01_complete.py'", True),
+    (r"python3 /old\ checkout/hooks/on_a01_complete.py", True),
+    ("python3 hooks/on_a01_complete.py --json", True),
+    ("python3 check_on_a01_complete.py", False),
+    ("python3 /tmp/hooks/check_on_a01_complete.py", False),
+    ("python3 /tmp/on_a01_complete.py", False),
+    ("python3 /tmp/myhooks/on_a01_complete.py", False),
+    ('python3 "/old checkout/hooks/on_a01_complete.py', False),  # unmatched quote: do not guess
+])
+def test_a01_complete_match_parses_quoting_and_requires_the_hooks_path(command, match):
+    assert build_agents._is_a01_complete({"type": "command", "command": command}) is match
+
+
+def test_a_quoted_registration_is_replaced_and_a_lookalike_stays(tree, ws, home):
+    quoted = 'python3 "/old checkout/hooks/on_a01_complete.py"'
+    lookalike = "python3 /tmp/hooks/check_on_a01_complete.py"
+    _seed(ws, [{"hooks": [
+        {"type": "command", "command": quoted},
+        {"type": "command", "command": lookalike},
+    ]}])
+    assert _install(tree, ws, home, "--with-a01-complete-hook").returncode == 0
+    expected = [lookalike, f"python3 {tree / 'hooks' / 'on_a01_complete.py'}"]
+    assert _stop(_claude(ws)) == expected and _stop(_grok(ws)) == expected
+    assert _install(tree, ws, home).returncode == 0
+    assert _stop(_claude(ws)) == [lookalike] and _stop(_grok(ws)) == [lookalike]
+
+
 def test_the_flag_moves_the_registration_to_this_checkouts_path(tree, ws, home):
     _seed(ws, [{"hooks": [{"type": "command", "command": "python3 /old/checkout/hooks/on_a01_complete.py"}]}])
     assert _install(tree, ws, home, "--with-a01-complete-hook").returncode == 0

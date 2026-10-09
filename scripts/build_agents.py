@@ -23,9 +23,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import shutil
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -786,8 +787,25 @@ def _copy_file(src: Path, dest: Path) -> None:
 
 
 def _is_a01_complete(hook: object) -> bool:
-    """True for a hook whose command runs hooks/on_a01_complete.py (the entry this installer registers)."""
-    return isinstance(hook, dict) and any(tok.endswith("on_a01_complete.py") for tok in str(hook.get("command", "")).split())
+    """True when the command's argv runs `hooks/on_a01_complete.py`.
+
+    Quoting is parsed, so a checkout path that contains a space still matches. The filename has to be exact — a
+    look-alike such as `check_on_a01_complete.py` does not — and its parent directory has to be named `hooks`.
+    A command shlex cannot parse is not a match: a reinstall must not delete a hook it cannot read."""
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command", "")
+    if not isinstance(command, str) or not command.strip():
+        return False
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    for token in tokens:
+        path = PurePosixPath(token)
+        if path.name == "on_a01_complete.py" and path.parent.name == "hooks":
+            return True
+    return False
 
 
 def _set_a01_complete_hook(hooks: dict, complete_cmd: str, enabled: bool) -> None:
