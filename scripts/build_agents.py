@@ -253,19 +253,70 @@ def install_targets() -> list[Path]:
     return [CLAUDE_DIR, GROK_DIR]
 
 
-def _write_or_check(target: Path, content: str, check: bool, changed: list, written: list) -> None:
+def _generated_symlink() -> Path | None:
+    """A generated directory, or a parent of one up to ROOT, that is a symlink."""
+    for base in (CLAUDE_DIR, GROK_DIR, CURSOR_DIR, OMP_AGENTS_DIR, OMP_SKILLS_DIR):
+        cur = base
+        while cur != ROOT and cur != cur.parent:
+            if cur.is_symlink():
+                return cur
+            cur = cur.parent
+    return None
+
+
+def _write_or_check(target: Path, content: str, check: bool, changed: list, written: list, blocked: list) -> None:
+    if target.is_symlink() or target.parent.is_symlink():
+        changed.append(str(target.relative_to(ROOT)))
+        blocked.append(str(target.relative_to(ROOT)))
+        return
     if target.exists() and target.read_text(encoding="utf-8") == content:
         return
     changed.append(str(target.relative_to(ROOT)))
     if not check:
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent.is_symlink() or target.is_symlink():
+            blocked.append(str(target.relative_to(ROOT)))
+            return
         target.write_text(content, encoding="utf-8")
         written.append(str(target.relative_to(ROOT)))
 
 
 def _contained(p: Path, base: Path) -> bool:
-    """True if p is a real (non-symlink) entry whose resolved path stays under base."""
-    return not p.is_symlink() and p.resolve().is_relative_to(base.resolve())
+    """Lexical containment: every component from ``base`` to ``p`` is a non-symlink.
+
+    A direct child of a non-symlink base qualifies, and so does ``SKILL.md`` under a
+    direct skill directory. ``Path.resolve()`` is not used, so a symlink is not followed.
+    """
+    if p.is_symlink() or base.is_symlink():
+        return False
+    try:
+        rel = p.relative_to(base)
+    except ValueError:
+        return False
+    if not rel.parts or ".." in rel.parts:
+        return False
+    cur = base
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return False
+    return True
+
+
+def _unlink_orphan(orphan: Path) -> None:
+    """Unlink a direct child of an export directory, or SKILL.md in a direct omp skill directory."""
+    if orphan.is_symlink():
+        return
+    parent = orphan.parent
+    if parent.is_symlink():
+        return
+    if orphan.name == "SKILL.md" and parent.parent == OMP_SKILLS_DIR:
+        orphan.unlink()
+        if not any(parent.iterdir()):
+            parent.rmdir()
+        return
+    if parent in (CLAUDE_DIR, GROK_DIR, CURSOR_DIR, OMP_AGENTS_DIR, OMP_SKILLS_DIR) and orphan.is_file():
+        orphan.unlink()
 
 
 def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
@@ -455,24 +506,37 @@ def main() -> int:
             install_workspace(workspace, dry_run=True)
             substrate = 0 if args.no_substrate else _install_substrate.install_substrate(workspace, runtimes, True, sys.stdout)
             return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout))
+    link = _generated_symlink()
+    if link is not None:
+        try:
+            shown = link.relative_to(ROOT)
+        except ValueError:
+            shown = link
+        print(f"error: refusing to generate or prune through symlink {shown}", file=sys.stderr)
+        return 1
     manifest_raw = json.loads((ROOT / "agents.json").read_text())
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     GROK_DIR.mkdir(parents=True, exist_ok=True)
-    changed, written = [], []
+    changed, written, blocked = [], [], []
     agents = list(load_manifest())
     for agent in agents:
         if only and agent["id"].lower() not in only and agent["slug"] not in only:
             continue
-        _write_or_check(CLAUDE_DIR / f"{agent['slug']}.md", render_claude(agent, defaults), args.check, changed, written)
-        _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written)
-        _write_or_check(CURSOR_DIR / f"{agent['slug']}.md", render_cursor(agent, defaults), args.check, changed, written)
-        _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written)
-        _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written)
+        _write_or_check(CLAUDE_DIR / f"{agent['slug']}.md", render_claude(agent, defaults), args.check, changed, written, blocked)
+        _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written, blocked)
+        _write_or_check(CURSOR_DIR / f"{agent['slug']}.md", render_cursor(agent, defaults), args.check, changed, written, blocked)
+        _write_or_check(OMP_AGENTS_DIR / f"{agent['slug']}.md", render_omp(agent, agents), args.check, changed, written, blocked)
+        _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written, blocked)
         if agent["id"] == "A01":
-            _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written)
+            _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written, blocked)
     refused = []
+    if blocked and not args.check:
+        # A symlinked file was in the write set. Do not prune; the directory check above
+        # already refused a symlinked export dir before any write.
+        print("refused to write through symlink: " + ", ".join(blocked), file=sys.stderr)
+        return 1
     if not only:
         slugs = {a["slug"] for a in agents}
         removable, refused = _omp_orphans(slugs)
@@ -482,9 +546,7 @@ def main() -> int:
         for orphan in removable:
             changed.append(str(orphan.relative_to(ROOT)))
             if not args.check:
-                orphan.unlink()
-                if orphan.name == "SKILL.md" and not any(orphan.parent.iterdir()):
-                    orphan.parent.rmdir()
+                _unlink_orphan(orphan)
                 written.append(f"removed {orphan.relative_to(ROOT)}")
         changed += [str(p.relative_to(ROOT)) for p in refused]
     if args.check:

@@ -359,7 +359,8 @@ def test_agent_session_preview_emits_no_dev_key_event(swarm_dir):
     assert r.returncode == 0, r.stdout + r.stderr
     assert _events(swarm_dir, "gate.verdict.unrecorded")
     assert _events(swarm_dir, "security.dev_key") == []
-    r = subprocess.run(gate, capture_output=True, text=True, env=env, cwd=ROOT)
+    r = subprocess.run(gate, capture_output=True, text=True,
+                       env={**env, "SWARM_ALLOW_INSECURE_DEV_KEY": "1"}, cwd=ROOT)
     assert r.returncode == 0, r.stdout + r.stderr
     assert {e["payload"]["source"] for e in _events(swarm_dir, "security.dev_key")} == {"A08@dry"}
 

@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 
-from .envelope import real_key_configured
+from .envelope import insecure_dev_key, real_key_configured
 from .errors import SwarmError, ErrorCode
 from .paths import swarm_dir
 from .gates import validate_verdict
@@ -236,6 +236,8 @@ class TaskStore:
                 if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
                     raise SwarmError(ErrorCode.E_POLICY,
                                      "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured", task_id=task_id)
+                if not real_key_configured() and insecure_dev_key() is None:
+                    raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured", task_id=task_id)
                 missing = self.missing_gates(task_id)
                 if missing:
                     raise SwarmError(ErrorCode.E_POLICY,

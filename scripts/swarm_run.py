@@ -152,6 +152,21 @@ Swarm runtime lives at {ROOT} (scripts: `python3 {ROOT}/scripts/<script>.py --ro
 Execute the task per your agent instructions and finish with your summary and the single ```json result block."""
 
 
+def preflight_signing() -> None:
+    """Refuse before any task is claimed when task.assign cannot be signed.
+
+    Same messages as sign_envelope. A REQUIRE_KEY or unloadable-Ed25519 misconfiguration
+    is reported first; otherwise a keyless run raises ``fail-closed: no signing key configured``.
+    ``--dry-run`` signs task.assign too, so it takes the same check. Nothing here claims a task.
+    """
+    from swarm.envelope import insecure_dev_key, real_key_configured, signing_config_error
+    err = signing_config_error()
+    if err:
+        raise SwarmError(ErrorCode.E_POLICY, err)
+    if not real_key_configured() and insecure_dev_key() is None:
+        raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured")
+
+
 def preflight_auth(claude_bin: str) -> None:
     """Fail fast (E-DEP) when the CLI has no credentials instead of burning task attempts."""
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -934,6 +949,8 @@ def run(args, ctx) -> dict:
         setattr(args, f"{args.runtime}_bin", binary)
         if args.runtime == "claude":
             preflight_auth(binary)
+    # before lease_bridge and any claim, including --dry-run (it signs task.assign)
+    preflight_signing()
     leases = lease_bridge(args, store_path, corr, repo, ctx)
     handoffs = handoff_bridge(store_path, corr, repo, ctx, leases)
     log, rounds = [], 0

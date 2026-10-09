@@ -8,8 +8,12 @@ from conftest import ROOT
 
 
 def _env():
-    # no SWARM_DIR (state must follow --repo) and no other ambient swarm settings
-    return {k: v for k, v in os.environ.items() if not k.startswith("SWARM_")}
+    # no SWARM_DIR (state must follow --repo) and no other ambient swarm settings.
+    # A dry-run signs task.assign. Pass this test's throwaway HMAC key; do not opt into the dev key.
+    key = os.environ["SWARM_SIGNING_KEY"]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SWARM_")}
+    env["SWARM_SIGNING_KEY"] = key
+    return env
 
 
 def _run(script, *args, cwd):

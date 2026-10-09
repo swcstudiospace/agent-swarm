@@ -67,12 +67,13 @@ flowchart LR
 
 **Signing** (`swarm/envelope.py`)
 - Ed25519 when `SWARM_ED25519_KEY` (hex seed) is set and `cryptography` imports.
-- Otherwise HMAC-SHA256 with `SWARM_SIGNING_KEY`, defaulting to `dev-insecure-key`. Every dev-key signing emits a `security.dev_key` event into the caller's resolved state dir, except a gate-script preview inside an agent session (`SWARM_AGENT_SESSION=1`), which records nothing and emits only `gate.verdict.unrecorded`.
+- Otherwise HMAC-SHA256 with `SWARM_SIGNING_KEY`. There is no implicit dev key. The public dev key is used only when `SWARM_ALLOW_INSECURE_DEV_KEY=1`, and not while `SWARM_ED25519_KEY` is set or `SWARM_REQUIRE_KEY=1`. The unset or empty `SWARM_SIGNING_KEY` opt-in path emits a `security.dev_key` event into the caller's resolved state dir, except a gate-script preview inside an agent session (`SWARM_AGENT_SESSION=1`), which records nothing and emits only `gate.verdict.unrecorded`.
+- Without a real key and without that opt-in, `sign_envelope` refuses (`E-POLICY`), gate scripts record no verdict rows and emit `gate.verdict.unrecorded` (the envelope file is advisory), a dev-key `hmac:` signature does not verify, and the transition to APPROVED fails closed (`fail-closed: no signing key configured`). Unsetting the opt-in makes a dev-key signature stop verifying. `swarm_run` calls `preflight_signing()` before it leases or claims a task, including `--dry-run`, and raises that same refusal so a keyless run leaves every task unattempted. A keyless quality or security gate whose own checks pass still fails when a per-target finding is blocking: the advisory file verdict is fail and the unsigned per-target envelopes are returned without writing verdict rows. Local keyless runs need the opt-in or a real key. Tests pass a throwaway `SWARM_SIGNING_KEY` (`secrets.token_hex`); the dev-key opt-in is only for tests of that path.
 - Signatures are prefixed `ed25519:` or `hmac:`.
 - Envelope schema is `swarm.v1.<type>`.
 - `missing_gates()` verifies each required verdict's signed envelope before APPROVED. `missing_gate_reasons` (`orch_status --history`) names why a gate is missing: `absent`, `unsigned`, `bad-sig` (malformed or forged), `mismatch` (row, task or correlation disagree), `stale` (signed before the last rework, even if re-inserted), `dry-run`, `fail`, `expired`.
-- A dev-key `hmac:` signature never verifies while `SWARM_ED25519_KEY` is set (even if unloadable) or `SWARM_REQUIRE_KEY=1`.
-- `SWARM_REQUIRE_KEY=1` without a real key fails APPROVED closed (E-POLICY). Gate scripts exit 2 with an explicit key-configuration error under a missing or unloadable key.
+- A dev-key `hmac:` signature never verifies while `SWARM_ED25519_KEY` is set (even if unloadable) or `SWARM_REQUIRE_KEY=1`, even when `SWARM_ALLOW_INSECURE_DEV_KEY=1`.
+- `SWARM_REQUIRE_KEY=1` without a real key fails APPROVED closed (E-POLICY). Gate scripts exit 2 with an explicit key-configuration error under a missing or unloadable key. The keyless fail-closed path above does not require `SWARM_REQUIRE_KEY=1`.
 
 **Hooks**
 - `hooks/user_prompt_submit.py` (Claude Code UserPromptSubmit)
