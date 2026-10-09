@@ -152,13 +152,12 @@ def test_recover_stranded_skips_live_rework_other_plans_and_bools(tmp_path):
 
 
 def _alive(pid: int) -> bool:
+    """False once the pid is gone or is a zombie. `os.kill(pid, 0)` still succeeds for state Z."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
         return False
-    except PermissionError:
-        return True
-    return True
 
 
 def test_gate_dispatch_deadline_covers_session_and_script(tmp_path, monkeypatch):
