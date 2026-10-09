@@ -69,7 +69,8 @@ def _credential(value) -> bool:
     return any(rx.search(text) for text in _strings(value) for rx in patterns)
 
 
-_APPROVAL_TOKEN = re.compile(r"\bAPPROVED\b")
+# Whitespace-delimited only. A path such as docs/APPROVED.md must not be renamed.
+_APPROVAL_TOKEN = re.compile(r"(?<!\S)APPROVED(?!\S)")
 
 
 def _withhold_approval(value: str) -> str:
@@ -77,15 +78,25 @@ def _withhold_approval(value: str) -> str:
     return _APPROVAL_TOKEN.sub("advisory-complete", value)
 
 
-def _free_text(value) -> str:
+def _redact_text(value) -> str:
     """Redact lease ids before any prefix. A prefix makes the string invalid JSON, so a later
     redact_leases pass would leave the token in place."""
     if not isinstance(value, str):
         return ""
     redacted = redact_leases(value)
-    if not isinstance(redacted, str):
-        return ""
-    return _withhold_approval(redacted)
+    return redacted if isinstance(redacted, str) else ""
+
+
+def _display(value) -> str | None:
+    """Status prose with a whitespace-delimited approval word relabeled.
+
+    None when the token is embedded in a path or other evidence that cannot be relabeled
+    without renaming it.
+    """
+    text = _withhold_approval(_redact_text(value))
+    if "APPROVED" in text:
+        return None
+    return text
 
 
 def _state_label(state) -> str:
@@ -212,13 +223,17 @@ def _advisory_file(sdir: Path, gate_task_id: str, target: str, gate: str) -> dic
 
 
 def _describe(store: TaskStore, target: str, gate: str, row: dict | None, advisory: dict | None, *,
-              ran: bool) -> tuple[str, str]:
+              ran: bool, event_verdict: str | None = None) -> tuple[str, str]:
     if row is not None:
         return _classify_row(store, target, gate, row)
     if advisory is not None or ran:
         # A file or a script event with no row is an unsigned run, not a missing run, and not a signature.
-        payload = _payload(advisory)
-        recorded = _recorded_word(payload.get("verdict") or "none") if advisory is not None else "none"
+        if advisory is not None:
+            recorded = _recorded_word(_payload(advisory).get("verdict") or "none")
+        elif event_verdict:
+            recorded = _recorded_word(event_verdict)
+        else:
+            recorded = "none"
         return "unsigned keyless", recorded
     return "not run", "none"
 
@@ -248,14 +263,21 @@ def _artifact_commit(store: TaskStore, task_id: str) -> str | None:
     return None
 
 
-def _evidence(store: TaskStore, task_id: str) -> str:
+def _evidence(store: TaskStore, task_id: str) -> tuple[str, int]:
     try:
         task = store.get(task_id)
     except SwarmError:
-        return ""
-    uris = [o.get("uri") for o in task.get("outputs") or []
-            if isinstance(o, dict) and isinstance(o.get("uri"), str)]
-    return ", ".join(uris)
+        return "", 0
+    kept, omitted = [], 0
+    for output in task.get("outputs") or []:
+        uri = output.get("uri") if isinstance(output, dict) else None
+        if not isinstance(uri, str):
+            continue
+        if "APPROVED" in uri:
+            omitted += 1
+            continue
+        kept.append(uri)
+    return ", ".join(kept), omitted
 
 
 def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | None], int], list[str], list[dict],
@@ -282,9 +304,25 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | Non
             if dry:
                 note += "; dry-run"
             skipped.append(note + "; it was not turned into a command")
-            bare[(name, owner)] = {"dry": dry, "commit": _sha_field(payload)}
+            bare[(name, owner)] = {
+                "dry": dry, "commit": _sha_field(payload),
+                "summary": payload.get("summary") if isinstance(payload.get("summary"), str) else None,
+                "verdict": payload.get("verdict") if isinstance(payload.get("verdict"), str) else None,
+            }
             continue
         cmd = recorded
+        if "APPROVED" in cmd:
+            skipped.append(f"{kind} command line contained the approval token and was omitted")
+            summary = payload.get("summary")
+            if isinstance(summary, str) and summary:
+                shown = _display(summary)
+                if shown:
+                    skipped.append(f"{kind} recorded output: {shown}")
+                else:
+                    skipped.append(
+                        f"{kind} output tail omitted; it contained the approval token "
+                        "and could not be preserved")
+            continue
         if dry and "--dry-run" not in cmd.split():
             cmd = f"{cmd} --dry-run"
         code = payload.get("exit_code")
@@ -300,7 +338,11 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | Non
             entry["duration_s"] = duration
         summary = payload.get("summary")
         if isinstance(summary, str):
-            entry["output_tail"] = _free_text(summary)
+            shown = _display(summary)
+            if shown:
+                entry["output_tail"] = shown
+            elif "APPROVED" in summary:
+                skipped.append(f"{kind} output tail omitted; it contained the approval token and could not be preserved")
         slot = len(commands)
         commands.append(entry)
         index[(name, owner)] = slot
@@ -308,14 +350,48 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | Non
     return commands, index, skipped, meta, bare
 
 
-def _image_ref(uri: str) -> bool:
-    """OCI refs from devops_build_record --image. Recorded file paths in the task store have neither."""
-    return "://" in uri or "@" in uri or ":" in uri
+_OCI_REF = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*(?::[0-9]+)?(?:/[A-Za-z0-9][A-Za-z0-9._-]*)+"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(?:@sha256:[0-9a-f]{64})?")
+_OCI_DIGEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}")
 
 
-def _files(tasks: list[dict]) -> tuple[list[str], list[str]]:
-    """File paths for files_changed, and non-file build artifacts kept out of that list."""
+def _recorded_images(sdir: Path) -> set[str]:
+    """image fields from devops_build_record JSON. Those URIs are not files."""
+    found: set[str] = set()
+    directory = sdir / "artifacts"
+    if not directory.is_dir():
+        return found
+    for path in directory.glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        image = record.get("image")
+        if isinstance(image, str) and image.strip():
+            found.add(image)
+    return found
+
+
+def _filesystem_path(uri: str) -> bool:
+    return uri.startswith(("/", "./", "../", ".swarm/")) or "\\" in uri
+
+
+def _is_image(uri: str, recorded: set[str]) -> bool:
+    """An image named by a build record, or an OCI ref that is not a filesystem path."""
+    if uri in recorded:
+        return True
+    if _filesystem_path(uri):
+        return False
+    return _OCI_DIGEST.fullmatch(uri) is not None or _OCI_REF.fullmatch(uri) is not None
+
+
+def _files(tasks: list[dict], recorded_images: set[str]) -> tuple[list[str], list[str], int]:
+    """File paths, non-file image lines, and a count of paths omitted for the approval token."""
     found, other = [], []
+    omitted = 0
     for task in tasks:
         for output in task.get("outputs") or []:
             if not isinstance(output, dict):
@@ -323,14 +399,17 @@ def _files(tasks: list[dict]) -> tuple[list[str], list[str]]:
             uri = output.get("uri")
             if not isinstance(uri, str) or not uri:
                 continue
-            if output.get("kind") == "build.artifact" and _image_ref(uri):
+            if "APPROVED" in uri:
+                omitted += 1
+                continue
+            if output.get("kind") == "build.artifact" and _is_image(uri, recorded_images):
                 line = f"non-file artifact {task['task_id']} build.artifact: {uri}"
                 if line not in other:
                     other.append(line)
                 continue
             if uri not in found:
                 found.append(uri)
-    return sorted(found), other
+    return sorted(found), other, omitted
 
 
 def _canned() -> dict:
@@ -399,9 +478,15 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
             siblings = _siblings(tasks, target, gate)
             row = _pick_row(store, target, gate, task["task_id"], siblings)
             advisory = None if row is not None else _advisory_file(sdir, task["task_id"], target, gate)
-            signature, recorded = _describe(store, target, gate, row, advisory, ran=ran)
+            event_verdict = info.get("verdict") if isinstance(info.get("verdict"), str) else None
+            signature, recorded = _describe(
+                store, target, gate, row, advisory, ran=ran, event_verdict=event_verdict)
             commit = _checked_commit(info, row, advisory, store, target)
-            evidence = _evidence(store, target)
+            evidence, omitted_evidence = _evidence(store, target)
+            if omitted_evidence:
+                unverified.append(
+                    f"omitted {omitted_evidence} evidence path(s) for {target}; "
+                    "they contained the approval token and could not be preserved")
             tail = f"; evidence {evidence}" if evidence else ""
             if signature == "not run":
                 unverified.append(
@@ -415,6 +500,14 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
                 unverified.append(sentence + f"; {missing}")
                 continue
             claims.append({"claim": sentence, "evidence_command_index": slot})
+        summary = info.get("summary") if key is not None and key in bare else None
+        if isinstance(summary, str) and summary:
+            shown = _display(summary)
+            if shown:
+                unverified.append(f"script {script} result: {shown}")
+            else:
+                unverified.append(
+                    f"script {script} result omitted; it contained the approval token and could not be preserved")
     for task in tasks:
         if (task.get("notes_json") or {}).get("gate"):
             continue
@@ -435,7 +528,12 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
                 "execution evidence is missing (no gate task)")
     for task in tasks:
         unverified.append(f"task {task['task_id']} state: {_state_label(task.get('state'))}")
-        unverified.append(f"task {task['task_id']} title: {_free_text(task.get('title') or '')}")
+        title = _display(task.get("title") or "")
+        if title is None:
+            unverified.append(
+                f"task {task['task_id']} title omitted; it contained the approval token and could not be preserved")
+        else:
+            unverified.append(f"task {task['task_id']} title: {title}")
         try:
             verdicts = store.latest_verdicts(task["task_id"])
         except SwarmError:
@@ -444,9 +542,19 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
             for finding in row.get("findings") or []:
                 summary = finding.get("summary") if isinstance(finding, dict) else None
                 if isinstance(summary, str) and summary:
-                    unverified.append(f"finding {task['task_id']} {gate}: {_free_text(summary)}")
-    files_changed, non_files = _files(tasks)
+                    shown = _display(summary)
+                    if shown:
+                        unverified.append(f"finding {task['task_id']} {gate}: {shown}")
+                    else:
+                        unverified.append(
+                            f"finding {task['task_id']} {gate} omitted; "
+                            "it contained the approval token and could not be preserved")
+    files_changed, non_files, omitted_files = _files(tasks, _recorded_images(sdir))
     unverified.extend(non_files)
+    if omitted_files:
+        unverified.append(
+            f"omitted {omitted_files} files_changed entry that contained the approval token "
+            "and could not be preserved")
     unverified.extend(unverified_extra)
     for i, command in enumerate(commands):
         if "duration_s" not in command:
@@ -485,24 +593,13 @@ def _open_store(root: Path) -> TaskStore:
     return TaskStore(path=db)
 
 
-def _rewrite(value):
-    if isinstance(value, str):
-        return _withhold_approval(value)
-    if isinstance(value, dict):
-        return {key: _rewrite(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_rewrite(item) for item in value]
-    return value
-
-
 def _guard(receipt: dict) -> dict:
-    """Redact, rename stored approval words, then refuse a leftover credential or approval token."""
+    """Redact, then refuse a leftover credential or an approval token that evidence still carries."""
     redacted = redact_leases(receipt)
     if not isinstance(redacted, dict) or list(redacted.keys()) != list(DESK_FIELDS):
         raise SwarmError(ErrorCode.E_INTERNAL, "redaction changed the receipt shape")
     if _credential(redacted) or _credential(json.dumps(redacted)):
         raise SwarmError(ErrorCode.E_POLICY, REFUSAL)
-    redacted = _rewrite(redacted)
     if any("APPROVED" in text for text in _strings(redacted)):
         raise SwarmError(ErrorCode.E_POLICY, "refusing to write a receipt that contains APPROVED")
     return redacted

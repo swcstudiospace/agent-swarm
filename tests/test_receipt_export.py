@@ -395,19 +395,22 @@ def test_gate_event_without_a_command_is_not_invented(swarm_dir, tmp_path):
          "notes": {"gate": "quality", "gate_for": ["T-be"], "gates": []}},
     ], [
         {"type": "script.qa_gate", "task_id": "T-qa", "payload": {
-            "status": "ok",
-            "executed": [{"runner": "pytest", "returncode": 0}],
-            "summary": "quality gate PASS — runners: ['pytest']"}},
+            "status": "fail",
+            "verdict": "fail",
+            "executed": [{"runner": "pytest", "returncode": 1}],
+            "summary": "quality gate FAIL — runners: ['pytest']"}},
     ])
     receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
     _assert_desk_shape(receipt)
     assert receipt["claims"] == []
     assert all("python3 scripts/qa_gate.py" not in c["cmd"] for c in receipt["commands"])
-    quality = [line for line in receipt["unverified"] if "T-qa" in line]
+    quality = [line for line in receipt["unverified"] if "T-qa" in line or "script qa_gate result" in line]
     assert quality
     assert any("no recorded cmd" in line for line in receipt["unverified"])
-    assert any("command line was not recorded" in line and "advisory" in line for line in quality)
+    assert any("command line was not recorded" in line and "recorded fail" in line for line in quality)
+    assert any("script qa_gate result: quality gate FAIL" in line for line in receipt["unverified"])
     assert all("not run" not in line for line in quality)
+    assert all("recorded none" not in line for line in quality)
 
 
 def test_status_summary_with_approved_still_exports(swarm_dir, tmp_path):
@@ -438,15 +441,53 @@ def test_image_artifact_is_not_a_changed_file(swarm_dir, tmp_path):
          "notes": {"gates": []}},
     ])
     image = "example.com/app@sha256:" + ("ab" * 32)
+    record_path = "/work/job@2/.swarm/artifacts/build.json"
     store.add_artifact("T-be", kind="code", uri="src/feature.py", producer="A05")
     store.add_artifact("T-be", kind="build.artifact", uri=".swarm/artifacts/record.json", producer="A11")
+    store.add_artifact("T-be", kind="build.artifact", uri=record_path, producer="A11")
     store.add_artifact("T-be", kind="build.artifact", uri=image, producer="A11")
+    artifacts = swarm_dir / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "build.json").write_text(
+        json.dumps({"kind": "build.artifact", "image": image}), encoding="utf-8")
     receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
     _assert_desk_shape(receipt)
-    assert receipt["files_changed"] == [".swarm/artifacts/record.json", "src/feature.py"]
+    assert receipt["files_changed"] == [
+        ".swarm/artifacts/record.json", "/work/job@2/.swarm/artifacts/build.json", "src/feature.py"]
     blob = json.dumps(receipt)
     assert image in blob
+    assert record_path in blob
     assert any(image in line and "non-file artifact" in line for line in receipt["unverified"])
+
+
+def test_approval_token_inside_a_path_is_omitted(swarm_dir, tmp_path):
+    corr = "corr-path"
+    _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+    ], [
+        {"type": "script.qa_gate", "task_id": "T-be", "payload": {
+            "status": "ok",
+            "cmd": "python3 -m pytest docs/APPROVED.md",
+            "exit_code": 0,
+            "summary": "T-be          A05   APPROVED           1"}},
+    ])
+    from swarm.taskstore import TaskStore
+
+    TaskStore().add_artifact("T-be", kind="code", uri="docs/APPROVED.md", producer="A05")
+    TaskStore().add_artifact("T-be", kind="code", uri="src/feature.py", producer="A05")
+    out = tmp_path / "receipt.json"
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr, "--out", str(out)))
+    assert out.is_file()
+    blob = json.dumps(receipt)
+    assert "APPROVED" not in blob
+    assert "advisory-complete.md" not in blob
+    assert receipt["files_changed"] == ["src/feature.py"]
+    assert receipt["commands"] == []
+    assert any("files_changed" in line and "could not be preserved" in line for line in receipt["unverified"])
+    assert any("command line contained the approval token" in line for line in receipt["unverified"])
+    assert any("recorded output:" in line and "advisory-complete" in line for line in receipt["unverified"])
+    assert all("docs/" not in line for line in receipt["unverified"])
 
 
 def test_in_progress_task_is_not_completed(swarm_dir, tmp_path):
