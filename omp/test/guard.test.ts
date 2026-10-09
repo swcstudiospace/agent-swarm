@@ -765,6 +765,36 @@ describe("HOOK-03 shell twin and D-08", () => {
     expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
   });
 
+  const GATE = "BLOCKED needs: human-approval (gate: gate-script-shell)";
+  const INTERP = "BLOCKED needs: human-approval (destructive: interpreter-stdin)";
+  test.each([
+    ["python3 -<scripts/rev_gate.py --task-id T", GATE],
+    ["bash -c 'python3 -' < scripts/rev_gate.py", GATE],
+    ["cp scripts/re[v]_gate.py /tmp/r.py", GATE],
+    ["printf 'print(1)\\n' | bash -c 'python3 -'", INTERP],
+    ["echo x | python3 -Wonce", INTERP],
+    ["echo x | python3 -Xtracemalloc", INTERP],
+    ["python3 < /dev/null", INTERP],
+  ])("stdin and copy hardening: %s blocks as %s", (command, reason) => {
+    expect(guardToolCall(bash(command), facts(B05))).toEqual({ block: true, reason });
+    expect(guardToolCall(bash(command), facts(undefined))).toBeUndefined();
+  });
+
+  test.each([
+    "echo x | python3 -c 'print(1)'",
+    "echo x | python3 -Bc 'print(1)'",
+    "python3 --version < /dev/null",
+    "python3 --help < /dev/null",
+    "python3 -V < /dev/null",
+    "python3 -h < /dev/null",
+    "cp notes.txt /tmp/n.txt",
+    "cp .swarm/tasks.db /tmp/tasks.db",
+    "printf 'print(1)\\n' | bash -c \"$VAR\"",
+    "bash -c \"$VAR\" < scripts/rev_gate.py",
+  ])("stdin and copy hardening: %s passes", (command) => {
+    expect(guardToolCall(bash(command), facts(B05))).toBeUndefined();
+  });
+
   /** WR-02: each gate stem, run by its owner or another agent through each spelling, is a run. */
   const GATE_OWNER: Record<string, string> = {
     qa_gate: "a08-qa", quality_gate: "a08-qa", rev_gate: "a09-reviewer", review_gate: "a09-reviewer",
@@ -1298,7 +1328,7 @@ describe("HOOK-03 shell twin and D-08", () => {
     "git add -A", 'git commit -m "feat: x"', "git status --short", "git diff HEAD~1 -- src/", "git checkout -b feat/x", "git switch main",
     "git stash", "git pull --rebase", "git push -u origin feat/x", "make -j8 test", "cargo build --release", "cargo test", "go test ./...",
     "go build -o bin/app ./cmd/app", "docker build -t app .", "docker compose up -d", "ls -la > files.txt", "echo done | tee -a log.txt",
-    "mkdir -p dist && cp -r src/* dist/", "rm -rf node_modules dist", "find . -name '*.ts' | xargs grep -l foo", "tar -czf dist.tgz dist",
+    "mkdir -p dist && cp -r src/*.md dist/", "rm -rf node_modules dist", "find . -name '*.ts' | xargs grep -l foo", "tar -czf dist.tgz dist",
     "curl -o /tmp/x.json https://x", "uvicorn app:app --reload &", "export NODE_ENV=test && bun test", "ruff check . --fix", "tsc -p tsconfig.json",
     "cd omp && bun run test 2>&1 | tail -20", "for f in src/*.ts; do echo $f; done", "wc -l $(git ls-files '*.py')", "date > build/stamp.txt",
   ])("common: %s passes", (command) => {

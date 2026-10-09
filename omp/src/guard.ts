@@ -496,14 +496,12 @@ function shellDashC(words: string[]): string[] | undefined {
 }
 
 /**
- * The command lines a segment hands to a shell, now or later: a shell's `-c` line (shellDashC), the `-c` value of
- * `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE` value, the `trap` action, and an `env -S`
- * line (its string split, the remaining words appended). eval/watch/parallel/`sudo -s`, which join all their
- * arguments, are normalizeSegments' (JOINS_ARGS).
+ * Command lines a segment hands to something other than a shell's own `-c` (that unwrap, and the stdin it inherits,
+ * is normalizeSegments'): the `-c` value of `su|runuser|script` and of a stripped `flock FILE`, every `alias NAME=LINE`
+ * value, the `trap` action, and an `env -S` line (its string split, the remaining words appended). eval/watch/parallel/
+ * `sudo -s`, which join all their arguments, are normalizeSegments' (JOINS_ARGS).
  */
-function commandLines(seg: string): string[] {
-  const shell = shellDashC(shellWords(seg));
-  if (shell !== undefined) return shell;
+function otherCommandLines(seg: string): string[] {
   const split = SPLIT_STRING.exec(seg);
   if (split !== null) {
     const [first = "", ...rest] = shellWords(seg.slice(split[0].length));
@@ -700,8 +698,9 @@ const COMPOUND_WORD = /^(?:(while|until|for|select)|(if)|(case)|(fi|done|esac))(
  * split on `;`, `&&`, `||`, `|`, `&` (outside quotes), plain quoted words are unquoted, and each segment loses leading
  * `env X=…`, `X=…`, `sudo`, `command`, wrapper words and shell keywords (`if`, `then`, `do`, `!` …). What a segment
  * runs in a child shell is normalized in turn and its segments appended (the outer segment stays too): a literal
- * `sh -c "…"` / `eval "…"` / `su -c` / `env -S` line and `find -exec` commands. A script fed to a shell's stdin is
- * not unwrapped (the `shell-stdin` row blocks it); `bash -c "$VAR"` is opaque by design (the documented residual).
+ * `sh -c "…"` / `eval "…"` / `su -c` / `env -S` line and `find -exec` commands. A literal shell `-c` payload inherits
+ * that segment's pipe and its `<` / `0<` files. A script fed to a shell's stdin is not unwrapped (the `shell-stdin`
+ * row blocks it); `bash -c "$VAR"` is opaque by design (the documented residual) and inherits neither.
  */
 export function normalize(command: string): string[] {
   const texts: string[] = [];
@@ -770,7 +769,23 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
-      for (const line of [...commandLines(seg), ...(joined === undefined ? [] : [joined])]) payload.push(...normalizeSegments(line, depth + 1, cuts));
+      const shellLines = shellDashC(shellWords(seg));
+      if (shellLines !== undefined) {
+        // a literal `-c` body runs with the shell's stdin: the pipe, and `< file` / `0<file` (not `bash -c "$VAR"`)
+        const suffix = stdinFileSuffix(`${prefix} ${seg}`);
+        for (const line of shellLines) {
+          if (!literalShellLine(line)) {
+            payload.push(...normalizeSegments(line, depth + 1, cuts));
+            continue;
+          }
+          const text = suffix === "" ? line : `${line}${suffix}`;
+          const inner = normalizeSegments(text, depth + 1, cuts);
+          payload.push(...(pipeIn ? inheritPipe(inner) : inner));
+        }
+      } else {
+        for (const line of otherCommandLines(seg)) payload.push(...normalizeSegments(line, depth + 1, cuts));
+      }
+      if (joined !== undefined) payload.push(...normalizeSegments(joined, depth + 1, cuts));
       if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth, cuts));
     }
     const runtime = info?.runtime;
@@ -1482,9 +1497,88 @@ function scriptStemOf(path: string): string | undefined {
   return SCRIPT_STEM.exec(path)?.[1];
 }
 
-/** Targets of stdin redirections (`< file`, `0<file`, `<<EOF`, `<<< '…'`), unquoted. */
+/**
+ * Bash ends a word at an unquoted `<`. `-<file` is the two words `-` and `<file`; a redirect that already begins
+ * at the operator (`0<file`, `<file`, `<<EOF`) stays one word. A quoted or backslash-escaped `<` stays inside the word.
+ */
+function splitStdinRedirect(word: string): string[] {
+  let quote: string | undefined;
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i];
+    if (quote !== undefined) {
+      if (c === "\\" && quote !== "'" && i + 1 < word.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      continue;
+    }
+    if (c === "$" && word[i + 1] === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c === "\\" && i + 1 < word.length) {
+      i++;
+      continue;
+    }
+    if (c !== "<") continue;
+    const before = word.slice(0, i);
+    let fd = before.length === 0;
+    if (!fd) {
+      fd = true;
+      for (let j = 0; j < before.length; j++) {
+        const d = before[j];
+        if (d < "0" || d > "9") {
+          fd = false;
+          break;
+        }
+      }
+    }
+    if (fd) return [word];
+    return [before, word.slice(i)];
+  }
+  return [word];
+}
+
+/** A `< file` or `0<file` word (a bare `<` / `0<` included), not a heredoc, here-string, `<>`, or fd copy (`<&`). */
+function isStdinFileWord(plain: string): boolean {
+  const at = plain.startsWith("0<") ? 2 : plain.startsWith("<") ? 1 : -1;
+  if (at < 0) return false;
+  const rest = plain[at];
+  return rest === undefined || (rest !== "<" && rest !== ">" && rest !== "&");
+}
+
+/** Outer `< file` / `0<file` words of a shell command, as written, to append to a literal `-c` payload. */
+function stdinFileSuffix(text: string): string {
+  const words = shellWords(text);
+  const kept: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const plain = unquote(words[i]);
+    if (!isStdinFileWord(plain)) continue;
+    const op = plain.startsWith("0<") ? 2 : 1;
+    if (plain.length > op) kept.push(words[i]);
+    else if (words[i + 1] !== undefined) kept.push(words[i], words[++i]);
+  }
+  return kept.length === 0 ? "" : ` ${kept.join(" ")}`;
+}
+
+/** The `-c` line names its command (`python3 -`). An expansion (`$VAR`, a cut, a glob) is the opaque residual. */
+function literalShellLine(line: string): boolean {
+  const first = unquote(shellWords(line)[0] ?? "");
+  if (first === "") return false;
+  return !first.includes("$") && !first.includes("`") && !first.includes("\u0001") && !first.includes("*") && !first.includes("?") && !first.includes("[");
+}
+
+/** The outer shell's pipe is the payload's stdin too, including a `-c` line unwrapped inside the payload. */
+function inheritPipe(items: Normalized[]): Normalized[] {
+  return items.map((item) => ({ ...item, piped: true, payload: inheritPipe(item.payload) }));
+}
+
+/** Targets of stdin redirections (`< file`, `0<file`, `<<EOF`, `<<< '…'`, and `-<file` split into `-` and `<file`), unquoted. */
 function stdinTargets(marked: string): string[] {
-  const words = shellWords(marked);
+  const words = shellWords(marked).flatMap(splitStdinRedirect);
   const out: string[] = [];
   for (let i = 0; i < words.length; i++) {
     const plain = unquote(words[i]);
@@ -1498,12 +1592,16 @@ function stdinTargets(marked: string): string[] {
 }
 
 /**
- * The interpreter's program is stdin: no script file, no `-c`/`--command` and no `-m`, and stdin is a pipe or a
- * redirect (`echo x | python3`, `python3 < scripts/rev_gate.py`, `python3 - --task-id T < scripts/rev_gate.py`).
- * `-c` and `-m` name the program, so a pipe into those is data and is not this.
+ * The interpreter's program is stdin: no script file, no `-c`/`--command` and no `-m`, no `--version`/`--help`/`-V`/`-h`
+ * before a script, and stdin is a pipe or a redirect (`echo x | python3`, `python3 < scripts/rev_gate.py`,
+ * `python3 -<scripts/rev_gate.py`). A short cluster is read left to right: `c` and `m` name the program, `h` and `V`
+ * are help and version, `W` and `X` take the rest of the cluster (or the next word) as their value (`-Bc` is `-c`;
+ * `-Wonce` and `-Xtracemalloc` are not), and other letters are flags. `-c` and `-m` name the program, so a pipe into
+ * those is data and is not this.
  */
 function readsProgramFromStdin(seg: Segment): boolean {
-  const { words, marked, piped } = seg;
+  const { marked, piped } = seg;
+  const words = seg.words.flatMap(splitStdinRedirect);
   let i = 0;
   let saw = false;
   while (i < words.length) {
@@ -1515,9 +1613,24 @@ function readsProgramFromStdin(seg: Segment): boolean {
     }
     if (!saw) return false;
     if (MODULE_OPTION.test(w) || w === "-c" || w.startsWith("-c") || w === "--command" || w.startsWith("--command=")) return false;
-    if (/^-[A-Za-z]+$/.test(w) && w.includes("c")) return false; // `python3 -Bc 'code'`
+    if (w === "--version" || w === "--help" || w.startsWith("--version=") || w.startsWith("--help=")) return false;
     if (INTERPRETER_VALUE_FLAG.test(w)) {
       i += 2;
+      continue;
+    }
+    if (/^-[A-Za-z]+$/.test(w)) {
+      let rest = w.slice(1);
+      let consumeNext = false;
+      while (rest !== "") {
+        const flag = rest[0];
+        rest = rest.slice(1);
+        if (flag === "c" || flag === "m" || flag === "h" || flag === "V") return false;
+        if (flag === "W" || flag === "X") {
+          consumeNext = rest === "";
+          break;
+        }
+      }
+      i += consumeNext ? 2 : 1;
       continue;
     }
     if (STDIN_FILE.test(w)) break; // `python3 -`: the program is stdin, and the rest are its arguments
@@ -1528,7 +1641,7 @@ function readsProgramFromStdin(seg: Segment): boolean {
     return false; // a real script word: stdin is data, not the program
   }
   if (!saw) return false;
-  return piped || shellWords(marked).some((w) => STDIN_REDIRECT.test(unquote(w)));
+  return piped || shellWords(marked).flatMap(splitStdinRedirect).some((w) => STDIN_REDIRECT.test(unquote(w)));
 }
 
 /** The stem of the file an interpreter is reading as its program, when that file is named by a stdin redirect. */
@@ -1541,13 +1654,93 @@ function stdinScriptStem(seg: Segment): string | undefined {
   return undefined;
 }
 
-/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand): the copy is how a renamed run used to get past the stem check. */
+/** A glob basename longer than this is not matched (the command is left alone, not failed closed). */
+const GLOB_PATTERN_MAX = 256;
+
+/** `ch` is in the class body `pattern[start, end)`, a linear `[abc]` / `[a-z]` scan. */
+function classMatches(pattern: string, start: number, end: number, ch: string): boolean {
+  let i = start;
+  while (i < end) {
+    const a = pattern[i];
+    if (i + 2 < end && pattern[i + 1] === "-" && a !== "-" && pattern[i + 2] !== "-") {
+      const b = pattern[i + 2];
+      const lo = a < b ? a : b;
+      const hi = a < b ? b : a;
+      if (ch >= lo && ch <= hi) return true;
+      i += 3;
+    } else {
+      if (a === ch) return true;
+      i++;
+    }
+  }
+  return false;
+}
+
+/** Linear `*` / `?` / `[abc]` / `[a-z]` match. No RegExp. A pattern longer than GLOB_PATTERN_MAX does not match. */
+function globMatch(pattern: string, text: string): boolean {
+  if (pattern.length > GLOB_PATTERN_MAX) return false;
+  let pi = 0;
+  let ti = 0;
+  let starP = -1;
+  let starT = -1;
+  while (ti < text.length) {
+    if (pi < pattern.length && pattern[pi] === "*") {
+      starP = pi;
+      starT = ti;
+      pi++;
+      continue;
+    }
+    if (pi < pattern.length && pattern[pi] === "?") {
+      pi++;
+      ti++;
+      continue;
+    }
+    if (pi < pattern.length && pattern[pi] === "[") {
+      let end = pi + 1;
+      while (end < pattern.length && pattern[end] !== "]") end++;
+      if (end < pattern.length && classMatches(pattern, pi + 1, end, text[ti])) {
+        pi = end + 1;
+        ti++;
+        continue;
+      }
+    } else if (pi < pattern.length && pattern[pi] === text[ti]) {
+      pi++;
+      ti++;
+      continue;
+    }
+    if (starP === -1) return false;
+    pi = starP + 1;
+    ti = ++starT;
+  }
+  while (pi < pattern.length && pattern[pi] === "*") pi++;
+  return pi === pattern.length;
+}
+
+/** A `cp`/`mv`/`install`/`ln` basename glob (`*`, `?`, `[`) that names a guarded `stem.py` or `stem.ts`. */
+function globOperandMatches(path: string, stems: Record<string, true>): boolean {
+  const slash = path.lastIndexOf("/");
+  const base = slash === -1 ? path : path.slice(slash + 1);
+  if (base.length === 0 || base.length > GLOB_PATTERN_MAX) return false;
+  let glob = false;
+  for (let i = 0; i < base.length && !glob; i++) {
+    const c = base[i];
+    glob = c === "*" || c === "?" || c === "[";
+  }
+  if (!glob) return false;
+  for (const stem of Object.keys(stems)) {
+    if (globMatch(base, `${stem}.py`) || globMatch(base, `${stem}.ts`)) return true;
+  }
+  return false;
+}
+
+/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand, a glob basename included): the copy is how a renamed run used to get past the stem check. */
 function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
   const cmd = seg.words[0] ?? "";
   if (!/^(?:cp|mv|install|ln)$/.test(cmd)) return false;
   return operands(seg.words.slice(1)).some((arg) => {
     const stem = scriptStemOf(arg);
-    return stem !== undefined && Object.hasOwn(stems, stem);
+    if (stem !== undefined && Object.hasOwn(stems, stem)) return true;
+    return globOperandMatches(arg, stems);
   });
 }
 
@@ -1639,7 +1832,8 @@ export const RULES: readonly Rule[] = [
     pattern: gateScriptRun,
     samples: [
       "python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x",
-      "python3 < scripts/rev_gate.py", "python3 - --task-id T < scripts/rev_gate.py", "cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py",
+      "python3 < scripts/rev_gate.py", "python3 - --task-id T < scripts/rev_gate.py", "python3 -<scripts/rev_gate.py --task-id T",
+      "bash -c 'python3 -' < scripts/rev_gate.py", "cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py", "cp scripts/re[v]_gate.py /tmp/r.py",
     ],
   },
   // D-08: dotglob would let a leading `*`/`?` name `.swarm`/`.omp` (shell targets assume it off, as bash starts)
@@ -1669,7 +1863,10 @@ export const RULES: readonly Rule[] = [
     id: "interpreter-stdin",
     capability: "destructive",
     pattern: readsProgramFromStdin,
-    samples: ["echo x | python3", "python3 < /tmp/notes.py", "python3 - < /tmp/notes.py", "uv run python <<< 'print(1)'"],
+    samples: [
+      "echo x | python3", "python3 < /tmp/notes.py", "python3 - < /tmp/notes.py", "uv run python <<< 'print(1)'",
+      "printf 'print(1)\\n' | bash -c 'python3 -'", "echo x | python3 -Wonce", "echo x | python3 -Xtracemalloc",
+    ],
   },
   // T-06-28: a nested claude/grok/omp is a top-level session without this guard, and it still connects the operator's MCP
   {
