@@ -91,7 +91,7 @@ UserPromptSubmit hook into the workspace, then installs the omp targets (`omp/ag
 `omp/` extension package). It also wires substrate-mcp: the `substrate` MCP entry in `<ws>/.mcp.json` (Claude, omp)
 and `<ws>/.grok/config.toml` (Grok), naming `${SUBSTRATE_TOKEN}` and never a value, plus one 0600 env file per agent
 outside the workspace holding that agent's `SUBSTRATE_TOKEN`, taken from `SUBSTRATE_TOKEN_<SURFACE>` in your
-environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). The install step writes only inside `<ws>` (never into this repo or `~/.omp`); the regeneration pass may update this repo's tracked generated files.
+environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files.
 It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, any
 destination reached through a symlink (the file or a parent dir under `<ws>`), a runtime that cannot call MCP, and an
 agent whose token it cannot deliver; for the last it prints what you must create.
