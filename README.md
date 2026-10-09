@@ -153,6 +153,24 @@ python3 scripts/build_agents.py --install-cursor /path/to/repo       # same copy
 
 It refuses a symlink on the way, a target inside this checkout or equal to `$HOME`, and any differing file it did not previously write. A second run against an unchanged tree writes nothing. `grokbot/skills/swarm-cloud-dispatch/SKILL.md` is the Grok Bot side of the same handoff: install in a pull request, then brief a Cursor cloud agent to run `a01-orchestrator`. The result comes back as a draft pull request.
 
+## Grok Bot seat map
+
+`python3 scripts/build_agents.py` also writes `grokbot/swarm/seat-map.json` and one `grokbot/skills/swarm-<lane>/SKILL.md` per manifest lane (`control`, `delivery`, `code`, `verify`, `ops`, `sustain`). `--check` fails if those files drift. The generator does not write under `.grok/` and does not touch the hand-written `grokbot/skills/swarm-cloud-dispatch/SKILL.md`. There is no sixteenth role.
+
+The map lists each of the 15 roles with a home (`desk-lead`, a desk seat, `executor`, `routine` or `cloud`), the seat that verifies the work, path globs, that seat's verification tools, and the autonomy ceiling from `agents.json`. Android, iOS and desktop are routing rules, because the swarm has no mobile or desktop role: `android/**` (and Kotlin/Gradle) to `bot-03-android`, `ios/**` (and Swift/Xcode) to `bot-04-ios`, desktop shells (`desktop/**`, `electron/**`, `tauri/**`) to `bot-02-web-edge`. A routing rule wins over a role path glob. When two roles both match, the longest path glob wins, so a lead-owned doc stays with Desk Lead under `docs/**`. UX design paths stay with `bot-01-systems-backend`, matching `design/**` in the desk ownership manifest.
+
+```bash
+python3 scripts/build_agents.py                                          # regenerate the seat map and lane skills
+python3 scripts/build_agents.py --check                                  # fail if the export drifts
+python3 scripts/_install_grokbot.py --target /path/to/dest --dry-run     # list grokbot/** paths; write nothing
+python3 scripts/_install_grokbot.py --target /path/to/dest               # copy, then write the sha256 stamp
+python3 scripts/_install_grokbot.py --target /path/to/dest --check       # exit 1 if the copy would change
+```
+
+The installer writes a stamp at `grokbot/.agent-swarm-grokbot.json` with the sha256 of each file it wrote, including the dispatch skill. It refuses a symlink on the way, a target inside this checkout or equal to `$HOME`, and any differing file it did not previously write. It never deletes a file the stamp does not record. A failed install restores the previous files through the same staged replace the Cursor installer uses.
+
+Desk Lead installs this onto the box and onto programming-desk only after Ming approves that copy. This repository does not run the installer against either of those trees.
+
 ## Suggested reading order
 
 Operators: 01 → 04 → 05 → 06 · Agent developers: 02 → your agent spec in 03/ → 07 · Auditors/security: agent §7 sections + 06 §S · Integration work: 02 → 04.
