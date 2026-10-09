@@ -6,7 +6,7 @@
       "name": "A01 Swarm Orchestrator",
       "english_identifier": "a01-orchestrator",
       "callable_by_other_agents": true,
-      "when_to_call": "Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC.",
+      "when_to_call": "Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC. Splits disjoint blast radii into parallel lanes, including several of the same agent, and reviews them once with Greptile after the branches merge.",
       "prompt_file": "agents/a01-orchestrator.md",
       "prompt_characters": 9416,
       "tools": [

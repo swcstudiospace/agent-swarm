@@ -57,6 +57,7 @@ sys.path.insert(0, str(ROOT))
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
 from swarm.manifest import get_agent, by_capability  # noqa: E402
+from swarm.blast_radius import join_result_text, lane_section, prepare_slice_worktree, take_agent_slot  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
 from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
@@ -130,6 +131,7 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path, lea
     if task["rework_loops"] and notes.get("feedback"):
         rework = "\n## Rework feedback (CHANGES_REQUESTED)\nAddress every finding below before reporting IN_REVIEW:\n" \
                  + json.dumps(notes["feedback"], indent=2)
+    lane_note = lane_section(notes)
     gate_note = ""
     if notes.get("gate"):
         gate_note = (f"\n## Gate instructions\nYou are issuing the **{notes['gate']}** gate for tasks {notes['gate_for']}. "
@@ -146,7 +148,7 @@ def assignment_prompt(store: TaskStore, task: dict, agent: dict, repo: Path, lea
 
 ## Brief
 {notes.get('brief_excerpt', '')}
-
+{lane_note}
 ## Working repository
 {repo}
 Swarm runtime lives at {ROOT} (scripts: `python3 {ROOT}/scripts/<script>.py --root {repo} --task-id {task['task_id']} --correlation-id {task['correlation_id']} --json`).
@@ -947,11 +949,14 @@ def dispatchable(store: TaskStore, corr: str, emit, handoffs=None) -> list[dict]
 
 
 def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases) -> tuple[list[tuple[dict, dict]], list[str]]:
-    """(task, agent) pairs to dispatch this round, and the tasks left waiting on a lease. The first `max_parallel` ready
-    tasks fill the round, as before; with leases on, each must first hold its node (or run unleased when the substrate
-    cannot answer). A denied, refused or busy claim leaves the task where it is (PLANNED/RETRY, or IN_PROGRESS for a rework)
-    without taking a slot, for a later round or run (LEASE-05)."""
-    batch, waiting, slots = [], [], max_parallel
+    """(task, agent) pairs to dispatch this round, and the tasks left waiting on a lease.
+
+    The round takes up to `max_parallel` tasks. The same agent fills more than one of those slots, up to that
+    agent's manifest `max_parallel`; a class that is at its ceiling does not consume a slot and does not block
+    a later task of a different class. With leases on, each selected task must first hold its node (or run
+    unleased when the substrate cannot answer). A denied, refused or busy claim leaves the task where it is
+    (PLANNED/RETRY, or IN_PROGRESS for a rework) without taking a slot, for a later round or run (LEASE-05)."""
+    batch, waiting, slots, replicas = [], [], max_parallel, {}
     for t in ready:
         if slots <= 0:
             break
@@ -961,12 +966,17 @@ def select_batch(store: TaskStore, ready: list[dict], max_parallel: int, leases)
             store.transition(t["task_id"], S.BLOCKED, reason="no agent for capability")
             slots -= 1
             continue
+        ceiling = max(1, int(agent.get("max_parallel") or 1))
+        if replicas.get(agent["id"], 0) >= ceiling:
+            continue  # a later task of another class can still take a free global slot
         if leases is not None:
             claim = leases.acquire(t, agent["id"])
             if not claim.dispatch:
                 holder = (claim.holder or {}).get("session_id")
                 waiting.append(f"{t['task_id']}: {claim.status}" + (f" (held by {holder})" if holder else ""))
                 continue
+        if not take_agent_slot(replicas, agent["id"], ceiling):
+            continue
         batch.append((t, agent))
         slots -= 1
     return batch, waiting
@@ -1011,11 +1021,15 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
     text, meta, raw_recorded = "", {}, False
     try:
         task = store.get(tid)
+        workspace = repo
+        if task["notes_json"].get("isolate") == "worktree" and not args.dry_run:
+            # same-agent lanes edit disjoint paths; each gets a worktree so they do not share the index
+            workspace = prepare_slice_worktree(repo, sdir / "worktrees" / tid, str(task["notes_json"].get("branch") or ""))
         context = ""
         if handoffs is not None:  # sent before the session starts, so its own context already holds them
             handoffs.dispatched(task, agent["id"])
             context = handoffs.context(tid, agent["id"])
-        prompt = assignment_prompt(store, task, agent, repo, lease_s=leases.lease_s(tid) if leases is not None else None,
+        prompt = assignment_prompt(store, task, agent, workspace, lease_s=leases.lease_s(tid) if leases is not None else None,
                                    handoffs=context)
         (sdir / "assignments").mkdir(parents=True, exist_ok=True)
         (sdir / "assignments" / f"{tid}.a{task['attempt']}.md").write_text(prompt)
@@ -1024,9 +1038,12 @@ def _execute_one(store_path, task, agent, args, ctx, repo, leases, handoffs):
             if task["notes_json"].get("gate"):
                 run_gate_script(task, repo, sdir, dry_run=True)
             text = canned_result(task, agent)
+        elif task["notes_json"].get("role") == "join":
+            # the runner merges the lane branches; a model is not required for the join itself
+            text, meta = join_result_text(repo, task), {"returncode": 0, "joined": True}
         else:
             watch.check(text, meta)  # lost before the session spawned: it never starts
-            text, meta = run_agent_headless(agent, prompt, repo, args, on_session=watch.attach)
+            text, meta = run_agent_headless(agent, prompt, workspace, args, on_session=watch.attach)
         write_evidence(sdir, tid, task['attempt'], text or "")
         result, err = None, None
         try:

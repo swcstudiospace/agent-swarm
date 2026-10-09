@@ -4,7 +4,7 @@
   "defaults": { "model": "sonnet", "heartbeat_s": 10, "offer_timeout_s": 60 },
   "agents": [
     { "id": "A01", "code": "ORCH", "slug": "a01-orchestrator", "name": "Swarm Orchestrator", "class": "control", "lane": "control", "model": "opus", "spec": "03-agents/A01-orchestrator.md", "prompt": "prompts/A01-orchestrator.md",
-      "description": "Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC.",
+      "description": "Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC. Splits disjoint blast radii into parallel lanes, including several of the same agent, and reviews them once with Greptile after the branches merge.",
       "capabilities": ["plan.decompose", "plan.schedule", "plan.arbitrate", "plan.escalate"],
       "consumes": ["project.brief", "task.bid", "task.status", "task.result", "gate.verdict", "agent.heartbeat", "conflict.report"],
       "produces": ["task.offer", "task.assign", "plan.updated", "conflict.arbitration", "escalation.request", "swarm.status"],

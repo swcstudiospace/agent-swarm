@@ -163,8 +163,10 @@ _CURSOR_COMMON = """You are running as a Cursor subagent inside the AgentSwarm (
 """
 _CURSOR_ORCH = (
     "- Nesting: Cursor allows two levels. You may spawn specialists with the Task tool, setting subagent_type "
-    "to the slug (a02-requirements through a15-docs). Launch independent specialists in parallel. A specialist "
-    "is the second level and must not spawn further subagents. Do not spawn a01-orchestrator.\n"
+    "to the slug (a02-requirements through a15-docs). Launch independent specialists in parallel, and spawn the "
+    "same slug once per ready blast-radius lane. A specialist is the second level and must not spawn further "
+    "subagents. Do not spawn a01-orchestrator. Do not review inside a lane; after the join, one Greptile review "
+    "covers the merged branch.\n"
 )
 _CURSOR_SPEC = (
     "- Nesting: Cursor allows two levels. You are a specialist, so you must not spawn subagents and you must "

@@ -55,10 +55,12 @@ Every script shares one CLI contract (`swarm/script_base.py`): `--task-id`, `--c
 ## Running the swarm
 
 ```bash
-# 1. plan: brief → task DAG (patterns: feature | hotfix | dependency | custom --plan plan.json)
+# 1. plan: brief → task DAG (patterns: feature | hotfix | dependency | parallel | custom --plan plan.json)
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature --risk-class medium
+#    parallel: a blast-radii JSON block, --slices, or --slices-json. Same agent, several lanes,
+#    each on its own worktree; join merges; one Greptile review of the merged branch.
 
-# 2. run autonomously (one headless session per task, parallel where the DAG allows)
+# 2. run autonomously (one headless session per task, parallel where the DAG allows, including several of one agent)
 #    --runtime auto (claude or grok) | claude | grok | omp; --runtime omp [--omp-bin omp] runs headless omp -p, never auto-picked (or set SWARM_RUNTIME=omp)
 python3 scripts/swarm_run.py --repo /path/to/codebase --max-parallel 3 --runtime auto
 
@@ -126,7 +128,7 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 
 - `before_agent_start`: SDLC-shaped prompts in a top-level session get a `## AgentSwarm` part pointing at `/swarm` and `task` with `a01-orchestrator`; subagents, `SWARM_CHILD=1`/`SWARM_AGENT` sessions and non-SDLC prompts get nothing. An Ultrathink/Prompt-Uplift XML prompt is classified by its unescaped `<ORIGINAL>` text (else the whole prompt), matching the plugin's headless kickoff.
 - `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)`; `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval`, MCP tools (`mcp__*` calls and `write` to `xd://mcp__*`, `(mcp: …)`) and writes into `.swarm/`, `.omp/`, `~/.omp` block.
-- `/swarm <brief> [--pattern=feature|hotfix|dependency] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`, correlation id = uuid5 of pattern, risk and brief, so an identical brief reuses its plan), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and holds the session on `isIdle()` until that turn ends (10 s start timeout; hold cap `SWARM_DISPATCH_HOLD_MS`, else 30 min with a UI and unbounded in `-p`/rpc; a cap expiry is a warning saying the plan was dispatched) before draining with `waitForIdle`. Usage, plan mode and `E-CONTRACT` conflicts never dispatch; without a UI they are reported on stderr as `[/swarm] …`.
+- `/swarm <brief> [--pattern=feature|hotfix|dependency|parallel] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`, correlation id = uuid5 of pattern, risk and brief, so an identical brief reuses its plan), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and holds the session on `isIdle()` until that turn ends (10 s start timeout; hold cap `SWARM_DISPATCH_HOLD_MS`, else 30 min with a UI and unbounded in `-p`/rpc; a cap expiry is a warning saying the plan was dispatched) before draining with `waitForIdle`. Usage, plan mode and `E-CONTRACT` conflicts never dispatch; without a UI they are reported on stderr as `[/swarm] …`.
 
 ## Rules the runtime enforces (mirrors the spec)
 

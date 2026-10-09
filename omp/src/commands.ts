@@ -65,7 +65,7 @@ function readyTaskIds(json: Record<string, unknown>): string[] {
   return ids;
 }
 
-/** The marker-tagged prompt that makes the session call `task` once with A01 and the task.assign payload. */
+/** The marker-tagged prompt that hands the plan to one A01, which then fans the lanes out. */
 function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs): string {
   const { json } = res;
   const corr = typeof json.correlation_id === "string" ? json.correlation_id : "";
@@ -77,7 +77,8 @@ function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs): string {
       `(pattern ${parsed.pattern}, risk ${parsed.risk_class}).`,
     'Call the `task` tool exactly once with agent "a01-orchestrator" and this task.assign payload as the task text:',
     JSON.stringify(assign),
-    "A01 executes the plan (dispatching a02–a15 by slug) and reports back; do not implement the brief in this session.",
+    "A01 executes the plan and reports back; do not implement the brief in this session.",
+    "A01 fans out every ready lane in that same turn, including several calls to the same slug when the plan repeats it. Disjoint blast radii stay parallel. Lane agents do not review. After the join merges their branches, one Greptile review covers the merged result.",
     "",
     "Plan summary:",
     summary,

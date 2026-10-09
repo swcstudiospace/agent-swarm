@@ -72,20 +72,33 @@ const RESULT = {
   summary_md: "patched",
 };
 
-test("plan dry: every advertised pattern plans (feature 13, hotfix 8, dependency 8)", async () => {
+test("plan dry: every advertised pattern plans (feature 13, hotfix 8, dependency 8, parallel 5)", async () => {
   const { ctx } = tmpStore();
   const { tool } = swarm();
-  const expected: Record<string, number> = { feature: 13, hotfix: 8, dependency: 8 };
+  const expected: Record<string, number> = { feature: 13, hotfix: 8, dependency: 8, parallel: 5 };
   // the schema must not advertise a pattern (e.g. `custom`) that python always rejects through this tool
   const props = tool("swarm_plan").parameters.properties;
   const pattern = props && typeof props === "object" && "pattern" in props ? props.pattern : undefined;
   const advertised = pattern && typeof pattern === "object" && "enum" in pattern && Array.isArray(pattern.enum) ? pattern.enum.map(String) : [];
   expect([...advertised].sort()).toEqual(Object.keys(expected).sort());
+  const slices = [
+    { id: "api", paths: ["swarm"], agent: "A05" },
+    { id: "cli", paths: ["scripts"], agent: "A05" },
+  ];
   for (const name of advertised) {
-    const res = await callTool(tool("swarm_plan"), { brief: "b", pattern: name, risk_class: "medium", dry_run: true }, ctx);
-    const details = res.details as { dry_run: boolean; tasks: unknown[] };
-    expect(details.dry_run).toBe(true);
-    expect(details.tasks).toHaveLength(expected[name]);
+    const params = { brief: "b", pattern: name, risk_class: "medium", dry_run: true, ...(name === "parallel" ? { slices } : {}) };
+    const res = await callTool(tool("swarm_plan"), params, ctx);
+    const details = res.details;
+    if (!details || typeof details !== "object" || !("dry_run" in details) || !("tasks" in details)) {
+      throw new Error(`plan ${name} result has no dry_run/tasks`);
+    }
+    const dryRun = details.dry_run;
+    const tasks = details.tasks;
+    if (typeof dryRun !== "boolean" || !Array.isArray(tasks)) {
+      throw new Error(`plan ${name} result has the wrong dry_run/tasks shape`);
+    }
+    expect(dryRun).toBe(true);
+    expect(tasks).toHaveLength(expected[name]);
   }
 });
 
