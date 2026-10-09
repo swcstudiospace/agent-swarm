@@ -77,6 +77,25 @@ def stamp_text(files: dict[str, str]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
+def _declared_lanes(seat_text: str, missing: list[str]) -> set[str]:
+    """Lanes named by the seat map. An unreadable map is a missing source, not an empty export."""
+    try:
+        seat_doc = json.loads(seat_text)
+    except json.JSONDecodeError:
+        missing.append(f"{SEAT_MAP_REL} (not valid JSON)")
+        return set()
+    lanes: set[str] = set()
+    roles = seat_doc.get("roles") if isinstance(seat_doc, dict) else None
+    if isinstance(roles, list):
+        for role in roles:
+            lane = role.get("lane") if isinstance(role, dict) else None
+            if isinstance(lane, str) and lane:
+                lanes.add(lane)
+    if not lanes:
+        missing.append(f"{SEAT_MAP_REL} (no lanes)")
+    return lanes
+
+
 def export_sources(source: Path | None = None) -> dict[str, str]:
     """Rel path under the target → file text. Includes the dispatch skill. No stamp."""
     root = source or ROOT
@@ -99,6 +118,12 @@ def export_sources(source: Path | None = None) -> dict[str, str]:
         missing.append("grokbot/skills")
     if DISPATCH_REL not in files:
         missing.append(DISPATCH_REL)
+    if SEAT_MAP_REL in files:
+        lanes = _declared_lanes(files[SEAT_MAP_REL], missing)
+        for lane in sorted(lanes):
+            rel = f"grokbot/skills/swarm-{lane}/SKILL.md"
+            if rel not in files:
+                missing.append(rel)
     if missing:
         raise GrokbotInstallError(
             "error: Grok Bot export sources missing or symlinked: " + ", ".join(dict.fromkeys(missing))

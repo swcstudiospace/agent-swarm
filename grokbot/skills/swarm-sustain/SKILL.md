@@ -18,9 +18,9 @@ Regenerate with `python3 scripts/build_agents.py`.
 
 ## Procedure
 
-1. Read the role prompt named below. The swarm has exactly these 15 roles.
-2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.
-3. Run that role's scripts with `python3 scripts/<script>.py --json` (the bun twin is `scripts/ts/<script>.ts`). Stay inside the role's path globs and autonomy ceiling.
+1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 15 roles.
+2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Among role globs, the longest match wins, and an equal length goes to the lowest role id. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.
+3. Run that role's scripts from the pinned checkout: `python3 "$SWARM_ROOT/scripts/<script>.py" --root <target repo> --json` (the bun twin is `bun "$SWARM_ROOT/scripts/ts/<script>.ts" --root <target repo> --json`). `<target repo>` is the git toplevel being edited. Do not run a `scripts/` path from the target tree. Stay inside the role's path globs and autonomy ceiling.
 4. Verify with the seat's verification tools from the seat map.
 5. Finish with a task.result. A keyless cloud session is advisory. Leave the pull request in draft.
 
@@ -28,16 +28,16 @@ Regenerate with `python3 scripts/build_agents.py`.
 
 ### A14 MAINT (a14-maintenance)
 
-- Prompt: `prompts/A14-maintenance.md`
+- Prompt: `$SWARM_ROOT/prompts/A14-maintenance.md`
 - Role: Senior Maintenance Engineer (A14 MAINT, slug a14-maintenance) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A14-maintenance.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for patch.task, debt.register, rca.report, dependency.bump.
 - Home: `routine`. Seat: `bot-01-systems-backend`.
 - Autonomy ceiling: major_bump=L3, patch_task=L2.
-- Scripts: `scripts/maint_deps.py`.
+- Scripts: `$SWARM_ROOT/scripts/maint_deps.py`.
 
 ### A15 DOC (a15-docs)
 
-- Prompt: `prompts/A15-docs.md`
+- Prompt: `$SWARM_ROOT/prompts/A15-docs.md`
 - Role: Senior Documentation Engineer (A15 DOC, slug a15-docs) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A15-docs.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for docs.bundle, api.reference, runbook, changelog.
 - Home: `executor`. Seat: `bot-06-quality-security`.
 - Autonomy ceiling: docs=L2, public_docs=L3.
-- Scripts: `scripts/docs_bundle.py`.
+- Scripts: `$SWARM_ROOT/scripts/docs_bundle.py`.

@@ -84,6 +84,16 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    if not root.exists():
+        return {}
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in root.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    }
+
+
 def _run_build(*args: str, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k != "SWARM_AGENTS_FILE"}
     return subprocess.run(
@@ -96,7 +106,8 @@ def test_seat_map_schema_covers_exactly_the_fifteen_roles():
     agents = _agents()
     doc = _map()
     assert doc["schema"] == "grokbot.seat-map.v1"
-    assert doc["precedence"] == "routing-before-roles; longest role glob wins"
+    assert doc["precedence"] == build_agents.SEAT_MAP_PRECEDENCE
+    assert "equal length: lowest role id" in doc["precedence"]
     assert {a["id"] for a in agents} == {f"A{n:02d}" for n in range(1, 16)}
     assert [r["slug"] for r in doc["roles"]] == sorted(a["slug"] for a in agents)
     assert len(doc["roles"]) == 15
@@ -127,6 +138,8 @@ def test_role_homes_globs_and_verification_follow_the_desk_seats():
     orch = _role(doc, "A01")
     assert orch["home"] == "desk-lead" and orch["seat"] == "bot-00-programming-lead"
     assert "grokbot/**" in orch["path_globs"]
+    assert "scripts/swarm_run.py" in orch["path_globs"]
+    assert "scripts/ts/swarm_run.ts" in orch["path_globs"]
     assert orch["verification_tools"] == ["desk_receipt_check"]
 
     req = _role(doc, "A02")
@@ -202,10 +215,15 @@ def test_render_is_deterministic_sorted_and_leaves_dispatch_and_grok_alone():
         assert f"name: swarm-{lane}\n" in text
         assert "disable-model-invocation: false" in text
         assert "## When to Use" in text and "## Procedure" in text
+        assert 'python3 "$SWARM_ROOT/scripts/<script>.py" --root <target repo> --json' in text
+        assert 'bun "$SWARM_ROOT/scripts/ts/<script>.ts" --root <target repo> --json' in text
+        assert "python3 scripts/<script>.py" not in text
         for agent in _agents():
             if agent["lane"] == lane:
                 assert agent["slug"] in text
-                assert agent["prompt"] in text
+                assert f"$SWARM_ROOT/{agent['prompt']}" in text
+    control = first["grokbot/skills/swarm-control/SKILL.md"]
+    assert "swarm_run.py" not in control
     diff = subprocess.run(
         ["git", "diff", "--exit-code", "HEAD", "--", "grokbot/skills/swarm-cloud-dispatch/SKILL.md"],
         cwd=ROOT, capture_output=True,
@@ -233,7 +251,7 @@ def test_unknown_lane_skill_is_pruned_and_dispatch_is_not(tree):
     orphan.parent.mkdir()
     orphan.write_text("orphan\n", encoding="utf-8")
     dispatch = (tree / "grokbot" / "skills" / "swarm-cloud-dispatch" / "SKILL.md").read_bytes()
-    grok_before = sorted(p.relative_to(tree).as_posix() for p in (tree / ".grok").rglob("*") if p.is_file())
+    grok_before = _tree_bytes(tree / ".grok")
     flagged = _run_build("--check", cwd=tree)
     assert flagged.returncode == 1
     assert "grokbot/skills/swarm-extra/SKILL.md" in flagged.stdout
@@ -242,8 +260,7 @@ def test_unknown_lane_skill_is_pruned_and_dispatch_is_not(tree):
     assert wrote.returncode == 0, wrote.stdout + wrote.stderr
     assert not orphan.exists()
     assert (tree / "grokbot" / "skills" / "swarm-cloud-dispatch" / "SKILL.md").read_bytes() == dispatch
-    grok_after = sorted(p.relative_to(tree).as_posix() for p in (tree / ".grok").rglob("*") if p.is_file())
-    assert grok_after == grok_before
+    assert _tree_bytes(tree / ".grok") == grok_before
     assert _run_build("--check", cwd=tree).returncode == 0
 
 
@@ -365,7 +382,12 @@ def test_failed_install_restores_via_the_staged_rollback(tmp_path, monkeypatch):
     for rel, text in grok_install.export_sources().items():
         path = source / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text + "\n# regenerated\n", encoding="utf-8")
+        if rel.endswith(".json"):
+            doc = json.loads(text)
+            doc["note"] = "regenerated"
+            path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        else:
+            path.write_text(text + "\n# regenerated\n", encoding="utf-8")
 
     state = {"n": 0, "armed": True}
     real = Path.write_text
@@ -389,8 +411,10 @@ def test_failed_install_restores_via_the_staged_rollback(tmp_path, monkeypatch):
     out = StringIO()
     assert grok_install.install_grokbot(target, source=source, check=True, out=out) == 0
     assert out.getvalue().startswith("up-to-date")
-    sample = target / "grokbot" / "swarm" / "seat-map.json"
+    sample = target / "grokbot" / "skills" / "swarm-code" / "SKILL.md"
     assert sample.read_text(encoding="utf-8").endswith("# regenerated\n")
+    seat = json.loads((target / "grokbot" / "swarm" / "seat-map.json").read_text(encoding="utf-8"))
+    assert seat["note"] == "regenerated"
 
 
 def test_non_utf8_edit_is_not_treated_as_ours(tmp_path):
@@ -413,3 +437,116 @@ def test_render_grokbot_rejects_a_sixteenth_role():
     extra["code"] = "EXTRA"
     with pytest.raises(ValueError, match="15"):
         build_agents.render_grokbot(agents + [extra])
+
+
+def test_equal_length_shared_scripts_resolve_to_one_seat():
+    doc = _map()
+    for agent_id in ("A05", "A06"):
+        globs = set(_role(doc, agent_id)["path_globs"])
+        assert "scripts/code_checks.py" in globs
+        assert "scripts/ts/code_checks.ts" in globs
+    for path in ("scripts/code_checks.py", "scripts/ts/code_checks.ts"):
+        got = build_agents.resolve_owner(doc, path)
+        assert got["via"] == "role"
+        assert got["role_id"] == "A05"
+        assert got["seat"] == "bot-01-systems-backend"
+        assert got["glob"] == path
+    runner = build_agents.resolve_owner(doc, "scripts/swarm_run.py")
+    assert runner["role_id"] == "A01" and runner["seat"] == "bot-00-programming-lead"
+    twin = build_agents.resolve_owner(doc, "scripts/ts/swarm_run.ts")
+    assert twin["role_id"] == "A01" and twin["glob"] == "scripts/ts/swarm_run.ts"
+    lead_doc = build_agents.resolve_owner(doc, "docs/desk-operating-model.md")
+    assert lead_doc["role_id"] == "A01"
+    nested = build_agents.resolve_owner(doc, "docs/other/page.md")
+    assert nested["role_id"] == "A15"
+
+
+def test_routing_wins_over_a_longer_role_glob():
+    doc = {
+        "roles": [{
+            "id": "A06",
+            "seat": "bot-02-web-edge",
+            "path_globs": ["android/app/special/file.kt"],
+        }],
+        "routing": [{
+            "kind": "android",
+            "seat": "bot-03-android",
+            "path_globs": ["android/**"],
+        }],
+    }
+    got = build_agents.resolve_owner(doc, "android/app/special/file.kt")
+    assert len("android/app/special/file.kt") > len("android/**")
+    assert got["via"] == "routing" and got["seat"] == "bot-03-android" and got["kind"] == "android"
+    live = _map()
+    desktop = build_agents.resolve_owner(live, "desktop/shell/main.ts")
+    assert desktop["via"] == "routing" and desktop["seat"] == "bot-02-web-edge"
+    ios = build_agents.resolve_owner(live, "ios/App/App.swift")
+    assert ios["seat"] == "bot-04-ios"
+
+
+def test_only_leaves_unselected_lanes_untouched(tree):
+    code = tree / "grokbot" / "skills" / "swarm-code" / "SKILL.md"
+    control = tree / "grokbot" / "skills" / "swarm-control" / "SKILL.md"
+    original_code = code.read_bytes()
+    original_control = control.read_bytes()
+    code.write_bytes(original_code + b"\n# drifted\n")
+    checked = _run_build("--check", "--only", "a01-orchestrator", cwd=tree)
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert "swarm-code" not in checked.stdout
+    assert code.read_bytes() == original_code + b"\n# drifted\n"
+    wrote = _run_build("--only", "a01-orchestrator", cwd=tree)
+    assert wrote.returncode == 0, wrote.stdout + wrote.stderr
+    assert code.read_bytes() == original_code + b"\n# drifted\n"
+    assert control.read_bytes() == original_control
+    control.write_bytes(original_control + b"\n")
+    drifted = _run_build("--check", "--only", "a01-orchestrator", cwd=tree)
+    assert drifted.returncode == 1
+    assert "grokbot/skills/swarm-control/SKILL.md" in drifted.stdout
+    assert code.read_bytes() == original_code + b"\n# drifted\n"
+    restored = _run_build("--only", "a05-backend", cwd=tree)
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert code.read_bytes() == original_code
+    assert control.read_bytes() == original_control + b"\n"
+
+
+def test_rejected_roster_writes_nothing(tree):
+    roots = (".claude", ".grok", ".cursor", "omp", "grokbot")
+    before = {name: _tree_bytes(tree / name) for name in roots}
+    manifest = json.loads((tree / "agents.json").read_text(encoding="utf-8"))
+    extra = dict(manifest["agents"][0])
+    extra["id"] = "A16"
+    extra["slug"] = "a16-extra"
+    extra["code"] = "EXTRA"
+    manifest["agents"].append(extra)
+    agents_file = tree / "agents-extra.json"
+    agents_file.write_text(json.dumps(manifest), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "SWARM_AGENTS_FILE"}
+    env["SWARM_AGENTS_FILE"] = str(agents_file)
+    proc = subprocess.run(
+        [sys.executable, str(tree / "scripts" / "build_agents.py")],
+        cwd=tree, capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 1
+    assert "15" in proc.stderr
+    assert "Traceback" not in proc.stderr
+    after = {name: _tree_bytes(tree / name) for name in roots}
+    assert after == before
+
+
+def test_installer_refuses_a_source_missing_a_declared_lane(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert grok_install.install_grokbot(target) == 0
+    before = _snapshot(target)
+    source = tmp_path / "src"
+    for rel, text in grok_install.export_sources().items():
+        path = source / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    missing = source / "grokbot" / "skills" / "swarm-code" / "SKILL.md"
+    missing.unlink()
+    err = StringIO()
+    assert grok_install.install_grokbot(target, source=source, err=err) == 2
+    assert "swarm-code/SKILL.md" in err.getvalue()
+    assert "Nothing was written" in err.getvalue()
+    assert _snapshot(target) == before

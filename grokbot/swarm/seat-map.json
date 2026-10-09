@@ -1,5 +1,5 @@
 {
-  "precedence": "routing-before-roles; longest role glob wins",
+  "precedence": "routing-before-roles; longest role glob wins; equal length: lowest role id",
   "roles": [
     {
       "autonomy_ceiling": {
@@ -26,8 +26,10 @@
         "prompts/bot-00-programming-lead.xml",
         "scripts/orch_plan.py",
         "scripts/orch_status.py",
+        "scripts/swarm_run.py",
         "scripts/ts/orch_plan.ts",
         "scripts/ts/orch_status.ts",
+        "scripts/ts/swarm_run.ts",
         "skills/agent-bus/**",
         "skills/desk-bootstrap/**",
         "skills/gotxcot-uplift/**",
