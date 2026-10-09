@@ -7,6 +7,8 @@ omp:    omp/agents/<slug>.md      (tools, spawns, blocking, autoloadSkills, outp
         omp/skills/<slug>/SKILL.md
         omp/skills/swarm-orchestrate/SKILL.md  (with A01)
 Cursor: .cursor/agents/<slug>.md  (name, description, model: inherit; body is the prompt plus a Cursor preamble)
+Grok Bot: grokbot/swarm/seat-map.json and grokbot/skills/swarm-<lane>/SKILL.md
+          (render_grokbot; does not write .grok/ or grokbot/skills/swarm-cloud-dispatch)
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
@@ -20,6 +22,7 @@ Copy Cursor agents only (no substrate, no MCP, no env files):
 from __future__ import annotations
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -39,6 +42,8 @@ GROK_DIR = ROOT / ".grok" / "agents"
 OMP_AGENTS_DIR = ROOT / "omp" / "agents"
 OMP_SKILLS_DIR = ROOT / "omp" / "skills"
 CURSOR_DIR = ROOT / ".cursor" / "agents"
+GROKBOT_SWARM_DIR = ROOT / "grokbot" / "swarm"
+GROKBOT_SKILLS_DIR = ROOT / "grokbot" / "skills"
 SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
 TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
 BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
@@ -336,6 +341,293 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
     return "\n".join(fm) + "\n\n" + preamble + "\n" + _body(agent) + "\n"
 
 
+# Grok Bot homes. The seat ids match programming-desk ownership.yaml (bot-00 lead through
+# bot-06 quality). Android and iOS are not homes: the swarm has no mobile role, so those
+# paths are routing rules. Desktop shells route to bot-02 the same way.
+# home is one of desk-lead, a seat id, executor, routine or cloud. seat is who verifies.
+_SEAT_VERIFICATION = {
+    "bot-00-programming-lead": ["desk_receipt_check"],
+    "bot-01-systems-backend": ["cargo", "pytest", "ruff"],
+    "bot-02-web-edge": ["bun", "deno"],
+    "bot-03-android": ["gradle"],
+    "bot-04-ios": ["xcodebuild"],
+    "bot-05-infrastructure": ["helm", "terraform"],
+    "bot-06-quality-security": ["greptile", "pytest", "ruff"],
+}
+_ROLE_HOME: dict[str, tuple[str, str]] = {
+    "A01": ("desk-lead", "bot-00-programming-lead"),
+    "A02": ("executor", "bot-00-programming-lead"),
+    "A03": ("bot-01-systems-backend", "bot-01-systems-backend"),
+    "A04": ("bot-01-systems-backend", "bot-01-systems-backend"),
+    "A05": ("bot-01-systems-backend", "bot-01-systems-backend"),
+    "A06": ("bot-02-web-edge", "bot-02-web-edge"),
+    "A07": ("bot-01-systems-backend", "bot-01-systems-backend"),
+    "A08": ("bot-06-quality-security", "bot-06-quality-security"),
+    "A09": ("bot-06-quality-security", "bot-06-quality-security"),
+    "A10": ("bot-06-quality-security", "bot-06-quality-security"),
+    "A11": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A12": ("cloud", "bot-05-infrastructure"),
+    "A13": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A14": ("routine", "bot-01-systems-backend"),
+    "A15": ("executor", "bot-06-quality-security"),
+}
+# Desk path families from ownership.yaml, partitioned so a role does not also claim
+# android, ios or desktop. Those three are routing rules below. Script paths from
+# agents.json are added for every role, so a role with no desk family still has globs.
+_DESK_GLOBS: dict[str, tuple[str, ...]] = {
+    "A01": (
+        ".claude/agents/**",
+        ".claude/commands/**",
+        ".claude/hooks/**",
+        ".planning/**",
+        "docs/desk-operating-model.md",
+        "docs/github-sot-orchestration.md",
+        "docs/gotxcot-cloud-pipeline.md",
+        "docs/intake-e2e-runbook.md",
+        "docs/vps-agent-bus.md",
+        "grokbot/**",
+        "prompts/bot-00-programming-lead.xml",
+        "skills/agent-bus/**",
+        "skills/desk-bootstrap/**",
+        "skills/gotxcot-uplift/**",
+        "skills/trackplan-dispatch/**",
+        "vendor/ultrathink-policy/**",
+    ),
+    "A03": ("ARCHITECTURE.md",),
+    "A04": ("design/**", "docs/design/**"),
+    "A05": (
+        "services/**", "crates/**", "**/*.py", "**/*.rs",
+        "pyproject.toml", "Cargo.toml", "Cargo.lock", "uv.lock",
+    ),
+    "A06": (
+        "web/**", "apps/web/**", "edge/**", "**/*.ts", "**/*.tsx",
+        "package.json", "deno.json", "deno.lock", "vercel.json",
+    ),
+    "A07": ("migrations/**",),
+    "A08": ("ci/gates/**", "ci/hooks/**", "ci/tests/**"),
+    "A09": (".gitignore", ".pre-commit-config.yaml", "ownership.yaml"),
+    "A10": (
+        "SECURITY.md", "ci/security/**", ".github/workflows/security-*.yml",
+        "contracts/**", "**/*.proto",
+    ),
+    "A11": (
+        "infra/**", "**/*.tf", "**/*.tfvars", "k8s/**", "Dockerfile*",
+        "docker-compose*.yml", ".github/workflows/**", ".mcp.json",
+    ),
+    "A12": ("deploy/**",),
+    "A15": ("README.md", "docs/**"),
+}
+_ROUTING: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("android", "bot-03-android", ("android/**", "**/*.kt", "**/*.kts", "**/build.gradle")),
+    ("ios", "bot-04-ios", ("ios/**", "**/*.swift", "**/*.xcodeproj/**", "**/Package.swift")),
+    ("desktop", "bot-02-web-edge", ("desktop/**", "apps/desktop/**", "electron/**", "tauri/**")),
+)
+# Headless runners stay out of the lane-skill procedure (_lane_skill). They stay
+# in the seat map, including the TypeScript twin, so a broad **/*.py or **/*.ts
+# glob cannot take them from the orchestrator.
+_RUNNER_SCRIPTS = {"scripts/swarm_run.py"}
+SEAT_MAP_SCHEMA = "grokbot.seat-map.v1"
+SEAT_MAP_PRECEDENCE = "routing-before-roles; longest role glob wins; equal length: lowest role id"
+
+
+def _role_line(agent: dict) -> str:
+    text = _body(agent)
+    start = text.find("<system_role>")
+    end = text.find("</system_role>")
+    raw = agent["description"] if start == -1 or end == -1 or end < start else text[start + len("<system_role>"):end]
+    return " ".join(raw.split())
+
+
+def _script_globs(agent: dict) -> list[str]:
+    """Literal script paths this role owns, plus the TypeScript twin of each Python script."""
+    globs: list[str] = []
+    for script in agent["scripts"]:
+        globs.append(script)
+        name = Path(script).name
+        if name.endswith(".py"):
+            globs.append(f"scripts/ts/{name[:-3]}.ts")
+    return globs
+
+
+def _glob_match(path: str, pattern: str) -> bool:
+    """Path glob: ``*`` stays inside one segment, ``**`` crosses segments (including zero)."""
+    path = path.replace("\\", "/").strip("/")
+    pattern = pattern.strip("/")
+    if not path or not pattern or ".." in path.split("/"):
+        return False
+    return _glob_parts(path.split("/"), pattern.split("/"))
+
+
+def _glob_parts(parts: list[str], globs: list[str]) -> bool:
+    if not globs:
+        return not parts
+    head, rest = globs[0], globs[1:]
+    if head == "**":
+        if _glob_parts(parts, rest):
+            return True
+        return bool(parts) and _glob_parts(parts[1:], globs)
+    if not parts or not _segment_match(parts[0], head):
+        return False
+    return _glob_parts(parts[1:], rest)
+
+
+def _segment_match(text: str, pattern: str) -> bool:
+    if "/" in pattern or pattern == "**":
+        return False
+    rx = re.escape(pattern).replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+    return re.fullmatch(rx, text) is not None
+
+
+def resolve_owner(doc: dict, path: str) -> dict:
+    """Seat for ``path`` under the seat map's precedence.
+
+    Routing rules are considered before roles. Within a group the longest matching
+    glob wins. Two role globs of equal length go to the lowest role id, which is
+    how the shared ``code_checks`` paths (claimed by both A05 and A06) resolve.
+    """
+    empty = {"seat": None, "role_id": None, "kind": None, "glob": None, "via": None}
+    best_route: tuple[int, str, str, str] | None = None
+    for route in doc.get("routing") or []:
+        for pattern in route.get("path_globs") or []:
+            if not _glob_match(path, pattern):
+                continue
+            cand = (len(pattern), route["kind"], route["seat"], pattern)
+            if best_route is None or cand[0] > best_route[0] or (cand[0] == best_route[0] and cand[1] < best_route[1]):
+                best_route = cand
+    if best_route is not None:
+        return {"seat": best_route[2], "role_id": None, "kind": best_route[1], "glob": best_route[3], "via": "routing"}
+    best: tuple[int, str, str, str] | None = None
+    for role in doc.get("roles") or []:
+        for pattern in role.get("path_globs") or []:
+            if not _glob_match(path, pattern):
+                continue
+            cand = (len(pattern), role["id"], role["seat"], pattern)
+            if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+                best = cand
+    if best is None:
+        return empty
+    return {"seat": best[2], "role_id": best[1], "kind": None, "glob": best[3], "via": "role"}
+
+
+def _seat_map(agents: list[dict]) -> dict:
+    roles = []
+    for agent in sorted(agents, key=lambda a: a["slug"]):
+        home, seat = _ROLE_HOME[agent["id"]]
+        roles.append({
+            "autonomy_ceiling": agent["autonomy_ceiling"],
+            "code": agent["code"],
+            "home": home,
+            "id": agent["id"],
+            "lane": agent["lane"],
+            "path_globs": sorted(set(_DESK_GLOBS.get(agent["id"], ())) | set(_script_globs(agent))),
+            "seat": seat,
+            "slug": agent["slug"],
+            "verification_tools": list(_SEAT_VERIFICATION[seat]),
+        })
+    routing = [
+        {
+            "kind": kind,
+            "path_globs": sorted(globs),
+            "seat": seat,
+            "verification_tools": list(_SEAT_VERIFICATION[seat]),
+        }
+        for kind, seat, globs in sorted(_ROUTING, key=lambda row: row[0])
+    ]
+    return {
+        "precedence": SEAT_MAP_PRECEDENCE,
+        "roles": roles,
+        "routing": routing,
+        "schema": SEAT_MAP_SCHEMA,
+    }
+
+
+def _lane_skill(lane: str, members: list[dict]) -> str:
+    members = sorted(members, key=lambda a: a["id"])
+    slugs = ", ".join(a["slug"] for a in members)
+    lines = [
+        "---",
+        f"name: swarm-{lane}",
+        "description: >",
+        f"  Grok Bot lane {lane} for {slugs}.",
+        "  Use when Desk Lead routes work to this lane of the 15 AgentSwarm roles.",
+        "disable-model-invocation: false",
+        "---",
+        "",
+        f"# Swarm lane {lane}",
+        "",
+        "Generated from agents.json and the role prompts. Do not edit by hand.",
+        "Regenerate with `python3 scripts/build_agents.py`.",
+        "",
+        "## When to Use",
+        "",
+        f"- The assignment belongs to lane `{lane}`.",
+        f"- The role slug is one of: {slugs}.",
+        "",
+        "## Procedure",
+        "",
+        "1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 15 roles.",
+        "2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Among role globs, the longest match wins, and an equal length goes to the lowest role id. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.",
+        "3. Run that role's scripts from the pinned checkout: `python3 \"$SWARM_ROOT/scripts/<script>.py\" --root <target repo> --json` (the bun twin is `bun \"$SWARM_ROOT/scripts/ts/<script>.ts\" --root <target repo> --json`). `<target repo>` is the git toplevel being edited. Do not run a `scripts/` path from the target tree. Stay inside the role's path globs and autonomy ceiling.",
+        "4. Verify with the seat's verification tools from the seat map.",
+        "5. Finish with a task.result. A keyless cloud session is advisory. Leave the pull request in draft.",
+        "",
+        "## Roles",
+        "",
+    ]
+    for agent in members:
+        home, seat = _ROLE_HOME[agent["id"]]
+        ceiling = ", ".join(f"{key}={value}" for key, value in sorted(agent["autonomy_ceiling"].items()))
+        scripts = [s for s in agent["scripts"] if s not in _RUNNER_SCRIPTS]
+        script_txt = ", ".join(f"`$SWARM_ROOT/{s}`" for s in scripts) or "(none)"
+        lines += [
+            f"### {agent['id']} {agent['code']} ({agent['slug']})",
+            "",
+            f"- Prompt: `$SWARM_ROOT/{agent['prompt']}`",
+            f"- Role: {_role_line(agent)}",
+            f"- Home: `{home}`. Seat: `{seat}`.",
+            f"- Autonomy ceiling: {ceiling}.",
+            f"- Scripts: {script_txt}.",
+            "",
+        ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_grokbot(agents: list[dict]) -> dict[str, str]:
+    """Relative path → file text for the seat map and one skill per lane.
+
+    Does not emit swarm-cloud-dispatch or anything under .grok/. Raises when the
+    manifest is not the existing 15 roles, so a new agent cannot appear here by drift.
+    """
+    ids = [a["id"] for a in agents]
+    if len(agents) != 15 or set(ids) != {f"A{n:02d}" for n in range(1, 16)}:
+        raise ValueError(f"grokbot seat map covers exactly 15 roles (A01–A15), got {sorted(ids)}")
+    missing = [i for i in ids if i not in _ROLE_HOME]
+    if missing:
+        raise ValueError(f"grokbot seat map has no home for {', '.join(missing)}")
+    files = {
+        "grokbot/swarm/seat-map.json": json.dumps(_seat_map(agents), indent=2, sort_keys=True) + "\n",
+    }
+    by_lane: dict[str, list[dict]] = {}
+    for agent in agents:
+        by_lane.setdefault(agent["lane"], []).append(agent)
+    for lane in sorted(by_lane):
+        files[f"grokbot/skills/swarm-{lane}/SKILL.md"] = _lane_skill(lane, by_lane[lane])
+    return files
+
+
+def _agent_selected(agent: dict, only: set[str] | None) -> bool:
+    if not only:
+        return True
+    return agent["id"].lower() in only or agent["slug"] in only
+
+
+def _grok_rel_selected(rel: str, agents: list[dict], only: set[str] | None) -> bool:
+    """The seat map is one roster file. Lane skills follow ``--only``."""
+    if not only or not rel.startswith("grokbot/skills/"):
+        return True
+    lane = Path(rel).parent.name.removeprefix("swarm-")
+    return any(agent["lane"] == lane and _agent_selected(agent, only) for agent in agents)
+
 
 def install_targets() -> list[Path]:
     return [CLAUDE_DIR, GROK_DIR]
@@ -343,7 +635,7 @@ def install_targets() -> list[Path]:
 
 def _generated_symlink() -> Path | None:
     """A generated directory, or a parent of one up to ROOT, that is a symlink."""
-    for base in (CLAUDE_DIR, GROK_DIR, CURSOR_DIR, OMP_AGENTS_DIR, OMP_SKILLS_DIR):
+    for base in (CLAUDE_DIR, GROK_DIR, CURSOR_DIR, OMP_AGENTS_DIR, OMP_SKILLS_DIR, GROKBOT_SWARM_DIR, GROKBOT_SKILLS_DIR):
         cur = base
         while cur != ROOT and cur != cur.parent:
             if cur.is_symlink():
@@ -398,7 +690,7 @@ def _unlink_orphan(orphan: Path) -> None:
     parent = orphan.parent
     if parent.is_symlink():
         return
-    if orphan.name == "SKILL.md" and parent.parent == OMP_SKILLS_DIR:
+    if orphan.name == "SKILL.md" and parent.parent in (OMP_SKILLS_DIR, GROKBOT_SKILLS_DIR):
         orphan.unlink()
         if not any(parent.iterdir()):
             parent.rmdir()
@@ -440,6 +732,29 @@ def _cursor_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
     for p in CURSOR_DIR.glob("*.md"):
         if p.stem not in slugs:
             (removable if _contained(p, CURSOR_DIR) else unsafe).append(p)
+    return sorted(removable), sorted(unsafe)
+
+
+def _grokbot_orphans(lane_dirs: set[str]) -> tuple[list[Path], list[Path]]:
+    """(removable, unsafe) grokbot/skills/swarm-* entries this export no longer produces.
+
+    swarm-cloud-dispatch is hand-written and is never an orphan. Other skill directories
+    under grokbot/skills are left alone.
+    """
+    removable: list[Path] = []
+    unsafe: list[Path] = []
+    if not GROKBOT_SKILLS_DIR.is_dir():
+        return removable, unsafe
+    known = set(lane_dirs) | {"swarm-cloud-dispatch"}
+    for directory in GROKBOT_SKILLS_DIR.iterdir():
+        if not directory.name.startswith("swarm-") or directory.name in known:
+            continue
+        if not _contained(directory, GROKBOT_SKILLS_DIR):
+            unsafe.append(directory)
+            continue
+        skill = directory / "SKILL.md"
+        if skill.is_symlink() or skill.exists():
+            (removable if _contained(skill, GROKBOT_SKILLS_DIR) else unsafe).append(skill)
     return sorted(removable), sorted(unsafe)
 
 
@@ -605,12 +920,20 @@ def main() -> int:
     manifest_raw = json.loads((ROOT / "agents.json").read_text())
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
+    # Validate the Grok Bot roster before any generated file is written. A rejected
+    # manifest (SWARM_AGENTS_FILE with a role outside A01–A15) must leave the other
+    # exports untouched.
+    agents = list(load_manifest())
+    try:
+        grok_files = render_grokbot(agents)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     GROK_DIR.mkdir(parents=True, exist_ok=True)
     changed, written, blocked = [], [], []
-    agents = list(load_manifest())
     for agent in agents:
-        if only and agent["id"].lower() not in only and agent["slug"] not in only:
+        if not _agent_selected(agent, only):
             continue
         _write_or_check(CLAUDE_DIR / f"{agent['slug']}.md", render_claude(agent, defaults), args.check, changed, written, blocked)
         _write_or_check(GROK_DIR / f"{agent['slug']}.md", render_grok(agent, defaults), args.check, changed, written, blocked)
@@ -619,6 +942,10 @@ def main() -> int:
         _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written, blocked)
         if agent["id"] == "A01":
             _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written, blocked)
+    for rel in sorted(grok_files):
+        if not _grok_rel_selected(rel, agents, only):
+            continue
+        _write_or_check(ROOT / rel, grok_files[rel], args.check, changed, written, blocked)
     refused = []
     if blocked and not args.check:
         # A symlinked file was in the write set. Do not prune; the directory check above
@@ -631,6 +958,10 @@ def main() -> int:
         cursor_removable, cursor_refused = _cursor_orphans(slugs)
         removable += cursor_removable
         refused += cursor_refused
+        lane_dirs = {Path(rel).parent.name for rel in grok_files if rel.startswith("grokbot/skills/")}
+        grok_removable, grok_refused = _grokbot_orphans(lane_dirs)
+        removable += grok_removable
+        refused += grok_refused
         for orphan in removable:
             changed.append(str(orphan.relative_to(ROOT)))
             if not args.check:
