@@ -1,6 +1,7 @@
 """Shared fixtures: isolated SWARM_DIR, script runner, stub claude and omp CLIs, omp workspace-install dirs."""
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -13,6 +14,19 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from install_helpers import _ENV_KEYS, _yaml  # noqa: E402  (after ROOT is on sys.path, as the installer expects)
+
+
+@pytest.fixture(autouse=True)
+def ephemeral_signing_key(monkeypatch):
+    """Each test gets a throwaway HMAC key. The dev-key opt-in stays off unless that test sets it.
+
+    The value is generated here and is not printed, logged, or written down. A test that needs
+    another configuration sets or clears the variables itself.
+    """
+    monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY", raising=False)
+    monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    monkeypatch.delenv("SWARM_REQUIRE_KEY", raising=False)
+    monkeypatch.setenv("SWARM_SIGNING_KEY", secrets.token_hex(32))
 
 
 @pytest.fixture()
