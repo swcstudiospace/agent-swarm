@@ -5,7 +5,6 @@ Fail-open. Detects a01-orchestrator completion (IN_REVIEW or UPLIFT boundary) or
 from __future__ import annotations
 import json
 import re
-from typing import Any
 
 # Full guarded classify (greptile: shared classifier must not change routing; preserve all checks)
 NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
