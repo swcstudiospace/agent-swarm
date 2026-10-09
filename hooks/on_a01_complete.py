@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Thin on a01-orchestrator complete / stop handler shim (n3/n8).
-Fail-open. Opt-in via AIO_SWARM_AFTER_ORCH. Delegates to swarm.hook_trigger.
+Fail-open. Opt-in via AIO_SWARM_AFTER_ORCH or SWARM_AFTER_ORCH
+(1, true, yes, or on). Delegates to swarm.hook_trigger.
 """
 
 import json
