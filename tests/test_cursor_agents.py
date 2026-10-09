@@ -123,6 +123,16 @@ def test_cursor_agents_forbid_merge_and_auto_merge():
     assert seen == 15
 
 
+def test_cursor_agents_ban_headless_runners_even_on_request():
+    """The Cursor line names both runners and overrides the shared rule's operator exception."""
+    for path in sorted(CURSOR.glob("*.md")):
+        pre = _preamble(path.read_text(encoding="utf-8"))
+        line = next((row for row in pre.splitlines() if row.startswith("- Do not start an unattended headless runner")), "")
+        assert "scripts/swarm_run.py" in line and "hooks/autonomous_run.py" in line, path.name
+        assert "even when an assignment asks for one" in line, path.name
+        assert "overrides the shared runner rule" in line, path.name
+
+
 def test_cursor_agents_keyless_advisory_is_not_e_dep():
     for agent in load_manifest():
         text = (CURSOR / f"{agent['slug']}.md").read_text(encoding="utf-8")
