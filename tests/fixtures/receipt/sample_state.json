@@ -1,0 +1,81 @@
+{
+  "correlation_id": "corr-receipt",
+  "tasks": [
+    {
+      "task_id": "T-be",
+      "capability": "code.backend",
+      "agent_id": "A05",
+      "title": "Implement feature",
+      "risk_class": "high",
+      "notes": {},
+      "artifacts": [
+        {"kind": "code", "uri": "src/feature.py"},
+        {"kind": "test", "uri": "tests/test_feature.py"}
+      ]
+    },
+    {
+      "task_id": "T-qa",
+      "capability": "gate.quality",
+      "agent_id": "A08",
+      "title": "Quality gate",
+      "risk_class": "low",
+      "notes": {"gate": "quality", "gate_for": ["T-be"], "gates": []}
+    },
+    {
+      "task_id": "T-rev",
+      "capability": "gate.review",
+      "agent_id": "A09",
+      "title": "Review gate",
+      "risk_class": "low",
+      "notes": {"gate": "review", "gate_for": ["T-be"], "gates": []}
+    },
+    {
+      "task_id": "T-sec",
+      "capability": "gate.security",
+      "agent_id": "A10",
+      "title": "Security gate",
+      "risk_class": "low",
+      "notes": {"gate": "security", "gate_for": ["T-be"], "gates": []}
+    }
+  ],
+  "events": [
+    {
+      "type": "script.qa_gate",
+      "task_id": "T-qa",
+      "payload": {
+        "status": "ok",
+        "cmd": "python3 -m pytest -q tests/test_feature.py",
+        "exit_code": 0,
+        "duration_s": 1.25,
+        "summary": "{\"lease_id\": \"lease-token-should-vanish\", \"note\": \"4 passed\"}"
+      }
+    },
+    {
+      "type": "script.rev_gate",
+      "task_id": "T-rev",
+      "payload": {
+        "status": "ok",
+        "cmd": "python3 scripts/rev_gate.py --root .",
+        "exit_code": 0,
+        "duration_s": 0.4,
+        "summary": "review rules pass"
+      }
+    },
+    {
+      "type": "script.sec_gate",
+      "task_id": "T-sec",
+      "payload": {
+        "status": "ok",
+        "cmd": "python3 scripts/sec_gate.py --root .",
+        "exit_code": 0,
+        "duration_s": 0.8,
+        "summary": "security scan pass"
+      }
+    }
+  ],
+  "verdicts": [
+    {"task_id": "T-be", "gate": "quality", "agent_id": "A08", "mode": "unsigned"},
+    {"task_id": "T-be", "gate": "review", "agent_id": "A09", "mode": "signed"},
+    {"task_id": "T-be", "gate": "security", "agent_id": "A10", "mode": "keyless"}
+  ]
+}
