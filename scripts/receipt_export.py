@@ -222,18 +222,34 @@ def _advisory_file(sdir: Path, gate_task_id: str, target: str, gate: str) -> dic
     return None
 
 
+def _saved_target_verdicts(payload: dict) -> dict[str, str]:
+    """Per-target verdicts saved on a gate event. The event's own verdict is the combined result."""
+    recorded = payload.get("recorded")
+    if not isinstance(recorded, dict):
+        return {}
+    out = {}
+    for target, env in recorded.items():
+        if not isinstance(target, str) or not isinstance(env, dict):
+            continue
+        verdict = _payload(env).get("verdict")
+        if isinstance(verdict, str):
+            out[target] = verdict
+    return out
+
+
 def _describe(store: TaskStore, target: str, gate: str, row: dict | None, advisory: dict | None, *,
               ran: bool, event_verdict: str | None = None) -> tuple[str, str]:
     if row is not None:
         return _classify_row(store, target, gate, row)
     if advisory is not None or ran:
         # A file or a script event with no row is an unsigned run, not a missing run, and not a signature.
+        # event_verdict is this target's saved envelope only. The combined script verdict is not copied here.
         if advisory is not None:
             recorded = _recorded_word(_payload(advisory).get("verdict") or "none")
         elif event_verdict:
             recorded = _recorded_word(event_verdict)
         else:
-            recorded = "none"
+            recorded = "unknown"
         return "unsigned keyless", recorded
     return "not run", "none"
 
@@ -308,6 +324,7 @@ def _commands(events: list[dict]) -> tuple[list[dict], dict[tuple[str, str | Non
                 "dry": dry, "commit": _sha_field(payload),
                 "summary": payload.get("summary") if isinstance(payload.get("summary"), str) else None,
                 "verdict": payload.get("verdict") if isinstance(payload.get("verdict"), str) else None,
+                "per_target": _saved_target_verdicts(payload),
             }
             continue
         cmd = recorded
@@ -478,9 +495,10 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
             siblings = _siblings(tasks, target, gate)
             row = _pick_row(store, target, gate, task["task_id"], siblings)
             advisory = None if row is not None else _advisory_file(sdir, task["task_id"], target, gate)
-            event_verdict = info.get("verdict") if isinstance(info.get("verdict"), str) else None
+            per_target = info.get("per_target") if isinstance(info.get("per_target"), dict) else {}
+            specific = per_target.get(target) if isinstance(per_target.get(target), str) else None
             signature, recorded = _describe(
-                store, target, gate, row, advisory, ran=ran, event_verdict=event_verdict)
+                store, target, gate, row, advisory, ran=ran, event_verdict=specific)
             commit = _checked_commit(info, row, advisory, store, target)
             evidence, omitted_evidence = _evidence(store, target)
             if omitted_evidence:
@@ -500,14 +518,18 @@ def _receipt(store: TaskStore, tasks: list[dict], events: list[dict], *, task_id
                 unverified.append(sentence + f"; {missing}")
                 continue
             claims.append({"claim": sentence, "evidence_command_index": slot})
-        summary = info.get("summary") if key is not None and key in bare else None
-        if isinstance(summary, str) and summary:
-            shown = _display(summary)
-            if shown:
-                unverified.append(f"script {script} result: {shown}")
-            else:
-                unverified.append(
-                    f"script {script} result omitted; it contained the approval token and could not be preserved")
+        if key is not None and key in bare:
+            summary = info.get("summary") if isinstance(info.get("summary"), str) else None
+            if summary:
+                shown = _display(summary)
+                if shown:
+                    unverified.append(f"script {script} result: {shown}")
+                else:
+                    unverified.append(
+                        f"script {script} result omitted; it contained the approval token and could not be preserved")
+            combined = info.get("verdict") if isinstance(info.get("verdict"), str) else None
+            if combined:
+                unverified.append(f"script {script} combined verdict: {_recorded_word(combined)}")
     for task in tasks:
         if (task.get("notes_json") or {}).get("gate"):
             continue

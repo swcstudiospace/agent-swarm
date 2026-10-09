@@ -407,10 +407,40 @@ def test_gate_event_without_a_command_is_not_invented(swarm_dir, tmp_path):
     quality = [line for line in receipt["unverified"] if "T-qa" in line or "script qa_gate result" in line]
     assert quality
     assert any("no recorded cmd" in line for line in receipt["unverified"])
-    assert any("command line was not recorded" in line and "recorded fail" in line for line in quality)
+    assert any("command line was not recorded" in line and "recorded unknown" in line for line in quality)
     assert any("script qa_gate result: quality gate FAIL" in line for line in receipt["unverified"])
+    assert any("script qa_gate combined verdict: fail" in line for line in receipt["unverified"])
+    assert all("recorded fail" not in line for line in receipt["unverified"])
     assert all("not run" not in line for line in quality)
     assert all("recorded none" not in line for line in quality)
+
+
+def test_combined_verdict_is_not_copied_onto_every_target(swarm_dir, tmp_path):
+    corr = "corr-multi"
+    _seed(corr, [
+        {"task_id": "T-be", "capability": "code.backend", "agent_id": "A05", "title": "Implement",
+         "notes": {"gates": []}},
+        {"task_id": "T-fe", "capability": "code.frontend", "agent_id": "A06", "title": "UI",
+         "notes": {"gates": []}},
+        {"task_id": "T-qa", "capability": "gate.quality", "agent_id": "A08", "title": "Quality",
+         "notes": {"gate": "quality", "gate_for": ["T-be", "T-fe"], "gates": []}},
+    ], [
+        {"type": "script.qa_gate", "task_id": "T-qa", "payload": {
+            "status": "fail",
+            "verdict": "fail",
+            "summary": "quality gate FAIL — runners: ['pytest']",
+            "recorded": {"T-be": {"payload": {"verdict": "pass"}}}}},
+    ])
+    receipt = _receipt(run_export(tmp_path, "--correlation-id", corr))
+    _assert_desk_shape(receipt)
+    be = next(line for line in receipt["unverified"] if "for T-be" in line)
+    fe = next(line for line in receipt["unverified"] if "for T-fe" in line)
+    assert "recorded pass" in be
+    assert "recorded unknown" in fe
+    assert "recorded fail" not in be
+    assert "recorded fail" not in fe
+    assert any("script qa_gate combined verdict: fail" in line for line in receipt["unverified"])
+    assert sum("combined verdict:" in line for line in receipt["unverified"]) == 1
 
 
 def test_status_summary_with_approved_still_exports(swarm_dir, tmp_path):
