@@ -31,13 +31,11 @@ def _runner():
 
 
 def _env(swarm, **extra) -> dict:
-    key = os.environ.get("SWARM_SIGNING_KEY")
-    env = {k: v for k, v in os.environ.items() if k != "SWARM_DIR"}
-    env["SWARM_DIR"] = str(swarm)
-    if key and "SWARM_SIGNING_KEY" not in extra:
-        env["SWARM_SIGNING_KEY"] = key
-    env.update(extra)
-    return env
+    # Test-owned values only. run_script's scrubbed base already supplies the platform vars
+    # (PATH, HOME, ...) and the ephemeral-signing-key fixture supplies the key, so neither is
+    # copied here; anything else the child needs rides in explicitly via extra. Host vars
+    # (SUBSTRATE_* tokens, proxies, SWARM_* session vars) never pass.
+    return {"SWARM_DIR": str(swarm), **extra}
 
 
 def _plan(tmp_path, env, plan=ONE) -> Path:

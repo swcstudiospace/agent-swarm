@@ -314,6 +314,89 @@ def test_apply_result_rolls_back_transition_when_a_provenance_write_fails(swarm_
     assert ts.conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id=?", (tid,)).fetchone()[0] == 0
 
 
+def test_apply_result_rolls_back_a_real_artifact_write(swarm_dir, monkeypatch):
+    """Failure after the first artifact row still rolls back: the row, the outputs update, notes, and transition."""
+    from swarm import results
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    tid = _atomic_task(ts)
+    before = ts.history(tid)
+    real_add = ts.add_artifact
+    calls = {"n": 0}
+    def _flaky(*a, **k):
+        out = real_add(*a, **k)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected crash after first artifact")
+        return out
+    monkeypatch.setattr(ts, "add_artifact", _flaky)
+    result = {"task_id": tid, "state": "IN_REVIEW",
+              "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""},
+                          {"kind": "docs.bundle", "uri": "file://y", "version": "1", "digest": ""}]}
+    with pytest.raises(RuntimeError, match="injected crash after first artifact"):
+        results.apply_result(ts, ts.get(tid), agent_id="A05", result=result, meta={"argv": ["x"]},
+                             emit=lambda *a: None, mode="headless")
+    assert calls["n"] == 1  # one row really landed before the crash
+    after = ts.get(tid)
+    assert after["state"] == "IN_PROGRESS"
+    assert "result" not in after["notes_json"]
+    assert after["outputs"] == []
+    assert ts.history(tid) == before
+    assert ts.conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id=?", (tid,)).fetchone()[0] == 0
+
+
+def _atomic_gate_task(ts, tid="G-1", targets=("T-a", "T-b")):
+    """A leased review gate task over two targets, with a failing script row per target from this lease,
+    so the gate checks pass and the result reaches target feedback."""
+    from swarm.gates import make_verdict
+    for t in targets:
+        ts.create(task_id=t, correlation_id="c", capability="code.backend", notes={"gates": []})
+    ts.create(task_id=tid, correlation_id="c", capability="gate.review",
+              notes={"gate": "review", "gate_for": list(targets)})
+    for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"):
+        ts.transition(tid, s)
+    for t in targets:
+        ts.record_verdict(t, make_verdict(gate="review", task_id=t, agent_id="A09@test", verdict="fail",
+                                          findings=[{"severity": "major", "kind": "k", "summary": "s"}],
+                                          correlation_id="c", extra={"gate_task": tid}))
+    return tid
+
+
+def test_apply_result_rolls_back_first_target_feedback_on_a_gate_task(swarm_dir, monkeypatch):
+    """Failure after the first target's feedback rolls back every earlier write: the transition, notes,
+    the artifact row, and the feedback already appended to that first target."""
+    from swarm import results
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    targets = ("T-a", "T-b")
+    tid = _atomic_gate_task(ts, targets=targets)
+    before = ts.history(tid)
+    real_feedback = ts.append_feedback
+    calls = {"n": 0}
+    def _flaky(target, entry):
+        out = real_feedback(target, entry)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected crash after first target feedback")
+        return out
+    monkeypatch.setattr(ts, "append_feedback", _flaky)
+    result = {"task_id": tid, "state": "IN_REVIEW",
+              "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
+              "verdicts": {t: {"verdict": "request_changes", "findings": []} for t in targets}}
+    with pytest.raises(RuntimeError, match="injected crash after first target feedback"):
+        results.apply_result(ts, ts.get(tid), agent_id="A09", result=result, meta={"argv": ["x"]},
+                             emit=lambda *a: None, mode="headless")
+    assert calls["n"] == 1  # T-a's feedback really landed before the crash
+    after = ts.get(tid)
+    assert after["state"] == "IN_PROGRESS"
+    assert "result" not in after["notes_json"]
+    assert after["outputs"] == []
+    assert ts.history(tid) == before
+    assert ts.conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id=?", (tid,)).fetchone()[0] == 0
+    for t in targets:
+        assert ts.get(t)["notes_json"].get("feedback", []) == []
+
+
 def test_apply_result_success_path_writes_state_notes_and_artifacts(swarm_dir):
     """No behavior change on success: same final state, notes, and artifact rows as before the move."""
     from swarm import results

@@ -14,12 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ROOT, omp_calls, omp_grandchild, run_script, stub_claude, stub_omp
+from conftest import ROOT, _scrubbed_base_env, omp_calls, omp_grandchild, run_script, stub_claude, stub_omp
 
 FIXTURE = ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl"
 KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
-_ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
-              "SWARM_DRYRUN_FAIL", "SWARM_RUNTIME", "ANTHROPIC_API_KEY")
 RESULT = {"task_id": "T-one", "state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
           "metrics": {"tests": 3}, "summary_md": "ok"}
 ONE_TASK = {"tasks": [{"id": "one", "capability": "code.backend", "agent": "A05", "title": "one", "depends_on": [], "gates": []}]}
@@ -36,14 +34,19 @@ def sr(tmp_path, monkeypatch):
 
 
 def _env(swarm, **extra) -> dict:
-    # the runner signs task.assign. Keep this test's throwaway HMAC key; extra may replace it.
-    key = os.environ.get("SWARM_SIGNING_KEY")
-    env = {k: v for k, v in os.environ.items() if k not in _ENV_NOISE}
-    env["SWARM_DIR"] = str(swarm)
-    if key and "SWARM_SIGNING_KEY" not in extra:
-        env["SWARM_SIGNING_KEY"] = key
-    env.update(extra)
-    return env
+    # Test-owned values only. run_script's scrubbed base already supplies the platform vars
+    # (PATH, HOME, ...) and the ephemeral-signing-key fixture supplies the key, so neither is
+    # copied here; anything else the child needs rides in explicitly via extra (PATH overrides,
+    # runner secrets). Host vars (SUBSTRATE_* tokens, proxies, SWARM_* session vars) never pass.
+    return {"SWARM_DIR": str(swarm), **extra}
+
+
+def _spawn_env(env) -> dict:
+    """Full env for processes spawned directly (not via run_script): the scrubbed platform base
+    plus this test's values."""
+    full = _scrubbed_base_env()
+    full.update(env)
+    return full
 
 
 def _plan(tmp_path, env, plan=ONE_TASK, *extra) -> Path:
@@ -252,7 +255,7 @@ def test_dry_run_line_replays_without_keys(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     line = next(ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: "))
     # The shell that replays the line still has the runner's keys and the parent's task ids.
-    replay_env = {**env, "SWARM_TASK_ID": "T-parent", "SWARM_CORRELATION_ID": "corr-parent"}
+    replay_env = {**_spawn_env(env), "SWARM_TASK_ID": "T-parent", "SWARM_CORRELATION_ID": "corr-parent"}
     p = subprocess.run(["/bin/sh", "-c", line.removeprefix("dry-run T-one [A05]: ")], capture_output=True, text=True,
                        env=replay_env, cwd=work, timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
@@ -318,7 +321,7 @@ def test_relative_omp_bin_resolved_at_preflight(tmp_path):
     stub = stub_omp(tmp_path, RESULT)
     # the runner's cwd must hold the relative path; from the repo (work/) `omp-bin/omp` does not exist
     r = subprocess.run([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin", "omp-bin/omp",
-                        "--repo", str(work), "--once", "--json"], capture_output=True, text=True, env=env, cwd=tmp_path)
+                        "--repo", str(work), "--once", "--json"], capture_output=True, text=True, env=_spawn_env(env), cwd=tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert _states(swarm) == {"T-one": "DONE"}
     (call,) = omp_calls(stub)
@@ -451,7 +454,7 @@ def test_signal_to_runner_group_ends_sessions(tmp_path, sig):
     stub = stub_omp(tmp_path, RESULT, hang=True)
     runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",
                                str(stub), "--task-timeout", "100", "--repo", str(work), "--once", "--json"],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=ROOT,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_spawn_env(env), cwd=ROOT,
                               start_new_session=True)
     pids: list[int] = []
     try:
@@ -490,7 +493,7 @@ def test_ignored_sighup_keeps_runner_and_session(tmp_path):
     gated.chmod(0o755)
     runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",
                                str(gated), "--task-timeout", "100", "--repo", str(work), "--once", "--json"],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=ROOT,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_spawn_env(env), cwd=ROOT,
                               start_new_session=True, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
     try:
         deadline = time.monotonic() + 30
