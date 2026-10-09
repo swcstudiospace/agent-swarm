@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /** Pass-through to scripts/rev_greptile_ingest.py — the findings are built in Python.
 
-Relative --threads, --map and --out are prefixed with this process's cwd.
+Relative --threads, --map and --out are prefixed with this process's cwd, including a filename that is a negative number (`--out -2`).
 passthrough then runs Python with cwd at the runtime checkout, so a relative
 path would otherwise name a different file than a direct python3 invocation.
 
@@ -30,6 +30,15 @@ function pinRoot(value: string, cwd: string): string {
   return joinCaller(cwd, value);
 }
 
+/** A filename that is only a negative number (`--out -2`). A flag (`--json`) is not a value. */
+function isNumericPath(value: string): boolean {
+  return /^-\d+(?:\.\d+)?$/.test(value);
+}
+
+function isValue(next: string | undefined): next is string {
+  return next !== undefined && (!next.startsWith("-") || isNumericPath(next));
+}
+
 function absolutize(argv: string[], cwd: string): string[] {
   const dir = process.env.SWARM_DIR;
   if (dir && !dir.startsWith("/")) process.env.SWARM_DIR = joinCaller(cwd, dir);
@@ -50,12 +59,12 @@ function absolutize(argv: string[], cwd: string): string[] {
       continue;
     }
     const next = argv[i + 1];
-    if (FILE_FLAGS.has(arg) && next !== undefined && !next.startsWith("-")) {
+    if (FILE_FLAGS.has(arg) && isValue(next)) {
       out.push(arg, joinCaller(cwd, next));
       i++;
       continue;
     }
-    if (arg === "--root" && next !== undefined && !next.startsWith("-")) {
+    if (arg === "--root" && isValue(next)) {
       sawRoot = true;
       out.push(arg, pinRoot(next, cwd));
       i++;
@@ -67,4 +76,8 @@ function absolutize(argv: string[], cwd: string): string[] {
   return out;
 }
 
-process.exit(passthrough("rev_greptile_ingest", absolutize(process.argv.slice(2), process.cwd())));
+export { absolutize };
+
+if (import.meta.main) {
+  process.exit(passthrough("rev_greptile_ingest", absolutize(process.argv.slice(2), process.cwd())));
+}

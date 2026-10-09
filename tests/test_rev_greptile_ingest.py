@@ -564,3 +564,31 @@ def test_twin_resolves_relative_paths_against_the_callers_cwd(tmp_path):
     data = _ok(proc)
     assert (work / "out.json").is_file() and not (ROOT / "out.json").exists()
     assert json.loads((work / "out.json").read_text(encoding="utf-8")) == data["per_target_findings"]
+
+
+@pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
+def test_twin_keeps_a_numeric_filename_in_the_callers_directory(tmp_path):
+    """`--threads -1` is a file named -1. Skipping every value that starts with `-` made the twin read the checkout."""
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copy2(THREADS, work / "-1")
+    proc = subprocess.run([BUN, str(TWIN), "--threads", "-1", "--out", "-2", "--target", "T-be", "--json"],
+                          cwd=work, capture_output=True, text=True, env=_env(tmp_path))
+    data = _ok(proc)
+    assert (work / "-2").is_file() and not (ROOT / "-2").exists()
+    assert json.loads((work / "-2").read_text(encoding="utf-8")) == data["per_target_findings"]
+
+
+@pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
+def test_twin_absolutize_pins_numeric_paths_and_does_not_add_a_second_root(tmp_path):
+    raw = json.dumps(["--threads", "-1", "--out=-2", "--root", "-3", "--json", "--map", "--nope"])
+    proc = subprocess.run([BUN, "-e",
+                           "import { absolutize } from './scripts/ts/rev_greptile_ingest.ts';"
+                           "const args = JSON.parse(process.argv.at(-1) ?? '[]');"
+                           "console.log(JSON.stringify(absolutize(args, '/caller')))",
+                           raw],
+                          cwd=ROOT, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout) == [
+        "--threads", "/caller/-1", "--out=/caller/-2", "--root", "/caller/-3", "--json", "--map", "--nope",
+    ]
