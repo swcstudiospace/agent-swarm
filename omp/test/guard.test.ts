@@ -749,6 +749,15 @@ describe("HOOK-03 shell twin and D-08", () => {
     ["/usr/bin/python3.11 -X dev scripts/qa_gate.py", "a08-qa", true],
     ["python3 -m scripts.unknown_gate", "a09-reviewer", false],
     ["python3.12 -m pytest tests/test_rev_gate.py", "a09-reviewer", false],
+    // T-05-22: the program is the redirected script, or the script was copied aside in the same command
+    ["python3 < scripts/rev_gate.py", "a09-reviewer", true],
+    ["python3 - --task-id T < scripts/rev_gate.py", "a09-reviewer", true],
+    ["cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py", "a05-backend", true],
+    ["pypy3 scripts/rev_gate.py", "a09-reviewer", true],
+    ["uv run --with pyyaml python scripts/rev_gate.py", "a09-reviewer", true],
+    ["uv run --python 3.12 scripts/rev_gate.py", "a09-reviewer", true],
+    ["python3 \"/srv/my swarm/scripts/sec_gate.py\"", "a10-security", true],
+    ["echo x | python3 -c 'print(1)'", "a09-reviewer", false],
   ])("gate script: %s from %s blocks=%p", (command, agent, blocks) => {
     const res = guardToolCall(bash(command), facts(agent));
     if (blocks) expect(res).toEqual({ block: true, reason: "BLOCKED needs: human-approval (gate: gate-script-shell)" });

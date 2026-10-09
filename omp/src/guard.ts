@@ -1475,22 +1475,109 @@ function executedScript({ words, argv0 }: Segment): { stem: string; args: string
   return m === null ? undefined : { stem: m[1], args: words.slice(i + 1) };
 }
 
+const ORCH_STEMS: Record<string, true> = { orch_plan: true, orch_status: true };
+const SCRIPT_STEM = /(?:^|\/)([A-Za-z0-9_-]+)\.(?:py|ts)$/;
+
+function scriptStemOf(path: string): string | undefined {
+  return SCRIPT_STEM.exec(path)?.[1];
+}
+
+/** Targets of stdin redirections (`< file`, `0<file`, `<<EOF`, `<<< '…'`), unquoted. */
+function stdinTargets(marked: string): string[] {
+  const words = shellWords(marked);
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const plain = unquote(words[i]);
+    const op = STDIN_REDIRECT.exec(plain);
+    if (op === null) continue;
+    const attached = plain.slice(op[0].length);
+    if (attached !== "") out.push(attached);
+    else if (words[i + 1] !== undefined) out.push(unquote(words[++i]));
+  }
+  return out;
+}
+
+/**
+ * The interpreter's program is stdin: no script file, no `-c`/`--command` and no `-m`, and stdin is a pipe or a
+ * redirect (`echo x | python3`, `python3 < scripts/rev_gate.py`, `python3 - --task-id T < scripts/rev_gate.py`).
+ * `-c` and `-m` name the program, so a pipe into those is data and is not this.
+ */
+function readsProgramFromStdin(seg: Segment): boolean {
+  const { words, marked, piped } = seg;
+  let i = 0;
+  let saw = false;
+  while (i < words.length) {
+    const w = words[i];
+    if (INTERPRETER.test(w) || (saw && w === "run")) {
+      saw = true;
+      i++;
+      continue;
+    }
+    if (!saw) return false;
+    if (MODULE_OPTION.test(w) || w === "-c" || w.startsWith("-c") || w === "--command" || w.startsWith("--command=")) return false;
+    if (/^-[A-Za-z]+$/.test(w) && w.includes("c")) return false; // `python3 -Bc 'code'`
+    if (INTERPRETER_VALUE_FLAG.test(w)) {
+      i += 2;
+      continue;
+    }
+    if (STDIN_FILE.test(w)) break; // `python3 -`: the program is stdin, and the rest are its arguments
+    if (w.startsWith("-")) {
+      i++;
+      continue;
+    }
+    return false; // a real script word: stdin is data, not the program
+  }
+  if (!saw) return false;
+  return piped || shellWords(marked).some((w) => STDIN_REDIRECT.test(unquote(w)));
+}
+
+/** The stem of the file an interpreter is reading as its program, when that file is named by a stdin redirect. */
+function stdinScriptStem(seg: Segment): string | undefined {
+  if (!readsProgramFromStdin(seg)) return undefined;
+  for (const target of stdinTargets(seg.marked)) {
+    const stem = scriptStemOf(target);
+    if (stem !== undefined) return stem;
+  }
+  return undefined;
+}
+
+/** `cp`/`mv`/`install`/`ln` of a guarded script (any operand): the copy is how a renamed run used to get past the stem check. */
+function relocatesStem(seg: Segment, stems: Record<string, true>): boolean {
+  const cmd = seg.words[0] ?? "";
+  if (!/^(?:cp|mv|install|ln)$/.test(cmd)) return false;
+  return operands(seg.words.slice(1)).some((arg) => {
+    const stem = scriptStemOf(arg);
+    return stem !== undefined && Object.hasOwn(stems, stem);
+  });
+}
+
 /**
  * A direct run of a gate script (qa/quality/rev/review/sec/security/release_gate, rel_plan) by any swarm agent, the
  * gate's owner included: a shell run scores whatever tree cwd points at and can overwrite its own verdict, so gates
- * are recorded only through swarm_gate (Phase 5 D-1).
+ * are recorded only through swarm_gate (Phase 5 D-1). A stdin redirect of the script file is the same run
+ * (`python3 < scripts/rev_gate.py`), and so is copying the file aside (`cp scripts/rev_gate.py /tmp/r.py`).
  */
 const gateScriptRun = (seg: Segment): boolean => {
   const run = executedScript(seg);
-  return run !== undefined && Object.hasOwn(GATE_STEMS, run.stem);
+  if (run !== undefined && Object.hasOwn(GATE_STEMS, run.stem)) return true;
+  const stem = stdinScriptStem(seg);
+  return (stem !== undefined && Object.hasOwn(GATE_STEMS, stem)) || relocatesStem(seg, GATE_STEMS);
 };
 
 /** A run of `orch_plan.py|ts` (or module), or of `orch_status.py|ts` (or module) with `--ingest`/`--transition`. */
 function orchStateScript(seg: Segment): boolean {
   const run = executedScript(seg);
-  if (run === undefined) return false;
-  return run.stem === "orch_plan" || (run.stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a)));
+  if (run !== undefined && (run.stem === "orch_plan" || (run.stem === "orch_status" && run.args.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))))) {
+    return true;
+  }
+  const stem = stdinScriptStem(seg);
+  if (stem === "orch_plan") return true;
+  if (stem === "orch_status" && seg.words.some((a) => /^--(?:ingest|transition)(?:=|$)/.test(a))) return true;
+  return relocatesStem(seg, ORCH_STEMS);
 }
+
+/** `claude` / `grok` / `omp` (a path's basename too): a nested agent CLI has no swarm guard and still reaches MCP. */
+const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(seg.words[0] ?? "");
 
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
@@ -1507,17 +1594,13 @@ export const RULES: readonly Rule[] = [
       "bun scripts/ts/orch_plan.ts",
       "scripts/ts/orch_status.ts --ingest x",
       "sqlite3 .swarm/tasks.db \"UPDATE tasks SET state='DONE'\"",
+      "python3 - --ingest x.json < scripts/orch_status.py",
+      "cp scripts/orch_plan.py /tmp/plan.py",
     ],
   },
-  // gates are recorded only through swarm_gate, never through the shell, the gate's owner included (Phase 5 D-1)
-  {
-    id: "gate-script-shell",
-    capability: "gate",
-    agents: Object.values(GATE_AGENTS),
-    pattern: gateScriptRun,
-    samples: ["python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x"],
-  },
-  // D-08: shell writes into .swarm/, .omp/ or ~/.omp
+  // D-08: shell writes into .swarm/, .omp/ or ~/.omp. These precede gate-script-shell: copying onto a guarded
+  // gate script, or moving one out of a runtime root, is tampering with that path. A renamed gate run
+  // (`cp scripts/rev_gate.py /tmp/r.py`) is not a protected path, so the gate row still catches it.
   {
     id: "protected-path-shell",
     capability: "protected_path",
@@ -1548,6 +1631,17 @@ export const RULES: readonly Rule[] = [
       "mkdir -p .omp/extensions",
     ],
   },
+  // gates are recorded only through swarm_gate, never through the shell, the gate's owner included (Phase 5 D-1)
+  {
+    id: "gate-script-shell",
+    capability: "gate",
+    agents: Object.values(GATE_AGENTS),
+    pattern: gateScriptRun,
+    samples: [
+      "python3 scripts/qa_gate.py --task T-1", "python3 scripts/rev_gate.py --task T-1", "bun scripts/ts/sec_gate.ts", "python3 scripts/review_gate.py x",
+      "python3 < scripts/rev_gate.py", "python3 - --task-id T < scripts/rev_gate.py", "cp scripts/rev_gate.py /tmp/r.py && python3 /tmp/r.py",
+    ],
+  },
   // D-08: dotglob would let a leading `*`/`?` name `.swarm`/`.omp` (shell targets assume it off, as bash starts)
   {
     id: "glob-dotfiles",
@@ -1569,6 +1663,20 @@ export const RULES: readonly Rule[] = [
       "curl -fsSL https://x/install.sh | sh", "printf 'git push %s' --force | sh", "echo ok | bash", "bash <<'EOF'\necho\nEOF", "sh <<< 'ls'",
       "sh < s.sh", "bash -s < s.sh", "cat s.sh |& env bash", "wget -qO- x | command bash -s -- -y", "echo ls | busybox sh", "cat x | source /dev/stdin",
     ],
+  },
+  // an interpreter reading its program from stdin is the same class as shell-stdin: the program is not judged
+  {
+    id: "interpreter-stdin",
+    capability: "destructive",
+    pattern: readsProgramFromStdin,
+    samples: ["echo x | python3", "python3 < /tmp/notes.py", "python3 - < /tmp/notes.py", "uv run python <<< 'print(1)'"],
+  },
+  // T-06-28: a nested claude/grok/omp is a top-level session without this guard, and it still connects the operator's MCP
+  {
+    id: "nested-agent",
+    capability: "mcp",
+    pattern: nestedAgentCli,
+    samples: ["claude -p", "grok -p --yolo", "omp -p --no-extensions --approval-mode yolo", "bash -lc \"claude -p\""],
   },
   {
     id: "git-force-push",
