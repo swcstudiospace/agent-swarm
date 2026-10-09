@@ -93,7 +93,29 @@ def test_a_re_lease_without_a_new_script_run_is_still_refused(tmp_path, swarm_di
     _not_run(_ingest(swarm, {"P-be": _PASS}))  # unchanged behaviour: the row is from the previous lease
 
 
-def test_a_re_lease_that_lands_after_the_script_check_is_still_refused(tmp_path, swarm_dir, monkeypatch):
+def _re_lease_after_the_script_check(monkeypatch):
+    """The race window: the first script check still sees this lease's row, then A01 re-leases before the locked recheck."""
+    from swarm import results
+    original = results._gate_script_missing
+
+    def after_the_check(store, task):
+        missing = original(store, task)
+        if not after_the_check.done:
+            assert missing == [], missing  # this lease's row verified; the refusal is the locked recheck's
+            after_the_check.done = True
+            store.transition("P-rev", "FAILED", reason="session died")
+            store.transition("P-rev", "RETRY", reason="requeue")
+            _lease(store, "P-rev")  # a new lease, and the script has not run in it
+        return missing
+
+    after_the_check.done = False
+    monkeypatch.setattr(results, "_gate_script_missing", after_the_check)
+
+
+_REVIEW_PASS = {"task_id": "P-rev", "state": "IN_REVIEW", "gate": "review", "verdicts": {"P-be": _PASS}}
+
+
+def test_a_re_lease_that_lands_after_the_script_check_is_still_refused(tmp_path, swarm_dir, runner_key, monkeypatch):
     """The check used to run on the caller's snapshot. A retry that reached IN_PROGRESS again before the transition
     made that transition legal, and the previous lease's row then approved the target. Ingest is a subprocess, so
     the interleaving is injected where the check returns, which is the window the race uses."""
@@ -103,25 +125,54 @@ def test_a_re_lease_that_lands_after_the_script_check_is_still_refused(tmp_path,
     ts, swarm, work, corr = _setup(tmp_path)
     _rev_gate(swarm, work, corr, {"P-be": []})
     snapshot = ts.get("P-rev")
-    original = results._gate_script_missing
-
-    def after_the_check(store, task):
-        missing = original(store, task)
-        if not after_the_check.done:
-            after_the_check.done = True
-            store.transition("P-rev", "FAILED", reason="session died")
-            store.transition("P-rev", "RETRY", reason="requeue")
-            _lease(store, "P-rev")  # a new lease, and the script has not run in it
-        return missing
-
-    after_the_check.done = False
-    monkeypatch.setattr(results, "_gate_script_missing", after_the_check)
-    result = {"task_id": "P-rev", "state": "IN_REVIEW", "gate": "review", "verdicts": {"P-be": _PASS}}
+    _re_lease_after_the_script_check(monkeypatch)
     with pytest.raises(SwarmError, match=r"gate script not run for \['P-be'\]"):
-        results.apply_result(ts, snapshot, agent_id="A09", result=result, meta={}, emit=lambda *a: None, mode="ingest")
+        results.apply_result(ts, snapshot, agent_id="A09", result=_REVIEW_PASS, meta={}, emit=lambda *a: None, mode="ingest")
     assert ts.get("P-rev")["state"] == "IN_PROGRESS"  # the new lease stands; the result was not accepted
     assert ts.get("P-be")["state"] == "IN_REVIEW"
     assert "IN_REVIEW" not in [h["to_state"] for h in ts.history("P-rev")]
+
+
+def test_a_re_lease_that_lands_after_the_script_check_does_not_fail_the_new_attempt(tmp_path, swarm_dir, runner_key, monkeypatch):
+    """Headless twin of the race: the older result is rejected, and the replacement attempt stays IN_PROGRESS."""
+    from swarm import results
+
+    ts, swarm, work, corr = _setup(tmp_path)
+    _rev_gate(swarm, work, corr, {"P-be": []})
+    snapshot = ts.get("P-rev")
+    _re_lease_after_the_script_check(monkeypatch)
+    events = []
+    outcome = results.apply_result(ts, snapshot, agent_id="A09", result=_REVIEW_PASS, meta={},
+                                   emit=lambda t, p: events.append((t, p)), mode="headless")
+    assert outcome == "IN_PROGRESS"
+    assert ts.get("P-rev")["state"] == "IN_PROGRESS"  # not FAILED
+    assert ts.get("P-rev")["attempt"] == snapshot["attempt"] + 1
+    assert ts.history("P-rev")[-1]["to_state"] == "IN_PROGRESS"
+    assert ts.get("P-be")["state"] == "IN_REVIEW"
+    assert "IN_REVIEW" not in [h["to_state"] for h in ts.history("P-rev")]
+    assert [p for t, p in events if t == "task.result.rejected"] == [
+        {"task_id": "P-rev", "mode": "headless", "reason": "E-CONTRACT: gate script not run for ['P-be']"}]
+
+
+def test_a_same_attempt_headless_refusal_still_fails(tmp_path, swarm_dir, runner_key):
+    """A gate result whose script did not run for this attempt still ends FAILED."""
+    from swarm import results
+
+    ts, swarm, work, corr = _setup(tmp_path)
+    _rev_gate(swarm, work, corr, {"P-be": []})  # lease 1 recorded a passing row
+    _failed_then_retry(ts, swarm)
+    _lease(ts, "P-rev")  # this attempt: the script has not run
+    snapshot = ts.get("P-rev")
+    events = []
+    outcome = results.apply_result(ts, snapshot, agent_id="A09", result=_REVIEW_PASS, meta={},
+                                   emit=lambda t, p: events.append((t, p)), mode="headless")
+    assert outcome == "FAILED"
+    assert ts.get("P-rev")["state"] == "FAILED"
+    assert ts.get("P-rev")["attempt"] == snapshot["attempt"]
+    assert ts.history("P-rev")[-1]["to_state"] == "FAILED"
+    assert ts.history("P-rev")[-1]["reason"].startswith("E-CONTRACT: gate script not run")
+    assert ts.get("P-be")["state"] == "IN_REVIEW"
+    assert [p["mode"] for t, p in events if t == "task.result.rejected"] == ["headless"]
 
 
 def test_gate_script_missing_counts_every_target_before_a_lease_exists(tmp_path, swarm_dir, runner_key):

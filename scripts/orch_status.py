@@ -44,7 +44,7 @@ def ingest(store: TaskStore, path: Path, ctx, *, approve: bool = True) -> dict:
                              meta={"ingest": str(path)}, emit=ctx.emit, mode="ingest")
     except SwarmError as e:
         if e.code is ErrorCode.E_CONTRACT:
-            reject(store, tid, reason=str(e), mode="ingest", emit=ctx.emit)
+            reject(store, tid, attempt=task["attempt"], reason=str(e), mode="ingest", emit=ctx.emit)
         raise
     log = reconcile(store, task["correlation_id"], ctx.emit, approve=approve)
     t = store.get(tid)
