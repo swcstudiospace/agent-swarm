@@ -17,19 +17,23 @@ sha256sum grokbot/skills/swarm-cloud-dispatch/SKILL.md
 
 Cloud runs are keyless and advisory. A cloud session never receives `SWARM_SIGNING_KEY`, `SWARM_ED25519_KEY`, or a substrate token (`SUBSTRATE_TOKEN`, including any `SUBSTRATE_TOKEN_*` name). Do not place a signing key or a substrate token on the cloud VM.
 
-Finished checks are advisory-complete (IN_REVIEW, never APPROVED) per B2. B2 marks finished quality, review and security checks `IN_REVIEW` so later build, release, observability and docs tasks can proceed in the same draft pull request. Those checks never move to `APPROVED`, and the gate scripts write no verdict rows. Nothing a cloud run records counts as APPROVED. The merge gate is Greptile, run by Desk Quality, and then Ming.
+Nothing a cloud run records counts as APPROVED. A non-gate result is saved with `orch_status.py --ingest --advisory` and is advisory-complete (IN_REVIEW, never APPROVED).
+
+A gate is not that path. The Cursor `a01-orchestrator` this skill installs, the B2 export on this main, does not mark a keyless gate advisory-complete and then continue. When a gate child returns, A01 transitions that gate task to BLOCKED with reason `advisory preview recorded no verdict rows; human records the gate`, stops the scheduling loop, and does not spawn tasks that depend on it. Build, release, observability and docs stay unscheduled. The preview writes no verdict rows. A human records the gate.
+
+The merge gate is Greptile, run by Desk Quality, and then Ming.
 
 ## Brief
 
 The brief is not a fixed wording. It is built from the ultrathink node prompt (the uplift plus that node's chain of thought) plus the seat, the branch and the graph id, via the port's prompts build.
 
-The agent passes that graph id to `scripts/orch_plan.py --graph-id`. The id has the form `ut-<base36>-<8 hex>`.
+The agent passes that graph id as `--graph-id` to the planner in the pinned checkout. The id has the form `ut-<base36>-<8 hex>`. The cloud agent starts in the target repo. That repo does not contain the planner. `--root` names the target repo and does not choose the script.
 
 ```bash
-python3 scripts/orch_plan.py --root <repo> --brief-text "<unit>" --pattern feature --risk-class low --graph-id <graph-id> --json
+python3 "$SWARM_ROOT/scripts/orch_plan.py" --root <repo> --brief-text "<unit>" --pattern feature --risk-class low --graph-id <graph-id> --json
 ```
 
-Use the unit's pattern (`feature`, `hotfix` or `dependency`) and its risk class. The command above is the shape, with `--graph-id` set to the ultrathink graph id.
+Use the unit's pattern (`feature`, `hotfix` or `dependency`) and its risk class. The command above is the shape, with `--graph-id` set to the ultrathink graph id. `$SWARM_ROOT` is the pinned agent-swarm checkout.
 
 ## Branches
 
