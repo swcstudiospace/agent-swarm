@@ -1,8 +1,17 @@
 # AgentSwarm on Agent Substrate — platform pointer
 
-**Status:** pointer / cross-link only. This document records *where* the swarm's shared platform lives
-and how its vocabulary maps onto the existing AgentSwarm spec. It changes no runtime behaviour: nothing
-in `swarm/`, `scripts/`, `omp/` or `hooks/` reads or depends on it.
+**Status:** index of the swarm's substrate runtime, plus the vocabulary map below. When
+`SUBSTRATE_URL` is set, the swarm calls Agent Substrate for leases, handoffs and governed memory,
+using pre-supplied per-agent tokens. The contracts are the four documents in the next section.
+
+## Runtime docs
+
+- [substrate-leases.md](substrate-leases.md) — task leases, so two replicas never work one node (`swarm/substrate_lease.py`, `scripts/swarm_run.py`)
+- [substrate-handoffs.md](substrate-handoffs.md) — signed handoffs when work crosses from one agent to another (`swarm/substrate_handoff.py`)
+- [substrate-memory.md](substrate-memory.md) — governed memory through the substrate write door (`swarm/memory.py`)
+- [substrate-workspace.md](substrate-workspace.md) — `substrate-mcp` wiring and per-agent tokens (`swarm/workspace.py`, `scripts/_install_substrate.py`)
+
+Those four share transport, timeouts and the event tee in [substrate-tee.md](substrate-tee.md).
 
 - **Platform repo:** [swcstudiospace/agent-substrate](https://github.com/swcstudiospace/agent-substrate)
 - **Primary ADR** (lands in that repo, not here): `docs/adr/*-swarm-substrate-integration.md`
@@ -36,10 +45,10 @@ replacement for them.
 
 | Substrate capability | AgentSwarm concept | Where it is already specified |
 |---|---|---|
-| Events over **substrate-mcp** | Message bus, `swarm.v1` envelope, `evt./req./offer./ctl./esc.` subjects | [02-message-protocol.md](../02-message-protocol.md) · [04 §2](../04-integration-plan.md) |
-| **Governed memory** | Memory plane (vector + KV): decisions, patterns, retrospectives, estimates, written via `memory.write` | [01 §2.2](../01-architecture.md) · [04 §2](../04-integration-plan.md) |
-| **Leases / handoffs** | `task.offer` → claim → `task.assign`, single-writer artifact ownership, A01-only state transitions | [01 §3](../01-architecture.md) · [02 lifecycle](../02-message-protocol.md) |
-| **Graph ID** | `correlation_id` — one business request, one id, carried by every artifact, message, PR, run and release | [04 §2 correlation invariant](../04-integration-plan.md) |
+| Events over **substrate-mcp** | Message bus, `swarm.v1` envelope, `evt./req./offer./ctl./esc.` subjects | [substrate-tee.md](substrate-tee.md) · [02-message-protocol.md](../02-message-protocol.md) · [04 §2](../04-integration-plan.md) |
+| **Governed memory** | Memory plane (vector + KV): decisions, patterns, retrospectives, estimates, written via `memory.write` | [substrate-memory.md](substrate-memory.md) · [01 §2.2](../01-architecture.md) · [04 §2](../04-integration-plan.md) |
+| **Leases / handoffs** | `task.offer` → claim → `task.assign`, single-writer artifact ownership, A01-only state transitions | [substrate-leases.md](substrate-leases.md) · [substrate-handoffs.md](substrate-handoffs.md) · [01 §3](../01-architecture.md) · [02 lifecycle](../02-message-protocol.md) |
+| **Graph ID** | `correlation_id` — one business request, one id, carried by every artifact, message, PR, run and release | [substrate-workspace.md](substrate-workspace.md) · [04 §2 correlation invariant](../04-integration-plan.md) |
 | Telemetry (*not claimed by substrate here*) | OTel telemetry plane: traces/metrics/logs correlated by `trace_id`, A13 operates, all agents emit | [01 §2.2](../01-architecture.md) · [04 §2](../04-integration-plan.md) |
 
 The Graph ID row is the load-bearing one, and it is a **correspondence, not string equality**: because the
@@ -57,6 +66,6 @@ its adapter stage, not to this page.
   migration sequencing; this page only points at it.
 - Not a change to [04-integration-plan.md](../04-integration-plan.md). That document's substrate table
   stays authoritative for what flows where; §2.1 there links back here.
-- Not a dependency. Governance of gates, verdicts and autonomy ceilings stays with the swarm
+- Not a transfer of governance. Gates, verdicts and autonomy ceilings stay with the swarm
   ([02-message-protocol.md](../02-message-protocol.md) autonomy levels L0–L4); substrate never raises a
-  ceiling.
+  ceiling. The runtime that does call the substrate is specified in the four documents linked above.
