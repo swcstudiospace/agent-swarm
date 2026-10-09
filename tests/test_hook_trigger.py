@@ -58,21 +58,22 @@ def _record_popen(monkeypatch):
     return calls
 
 
-def _reasons(state: Path) -> list[str]:
+def _hook_payloads(state: Path) -> list[dict]:
     log = state / "events.jsonl"
     if not log.exists():
         return []
-    reasons = []
+    payloads = []
     for line in log.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         rec = json.loads(line)
-        if rec.get("type") != "hook-fired":
-            continue
-        reason = (rec.get("payload") or {}).get("reason")
-        if reason:
-            reasons.append(reason)
-    return reasons
+        if rec.get("type") == "hook-fired":
+            payloads.append(rec.get("payload") or {})
+    return payloads
+
+
+def _reasons(state: Path) -> list[str]:
+    return [p["reason"] for p in _hook_payloads(state) if p.get("reason")]
 
 
 def test_no_real_key_does_not_spawn(state, monkeypatch):
@@ -117,10 +118,11 @@ def test_without_second_opt_in_does_not_spawn(state, monkeypatch):
     assert _reasons(state) == ["autonomous-not-allowed"]
 
 
-def test_cloud_agent_marker_does_not_spawn(state, monkeypatch):
+@pytest.mark.parametrize("marker", _CLOUD_MARKERS)
+def test_cloud_agent_marker_does_not_spawn(state, monkeypatch, marker):
     _clear_cloud(monkeypatch)
     monkeypatch.setenv("SWARM_ALLOW_AUTONOMOUS", "1")
-    monkeypatch.setenv("CURSOR_AGENT", "1")
+    monkeypatch.setenv(marker, "1")
     calls = _record_popen(monkeypatch)
 
     result = fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)
@@ -128,7 +130,28 @@ def test_cloud_agent_marker_does_not_spawn(state, monkeypatch):
     assert calls == []
     assert result["fired"] is False
     assert result["reason"] == "cloud-agent"
+    assert result["marker"] == marker
     assert _reasons(state) == ["cloud-agent"]
+    refused = [p for p in _hook_payloads(state) if p.get("reason") == "cloud-agent"]
+    assert refused == [{"hook": "a01_complete", "deduped": False, "reason": "cloud-agent", "marker": marker}]
+
+
+def test_spawn_oserror_is_recorded(state, monkeypatch):
+    _clear_cloud(monkeypatch)
+    monkeypatch.setenv("SWARM_ALLOW_AUTONOMOUS", "1")
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("spawn refused by test")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+
+    result = fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)
+
+    assert result["fired"] is False
+    assert result["reason"] == "spawn-failed"
+    failed = [p for p in _hook_payloads(state) if p.get("reason") == "spawn-failed"]
+    assert len(failed) == 1
+    assert failed[0]["error"] == "OSError"
 
 
 def test_real_key_and_second_opt_in_reaches_spawn(state, monkeypatch):
