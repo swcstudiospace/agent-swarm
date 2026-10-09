@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -397,11 +398,67 @@ def _skill_ancestors(ws: Path, home: Path) -> list[Path]:
     return out
 
 
-def _read(path: Path) -> str | None:
+_READ_LIMIT = 1_048_576  # a config or agent file larger than this is not one this installer will load
+
+
+def _read(path: Path, *, limit: int | None = None) -> str | None:
+    """Text of a regular file, or None when it is missing, not a regular file, or over `limit`.
+
+    The open is non-blocking. `read_text` on `/dev/zero` or a FIFO `config.yml` never returns, and a caller that
+    treats that as "no config" can then overwrite a real file (T-07-09). Size is taken from `fstat` before the
+    read. `os.read` may return short, so the read loops until EOF or the buffer exceeds `limit` (still too big).
+    `limit` is read from `_READ_LIMIT` at call time so a test can point the cap at a few bytes."""
+    if limit is None:
+        limit = _READ_LIMIT
     try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
         return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        parts: list[bytes] = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, limit + 1 - total)
+            if chunk == b"":
+                break
+            parts.append(chunk)
+            total += len(chunk)
+        data = b"".join(parts)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _text_or_missing(path: Path) -> str | None:
+    """Text of `path`, or None when it is absent.
+
+    A present file that is not a readable regular file, or that `_read` cannot load (larger than `_READ_LIMIT`,
+    or a regular file that comes back None), raises `InstallError` naming `path`. A FIFO or device is not read
+    and is not treated as an empty config."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    try:
+        followed = os.stat(path) if stat.S_ISLNK(info.st_mode) else info
+    except OSError:
+        raise InstallError(f"{path} is unreadable") from None
+    if not stat.S_ISREG(followed.st_mode):
+        raise InstallError(f"{path} is unreadable")
+    text = _read(path)
+    if text is None:
+        raise InstallError(f"{path} is unreadable")
+    return text
 
 
 def shadow_scan(
@@ -473,8 +530,11 @@ class _Plan:
 
 
 def _json_extensions(path: Path) -> list[str] | None:
-    """The `extensions` list of a legacy settings.json; None when the file or the key is absent."""
-    text = _read(path)
+    """The `extensions` list of a legacy settings.json; None when the file or the key is absent.
+
+    `_read` returning None used to mean "missing". A present file that cannot be read raises instead, so link
+    mode does not write a project list that drops the extensions omp still loads from this file."""
+    text = _text_or_missing(path)
     if text is None:
         return None
     try:
@@ -491,21 +551,35 @@ def _json_extensions(path: Path) -> list[str] | None:
 
 def _inherited(ws: Path, home: Path, env: Mapping[str, str]) -> tuple[list[str], Path | None]:
     """The list omp uses in `ws` while its config.yml has no `extensions` key, in omp's `readConfiguredExtensions`
-    order: project settings.json, the user YAML (present without the key: nothing), then user settings.json."""
+    order: project settings.json, the user YAML (present without the key: nothing), then user settings.json.
+
+    A missing file stays absent. A present settings.json or user YAML that exists but cannot be read raises;
+    skipping it would install a project list without the extensions that source still holds. A FIFO is not an
+    empty config: the install fails instead of treating it as absent and reading a later source."""
     project = ws / ".omp" / "settings.json"
     value = _json_extensions(project)
     if value is not None:
         return value, project
-    user_yaml = _user_yaml(home, env)
-    if user_yaml:
-        text = _read(user_yaml) or ""
-        value = _read_list(text, "extensions")
-        if value is not None:
-            return value, user_yaml
-        if any(_ANY_KEY.match(line) for line in text.removeprefix(_BOM).splitlines() if not _skip(line)):
-            raise InstallError(f"{user_yaml} has an `extensions` value this installer cannot read")
-        return [], user_yaml  # a present user YAML suppresses the legacy settings.json
-    legacy = user_dir(home, env) / "settings.json"
+    agent = user_dir(home, env)
+    user_yaml: Path | None = None
+    for name in ("config.yml", "config.yaml"):
+        candidate = agent / name
+        try:
+            os.lstat(candidate)
+        except OSError:
+            continue
+        user_yaml = candidate
+        break
+    if user_yaml is not None:
+        text = _text_or_missing(user_yaml)
+        if text is not None:  # removed between the lstat above and the read: fall through
+            value = _read_list(text, "extensions")
+            if value is not None:
+                return value, user_yaml
+            if any(_ANY_KEY.match(line) for line in text.removeprefix(_BOM).splitlines() if not _skip(line)):
+                raise InstallError(f"{user_yaml} has an `extensions` value this installer cannot read")
+            return [], user_yaml  # a present user YAML suppresses the legacy settings.json
+    legacy = agent / "settings.json"
     value = _json_extensions(legacy)
     return (value, legacy) if value is not None else ([], None)
 

@@ -41,19 +41,70 @@ export function classifyPrompt(prompt: string): boolean {
 
 /** Root elements of an Ultrathink/Prompt-Uplift XML; omp replaces the user's prompt with that XML. */
 const UPLIFT_ROOT = /^<(BUILD_PROMPT|FIX_PROMPT|RESEARCH_PROMPT|CHANGE_PROMPT|UPLIFTED_PROMPT|uplifted|ultrathink)\b/i;
-const ORIGINAL_EL = /<ORIGINAL\b[^>]*>([\s\S]*?)<\/ORIGINAL>/i;
 
-/** The user's own words: the unescaped <ORIGINAL> of an uplift XML, else the prompt unchanged. */
+const ORIGINAL_OPEN = "<original";
+const ORIGINAL_CLOSE = "</original>";
+
+/** Index of lowercase ASCII `needle` in `text` at or after `from`, or -1.
+ *
+ * One forward pass. A character matches only when `ch.toLowerCase()` has length 1 and equals the needle
+ * character, so indexes stay on `text`. U+0130 lowercases to two characters; a lowercased copy of the whole
+ * prompt would shift the closing tag. */
+function indexOfAscii(text: string, needle: string, from: number): number {
+  const n = needle.length;
+  let matched = 0;
+  for (let i = from; i < text.length; i++) {
+    const low = text.charAt(i).toLowerCase();
+    if (low.length === 1 && low === needle.charAt(matched)) {
+      matched++;
+      if (matched === n) return i - n + 1;
+      continue;
+    }
+    matched = low.length === 1 && low === needle.charAt(0) ? 1 : 0;
+  }
+  return -1;
+}
+
+/** True for one ASCII identifier character (`[a-z0-9_]`). A multi-character lowercase is not a match. */
+function isAsciiIdentChar(ch: string): boolean {
+  return ch.length === 1 && ((ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "_");
+}
+
+/** The user's own words: the unescaped <ORIGINAL> of an uplift XML, else the prompt unchanged.
+ *
+ * One forward scan. A regex over every `<ORIGINAL` opener is quadratic: a few hundred kilobytes of unclosed
+ * openers used to take seconds (T-06-25). Tags are matched on the original string (see `indexOfAscii`).
+ * `&amp;` is decoded last so `&amp;lt;` stays `&lt;`. */
 export function classifiedText(prompt: string): string {
   const t = prompt.trim();
-  const m = UPLIFT_ROOT.test(t) ? ORIGINAL_EL.exec(t) : null;
-  if (!m) return prompt;
-  return m[1]
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&");
+  if (!UPLIFT_ROOT.test(t)) return prompt;
+  let from = 0;
+  while (from < t.length) {
+    const open = indexOfAscii(t, ORIGINAL_OPEN, from);
+    if (open < 0) return prompt;
+    const boundary = t.charAt(open + ORIGINAL_OPEN.length);
+    if (boundary !== "" && isAsciiIdentChar(boundary.toLowerCase())) {
+      from = open + ORIGINAL_OPEN.length;
+      continue;
+    }
+    const gt = t.indexOf(">", open);
+    if (gt < 0) return prompt;
+    const close = indexOfAscii(t, ORIGINAL_CLOSE, gt + 1);
+    if (close < 0) return prompt;
+    return t
+      .slice(gt + 1, close)
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&amp;/g, "&");
+  }
+  return prompt;
+}
+
+/** A POSIX single-quoted word. A runtime root with spaces or quotes stays one shell word (T-07-15). */
+export function shellQuote(text: string): string {
+  return `'${text.replace(/'/g, `'"'"'`)}'`;
 }
 
 /**
@@ -84,12 +135,14 @@ export const RUNTIME_HEADING = "## AgentSwarm runtime";
 /** The label of the runtime part's root line; the omp preamble tells specialists to read that line. */
 export const RUNTIME_ROOT_LABEL = "Runtime root:";
 
-/** The runtime part for an absolute runtime root; the omp preamble reads its RUNTIME_ROOT_LABEL line. */
+/** The runtime part for an absolute runtime root; the omp preamble reads its RUNTIME_ROOT_LABEL line.
+ * The command quotes the root, so a path containing spaces is one shell word and the guard can see the script. */
 export function runtimePart(root: string): string {
+  const scripts = `${shellQuote(root)}/scripts/<script>.py`;
   return `${RUNTIME_HEADING}
 
 ${RUNTIME_ROOT_LABEL} ${root}
-Run swarm scripts as \`python3 ${root}/scripts/<script>.py … --root <repo> --json\`, where \`<repo>\` is the git toplevel of your working directory.
+Run swarm scripts as \`python3 ${scripts} … --root <repo> --json\`, where \`<repo>\` is the git toplevel of your working directory.
 `;
 }
 
