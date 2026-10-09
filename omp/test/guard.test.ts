@@ -454,26 +454,127 @@ describe("HOOK-02", () => {
     expect(normalize('bash -c "$VAR" && bash script.sh')).toEqual(['bash -c "$VAR"', "$VAR", "bash script.sh"]);
   });
 
-  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups normalizes well under a second (WR-09)", () => {
-    const big: [string, string[]][] = [
-      [`${"A=1 ".repeat(250_000)}git status`, ["git status"]],
-      [`${"sudo ".repeat(200_000)}git status`, ["git status"]],
-      [`${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
-      [`sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
-      [`${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
-      [`${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
-      [`A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+  test("normalize is linear: 1 MB of stacked prefixes, quotes or groups scales linearly, never superlinearly (WR-09)", { timeout: 30_000 }, () => {
+    // Same-size differential per shape: [name, adversarial input, expected for adversarial].
+    // Adversarial keeps the original 1 MB inputs, so full-scale correctness coverage is unchanged.
+    const shapes: [string, string, string[] | undefined][] = [
+      ["assignment prefixes", `${"A=1 ".repeat(250_000)}git status`, ["git status"]],
+      ["sudo stacking", `${"sudo ".repeat(200_000)}git status`, ["git status"]],
+      ["timeout stacking", `${"timeout 1 ".repeat(100_000)}git status`, ["git status"]],
+      ["sudo -u flags", `sudo ${"-u ".repeat(300_000)}git status`, ["git status"]],
+      ["env stacking", `${"/usr/bin/env ".repeat(100_000)}git status`, ["git status"]],
+      ["long path word", `${"/".repeat(1_000_000)} x`, [`${"/".repeat(1_000_000)} x`]],
+      ["long value", `A=${"b".repeat(1_000_000)}`, [`A=${"b".repeat(1_000_000)}`]],
+      ["quoted pairs", "'a b' ".repeat(150_000), undefined],
+      ["brace groups", "x { ".repeat(200_000), undefined],
+      ["heredoc lines", `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`, undefined],
     ];
-    for (const [command, expected] of big) {
-      const t0 = performance.now();
-      expect(normalize(command)).toEqual(expected);
-      expect(performance.now() - t0).toBeLessThan(1000);
+    // Same-shape builder for the scaling leg: rebuilds each adversarial shape
+    // at an arbitrary byte size with the same repeat unit, so the small and
+    // large inputs exercise the identical code path at two sizes. Prefix
+    // shapes keep their trailing `git status` (never sliced); repeated-token
+    // shapes are truncated to the exact size (a cut token is still the same
+    // class); heredoc keeps its 1000-line header and scales the body.
+    const scalingFor = (name: string, bytes: number): string => {
+      switch (name) {
+        case "assignment prefixes": return `${"A=1 ".repeat(Math.max(1, Math.ceil((bytes - 10) / 4)))}git status`;
+        case "sudo stacking": return `${"sudo ".repeat(Math.max(1, Math.ceil((bytes - 10) / 5)))}git status`;
+        case "timeout stacking": return `${"timeout 1 ".repeat(Math.max(1, Math.ceil((bytes - 10) / 10)))}git status`;
+        case "sudo -u flags": return `sudo ${"-u ".repeat(Math.max(1, Math.ceil((bytes - 15) / 3)))}git status`;
+        case "env stacking": return `${"/usr/bin/env ".repeat(Math.max(1, Math.ceil((bytes - 10) / 13)))}git status`;
+        case "long path word": return `${"/".repeat(Math.max(1, bytes - 2))} x`;
+        case "long value": return `A=${"b".repeat(Math.max(1, bytes - 2))}`;
+        case "quoted pairs": return "'a b' ".repeat(Math.max(1, Math.ceil(bytes / 6))).slice(0, bytes);
+        case "brace groups": return "x { ".repeat(Math.max(1, Math.ceil(bytes / 4))).slice(0, bytes);
+        case "heredoc lines": {
+          const header = "cat <<EOF\n".repeat(1000);
+          return header + "x\n".repeat(Math.max(1, Math.ceil((bytes - header.length) / 2)));
+        }
+        default: throw new Error(`scalingFor: unknown shape ${name}`);
+      }
+    };
+    // Scaling, not wall-clock: each adversarial input is compared against a
+    // benign reference of EQUAL byte length (repeated `git status ;` units,
+    // truncated to the exact length), so fixed overhead, JIT/GC regime, and
+    // heap state cancel out instead of inflating the ratio. The old cross-size
+    // ratio compared a small input below normalize's ~200 KB regime knee
+    // against a large input above it, which made the ratio inherently
+    // environment-sensitive (isolation passed, full suite failed: 43.0x vs the
+    // 40x cap on `sudo -u flags`). Equal-size inputs have no knee to straddle.
+    // Reps interleave back-to-back (A,B,A,B...) in this process, so CI load
+    // slows both sides together and the ratio cannot flake; best-of-N takes
+    // the min each side. Linear work costs ~1x against its equal-size
+    // reference; the WR-09 backtracking class costs ~1000x or more, so a 40x
+    // cap catches a genuine regression decisively with wide headroom. No
+    // absolute wall-clock bound is asserted. The { timeout } above is a
+    // runaway budget, not a correctness assertion: a genuine superlinear hang
+    // still fails fast (via the ratio or the timeout) instead of hanging CI,
+    // and normal runs never approach it. Best-of-3 keeps the full-suite cost
+    // at ~2-4s even under contention from the ~1400 preceding tests.
+    const LINEAR_CAP = 40;
+    const REPS = 3;
+    const BENIGN_UNIT = "git status ; ";
+    const referenceFor = (bytes: number): string =>
+      BENIGN_UNIT.repeat(Math.ceil(bytes / BENIGN_UNIT.length)).slice(0, bytes);
+    normalize("git status"); // warm up (JIT) before measuring
+    const over: string[] = [];
+    for (const [name, adversarial, expected] of shapes) {
+      // Correctness at the original 1 MB scale is unchanged.
+      if (expected !== undefined) expect(normalize(adversarial)).toEqual(expected);
+      // The reference must exercise normalize() genuinely, not be skipped.
+      const reference = referenceFor(adversarial.length);
+      expect(reference.length).toBe(adversarial.length);
+      expect(normalize(reference).length).toBeGreaterThan(0);
+      let adversarialMs = Infinity;
+      let referenceMs = Infinity;
+      for (let i = 0; i < REPS; i++) {
+        let t = performance.now();
+        normalize(adversarial);
+        const advMs = performance.now() - t;
+        if (advMs < adversarialMs) adversarialMs = advMs;
+        t = performance.now();
+        normalize(reference);
+        const refMs = performance.now() - t;
+        if (refMs < referenceMs) referenceMs = refMs;
+      }
+      const ratio = adversarialMs / referenceMs;
+      if (ratio >= LINEAR_CAP) over.push(`${name}: ${ratio.toFixed(1)}x (adversarial ${adversarialMs.toFixed(1)}ms / reference ${referenceMs.toFixed(1)}ms, best of ${REPS})`);
     }
-    for (const command of ["'a b' ".repeat(150_000), "x { ".repeat(200_000), `${"cat <<EOF\n".repeat(1000)}${"x\n".repeat(100_000)}`]) {
-      const t0 = performance.now();
-      normalize(command);
-      expect(performance.now() - t0).toBeLessThan(1000);
+    expect(over).toEqual([]);
+    // Same-shape scaling leg: the differential above cannot catch shared-path
+    // quadratic work, because both sides of an equal-size comparison grow
+    // together and their ratio stays flat (~1x) even when absolute cost is
+    // superlinear. So each adversarial shape is also timed against ITSELF at
+    // two sizes, both above the measured ~200 KB regime knee: SMALL ~400 KB
+    // vs LARGE ~800 KB, i.e. a size ratio of ~2x. Linear work scales with
+    // size (~2x time); shared-path quadratic work scales ~4x. SCALING_CAP 3x
+    // is the size ratio (2x) with 1.5x headroom: linear passes with margin,
+    // pure quadratic fails decisively. Same interleaved best-of-N protocol as
+    // the differential leg, and likewise no absolute wall-clock assertion.
+    const SMALL_BYTES = 400_000;
+    const LARGE_BYTES = 800_000;
+    const SCALING_CAP = 3;
+    const scalingOver: string[] = [];
+    for (const [name] of shapes) {
+      const small = scalingFor(name, SMALL_BYTES);
+      const large = scalingFor(name, LARGE_BYTES);
+      let smallMs = Infinity;
+      let largeMs = Infinity;
+      for (let i = 0; i < REPS; i++) {
+        let t = performance.now();
+        normalize(small);
+        const sMs = performance.now() - t;
+        if (sMs < smallMs) smallMs = sMs;
+        t = performance.now();
+        normalize(large);
+        const lMs = performance.now() - t;
+        if (lMs < largeMs) largeMs = lMs;
+      }
+      const sizeRatio = large.length / small.length;
+      const timeRatio = largeMs / smallMs;
+      if (timeRatio >= SCALING_CAP) scalingOver.push(`${name}: ${timeRatio.toFixed(2)}x time for ${sizeRatio.toFixed(2)}x size (large ${largeMs.toFixed(1)}ms @ ${large.length}B / small ${smallMs.toFixed(1)}ms @ ${small.length}B, best of ${REPS}, cap ${SCALING_CAP}x)`);
     }
+    expect(scalingOver).toEqual([]);
   });
 
   test.each([

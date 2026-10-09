@@ -12,7 +12,7 @@ Grok Bot: grokbot/swarm/seat-map.json and grokbot/skills/swarm-<lane>/SKILL.md
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
-                               [--runtimes claude,grok,omp | --no-substrate] [--with-a01-complete-hook]
+                               [--runtimes claude,grok,omp | --no-substrate] [--with-a01-complete-hook] [--allow-shadowed-copy]
 The install also wires substrate-mcp (scripts/_install_substrate.py): the `substrate` MCP entry for each runtime and one
 0600 env file per agent holding its SUBSTRATE_TOKEN, read from SUBSTRATE_TOKEN_<SURFACE> (docs/substrate-workspace.md).
 Copy Cursor agents only (no substrate, no MCP, no env files):
@@ -21,6 +21,7 @@ Copy Cursor agents only (no substrate, no MCP, no env files):
 """
 from __future__ import annotations
 import argparse
+import errno
 import json
 import os
 import re
@@ -669,20 +670,125 @@ def _generated_symlink() -> Path | None:
     return None
 
 
+def _classify_target_stat(st: os.stat_result, target: Path) -> str | None:
+    """Why `target` must not be written through (T-07-05): a symlink, a directory, a non-regular file,
+    or a hardlink (shared inode, which `is_symlink()` misses). None when `st` is a singly-linked file."""
+    if stat.S_ISLNK(st.st_mode):
+        return f"{target} is a symlink"
+    if stat.S_ISDIR(st.st_mode):
+        return f"{target} is a directory"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{target} is not a regular file"
+    if st.st_nlink > 1:
+        return f"{target} is a hardlink (nlink={st.st_nlink})"
+    return None
+
+
+def _target_refusal(target: Path) -> str | None:
+    """Why `target` must not be written right now (T-07-05): `_classify_target_stat` at it, or a
+    symlink/non-directory at its parent. Reads only; `lstat` never follows a swapped-in symlink."""
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return f"{target} is unreadable ({exc.strerror})"
+    else:
+        refusal = _classify_target_stat(st, target)
+        if refusal is not None:
+            return refusal
+    try:
+        pst = os.lstat(target.parent)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"{target.parent} is unreadable ({exc.strerror})"
+    if stat.S_ISLNK(pst.st_mode):
+        return f"{target.parent} is a symlink"
+    if not stat.S_ISDIR(pst.st_mode):
+        return f"{target.parent} is not a directory"
+    return None
+
+
+def _read_target(target: Path) -> str | None:
+    """Current text of `target`, or None when absent or unreadable (T-07-05). The open uses `O_NOFOLLOW`
+    so a swapped-in symlink is never followed; only the exact opened inode counts."""
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _safe_write_text(target: Path, content: str) -> str | None:
+    """Write `content` to `target` without following a symlink and without truncating a swapped file
+    (T-07-05). A swapped-in symlink fails the `O_NOFOLLOW` open with `ELOOP`; when the destination did
+    not exist the open uses `O_EXCL`, otherwise the opened file's `fstat` (dev, ino) must equal the
+    pre-open `lstat` and a hardlink refuses — all before any truncation. Returns a refusal reason,
+    or None on success; writes nothing on refusal."""
+    try:
+        before = os.lstat(target)
+    except FileNotFoundError:
+        before = None
+    except OSError as exc:
+        return f"{target} is unreadable ({exc.strerror})"
+    if before is not None:
+        refusal = _classify_target_stat(before, target)
+        if refusal is not None:
+            return refusal
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | (0 if before is not None else os.O_EXCL), 0o666)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return f"{target} is a symlink"
+        if exc.errno == errno.EEXIST:
+            return f"{target} changed after the check"
+        return f"{target} cannot be opened ({exc.strerror})"
+    refusal = None
+    try:
+        after = os.fstat(fd)
+        refusal = _classify_target_stat(after, target)
+        if refusal is None and before is not None and (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            refusal = f"{target} changed after the check"
+        if refusal is None:
+            os.ftruncate(fd, 0)
+            data = content.encode("utf-8")
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+    except OSError as exc:
+        refusal = f"{target} cannot be written ({exc.strerror})"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return refusal
+
+
 def _write_or_check(target: Path, content: str, check: bool, changed: list, written: list, blocked: list) -> None:
-    if target.is_symlink() or target.parent.is_symlink():
+    if _target_refusal(target) is not None:
         changed.append(str(target.relative_to(ROOT)))
         blocked.append(str(target.relative_to(ROOT)))
         return
-    if target.exists() and target.read_text(encoding="utf-8") == content:
+    if _read_target(target) == content:
         return
     changed.append(str(target.relative_to(ROOT)))
     if not check:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.parent.is_symlink() or target.is_symlink():
+        if _target_refusal(target) is not None:
             blocked.append(str(target.relative_to(ROOT)))
             return
-        target.write_text(content, encoding="utf-8")
+        refusal = _safe_write_text(target, content)
+        if refusal is not None:
+            blocked.append(str(target.relative_to(ROOT)))
+            print(f"error: refusing to write {target.relative_to(ROOT)} ({refusal})", file=sys.stderr)
+            return
         written.append(str(target.relative_to(ROOT)))
 
 
@@ -978,6 +1084,7 @@ def main() -> int:
     ap.add_argument("--only", help="comma list of agent ids/slugs")
     ap.add_argument("--install-workspace", help="install into this existing workspace root: Claude/Grok agents, skills and hooks, the omp package, and the substrate-mcp wiring")
     ap.add_argument("--omp-mode", choices=("link", "copy"), help="omp step of --install-workspace: link the package (default) or copy agents and skills only (no tools, no guard)")
+    ap.add_argument("--allow-shadowed-copy", action="store_true", help="with --install-workspace --omp-mode copy: proceed when an ancestor workspace shadows the package (the copies still carry no tools and no guard)")
     ap.add_argument("--install-cursor", help="copy .cursor/agents and .cursor/rules/agent-swarm.mdc into this existing repo; no substrate, no MCP, no env files")
     ap.add_argument("--dry-run", action="store_true", help="with --install-workspace or --install-cursor: print the plan, write nothing")
     ap.add_argument("--runtimes", help="with --install-workspace: the runtimes that will execute swarm nodes here, each wired to "
@@ -989,8 +1096,8 @@ def main() -> int:
                          "can detach the unattended runner, which itself needs a real signing key and SWARM_ALLOW_AUTONOMOUS=1); "
                          "a reinstall without this flag removes an earlier registration")
     args = ap.parse_args()
-    if (args.omp_mode or args.runtimes or args.no_substrate or args.with_a01_complete_hook) and not args.install_workspace:
-        ap.error("--omp-mode, --runtimes, --no-substrate and --with-a01-complete-hook need --install-workspace")
+    if (args.omp_mode or args.allow_shadowed_copy or args.runtimes or args.no_substrate or args.with_a01_complete_hook) and not args.install_workspace:
+        ap.error("--omp-mode, --allow-shadowed-copy, --runtimes, --no-substrate and --with-a01-complete-hook need --install-workspace")
     if args.dry_run and not args.install_workspace and not args.install_cursor:
         ap.error("--dry-run needs --install-workspace or --install-cursor")
     if args.install_cursor and args.install_workspace:
@@ -999,6 +1106,8 @@ def main() -> int:
         ap.error("--install-cursor only combines with --dry-run")
     if args.runtimes and args.no_substrate:
         ap.error("--runtimes wires substrate-mcp; it cannot be combined with --no-substrate")
+    if args.allow_shadowed_copy and args.omp_mode != "copy":
+        ap.error("--allow-shadowed-copy needs --omp-mode copy")
     if args.install_cursor:
         # Copies the already generated files. It does not regenerate and it does not call _install_substrate.
         return _install_cursor.install_cursor(args.install_cursor, dry_run=args.dry_run)
@@ -1012,7 +1121,7 @@ def main() -> int:
         if not workspace.is_dir():
             print(f"error: workspace {workspace} is not an existing directory", file=sys.stderr)
             return 2
-        problem = _install_omp.preflight(workspace, mode)
+        problem = _install_omp.preflight(workspace, mode, allow_shadowed_copy=args.allow_shadowed_copy)
         if not problem:
             # CR-01: no Claude/Grok write may follow a symlink; refuse before generation or any copy.
             dests = [d for _, d in _workspace_copies(workspace)] + list(_workspace_hooks(workspace))
@@ -1040,7 +1149,7 @@ def main() -> int:
             print("dry-run: skipping generation; the files below are copied as they are on disk")
             install_workspace(workspace, dry_run=True, with_a01_complete_hook=args.with_a01_complete_hook)
             substrate = 0 if args.no_substrate else _install_substrate.install_substrate(workspace, runtimes, True, sys.stdout)
-            return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout))
+            return max(substrate, _install_omp.install_omp(workspace, mode, True, sys.stdout, allow_shadowed_copy=args.allow_shadowed_copy))
     link = _generated_symlink()
     if link is not None:
         try:
@@ -1080,9 +1189,9 @@ def main() -> int:
         _write_or_check(ROOT / rel, grok_files[rel], args.check, changed, written, blocked)
     refused = []
     if blocked and not args.check:
-        # A symlinked file was in the write set. Do not prune; the directory check above
-        # already refused a symlinked export dir before any write.
-        print("refused to write through symlink: " + ", ".join(blocked), file=sys.stderr)
+        # A symlinked, hardlinked or swapped file was in the write set. Do not prune; the directory
+        # check above already refused a symlinked export dir before any write.
+        print("refused to write through symlink or hardlink: " + ", ".join(blocked), file=sys.stderr)
         return 1
     if not only:
         slugs = {a["slug"] for a in agents}
@@ -1114,7 +1223,7 @@ def main() -> int:
             return 2
         install_workspace(workspace, with_a01_complete_hook=args.with_a01_complete_hook)
         print(f"installed Claude/Grok agents, skills and hook into {workspace}")
-        return _install_omp.install_omp(workspace, mode, False, sys.stdout)
+        return _install_omp.install_omp(workspace, mode, False, sys.stdout, allow_shadowed_copy=args.allow_shadowed_copy)
     return 0
 
 

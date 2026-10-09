@@ -3,15 +3,17 @@
 link (default, D-01..D-04): merge the realpath of this checkout's `omp/` package into `<ws>/.omp/config.yml`
 `extensions:` line by line; every other line stays byte-for-byte. copy (D-06): copy the generated agents and
 skills into `<ws>/.omp/` and leave the config alone. Both modes print one WARNING per same-name agent or skill that
-shadows the package (D-05); warnings never change the exit code. Nothing here writes into this repo or `~/.omp`.
+shadows the package (D-05); warnings never change the exit code. Copy mode additionally refuses when a strict
+ancestor of the workspace shadows the package (T-07-20): the copies would run guard-less with shadowed skills;
+pass `allow_shadowed_copy=True` to proceed with the warnings. Nothing here writes into this repo or `~/.omp`.
 """
 from __future__ import annotations
 
 import difflib
+import errno
 import json
 import os
 import re
-import shutil
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -40,7 +42,7 @@ class InstallError(Exception):
 
 
 class UnsafeDestination(InstallError):
-    """A destination the installer would reach through a symlink: exit 2, nothing written (CR-01)."""
+    """A destination the installer would reach through a symlink, hardlink, or swapped path: exit 2, nothing written (CR-01, T-07-05)."""
 
 
 @dataclass(frozen=True)
@@ -527,6 +529,8 @@ class _Plan:
     replaced: list[str] = field(default_factory=list)  # inherited entries spelling the package differently
     copies: list[tuple[Path, Path]] = field(default_factory=list)
     shadows: list[Shadow] = field(default_factory=list)
+    copy_blockers: list[Shadow] = field(default_factory=list)  # copy mode only: strict-ancestor shadows (T-07-20)
+    dest_state: dict[str, list[tuple[str, tuple[int, int] | None]]] = field(default_factory=dict)
 
 
 def _json_extensions(path: Path) -> list[str] | None:
@@ -599,15 +603,34 @@ def workspace_problem(ws: Path, home: Path) -> str | None:
 
 
 def unsafe_destinations(ws: Path, dests: list[Path]) -> list[str]:
-    """Reasons the installer must not write `dests` (CR-01): a symlink at a destination or at any path component
-    between `ws` and it, or a destination outside `ws`. Reads only; `ws` must be resolved."""
+    """Reasons the installer must not write `dests` (CR-01, T-07-05): a symlink at a destination or at any
+    path component between `ws` and it, a hardlink (shared inode) at a regular-file destination, a
+    non-directory component, or a destination outside `ws`. Reads only; `ws` must be resolved.
+
+    Directories pass as destinations (sibling installers check export roots); the omp write path
+    additionally refuses non-regular destinations at write time (`_stat_dest`)."""
     reasons: list[str] = []
     for dest in dests:
         p = Path(dest)
         while p != ws:
-            if p.is_symlink():
-                reasons.append(f"{p} is a symlink")
+            try:
+                st = os.lstat(p)
+            except FileNotFoundError:
+                pass  # absent: nothing planted here; keep walking toward `ws`
+            except OSError as exc:
+                reasons.append(f"{p} is unreadable ({exc.strerror})")
                 break
+            else:
+                if stat.S_ISLNK(st.st_mode):
+                    reasons.append(f"{p} is a symlink")
+                    break
+                if p == dest:
+                    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                        reasons.append(f"{dest} is a hardlink (nlink={st.st_nlink})")
+                        break
+                elif not stat.S_ISDIR(st.st_mode):
+                    reasons.append(f"{p} is not a directory")
+                    break
             if p.parent == p:
                 reasons.append(f"{dest} is outside {ws}")
                 break
@@ -619,6 +642,310 @@ def _check_destinations(ws: Path, dests: list[Path]) -> None:
     reasons = unsafe_destinations(ws, dests)
     if reasons:
         raise UnsafeDestination("; ".join(reasons))
+
+
+def _record_dest_state(ws: Path, dests: list[Path]) -> dict[str, list[tuple[str, tuple[int, int] | None]]]:
+    """Plan-time (dev, ino) record of every component from `ws` to each destination (T-07-05).
+
+    The write path re-resolves each component with `O_NOFOLLOW` and refuses on any difference, so a
+    symlink or hardlink swapped in between the plan check and the write, or a replaced directory,
+    fails closed instead of winning the race. Call only after `_check_destinations` passed."""
+    state: dict[str, list[tuple[str, tuple[int, int] | None]]] = {}
+    for dest in dests:
+        parts: list[Path] = []
+        p = Path(dest)
+        while True:
+            parts.append(p)
+            if p == ws or p.parent == p:
+                break
+            p = p.parent
+        chain: list[tuple[str, tuple[int, int] | None]] = []
+        for comp in reversed(parts):
+            try:
+                st = os.lstat(comp)
+            except OSError:
+                chain.append((str(comp), None))
+            else:
+                chain.append((str(comp), (st.st_dev, st.st_ino)))
+        state[str(dest)] = chain
+    return state
+
+
+def _revalidate_destinations(
+    ws: Path, dests: list[Path], state: dict[str, list[tuple[str, tuple[int, int] | None]]]
+) -> tuple[list[str], dict[str, tuple[int, int]]]:
+    """Write-time re-validation of every destination (T-07-05). Reads only; writes nothing.
+
+    Each component from `ws` to each destination is re-resolved with `O_NOFOLLOW` (a swapped-in
+    symlink fails with `ELOOP` instead of being followed) and its `fstat` (dev, ino) is compared
+    against the plan-time record; a regular-file destination with more than one link refuses as a
+    hardlink. Returns (reasons, baseline): `reasons` is empty when every destination is unchanged,
+    and `baseline` maps each existing component to its fresh (dev, ino) for the write path to pin."""
+    reasons: list[str] = []
+    baseline: dict[str, tuple[int, int]] = {}
+    for dest in dests:
+        try:
+            dst = os.lstat(dest)
+        except OSError:
+            pass  # absent/unreadable: the component walk below reports it
+        else:
+            if stat.S_ISLNK(dst.st_mode):
+                reasons.append(f"{dest} is a symlink")
+            elif stat.S_ISDIR(dst.st_mode):
+                reasons.append(f"{dest} is a directory")
+            elif not stat.S_ISREG(dst.st_mode):
+                reasons.append(f"{dest} is not a regular file")
+            elif dst.st_nlink > 1:
+                reasons.append(f"{dest} is a hardlink (nlink={dst.st_nlink})")
+        want = dict(state.get(str(dest), []))
+        chain: list[Path] = []
+        p = Path(dest)
+        while True:
+            chain.append(p)
+            if p == ws or p.parent == p:
+                break
+            p = p.parent
+        if chain[-1] != ws:
+            reasons.append(f"{dest} is outside {ws}")
+            continue
+        for comp in reversed(chain):
+            key = str(comp)
+            expected = want.get(key)
+            try:
+                fd = os.open(comp, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | (os.O_DIRECTORY if comp != dest else 0))
+            except FileNotFoundError:
+                if expected is None and key in want:
+                    continue
+                reasons.append(f"{comp} disappeared after the plan check")
+                break
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    reasons.append(f"{comp} is a symlink")
+                elif exc.errno == errno.ENOTDIR:
+                    reasons.append(f"{comp} is not a directory")
+                else:
+                    reasons.append(f"{comp} is unreadable ({exc.strerror})")
+                break
+            try:
+                st = os.fstat(fd)
+            finally:
+                os.close(fd)
+            if comp != dest:
+                if not stat.S_ISDIR(st.st_mode):
+                    reasons.append(f"{comp} is not a directory")
+                    break
+            elif stat.S_ISDIR(st.st_mode):
+                reasons.append(f"{dest} is a directory")
+                break
+            elif not stat.S_ISREG(st.st_mode):
+                reasons.append(f"{dest} is not a regular file")
+                break
+            elif st.st_nlink > 1:
+                reasons.append(f"{dest} is a hardlink (nlink={st.st_nlink})")
+                break
+            seen = (st.st_dev, st.st_ino)
+            if key not in want:
+                reasons.append(f"{comp} changed after the plan check")
+                break
+            if expected is None:
+                reasons.append(f"{comp} appeared after the plan check")
+                break
+            if expected != seen:
+                reasons.append(f"{comp} changed after the plan check")
+                break
+            baseline[key] = seen
+    return list(dict.fromkeys(reasons)), baseline
+
+
+def _stat_dest(dest: Path, dir_fd: int | None = None) -> os.stat_result | None:
+    """`lstat` of a destination file, refusing symlinks, directories, non-regular files and hardlinks
+    (T-07-05); None when absent. The caller compares the result against the plan-time record.
+
+    With `dir_fd` the `lstat` resolves `dest.name` inside an already-open parent directory, so a
+    component swapped after the parent check cannot redirect it outside the workspace."""
+    try:
+        st = os.lstat(dest.name if dir_fd is not None else dest, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise UnsafeDestination(f"{dest} is unreadable ({exc.strerror})") from None
+    if stat.S_ISLNK(st.st_mode):
+        raise UnsafeDestination(f"{dest} is a symlink") from None
+    if stat.S_ISDIR(st.st_mode):
+        raise UnsafeDestination(f"{dest} is a directory") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise UnsafeDestination(f"{dest} is not a regular file") from None
+    if st.st_nlink > 1:
+        raise UnsafeDestination(f"{dest} is a hardlink (nlink={st.st_nlink})") from None
+    return st
+
+
+def _verify_dest_snapshot(
+    dest: Path, state: dict[str, list[tuple[str, tuple[int, int] | None]]], dir_fd: int | None = None
+) -> os.stat_result | None:
+    """The verified pre-write `lstat` of `dest`: classified by `_stat_dest` and compared by (dev, ino)
+    against the plan-time record (T-07-05). Any planted symlink/hardlink or check-write swap raises
+    `UnsafeDestination` with a named reason before anything is written.
+
+    With `dir_fd` the check resolves inside the pinned parent directory, so it observes the same
+    directory the subsequent write opens its file in."""
+    chain = state.get(str(dest))
+    if chain is None:
+        raise UnsafeDestination(f"{dest} was not recorded at plan time") from None
+    expected = dict(chain)[str(dest)]
+    before = _stat_dest(dest, dir_fd)
+    if expected is None:
+        if before is not None:
+            raise UnsafeDestination(f"{dest} appeared after the plan check") from None
+    elif before is None:
+        raise UnsafeDestination(f"{dest} disappeared after the plan check") from None
+    elif (before.st_dev, before.st_ino) != expected:
+        raise UnsafeDestination(f"{dest} changed after the plan check") from None
+    return before
+
+
+def _safe_ensure_parent(ws: Path, dest: Path, baseline: dict[str, tuple[int, int]]) -> int:
+    """Create the missing parents of `dest` below `ws` without following symlinks (T-07-05).
+
+    Every level is opened with `O_NOFOLLOW` relative to its parent's open directory (`dir_fd`),
+    so a level swapped for a symlink after the check cannot redirect the descent outside `ws`.
+    Every level is still pinned by (dev, ino): levels the write-time record saw must match it, and
+    levels this install creates are pinned at creation — so a level that appears out of nowhere,
+    including an `EEXIST` race against `os.mkdir`, refuses as a check-write swap instead of being
+    descended into. Returns an open fd for `dest.parent`; the caller must close it after writing
+    through it, keeping the checked directories open across the check-write window."""
+    try:
+        rel = dest.parent.relative_to(ws)
+    except ValueError:
+        raise UnsafeDestination(f"{dest} is outside {ws}") from None
+    try:
+        cur_fd = os.open(ws, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnsafeDestination(f"{ws} is a symlink") from None
+        raise UnsafeDestination(f"{ws} is unreadable ({exc.strerror})") from None
+    cur = ws
+    try:
+        for part in rel.parts:
+            nxt = cur / part
+            key = str(nxt)
+            try:
+                fd = os.open(part, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=cur_fd)
+            except FileNotFoundError:
+                if key in baseline:
+                    raise UnsafeDestination(f"{nxt} disappeared after the plan check") from None
+                try:
+                    os.mkdir(part, 0o777, dir_fd=cur_fd)
+                except FileExistsError:
+                    raise UnsafeDestination(f"{nxt} changed after the plan check") from None
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise UnsafeDestination(f"{nxt} is a symlink") from None
+                    raise UnsafeDestination(f"{nxt} cannot be created ({exc.strerror})") from None
+                try:
+                    fd = os.open(part, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=cur_fd)
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise UnsafeDestination(f"{nxt} is a symlink") from None
+                    if exc.errno == errno.ENOTDIR:
+                        raise UnsafeDestination(f"{nxt} is not a directory") from None
+                    raise UnsafeDestination(f"{nxt} is unreadable ({exc.strerror})") from None
+                st = os.fstat(fd)
+                if not stat.S_ISDIR(st.st_mode):
+                    os.close(fd)
+                    raise UnsafeDestination(f"{nxt} is not a directory") from None
+                baseline[key] = (st.st_dev, st.st_ino)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise UnsafeDestination(f"{nxt} is a symlink") from None
+                if exc.errno == errno.ENOTDIR:
+                    raise UnsafeDestination(f"{nxt} is not a directory") from None
+                raise UnsafeDestination(f"{nxt} is unreadable ({exc.strerror})") from None
+            else:
+                st = os.fstat(fd)
+                if not stat.S_ISDIR(st.st_mode):
+                    os.close(fd)
+                    raise UnsafeDestination(f"{nxt} is not a directory") from None
+                if baseline.get(key) != (st.st_dev, st.st_ino):
+                    os.close(fd)
+                    raise UnsafeDestination(f"{nxt} changed after the plan check") from None
+            os.close(cur_fd)
+            cur_fd = fd
+            cur = nxt
+    except BaseException:
+        os.close(cur_fd)
+        raise
+    return cur_fd
+
+
+def _same_bytes(dest: Path, before: os.stat_result, data: bytes, dir_fd: int | None = None) -> bool:
+    """True when `dest` already holds `data` (T-07-05). `before` is the verified pre-write `lstat`: the
+    read uses `O_NOFOLLOW` and is accepted only when the opened file is the same inode with one link,
+    so a swapped or multiply-linked `dest` never counts as "same" — it proceeds to the write path,
+    which refuses. With `dir_fd` the file is opened as `dest.name` inside the pinned parent."""
+    try:
+        fd = os.open(dest.name if dir_fd is not None else dest, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        live = os.fstat(fd)
+        if (live.st_dev, live.st_ino) != (before.st_dev, before.st_ino) or live.st_nlink > 1:
+            return False
+        if live.st_size != len(data):
+            return False
+        parts: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if chunk == b"":
+                break
+            parts.append(chunk)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return b"".join(parts) == data
+
+
+def _safe_write_bytes(
+    dest: Path, data: bytes, before: os.stat_result | None, mode: int | None = None, dir_fd: int | None = None
+) -> None:
+    """Write `data` to `dest` without following a symlink and without truncating a swapped file (T-07-05).
+
+    `before` is the verified pre-write `lstat` (`_verify_dest_snapshot`): when it is None the open uses
+    `O_EXCL`, so a file raced into place refuses instead of being overwritten; otherwise the opened
+    file's `fstat` (dev, ino) must equal it and a hardlink refuses — all before `ftruncate`, so a
+    swapped-in file is never truncated. With `dir_fd` the file is opened as `dest.name` inside the
+    pinned parent directory, so a component swapped after the parent check cannot redirect the write
+    outside the workspace (`O_NOFOLLOW` alone guards only the final component). Every refusal raises
+    `UnsafeDestination` with a named reason."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | (0 if before is not None else os.O_EXCL)
+    try:
+        fd = os.open(dest.name if dir_fd is not None else dest, flags, 0o666, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnsafeDestination(f"{dest} is a symlink") from None
+        if exc.errno == errno.EEXIST:
+            raise UnsafeDestination(f"{dest} changed after the plan check") from None
+        raise UnsafeDestination(f"{dest} cannot be opened ({exc.strerror})") from None
+    try:
+        after = os.fstat(fd)
+        if stat.S_ISDIR(after.st_mode):
+            raise UnsafeDestination(f"{dest} is a directory") from None
+        if not stat.S_ISREG(after.st_mode):
+            raise UnsafeDestination(f"{dest} is not a regular file") from None
+        if after.st_nlink > 1:
+            raise UnsafeDestination(f"{dest} is a hardlink (nlink={after.st_nlink})") from None
+        if before is not None and (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise UnsafeDestination(f"{dest} changed after the plan check") from None
+        if mode is not None:
+            os.fchmod(fd, mode)
+        os.ftruncate(fd, 0)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+    finally:
+        os.close(fd)
 
 
 def _check_package(pkg: Path) -> None:
@@ -638,7 +965,9 @@ def _plan(ws: Path, mode: str, home: Path, env: Mapping[str, str]) -> _Plan:
     if mode == "copy":
         plan.copies = [(PKG / "agents" / f"{s}.md", ws / ".omp" / "agents" / f"{s}.md") for s in sorted(agents)]
         plan.copies += [(PKG / "skills" / s / "SKILL.md", ws / ".omp" / "skills" / s / "SKILL.md") for s in sorted(skills)]
-    _check_destinations(ws, [d for _, d in plan.copies] if mode == "copy" else [cfg])
+    targets = [d for _, d in plan.copies] if mode == "copy" else [cfg]
+    _check_destinations(ws, targets)
+    plan.dest_state = _record_dest_state(ws, targets)
     if cfg.exists():
         plan.old = _read(cfg)
         if plan.old is None:
@@ -648,9 +977,13 @@ def _plan(ws: Path, mode: str, home: Path, env: Mapping[str, str]) -> _Plan:
         plan.linked = next((e for e in entries or [] if _resolve_entry(e, ws, home) == PKG), None)
         dests = {d for _, d in plan.copies}
         own = ws / ".omp"
-        plan.shadows = [
-            s for s in shadow_scan(ws, home, (), env, agents, skills)
-            if s.custom or (s.path.is_relative_to(own) and s.path not in dests)
+        found = shadow_scan(ws, home, (), env, agents, skills)
+        plan.shadows = [s for s in found if s.custom or (s.path.is_relative_to(own) and s.path not in dests)]
+        # T-07-20: project-level shadows outside `ws/.omp` live in a strict ancestor. The copies below would
+        # resolve ahead of that ancestor's package wiring, so the workspace would run guard-less with shadowed
+        # skills while looking installed; the copy path refuses them unless the caller opts in.
+        plan.copy_blockers = [
+            s for s in found if s.level == "project" and not s.custom and not s.path.is_relative_to(own)
         ]
         return plan
     bom = _BOM if (plan.old or "").startswith(_BOM) else ""
@@ -697,16 +1030,49 @@ def _error(ws: Path, exc: InstallError) -> str:
     )
 
 
-def preflight(ws: Path, mode: str, home: Path | None = None, env: Mapping[str, str] | None = None) -> str | None:
+def _partial_error(ws: Path, exc: InstallError, written: list[Path], failed: Path | None) -> str:
+    """Truthful report for a copy-install that saved files before failing: which files were written
+    and which destination failed, instead of claiming nothing was written. Call only when `written`
+    is non-empty; a failure before the first write keeps `_error`'s nothing-written report."""
+    done = ", ".join(str(p) for p in written)
+    tail = f"; failed at {failed}" if failed is not None else ""
+    return (
+        f"error: refusing to install into {ws}: {exc}; partial install: wrote "
+        f"{len(written)} file(s) ({done}){tail}; re-run the install to finish."
+    )
+
+
+def _copy_shadow_error(ws: Path, blockers: list[Shadow]) -> str:
+    """Refusal for a copy-install under a shadowing ancestor (T-07-20): names the workspace, the ancestor
+    shadows, the guard-less consequence, and the two ways forward. Writes nothing."""
+    names = ", ".join(f"{s.kind} {s.name} at {s.path}" for s in blockers)
+    return (
+        f"error: refusing copy mode into {ws}: {names} shadow the agent-swarm package from an ancestor "
+        f"workspace, so the copies in {ws / '.omp'} would run guard-less (no tools (swarm_*), no guard "
+        f"(tool_call)) with shadowed skills while looking installed. Nothing was written. "
+        f"Re-run with --allow-shadowed-copy to proceed anyway, or use link mode to keep tools and guard."
+    )
+
+
+def preflight(
+    ws: Path,
+    mode: str,
+    home: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    allow_shadowed_copy: bool = False,
+) -> str | None:
     """The error `install_omp` would stop on (exit 2), or None. Reads only."""
     ws, home = Path(ws).resolve(), Path.home() if home is None else Path(home)
     problem = workspace_problem(ws, home)
     if problem:
         return problem
     try:
-        _plan(ws, mode, home, os.environ if env is None else env)
+        plan = _plan(ws, mode, home, os.environ if env is None else env)
     except InstallError as exc:
         return _error(ws, exc)
+    if mode == "copy" and plan.copy_blockers and not allow_shadowed_copy:
+        return _copy_shadow_error(ws, plan.copy_blockers)
     return None
 
 
@@ -717,6 +1083,8 @@ def install_omp(
     out: TextIO = sys.stdout,
     home: Path | None = None,
     env: Mapping[str, str] | None = None,
+    *,
+    allow_shadowed_copy: bool = False,
 ) -> int:
     """Link (default) or copy the omp package into `ws`; 0 on success, 2 on an unsupported workspace state."""
     ws = Path(ws).resolve()
@@ -741,6 +1109,9 @@ def install_omp(
     except InstallError as exc:
         say(_error(ws, exc))
         return 2
+    if mode == "copy" and plan.copy_blockers and not allow_shadowed_copy:
+        say(_copy_shadow_error(ws, plan.copy_blockers))
+        return 2
     if plan.carried or plan.replaced:
         what = ", ".join(plan.carried) or "(none)"
         extra = f"; replaced {', '.join(plan.replaced)} with the package realpath" if plan.replaced else ""
@@ -753,17 +1124,38 @@ def install_omp(
     for shadow in plan.shadows:
         say(shadow.line())
     if mode == "copy":
+        for shadow in plan.copy_blockers:
+            say(shadow.line())
+    if mode == "copy":
         say(COPY_WARNING)
         changed = 0
-        for src, dest in plan.copies:
-            if dry_run:
+        if dry_run:
+            for src, dest in plan.copies:
                 say(f"dry-run: would copy {src.relative_to(ROOT)} -> {dest}")
-                continue
-            if dest.is_file() and dest.read_bytes() == src.read_bytes():
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dest)
-            changed += 1
+        else:
+            written: list[Path] = []
+            failed: Path | None = None
+            try:
+                reasons, baseline = _revalidate_destinations(ws, [d for _, d in plan.copies], plan.dest_state)
+                if reasons:
+                    raise UnsafeDestination("; ".join(reasons))
+                for src, dest in plan.copies:
+                    failed = dest
+                    data = src.read_bytes()
+                    src_mode = stat.S_IMODE(os.stat(src).st_mode)
+                    parent_fd = _safe_ensure_parent(ws, dest, baseline)
+                    try:
+                        before = _verify_dest_snapshot(dest, plan.dest_state, dir_fd=parent_fd)
+                        if before is None or not _same_bytes(dest, before, data, dir_fd=parent_fd):
+                            _safe_write_bytes(dest, data, before, src_mode, dir_fd=parent_fd)
+                            written.append(dest)
+                    finally:
+                        os.close(parent_fd)
+                    failed = None
+                changed = len(written)
+            except InstallError as exc:
+                say(_partial_error(ws, exc, written, failed) if written else _error(ws, exc))
+                return 2
         n_agents = sum(1 for _, d in plan.copies if d.suffix == ".md" and d.name != "SKILL.md")
         if not dry_run:
             say(
@@ -781,8 +1173,19 @@ def install_omp(
         for line in diff:
             out.write(line if line.endswith("\n") else line + "\n")
     else:
-        plan.config.parent.mkdir(parents=True, exist_ok=True)
-        plan.config.write_text(plan.new, encoding="utf-8")
+        try:
+            reasons, baseline = _revalidate_destinations(ws, [plan.config], plan.dest_state)
+            if reasons:
+                raise UnsafeDestination("; ".join(reasons))
+            parent_fd = _safe_ensure_parent(ws, plan.config, baseline)
+            try:
+                before = _verify_dest_snapshot(plan.config, plan.dest_state, dir_fd=parent_fd)
+                _safe_write_bytes(plan.config, plan.new.encode("utf-8"), before, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+        except InstallError as exc:
+            say(_error(ws, exc))
+            return 2
         say(f"installed omp package (link) into {plan.config}: {PKG}")
     if mode == "link":
         say(NOTE_CWD.format(ws=ws))

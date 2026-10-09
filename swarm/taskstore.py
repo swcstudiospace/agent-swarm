@@ -218,15 +218,27 @@ class TaskStore:
             extra = {}
             if to_state is S.CHANGES_REQUESTED:
                 loops = task["rework_loops"] + 1
+                notes = task["notes_json"]
+                # T-06-10: the next dispatch replaces notes result/meta and reuses the same attempt
+                # number, so stash this attempt's failing evidence before rework supersedes it. One
+                # entry per rework loop, bounded by MAX_REWORK_LOOPS. Inside this transaction, so the
+                # stash commits or rolls back with the state change itself.
+                prior = {k: notes[k] for k in ("result", "meta") if notes.get(k)}
+                if prior:
+                    history = notes.get("rework_evidence")
+                    if not isinstance(history, list):
+                        history = notes["rework_evidence"] = []
+                    history.append(prior)
                 if loops > MAX_REWORK_LOOPS:
                     to_state, reason = S.ESCALATED, f"rework loops exhausted ({loops-1}); {reason}"
+                    if prior:
+                        extra["notes"] = json.dumps(notes)
                     if S.ESCALATED not in LEGAL_TRANSITIONS[from_state]:
                         # IN_REVIEW → CHANGES_REQUESTED → ESCALATED in one audited step
                         self._apply(task_id, from_state, S.CHANGES_REQUESTED, actor, "rework cap reached")
                         from_state = S.CHANGES_REQUESTED
                 else:
                     extra["rework_loops"] = loops
-                    notes = task["notes_json"]
                     notes["verdicts_since"] = time.time() + 0.001
                     extra["notes"] = json.dumps(notes)
             if to_state in (S.CLAIMED,) and from_state in (S.PLANNED, S.RETRY, S.BLOCKED):

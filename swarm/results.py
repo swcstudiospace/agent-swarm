@@ -274,6 +274,11 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
         target, reason = None, ""
         if current != S.IN_PROGRESS.value:
             raise SwarmError(ErrorCode.E_CONTRACT, f"illegal transition {current} → IN_PROGRESS for {tid}", task_id=tid)
+    # The transition and its provenance (notes, artifact rows, gate-target feedback) commit in one
+    # transaction: transition/set_notes/append_feedback join the outer block (TaskStore.transaction
+    # nests) and add_artifact's INSERT + outputs UPDATE ride along, so a crash at any point leaves a
+    # fully-applied or fully-rolled-back result — never a new state with stale notes or missing
+    # artifacts. Lock order matches TaskStore.transition: state row + audit row first, provenance after.
     if target is not None:
         # Re-read under the same write lock as the transition. Between the check above and here another caller can
         # move a gate task through RETRY → CLAIMED → IN_PROGRESS; the state is IN_PROGRESS again, so the move to
@@ -286,16 +291,25 @@ def apply_result(store: TaskStore, task: dict, *, agent_id: str, result: dict, m
                     if err is not None:
                         raise err
                 store.transition(tid, target, actor=agent_id, reason=reason)
+                store.set_notes(tid, result=result, meta=meta)
+                for o in result.get("outputs", []) or []:
+                    store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
+                                       version=str(o.get("version", "1")),
+                                       digest=o.get("digest", ""), producer=agent_id)
+                if target is S.IN_REVIEW:
+                    _agent_verdict_feedback(store, fresh, result)
         except _GateRefused as err:
             # `task["attempt"]` is the attempt that produced this result. A retry increments attempt on the
             # way back to CLAIMED; failing the re-read row would kill that replacement lease.
             return _refuse_gate(store, tid, err, mode, emit, attempt=task["attempt"])
-    store.set_notes(tid, result=result, meta=meta)
-    for o in result.get("outputs", []) or []:
-        store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""), version=str(o.get("version", "1")),
-                           digest=o.get("digest", ""), producer=agent_id)
-    if target is S.IN_REVIEW:
-        _agent_verdict_feedback(store, task, result)
+    else:
+        # Heartbeat: no transition, but notes + artifacts still commit together.
+        with store.transaction():
+            store.set_notes(tid, result=result, meta=meta)
+            for o in result.get("outputs", []) or []:
+                store.add_artifact(tid, kind=o.get("kind", "artifact"), uri=o.get("uri", ""),
+                                   version=str(o.get("version", "1")),
+                                   digest=o.get("digest", ""), producer=agent_id)
     return store.get(tid)["state"]
 
 

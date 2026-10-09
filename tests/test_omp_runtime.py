@@ -14,12 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ROOT, omp_calls, omp_grandchild, run_script, stub_claude, stub_omp
+from conftest import ROOT, _scrubbed_base_env, omp_calls, omp_grandchild, run_script, stub_claude, stub_omp
 
 FIXTURE = ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl"
 KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
-_ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
-              "SWARM_DRYRUN_FAIL", "SWARM_RUNTIME", "ANTHROPIC_API_KEY")
 RESULT = {"task_id": "T-one", "state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
           "metrics": {"tests": 3}, "summary_md": "ok"}
 ONE_TASK = {"tasks": [{"id": "one", "capability": "code.backend", "agent": "A05", "title": "one", "depends_on": [], "gates": []}]}
@@ -36,14 +34,19 @@ def sr(tmp_path, monkeypatch):
 
 
 def _env(swarm, **extra) -> dict:
-    # the runner signs task.assign. Keep this test's throwaway HMAC key; extra may replace it.
-    key = os.environ.get("SWARM_SIGNING_KEY")
-    env = {k: v for k, v in os.environ.items() if k not in _ENV_NOISE}
-    env["SWARM_DIR"] = str(swarm)
-    if key and "SWARM_SIGNING_KEY" not in extra:
-        env["SWARM_SIGNING_KEY"] = key
-    env.update(extra)
-    return env
+    # Test-owned values only. run_script's scrubbed base already supplies the platform vars
+    # (PATH, HOME, ...) and the ephemeral-signing-key fixture supplies the key, so neither is
+    # copied here; anything else the child needs rides in explicitly via extra (PATH overrides,
+    # runner secrets). Host vars (SUBSTRATE_* tokens, proxies, SWARM_* session vars) never pass.
+    return {"SWARM_DIR": str(swarm), **extra}
+
+
+def _spawn_env(env) -> dict:
+    """Full env for processes spawned directly (not via run_script): the scrubbed platform base
+    plus this test's values."""
+    full = _scrubbed_base_env()
+    full.update(env)
+    return full
 
 
 def _plan(tmp_path, env, plan=ONE_TASK, *extra) -> Path:
@@ -252,7 +255,7 @@ def test_dry_run_line_replays_without_keys(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     line = next(ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: "))
     # The shell that replays the line still has the runner's keys and the parent's task ids.
-    replay_env = {**env, "SWARM_TASK_ID": "T-parent", "SWARM_CORRELATION_ID": "corr-parent"}
+    replay_env = {**_spawn_env(env), "SWARM_TASK_ID": "T-parent", "SWARM_CORRELATION_ID": "corr-parent"}
     p = subprocess.run(["/bin/sh", "-c", line.removeprefix("dry-run T-one [A05]: ")], capture_output=True, text=True,
                        env=replay_env, cwd=work, timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
@@ -318,7 +321,7 @@ def test_relative_omp_bin_resolved_at_preflight(tmp_path):
     stub = stub_omp(tmp_path, RESULT)
     # the runner's cwd must hold the relative path; from the repo (work/) `omp-bin/omp` does not exist
     r = subprocess.run([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin", "omp-bin/omp",
-                        "--repo", str(work), "--once", "--json"], capture_output=True, text=True, env=env, cwd=tmp_path)
+                        "--repo", str(work), "--once", "--json"], capture_output=True, text=True, env=_spawn_env(env), cwd=tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert _states(swarm) == {"T-one": "DONE"}
     (call,) = omp_calls(stub)
@@ -451,7 +454,7 @@ def test_signal_to_runner_group_ends_sessions(tmp_path, sig):
     stub = stub_omp(tmp_path, RESULT, hang=True)
     runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",
                                str(stub), "--task-timeout", "100", "--repo", str(work), "--once", "--json"],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=ROOT,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_spawn_env(env), cwd=ROOT,
                               start_new_session=True)
     pids: list[int] = []
     try:
@@ -490,7 +493,7 @@ def test_ignored_sighup_keeps_runner_and_session(tmp_path):
     gated.chmod(0o755)
     runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",
                                str(gated), "--task-timeout", "100", "--repo", str(work), "--once", "--json"],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=ROOT,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_spawn_env(env), cwd=ROOT,
                               start_new_session=True, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
     try:
         deadline = time.monotonic() + 30
@@ -555,3 +558,110 @@ def test_low_risk_plan_done_on_omp(tmp_path):
         assert Path(c["cwd"]) == work
         assert c["argv"][1:4] == ["-p", "--mode", "json"]
 
+
+
+# ---------------------------------------------------------------- (f) T-06-10 rework evidence
+def test_live_result_meta_records_runtime_and_argv(tmp_path):
+    """Live (non-dry-run) dispatches store the producing runtime and argv in notes meta and the
+    task.result.raw event, matching what --dry-run records."""
+    swarm = tmp_path / ".swarm"
+    env = _env(swarm)
+    work = _plan(tmp_path, env)
+    stub = stub_omp(tmp_path, RESULT)
+    r = run_script("swarm_run.py", "--runtime", "omp", "--omp-bin", str(stub), "--repo", str(work),
+                   "--once", "--json", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (call,) = omp_calls(stub)
+    con = sqlite3.connect(swarm / "tasks.db")
+    (notes_raw,) = con.execute("SELECT notes FROM tasks WHERE task_id='T-one'").fetchone()
+    con.close()
+    stored = json.loads(notes_raw)["meta"]
+    assert stored["runtime"] == "omp" and stored["argv"] == call["argv"]
+    assert stored["argv"][0] == str(stub)
+    raw = [json.loads(ln) for ln in (swarm / "events.jsonl").read_text().splitlines() if '"task.result.raw"' in ln]
+    event_meta = raw[-1]["payload"]["meta"]
+    assert event_meta["runtime"] == "omp" and event_meta["argv"] == call["argv"]
+    assert (swarm / "results" / "T-one.a1.md").is_file()
+
+
+def test_same_attempt_redispatch_preserves_evidence_file(sr, tmp_path):
+    """A second write of the same attempt namespaces instead of overwriting: the prior file stays readable."""
+    sdir = tmp_path / ".swarm"
+    (sdir / "results").mkdir(parents=True)
+    first = sr.evidence_path(sdir, "T-one", 1)
+    assert first.name == "T-one.a1.md"
+    first.write_text("first attempt output")
+    second = sr.evidence_path(sdir, "T-one", 1)
+    assert second.name == "T-one.a1.r1.md"
+    second.write_text("redispatch output")
+    assert first.read_text() == "first attempt output"
+    assert second.read_text() == "redispatch output"
+    assert sr.evidence_path(sdir, "T-one", 1).name == "T-one.a1.r2.md"
+
+
+def test_concurrent_same_attempt_writes_never_share_path(sr, tmp_path):
+    """Two runners on the same IN_PROGRESS rework task (same attempt) race for the evidence file:
+    O_EXCL reservation gives each a distinct path — the loser takes the next suffix — and neither
+    output overwrites or mixes with the other."""
+    import threading
+    sdir = tmp_path / ".swarm"
+    (sdir / "results").mkdir(parents=True)
+    (sdir / "results" / "T-one.a1.md").write_text("prior attempt output")
+    barrier = threading.Barrier(2)
+    paths: list = [None, None]
+    errors: list = []
+
+    def run(i, body):
+        try:
+            barrier.wait(timeout=10)
+            paths[i] = sr.write_evidence(sdir, "T-one", 1, body)
+        except Exception as e:  # noqa: BLE001 — surfaced below via assert
+            errors.append(e)
+
+    bodies = ("runner-a output", "runner-b output")
+    threads = [threading.Thread(target=run, args=(i, body)) for i, body in enumerate(bodies)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors
+    assert all(t is not None for t in paths)
+    assert sorted(p.name for p in paths) == ["T-one.a1.r1.md", "T-one.a1.r2.md"]
+    assert sorted(p.read_text() for p in paths) == sorted(bodies)
+    assert (sdir / "results" / "T-one.a1.md").read_text() == "prior attempt output"
+
+
+def test_write_evidence_keeps_canonical_name_when_uncontended(sr, tmp_path):
+    """Single-runner behavior is unchanged: the first write of an attempt takes the canonical name."""
+    sdir = tmp_path / ".swarm"
+    path = sr.write_evidence(sdir, "T-one", 1, "only output")
+    assert path.name == "T-one.a1.md"
+    assert path.read_text() == "only output"
+
+
+def test_rework_stashes_failing_evidence(tmp_path):
+    """CHANGES_REQUESTED stashes the failing attempt's result/meta under notes.rework_evidence, so a
+    later dispatch replacing them leaves the failing evidence reachable; with no prior result only
+    verdicts_since is stamped."""
+    from swarm.taskstore import TaskStore
+    store = TaskStore(tmp_path / "tasks.db")
+    failing_result = {"task_id": "T-one", "state": "IN_REVIEW", "summary_md": "bad"}
+    failing_meta = {"runtime": "omp", "argv": ["omp", "-p"]}
+    store.create(task_id="T-one", correlation_id="c", capability="code.backend")
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("T-one", state)
+    store.set_notes("T-one", result=failing_result, meta=failing_meta)
+    store.transition("T-one", "CHANGES_REQUESTED", reason="gate failed")
+    notes = store.get("T-one")["notes_json"]
+    assert notes["verdicts_since"] > 0
+    assert notes["rework_evidence"] == [{"result": failing_result, "meta": failing_meta}]
+    store.set_notes("T-one", result={"task_id": "T-one", "state": "IN_REVIEW", "summary_md": "retry"},
+                    meta={"runtime": "omp", "argv": ["omp", "-p", "--retry"]})
+    assert store.get("T-one")["notes_json"]["rework_evidence"] == [
+        {"result": failing_result, "meta": failing_meta}]
+    store.create(task_id="T-two", correlation_id="c", capability="code.backend")
+    for state in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
+        store.transition("T-two", state)
+    store.transition("T-two", "CHANGES_REQUESTED", reason="manual")
+    bare = store.get("T-two")["notes_json"]
+    assert "rework_evidence" not in bare and bare["verdicts_since"] > 0

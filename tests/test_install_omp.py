@@ -371,6 +371,167 @@ def test_link_refuses_a_symlinked_config(ws, home, tmp_path):
     assert _cfg(ws).is_symlink()
 
 
+# ---------------------------------------------------------------- write-time re-validation (T-07-05 TOCTOU)
+
+
+def _first_copy_dest(ws):
+    agents, _ = inst.package_names()
+    return ws / ".omp" / "agents" / f"{sorted(agents)[0]}.md"
+
+
+def _real_files(ws):
+    return [p for p in ws.rglob("*") if p.is_file() and not p.is_symlink()]
+
+
+def test_copy_mode_refuses_hardlink_at_destination(ws, home, tmp_path):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    dest.parent.mkdir(parents=True)
+    os.link(victim, dest)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "hardlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == [dest]
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_copy_mode_write_time_refuses_symlink_at_destination(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(victim)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == []
+
+
+def test_copy_mode_write_time_refuses_symlink_at_path_component(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    victim = _write(outside / "victim.txt", "keep\n")
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        (ws / ".omp").symlink_to(outside)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+    assert _real_files(ws) == []
+
+
+def test_copy_mode_write_time_refuses_hardlink_at_destination(ws, home, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    dest = _first_copy_dest(ws)
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.link(victim, dest)
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "hardlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert _real_files(ws) == [dest]
+
+
+def test_link_write_time_refuses_planted_config(ws, home, tmp_path, monkeypatch):
+    real = inst._revalidate_destinations
+
+    def planting(w, ds, state):
+        _write(_cfg(ws), "theme: planted\n")
+        return real(w, ds, state)
+
+    monkeypatch.setattr(inst, "_revalidate_destinations", planting)
+    rc, out = _run(ws)
+    assert rc == 2
+    assert "after the plan check" in out
+    assert _cfg(ws).read_text(encoding="utf-8") == "theme: planted\n"
+
+
+def test_copy_mode_parent_swap_between_check_and_write_cannot_escape(ws, home, tmp_path, monkeypatch):
+    """A `.omp/agents` swap after the parent check must not redirect a new-file write outside the
+    workspace: the write goes through the pinned parent directory, so it refuses (or lands in the
+    pinned directory) instead of following the planted symlink."""
+    import shutil
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    real_write = inst._safe_write_bytes
+    swapped = False
+
+    def swapping(dest, data, before, mode=None, dir_fd=None):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target = ws / ".omp" / "agents"
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            target.symlink_to(outside)
+        return real_write(dest, data, before, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inst, "_safe_write_bytes", swapping)
+    rc, out = _run(ws, "copy")
+    assert swapped
+    assert rc == 2
+    assert "symlink" in out
+    assert victim.read_bytes() == b"keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.txt"]
+
+
+def test_copy_mode_partial_failure_reports_written_and_failed(ws, home, tmp_path, monkeypatch):
+    """When a later destination fails after earlier copies saved, the error names the written files
+    and the failed destination instead of claiming nothing was written."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = _write(outside / "victim.txt", "keep\n")
+    real_write = inst._safe_write_bytes
+    calls = 0
+
+    def planting(dest, data, before, mode=None, dir_fd=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # plant a symlink at this destination after it verified absent; the pinned write refuses
+            os.symlink(str(victim), dest.name, dir_fd=dir_fd)
+        return real_write(dest, data, before, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(inst, "_safe_write_bytes", planting)
+    rc, out = _run(ws, "copy")
+    assert calls >= 2
+    assert rc == 2
+    assert "Nothing was written" not in out
+    assert "partial install" in out
+    first = _first_copy_dest(ws)
+    assert first.is_file()
+    assert str(first) in out
+    assert "failed" in out
+    assert victim.read_bytes() == b"keep\n"
+
+
 @pytest.mark.parametrize("where", ["home", "omp-dir", "checkout"])
 def test_install_omp_refuses_home_omp_dir_and_checkout(home, tmp_path, monkeypatch, where):
     fake = tmp_path / "checkout"  # stands in for the checkout, so no test ever targets the real one
@@ -586,3 +747,116 @@ def test_unquoted_stop_hook_is_removed_unless_the_flag_replaces_it(tree, ws, hom
     commands = [entry["command"] for group in data["hooks"]["Stop"] for entry in group["hooks"]]
     expected = f"python3 {shlex.quote(str(tree / 'hooks' / 'on_a01_complete.py'))}"
     assert commands == [unrelated, expected]
+
+
+# ---------------------------------------------------------------- copy mode under a shadowing ancestor (T-07-20)
+
+
+def _pkg_skill():
+    _, skills = inst.package_names()
+    return sorted(skills)[0]
+
+
+def _pkg_agent():
+    agents, _ = inst.package_names()
+    return sorted(agents)[0]
+
+
+def _ancestor_skill(parent, name):
+    return _write(
+        parent / ".omp" / "skills" / name / "SKILL.md",
+        f"---\nname: {name}\ndescription: ancestor copy\n---\nancestor\n",
+    )
+
+
+def _ancestor_agent(parent, slug):
+    return _write(
+        parent / ".omp" / "agents" / f"{slug}.md",
+        f"---\nname: {slug}\ndescription: ancestor copy\n---\nancestor\n",
+    )
+
+
+def test_copy_mode_refuses_under_shadowing_ancestor_skill(ws, home):
+    skill = _pkg_skill()
+    planted = _ancestor_skill(ws.parent, skill)
+    before = _snapshot(ws, home)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "guard-less" in out and skill in out and "--allow-shadowed-copy" in out
+    assert "Nothing was written" in out
+    assert not (ws / ".omp").exists()
+    assert _snapshot(ws, home) == before
+    assert planted.read_text(encoding="utf-8").endswith("ancestor\n")
+    problem = inst.preflight(ws, "copy")
+    assert problem is not None and "guard-less" in problem
+
+
+def test_copy_mode_refuses_under_shadowing_ancestor_agent(ws, home):
+    slug = _pkg_agent()
+    _ancestor_agent(ws.parent, slug)
+    rc, out = _run(ws, "copy")
+    assert rc == 2
+    assert "guard-less" in out and slug in out
+    assert not (ws / ".omp").exists()
+
+
+def test_copy_mode_dry_run_refuses_under_shadowing_ancestor(ws, home):
+    _ancestor_skill(ws.parent, _pkg_skill())
+    rc, out = _run(ws, "copy", dry_run=True)
+    assert rc == 2
+    assert "guard-less" in out
+    assert not (ws / ".omp").exists()
+
+
+def test_copy_mode_opt_in_proceeds_with_loud_warnings(ws, home):
+    skill = _pkg_skill()
+    _ancestor_skill(ws.parent, skill)
+    buf = io.StringIO()
+    rc = inst.install_omp(ws, "copy", False, buf, home, allow_shadowed_copy=True)
+    assert rc == 0
+    out = buf.getvalue()
+    assert "no tools" in out and "no guard" in out  # the COPY_WARNING stays loud on opt-in
+    assert any(
+        line.startswith("WARNING shadow:") and skill in line and "(project)" in line
+        for line in out.splitlines()
+    )
+    assert (ws / ".omp" / "skills" / skill / "SKILL.md").is_file()
+
+
+def test_copy_mode_opt_in_preflight_passes(ws, home):
+    _ancestor_skill(ws.parent, _pkg_skill())
+    assert inst.preflight(ws, "copy", home, allow_shadowed_copy=True) is None
+
+
+def test_link_mode_under_shadowing_ancestor_warns_only(ws, home):
+    """Link mode keeps full tools/guard, so an ancestor shadow stays a warning, never a refusal."""
+    skill = _pkg_skill()
+    _ancestor_skill(ws.parent, skill)
+    rc, out = _run(ws)
+    assert rc == 0
+    assert any(skill in line and "(project)" in line for line in _warnings(out))
+    assert _cfg(ws).exists()
+
+
+def test_install_workspace_copy_refusal_and_opt_in_flag(tree, ws, home):
+    skill = _pkg_skill()
+    _ancestor_skill(ws.parent, skill)
+    before = _snapshot(tree, ws)
+    r = _cli(tree, ws, home, "--omp-mode", "copy", "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "guard-less" in (r.stdout + r.stderr)
+    assert _snapshot(tree, ws) == before
+    assert not (ws / ".omp").exists()
+    r = _cli(tree, ws, home, "--omp-mode", "copy", "--no-substrate", "--allow-shadowed-copy")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (ws / ".omp" / "skills" / skill / "SKILL.md").is_file()
+
+
+def test_allow_shadowed_copy_flag_usage_errors(tree, ws, home):
+    before = _snapshot(tree, ws, home)
+    r = _cli(tree, ws, home, "--allow-shadowed-copy")
+    assert r.returncode == 2, r.stdout + r.stderr
+    r = _cli(tree, ws, home, "--install-workspace", str(ws), "--allow-shadowed-copy", "--no-substrate")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "needs --omp-mode copy" in (r.stdout + r.stderr)
+    assert _snapshot(tree, ws, home) == before

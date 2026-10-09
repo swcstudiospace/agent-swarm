@@ -269,3 +269,150 @@ def test_unaccepted_gates_skips_gates_that_fail_for_another_reason(tmp_path, swa
     con.close()
     assert ts.missing_gate_reasons("P-be") == {"review": "bad-sig"}
     assert ts.unaccepted_gates("P-be") == {}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Batch-01 rank 1: apply_result is atomic — the state transition and its provenance (notes, artifact
+# rows, gate-target feedback) commit in one transaction, so a crash at any point leaves a
+# fully-applied or fully-rolled-back result, never a new state with stale notes/missing artifacts.
+
+
+def _atomic_task(ts):
+    """A non-gate task leased to IN_PROGRESS, ready for an IN_REVIEW result."""
+    ts.create(task_id="A-1", correlation_id="c", capability="code.backend", notes={"gates": []})
+    for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"):
+        ts.transition("A-1", s)
+    return "A-1"
+
+
+def _atomic_result(tid):
+    return {"task_id": tid, "state": "IN_REVIEW",
+            "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}]}
+
+
+@pytest.mark.parametrize("fail_at", ["set_notes", "add_artifact"])
+def test_apply_result_rolls_back_transition_when_a_provenance_write_fails(swarm_dir, monkeypatch, fail_at):
+    """Failure injected at either provenance write rolls back the transition too: no half-state."""
+    from swarm import results
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    tid = _atomic_task(ts)
+    before = ts.history(tid)
+
+    def _boom(*a, **k):
+        raise RuntimeError(f"injected crash at {fail_at}")
+    monkeypatch.setattr(ts, fail_at, _boom)
+
+    with pytest.raises(RuntimeError, match=f"injected crash at {fail_at}"):
+        results.apply_result(ts, ts.get(tid), agent_id="A05", result=_atomic_result(tid), meta={"argv": ["x"]},
+                             emit=lambda *a: None, mode="headless")
+    after = ts.get(tid)
+    assert after["state"] == "IN_PROGRESS"  # the transition did not survive the crash
+    assert "result" not in after["notes_json"]  # no new-state-with-stale-notes
+    assert after["outputs"] == []
+    assert ts.history(tid) == before  # no audit row for the rolled-back move
+    assert ts.conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id=?", (tid,)).fetchone()[0] == 0
+
+
+def test_apply_result_rolls_back_a_real_artifact_write(swarm_dir, monkeypatch):
+    """Failure after the first artifact row still rolls back: the row, the outputs update, notes, and transition."""
+    from swarm import results
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    tid = _atomic_task(ts)
+    before = ts.history(tid)
+    real_add = ts.add_artifact
+    calls = {"n": 0}
+    def _flaky(*a, **k):
+        out = real_add(*a, **k)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected crash after first artifact")
+        return out
+    monkeypatch.setattr(ts, "add_artifact", _flaky)
+    result = {"task_id": tid, "state": "IN_REVIEW",
+              "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""},
+                          {"kind": "docs.bundle", "uri": "file://y", "version": "1", "digest": ""}]}
+    with pytest.raises(RuntimeError, match="injected crash after first artifact"):
+        results.apply_result(ts, ts.get(tid), agent_id="A05", result=result, meta={"argv": ["x"]},
+                             emit=lambda *a: None, mode="headless")
+    assert calls["n"] == 1  # one row really landed before the crash
+    after = ts.get(tid)
+    assert after["state"] == "IN_PROGRESS"
+    assert "result" not in after["notes_json"]
+    assert after["outputs"] == []
+    assert ts.history(tid) == before
+    assert ts.conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id=?", (tid,)).fetchone()[0] == 0
+
+
+def _atomic_gate_task(ts, tid="G-1", targets=("T-a", "T-b")):
+    """A leased review gate task over two targets, with a failing script row per target from this lease,
+    so the gate checks pass and the result reaches target feedback."""
+    from swarm.gates import make_verdict
+    for t in targets:
+        ts.create(task_id=t, correlation_id="c", capability="code.backend", notes={"gates": []})
+    ts.create(task_id=tid, correlation_id="c", capability="gate.review",
+              notes={"gate": "review", "gate_for": list(targets)})
+    for s in ("VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"):
+        ts.transition(tid, s)
+    for t in targets:
+        ts.record_verdict(t, make_verdict(gate="review", task_id=t, agent_id="A09@test", verdict="fail",
+                                          findings=[{"severity": "major", "kind": "k", "summary": "s"}],
+                                          correlation_id="c", extra={"gate_task": tid}))
+    return tid
+
+
+def test_apply_result_rolls_back_first_target_feedback_on_a_gate_task(swarm_dir, monkeypatch):
+    """Failure after the first target's feedback rolls back every earlier write: the transition, notes,
+    the artifact row, and the feedback already appended to that first target."""
+    from swarm import results
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    targets = ("T-a", "T-b")
+    tid = _atomic_gate_task(ts, targets=targets)
+    before = ts.history(tid)
+    real_feedback = ts.append_feedback
+    calls = {"n": 0}
+    def _flaky(target, entry):
+        out = real_feedback(target, entry)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected crash after first target feedback")
+        return out
+    monkeypatch.setattr(ts, "append_feedback", _flaky)
+    result = {"task_id": tid, "state": "IN_REVIEW",
+              "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
+              "verdicts": {t: {"verdict": "request_changes", "findings": []} for t in targets}}
+    with pytest.raises(RuntimeError, match="injected crash after first target feedback"):
+        results.apply_result(ts, ts.get(tid), agent_id="A09", result=result, meta={"argv": ["x"]},
+                             emit=lambda *a: None, mode="headless")
+    assert calls["n"] == 1  # T-a's feedback really landed before the crash
+    after = ts.get(tid)
+    assert after["state"] == "IN_PROGRESS"
+    assert "result" not in after["notes_json"]
+    assert after["outputs"] == []
+    assert ts.history(tid) == before
+    assert ts.conn.execute("SELECT COUNT(*) FROM artifacts WHERE task_id=?", (tid,)).fetchone()[0] == 0
+    for t in targets:
+        assert ts.get(t)["notes_json"].get("feedback", []) == []
+
+
+def test_apply_result_success_path_writes_state_notes_and_artifacts(swarm_dir):
+    """No behavior change on success: same final state, notes, and artifact rows as before the move."""
+    from swarm import results
+    from swarm.taskstore import TaskStore
+    ts = TaskStore()
+    tid = _atomic_task(ts)
+    result = _atomic_result(tid)
+    out = results.apply_result(ts, ts.get(tid), agent_id="A05", result=result, meta={"argv": ["x"]},
+                               emit=lambda *a: None, mode="headless")
+    assert out == "IN_REVIEW"
+    after = ts.get(tid)
+    assert after["state"] == "IN_REVIEW"
+    assert after["notes_json"]["result"] == result
+    assert after["notes_json"]["meta"] == {"argv": ["x"]}
+    assert [dict(a) for a in ts.conn.execute(
+        "SELECT kind, uri, version, digest, producer FROM artifacts WHERE task_id=?", (tid,))] == [
+        {"kind": "code.backend", "uri": "file://x", "version": "1", "digest": "", "producer": "A05"}]
+    assert after["outputs"] == [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}]
+    assert [h["to_state"] for h in ts.history(tid)][-1] == "IN_REVIEW"
