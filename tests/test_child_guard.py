@@ -1,5 +1,6 @@
 """Headless swarm agents must never re-run Prompt Uplift or re-kick the swarm."""
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -23,15 +24,29 @@ def _load_swarm_run(tmp_path, monkeypatch):
 def test_headless_agent_env_marks_child(tmp_path, monkeypatch):
     mod = _load_swarm_run(tmp_path, monkeypatch)
     seen = {}
+    # ChildGroup patches this module's Popen. The dead-pid spawn has to use the real one, or it re-enters the double.
+    real_popen = subprocess.Popen
 
     class FakePopen:
-        pid, returncode = 0, 0
+        """The runner reads the session's pipes while it is alive, so a double has to be a pipe, not `communicate`."""
 
         def __init__(self, cmd, **kw):
             seen["env"] = kw["env"]
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(b'{"result":"ok"}')
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+            # pid 0 is this process's own group: a shutdown would SIGTERM the test run. A pid that has already
+            # exited is ESRCH, which the runner treats as "the group is gone".
+            dead = real_popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            self.pid = dead.pid
 
-        def communicate(self, input=None, timeout=None):
-            return '{"result":"ok"}', ""
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
 
     monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
     args = SimpleNamespace(runtime="claude", claude_bin="claude", permission_mode="bypassPermissions",

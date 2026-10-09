@@ -3,12 +3,17 @@
 
 Fail-open. Dedupes concurrent kicks with a lock file. Always writes a log under
 $SWARM_DIR/autonomous.log.
+
+The run step is capped (SWARM_AUTONOMOUS_RUN_CAP_S, default 3600). On expiry the runner is
+SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_RUN_GRACE_S
+(default 15). subprocess.run's timeout SIGKILLs immediately, which orphans those sessions.
 """
 from __future__ import annotations
 import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -45,6 +50,45 @@ def pattern_for(brief: str) -> str:
     if "dependenc" in low or "bump" in low:
         return "dependency"
     return "feature"
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A positive number of seconds from the environment, else `default`. Blank, non-numeric and non-positive
+    values are the default: a typo must not disable the cap or the grace."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: float) -> subprocess.CompletedProcess:
+    """Run `cmd`, capturing stdout and stderr. `subprocess.run(timeout=)` SIGKILLs on expiry, which orphans the
+    runner's sessions: they sit in their own OS session, so the kill never reaches them and their tasks stay
+    IN_PROGRESS (T-06-26). Ask the runner to stop with SIGTERM first — its handler ends those sessions — and
+    SIGKILL only what ignores that for `grace` seconds. `Popen.communicate` does not kill on timeout; `run` does,
+    which is why this does not call `run`."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _signal_pid(proc.pid, signal.SIGTERM)
+        try:
+            out, err = proc.communicate(timeout=grace)
+        except subprocess.TimeoutExpired:
+            _signal_pid(proc.pid, signal.SIGKILL)
+            out, err = proc.communicate()
+    return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, out or "", err or "")
 
 
 def acquire(lock: Path) -> bool:
@@ -109,7 +153,13 @@ def main() -> int:
             }, indent=2))
             return 0
         run += ["--correlation-id", plan_json["correlation_id"]]
-        p2 = subprocess.run(run, cwd=str(root), env=env, capture_output=True, text=True, timeout=3600)
+        # SWARM_AUTONOMOUS_RUN_CAP_S bounds the run (default 3600). The grace is how long the runner has to end
+        # its sessions after SIGTERM before this process SIGKILLs it (T-06-26).
+        p2 = run_capped(
+            run, cwd=str(root), env=env,
+            timeout=_env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600),
+            grace=_env_seconds("SWARM_AUTONOMOUS_RUN_GRACE_S", 15),
+        )
         log.write_text(
             json.dumps({
                 "brief": args.brief[:500],

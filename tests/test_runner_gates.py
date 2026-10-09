@@ -1,6 +1,7 @@
 """WR-12 / WR-08: headless agent sessions get no signing keys, the key-holding runner runs each gate script,
 and a gate task cannot finish without its script's verdicts."""
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -71,15 +72,27 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     seen = {}
     # each runtime's own stdout shape: omp streams JSONL, claude/grok print one JSON object
     stdout = (ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl").read_text() if runtime == "omp" else '{"result":"ok"}'
+    # ChildGroup patches this module's Popen. The dead-pid spawn has to use the real one, or it re-enters the double.
+    real_popen = subprocess.Popen
 
     class FakePopen:
-        pid, returncode = 0, 0
+        """The runner reads the session's pipes while it is alive, so a double has to be a pipe, not `communicate`."""
 
         def __init__(self, cmd, **kw):
             seen["cmd"], seen["env"] = cmd, kw["env"]
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(stdout.encode())
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+            dead = real_popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            self.pid = dead.pid  # already exited: never pgid 0, which is the test run's own group
 
-        def communicate(self, input=None, timeout=None):
-            return stdout, ""
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
 
     monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
     args = SimpleNamespace(runtime=runtime, claude_bin="claude", grok_bin="grok", omp_bin="omp",
