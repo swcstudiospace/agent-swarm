@@ -13,10 +13,13 @@ Kind map (through agents.json, never an agent outside the fifteen):
 - decompose, generate, and refine → the owning implementer, or A03
   ``design.blueprint`` when no step names an owned file
 
-refine is mapped like generate. A node stays one task unless it is a critique
-or its steps name files owned by more than one agent. Steps that name no file
-stay on every split of that node; a step that names a file stays with that
-file's owner. Owned-file rules, first match:
+refine is mapped like generate. Tasks are emitted in dependency order (stable
+with the summary), because orch_plan indexes a dependency only after that task
+has been created. A node stays one task unless it is a critique or its steps
+name files owned by more than one agent. Steps that name no file stay on every
+split. A step whose files belong to one agent stays whole on that agent. A step
+that names two owners is rewritten so each agent is asked only for its own files.
+Owned-file rules, first match:
 
 - ``*.md`` → A15 docs
 - ``*.sql`` or a ``migrations/`` path → A07 data
@@ -39,10 +42,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.manifest import load_manifest  # noqa: E402
-from swarm.script_base import AgentScript  # noqa: E402
+from swarm.script_base import AgentScript, check_task_id  # noqa: E402
 from swarm.substrate_tee import is_graph_id  # noqa: E402
 
-_NODE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,40}")
 _FILE = re.compile(
     r"(?<![\w@./-])"
     r"((?:[\w.-]+/)*[\w.-]+\.(?:py|ts|tsx|js|jsx|go|rs|sql|md|sh|yml|yaml|toml|tf|css|html))"
@@ -125,8 +127,9 @@ def _nodes(data: dict) -> list[dict]:
         if not isinstance(node, dict):
             raise SwarmError(ErrorCode.E_INPUT, "each node must be an object")
         node_id = node.get("id")
-        if not isinstance(node_id, str) or _NODE_ID.fullmatch(node_id) is None:
+        if not isinstance(node_id, str):
             raise SwarmError(ErrorCode.E_INPUT, f"invalid node id {node_id!r}")
+        check_task_id(node_id, "node id")
         if node_id in seen:
             raise SwarmError(ErrorCode.E_INPUT, f"duplicate node id {node_id}")
         seen.add(node_id)
@@ -160,26 +163,59 @@ def _dependencies(nodes: list[dict]) -> dict[str, list[str]]:
     return deps
 
 
-def _assert_acyclic(deps: dict[str, list[str]]) -> None:
+def _cycle_path(deps: dict[str, list[str]]) -> str:
+    """One cycle, found with an explicit stack so a long chain cannot hit Python's recursion limit."""
     white, grey, black = 0, 1, 2
     color = {node_id: white for node_id in deps}
-    stack: list[str] = []
+    for start in deps:
+        if color[start] != white:
+            continue
+        stack = [(start, 0)]
+        path: list[str] = []
+        while stack:
+            node_id, index = stack[-1]
+            if color[node_id] == white:
+                color[node_id] = grey
+                path.append(node_id)
+            outgoing = deps[node_id]
+            if index < len(outgoing):
+                stack[-1] = (node_id, index + 1)
+                nxt = outgoing[index]
+                if color[nxt] == grey:
+                    cycle = path[path.index(nxt):] + [nxt]
+                    return " -> ".join(cycle)
+                if color[nxt] == white:
+                    stack.append((nxt, 0))
+            else:
+                color[node_id] = black
+                path.pop()
+                stack.pop()
+    return "dependency cycle"
 
-    def visit(node_id: str) -> None:
-        color[node_id] = grey
-        stack.append(node_id)
-        for dep in deps[node_id]:
-            if color[dep] == grey:
-                cycle = stack[stack.index(dep):] + [dep]
-                raise SwarmError(ErrorCode.E_INPUT, f"dependency cycle: {' -> '.join(cycle)}")
-            if color[dep] == white:
-                visit(dep)
-        stack.pop()
-        color[node_id] = black
 
-    for node_id in deps:
-        if color[node_id] == white:
-            visit(node_id)
+def _topo(nodes: list[dict], deps: dict[str, list[str]]) -> list[str]:
+    """Dependency order, stable against the summary's node order. orch_plan indexes dependencies as it goes."""
+    index = {node["id"]: i for i, node in enumerate(nodes)}
+    indeg = {node_id: len(node_deps) for node_id, node_deps in deps.items()}
+    children: dict[str, list[str]] = {node_id: [] for node_id in deps}
+    for node_id, node_deps in deps.items():
+        for dep in node_deps:
+            children[dep].append(node_id)
+    ready = sorted((node_id for node_id, count in indeg.items() if count == 0), key=lambda node_id: index[node_id])
+    ordered: list[str] = []
+    while ready:
+        node_id = ready.pop(0)
+        ordered.append(node_id)
+        newly = []
+        for child in children[node_id]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                newly.append(child)
+        ready.extend(newly)
+        ready.sort(key=lambda item: index[item])
+    if len(ordered) != len(nodes):
+        raise SwarmError(ErrorCode.E_INPUT, f"dependency cycle: {_cycle_path(deps)}")
+    return ordered
 
 
 def _waves(data: dict, deps: dict[str, list[str]]) -> list | None:
@@ -252,15 +288,37 @@ def _agents_for(node: dict) -> list[tuple[str, str]]:
     return [(agent, _OWNER_CAPABILITY[agent]) for agent in owners]
 
 
+def _for_agent(step: str, agent: str) -> str | None:
+    """The step as this agent's checklist line.
+
+    A step that names no file is shared. A step whose files all belong to one agent is kept whole.
+    A step that names two owners is rewritten so this agent is not asked to edit the other owner's files.
+    """
+    owned = _files(step)
+    if not owned:
+        return step
+    mine = [path for path, owner in owned if owner == agent]
+    if not mine:
+        return None
+    if all(owner == agent for _path, owner in owned):
+        return step
+    text = step
+    for path, owner in sorted(owned, key=lambda item: len(item[0]), reverse=True):
+        if owner == agent:
+            continue
+        text = re.sub(rf"(?:\s*(?:,|and|or)\s*)?{re.escape(path)}(?:\s*(?:,|and|or)\s*)?", " ", text, count=1)
+    return re.sub(r"\s+", " ", text).strip(" ,;:")
+
+
 def _acceptance(node: dict, agent: str, multi: bool) -> list[str]:
     steps: list[str] = node["steps"]
     if not multi or node["kind"] == "critique":
         return list(steps)
     kept: list[str] = []
     for step in steps:
-        owners = [owner for _path, owner in _files(step)]
-        if not owners or agent in owners:
-            kept.append(step)
+        line = _for_agent(step, agent)
+        if line:
+            kept.append(line)
     return kept
 
 
@@ -284,17 +342,20 @@ def convert(data: dict, summary_sha256: str) -> dict:
         raise SwarmError(ErrorCode.E_INPUT, f"invalid graphId {graph_id!r}: expected ut-<base36>-<8 hex>")
     nodes = _nodes(data)
     deps = _dependencies(nodes)
-    _assert_acyclic(deps)
+    order = _topo(nodes, deps)
     waves = _waves(data, deps)
     _check_totals(data, nodes)
     manifest = _manifest()
 
-    chosen = [(node, _agents_for(node)) for node in nodes]
+    by_id = {node["id"]: node for node in nodes}
+    chosen = [(by_id[node_id], _agents_for(by_id[node_id])) for node_id in order]
     id_of: dict[str, list[str]] = {}
     emitted: list[str] = []
     for node, agents in chosen:
         multi = len(agents) > 1
         ids = [f"{node['id']}-{agent.lower()}" if multi else node["id"] for agent, _cap in agents]
+        for task_id in ids:
+            check_task_id(task_id, "task id")
         id_of[node["id"]] = ids
         emitted.extend(ids)
     if len(emitted) != len(set(emitted)):

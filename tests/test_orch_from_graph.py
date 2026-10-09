@@ -275,6 +275,90 @@ def test_dry_run_writes_nothing(tmp_path):
     assert not out.exists()
 
 
+def test_out_of_order_dependencies_load_in_orch_plan(tmp_path):
+    path = _write_summary(tmp_path, [
+        _node("n2", "generate", ["Edit src/api.py"], depends_on=["n1"], title="After"),
+        _node("n1", "understand", ["Pin the contract"], title="Before"),
+    ])
+    out = tmp_path / "plan.json"
+    proc = _run(tmp_path, "--summary", str(path), "--out", str(out))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    tasks = json.loads(out.read_text(encoding="utf-8"))["tasks"]
+    assert [task["id"] for task in tasks] == ["n1", "n2"]
+    assert tasks[1]["depends_on"] == ["n1"]
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    env = _env(tmp_path)
+    env["SWARM_DIR"] = str(repo / ".swarm")
+    planned = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "orch_plan.py"),
+         "--repo", str(repo), "--pattern", "custom", "--plan", str(out),
+         "--graph-id", GRAPH_ID, "--prefix", "G", "--json"],
+        cwd=repo, capture_output=True, text=True, env=env,
+    )
+    assert planned.returncode == 0, planned.stdout + planned.stderr
+    assert len(json.loads(planned.stdout)["tasks"]) == 2
+
+
+def test_mixed_owner_step_names_only_that_agents_files(tmp_path):
+    path = _write_summary(tmp_path, [
+        _node("n1", "generate", ["Edit src/api.py and docs/GUIDE.md"]),
+    ])
+    tasks = {task["agent"]: task for task in _plan(tmp_path, path)["tasks"]}
+    assert tasks["A05"]["acceptance"] == ["Edit src/api.py"]
+    assert tasks["A15"]["acceptance"] == ["Edit docs/GUIDE.md"]
+
+
+def test_node_id_with_parent_segment_is_refused(tmp_path):
+    path = _write_summary(tmp_path, [_node("a..b", "understand", ["Pin it"])])
+    out = tmp_path / "plan.json"
+    proc = _run(tmp_path, "--summary", str(path), "--out", str(out))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout)["error"]["code"] == "E-INPUT"
+    assert ".." in json.loads(proc.stdout)["error"]["message"]
+    assert not out.exists()
+
+
+def test_deep_chain_and_cycle_stay_within_e_input(tmp_path):
+    chain = [
+        _node(f"n{i}", "understand", ["Pin it"], depends_on=[] if i == 0 else [f"n{i - 1}"])
+        for i in range(1199, -1, -1)
+    ]
+    plan = _plan(tmp_path, _write_summary(tmp_path, chain))
+    assert [task["id"] for task in plan["tasks"]] == [f"n{i}" for i in range(1200)]
+
+    cycle = [
+        _node(f"c{i}", "understand", ["Pin it"], depends_on=[f"c{(i + 1) % 1200}"])
+        for i in range(1200)
+    ]
+    proc = _run(tmp_path, "--summary", str(_write_summary(tmp_path, cycle)), "--out", str(tmp_path / "cycle.json"))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    body = json.loads(proc.stdout)
+    assert body["error"]["code"] == "E-INPUT"
+    assert "RecursionError" not in proc.stderr
+    assert not (tmp_path / "cycle.json").exists()
+
+
+@pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
+def test_twins_agree_on_relative_paths_outside_the_checkout(tmp_path):
+    (tmp_path / "summary.json").write_bytes(SUMMARY.read_bytes())
+    env = _env(tmp_path)
+    py = subprocess.run(
+        [sys.executable, str(SCRIPT), "--summary", "summary.json", "--out", "py.json", "--json"],
+        cwd=tmp_path, capture_output=True, text=True, env=env,
+    )
+    ts = subprocess.run(
+        [BUN, str(TWIN), "--summary", "summary.json", "--out", "ts.json", "--json"],
+        cwd=tmp_path, capture_output=True, text=True, env=env,
+    )
+    assert py.returncode == 0, py.stdout + py.stderr
+    assert ts.returncode == 0, ts.stdout + ts.stderr
+    assert (tmp_path / "py.json").read_bytes() == (tmp_path / "ts.json").read_bytes()
+    assert not (ROOT / "py.json").exists()
+    assert not (ROOT / "ts.json").exists()
+
+
 @pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
 def test_ts_twin_plan_is_byte_identical(tmp_path):
     py_out = tmp_path / "py.json"
