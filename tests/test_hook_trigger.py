@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from swarm.envelope import insecure_dev_key
-from swarm.hook_trigger import fire_if_ready
+from swarm.hook_trigger import fire_if_ready, is_opt_in
 
 _COMPLETE = "a01-orchestrator task.result state IN_REVIEW"
 _CLOUD_MARKERS = ("CURSOR_AGENT", "CURSOR_CLOUD_AGENT", "CLOUD_AGENT")
@@ -74,6 +74,39 @@ def _hook_payloads(state: Path) -> list[dict]:
 
 def _reasons(state: Path) -> list[str]:
     return [p["reason"] for p in _hook_payloads(state) if p.get("reason")]
+
+
+@pytest.mark.parametrize("name,value", [
+    ("AIO_SWARM_AFTER_ORCH", "1"),
+    ("AIO_SWARM_AFTER_ORCH", "true"),
+    ("AIO_SWARM_AFTER_ORCH", "yes"),
+    ("AIO_SWARM_AFTER_ORCH", "on"),
+    ("AIO_SWARM_AFTER_ORCH", " TRUE "),
+    ("SWARM_AFTER_ORCH", "1"),
+    ("SWARM_AFTER_ORCH", "yes"),
+])
+def test_opt_in_accepts_either_name_and_the_true_words(monkeypatch, name, value):
+    monkeypatch.delenv("AIO_SWARM_AFTER_ORCH", raising=False)
+    monkeypatch.delenv("SWARM_AFTER_ORCH", raising=False)
+    assert is_opt_in() is False
+    monkeypatch.setenv(name, value)
+    assert is_opt_in() is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "maybe"])
+def test_opt_in_rejects_other_values(monkeypatch, value):
+    monkeypatch.setenv("AIO_SWARM_AFTER_ORCH", value)
+    monkeypatch.delenv("SWARM_AFTER_ORCH", raising=False)
+    assert is_opt_in() is False
+
+
+def test_opt_in_off_and_no_signal_write_no_event(state, monkeypatch):
+    monkeypatch.setenv("AIO_SWARM_AFTER_ORCH", "0")
+    assert fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)["reason"] == "opt-in-off"
+    assert _hook_payloads(state) == []
+    monkeypatch.setenv("AIO_SWARM_AFTER_ORCH", "1")
+    assert fire_if_ready("what is a monad", session_id="s", corr="c", root=state)["reason"] == "no-signal"
+    assert _hook_payloads(state) == []
 
 
 def test_no_real_key_does_not_spawn(state, monkeypatch):
