@@ -236,6 +236,25 @@ def test_double_backtick_span_and_unterminated_fence_are_kept(tmp_path):
     assert f["evidence"] == "Write ``a ` <b>`` here.\n\n```py\nprint('<b>')"
 
 
+def test_a_long_link_keeps_its_label_and_the_following_explanation(tmp_path):
+    """A URL cap left the tail of a long artifact link in the evidence and cut the explanation off."""
+    url = "https://artifacts.example/" + ("a" * 4000)
+    rest = f"See [the artifact]({url}) and then the explanation that must survive."
+    evidence = _one(tmp_path, _badged(2, "T", rest))["evidence"]
+    assert evidence == "See the artifact and then the explanation that must survive."
+    assert "https://" not in evidence
+
+
+def test_a_backtick_on_the_opening_line_is_inline_code_not_a_fence(tmp_path):
+    """```a ` <b>``` is one inline span. Reading it as a fence kept the prompt block that follows."""
+    rest = ("Before ```a ` <b>``` after.\n\n"
+            "<details><summary>Prompt To Fix With AI</summary>\nhidden prompt\n</details>\n\n"
+            "Kept.\n\n~~~`lang`\n<img alt='P1'>\n~~~")
+    evidence = _one(tmp_path, _badged(2, "T", rest))["evidence"]
+    assert evidence == "Before ```a ` <b>``` after.\n\nKept.\n\n~~~`lang`\n<img alt='P1'>\n~~~"
+    assert "hidden prompt" not in evidence
+
+
 def test_a_fence_inside_the_prompt_block_is_removed_with_it(tmp_path):
     rest = "Visible.\n\n<details><summary>Prompt To Fix With AI</summary>\n\n`````markdown\nhidden <b>\n`````\n</details>\n\nAfter."
     assert _one(tmp_path, _badged(2, "T", rest))["evidence"] == "Visible.\n\nAfter."

@@ -47,10 +47,14 @@ _META_LINES = re.compile(r"^[ \t]*\*\*(?:Knowledge Base|Sources?) Used:?\*\*:?[^
 # source carry the trailing "Fix in ..." buttons; their anchors hold long percent-encoded prompt URLs.
 _HTML = re.compile(r"</?(?:a|img|picture|source|br|hr|p|b|i|em|strong|code|pre|sub|sup|summary|div|span|ul|ol|li|h[1-6]|"
                    r"blockquote|table|thead|tbody|tr|td|th)\b[^>]*>", re.I)
-# link text may hold escaped brackets: [\[n6\] title](url). Both parts are bounded: an unbounded text scan from every "["
-# is quadratic on a body that is mostly brackets (10,000 of them took 2 s).
-_LINK = re.compile(r"\[((?:\\.|[^\]\\\n]){1,300})\]\([^)\n]{0,2000}\)")
-_FENCE_OPEN = re.compile(r"[ \t]*(`{3,}|~{3,})")
+# link text may hold escaped brackets: [\[n6\] title](url). The label is at most 300 tokens: an unbounded text scan
+# from every "[" is quadratic on a body that is mostly brackets (10,000 of them took 2 s). The URL is not capped.
+# A 2,000-character cap left the tail of a long artifact URL in the evidence and cut off the explanation after it.
+_LABEL_TOKENS = 300
+# A backtick fence whose opening line contains a backtick is inline code (```a ` <b>```), not a block. Treating it as
+# a fence saved every following line, including the <details> prompt, as code. Tilde fences may name a backtick language.
+_FENCE_TICK = re.compile(r"[ \t]*(`{3,})([^`]*)$")
+_FENCE_TILDE = re.compile(r"[ \t]*(~{3,})")
 _INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")  # one line; a run of backticks closes with the same run
 _PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 _TITLE = re.compile(r"\*\*(.+?)\*\*", re.S)
@@ -176,6 +180,58 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
+def _label_open(text: str, i: int) -> int | None:
+    """Index just after `](` if `text[i]` opens a link label of 1..300 tokens, else None.
+
+    A token is one ordinary character or a backslash escape (two characters). A newline ends the label. The bound is
+    what keeps a body of brackets linear."""
+    n = len(text)
+    if i >= n or text[i] != "[":
+        return None
+    j, tokens = i + 1, 0
+    while j < n and tokens < _LABEL_TOKENS:
+        if text[j] == "\\" and j + 1 < n:
+            j += 2
+        elif text[j] in "]\n":
+            break
+        else:
+            j += 1
+        tokens += 1
+    if tokens == 0 or j + 1 >= n or text[j] != "]" or text[j + 1] != "(":
+        return None
+    return j + 2
+
+
+def _strip_links(text: str) -> str:
+    """Markdown links become their label, escaped brackets included. The URL is consumed through its `)` or the end of
+    the line, with no character cap: a long artifact URL must not survive into the evidence. When a `](` has no closer
+    before the newline, nothing else on that line is a closed link either, so the rest of the line is copied once."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        bracket = text.find("[", i)
+        if bracket == -1:
+            out.append(text[i:])
+            break
+        out.append(text[i:bracket])
+        opened = _label_open(text, bracket)
+        if opened is None:
+            out.append("[")
+            i = bracket + 1
+            continue
+        k = opened
+        while k < n and text[k] not in ")\n":
+            k += 1
+        if k < n and text[k] == ")":
+            out.append(re.sub(r"\\([\[\]])", r"\1", text[bracket + 1:opened - 2]))
+            i = k + 1
+            continue
+        end = k if k < n else n
+        out.append(text[bracket:end])
+        i = end
+    return "".join(out)
+
+
 def _protect_code(text: str) -> tuple[str, list[str]]:
     """`text` with every fenced block (``` or ~~~, an unterminated one to the end) and every inline code span replaced by
     a \\x00N\\x00 placeholder, and the originals. Greptile quotes code in its explanations; markup removal must not touch
@@ -191,7 +247,7 @@ def _protect_code(text: str) -> tuple[str, list[str]]:
     for line in text.split("\n"):
         bare = line.strip(" \t")
         if not fence:
-            opening = _FENCE_OPEN.match(line)
+            opening = _FENCE_TICK.match(line) or _FENCE_TILDE.match(line)
             if opening:
                 fence, block = opening.group(1), [line]
             else:
@@ -214,7 +270,7 @@ def _clean(body: str) -> str:
     text = _DETAILS.sub("", text)
     text = _META_LINES.sub("", text)
     text = _HTML.sub("", text)
-    text = _LINK.sub(lambda m: re.sub(r"\\([\[\]])", r"\1", m.group(1)), text)
+    text = _strip_links(text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return _PLACEHOLDER.sub(lambda m: saved[int(m.group(1))], text).strip()
