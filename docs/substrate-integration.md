@@ -1,8 +1,8 @@
 # AgentSwarm on Agent Substrate — platform pointer
 
 **Status:** index of the swarm's substrate runtime, plus the vocabulary map below. When
-`SUBSTRATE_URL` is set, the swarm calls Agent Substrate for leases, handoffs, governed memory
-and workspace tokens. The contracts are the four documents in the next section.
+`SUBSTRATE_URL` is set, the swarm calls Agent Substrate for leases, handoffs and governed memory,
+using pre-supplied per-agent tokens. The contracts are the four documents in the next section.
 
 ## Runtime docs
 
