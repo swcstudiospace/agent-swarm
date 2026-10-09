@@ -29,7 +29,8 @@ export const PATTERNS = ["feature", "hotfix", "dependency"] as const;
 export const RISK_CLASSES = ["low", "medium", "high"] as const;
 const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 
-/** Gate → script (copied from swarm/verdicts.py:17 GATE_SCRIPTS); the script derives and signs the verdict. */
+/** Gate → script (parity mirror of swarm/verdicts.py GATE_SCRIPTS; omp/test/gate.test.ts pins equal);
+ * the script derives and signs the verdict. */
 const GATE_SCRIPTS = { quality: "qa_gate", review: "rev_gate", security: "sec_gate", release: "rel_plan" } as const satisfies Record<string, Script>;
 type Gate = keyof typeof GATE_SCRIPTS;
 /** Every gate has its owner in GATE_AGENTS (context.ts), and nothing else. */

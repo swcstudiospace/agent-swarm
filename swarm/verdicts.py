@@ -46,6 +46,7 @@ def advisory_envelope(*, gate: str, task_id: str, agent_id: str, findings: list[
     return build_envelope(source=agent_id, target="A01", msg_type="gate.verdict", payload=payload,
                            correlation_id=correlation_id, priority="P1")
 
+# Parity mirror: omp/src/tools.ts GATE_SCRIPTS; omp/test/gate.test.ts pins the two maps equal.
 GATE_SCRIPTS = {"quality": "qa_gate", "review": "rev_gate", "security": "sec_gate", "release": "rel_plan"}
 SIM_FINDING = {"id": "SIM-1", "severity": "major", "kind": "functional", "summary": "simulated gate failure",
                "evidence": "", "ac_ref": None, "owner_suggestion": None, "location": None}
