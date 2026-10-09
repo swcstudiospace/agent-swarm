@@ -124,6 +124,7 @@ type at runtime is skipped, never downgraded to `note`. The exact swarm type alw
 | `task.transition` | `orch_status` | `note` | State-machine bookkeeping. |
 | `task.result.raw` | `swarm_run` | `note` | Raw agent output captured before validation. |
 | `task.claimed` | `results.apply_result` | `claim` | An agent took a task: the closest EVENT_KINDS meaning. |
+| `task.stranded` | `swarm_run.recover_stranded` | `warning` | A later run failed a task left `IN_PROGRESS` past `notes.running_deadline` because its runner died. |
 | `gate.verdict.unrecorded` | `swarm.verdicts` | `warning` | A gate ran but its verdict was not recorded against a task. |
 | `gate.findings.coerced` | `swarm_run` | `warning` | A gate's findings had to be coerced into shape. |
 | `gate.findings.synthesized` | `swarm_run` | `warning` | Findings were synthesized rather than reported. |

@@ -98,6 +98,7 @@ TYPE_KINDS: dict[str, str] = {
     "per-unit": "note",                        # per-unit progress update
     "batch-end": "note",                       # batch execution round completed
     "stale": "warning",                        # watchdog detected stale state or lease
+    "task.stranded": "warning",                # a later run failed a task left IN_PROGRESS past its deadline (T-06-26)
 }
 # `script.<name>` and `script.<name>.error` are the exit record of one agent script run -> tool.call.
 PREFIX_KINDS: tuple[tuple[str, str], ...] = (("script.", "tool.call"),)

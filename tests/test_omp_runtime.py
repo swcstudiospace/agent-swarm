@@ -220,12 +220,13 @@ def test_dry_run_prints_omp_invocation(tmp_path):
     lines = [ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: ")]
     assert len(lines) == 1
     tokens = shlex.split(lines[0].removeprefix("dry-run T-one [A05]: "))
-    # WR-06: a replay from the runner's shell drops the key vars, as the live child env does
-    assert tokens[:7] == ["env", "-u", "SWARM_SIGNING_KEY", "-u", "SWARM_ED25519_KEY", "-u", "SWARM_REQUIRE_KEY"]
-    assert dict(t.split("=", 1) for t in tokens[7:13]) == {
+    # WR-06 / T-06-19: a replay from the runner's shell drops the key vars and the parent's task ids.
+    assert tokens[:11] == ["env", "-u", "SWARM_SIGNING_KEY", "-u", "SWARM_ED25519_KEY", "-u", "SWARM_REQUIRE_KEY",
+                           "-u", "SWARM_TASK_ID", "-u", "SWARM_CORRELATION_ID"]
+    assert dict(t.split("=", 1) for t in tokens[11:17]) == {
         "SWARM_DIR": str(swarm), "SWARM_CHILD": "1", "SWARM_AGENT_SESSION": "1", "SWARM_AGENT": "a05-backend",
         "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
-    argv, (redirect, stdin) = tokens[13:-2], tokens[-2:]
+    argv, (redirect, stdin) = tokens[17:-2], tokens[-2:]
     assert argv[0] == "omp" and "--no-extensions" in argv
     opt = lambda k: argv[argv.index(k) + 1]  # noqa: E731
     assert opt("-e") == str(ROOT / "omp")
@@ -250,11 +251,14 @@ def test_dry_run_line_replays_without_keys(tmp_path):
                    "--json", env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     line = next(ln for ln in r.stderr.splitlines() if ln.startswith("dry-run T-one [A05]: "))
+    # The shell that replays the line still has the runner's keys and the parent's task ids.
+    replay_env = {**env, "SWARM_TASK_ID": "T-parent", "SWARM_CORRELATION_ID": "corr-parent"}
     p = subprocess.run(["/bin/sh", "-c", line.removeprefix("dry-run T-one [A05]: ")], capture_output=True, text=True,
-                       env=env, cwd=work, timeout=60)
+                       env=replay_env, cwd=work, timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
     (call,) = omp_calls(stub)
     assert not set(KEY_VARS) & set(call["env"])
+    assert "SWARM_TASK_ID" not in call["env"] and "SWARM_CORRELATION_ID" not in call["env"]
     assert call["env"]["SWARM_AGENT"] == "a05-backend" and call["env"]["SWARM_AGENT_SESSION"] == "1"
 
 
@@ -397,8 +401,9 @@ def test_timeout_kills_the_session_process_group(tmp_path):
 
 
 def test_extension_load_failure_fails_gate_session_and_records_no_gate(tmp_path):
-    """T-06-06: omp only warns on stderr when the -e guard package fails to load, and runs the session unguarded;
-    the runner fails that task closed (E-DEP), applies none of its result and records no gate."""
+    """T-06-06 / T-06-27: omp only warns on stderr when the -e guard package fails to load, and would run the
+    session unguarded. The runner fails that task closed (E-DEP), applies none of its result and records no gate,
+    and it does not retry the unguarded session in the same run."""
     swarm = tmp_path / ".swarm"
     env = _env(swarm, SWARM_SIGNING_KEY="runner-secret")
     plan = {"tasks": [{"id": "be", "capability": "code.backend", "agent": "A05", "gates": ["review"]},
@@ -414,9 +419,11 @@ def test_extension_load_failure_fails_gate_session_and_records_no_gate(tmp_path)
     con.close()
     assert rows == []
     states = _states(swarm)
-    assert states["T-be"] == "IN_REVIEW" and states["T-rev"] == "ESCALATED"
+    assert states["T-be"] == "IN_REVIEW" and states["T-rev"] == "FAILED"
     reasons = _failed_reasons(swarm, "T-rev")
-    assert reasons and all(x.startswith("E-DEP") and "Failed to load extension" in x for x in reasons)
+    assert len(reasons) == 1 and reasons[0].startswith("E-DEP") and "Failed to load extension" in reasons[0]
+    rev_calls = [c for c in omp_calls(stub) if "T-rev" in c["stdin"]]
+    assert len(rev_calls) == 1
 
 
 def _grandchild_when_started(stub: Path, timeout: float = 30) -> int:
