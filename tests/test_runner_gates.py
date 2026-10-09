@@ -68,6 +68,8 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     monkeypatch.setenv("SWARM_SIGNING_KEY", "s")
     monkeypatch.setenv("SWARM_ED25519_KEY", "11" * 32)
     monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    monkeypatch.setenv("SWARM_TASK_ID", "T-parent")
+    monkeypatch.setenv("SWARM_CORRELATION_ID", "corr-parent")
     mod = _load_swarm_run(tmp_path, monkeypatch)
     seen = {}
     # each runtime's own stdout shape: omp streams JSONL, claude/grok print one JSON object
@@ -101,6 +103,8 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     env = seen["env"]
     assert seen["cmd"][0] == runtime
     assert not set(KEY_VARS) & set(env)
+    assert "SWARM_TASK_ID" not in env and "SWARM_CORRELATION_ID" not in env  # T-06-19: the parent's ids stay with the runner
+    assert os.environ["SWARM_TASK_ID"] == "T-parent"
     assert env["SWARM_AGENT_SESSION"] == "1"
     assert env["SWARM_AGENT"] == "a09-reviewer"  # the session identity swarm_gate binds the gate to
     assert env["SWARM_CHILD"] == "1"

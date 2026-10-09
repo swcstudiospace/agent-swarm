@@ -149,6 +149,23 @@ def _load_hook():
     return mod
 
 
+def test_kickoff_lock_is_held_until_released_and_then_debounced(tmp_path):
+    """T-06-18: a second kick cannot start while the first holds the lock, nor within 120s after release."""
+    import os
+    import time
+    mod = _load_hook()
+    lock = tmp_path / "kickoffs" / "same.lock"
+    held = mod.acquire(lock)
+    assert held is not None
+    assert mod.acquire(lock) is None
+    os.close(held)
+    assert mod.acquire(lock) is None
+    os.utime(lock, (time.time() - 121, time.time() - 121))
+    again = mod.acquire(lock)
+    assert again is not None
+    os.close(again)
+
+
 def test_env_seconds_falls_back_on_blank_or_non_positive(monkeypatch):
     mod = _load_hook()
     monkeypatch.delenv("SWARM_AUTONOMOUS_RUN_CAP_S", raising=False)

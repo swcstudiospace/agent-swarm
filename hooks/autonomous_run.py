@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Detached AgentSwarm runner used after the all-in-one Prompt Uplift hook.
 
-Fail-open. Dedupes concurrent kicks with a lock file. Always writes a log under
-$SWARM_DIR/autonomous.log.
+Fail-open. Dedupes concurrent kicks with an exclusive lock held for the whole run, plus a
+120s mtime debounce after it finishes. Always writes a log under $SWARM_DIR/autonomous.log.
 
 The run step is capped (SWARM_AUTONOMOUS_RUN_CAP_S, default 3600). On expiry the runner is
 SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_RUN_GRACE_S
@@ -10,6 +10,7 @@ SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_
 """
 from __future__ import annotations
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -91,13 +92,29 @@ def run_capped(cmd: list[str], *, cwd: str, env: dict, timeout: float, grace: fl
     return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, out or "", err or "")
 
 
-def acquire(lock: Path) -> bool:
+def acquire(lock: Path) -> int | None:
+    """An fd holding the exclusive kickoff lock, or None when this brief must not start.
+
+    The fd stays open for the whole run, so a second process cannot pass the check while the first
+    is still planning or running (T-06-18). The mtime is when the lock was taken. After the fd is
+    closed, a kick inside 120s is still a duplicate. A crash releases the lock with the process;
+    the file's mtime then keeps the 120s debounce."""
     lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
     now = time.time()
-    if lock.exists() and now - lock.stat().st_mtime < 120:
-        return False
-    lock.write_text(str(now))
-    return True
+    info = os.fstat(fd)
+    if info.st_size > 0 and now - info.st_mtime < 120:
+        os.close(fd)
+        return None
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(now).encode())
+    return fd
 
 
 def main() -> int:
@@ -120,7 +137,8 @@ def main() -> int:
     digest = hashlib.sha256(f"{repo}|{args.brief}".encode()).hexdigest()[:16]
     lock = swarm_dir / "kickoffs" / f"{digest}.lock"
     log = swarm_dir / "autonomous.log"
-    if not acquire(lock):
+    held = acquire(lock)
+    if held is None:
         log.write_text((log.read_text() if log.exists() else "") + f"skip duplicate {digest}\n")
         return 0
     env = {**os.environ, "SWARM_DIR": str(swarm_dir), "SWARM_CHILD": "1", "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
@@ -176,6 +194,8 @@ def main() -> int:
     except Exception as exc:
         log.write_text(json.dumps({"error": str(exc)}))
         return 0
+    finally:
+        os.close(held)
 
 
 if __name__ == "__main__":

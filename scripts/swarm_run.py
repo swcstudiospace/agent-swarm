@@ -69,7 +69,12 @@ from swarm import memory as swarm_memory, substrate_client, substrate_handoff, s
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
 # three; it performs every APPROVED transition and the recorded gate run.
-AGENT_SESSION_STRIPPED = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+# SWARM_TASK_ID and SWARM_CORRELATION_ID are the runner's own defaults for script flags. A child that
+# inherits them binds its gate scripts to the parent's task (T-06-19).
+AGENT_SESSION_STRIPPED = (
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY",
+    "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+)
 
 
 def upstream_context(store: TaskStore, task: dict) -> str:
