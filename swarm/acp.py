@@ -6,10 +6,11 @@ hardcoded peer list. Local tool calls do not consult the peer circuit breaker.
 """
 from __future__ import annotations
 
+import copy
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Callable
+
+from swarm.tools.support import StillRunning, invoke_bounded
 
 SCHEMA = "acp.v1"
 REQUIRED = (
@@ -138,7 +139,7 @@ class Bus:
                 "target": tool_name,
                 "reason": "caller is not permitted to invoke this tool",
             }
-        return call_tool(tool_name, caller, payload)
+        return call_tool(tool_name, caller, payload, data=self.data)
 
     def request(self, envelope: dict) -> dict:
         errors = validate_envelope(envelope)
@@ -176,21 +177,28 @@ class Bus:
         history = ["PENDING", "DELIVERED", "IN_PROGRESS"]
         handler = self.handlers.get(recipient)
         last_error = "peer unreachable"
+        # Handlers can mutate the dict they receive. Keep one untouched copy for
+        # retries and the dead letter, and hand each attempt its own copy.
+        original = copy.deepcopy(envelope)
         for attempt in range(1, self.max_attempts + 1):
             try:
                 if handler is None:
                     raise ConnectionError("no in-process handler for recipient")
-                response = self._invoke(handler, envelope, float(envelope["timeout_hint_s"]))
+                response = invoke_bounded(handler, copy.deepcopy(original), float(original["timeout_hint_s"]))
             except ACPStatus as exc:
                 history.append(exc.state)
                 return self._terminal(
-                    envelope,
+                    original,
                     exc.state,
                     attempts=attempt,
                     history=history,
                     reason=str(exc),
                     retryable=False,
                 )
+            except StillRunning as exc:
+                # The handler is still running. Another attempt would run it twice.
+                history.append("DEAD_LETTERED")
+                return self._fail_peer(original, "DEAD_LETTERED", attempt, history, str(exc) or "timeout")
             except TimeoutError as exc:
                 last_error = str(exc) or "timeout"
                 if attempt < self.max_attempts:
@@ -198,7 +206,7 @@ class Bus:
                     self.sleep(self._delay(attempt))
                     continue
                 history.append("DEAD_LETTERED")
-                return self._fail_peer(envelope, "DEAD_LETTERED", attempt, history, last_error)
+                return self._fail_peer(original, "DEAD_LETTERED", attempt, history, last_error)
             except (ConnectionError, OSError) as exc:
                 last_error = str(exc) or "peer unreachable"
                 if attempt < self.max_attempts:
@@ -206,25 +214,37 @@ class Bus:
                     self.sleep(self._delay(attempt))
                     continue
                 history.append("DEAD_LETTERED")
-                return self._fail_peer(envelope, "DEAD_LETTERED", attempt, history, last_error)
+                return self._fail_peer(original, "DEAD_LETTERED", attempt, history, last_error)
+            except Exception as exc:
+                history.append("FAILED")
+                return self._terminal(
+                    original,
+                    "FAILED",
+                    attempts=attempt,
+                    history=history,
+                    reason=f"handler failed: {exc}",
+                    retryable=False,
+                )
             if not isinstance(response, dict):
                 history.append("FAILED")
                 return self._terminal(
-                    envelope,
+                    original,
                     "FAILED",
                     attempts=attempt,
                     history=history,
                     reason="handler did not return an object",
+                    retryable=False,
                 )
-            echoed = response.get("correlation_id", envelope["correlation_id"])
-            if echoed != envelope["correlation_id"]:
+            echoed = response.get("correlation_id")
+            if echoed != original["correlation_id"]:
                 history.append("FAILED")
                 return self._terminal(
-                    envelope,
+                    original,
                     "FAILED",
                     attempts=attempt,
                     history=history,
                     reason="response correlation_id does not match the request",
+                    retryable=False,
                 )
             self._failures[recipient] = 0
             history.append("RESPONDED")
@@ -233,22 +253,12 @@ class Bus:
                 "state": "RESPONDED",
                 "attempts": attempt,
                 "history": history,
-                "envelope": envelope,
+                "envelope": original,
                 "response": response,
-                "correlation_id": envelope["correlation_id"],
+                "correlation_id": original["correlation_id"],
             }
         history.append("DEAD_LETTERED")
-        return self._fail_peer(envelope, "DEAD_LETTERED", self.max_attempts, history, last_error)
-
-    def _invoke(self, handler: Callable[[dict], dict], envelope: dict, timeout_s: float) -> dict:
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(handler, envelope)
-        try:
-            return future.result(timeout=timeout_s)
-        except FuturesTimeout as exc:
-            raise TimeoutError(f"exceeded {timeout_s}s") from exc
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        return self._fail_peer(original, "DEAD_LETTERED", self.max_attempts, history, last_error)
 
     def _delay(self, attempt: int) -> float:
         return min(self.backoff_s * (2 ** (attempt - 1)), self.max_backoff_s)

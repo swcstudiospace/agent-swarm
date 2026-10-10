@@ -2,12 +2,46 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS: dict[str, Any] = {}
+
+
+class StillRunning(Exception):
+    """The call exceeded its limit and the worker has not finished.
+
+    The worker is not killed. Callers must not start another attempt until it has.
+    """
+
+
+def target_root() -> Path:
+    """Workspace the swarm is operating on. Script modules still load from ROOT."""
+    return Path.cwd().resolve()
+
+
+def invoke_bounded(fn, arg, timeout_s: float):
+    """Run ``fn(arg)`` until ``timeout_s``. A still-running call raises StillRunning."""
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = fn(arg)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=target, daemon=True).start()
+    if not done.wait(timeout_s):
+        raise StillRunning(f"exceeded {timeout_s}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def script(stem: str) -> Any:

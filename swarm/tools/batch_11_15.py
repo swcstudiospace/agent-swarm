@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from swarm.tools.support import ROOT, respond, script
+from swarm.tools.support import respond, script, target_root
 
 
 def ci_kind(payload: dict) -> dict:
@@ -20,7 +20,7 @@ def build_systems(payload: dict) -> dict:
     def work() -> dict:
         if payload["scan"] is not True:
             return {"state": "INVALID_INPUT", "field": "scan", "message": "scan must be true"}
-        found = script("devops_build_record").detect_build_systems(ROOT)
+        found = script("devops_build_record").detect_build_systems(target_root())
         return {"state": "SUCCESS", "systems": ",".join(found)}
 
     return respond(payload, work)

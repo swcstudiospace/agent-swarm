@@ -129,6 +129,91 @@ def test_circuit_breaker_fails_fast_while_local_tools_still_run():
     assert local["state"] == "SUCCESS" and local["token"] == "ping"
 
 
+def test_handler_exception_is_a_failed_delivery_and_is_not_retried():
+    bus = Bus(sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("retried")))
+
+    def handler(_envelope):
+        raise RuntimeError("boom")
+
+    bus.register("A03", handler)
+    result = bus.request(HAPPY)
+    assert result["state"] == "FAILED"
+    assert result["retryable"] is False
+    assert result["attempts"] == 1
+    assert "boom" in result["reason"]
+
+
+def test_response_must_echo_the_correlation_id():
+    bus = Bus(sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("retried")))
+
+    def missing(_envelope):
+        return {}
+
+    bus.register("A03", missing)
+    omitted = bus.request(HAPPY)
+    assert omitted["state"] == "FAILED"
+    assert omitted["retryable"] is False
+    assert "correlation_id" in omitted["reason"]
+
+    def mismatched(_envelope):
+        return {"correlation_id": "other"}
+
+    bus.register("A03", mismatched)
+    wrong = bus.request({**HAPPY, "correlation_id": "corr-echo"})
+    assert wrong["state"] == "FAILED"
+    assert wrong["retryable"] is False
+
+
+def test_retries_keep_the_original_envelope():
+    seen = []
+
+    def handler(envelope):
+        seen.append(envelope["payload"].get("spec"))
+        envelope["payload"].clear()
+        raise ConnectionError("down")
+
+    bus = Bus(sleep=lambda _seconds: None, max_attempts=2, breaker_threshold=9)
+    bus.register("A03", handler)
+    result = bus.request(HAPPY)
+    assert result["state"] == "DEAD_LETTERED"
+    assert seen == ["ping", "ping"]
+    assert result["envelope"]["payload"] == {"spec": "ping"}
+    assert bus.dead[-1]["envelope"]["payload"] == {"spec": "ping"}
+    assert HAPPY["payload"] == {"spec": "ping"}
+
+
+def test_slow_handler_is_not_started_again_while_it_is_still_running():
+    starts = []
+
+    def handler(envelope):
+        starts.append(envelope["correlation_id"])
+        time.sleep(0.3)
+        return {"correlation_id": envelope["correlation_id"]}
+
+    bus = Bus(sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("retried")), max_attempts=3)
+    bus.register("A03", handler)
+    result = bus.request({**HAPPY, "correlation_id": "corr-inflight", "timeout_hint_s": 0.05})
+    assert result["state"] == "DEAD_LETTERED"
+    assert result["attempts"] == 1
+    assert starts == ["corr-inflight"]
+
+
+def test_invoke_tool_uses_the_bus_registry():
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path("agents.json").read_text(encoding="utf-8"))
+    tool = data["agents"][0]["registered_tools"][0]
+    assert tool["name"] == "orch_registry_ping"
+    tool["permitted_callers"] = ["A15"]
+    bus = Bus(data=data)
+    denied = bus.invoke_tool("A01", "orch_registry_ping", {"token": "ping"})
+    assert denied["state"] == "UNAUTHORIZED"
+    allowed = bus.invoke_tool("A15", "orch_registry_ping", {"token": "ping"})
+    assert allowed["state"] == "SUCCESS"
+    assert allowed["token"] == "ping"
+
+
 def test_unauthorized_tool_is_audited():
     bus = Bus()
     result = bus.invoke_tool("A02", "orch_registry_ping", {"token": "ping"})

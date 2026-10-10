@@ -87,6 +87,57 @@ def test_duplicate_names_are_rejected(tmp_path):
     assert any("collides" in error for error in errors)
 
 
+def test_null_contract_fields_are_reported_and_do_not_raise(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    tool = document["agents"][0]["registered_tools"][0]
+    tool["errors"] = None
+    tool["entrypoint"] = None
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("errors must list" in error for error in errors)
+    assert any("entrypoint must be a repo-relative file path" in error for error in errors)
+
+
+def test_unsupported_schema_keywords_are_rejected(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    tool = document["agents"][0]["registered_tools"][0]
+    tool["input_schema"]["properties"]["token"]["pattern"] = "^ping$"
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("unsupported schema keywords pattern" in error for error in errors)
+
+
+def test_declared_bounds_items_and_nested_required_are_enforced():
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    tool = document["agents"][0]["registered_tools"][0]
+    tool["input_schema"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["count", "tags", "doc"],
+        "properties": {
+            "count": {"type": "integer", "minimum": 1},
+            "tags": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "doc": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {"id": {"type": "string"}},
+            },
+        },
+    }
+
+    def call(payload):
+        return call_tool("orch_registry_ping", "A01", payload, data=document)
+
+    low = call({"count": 0, "tags": ["a"], "doc": {"id": "x"}})
+    assert low["state"] == "INVALID_INPUT" and low["field"] == "count"
+    blank = call({"count": 1, "tags": [""], "doc": {"id": "x"}})
+    assert blank["state"] == "INVALID_INPUT" and blank["field"] == "tags"
+    nested = call({"count": 1, "tags": ["a"], "doc": {}})
+    assert nested["state"] == "INVALID_INPUT" and nested["field"] == "doc"
+
+
 def test_incomplete_contract_names_the_missing_field(tmp_path):
     document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
     tool = document["agents"][0]["registered_tools"][0]

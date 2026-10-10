@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from swarm.tools.support import ROOT, respond, script
+from swarm.tools.support import respond, script, target_root
 
 
 def a11y_scan(payload: dict) -> dict:
@@ -26,7 +26,7 @@ def runner_detect(payload: dict) -> dict:
     def work() -> dict:
         if payload["scan"] is not True:
             return {"state": "INVALID_INPUT", "field": "scan", "message": "scan must be true"}
-        names = [item["name"] for item in script("qa_gate").detect_runners(ROOT)]
+        names = [item["name"] for item in script("qa_gate").detect_runners(target_root())]
         return {"state": "SUCCESS", "runner_count": len(names), "has_pytest": "pytest" in names}
 
     return respond(payload, work)

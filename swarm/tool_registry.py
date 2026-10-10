@@ -10,9 +10,9 @@ import importlib
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
+
+from swarm.tools.support import StillRunning, invoke_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_FILE = Path(os.environ.get("SWARM_AGENTS_FILE", ROOT / "agents.json"))
@@ -125,14 +125,26 @@ def validate_registry(path: Path | None = None, *, root: Path | None = None) -> 
     return errors
 
 
-def call_tool(name: str, caller: str, payload: object, *, timeout_s: float | None = None, path: Path | None = None) -> dict:
-    """Call one registered tool. Unregistered names do not import a handler."""
+def call_tool(
+    name: str,
+    caller: str,
+    payload: object,
+    *,
+    timeout_s: float | None = None,
+    path: Path | None = None,
+    data: dict | None = None,
+) -> dict:
+    """Call one registered tool. Unregistered names do not import a handler.
+
+    ``data`` is the registry to use. When it is omitted, the on-disk document is loaded.
+    """
     if not isinstance(name, str) or not name:
         return {"state": "INVALID_INPUT", "field": "name", "message": "tool name is required"}
-    try:
-        data = load_document(path)
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"state": "DEPENDENCY_UNAVAILABLE", "message": f"registry unreadable: {exc}"}
+    if data is None:
+        try:
+            data = load_document(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"state": "DEPENDENCY_UNAVAILABLE", "message": f"registry unreadable: {exc}"}
     tool = _find(data, name)
     if tool is None:
         return {"state": "INVALID_INPUT", "field": "name", "message": f"tool {name!r} is not registered"}
@@ -152,8 +164,8 @@ def call_tool(name: str, caller: str, payload: object, *, timeout_s: float | Non
     limit = tool["timeout_s"] if timeout_s is None else timeout_s
     try:
         fn = _import_handler(tool["handler"])
-        raw = _invoke(fn, payload, float(limit))
-    except TimeoutError:
+        raw = invoke_bounded(fn, payload, float(limit))
+    except (TimeoutError, StillRunning):
         return {"state": "TIMEOUT", "message": f"exceeded {limit}s"}
     except OSError as exc:
         return {"state": "DEPENDENCY_UNAVAILABLE", "message": str(exc)}
@@ -239,7 +251,8 @@ def _check_tool(tool: dict, container: str, agent_ids: set, root: Path) -> tuple
     if "purpose" in tool and (not isinstance(purpose, str) or not purpose.strip() or "|" in purpose or "\n" in purpose):
         errors.append(f"{where}: purpose must be one non-empty line without '|'")
     errors.extend(_check_schemas(where, tool))
-    errors.extend(_check_errors(where, tool.get("errors")))
+    if "errors" in tool:
+        errors.extend(_check_errors(where, tool.get("errors")))
     timeout = tool.get("timeout_s")
     if "timeout_s" in tool and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3600):
         errors.append(f"{where}: timeout_s must be a number in (0, 3600]")
@@ -251,7 +264,7 @@ def _check_tool(tool: dict, container: str, agent_ids: set, root: Path) -> tuple
             errors.append(f"{where}: permitted_callers must be a non-empty list of agent ids")
         elif len(callers) != len(set(callers)):
             errors.append(f"{where}: permitted_callers contains a duplicate")
-    errors.extend(_check_entrypoint(where, tool.get("entrypoint"), tool.get("handler"), root))
+    errors.extend(_check_entrypoint(where, tool, root))
     if "examples" in tool and not errors:
         errors.extend(_check_examples(where, tool, agent_ids))
     structural = bool(errors) or bool(missing) or tool.get("stub") is True
@@ -262,6 +275,26 @@ def _conventional_name(name: str) -> bool:
     return bool(name) and name[0].islower() and all(ch.islower() or ch.isdigit() or ch == "_" for ch in name)
 
 
+_SCHEMA_KEYWORDS = {
+    "additionalProperties",
+    "const",
+    "description",
+    "enum",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minimum",
+    "properties",
+    "required",
+    "type",
+}
+
+
 def _check_schemas(where: str, tool: dict) -> list[str]:
     errors = []
     for key in ("input_schema", "output_schema"):
@@ -270,26 +303,52 @@ def _check_schemas(where: str, tool: dict) -> list[str]:
             continue
         if not isinstance(schema, dict) or schema.get("type") != "object":
             errors.append(f"{where}: {key} must be a JSON schema object with type 'object'")
+            continue
+        errors.extend(_schema_keyword_errors(f"{where}: {key}", schema))
+    return errors
+
+
+def _schema_keyword_errors(where: str, schema: dict) -> list[str]:
+    unknown = sorted(set(schema) - _SCHEMA_KEYWORDS)
+    errors = [f"{where}: unsupported schema keywords {', '.join(unknown)}"] if unknown else []
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for name, child in props.items():
+            if isinstance(child, dict):
+                errors.extend(_schema_keyword_errors(f"{where}.{name}", child))
+            else:
+                errors.append(f"{where}.{name}: schema must be an object")
+    items = schema.get("items")
+    if isinstance(items, dict):
+        errors.extend(_schema_keyword_errors(f"{where}.items", items))
+    elif items is not None:
+        errors.append(f"{where}.items: schema must be an object")
     return errors
 
 
 def _check_errors(where: str, errors_field) -> list[str]:
     if not isinstance(errors_field, list):
-        return [] if errors_field is None else [f"{where}: errors must list {', '.join(ERROR_STATES)}"]
+        return [f"{where}: errors must list {', '.join(ERROR_STATES)}"]
     if set(errors_field) != set(ERROR_STATES) or len(errors_field) != len(ERROR_STATES):
         return [f"{where}: errors must be exactly {', '.join(ERROR_STATES)}"]
     return []
 
 
-def _check_entrypoint(where: str, entrypoint, handler, root: Path) -> list[str]:
+def _check_entrypoint(where: str, tool: dict, root: Path) -> list[str]:
     errors = []
-    if isinstance(entrypoint, str):
+    entrypoint = tool.get("entrypoint")
+    handler = tool.get("handler")
+    if "entrypoint" in tool and not isinstance(entrypoint, str):
+        errors.append(f"{where}: entrypoint must be a repo-relative file path")
+    elif isinstance(entrypoint, str):
         path = Path(entrypoint)
         if path.is_absolute() or ".." in path.parts or not (root / path).is_file():
             errors.append(f"{where}: entrypoint {entrypoint!r} must be a file inside the repo")
         elif isinstance(handler, str) and _handler_file(handler) != path.as_posix():
             errors.append(f"{where}: handler {handler!r} must point at entrypoint {entrypoint!r}")
-    if isinstance(handler, str) and _handler_file(handler) is None:
+    if "handler" in tool and not isinstance(handler, str):
+        errors.append(f"{where}: handler must look like swarm.tools.<module>:<function>")
+    elif isinstance(handler, str) and _handler_file(handler) is None:
         errors.append(f"{where}: handler must look like swarm.tools.<module>:<function>")
     return errors
 
@@ -306,11 +365,15 @@ def _handler_file(handler: str) -> str | None:
 
 def _check_handler(tool: dict, root: Path) -> list[str]:
     where = f"tool {tool.get('name')} (owner {tool.get('owner')})"
+    entrypoint = tool.get("entrypoint")
+    handler = tool.get("handler")
+    if not isinstance(entrypoint, str) or not isinstance(handler, str):
+        return []
     try:
-        _import_handler(tool["handler"])
+        _import_handler(handler)
     except Exception as exc:
-        return [f"{where}: handler {tool.get('handler')!r} cannot be imported ({exc})"]
-    expected = root / tool["entrypoint"]
+        return [f"{where}: handler {handler!r} cannot be imported ({exc})"]
+    expected = root / entrypoint
     module = tool["handler"].split(":", 1)[0]
     found = Path(importlib.import_module(module).__file__ or "")
     if found.resolve() != expected.resolve():
@@ -378,22 +441,60 @@ def _value_error(spec: dict, value) -> str | None:
     elif expected == "integer":
         if isinstance(value, bool) or not isinstance(value, int):
             return "expected integer"
+        bound = _bound_error(spec, value)
+        if bound:
+            return bound
     elif expected == "number":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return "expected number"
+        bound = _bound_error(spec, value)
+        if bound:
+            return bound
     elif expected == "boolean":
         if not isinstance(value, bool):
             return "expected boolean"
     elif expected == "object":
         if not isinstance(value, dict):
             return "expected object"
+        nested = _payload_errors(spec, value)
+        if nested:
+            field, message = nested[0]
+            return f"{field}: {message}"
     elif expected == "array":
         if not isinstance(value, list):
             return "expected array"
+        minimum = spec.get("minItems")
+        maximum = spec.get("maxItems")
+        if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and len(value) < minimum:
+            return f"fewer than {minimum} items"
+        if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and len(value) > maximum:
+            return f"more than {maximum} items"
+        item_spec = spec.get("items")
+        if isinstance(item_spec, dict):
+            for index, item in enumerate(value):
+                message = _value_error(item_spec, item)
+                if message:
+                    return f"[{index}] {message}"
     if "const" in spec and value != spec["const"]:
         return f"expected {spec['const']!r}"
     if "enum" in spec and value not in spec["enum"]:
         return f"expected one of {spec['enum']!r}"
+    return None
+
+
+def _bound_error(spec: dict, value: int | float) -> str | None:
+    minimum = spec.get("minimum")
+    exclusive_minimum = spec.get("exclusiveMinimum")
+    maximum = spec.get("maximum")
+    exclusive_maximum = spec.get("exclusiveMaximum")
+    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and value < minimum:
+        return f"below minimum {minimum}"
+    if isinstance(exclusive_minimum, (int, float)) and not isinstance(exclusive_minimum, bool) and value <= exclusive_minimum:
+        return f"not above {exclusive_minimum}"
+    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and value > maximum:
+        return f"above maximum {maximum}"
+    if isinstance(exclusive_maximum, (int, float)) and not isinstance(exclusive_maximum, bool) and value >= exclusive_maximum:
+        return f"not below {exclusive_maximum}"
     return None
 
 
@@ -404,17 +505,6 @@ def _import_handler(handler: str):
     if not callable(fn):
         raise TypeError(f"{handler} is not callable")
     return fn
-
-
-def _invoke(fn, payload: dict, timeout_s: float):
-    pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(fn, payload)
-    try:
-        return future.result(timeout=timeout_s)
-    except FuturesTimeout as exc:
-        raise TimeoutError(str(exc)) from exc
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _finish(tool: dict, raw) -> dict:
