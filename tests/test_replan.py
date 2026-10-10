@@ -154,6 +154,22 @@ def test_plan_atomic_rollback(tmp_path):
     assert not (tmp_path / ".swarm" / "latest_correlation").exists()
 
 
+def test_reuse_tolerates_truncated_plan_snapshot(tmp_path):
+    """A re-plan must not traceback when the snapshot exists but the writer has not finished it."""
+    env = _env(tmp_path)
+    first = _plan(env, "--brief-text", "billing", "--prefix", "R")
+    assert first.returncode == 0, first.stdout + first.stderr
+    corr = json.loads(first.stdout)["correlation_id"]
+    snap = tmp_path / ".swarm" / "plans" / f"{corr}.json"
+    snap.write_text("")
+    again = _plan(env, "--brief-text", "billing", "--prefix", "R")
+    assert again.returncode == 0, again.stdout + again.stderr
+    out = json.loads(again.stdout)
+    assert out["reused"] is True and out["plan_file"] is None
+    assert len(out["tasks"]) == 13
+    assert "IntegrityError" not in again.stdout + again.stderr and "Traceback" not in again.stdout + again.stderr
+
+
 def test_concurrent_same_prefix_no_integrityerror(tmp_path):
     env = {**os.environ, **_env(tmp_path)}
     # initialise the DB schema first so both racers contend only on plan rows

@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -156,18 +158,51 @@ def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr, ar
     return corr
 
 
+def _tasks_from_store(store: TaskStore, corr: str) -> list:
+    return [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
+            | {"gates": store.required_gates(t["task_id"]), "notes": t["notes_json"]}
+            for t in store.list(correlation_id=corr)]
+
+
+def _read_plan_tasks(plan_file: Path) -> list | None:
+    """Tasks from a finished snapshot. None when the file is missing or not valid JSON yet."""
+    try:
+        raw = plan_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    tasks = body.get("tasks") if isinstance(body, dict) else None
+    return tasks if isinstance(tasks, list) else None
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Publish text by rename so a concurrent reader never observes a truncated file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 def _reuse_result(store: TaskStore, ctx, corr: str, pattern: str) -> dict:
     # corr comes from the Task Store here, not argv: re-check it before it names a file (WR-05)
     plan_file = swarm_dir(ctx.root, create=True) / "plans" / f"{check_task_id(corr, 'correlation id')}.json"
-    if plan_file.exists():
-        tasks = json.loads(plan_file.read_text())["tasks"]
-    else:
-        tasks = [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
-                 | {"gates": store.required_gates(t["task_id"]), "notes": t["notes_json"]}
-                 for t in store.list(correlation_id=corr)]
+    tasks = _read_plan_tasks(plan_file)
+    recorded = str(plan_file) if tasks is not None else None
+    if tasks is None:
+        tasks = _tasks_from_store(store, corr)
     ctx.correlation_id = corr
     return {"status": "ok", "correlation_id": corr, "pattern": pattern, "reused": True, "tasks": tasks,
-            "plan_file": str(plan_file) if plan_file.exists() else None,
+            "plan_file": recorded,
             "summary": f"reused existing plan for correlation {corr} ({len(tasks)} tasks, no changes)"}
 
 
@@ -284,7 +319,7 @@ def run(args, ctx) -> dict:
     sdir = swarm_dir(ctx.root, create=True)
     plans = sdir / "plans"
     plans.mkdir(parents=True, exist_ok=True)
-    (plans / f"{corr}.json").write_text(json.dumps(plan, indent=2))
+    _write_text_atomic(plans / f"{corr}.json", json.dumps(plan, indent=2))
     (sdir / "latest_correlation").write_text(corr)
     ctx.correlation_id = corr
     _bind_graph(args, ctx, corr, brief, plan["tasks"])  # before plan.updated, so that event and the exit record are tee'd

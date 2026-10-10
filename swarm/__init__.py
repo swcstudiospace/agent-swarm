@@ -7,6 +7,7 @@ envelope   swarm.envelope.v1 build/validate/sign/verify (§1)
 taskstore  SQLite Task Store implementing the task lifecycle state machine (§3)
 gates      gate verdict construction, validation and conjunction (04-integration-plan.md §5)
 manifest   agent manifest registry loaded from agents.json (07-scalability.md)
+tool_registry  tool contracts registered in agents.json, plus the call gate
 runlog     append-only JSONL event log used by every agent script
 """
 from .errors import SwarmError, ErrorCode

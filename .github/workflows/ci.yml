@@ -27,6 +27,12 @@ jobs:
         run: python3 scripts/build_agents.py --check
       - name: build_trae_agents check
         run: python3 scripts/build_trae_agents.py --check
+      - name: tool registry
+        run: python3 -m swarm.tool_registry check
+      - name: tool docs drift
+        run: python3 -m swarm.tool_registry docs --check
+      - name: tool contract tests drift
+        run: python3 -m swarm.tool_registry gen-tests --check
       - name: root TS suite
         run: bun test tests/ts
       - name: omp package suite

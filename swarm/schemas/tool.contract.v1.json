@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "swarm.tool.v1",
+  "description": "Contract every registered lane or shared tool satisfies. The checker in swarm/tool_registry.py enforces these rules; this file is the documented shape.",
+  "type": "object",
+  "required": [
+    "name",
+    "owner",
+    "purpose",
+    "input_schema",
+    "output_schema",
+    "errors",
+    "timeout_s",
+    "idempotency",
+    "permitted_callers",
+    "entrypoint",
+    "handler",
+    "examples"
+  ],
+  "properties": {
+    "name": {"type": "string", "description": "Lane-prefixed unique name: orch_, req_, arch_, ux_, be_, fe_, data_, qa_, rev_, sec_, devops_, rel_, obs_, maint_, docs_, or shared_."},
+    "owner": {"type": "string", "description": "Agent id A01–A15, or shared."},
+    "purpose": {"type": "string", "minLength": 1},
+    "input_schema": {"type": "object"},
+    "output_schema": {"type": "object"},
+    "errors": {
+      "type": "array",
+      "items": {"enum": ["INVALID_INPUT", "UNAUTHORIZED", "DEPENDENCY_UNAVAILABLE", "TIMEOUT", "PARTIAL_SUCCESS"]}
+    },
+    "timeout_s": {"type": "number", "exclusiveMinimum": 0},
+    "idempotency": {"enum": ["idempotent", "at-least-once", "unsafe"]},
+    "permitted_callers": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "entrypoint": {"type": "string"},
+    "handler": {"type": "string", "description": "swarm.tools.<module>:<function>"},
+    "examples": {"type": "object"},
+    "stub": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}
