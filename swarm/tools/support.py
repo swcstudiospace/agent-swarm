@@ -10,16 +10,24 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS: dict[str, Any] = {}
-_inflight: set[int] = set()
-_inflight_lock = threading.Lock()
+_running: set[int] = set()
+_lane = threading.Condition()
 _cancel: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar("swarm_call_cancel", default=None)
 
 
 class StillRunning(Exception):
-    """The call exceeded its limit and the worker has not finished.
+    """This call started, exceeded its limit, and the worker has not finished.
 
-    The worker is not killed. The cancel flag is set, and another call of the same
-    function is rejected until this one returns.
+    The worker is not killed. The cancel flag is set, and the function stays
+    occupied until the worker returns so a later call cannot overlap it.
+    """
+
+
+class Waiting(Exception):
+    """This call never started: the previous one still holds the function.
+
+    Independent callers wait for that worker. Timing out in the queue is not a
+    failure of a peer that did not receive this request.
     """
 
 
@@ -44,14 +52,20 @@ def sleep_until_cancelled(seconds: float) -> bool:
 def invoke_bounded(fn, arg, timeout_s: float):
     """Run ``fn(arg)`` until ``timeout_s``.
 
-    A still-running call raises StillRunning and sets the cancel flag. A second call
-    of the same function raises Busy until that worker returns.
+    One function runs at a time. A later independent call waits for the worker
+    that is already in progress, and raises Waiting if that wait exceeds its own
+    limit. A call that did start raises StillRunning, sets the cancel flag, and
+    keeps the function occupied until the worker returns.
     """
     key = id(fn)
-    with _inflight_lock:
-        if key in _inflight:
-            raise Busy(getattr(fn, "__name__", "handler"))
-        _inflight.add(key)
+    deadline = time.monotonic() + float(timeout_s)
+    with _lane:
+        while key in _running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Waiting(getattr(fn, "__name__", "handler"))
+            _lane.wait(remaining)
+        _running.add(key)
     done = threading.Event()
     outcome: dict[str, Any] = {}
     cancel = threading.Event()
@@ -64,16 +78,15 @@ def invoke_bounded(fn, arg, timeout_s: float):
             outcome["error"] = exc
         finally:
             _cancel.reset(token)
-            with _inflight_lock:
-                _inflight.discard(key)
+            with _lane:
+                _running.discard(key)
+                _lane.notify_all()
             done.set()
 
     threading.Thread(target=target, daemon=True).start()
-    if not done.wait(timeout_s):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not done.wait(remaining):
         cancel.set()
-        # A handler that watches the cancel flag can leave before the next call.
-        # One that does not stays in flight, and the next call is rejected.
-        done.wait(0.05)
         raise StillRunning(f"exceeded {timeout_s}s")
     if "error" in outcome:
         raise outcome["error"]

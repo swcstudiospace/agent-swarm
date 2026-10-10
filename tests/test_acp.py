@@ -197,6 +197,53 @@ def test_busy_handler_is_not_retried(monkeypatch):
     assert result["retryable"] is True
 
 
+def test_independent_calls_wait_and_do_not_open_the_circuit():
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def handler(envelope):
+        seen.append(envelope["correlation_id"])
+        if envelope["correlation_id"] == "first":
+            entered.set()
+            release.wait(2)
+        return {"correlation_id": envelope["correlation_id"]}
+
+    bus = Bus(sleep=lambda _seconds: None, max_attempts=1, breaker_threshold=3)
+    bus.register("A03", handler)
+    results = {}
+
+    def run(correlation_id, timeout):
+        results[correlation_id] = bus.request({**HAPPY, "correlation_id": correlation_id, "timeout_hint_s": timeout})
+
+    first = threading.Thread(target=run, args=("first", 0.05))
+    first.start()
+    assert entered.wait(1)
+    second = threading.Thread(target=run, args=("second", 2))
+    third = threading.Thread(target=run, args=("third", 2))
+    second.start()
+    third.start()
+    deadline = time.monotonic() + 1
+    while "first" not in results and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert results["first"]["state"] == "DEAD_LETTERED"
+    assert "second" not in seen
+    assert "third" not in seen
+    release.set()
+    first.join(2)
+    second.join(2)
+    third.join(2)
+    assert results["first"]["state"] == "DEAD_LETTERED"
+    assert results["first"]["attempts"] == 1
+    assert results["second"]["state"] == "RESPONDED"
+    assert results["third"]["state"] == "RESPONDED"
+    assert bus.open_circuits == set()
+    assert seen.count("second") == 1
+    assert seen.count("third") == 1
+
+
 def test_slow_handler_is_not_started_again_while_it_is_still_running():
     starts = []
 

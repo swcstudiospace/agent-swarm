@@ -119,6 +119,16 @@ def test_schema_keywords_must_apply_to_their_type(tmp_path):
     assert any("minimum" in error and "not valid for string" in error for error in errors)
 
 
+def test_schema_type_list_is_reported_without_raising(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    tool = document["agents"][0]["registered_tools"][0]
+    tool["input_schema"]["properties"]["token"] = {"type": ["string", "null"]}
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("type must be one of" in error and "token" in error for error in errors)
+
+
 def test_declared_bounds_items_and_nested_required_are_enforced():
     document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
     tool = document["agents"][0]["registered_tools"][0]
@@ -187,14 +197,15 @@ def test_timed_out_call_does_not_overlap_or_continue_into_the_tool(monkeypatch):
     assert entered.wait(1)
     overlap = call_tool("orch_registry_ping", "A01", {"token": "ping"}, timeout_s=0.05)
     assert timed_out["state"] == "TIMEOUT"
-    assert overlap["state"] == "DEPENDENCY_UNAVAILABLE"
+    assert overlap["state"] == "TIMEOUT"
+    assert overlap["message"] == "previous call is still running"
     assert worked == []
     assert active["max"] == 1
     release.set()
-    finished = {"state": "DEPENDENCY_UNAVAILABLE"}
+    finished = {"state": "TIMEOUT"}
     for _ in range(50):
         finished = call_tool("orch_registry_ping", "A01", {"token": "ping"}, timeout_s=1)
-        if finished["state"] != "DEPENDENCY_UNAVAILABLE":
+        if finished["state"] == "SUCCESS":
             break
         time.sleep(0.01)
     assert finished["state"] == "SUCCESS"

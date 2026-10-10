@@ -7,10 +7,11 @@ hardcoded peer list. Local tool calls do not consult the peer circuit breaker.
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from typing import Callable
 
-from swarm.tools.support import Busy, StillRunning, invoke_bounded
+from swarm.tools.support import Busy, StillRunning, Waiting, invoke_bounded
 
 SCHEMA = "acp.v1"
 REQUIRED = (
@@ -119,6 +120,7 @@ class Bus:
         self.audit: list[dict] = []
         self._failures: dict[str, int] = {}
         self.open_circuits: set[str] = set()
+        self._lock = threading.Lock()
 
     def register(self, agent_id: str, handler: Callable[[dict], dict]) -> None:
         self.handlers[agent_id] = handler
@@ -128,11 +130,12 @@ class Bus:
         from swarm.tool_registry import call_tool
 
         if not tool_allowed(self.data, caller, tool_name):
-            self.audit.append({
-                "caller": caller,
-                "target": tool_name,
-                "reason": "caller is not permitted to invoke this tool",
-            })
+            with self._lock:
+                self.audit.append({
+                    "caller": caller,
+                    "target": tool_name,
+                    "reason": "caller is not permitted to invoke this tool",
+                })
             return {
                 "state": "UNAUTHORIZED",
                 "caller": caller,
@@ -156,7 +159,8 @@ class Bus:
         message_type = envelope["message_type"]
         if not message_allowed(self.data, sender, recipient, message_type):
             reason = "message type is not permitted for this sender and recipient"
-            self.audit.append({"caller": sender, "target": recipient, "reason": reason, "message_type": message_type})
+            with self._lock:
+                self.audit.append({"caller": sender, "target": recipient, "reason": reason, "message_type": message_type})
             return {
                 "ok": False,
                 "state": "UNAUTHORIZED",
@@ -166,7 +170,9 @@ class Bus:
                 "attempts": 1,
                 "history": ["UNAUTHORIZED"],
             }
-        if recipient in self.open_circuits:
+        with self._lock:
+            circuit_open = recipient in self.open_circuits
+        if circuit_open:
             return self._terminal(
                 envelope,
                 "FAILED",
@@ -195,9 +201,19 @@ class Bus:
                     reason=str(exc),
                     retryable=False,
                 )
+            except Waiting:
+                # This attempt never reached the peer. Waiting out the queue is not a peer failure.
+                history.append("TIMED_OUT")
+                return self._terminal(
+                    original,
+                    "TIMED_OUT",
+                    attempts=attempt,
+                    history=history,
+                    reason="previous call is still running",
+                    retryable=True,
+                )
             except (StillRunning, Busy) as exc:
-                # The handler is still running, or a previous call has not finished.
-                # Another attempt would run it twice.
+                # The handler started and did not finish. Another attempt would run it twice.
                 history.append("DEAD_LETTERED")
                 return self._fail_peer(original, "DEAD_LETTERED", attempt, history, str(exc) or "timeout")
             except TimeoutError as exc:
@@ -247,7 +263,8 @@ class Bus:
                     reason="response correlation_id does not match the request",
                     retryable=False,
                 )
-            self._failures[recipient] = 0
+            with self._lock:
+                self._failures[recipient] = 0
             history.append("RESPONDED")
             return {
                 "ok": True,
@@ -266,10 +283,11 @@ class Bus:
 
     def _fail_peer(self, envelope: dict, state: str, attempts: int, history: list[str], reason: str) -> dict:
         recipient = envelope["recipient"]
-        self._failures[recipient] = self._failures.get(recipient, 0) + 1
-        if self._failures[recipient] >= self.breaker_threshold:
-            self.open_circuits.add(recipient)
-        self.dead.append({"envelope": envelope, "reason": reason, "state": state})
+        with self._lock:
+            self._failures[recipient] = self._failures.get(recipient, 0) + 1
+            if self._failures[recipient] >= self.breaker_threshold:
+                self.open_circuits.add(recipient)
+            self.dead.append({"envelope": envelope, "reason": reason, "state": state})
         return self._terminal(envelope, state, attempts=attempts, history=history, reason=reason)
 
     def _terminal(self, envelope: dict, state: str, *, attempts: int, history: list[str], reason: str, retryable: bool = True) -> dict:

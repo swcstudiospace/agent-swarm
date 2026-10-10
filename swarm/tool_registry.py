@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from swarm.tools.support import Busy, StillRunning, invoke_bounded
+from swarm.tools.support import Busy, StillRunning, Waiting, invoke_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_FILE = Path(os.environ.get("SWARM_AGENTS_FILE", ROOT / "agents.json"))
@@ -165,6 +165,8 @@ def call_tool(
     try:
         fn = _import_handler(tool["handler"])
         raw = invoke_bounded(fn, payload, float(limit))
+    except Waiting:
+        return {"state": "TIMEOUT", "message": "previous call is still running"}
     except Busy:
         return {"state": "DEPENDENCY_UNAVAILABLE", "message": "previous call is still running"}
     except (TimeoutError, StillRunning):
@@ -304,13 +306,15 @@ def _check_schemas(where: str, tool: dict) -> list[str]:
 
 def _schema_keyword_errors(where: str, schema: dict) -> list[str]:
     expected = schema.get("type")
-    allowed = _SCHEMA_COMMON | _SCHEMA_BY_TYPE.get(expected, set())
-    unknown = sorted(set(schema) - allowed)
+    # A list or other non-string is unhashable; never use it as a dict key.
+    supported = isinstance(expected, str) and expected in _SCHEMA_BY_TYPE
+    allowed = (_SCHEMA_COMMON | _SCHEMA_BY_TYPE[expected]) if supported else _SCHEMA_COMMON
+    unknown = sorted(key for key in schema if key not in allowed)
     errors = []
-    if expected not in _SCHEMA_TYPES:
+    if not supported:
         errors.append(f"{where}: type must be one of {', '.join(_SCHEMA_TYPES)}")
     if unknown:
-        if expected in _SCHEMA_TYPES:
+        if supported:
             errors.append(f"{where}: keywords {', '.join(unknown)} are not valid for {expected}")
         else:
             errors.append(f"{where}: unsupported schema keywords {', '.join(unknown)}")
@@ -343,6 +347,10 @@ def _keyword_value_errors(where: str, schema: dict) -> list[str]:
     required = schema.get("required")
     if "required" in schema and (not isinstance(required, list) or not all(isinstance(item, str) for item in required)):
         errors.append(f"{where}: required must be a list of strings")
+    elif isinstance(required, list) and isinstance(schema.get("properties"), dict):
+        missing = [item for item in required if item not in schema["properties"]]
+        if missing:
+            errors.append(f"{where}: required fields {', '.join(missing)} are not in properties")
     enum = schema.get("enum")
     if "enum" in schema and (not isinstance(enum, list) or not enum):
         errors.append(f"{where}: enum must be a non-empty list")
@@ -463,55 +471,84 @@ def _payload_errors(schema: dict, payload: dict) -> list[tuple[str, str]]:
 
 
 def _value_error(spec: dict, value) -> str | None:
-    expected = spec.get("type")
-    if expected == "string":
-        if not isinstance(value, str):
-            return "expected string"
-        if _is_count(spec.get("minLength")) and len(value) < spec["minLength"]:
-            return f"shorter than {spec['minLength']}"
-        if _is_count(spec.get("maxLength")) and len(value) > spec["maxLength"]:
-            return f"longer than {spec['maxLength']}"
-    elif expected == "integer":
-        if isinstance(value, bool) or not isinstance(value, int):
-            return "expected integer"
-        bound = _bound_error(spec, value)
-        if bound:
-            return bound
-    elif expected == "number":
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return "expected number"
-        bound = _bound_error(spec, value)
-        if bound:
-            return bound
-    elif expected == "boolean":
-        if not isinstance(value, bool):
-            return "expected boolean"
-    elif expected == "object":
-        if not isinstance(value, dict):
-            return "expected object"
-        nested = _payload_errors(spec, value)
-        if nested:
-            field, message = nested[0]
-            return f"{field}: {message}"
-    elif expected == "array":
-        if not isinstance(value, list):
-            return "expected array"
-        min_items = spec.get("minItems")
-        max_items = spec.get("maxItems")
-        if _is_count(min_items) and len(value) < min_items:
-            return f"fewer than {min_items} items"
-        if _is_count(max_items) and len(value) > max_items:
-            return f"more than {max_items} items"
-        item_spec = spec.get("items")
-        if isinstance(item_spec, dict):
-            for index, item in enumerate(value):
-                message = _value_error(item_spec, item)
-                if message:
-                    return f"[{index}] {message}"
+    """Enforce declared type, numeric bounds, string length, array items, and nested objects.
+
+    ``items``, ``minItems``, ``minimum``, and nested ``required`` are applied here.
+    Registration rejects keywords this function does not implement.
+    """
+    checkers = {
+        "string": _string_error,
+        "integer": _integer_error,
+        "number": _number_error,
+        "boolean": _boolean_error,
+        "object": _object_error,
+        "array": _array_error,
+    }
+    checker = checkers.get(spec.get("type")) if isinstance(spec.get("type"), str) else None
+    if checker is not None:
+        message = checker(spec, value)
+        if message:
+            return message
     if "const" in spec and value != spec["const"]:
         return f"expected {spec['const']!r}"
     if "enum" in spec and value not in spec["enum"]:
         return f"expected one of {spec['enum']!r}"
+    return None
+
+
+def _string_error(spec: dict, value) -> str | None:
+    if not isinstance(value, str):
+        return "expected string"
+    if _is_count(spec.get("minLength")) and len(value) < spec["minLength"]:
+        return f"shorter than {spec['minLength']}"
+    if _is_count(spec.get("maxLength")) and len(value) > spec["maxLength"]:
+        return f"longer than {spec['maxLength']}"
+    return None
+
+
+def _integer_error(spec: dict, value) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "expected integer"
+    return _bound_error(spec, value)
+
+
+def _number_error(spec: dict, value) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "expected number"
+    return _bound_error(spec, value)
+
+
+def _boolean_error(_spec: dict, value) -> str | None:
+    if not isinstance(value, bool):
+        return "expected boolean"
+    return None
+
+
+def _object_error(spec: dict, value) -> str | None:
+    if not isinstance(value, dict):
+        return "expected object"
+    nested = _payload_errors(spec, value)
+    if nested:
+        field, message = nested[0]
+        return f"{field}: {message}"
+    return None
+
+
+def _array_error(spec: dict, value) -> str | None:
+    if not isinstance(value, list):
+        return "expected array"
+    min_items = spec.get("minItems")
+    max_items = spec.get("maxItems")
+    if _is_count(min_items) and len(value) < min_items:
+        return f"fewer than {min_items} items"
+    if _is_count(max_items) and len(value) > max_items:
+        return f"more than {max_items} items"
+    item_spec = spec.get("items")
+    if isinstance(item_spec, dict):
+        for index, item in enumerate(value):
+            message = _value_error(item_spec, item)
+            if message:
+                return f"[{index}] {message}"
     return None
 
 
