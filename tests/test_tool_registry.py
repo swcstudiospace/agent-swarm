@@ -1,0 +1,97 @@
+"""Registry validation, the call gate, and generated docs/tests."""
+import json
+from pathlib import Path
+
+from swarm.tool_generate import SECTIONS, render_docs
+from swarm.tool_registry import call_tool, validate_registry
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_live_registry_accepts_the_pilot():
+    assert validate_registry() == []
+
+
+def test_pilot_success_echoes_the_token():
+    assert call_tool("orch_registry_ping", "A01", {"token": "ping"}) == {
+        "state": "SUCCESS",
+        "token": "ping",
+        "owner": "A01",
+    }
+
+
+def test_invalid_input_names_the_field():
+    result = call_tool("orch_registry_ping", "A01", {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"] == "token"
+
+
+def test_unauthorized_echoes_the_caller_and_does_not_run():
+    result = call_tool("orch_registry_ping", "A02", {"token": "ping"})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result["caller"] == "A02"
+    assert result["target"] == "orch_registry_ping"
+
+
+def test_unregistered_name_does_not_resolve_a_handler():
+    result = call_tool("not_a_registered_tool", "A01", {"token": "ping"})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"] == "name"
+    assert "not registered" in result["message"]
+
+
+def test_registry_pages_have_the_six_sections_and_no_placeholders():
+    data = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    pages = render_docs(data)
+    agent_pages = [text for rel, text in pages.items() if rel.startswith("docs/tools/agents/")]
+    assert len(agent_pages) == 15
+    for text in agent_pages:
+        for heading in SECTIONS:
+            assert heading in text
+        lowered = text.lower()
+        assert "todo" not in lowered
+        assert "tbd" not in lowered
+        assert "placeholder" not in lowered
+    catalog = pages["docs/tools/catalog.md"]
+    lane = sum(len(agent.get("registered_tools") or []) for agent in data["agents"])
+    shared = len(data.get("shared_tools") or [])
+    assert "`orch_registry_ping`" in catalog
+    assert f"Registered tools: {lane + shared}" in catalog
+    assert f"Shared tools: {shared}" in catalog
+
+
+def test_colliding_and_stub_contracts_are_rejected(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    pilot = document["agents"][0]["registered_tools"][0]
+    stub = json.loads(json.dumps(pilot))
+    stub["name"] = "orch_stubbed"
+    stub["stub"] = True
+    other = json.loads(json.dumps(pilot))
+    other["owner"] = "A02"
+    document["agents"][0]["registered_tools"].append(stub)
+    document["agents"][1]["registered_tools"] = [other]
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("stub contracts cannot be registered" in error for error in errors)
+    assert any("name must match req_" in error for error in errors)
+
+
+def test_duplicate_names_are_rejected(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    duplicate = json.loads(json.dumps(document["agents"][0]["registered_tools"][0]))
+    document["agents"][0]["registered_tools"].append(duplicate)
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("collides" in error for error in errors)
+
+
+def test_incomplete_contract_names_the_missing_field(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    tool = document["agents"][0]["registered_tools"][0]
+    del tool["timeout_s"]
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("missing timeout_s" in error for error in errors)
