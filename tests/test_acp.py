@@ -182,6 +182,21 @@ def test_retries_keep_the_original_envelope():
     assert HAPPY["payload"] == {"spec": "ping"}
 
 
+def test_busy_handler_is_not_retried(monkeypatch):
+    from swarm.tools.support import Busy
+
+    def boom(_fn, _arg, _timeout):
+        raise Busy("call")
+
+    monkeypatch.setattr("swarm.acp.invoke_bounded", boom)
+    bus = Bus(sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("retried")))
+    bus.register("A03", lambda envelope: {"correlation_id": envelope["correlation_id"]})
+    result = bus.request(HAPPY)
+    assert result["state"] == "DEAD_LETTERED"
+    assert result["attempts"] == 1
+    assert result["retryable"] is True
+
+
 def test_slow_handler_is_not_started_again_while_it_is_still_running():
     starts = []
 

@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-from swarm.tools.support import StillRunning, invoke_bounded
+from swarm.tools.support import Busy, StillRunning, invoke_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_FILE = Path(os.environ.get("SWARM_AGENTS_FILE", ROOT / "agents.json"))
@@ -165,6 +165,8 @@ def call_tool(
     try:
         fn = _import_handler(tool["handler"])
         raw = invoke_bounded(fn, payload, float(limit))
+    except Busy:
+        return {"state": "DEPENDENCY_UNAVAILABLE", "message": "previous call is still running"}
     except (TimeoutError, StillRunning):
         return {"state": "TIMEOUT", "message": f"exceeded {limit}s"}
     except OSError as exc:
@@ -275,23 +277,15 @@ def _conventional_name(name: str) -> bool:
     return bool(name) and name[0].islower() and all(ch.islower() or ch.isdigit() or ch == "_" for ch in name)
 
 
-_SCHEMA_KEYWORDS = {
-    "additionalProperties",
-    "const",
-    "description",
-    "enum",
-    "exclusiveMaximum",
-    "exclusiveMinimum",
-    "items",
-    "maxItems",
-    "maxLength",
-    "maximum",
-    "minItems",
-    "minLength",
-    "minimum",
-    "properties",
-    "required",
-    "type",
+_SCHEMA_TYPES = ("string", "integer", "number", "boolean", "array", "object")
+_SCHEMA_COMMON = {"const", "description", "enum", "type"}
+_SCHEMA_BY_TYPE = {
+    "string": {"maxLength", "minLength"},
+    "integer": {"exclusiveMaximum", "exclusiveMinimum", "maximum", "minimum"},
+    "number": {"exclusiveMaximum", "exclusiveMinimum", "maximum", "minimum"},
+    "boolean": set(),
+    "array": {"items", "maxItems", "minItems"},
+    "object": {"additionalProperties", "properties", "required"},
 }
 
 
@@ -309,8 +303,18 @@ def _check_schemas(where: str, tool: dict) -> list[str]:
 
 
 def _schema_keyword_errors(where: str, schema: dict) -> list[str]:
-    unknown = sorted(set(schema) - _SCHEMA_KEYWORDS)
-    errors = [f"{where}: unsupported schema keywords {', '.join(unknown)}"] if unknown else []
+    expected = schema.get("type")
+    allowed = _SCHEMA_COMMON | _SCHEMA_BY_TYPE.get(expected, set())
+    unknown = sorted(set(schema) - allowed)
+    errors = []
+    if expected not in _SCHEMA_TYPES:
+        errors.append(f"{where}: type must be one of {', '.join(_SCHEMA_TYPES)}")
+    if unknown:
+        if expected in _SCHEMA_TYPES:
+            errors.append(f"{where}: keywords {', '.join(unknown)} are not valid for {expected}")
+        else:
+            errors.append(f"{where}: unsupported schema keywords {', '.join(unknown)}")
+    errors.extend(_keyword_value_errors(where, schema))
     props = schema.get("properties")
     if isinstance(props, dict):
         for name, child in props.items():
@@ -318,12 +322,41 @@ def _schema_keyword_errors(where: str, schema: dict) -> list[str]:
                 errors.extend(_schema_keyword_errors(f"{where}.{name}", child))
             else:
                 errors.append(f"{where}.{name}: schema must be an object")
+    elif "properties" in schema:
+        errors.append(f"{where}: properties must be an object")
     items = schema.get("items")
     if isinstance(items, dict):
         errors.extend(_schema_keyword_errors(f"{where}.items", items))
-    elif items is not None:
+    elif "items" in schema:
         errors.append(f"{where}.items: schema must be an object")
     return errors
+
+
+def _keyword_value_errors(where: str, schema: dict) -> list[str]:
+    errors = []
+    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+        if key in schema and not _is_number(schema[key]):
+            errors.append(f"{where}: {key} must be a number")
+    for key in ("minLength", "maxLength", "minItems", "maxItems"):
+        if key in schema and not _is_count(schema[key]):
+            errors.append(f"{where}: {key} must be a non-negative integer")
+    required = schema.get("required")
+    if "required" in schema and (not isinstance(required, list) or not all(isinstance(item, str) for item in required)):
+        errors.append(f"{where}: required must be a list of strings")
+    enum = schema.get("enum")
+    if "enum" in schema and (not isinstance(enum, list) or not enum):
+        errors.append(f"{where}: enum must be a non-empty list")
+    if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+        errors.append(f"{where}: additionalProperties must be a boolean")
+    return errors
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _check_errors(where: str, errors_field) -> list[str]:
@@ -434,9 +467,9 @@ def _value_error(spec: dict, value) -> str | None:
     if expected == "string":
         if not isinstance(value, str):
             return "expected string"
-        if "minLength" in spec and len(value) < spec["minLength"]:
+        if _is_count(spec.get("minLength")) and len(value) < spec["minLength"]:
             return f"shorter than {spec['minLength']}"
-        if "maxLength" in spec and len(value) > spec["maxLength"]:
+        if _is_count(spec.get("maxLength")) and len(value) > spec["maxLength"]:
             return f"longer than {spec['maxLength']}"
     elif expected == "integer":
         if isinstance(value, bool) or not isinstance(value, int):
@@ -463,12 +496,12 @@ def _value_error(spec: dict, value) -> str | None:
     elif expected == "array":
         if not isinstance(value, list):
             return "expected array"
-        minimum = spec.get("minItems")
-        maximum = spec.get("maxItems")
-        if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and len(value) < minimum:
-            return f"fewer than {minimum} items"
-        if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and len(value) > maximum:
-            return f"more than {maximum} items"
+        min_items = spec.get("minItems")
+        max_items = spec.get("maxItems")
+        if _is_count(min_items) and len(value) < min_items:
+            return f"fewer than {min_items} items"
+        if _is_count(max_items) and len(value) > max_items:
+            return f"more than {max_items} items"
         item_spec = spec.get("items")
         if isinstance(item_spec, dict):
             for index, item in enumerate(value):
@@ -487,13 +520,13 @@ def _bound_error(spec: dict, value: int | float) -> str | None:
     exclusive_minimum = spec.get("exclusiveMinimum")
     maximum = spec.get("maximum")
     exclusive_maximum = spec.get("exclusiveMaximum")
-    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and value < minimum:
+    if _is_number(minimum) and value < minimum:
         return f"below minimum {minimum}"
-    if isinstance(exclusive_minimum, (int, float)) and not isinstance(exclusive_minimum, bool) and value <= exclusive_minimum:
+    if _is_number(exclusive_minimum) and value <= exclusive_minimum:
         return f"not above {exclusive_minimum}"
-    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and value > maximum:
+    if _is_number(maximum) and value > maximum:
         return f"above maximum {maximum}"
-    if isinstance(exclusive_maximum, (int, float)) and not isinstance(exclusive_maximum, bool) and value >= exclusive_maximum:
+    if _is_number(exclusive_maximum) and value >= exclusive_maximum:
         return f"not below {exclusive_maximum}"
     return None
 

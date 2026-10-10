@@ -10,7 +10,7 @@ import copy
 import time
 from typing import Callable
 
-from swarm.tools.support import StillRunning, invoke_bounded
+from swarm.tools.support import Busy, StillRunning, invoke_bounded
 
 SCHEMA = "acp.v1"
 REQUIRED = (
@@ -195,8 +195,9 @@ class Bus:
                     reason=str(exc),
                     retryable=False,
                 )
-            except StillRunning as exc:
-                # The handler is still running. Another attempt would run it twice.
+            except (StillRunning, Busy) as exc:
+                # The handler is still running, or a previous call has not finished.
+                # Another attempt would run it twice.
                 history.append("DEAD_LETTERED")
                 return self._fail_peer(original, "DEAD_LETTERED", attempt, history, str(exc) or "timeout")
             except TimeoutError as exc:

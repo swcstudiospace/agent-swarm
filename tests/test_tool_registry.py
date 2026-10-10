@@ -106,7 +106,17 @@ def test_unsupported_schema_keywords_are_rejected(tmp_path):
     path = tmp_path / "agents.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     errors = validate_registry(path)
-    assert any("unsupported schema keywords pattern" in error for error in errors)
+    assert any("pattern" in error and "not valid for string" in error for error in errors)
+
+
+def test_schema_keywords_must_apply_to_their_type(tmp_path):
+    document = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
+    tool = document["agents"][0]["registered_tools"][0]
+    tool["input_schema"]["properties"]["token"]["minimum"] = 1
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    errors = validate_registry(path)
+    assert any("minimum" in error and "not valid for string" in error for error in errors)
 
 
 def test_declared_bounds_items_and_nested_required_are_enforced():
@@ -136,6 +146,60 @@ def test_declared_bounds_items_and_nested_required_are_enforced():
     assert blank["state"] == "INVALID_INPUT" and blank["field"] == "tags"
     nested = call({"count": 1, "tags": ["a"], "doc": {}})
     assert nested["state"] == "INVALID_INPUT" and nested["field"] == "doc"
+
+
+def test_sleep_probe_does_not_run_the_tool():
+    from swarm.tools.support import respond
+
+    ran = []
+    result = respond({"probe": "sleep"}, lambda: ran.append("work") or {"state": "SUCCESS"})
+    assert result["state"] == "TIMEOUT"
+    assert ran == []
+
+
+def test_timed_out_call_does_not_overlap_or_continue_into_the_tool(monkeypatch):
+    import threading
+    import time
+
+    active = {"n": 0, "max": 0}
+    lock = threading.Lock()
+    entered = threading.Event()
+    release = threading.Event()
+    worked = []
+
+    def call(payload):
+        with lock:
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+        entered.set()
+        try:
+            if payload.get("probe") == "sleep":
+                release.wait(1)
+                return {"state": "TIMEOUT", "message": "probe sleep"}
+            worked.append(payload["token"])
+            return {"state": "SUCCESS", "token": payload["token"], "owner": "A01"}
+        finally:
+            with lock:
+                active["n"] -= 1
+
+    monkeypatch.setattr("swarm.tools.orch_registry_ping.call", call)
+    timed_out = call_tool("orch_registry_ping", "A01", {"token": "ping", "probe": "sleep"}, timeout_s=0.05)
+    assert entered.wait(1)
+    overlap = call_tool("orch_registry_ping", "A01", {"token": "ping"}, timeout_s=0.05)
+    assert timed_out["state"] == "TIMEOUT"
+    assert overlap["state"] == "DEPENDENCY_UNAVAILABLE"
+    assert worked == []
+    assert active["max"] == 1
+    release.set()
+    finished = {"state": "DEPENDENCY_UNAVAILABLE"}
+    for _ in range(50):
+        finished = call_tool("orch_registry_ping", "A01", {"token": "ping"}, timeout_s=1)
+        if finished["state"] != "DEPENDENCY_UNAVAILABLE":
+            break
+        time.sleep(0.01)
+    assert finished["state"] == "SUCCESS"
+    assert worked == ["ping"]
+    assert active["max"] == 1
 
 
 def test_incomplete_contract_names_the_missing_field(tmp_path):

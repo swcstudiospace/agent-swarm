@@ -5,13 +5,14 @@ without a task-store side effect. Callers that omit it get SUCCESS.
 """
 from __future__ import annotations
 
-import time
+from swarm.tools.support import sleep_until_cancelled
 
 
 def call(payload: dict) -> dict:
     probe = payload.get("probe")
     if probe == "sleep":
-        time.sleep(0.2)
+        sleep_until_cancelled(0.2)
+        return {"state": "TIMEOUT", "message": "probe sleep", "token": payload.get("token", ""), "owner": "A01"}
     if probe == "dependency":
         raise OSError("pilot dependency is unavailable")
     if probe == "partial":
