@@ -65,6 +65,9 @@ def invoke_bounded(fn, arg, timeout_s: float):
             if remaining <= 0:
                 raise Waiting(getattr(fn, "__name__", "handler"))
             _lane.wait(remaining)
+        # The slot can free as the wait expires. Recheck before starting the handler.
+        if time.monotonic() >= deadline:
+            raise Waiting(getattr(fn, "__name__", "handler"))
         _running.add(key)
     done = threading.Event()
     outcome: dict[str, Any] = {}

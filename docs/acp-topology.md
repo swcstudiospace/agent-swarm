@@ -53,11 +53,11 @@ A denial returns `UNAUTHORIZED` and appends `{caller, target, reason}` to `Bus.a
 
 ## Retry, dead-letter, circuit breaker
 
-Retryable failures are timeouts and connection errors. Backoff is `min(backoff_s * 2^(attempt-1), max_backoff_s)`, capped by `max_attempts` (default 3).
+Retryable failures are timeouts and connection errors. A timeout includes a call that was still queued when `timeout_hint_s` elapsed, so the handler never started. Backoff is `min(backoff_s * 2^(attempt-1), max_backoff_s)`, capped by `max_attempts` (default 3).
 
 When the budget is exhausted the bus stores the original envelope (sender, recipient, correlation id, type, payload, timestamp, timeout hint) and returns `DEAD_LETTERED`.
 
-Each exhausted delivery increments that peer's failure count. At `breaker_threshold` the circuit opens. Later sends to that peer return `FAILED` / `circuit open` immediately, with zero handler calls. Tools invoked through `invoke_tool` ignore the breaker.
+An exhausted queue wait does not increment the peer's failure count. Each exhausted delivery that reached the handler does. At `breaker_threshold` the circuit opens. Later sends to that peer return `FAILED` / `circuit open` immediately, with zero handler calls. Tools invoked through `invoke_tool` ignore the breaker.
 
 ## Worked example: happy path
 

@@ -202,16 +202,15 @@ class Bus:
                     retryable=False,
                 )
             except Waiting:
-                # This attempt never reached the peer. Waiting out the queue is not a peer failure.
-                history.append("TIMED_OUT")
-                return self._terminal(
-                    original,
-                    "TIMED_OUT",
-                    attempts=attempt,
-                    history=history,
-                    reason="previous call is still running",
-                    retryable=True,
-                )
+                # This attempt never reached the peer. Retry it like any other timeout.
+                # Exhaustion keeps the envelope and does not count as a peer failure.
+                last_error = "previous call is still running"
+                if attempt < self.max_attempts:
+                    history.append("TIMED_OUT")
+                    self.sleep(self._delay(attempt))
+                    continue
+                history.append("DEAD_LETTERED")
+                return self._save(original, "DEAD_LETTERED", attempt, history, last_error)
             except (StillRunning, Busy) as exc:
                 # The handler started and did not finish. Another attempt would run it twice.
                 history.append("DEAD_LETTERED")
@@ -280,6 +279,12 @@ class Bus:
 
     def _delay(self, attempt: int) -> float:
         return min(self.backoff_s * (2 ** (attempt - 1)), self.max_backoff_s)
+
+    def _save(self, envelope: dict, state: str, attempts: int, history: list[str], reason: str) -> dict:
+        """Keep the envelope for replay. The handler never started, so the peer did not fail."""
+        with self._lock:
+            self.dead.append({"envelope": envelope, "reason": reason, "state": state})
+        return self._terminal(envelope, state, attempts=attempts, history=history, reason=reason)
 
     def _fail_peer(self, envelope: dict, state: str, attempts: int, history: list[str], reason: str) -> dict:
         recipient = envelope["recipient"]

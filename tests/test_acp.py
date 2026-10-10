@@ -244,6 +244,111 @@ def test_independent_calls_wait_and_do_not_open_the_circuit():
     assert seen.count("third") == 1
 
 
+def test_expired_waiter_does_not_start_when_the_slot_frees(monkeypatch):
+    from swarm.tools import support
+
+    calls = []
+
+    def fn(arg):
+        calls.append(arg)
+        return arg
+
+    key = id(fn)
+    support._running.add(key)
+    started = time.monotonic()
+    jumped = {"on": False}
+    original = support.time.monotonic
+
+    def monotonic():
+        if jumped["on"]:
+            return started + 10
+        return original()
+
+    def wait(timeout=None):
+        jumped["on"] = True
+        support._running.discard(key)
+        return True
+
+    monkeypatch.setattr(support.time, "monotonic", monotonic)
+    monkeypatch.setattr(support._lane, "wait", wait)
+    try:
+        try:
+            support.invoke_bounded(fn, "x", 0.2)
+        except support.Waiting:
+            pass
+        else:
+            raise AssertionError("expired waiter started")
+    finally:
+        support._running.discard(key)
+    assert calls == []
+
+
+def test_queue_timeout_is_retried_until_the_peer_is_free():
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def handler(envelope):
+        correlation_id = envelope["correlation_id"]
+        seen.append(correlation_id)
+        if correlation_id == "holder":
+            entered.set()
+            release.wait(2)
+        return {"correlation_id": correlation_id}
+
+    bus = Bus(sleep=lambda _seconds: release.set(), max_attempts=2, breaker_threshold=1)
+    bus.register("A03", handler)
+    holder = threading.Thread(
+        target=lambda: bus.request({**HAPPY, "correlation_id": "holder", "timeout_hint_s": 1})
+    )
+    holder.start()
+    assert entered.wait(1)
+    result = bus.request({**HAPPY, "correlation_id": "queued", "timeout_hint_s": 0.05})
+    holder.join(2)
+    assert result["state"] == "RESPONDED"
+    assert result["attempts"] == 2
+    assert "TIMED_OUT" in result["history"]
+    assert seen.count("queued") == 1
+    assert bus.dead == []
+    assert bus.open_circuits == set()
+
+
+def test_exhausted_queue_wait_is_dead_lettered_without_a_peer_failure():
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def handler(envelope):
+        seen.append(envelope["correlation_id"])
+        if envelope["correlation_id"] == "holder":
+            entered.set()
+            release.wait(2)
+        return {"correlation_id": envelope["correlation_id"]}
+
+    bus = Bus(sleep=lambda _seconds: None, max_attempts=2, breaker_threshold=1)
+    bus.register("A03", handler)
+    holder = threading.Thread(
+        target=lambda: bus.request({**HAPPY, "correlation_id": "holder", "timeout_hint_s": 1})
+    )
+    holder.start()
+    assert entered.wait(1)
+    result = bus.request({**HAPPY, "correlation_id": "queued", "timeout_hint_s": 0.05})
+    assert result["state"] == "DEAD_LETTERED"
+    assert result["attempts"] == 2
+    assert result["history"].count("TIMED_OUT") == 1
+    assert "queued" not in seen
+    assert bus.dead[-1]["envelope"]["correlation_id"] == "queued"
+    assert bus.dead[-1]["envelope"]["payload"] == {"spec": "ping"}
+    assert bus._failures.get("A03", 0) == 0
+    assert bus.open_circuits == set()
+    release.set()
+    holder.join(2)
+
+
 def test_slow_handler_is_not_started_again_while_it_is_still_running():
     starts = []
 
