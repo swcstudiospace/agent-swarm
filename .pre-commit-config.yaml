@@ -1,0 +1,21 @@
+repos:
+  - repo: local
+    hooks:
+      - id: swarm-tool-registry
+        name: Swarm tool registry
+        entry: python3 -m swarm.tool_registry check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: swarm-tool-docs
+        name: Swarm tool documentation drift
+        entry: python3 -m swarm.tool_registry docs --check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: swarm-tool-contract-tests
+        name: Swarm tool contract test drift
+        entry: python3 -m swarm.tool_registry gen-tests --check
+        language: system
+        pass_filenames: false
+        always_run: true

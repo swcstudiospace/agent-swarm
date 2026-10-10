@@ -2,7 +2,20 @@
 
 Commands assume the repo root. The registry command is `python3 -m swarm.tool_registry`. Docs and contract tests are generated; do not hand-edit `docs/tools/` or `tests/generated/test_tool_contracts.py`.
 
-CI (`.github/workflows/ci.yml`) runs `check`, `docs --check`, and `gen-tests --check` on every push and pull request. That is the drift gate. Run the same three commands locally before pushing. A pre-commit hook is the same three commands if an operator wants them on commit; CI remains the gate that fails the branch.
+CI (`.github/workflows/ci.yml`) runs `check`, `docs --check`, and `gen-tests --check` on every push and pull request. `.pre-commit-config.yaml` runs the same three checks before a commit when the hook is installed. Both checks are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
+
+## Enable the commit-time drift gate
+
+Install the optional `pre-commit` development tool, then run:
+
+```bash
+pre-commit install
+pre-commit run --all-files
+```
+
+The hooks use the existing `python3` runtime, pass no filenames, and run even when the staged files are unrelated to the registry. At commit time, pre-commit temporarily stashes unstaged changes, so the checks see the staged snapshot. If a hook fails, regenerate the docs and contract tests using the commands below, stage the generated files with the registry change, and retry.
+
+Without pre-commit, run `python3 -m swarm.tool_registry check`, `docs --check`, and `gen-tests --check` locally before pushing. The swarm runtime does not depend on pre-commit, and the existing CI checks remain active.
 
 ## Add a lane tool
 
