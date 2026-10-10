@@ -17,6 +17,13 @@ The hooks use the existing `python3` runtime, pass no filenames, and run even wh
 
 Without pre-commit, run `python3 -m swarm.tool_registry check`, `docs --check`, and `gen-tests --check` locally before pushing. The swarm runtime does not depend on pre-commit, and the existing CI checks remain active.
 
+## Validate the omp shell guard
+
+From `omp/`, run `bun run test`, not a bare full `bun test`: the extension registration test mocks `node:fs` and runs in its own process.
+
+The raw shell scanners retain literal spans by index, and plain unquoted words are reused instead of rebuilt character by character. Quote, escape, comment, heredoc and operator handling is unchanged. The WR-09 regression still checks the original million-byte inputs, the 40× differential cap, and the 3× cap for doubling the same input shape from 400 KB to 800 KB.
+
+
 ## Add a lane tool
 
 1. Pick the owner agent and the prefix from the manifest (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`). The name must be unique.

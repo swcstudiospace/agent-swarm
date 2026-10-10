@@ -384,6 +384,7 @@ const ANSI_ESCAPE: Record<string, string> = {
  * and newline; `$'…'` with its C escapes decoded; a bare `\x` is x), and whether every quote it opens is closed.
  */
 function dequote(word: string): { text: string; closed: boolean } {
+  if (!/["'\\]/.test(word)) return { text: word, closed: true };
   let text = "";
   let quote: string | undefined;
   for (let i = 0; i < word.length; i++) {
@@ -418,31 +419,26 @@ const unquote = (word: string): string => dequote(word).text;
  */
 function shellWords(text: string): string[] {
   const words: string[] = [];
-  let cur = "";
+  let start = 0;
   let quote: string | undefined;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (quote !== undefined) {
-      if (c === "\\" && quote !== "'" && i + 1 < text.length) cur += c + text[++i];
-      else {
-        cur += c;
-        if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
-      }
+      if (c === "\\" && quote !== "'" && i + 1 < text.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
     } else if (c === " " || c === "\t" || c === "\n" || c === "\r") {
-      if (cur !== "") words.push(cur);
-      cur = "";
+      if (start < i) words.push(text.slice(start, i));
+      start = i + 1;
     } else if (c === "$" && text[i + 1] === "'") {
-      cur += "$'";
       quote = "$'";
       i++;
     } else {
-      cur += c;
       if (c === "'" || c === '"') quote = c;
-      else if (c === "\\" && i + 1 < text.length) cur += text[++i];
+      else if (c === "\\" && i + 1 < text.length) i++;
     }
   }
   if (quote !== undefined) return text.split(/\s+/).filter((w) => w !== "");
-  if (cur !== "") words.push(cur);
+  if (start < text.length) words.push(text.slice(start));
   return words;
 }
 
@@ -544,19 +540,21 @@ interface Piece {
  */
 function splitTopLevel(text: string, quotesOn = true): Piece[] {
   const out: Piece[] = [];
-  let cur = "";
-  let blank = true; // cur holds only whitespace
+  // Preserve literal spans by index instead of allocating a string node for every character.
+  let from = 0;
+  let to = 0;
+  let blank = true; // the segment holds only whitespace
   let quote: string | undefined;
   let quoteAt = 0;
   let quoteOut = 0;
-  let quoteCur = "";
+  let quoteFrom = 0;
   let heredoc: string | undefined;
   let redirect = false; // the previous character is an unquoted, unescaped `<` or `>`
   let plain = ""; // the previous character when it was a plain one (not quoted, escaped or an operator)
   let extglob = 0; // open extglob groups, whose `|` and parentheses belong to the word
-  const boundary = (end: Op) => {
-    out.push({ text: cur, end });
-    cur = "";
+  const boundary = (end: Op, next: number) => {
+    out.push({ text: text.slice(from, to), end });
+    from = to = next;
     blank = true;
   };
   /** The index of the newline that ends the heredoc delimiter line at or after `from` (text.length when absent). */
@@ -582,11 +580,9 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
     plain = "";
     if (quote !== undefined) {
       // an escaped character never closes the quote, and stays in the text as written
-      if (c === "\\" && quote !== "'" && i + 1 < text.length) cur += c + text[++i];
-      else {
-        cur += c;
-        if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
-      }
+      if (c === "\\" && quote !== "'" && i + 1 < text.length) i++;
+      else if (c === (quote === "$'" ? "'" : quote)) quote = undefined;
+      to = i + 1;
       continue;
     }
     if (quotesOn && (c === "'" || c === '"')) {
@@ -594,10 +590,11 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
       quote = c === "'" && before === "$" ? "$'" : c;
       quoteAt = i;
       quoteOut = out.length;
-      quoteCur = cur;
-      cur += c;
+      quoteFrom = from;
+      to = i + 1;
     } else if (c === "\\" && i + 1 < text.length) {
-      cur += c + text[++i];
+      i++;
+      to = i + 1;
       blank = false;
     } else if (c === "#" && (blank || /\s/.test(text[i - 1]))) {
       // a comment runs to the end of the line; the newline itself is the segment boundary
@@ -605,57 +602,58 @@ function splitTopLevel(text: string, quotesOn = true): Piece[] {
       i = (nl === -1 ? text.length : nl) - 1;
     } else if (c === "<" && text[i + 1] === "<" && text[i + 2] !== "<" && (m = heredocAt(i)) !== null) {
       heredoc = m[1] ?? m[2] ?? m[3];
-      cur += m[0];
       blank = false;
       i += m[0].length - 1;
+      to = i + 1;
     } else if (c === "\n") {
-      boundary(";");
+      boundary(";", i + 1);
       if (heredoc !== undefined) {
         const end = heredocEnd(i + 1);
         out[out.length - 1].body = text.slice(i + 1, end);
         i = end;
         heredoc = undefined;
+        from = to = i + 1;
       }
     } else if (extglob > 0 && (c === "(" || c === ")" || c === "|")) {
-      cur += c;
+      to = i + 1;
       if (c !== "|") extglob += c === "(" ? 1 : -1;
-    } else if (c === "(" && /[@!+*?]/.test(before) && !(before === "!" && cur.trim() === "!")) {
+    } else if (c === "(" && /[@!+*?]/.test(before) && !(before === "!" && text.slice(from, to).trim() === "!")) {
       // an extglob group `@(…)`, `x!(…)`, `*(…)`: part of the word, not a subshell (`! (…)` negates one)
       extglob = 1;
-      cur += c;
+      to = i + 1;
     } else if (c === "|" && afterRedirect && text[i - 1] === ">") {
       // `>|`, `2>|`, `&>|`: a noclobber-override redirection, not a pipe
-      cur += c;
+      to = i + 1;
     } else if (c === ";" || c === "|" || (c === "&" && text[i + 1] === "&")) {
       const double = c !== ";" && text[i + 1] === c;
       if (double) i++;
       // `|&` pipes stderr too: one pipe
       else if (c === "|" && text[i + 1] === "&") i++;
-      boundary(c === ";" ? ";" : c === "&" ? "&&" : double ? "||" : "|");
+      boundary(c === ";" ? ";" : c === "&" ? "&&" : double ? "||" : "|", i + 1);
     } else if (c === "&" && text[i + 1] !== ">" && !afterRedirect) {
       // a lone `&` runs what precedes it in the background (`>&`, `&>`, `2>&1` are redirections)
-      boundary("&");
+      boundary("&", i + 1);
     } else if (c === "(" || c === ")") {
       // a subshell `( … )`: its body is its own segment list (`$(…)` was cut out before the split)
-      boundary(c);
+      boundary(c, i + 1);
     } else if (c === "{" && blank && (i + 1 === text.length || /\s/.test(text[i + 1]))) {
       // a brace group `{ …; }` opener as a word of its own (`${VAR}` and `{a,b}` are glued, never split)
-      boundary("{");
+      boundary("{", i + 1);
     } else if (c === "}" && (i === 0 || /[\s;]/.test(text[i - 1])) && (i + 1 === text.length || /[\s;&|)]/.test(text[i + 1]))) {
-      boundary("}");
+      boundary("}", i + 1);
     } else {
-      cur += c;
+      to = i + 1;
       if (blank && !/\s/.test(c)) blank = false;
       redirect = c === "<" || c === ">";
       plain = c;
     }
   }
-  boundary("");
+  boundary("", text.length);
   if (quote !== undefined) {
     // bash would reject an unterminated quote; a heredoc or comment the scan missed is the likelier reading
     const tail = splitTopLevel(text.slice(quoteAt + 1), false);
     out.length = quoteOut;
-    tail[0] = { ...tail[0], text: `${quoteCur}${quote}${tail[0].text}` };
+    tail[0] = { ...tail[0], text: `${text.slice(quoteFrom, quoteAt)}${quote}${tail[0].text}` };
     out.push(...tail);
   }
   return out;
