@@ -12,7 +12,7 @@ Grok Bot: grokbot/swarm/seat-map.json and grokbot/skills/swarm-<lane>/SKILL.md
 
 Run after editing any prompt or the manifest:  python3 scripts/build_agents.py [--check]
 Install into a workspace:  python3 scripts/build_agents.py --install-workspace <ws> [--omp-mode link|copy] [--dry-run]
-                               [--runtimes claude,grok,omp | --no-substrate] [--with-a01-complete-hook] [--allow-shadowed-copy]
+                               [--runtimes claude,grok,omp,cursor | --no-substrate] [--with-a01-complete-hook] [--allow-shadowed-copy]
 The install also wires substrate-mcp (scripts/_install_substrate.py): the `substrate` MCP entry for each runtime and one
 0600 env file per agent holding its SUBSTRATE_TOKEN, read from SUBSTRATE_TOKEN_<SURFACE> (docs/substrate-workspace.md).
 Copy Cursor agents only (no substrate, no MCP, no env files):
