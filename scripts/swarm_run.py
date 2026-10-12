@@ -172,7 +172,13 @@ def preflight_signing() -> None:
     if err:
         raise SwarmError(ErrorCode.E_POLICY, err)
     if not real_key_configured() and insecure_dev_key() is None:
-        raise SwarmError(ErrorCode.E_POLICY, "fail-closed: no signing key configured")
+        raise SwarmError(
+            ErrorCode.E_POLICY,
+            "fail-closed: no signing key configured — task transitions and gate verdicts are signed, so a run"
+            " cannot start without one. Set SWARM_ED25519_KEY to a 64-hex Ed25519 seed (or SWARM_SIGNING_KEY to"
+            " any secret) and re-run; SWARM_ALLOW_INSECURE_DEV_KEY=1 permits an unsigned local dev key (never"
+            " combine it with SWARM_REQUIRE_KEY=1).",
+        )
 
 
 def preflight_auth(claude_bin: str) -> None:
