@@ -585,7 +585,7 @@ def test_skill_frontmatter_is_name_and_description_only():
     assert "SWARM_ROOT" in text
 
 
-_SUBSTRATE_PATHS = ("swarm/substrate_mcp.json", "scripts/_install_substrate.py")
+_SUBSTRATE_PATHS = ("scripts/_install_substrate.py",)
 _BRANCH_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 
@@ -644,6 +644,19 @@ def substrate_base_ref() -> str:
         f"none of {', '.join(_candidate_refs())} resolved and "
         f"git fetch --depth=1 origin of {', '.join(_base_names())} did not create one"
     )
+
+
+def test_substrate_spec_adds_cursor_without_a_token_value():
+    spec = json.loads((ROOT / "swarm" / "substrate_mcp.json").read_text(encoding="utf-8"))
+    assert spec["runtimes"]["cursor"] == {"path": ".cursor/mcp.json", "format": "json"}
+    assert spec["runtimes"]["claude"]["path"] == ".mcp.json"
+    assert spec["runtimes"]["omp"]["path"] == ".mcp.json"
+    assert spec["runtimes"]["grok"]["path"] == ".grok/config.toml"
+    rendered = json.dumps(spec)
+    assert "${SUBSTRATE_URL}/mcp" in rendered
+    assert "Bearer ${SUBSTRATE_TOKEN}" in rendered
+    assert "http://" not in rendered
+    assert "SUBSTRATE_TOKEN" not in (ROOT / "scripts" / "_install_cursor.py").read_text(encoding="utf-8")
 
 
 def test_substrate_spec_is_byte_identical_to_main():

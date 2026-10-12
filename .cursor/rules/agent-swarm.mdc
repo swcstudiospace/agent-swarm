@@ -11,7 +11,9 @@ alwaysApply: false
 
 `<this repo>` is the git toplevel of the repository you are editing. If `SWARM_ROOT` is unset, repo-local `scripts/` are swarm tools only inside the agent-swarm checkout itself (it contains `swarm/taskstore.py` and `scripts/orch_plan.py`). In any other repo, including one that already has a `scripts/` directory, stop and report `BLOCKED` with `needs` `SWARM_ROOT`. Do not run that repo's `scripts/` as swarm tools.
 
-Cursor cloud sessions are advisory. No signing key is present (`SWARM_ED25519_KEY` and `SWARM_REQUIRE_KEY` are unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
+Cursor cloud sessions are advisory. No signing key is present (`SWARM_ED25519_KEY` and `SWARM_REQUIRE_KEY` are unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality. A cloud session does not set `SUBSTRATE_URL` and does not hold `SUBSTRATE_TOKEN`.
+
+An SDLC prompt that ultrathink already uplifted is classified from its unescaped `<ORIGINAL>` text. Pass that plan's Graph ID to `orch_plan.py --graph-id` so the substrate tee can `graph_bind` the correlation. Do not start `swarm_run.py` or `hooks/autonomous_run.py`.
 
 Nesting stops at two levels. The parent session may spawn `a01-orchestrator`. A01 may spawn the other fourteen slugs with the Task tool (`subagent_type` is the slug). Those specialists must not spawn further subagents.
 
