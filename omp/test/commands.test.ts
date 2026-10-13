@@ -2,7 +2,7 @@
  * `/swarm <brief>` (ORCH-03, D-11): the ordered plan → dispatch → wait → report log through the registered command,
  * with a recording bridge; usage / plan-mode / conflict paths never dispatch.
  */
-import { expect, spyOn, test } from "bun:test";
+import { beforeEach, expect, spyOn, test } from "bun:test";
 import { type Bridge, type BridgeRequest, type BridgeResult, runPy, SwarmToolError } from "../src/bridge.ts";
 import { HOLD_ENV, holdTimeoutMs, parseSwarmArgs, swarmCommand, swarmCorrelationId } from "../src/commands.ts";
 import { DISPATCH_MARKER } from "../src/hooks.ts";
@@ -12,36 +12,41 @@ import {
   type CallLog,
   callTool,
   commandCtx,
+  ephemeralSigningKey,
   fakeCtx,
   fakePi,
   fakeTurn,
   gitRepo,
   isolateEnv,
+  REPO_ROOT,
+  runPython,
   type ScriptedTurn,
   tmpDir,
   withOmpArgv,
 } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_AGENT", HOLD_ENV);
+isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_AGENT", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+  "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_REQUIRE_KEY", HOLD_ENV);
 
 const CORR = "c0ffee01-2222-4333-8444-555555555555";
 const BRIEF = "add a /health endpoint";
 const BRIEF_CORR = swarmCorrelationId({ brief: BRIEF, pattern: "feature", risk_class: "medium" });
-const PLAN: BridgeResult = {
-  exitCode: 0,
-  json: {
-    status: "ok",
-    correlation_id: CORR,
-    pattern: "feature",
-    tasks: [
-      { task_id: "Tc0ff-req", agent_id: "a02", depends_on: [] },
-      { task_id: "Tc0ff-arch", agent_id: "a03", depends_on: ["Tc0ff-req"] },
-      { task_id: "Tc0ff-be", agent_id: "a05", depends_on: ["Tc0ff-arch", "Tc0ff-req"] },
-    ],
-    summary: `created 3 tasks for correlation ${CORR}\nTc0ff-req a02 d=0 ← -`,
-  },
-  swarmDir: "",
-};
+const PLAN: BridgeResult = { exitCode: 0, json: {}, swarmDir: "" };
+
+let fixtureSigningKey = "";
+// Every dispatch fixture comes from canonical Python signing with test-owned key material, not a fake signature.
+beforeEach(() => {
+  fixtureSigningKey = ephemeralSigningKey();
+  process.env.SWARM_SIGNING_KEY = fixtureSigningKey;
+  for (const key of ["SWARM_ROOT", "SWARM_AGENT", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_ALLOW_INSECURE_DEV_KEY"]) {
+    delete process.env[key];
+  }
+  process.env.SWARM_REQUIRE_KEY = "1";
+  process.env.SWARM_DIR = tmpDir("swarm-omp-fixture-");
+  const planned = runPython("orch_plan.py", [`--root=${gitRepo()}`, `--brief-text=${BRIEF}`, `--correlation-id=${CORR}`], {});
+  if (planned.code !== 0 || planned.json.execution_assignment_verified !== true) throw new Error("canonical signed planning fixture failed");
+  PLAN.json = planned.json;
+});
 const HINT = `prefix Tc0ff already used by correlation ${CORR} with a different brief; pass a new --correlation-id or --prefix for this brief`;
 const PLAN_MODE: SessionEntry[] = [{ type: "mode_change", mode: "plan" }];
 
@@ -67,6 +72,50 @@ function payload(text: string): Record<string, unknown> {
   if (!line) throw new Error(`no payload line in:\n${text}`);
   return JSON.parse(line);
 }
+
+/** Consumer-side verification uses only this test's signer, never a host key or private-reference loader. */
+function dispatchEvidence(envelope: Record<string, unknown>, correlationId: string): { verified: boolean; authorized: boolean } {
+  const verification = Bun.spawnSync(["python3", "-c", `
+import json, sys
+from swarm.envelope import verify_envelope
+
+envelope = json.load(sys.stdin)
+assignment = envelope.get("payload", {})
+inputs = assignment.get("inputs", [])
+plan = inputs[0] if len(inputs) == 1 else {}
+tasks = plan.get("tasks", [])
+complete = {task["task_id"] for task in tasks if task["state"] in ("IN_REVIEW", "APPROVED", "DONE")}
+ready = {task["task_id"] for task in tasks
+         if task["state"] in ("CREATED", "VALIDATED", "PLANNED", "RETRY")
+         and all(dependency in complete for dependency in task["depends_on"])}
+assigned_ready = assignment.get("ready_tasks", [])
+authorized = (
+    envelope.get("schema") == "swarm.v1.task.assign"
+    and envelope.get("type") == "task.assign"
+    and envelope.get("source") == "A01@controller"
+    and envelope.get("target") == assignment.get("agent_id") == "A01"
+    and assignment.get("capability") == "plan.execute"
+    and envelope.get("correlation_id") == assignment.get("correlation_id") == assignment.get("task_id") == plan.get("correlation_id") == sys.argv[1]
+    and assignment.get("risk_class") == envelope.get("risk_class")
+    and isinstance(assignment.get("budget"), dict)
+    and isinstance(assignment.get("acceptance"), list)
+    and all(isinstance(criterion, str) for criterion in assignment["acceptance"])
+    and bool(tasks)
+    and len(assigned_ready) == len(set(assigned_ready)) == len(ready)
+    and set(assigned_ready) == ready
+)
+print(json.dumps({"verified": verify_envelope(envelope), "authorized": authorized}))
+`, correlationId], {
+    cwd: REPO_ROOT,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", SWARM_SIGNING_KEY: fixtureSigningKey, SWARM_REQUIRE_KEY: "1" },
+    stdin: Buffer.from(JSON.stringify(envelope)),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(verification.exitCode).toBe(0);
+  expect(verification.stderr.toString()).toBe("");
+  return JSON.parse(verification.stdout.toString());
+}
 /** The task ids in a swarm_status result. */
 function statusTaskIds(details: unknown): string[] {
   if (!details || typeof details !== "object" || !("tasks" in details) || !Array.isArray(details.tasks)) throw new Error("no tasks in status");
@@ -76,31 +125,26 @@ function statusTaskIds(details: unknown): string[] {
   });
 }
 
-test("dispatch order: bridge orch_plan with the shared argv, then sendUserMessage, then waitForIdle, then notify", async () => {
+test("kickoff dispatches a cryptographically valid controller assignment for the canonical plan", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log }));
 
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
-  const req = bridgeReq(log);
-  expect(req?.script).toBe("orch_plan");
-  expect(req?.cwd).toBe(repo);
-  expect(req?.args).toEqual([`--root=${repo}`, `--brief-text=${BRIEF}`, "--pattern=feature", "--risk-class=medium", `--correlation-id=${BRIEF_CORR}`]);
-
   const text = dispatchText(log) ?? "";
   expect(text.startsWith(DISPATCH_MARKER)).toBe(true);
   expect(text).toContain("a01-orchestrator");
-  expect(text).toContain("task");
-  expect(payload(text)).toEqual({ correlation_id: CORR, capability: "plan.execute", ready_tasks: ["Tc0ff-req"] });
-  expect(log.at(-1)?.message).toContain(CORR);
+  expect(dispatchEvidence(payload(text), CORR)).toEqual({ verified: true, authorized: true });
+  expect(calls(log)).toContain("waitForIdle");
+  expect(log.at(-1)?.level).toBe("info");
 });
 
-test("no UI: same order without notify; the plan summary travels in the dispatch text", async () => {
+test("no UI: the same authorized assignment dispatches and is awaited without notification", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log, hasUI: false }));
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle"]);
-  expect(dispatchText(log)).toContain(`created 3 tasks for correlation ${CORR}`);
+  expect(dispatchEvidence(payload(dispatchText(log) ?? ""), CORR)).toEqual({ verified: true, authorized: true });
+  expect(calls(log)).toContain("waitForIdle");
+  expect(calls(log)).not.toContain("notify");
 });
 
 /** The dispatch user message as omp records it on the branch once the turn starts. */
@@ -337,10 +381,107 @@ test.each<[string, Error | BridgeResult]>([
 
 test("reused plan: an identical brief dispatches normally", async () => {
   const repo = gitRepo();
-  const { log, swarm } = session({ ...PLAN, json: { ...PLAN.json, reused: true, summary: `reused existing plan for correlation ${CORR}` } });
+  const { log, swarm } = session({ ...PLAN, json: { ...PLAN.json, reused: true } });
   await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log }));
-  expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle", "notify"]);
-  expect(payload(dispatchText(log) ?? "").ready_tasks).toEqual(["Tc0ff-req"]);
+  expect(dispatchEvidence(payload(dispatchText(log) ?? ""), CORR)).toEqual({ verified: true, authorized: true });
+  expect(calls(log)).toContain("waitForIdle");
+  expect(log.at(-1)?.level).toBe("info");
+});
+
+test.each(["unsigned", "tampered", "mismatched"])(
+  "consumer verification rejects %s assignments and its failed attestation prevents dispatch",
+  async (fault) => {
+    const original = session();
+    await original.swarm.handler(BRIEF, commandCtx(gitRepo(), [], { log: original.log }));
+    const envelope = payload(dispatchText(original.log) ?? "");
+    expect(dispatchEvidence(envelope, CORR)).toEqual({ verified: true, authorized: true });
+    if (fault === "unsigned") delete envelope.sig;
+    if (fault === "tampered") envelope.ttl_s = Number(envelope.ttl_s) + 1;
+    if (fault === "mismatched") envelope.target = "A05";
+    const evidence = dispatchEvidence(envelope, CORR);
+    expect(evidence.verified).toBe(false);
+    expect(evidence.authorized).toBe(fault !== "mismatched");
+    const { log, swarm } = session({
+      ...PLAN,
+      json: { ...PLAN.json, execution_assignment: envelope, execution_assignment_verified: evidence.verified },
+    });
+    await swarm.handler(BRIEF, commandCtx(gitRepo(), [], { log }));
+    expect(calls(log)).not.toContain("sendUserMessage");
+    expect(calls(log)).not.toContain("waitForIdle");
+    expect(log.at(-1)?.level).toBe("error");
+    expect(log.at(-1)?.message).toContain("E-POLICY");
+  },
+);
+
+test.each([
+  "unsuccessful plan",
+  "absent", "unverified", "missing verification", "model assertion", "missing signature", "advisory", "schema", "type", "source", "target", "outer correlation",
+  "payload correlation", "controller identity", "agent", "capability", "ready tasks", "duplicate ready tasks",
+  "missing plan", "plan correlation", "plan task mismatch", "malformed tasks", "missing budget", "risk mismatch",
+])("assignment denial (%s): no A01 turn, no wait, no envelope leakage", async (fault) => {
+  const result = structuredClone(PLAN);
+  const json = result.json;
+  const envelope = json.execution_assignment as Record<string, unknown>;
+  const assign = envelope.payload as Record<string, unknown>;
+  const plan = (assign.inputs as Array<Record<string, unknown>>)[0];
+  switch (fault) {
+    case "unsuccessful plan": json.status = "error"; break;
+    case "absent": delete json.execution_assignment; break;
+    case "unverified": json.execution_assignment_verified = false; break;
+    case "advisory": envelope.sig = "advisory:UNTRUSTED-SENSITIVE"; break;
+    case "missing verification": delete json.execution_assignment_verified; break;
+    case "model assertion": json.execution_assignment_verified = "true"; break;
+    case "missing signature": delete envelope.sig; break;
+    case "schema": envelope.schema = "swarm.v1.task.result"; break;
+    case "type": envelope.type = "task.result"; break;
+    case "source": envelope.source = "A01"; break;
+    case "target": envelope.target = "A05"; break;
+    case "outer correlation": envelope.correlation_id = "other"; break;
+    case "payload correlation": assign.correlation_id = "other"; break;
+    case "controller identity": assign.task_id = "other"; break;
+    case "agent": assign.agent_id = "A05"; break;
+    case "capability": assign.capability = "code.backend"; break;
+    case "ready tasks": assign.ready_tasks = ["not-in-plan"]; break;
+    case "duplicate ready tasks": assign.ready_tasks = [...assign.ready_tasks as string[], ...assign.ready_tasks as string[]]; break;
+    case "missing plan": assign.inputs = []; break;
+    case "plan correlation": plan.correlation_id = "other"; break;
+    case "plan task mismatch": (plan.tasks as Array<Record<string, unknown>>)[0].task_id = "other"; break;
+    case "malformed tasks": json.tasks = [{ task_id: "missing-state", depends_on: [] }]; break;
+    case "missing budget": delete assign.budget; break;
+    case "risk mismatch": assign.risk_class = "other"; break;
+  }
+  json.summary = "UNTRUSTED-SENSITIVE";
+  const { log, swarm } = session(result);
+  const entries: SessionEntry[] = [];
+  let idleReads = 0;
+  await swarm.handler(BRIEF, commandCtx(gitRepo(), entries, { log, isIdle: () => (idleReads++, false) }));
+  expect(calls(log)).toEqual(["bridge", "notify"]);
+  expect(idleReads).toBe(0);
+  expect(entries).toEqual([]);
+  expect(log.at(-1)?.level).toBe("error");
+  expect(log.at(-1)?.message).toContain("E-POLICY");
+  expect(log.at(-1)?.message).not.toContain("UNTRUSTED-SENSITIVE");
+});
+
+test("unsigned legacy planning remains available but cannot dispatch even without a UI", async () => {
+  delete process.env.SWARM_SIGNING_KEY;
+  delete process.env.SWARM_REQUIRE_KEY;
+  const log: CallLog = [];
+  const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
+  pi.load(createSwarmExtension({ bridge: runPy }));
+  const { out, err } = await capturedStreams(() => pi.command("swarm").handler(BRIEF, commandCtx(gitRepo(), [], { log, hasUI: false })));
+  expect(calls(log)).toEqual([]);
+  expect(out).toEqual([]);
+  expect(err).toHaveLength(1);
+  expect(err[0]).toContain("dispatch refused");
+  expect(err[0]).not.toContain('"payload"');
+});
+
+test("child session: only a top-level controller may plan and dispatch", async () => {
+  const { log, swarm } = session();
+  await swarm.handler(BRIEF, commandCtx(gitRepo(), [{ type: "session_init", agent: "a01-orchestrator" }], { log }));
+  expect(calls(log)).toEqual(["notify"]);
+  expect(log[0].message).toContain("top-level controller");
 });
 
 /** stdout/stderr writes during `run`, with the streams restored afterwards. */
@@ -393,18 +534,6 @@ test("no UI: a dispatch that never starts reports on stderr; a dispatched plan w
   expect(ok.err).toEqual([]);
 });
 
-test("ready ids: exactly the tasks whose depends_on is empty, in result order", async () => {
-  const repo = gitRepo();
-  const tasks = [
-    { task_id: "X-a", depends_on: ["X-c"] },
-    { task_id: "X-b", depends_on: [] },
-    { task_id: "X-c", depends_on: [] },
-    { task_id: "X-d" },
-  ];
-  const { log, swarm } = session({ ...PLAN, json: { ...PLAN.json, tasks } });
-  await swarm.handler("add a /health endpoint", commandCtx(repo, [], { log }));
-  expect(payload(dispatchText(log) ?? "").ready_tasks).toEqual(["X-b", "X-c"]);
-});
 
 test("scoped bridge: the command and swarm_plan share one session's inflight set; another session has its own", async () => {
   const repo = gitRepo();
@@ -435,7 +564,12 @@ test("real orch_plan: the same brief reuses one plan; a different brief gets its
   process.env.SWARM_DIR = tmpDir("swarm-omp-dir-");
   const log: CallLog = [];
   const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
-  pi.load(createSwarmExtension({ bridge: runPy }));
+  const planned: BridgeResult[] = [];
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    const result = await runPy(req);
+    if (req.script === "orch_plan") planned.push(result);
+    return result;
+  } }));
   const swarm = pi.command("swarm");
   const ctx = commandCtx(repo, [], { log, hasUI: false });
 
@@ -444,20 +578,52 @@ test("real orch_plan: the same brief reuses one plan; a different brief gets its
   await swarm.handler("fix the login bug --pattern=hotfix", ctx);
   const texts = log.filter((e) => e.call === "sendUserMessage").map((e) => String(e.text));
   expect(texts).toHaveLength(3);
+  expect(planned).toHaveLength(3);
+  const expectedCorrelations = [BRIEF_CORR, BRIEF_CORR, swarmCorrelationId({
+    brief: "fix the login bug", pattern: "hotfix", risk_class: "medium",
+  })];
+  for (let i = 0; i < planned.length; i++) {
+    expect(planned[i].json.execution_assignment_verified).toBe(true);
+    expect(dispatchEvidence(payload(texts[i]), expectedCorrelations[i])).toEqual({ verified: true, authorized: true });
+  }
+  expect(planned[1].json.reused).toBe(true);
 
-  const [first, again, other] = texts.map(payload);
+  const [first, again, other] = texts.map(payload) as Array<{ correlation_id: string; payload: { ready_tasks: string[]; task_id: string; correlation_id: string } }>;
   expect(first.correlation_id).toBe(BRIEF_CORR);
-  expect(again).toEqual(first);
-  expect(texts[0]).toContain(`is ready: 13 tasks`);
-  expect(texts[1]).toContain(`is reused: 13 tasks`);
+  expect(again.payload.ready_tasks).toEqual(first.payload.ready_tasks);
+  expect(again.payload.task_id).toBe(BRIEF_CORR);
   expect(other.correlation_id).not.toBe(BRIEF_CORR);
-  expect(other.ready_tasks).toHaveLength(1);
+  expect(other.payload.ready_tasks).toHaveLength(1);
 
   // one plan for the brief in the store: the second run created nothing
   const mine = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: BRIEF_CORR }, fakeCtx(repo))).details);
   expect(mine).toHaveLength(13);
-  expect(mine).toContain(first.ready_tasks[0]);
+  expect(mine).toContain(first.payload.ready_tasks[0]);
   const others = statusTaskIds((await callTool(pi.tool("swarm_status"), { correlation_id: other.correlation_id }, fakeCtx(repo))).details);
   expect(others).toHaveLength(8);
-  expect(others).toContain(other.ready_tasks[0]);
+  expect(others).toContain(other.payload.ready_tasks[0]);
+});
+
+test("reused live plan dispatches newly ready dependencies, not its stale initial snapshot", async () => {
+  const repo = gitRepo();
+  process.env.SWARM_DIR = tmpDir("swarm-omp-dir-");
+  const args = [`--root=${repo}`, `--brief-text=${BRIEF}`, `--correlation-id=${BRIEF_CORR}`];
+  const initial = await runPy({ script: "orch_plan", args, cwd: repo });
+  const tasks = initial.json.tasks as Array<{ task_id: string; depends_on: string[] }>;
+  const root = tasks.find((task) => task.depends_on.length === 0)!;
+  for (const state of ["CLAIMED", "IN_PROGRESS", "IN_REVIEW"]) {
+    const result = await runPy({ script: "orch_status", args: [`--root=${repo}`, "--transition", root.task_id, state, "--reason=test-owned progress"], cwd: repo });
+    expect(result.exitCode).toBe(0);
+  }
+  const log: CallLog = [];
+  const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
+  pi.load(createSwarmExtension({ bridge: runPy }));
+  await pi.command("swarm").handler(BRIEF, commandCtx(repo, [], { log }));
+  const envelope = payload(dispatchText(log) ?? "");
+  expect(dispatchEvidence(envelope, BRIEF_CORR)).toEqual({ verified: true, authorized: true });
+  const assignment = envelope.payload as { ready_tasks: string[] };
+  expect(assignment.ready_tasks).not.toContain(root.task_id);
+  expect(new Set(assignment.ready_tasks)).toEqual(new Set(tasks.filter((task) =>
+    task.depends_on.length > 0 && task.depends_on.every((id) => id === root.task_id)).map((task) => task.task_id)));
+  expect(calls(log)).toEqual(["sendUserMessage", "waitForIdle", "notify"]);
 });

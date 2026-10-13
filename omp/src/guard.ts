@@ -2,8 +2,9 @@
  * The `tool_call` guard decision (Phase 4 HOOK-03/04): a pure function of (event, facts) with no I/O, no bridge,
  * no fs and no process access — index.ts reads the facts (identity, plan mode, active tools, env) and passes them in.
  * Precedence, first match decides: HOOK-04 (A01 depth cap) → HOOK-03 (swarm-state tools) → outside a swarm
- * session nothing else applies → D-08 (eval, xd://run_code and xd://debug writes, protected write/edit paths) → HOOK-02 (the RULES table over bash:
- * D-05 shell twin and gate scripts, D-08 shell writes, D-03/D-04 autonomy ceiling).
+ * session nothing else applies → D-08 (eval, xd://run_code and xd://debug writes, protected write/edit paths)
+ * and private signer-file reads → HOOK-02 (the RULES table over bash: D-05 shell twin and gate scripts,
+ * private signer-file reads, D-08 shell writes, D-03/D-04 autonomy ceiling).
  * Reason strings are read by the A01 dispatcher (D-07) and operators: keep them and the rule ids stable.
  */
 import { posix } from "node:path";
@@ -52,6 +53,8 @@ export interface GuardFacts {
    * write targets inside one are protected unless the session's cwd is inside it too (isProtectedPath).
    */
   runtimeRoots: readonly string[];
+  /** Deny-only signer paths, including originals captured before bash HOME/cwd/env overrides; never loading references. */
+  signerReadPaths?: readonly string[];
 }
 
 /**
@@ -123,6 +126,9 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
     const mcp = devices.find((p) => MCP_DEVICE.test(p) && !ownSubstrateTool(p, facts));
     if (mcp !== undefined) return { block: true, reason: reason("mcp", mcp) };
   }
+  if ((event.toolName === "read" || event.toolName === "grep") && signerToolRead(event, facts)) {
+    return { block: true, reason: reason("signer_credential", "signer-file-read") };
+  }
   if (event.toolName === "write" || event.toolName === "edit") {
     if (editTargets(event.input).some((p) => isProtectedPath(p, facts))) {
       return { block: true, reason: reason("protected_path", "protected-path-write") };
@@ -139,10 +145,18 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   if (env.has("GLOBIGNORE") || env.has("BASHOPTS")) return { block: true, reason: reason("protected_path", "glob-dotfiles") };
   const home = env.get("HOME");
   const cdpath = env.get("CDPATH");
+  const keyFile = env.get("SWARM_ED25519_KEY_FILE");
+  const xdg = env.get("XDG_CONFIG_HOME");
   const shellFacts: GuardFacts = {
     ...facts,
+    signerReadPaths: signerSources(facts),
     home: typeof home === "string" ? home : facts.home,
-    env: typeof cdpath === "string" ? { ...facts.env, CDPATH: cdpath } : facts.env,
+    env: {
+      ...facts.env,
+      ...(typeof cdpath === "string" ? { CDPATH: cdpath } : {}),
+      ...(typeof keyFile === "string" ? { SWARM_ED25519_KEY_FILE: keyFile } : {}),
+      ...(typeof xdg === "string" ? { XDG_CONFIG_HOME: xdg } : {}),
+    },
   };
   // the bash tool's `cwd` is where the command starts; an internal URL (`local://…`) is a directory the guard cannot place
   const cwd = "cwd" in input && typeof input.cwd === "string" ? input.cwd.trim() : "";
@@ -964,6 +978,183 @@ export function resolvePath(p: string, facts: Pick<GuardFacts, "cwd" | "home">):
 const within = (path: string, dir: string) => dir !== "" && dir !== "/" && path.startsWith(`${dir}/`);
 /** Where a segment's paths resolve: its tracked directory, else the session cwd (protectedTarget fails closed first). */
 const segmentBase = (seg: Segment, facts: GuardFacts) => ({ cwd: seg.cwd ?? facts.cwd, home: facts.home });
+
+/**
+ * Controller-carried deny-only metadata: bounded lexical paths, never credential bytes or signer inputs.
+ * Malformed supplied policy throws into index.ts's swarm-only fail-closed handler, without echoing its value.
+ */
+export function parseSignerDenyPaths(value: string | undefined): readonly string[] {
+  if (value === undefined) return [];
+  const invalid = () => new Error("invalid signer deny-path policy");
+  if (value.length > 131072) throw invalid();
+  let paths: unknown;
+  try {
+    paths = JSON.parse(value);
+  } catch {
+    throw invalid();
+  }
+  if (!Array.isArray(paths) || paths.length > 32) throw invalid();
+  const normalized: string[] = [];
+  for (const path of paths) {
+    if (typeof path !== "string" || path.length > 4096 || !posix.isAbsolute(path) || path.includes("\0")) throw invalid();
+    const source = posix.normalize(path);
+    if (!normalized.includes(source)) normalized.push(source);
+  }
+  return normalized;
+}
+
+/**
+ * Private signer references are secret sources, not role artifacts. Protect the conventional HOME location
+ * even when XDG or an explicit file is configured: changing a command's env must not unprotect the host key.
+ * This guard is lexical and pure, like protectedTarget: symlink aliases and arbitrary code remain FA-6 residuals.
+ */
+function signerSources(facts: GuardFacts): readonly string[] {
+  const paths = [...(facts.signerReadPaths ?? []),
+    posix.resolve(facts.cwd || "/", facts.home || "/", ".config/agent-swarm/signing-key.hex")];
+  const xdg = facts.env.XDG_CONFIG_HOME;
+  if (xdg) paths.push(posix.resolve(facts.cwd || "/", xdg, "agent-swarm/signing-key.hex"), resolvePath(posix.join(xdg, "agent-swarm/signing-key.hex"), facts));
+  const configured = facts.env.SWARM_ED25519_KEY_FILE;
+  if (configured) paths.push(posix.resolve(facts.cwd || "/", configured), resolvePath(configured, facts));
+  return paths;
+}
+
+/** Expand only known path references, never arbitrary shell expressions or secret values. */
+function signerPath(path: string, facts: GuardFacts, cwd: string | undefined): string | undefined {
+  let expanded = path.replace(/^(?:\$SWARM_ED25519_KEY_FILE|\$\{SWARM_ED25519_KEY_FILE\})(?=\/|$)/,
+    facts.env.SWARM_ED25519_KEY_FILE ?? CUT);
+  expanded = expanded.replace(/^(?:\$XDG_CONFIG_HOME|\$\{XDG_CONFIG_HOME\})(?=\/|$)/,
+    facts.env.XDG_CONFIG_HOME ?? CUT);
+  if (cwd !== undefined && facts.env.PWD !== CUT) expanded = expanded.replace(/^(?:\$PWD|\$\{PWD\})(?=\/|$)/, cwd);
+  const rest = expanded.replace(HOME_PREFIX, "");
+  if (/[$`\u0001]/.test(rest) || rest.startsWith("~") || (HOME_PREFIX.test(expanded) && facts.home.includes(CUT))) return undefined;
+  if (cwd === undefined && !expanded.startsWith("/") && !HOME_PREFIX.test(expanded)) return undefined;
+  return resolvePath(expanded, { cwd: cwd ?? facts.cwd, home: facts.home });
+}
+
+/** Match the file itself (including selectors), glob spellings, or a content-search subtree containing it. */
+function signerReadTarget(target: string, facts: GuardFacts, cwd: string | undefined, recursive = false, selectors = false): boolean {
+  let path = target;
+  if (/^file:\/\//i.test(path)) {
+    try { path = decodeURIComponent(path.replace(/^file:\/\//i, "")); } catch { return true; }
+  } else if (/^[a-z][\w+.-]*:\/\//i.test(path)) return false;
+  const alternatives = braceAlternatives(path);
+  if (alternatives === undefined) return true;
+  return alternatives.some((alt) => {
+    // Literal configured references may contain `$` or `~`: Python's Path does not expand those characters.
+    if (cwd !== undefined && signerSources(facts).some((source) => posix.resolve(cwd, alt) === source)) return true;
+    const resolved = signerPath(alt, facts, cwd);
+    if (resolved === undefined) {
+      // Fail closed for an unresolved signer reference or a signer filename in an unknown directory,
+      // without changing the existing arbitrary-expression residual for unrelated public source reads.
+      return /(?:\$SWARM_ED25519_KEY_FILE|\$\{SWARM_ED25519_KEY_FILE\})/.test(alt) ||
+        signerSources(facts).some((source) => posix.basename(alt) === posix.basename(source));
+    }
+    const parts = resolved.split("/");
+    return signerSources(facts).some((source) => {
+      const key = posix.resolve(source);
+      if (resolved.toLowerCase() === key.toLowerCase()) return true;
+      if (selectors && resolved.toLowerCase().startsWith(`${key.toLowerCase()}:`)) return true;
+      if (recursive && (resolved === "/" || key.startsWith(`${resolved}/`))) return true;
+      const names = key.split("/");
+      if (!GLOB_CHAR.test(resolved)) return false;
+      let positions = new Set([0]);
+      for (const part of parts) {
+        const next = new Set<number>();
+        for (const name of positions) {
+          if (part === "**") for (let i = name; i <= names.length; i++) next.add(i);
+          else if (name < names.length && mayName(part, names[name])) next.add(name + 1);
+        }
+        positions = next;
+        if (positions.size === 0) return false;
+      }
+      return recursive ? positions.size > 0 : positions.has(names.length);
+    });
+  });
+}
+
+function signerToolRead(event: ToolCallEvent, facts: GuardFacts): boolean {
+  if (typeof event.input !== "object" || event.input === null) return false;
+  const { path, file_path } = event.input as { path?: unknown; file_path?: unknown };
+  const targets = [path, file_path].filter((p): p is string => typeof p === "string" && p.trim() !== "");
+  if (event.toolName === "grep" && targets.length === 0) targets.push(".");
+  return targets.some((target) => (event.toolName === "grep" ? target.split(";") : [target])
+    .some((p) => signerReadTarget(p, facts, facts.cwd, event.toolName === "grep", true) ||
+      (p !== p.trim() && signerReadTarget(p.trim(), facts, facts.cwd, event.toolName === "grep", true)) ||
+      (event.toolName === "grep" && GLOB_CHAR.test(p) && !p.includes("/") &&
+        signerReadTarget(`**/${p}`, facts, facts.cwd, true, true))));
+}
+
+/** Known file-reading argv forms; grep/sed/awk programs are data, not file operands. */
+function signerShellReads(seg: Segment, facts: GuardFacts): boolean {
+  // Here-doc delimiters and here-strings are data; only real file redirects consume a signer source.
+  const redirects = shellWords(seg.marked).flatMap(splitStdinRedirect);
+  const targets: string[] = [];
+  for (let i = 0; i < redirects.length; i++) {
+    const raw = redirects[i];
+    if (!hasUnquoted(raw, (c) => c === "<")) continue;
+    const word = unquote(raw);
+    const op = /^(?:\d*<>)|^(?:\d*<)(?!<)/.exec(word);
+    if (op !== null) {
+      const attached = word.slice(op[0].length);
+      if (attached) targets.push(attached);
+      else if (redirects[i + 1] !== undefined) targets.push(unquote(redirects[++i]));
+    }
+  }
+  const cmd = seg.words[0] ?? "";
+  const args = seg.words.slice(1);
+  const search = /^(?:grep|egrep|fgrep|rg|ripgrep|ag)$/.test(cmd);
+  const scripted = search || /^(?:sed|awk|gawk|mawk|nawk)$/.test(cmd);
+  const recursive = /^(?:rg|ripgrep|ag|rsync|tar)$/.test(cmd) ||
+    (search && args.some((w) => /^--(?:recursive|dereference-recursive)$/.test(w) || /^-[^-]*[rR]/.test(w))) ||
+    (/^(?:cp|mv|install|zip)$/.test(cmd) && args.some((w) => /^--(?:recursive|archive)$/.test(w) || /^-[^-]*[rRa]/.test(w)));
+  if (/^(?:rg|ripgrep)$/.test(cmd) && args[0] === "--files" &&
+      args.slice(1).every((w) => !w.startsWith("-") || /^(?:--hidden|--no-ignore)$/.test(w))) {
+    return targets.some((target) => signerReadTarget(target, facts, seg.cwd));
+  }
+  if (scripted) {
+    let program = false;
+    let endOptions = false;
+    for (let i = 0; i < args.length; i++) {
+      const word = args[i];
+      if (!endOptions && word === "--") { endOptions = true; continue; }
+      const clusteredProgram = endOptions ? null : /^-([A-Za-z]*?)([ef])(.*)$/.exec(word);
+      if (clusteredProgram !== null) {
+        const value = clusteredProgram[3] || args[++i];
+        if (clusteredProgram[2] === "f" && value !== undefined) targets.push(value);
+        program = true;
+        continue;
+      }
+      if (!endOptions && /^(?:-e|--regexp|--expression|-f|--file)$/.test(word)) {
+        if (/^(?:-f|--file)$/.test(word) && args[i + 1] !== undefined) targets.push(args[i + 1]);
+        program = true;
+        i++;
+        continue;
+      }
+      if (!endOptions && /^(?:-e.|--(?:regexp|expression)=)/.test(word)) { program = true; continue; }
+      if (!endOptions && /^(?:-f.|--file=)/.test(word)) {
+        targets.push(word.startsWith("-f") ? word.slice(2) : word.slice(word.indexOf("=") + 1));
+        program = true;
+        continue;
+      }
+      if (!endOptions && word.startsWith("-")) {
+        if (/^(?:-A|-B|-C|-m|--max-count|--include|--exclude|--exclude-dir|--glob|-g|-t|-T|-F|-v|--field-separator)$/.test(word) &&
+            !(search && /^(?:-F|-v)$/.test(word))) i++;
+        continue;
+      }
+      if (!program) program = true;
+      else targets.push(word);
+    }
+    if (recursive && targets.length === 0) targets.push(".");
+  } else if (/^(?:cat|tac|head|tail|nl|less|more|strings|xxd|od|hexdump|base64|basenc|wc|sort|uniq|cut|paste|join|comm|file|cp|mv|install|rsync|tar|zip|gzip|bzip2|xz|zstd|jq|yq|openssl|sha256sum|sha512sum|sha1sum|md5sum|cksum|sum|source|\.)$/.test(cmd)) {
+    targets.push(...operands(args));
+    if (cmd === "sort") targets.push(...optionValues(seg.words, ["--files0-from"], "--files0-from"));
+  } else if (cmd === "dd") {
+    targets.push(...args.filter((w) => w.startsWith("if=")).map((w) => w.slice(3)));
+  } else if (cmd === "git" && git(seg.words).sub === "diff" && args.includes("--no-index")) {
+    targets.push(...operands(git(seg.words).args));
+  }
+  return targets.some((target) => signerReadTarget(target, facts, seg.cwd, recursive));
+}
 
 /** The D-08 state directories (compared in any case: a case-insensitive file system maps `.Swarm` onto `.swarm`). */
 const PROTECTED_DIRS = [".swarm", ".omp"];
@@ -1868,6 +2059,12 @@ export const RULES: readonly Rule[] = [
       "python3 - --ingest x.json < scripts/orch_status.py",
       "cp scripts/orch_plan.py /tmp/plan.py",
     ],
+  },
+  {
+    id: "signer-file-shell",
+    capability: "signer_credential",
+    pattern: signerShellReads,
+    samples: ["cat ~/.config/agent-swarm/signing-key.hex", "head -c 1 ~/.config/agent-swarm/signing-key.hex"],
   },
   // D-08: shell writes into .swarm/, .omp/ or ~/.omp. These precede gate-script-shell: copying onto a guarded
   // gate script, or moving one out of a runtime root, is tampering with that path. A renamed gate run

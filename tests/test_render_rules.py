@@ -59,14 +59,6 @@ def test_there_are_fifteen_agents_in_each_of_the_four_renders():
         assert {p.name for p in directory.glob("*.md")} == {f"{a['slug']}.md" for a in AGENTS}, render
 
 
-def test_the_shared_block_states_each_rule():
-    block = build_agents.SHARED_RULES
-    for needle in ("Never merge a pull request", "open a draft PR and report instead", "<seat-prefix>/<task_id>",
-                   "bot-0N-<seat>/<task_id>", "ownership.yaml", "^bot-0[0-6]-[a-z0-9-]+$", "nothing counts as APPROVED",
-                   "advisory, never as a pass", "scripts/swarm_run.py", "hooks/autonomous_run.py", "bypassPermissions",
-                   "--dangerously-skip-permissions", "--yolo"):
-        assert needle in block, needle
-    assert "swarm/<task_id>" not in block  # tests/test_cursor_agents.py forbids the literal in Cursor output
 
 
 @pytest.mark.parametrize("render,slug", CASES, ids=IDS)

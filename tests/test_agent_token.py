@@ -1,5 +1,5 @@
 """INST-03 on the runner's side (ADR 0001 S4 criteria 4-5): each agent session starts with its own SUBSTRATE_TOKEN and no
-other, and each runtime's argv reaches the `substrate` MCP entry the install wrote into the workspace."""
+other, and supported runtimes reach the projected `substrate` MCP entry without bypassing approval."""
 import importlib.util
 import json
 import os
@@ -11,6 +11,7 @@ import pytest
 
 from conftest import ROOT, omp_calls, run_script, stub_omp
 from swarm import workspace
+from swarm.errors import SwarmError
 
 A05_TOKEN = "p14-a05-own-token-0123456789"
 RUNNER_TOKENS = {"SUBSTRATE_TOKEN": "p14-runner-a01-token-0123456789",
@@ -62,7 +63,7 @@ def _tokens(env):
     return {k: v for k, v in env.items() if workspace.carries_token(k)}
 
 
-@pytest.mark.parametrize("runtime", ["claude", "grok", "omp"])
+@pytest.mark.parametrize("runtime", ["claude", "omp"])
 def test_a_session_holds_its_own_token_and_no_other(sr, ws, tmp_path, runtime):
     _, env, _ = sr.headless_command(runtime, A05, ws, tmp_path / ".swarm", _args())
     assert _tokens(env) == {"SUBSTRATE_TOKEN": A05_TOKEN}
@@ -89,20 +90,26 @@ def test_claude_gets_the_workspace_mcp_config_and_the_substrate_tools(sr, ws, tm
     assert argv[argv.index("--mcp-config") + 1] == str(ws / ".mcp.json") and "--strict-mcp-config" in argv
     allowed = argv[argv.index("--allowedTools") + 1: argv.index("--add-dir", argv.index("--allowedTools"))]
     assert allowed == ["Read", "Grep", "mcp__substrate"]
-    assert argv[-2:] == ["--add-dir", str(ws)]
 
 
 def test_an_unwired_workspace_gets_no_mcp_flags(sr, ws, tmp_path):
     argv, _, _ = sr.headless_command("claude", A05, ws, tmp_path / ".swarm", _args())
     assert "--mcp-config" not in argv and "mcp__substrate" not in argv
-    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
-    assert "--trust" not in argv
 
 
-def test_grok_clears_folder_trust_for_the_workspace_it_runs_in(sr, ws, tmp_path):
-    _wire(ws)
-    argv, _, cwd = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
-    assert "--trust" in argv and argv[argv.index("--cwd") + 1] == str(ws) and cwd == ws
+@pytest.mark.parametrize("wired", [False, True])
+def test_grok_refuses_unsupported_transport_before_dispatch(sr, ws, tmp_path, monkeypatch, wired):
+    if wired:
+        _wire(ws)
+
+    def refuse_spawn(*args, **kwargs):
+        raise AssertionError("unsupported Grok transport must not spawn a specialist")
+
+    monkeypatch.setattr(sr.subprocess, "Popen", refuse_spawn)
+    with pytest.raises(SwarmError) as e:
+        sr.run_agent_headless(A05, "test-owned assignment", ws, _args(runtime="grok"))
+    assert e.value.code.value == "E-DEP"
+    assert "stdin assignment transport" in str(e.value)
 
 
 @pytest.mark.parametrize("config", [
@@ -114,31 +121,28 @@ def test_grok_clears_folder_trust_for_the_workspace_it_runs_in(sr, ws, tmp_path)
     '[mcp_servers.substrate\n',
     'mcp_servers = "not a table"\n',
 ])
-def test_grok_does_not_auto_trust_unrelated_malformed_or_nonprojected_configs(sr, ws, tmp_path, config):
+def test_grok_projection_rejects_unrelated_malformed_or_nonprojected_configs(ws, config):
     path = workspace.mcp_config(ws, "grok")
     path.parent.mkdir()
     path.write_text(config)
-    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
-    assert "--trust" not in argv
+    assert not workspace.projected_mcp(ws, "grok")
 
 
-def test_grok_trust_accepts_an_exact_projection_among_other_settings(sr, ws, tmp_path):
+def test_grok_projection_accepts_exact_entry_among_other_settings(ws):
     path = workspace.mcp_config(ws, "grok")
     path.parent.mkdir()
     path.write_text('model = "grok-4"\n' + workspace.SPEC["toml"]["block"] +
                     '\n[mcp_servers.other]\nurl = "https://example.invalid/mcp"\n')
-    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
-    assert "--trust" in argv
+    assert workspace.projected_mcp(ws, "grok")
 
 
-def test_projected_config_through_a_symlink_does_not_unlock_trust(sr, ws, tmp_path):
+def test_projected_config_through_a_symlink_is_refused(ws, tmp_path):
     other = tmp_path / "outside-config.toml"
     other.write_text(workspace.SPEC["toml"]["block"])
     path = workspace.mcp_config(ws, "grok")
     path.parent.mkdir()
     path.symlink_to(other)
-    argv, _, _ = sr.headless_command("grok", A05, ws, tmp_path / ".swarm", _args())
-    assert "--trust" not in argv
+    assert not workspace.projected_mcp(ws, "grok")
 
 
 def test_omp_runs_where_the_entry_is_and_its_tools_list_names_only_builtins(sr, ws, tmp_path):
@@ -259,7 +263,7 @@ def test_claude_does_not_unlock_substrate_flags_for_unrelated_or_invalid_configs
     assert workspace.CLAUDE_TOOLS not in argv
 
 
-@pytest.mark.parametrize("runtime", ["claude", "grok", "omp"])
+@pytest.mark.parametrize("runtime", ["claude", "omp"])
 def test_substrate_disabled_turns_off_child_mcp_and_strips_token(sr, ws, tmp_path, monkeypatch, runtime):
     _wire(ws)
     monkeypatch.setenv("SUBSTRATE_DISABLED", "1")
@@ -268,8 +272,6 @@ def test_substrate_disabled_turns_off_child_mcp_and_strips_token(sr, ws, tmp_pat
     if runtime == "claude":
         assert "--mcp-config" not in argv
         assert workspace.CLAUDE_TOOLS not in argv
-    elif runtime == "grok":
-        assert "--trust" not in argv
     elif runtime == "omp":
         assert "SWARM_SUBSTRATE_AGENT" not in env
 

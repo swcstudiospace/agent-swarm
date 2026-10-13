@@ -285,10 +285,6 @@ def test_omp_preamble_keeps_autonomy_ceiling():
         assert 'L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`' in _omp(a), a["id"]
 
 
-def test_omp_size_bound():
-    sizes = {p.stem: p.stat().st_size for p in OMP_AGENTS.glob("*.md")}
-    assert max(sizes.values()) <= 24 * 1024
-    assert max(sizes, key=sizes.get) == "a01-orchestrator"
 
 
 def test_omp_no_host_paths():

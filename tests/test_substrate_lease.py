@@ -1355,8 +1355,8 @@ def test_run_resumes_review_leases_before_the_first_reconcile(tmp_path, monkeypa
     _plan(store)
     for s in ("CLAIMED", "IN_PROGRESS", "IN_REVIEW"):
         store.transition("T-be", s)
-    args = SimpleNamespace(repo=str(tmp_path), dry_run=False, runtime="grok", grok_bin=sys.executable,
-                           claude_bin="claude", omp_bin="omp", max_parallel=1, once=True, max_rounds=1)
+    args = _args(repo=str(tmp_path), max_parallel=1, once=True, max_rounds=1)
+    args.claude_bin = sys.executable
     runner.run(args, SimpleNamespace(correlation_id=CORR, emit=lambda *a, **k: None))
     assert calls[:3] == ["resume", "start", "reconcile"]
 
@@ -1396,7 +1396,7 @@ def test_full_non_dry_run_outage_preserves_the_disabled_dag_budgets_and_results(
                                task_id=payload.get("task_id"), root=repo)
 
         args = _args(repo=str(repo), max_parallel=1, once=False, max_rounds=5)
-        args.runtime, args.grok_bin = "grok", sys.executable
+        args.claude_bin = sys.executable
         result = runner.run(args, SimpleNamespace(correlation_id=CORR, emit=emit))
         assert result["complete"] is True and result["counts"] == {"DONE": 2}
         tasks = store.list(correlation_id=CORR)

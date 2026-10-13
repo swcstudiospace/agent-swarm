@@ -1,17 +1,16 @@
 """swarm.envelope.v1 — build, validate, sign and verify inter-agent messages.
 
-Signing: ed25519 via `cryptography` when SWARM_ED25519_KEY (hex seed) is set;
-otherwise HMAC-SHA256 with SWARM_SIGNING_KEY. There is no implicit dev key.
+Signing: ed25519 via `cryptography` with a raw SWARM_ED25519_KEY seed or a trusted
+private file reference; otherwise HMAC-SHA256 with SWARM_SIGNING_KEY.
 Signatures are REQUIRED for task.assign, gate verdicts and promote/rollback commands.
 
 The public dev key is used only when SWARM_ALLOW_INSECURE_DEV_KEY=1, and not while
-SWARM_ED25519_KEY or SWARM_REQUIRE_KEY=1 is set. That signing emits a `security.dev_key`
-event, except a gate-script preview inside a key-less agent session (SWARM_AGENT_SESSION=1),
-which never records (WR-15). Without a real key and without the opt-in, sign_envelope
-refuses, dev-key hmac signatures do not verify, and APPROVED fails closed.
-SWARM_REQUIRE_KEY=1 makes APPROVED fail closed (E-POLICY) unless SWARM_ED25519_KEY
-(loadable) or SWARM_SIGNING_KEY is configured, and `signing_config_error()` lets
-verdict signing fail fast on a missing or unloadable key.
+a private Ed25519 signer is configured or SWARM_REQUIRE_KEY=1 is set. That signing
+emits a `security.dev_key` event, except a key-less agent-session preview.
+Without a real key and without the opt-in, signing refuses and APPROVED fails closed.
+Raw signing variables take precedence over SWARM_ED25519_KEY_FILE and the conventional
+XDG_CONFIG_HOME-or-HOME/.config/agent-swarm/signing-key.hex source. Private references
+are never read inside agent/child sessions. Configuration failures are redacted.
 """
 from __future__ import annotations
 import base64
@@ -20,6 +19,7 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -101,15 +101,96 @@ def _canonical(env: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def _ed25519_key():
-    seed = os.environ.get("SWARM_ED25519_KEY")
-    if not seed:
-        return None
+def _agent_session() -> bool:
+    return any(os.environ.get(name) == "1" for name in ("SWARM_AGENT_SESSION", "SWARM_CHILD"))
+
+
+def _private_seed(path: Path, *, fallback: bool) -> bytes | None:
+    """Open without following links; validate the same descriptors that supply the seed.
+
+    A missing conventional file is optional. Every other reference failure is fatal.
+    Callers redact all exceptions, including filenames and malformed file contents.
+    """
+    directory = os.open(path.anchor or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = None
     try:
+        parts = path.parts[1:] if path.is_absolute() else path.parts
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            except FileNotFoundError:
+                if fallback:
+                    return None
+                raise
+            os.close(directory)
+            directory = child
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            if fallback:
+                return None
+            raise
+        parent = os.fstat(directory)
+        if fallback and (parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o077):
+            raise ValueError("unsafe private directory")
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) & 0o077 or before.st_size not in (64, 65)):
+            raise ValueError("unsafe private seed")
+        data = os.read(fd, 66)
+        after = os.fstat(fd)
+        fields = ("st_dev", "st_ino", "st_uid", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in fields):
+            raise ValueError("private seed changed during read")
+        if len(data) == 65 and data[-1:] == b"\n":
+            data = data[:-1]
+        if len(data) != 64 or any(c not in b"0123456789abcdefABCDEF" for c in data):
+            raise ValueError("invalid private seed")
+        return bytes.fromhex(data.decode("ascii"))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory)
+
+
+def _ed25519_material() -> tuple[object | None, str | None]:
+    raw = os.environ.get("SWARM_ED25519_KEY")
+    if raw:
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(raw)), None
+        except Exception:
+            return None, ("fail-closed: SWARM_ED25519_KEY is set but cannot be loaded "
+                          "(cryptography missing or seed is not 32-byte hex)")
+    # Both raw signer variables take precedence over private references, even a dev HMAC.
+    if os.environ.get("SWARM_SIGNING_KEY"):
+        return None, None
+    reference = os.environ.get("SWARM_ED25519_KEY_FILE")
+    if _agent_session():
+        return None, ("fail-closed: private signing references are unavailable in agent sessions"
+                      if reference is not None else None)
+    try:
+        if reference is not None:
+            if not reference:
+                raise ValueError("empty reference")
+            path = Path(reference)
+        else:
+            config = os.environ.get("XDG_CONFIG_HOME")
+            home = os.environ.get("HOME")
+            if not config and not home:
+                return None, None
+            path = (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
+        seed = _private_seed(path, fallback=reference is None)
+        if seed is None:
+            return None, None
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed))
-    except Exception:  # pragma: no cover - library absent or bad key
-        return None
+        return Ed25519PrivateKey.from_private_bytes(seed), None
+    except Exception:
+        return None, "fail-closed: private Ed25519 signing reference cannot be loaded safely"
+
+
+def _ed25519_key():
+    return _ed25519_material()[0]
 
 
 # sha256 of the public dev key. Recognition only; the value itself is returned
@@ -132,7 +213,8 @@ def insecure_dev_key() -> str | None:
     """
     if os.environ.get("SWARM_ALLOW_INSECURE_DEV_KEY") != "1":
         return None
-    if os.environ.get("SWARM_ED25519_KEY") or os.environ.get("SWARM_REQUIRE_KEY") == "1":
+    key, error = _ed25519_material()
+    if key is not None or error or os.environ.get("SWARM_REQUIRE_KEY") == "1":
         return None
     return "dev-insecure-key"
 
@@ -144,11 +226,6 @@ def real_key_configured() -> bool:
     return _ed25519_key() is not None or valid_hmac
 
 
-def _dev_key_forbidden() -> bool:
-    """The public dev key must not verify once a real key is configured (even an unloadable
-    Ed25519 seed: misconfiguration fails closed) or required via SWARM_REQUIRE_KEY=1."""
-    return (bool(os.environ.get("SWARM_ED25519_KEY")) or os.environ.get("SWARM_REQUIRE_KEY") == "1"
-            or _is_public_dev_value(os.environ.get("SWARM_SIGNING_KEY")))
 
 
 def _signing_hmac() -> tuple[bytes, bool] | None:
@@ -169,12 +246,12 @@ def _signing_hmac() -> tuple[bytes, bool] | None:
 
 def signing_config_error() -> str | None:
     """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None."""
+    _key, error = _ed25519_material()
+    if error and (not os.environ.get("SWARM_SIGNING_KEY")
+                  or not os.environ.get("SWARM_ED25519_KEY")):
+        return error
     if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
         return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
-    if (os.environ.get("SWARM_ED25519_KEY") and _ed25519_key() is None
-            and not os.environ.get("SWARM_SIGNING_KEY")):
-        return ("fail-closed: SWARM_ED25519_KEY is set but cannot be loaded "
-                "(cryptography missing or seed is not 32-byte hex)")
     return None
 
 
@@ -191,7 +268,7 @@ def sign_envelope(env: dict, *, root: str | Path | None = None, audit: bool = Tr
     """Sign in place. `root` is the caller's --root: the dev-key audit event lands in its state dir (D-10).
     audit=False skips that event for a key-less agent-session preview that can never record (WR-15)."""
     err = signing_config_error()
-    if err and _dev_key_forbidden() and not real_key_configured():
+    if err:
         raise SwarmError(ErrorCode.E_POLICY, err)
     key = _ed25519_key()
     if key is not None:
