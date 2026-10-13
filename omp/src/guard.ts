@@ -27,6 +27,7 @@ export const DEPTH_REASON =
   `BLOCKED needs: depth — ${ORCHESTRATOR} is at the task depth cap (no \`task\` tool), so it cannot dispatch. ` +
   `The only permitted call is yield with data {task_id, state: "BLOCKED", needs: "depth"}.`;
 export const SWARM_STATE_REASON = "BLOCKED needs: human-approval (swarm-state)";
+export const SWARM_ASSIGNMENT_REASON = "BLOCKED needs: human-approval (swarm-assignment)";
 /** index.ts appends the error message and `)` when the guard itself throws inside a swarm session (D-02). */
 export const GUARD_ERROR_PREFIX = "BLOCKED needs: human-approval (guard error: ";
 
@@ -110,6 +111,11 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   // HOOK-03 (D-05): applies everywhere, swarm session or not
   if (Object.hasOwn(SWARM_STATE_TOOLS, event.toolName) && facts.agent !== ORCHESTRATOR) {
     return { block: true, reason: SWARM_STATE_REASON };
+  }
+  // A signed assignment grants dispatch authority even though obtaining it does not mutate task state.
+  // Enforce before the outside-swarm return, so generic children and unidentified sessions cannot obtain one.
+  if (event.toolName === "swarm_assignment" && (facts.agent !== ORCHESTRATOR || facts.planMode)) {
+    return { block: true, reason: SWARM_ASSIGNMENT_REASON };
   }
   // Outside a swarm session nothing else applies (D-01)
   if (!inSwarm(facts)) return undefined;
@@ -2026,6 +2032,14 @@ const gateScriptRun = (seg: Segment): boolean => {
   return (stem !== undefined && Object.hasOwn(GATE_STEMS, stem)) || relocatesStem(seg, GATE_STEMS);
 };
 
+/** Assignment authority is available only through the typed tool, never by running or relocating its script. */
+const ASSIGNMENT_STEMS: Record<string, true> = { orch_assign: true };
+function assignmentScriptRun(seg: Segment): boolean {
+  const run = executedScript(seg);
+  if (run?.stem === "orch_assign") return true;
+  return stdinScriptStem(seg) === "orch_assign" || relocatesStem(seg, ASSIGNMENT_STEMS);
+}
+
 /** A run of `orch_plan.py|ts` (or module), or of `orch_status.py|ts` (or module) with `--ingest`/`--transition`. */
 function orchStateScript(seg: Segment): boolean {
   const run = executedScript(seg);
@@ -2043,6 +2057,18 @@ const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(s
 
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
+  {
+    id: "assignment-script-shell",
+    capability: "swarm-assignment",
+    reason: SWARM_ASSIGNMENT_REASON,
+    pattern: assignmentScriptRun,
+    samples: [
+      "python3 scripts/orch_assign.py --task-id T-req --correlation-id c1",
+      "python3 -m scripts.orch_assign --task-id T-req --correlation-id c1",
+      "python3 - --task-id T-req < scripts/orch_assign.py",
+      "cp scripts/orch_assign.py /tmp/assign.py",
+    ],
+  },
   // HOOK-03 shell twin (D-05): Task Store mutation through the scripts is A01's alone, like the swarm-state tools
   {
     id: "orch-state-shell",

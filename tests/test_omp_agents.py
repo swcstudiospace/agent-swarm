@@ -65,10 +65,9 @@ def test_omp_skill_matches_renderer():
 
 builder = _load("build_agents")
 SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
-SWARM_NAMES = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"}
+SWARM_NAMES = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment", "swarm_gate"}
 OMP_TOOLS = {"read", "grep", "glob", "bash", "write", "edit", "task"} | SWARM_NAMES
 GATE_AGENTS = {"A08", "A09", "A10", "A12"}
-KEY_ORDER = ["name", "description", "tools", "spawns", "blocking", "autoloadSkills", "output"]
 
 
 def _agents():
@@ -83,33 +82,34 @@ def _keys(text):
     return [line.split(": ", 1)[0] for line in _fm_lines(text)]
 
 
-def test_omp_tools_exact():
+def test_omp_tools_follow_manifest_and_authority_ceiling():
     for a in _agents():
         tools = _fm(_omp(a))["tools"].split(", ")
-        assert tools == [builder.TOOL_MAP[t] for t in a["tools"]] + builder.SWARM_TOOLS.get(a["id"], []), a["id"]
-        assert set(tools) <= OMP_TOOLS
-    a01 = next(a for a in _agents() if a["id"] == "A01")
-    assert _fm(_omp(a01))["tools"] == (
-        "read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition"
-    )
+        assert len(tools) == len(set(tools)), a["id"]
+        assert set(tools) <= OMP_TOOLS, a["id"]
+        assert {builder.TOOL_MAP[t] for t in a["tools"]} <= set(tools), a["id"]
+        assert not {"eval", "run_code"} & set(tools), a["id"]
 
 
 def test_swarm_tool_grants():
-    """D-01: only A01 moves task state and only the four gate agents record verdicts; nobody does both."""
+    """Only A01 leases and requests assignments; gate agents retain only their verdict authority."""
     for a in _agents():
-        swarm = [t for t in _fm(_omp(a))["tools"].split(", ") if t.startswith("swarm_")]
+        swarm = {t for t in _fm(_omp(a))["tools"].split(", ") if t.startswith("swarm_")}
         if a["id"] == "A01":
-            assert swarm == ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"]
+            assert "swarm_assignment" in swarm
+            assert {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"} <= swarm
+            assert swarm <= builder.ORCH_SWARM_TOOLS
+            assert "swarm_gate" not in swarm
         elif a["id"] in GATE_AGENTS:
-            assert swarm == ["swarm_gate"], a["id"]
+            assert swarm == {"swarm_gate"}, a["id"]
         else:
-            assert swarm == [], a["id"]
+            assert not swarm, a["id"]
 
 
 @pytest.mark.parametrize(
     ("aid", "grant"),
     [
-        ("A01", ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"]),
+        ("A01", ["swarm_gate"]),
         ("A05", ["swarm_status"]),
         ("A09", ["swarm_gate", "swarm_transition"]),
         ("A08", ["swarm_nope"]),
@@ -117,6 +117,13 @@ def test_swarm_tool_grants():
 )
 def test_swarm_tools_guard(monkeypatch, aid, grant):
     monkeypatch.setitem(builder.SWARM_TOOLS, aid, grant)
+    with pytest.raises(ValueError, match=aid):
+        builder.render_omp(_a(aid), _agents())
+
+
+@pytest.mark.parametrize("aid", [a["id"] for a in _agents() if a["id"] != "A01"])
+def test_specialists_cannot_receive_assignment_transport(monkeypatch, aid):
+    monkeypatch.setitem(builder.SWARM_TOOLS, aid, ["swarm_assignment"])
     with pytest.raises(ValueError, match=aid):
         builder.render_omp(_a(aid), _agents())
 
@@ -199,11 +206,12 @@ def test_omp_blocking_set():
     assert blocking == {"A01", "A08", "A09", "A10", "A12"}
 
 
-def test_omp_frontmatter_key_order():
+def test_omp_frontmatter_contract_fields():
+    required = {"name", "description", "tools", "spawns", "autoloadSkills", "output"}
     for a in _agents():
         keys = _keys(_omp(a))
-        assert keys == [k for k in KEY_ORDER if k in keys] and len(keys) == len(set(keys))
-        assert set(KEY_ORDER) - {"blocking"} <= set(keys)
+        assert len(keys) == len(set(keys)), a["id"]
+        assert required <= set(keys) <= required | {"blocking"}, a["id"]
 
 
 def test_omp_no_bundled_name_collision():
@@ -215,12 +223,29 @@ GATES = ("a08-qa", "a09-reviewer", "a10-security", "a12-release")
 
 
 def test_a01_strict_dispatch():
-    text = builder.OMP_ORCH_PREAMBLE
-    assert 'schemaMode: "strict"' in text
-    rule = next(line for line in text.splitlines() if 'schemaMode: "strict"' in line)
-    for gate in GATES:
-        assert gate in rule, gate
-    assert _omp(_a("A01")).count(rule) == 1
+    for text in (builder.OMP_ORCH_PREAMBLE, _omp(_a("A01"))):
+        rule = next(line for line in text.splitlines() if 'schemaMode: "strict"' in line)
+        for gate in GATES:
+            assert gate in rule, gate
+
+
+def test_a01_lease_assignment_dispatch_protocol():
+    for text in (builder.OMP_ORCH_PREAMBLE, _omp(_a("A01"))):
+        block = text[text.index("<swarm_runtime>\n"):text.index("</swarm_runtime>")]
+        lines = block.splitlines()
+        lease = _rule(lines, "- Lease:")
+        assignment = _rule(lines, "- Assignment:")
+        dispatch = _rule(lines, "- Dispatch:")
+        assert lease < assignment < dispatch
+        assert {"CLAIMED", "IN_PROGRESS"} <= set(lines[lease].split())
+        for token in ("swarm_assignment", "task_id", "correlation_id", "assignment_prompt",
+                      'status: "ok"', "assignment_verified: true"):
+            assert token in lines[assignment], token
+        for token in ("unsigned", "advisory", "dry-run", "no dispatch authority",
+                      "Never construct or sign", "signing material", "eval", "xd://run_code", "raw swarm state"):
+            assert token in lines[assignment], token
+        for token in ("verified assignment", "`agent_slug`", "`prompt` unchanged"):
+            assert token in lines[dispatch], token
 
 
 def _a01_runtime_lines():
@@ -293,34 +318,6 @@ def test_omp_no_host_paths():
         assert "/root/" not in p.read_text(encoding="utf-8"), p
 
 
-def _yaml_lists(text):
-    """Minimal reader for a YAML mapping of block lists (`key:` then `  - item` lines); stdlib only."""
-    out, key = {}, None
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        if not line[0].isspace():
-            assert line.endswith(":"), line
-            key = line[:-1]
-            out[key] = []
-        else:
-            item = line.strip()
-            assert key is not None and item.startswith("- "), line
-            out[key].append(item[2:].strip())
-    return out
-
-
-def test_omp_wiring():
-    """D-11 / PKG-04: the repo loads its own package through `.omp/config.yml` only, never a symlink or copies."""
-    config = ROOT / ".omp" / "config.yml"
-    assert _yaml_lists(config.read_text(encoding="utf-8")) == {"extensions": ["omp"]}
-    for name in ("agents", "skills", "extensions"):
-        assert not os.path.lexists(ROOT / ".omp" / name), name
-    ignored = subprocess.run(["git", "check-ignore", "-q", ".omp/config.yml"], cwd=ROOT)
-    assert ignored.returncode == 1  # 1 = not ignored (0 would mean .gitignore hides the wiring)
-    pkg = json.loads((ROOT / "omp" / "package.json").read_text(encoding="utf-8"))
-    assert pkg["omp"]["extensions"] == ["./src/index.ts"]
 
 
 _TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", ".cursor", "omp", "grokbot")

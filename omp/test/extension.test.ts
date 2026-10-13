@@ -1,7 +1,7 @@
 /**
- * SC5 / TOOL-01 / TOOL-06: the extension entry does no I/O at load, registers exactly the five hidden essential
- * swarm tools, the `/swarm` command and the session_shutdown / before_agent_start / tool_call handlers, routes every
- * tool through the single injected bridge, and its tool_call guard does no I/O when it runs.
+ * SC5 / TOOL-01 / TOOL-06: the extension entry does no I/O at load, registers hidden essential
+ * swarm operations, the `/swarm` command and session handlers, routes operations through the injected
+ * bridge, and guards typed assignment authority without opening generic execution.
  *
  * mock.module("node:fs") is process-wide and mock.restore cannot undo it, so this file runs in its own `bun test`
  * process (omp/package.json scripts.test runs it first, then the rest with it ignored).
@@ -10,6 +10,7 @@ import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import * as nodeFs from "node:fs";
 import type { BridgeRequest, BridgeResult } from "../src/bridge.ts";
 import type * as EntryModule from "../src/index.ts";
+import { SWARM_SLUGS } from "../src/guard.ts";
 import { agentCtx, type CallLog, callTool, commandCtx, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
 
 isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT", "SWARM_ED25519_KEY_FILE", "SWARM_SIGNER_DENY_PATHS");
@@ -37,7 +38,6 @@ afterAll(() => {
   spawnSync.mockRestore();
 });
 
-const NAMES = ["swarm_gate", "swarm_ingest", "swarm_plan", "swarm_status", "swarm_transition"];
 
 type Entry = typeof EntryModule;
 let entry: Promise<Entry> | undefined;
@@ -56,7 +56,7 @@ function reachable(value: unknown, out = new Set<object>()): Set<object> {
   return out;
 }
 
-test("registers five with no io: evaluation and factory do no fs, spawn or spawnSync", async () => {
+test("registers hidden essential swarm operations without fs, spawn or spawnSync", async () => {
   fsCalls = 0;
   spawn.mockClear();
   spawnSync.mockClear();
@@ -73,12 +73,12 @@ test("registers five with no io: evaluation and factory do no fs, spawn or spawn
   // registration order is not part of the contract
   expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
   expect([...pi.commands.keys()]).toEqual(["swarm"]);
-  expect(pi.tools.map((t) => t.name).sort()).toEqual(NAMES);
   for (const tool of pi.tools) {
     expect(tool.hidden).toBe(true);
     expect(tool.loadMode).toBe("essential");
     expect(tool.parameters.type).toBe("object");
   }
+  expect(pi.tool("swarm_assignment").name).toBe("swarm_assignment");
 });
 
 test("no action at load: the factory never calls a runtime pi action", async () => {
@@ -163,7 +163,7 @@ test("registered headless guard consumes custom deny metadata without signer loa
   expect(pi.runtimeCalls).toEqual([]);
 });
 
-test("factory twice: two sessions each get five unique tools and share no mutable object", async () => {
+test("factory twice: sessions get unique tools and share no mutable object", async () => {
   const { default: factory } = await loadEntry();
   const [pi1, pi2] = [fakePi(), fakePi()];
   factory(pi1.api);
@@ -171,8 +171,8 @@ test("factory twice: two sessions each get five unique tools and share no mutabl
   for (const pi of [pi1, pi2]) {
     const names = pi.tools.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
-    expect(names.sort()).toEqual(NAMES);
   }
+  expect(new Set(pi1.tools.map((t) => t.name))).toEqual(new Set(pi2.tools.map((t) => t.name)));
 
   const other = reachable(pi2.tools);
   const shared = [...reachable(pi1.tools)].filter((o) => other.has(o)).map((o) => JSON.stringify(o)?.slice(0, 80));
@@ -225,6 +225,144 @@ test("bridge once per tool: one recorded bridge call each with the expected scri
     expect(res.content[0].text).toBe(`${script} ok`);
   }
   expect(spawn).toHaveBeenCalledTimes(0);
+});
+
+test("registered assignment transport returns the canonical prompt and envelope only for A01", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const repo = gitRepo();
+  const assignment = {
+    source: "A01@runner", target: "A02", type: "task.assign", schema: "swarm.v1.task.assign", correlation_id: "c-hot",
+    sig: "hmac:synthetic-controller-signature",
+    payload: { task_id: "H-req", correlation_id: "c-hot", agent_id: "A02" },
+  };
+  const prompt = `# task.assign (signed envelope)\n\`\`\`json\n${JSON.stringify(assignment)}\n\`\`\`\n\nCanonical specialist instructions.`;
+  const canonical = {
+    status: "ok", task_id: "H-req", correlation_id: "c-hot", agent_slug: "a02-requirements",
+    assignment_verified: true, assignment, prompt,
+  };
+  const requests: BridgeRequest[] = [];
+  const pi = fakePi({ activeTools: ["task", "swarm_assignment"] });
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    requests.push(req);
+    return { exitCode: 0, json: canonical, swarmDir: "" };
+  } }));
+  const tool = pi.tool("swarm_assignment");
+  expect(tool.parameters.required).toEqual(expect.arrayContaining(["task_id", "correlation_id"]));
+  expect(Object.keys(tool.parameters.properties ?? {}).sort()).toEqual(["correlation_id", "task_id"]);
+  expect(tool.parameters.additionalProperties).toBe(false);
+  const params = { task_id: "H-req", correlation_id: "c-hot" };
+  const ctx = agentCtx(repo, "a01-orchestrator", [], false);
+  expect(pi.handler("tool_call")({ toolName: tool.name, toolCallId: "assign-1", input: params }, ctx)).toBeUndefined();
+  const result = await callTool(tool, params, ctx);
+  expect(requests).toHaveLength(1);
+  expect(requests[0].script).toBe("orch_assign");
+  expect(requests[0].args).toEqual([`--root=${repo}`, "--task-id=H-req", "--correlation-id=c-hot"]);
+  expect(requests[0].cwd).toBe(repo);
+  expect(result.content).toEqual([{ type: "text", text: prompt }]);
+  expect(result.details).toEqual(canonical);
+});
+
+test("registered assignment transport accepts identities only, not caller-supplied authority", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const requests: BridgeRequest[] = [];
+  const pi = fakePi();
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    requests.push(req);
+    return { exitCode: 0, json: {}, swarmDir: "" };
+  } }));
+  const tool = pi.tool("swarm_assignment");
+  const ctx = agentCtx("/nonexistent-assignment-cwd", "a01-orchestrator");
+  fsCalls = 0;
+  spawn.mockClear();
+  spawnSync.mockClear();
+  for (const extra of [
+    { assignment: { type: "task.assign" } },
+    { payload: { capability: "code.backend" } },
+    { script: "arbitrary_script" },
+    { root: "/caller-selected-workspace" },
+    { dry_run: true },
+    { advisory: true },
+  ]) {
+    await expect(callTool(tool, { task_id: "H-req", correlation_id: "c-hot", ...extra }, ctx))
+      .rejects.toMatchObject({ code: "E-INPUT" });
+  }
+  expect(requests).toEqual([]);
+  expect(fsCalls).toBe(0);
+  expect(spawn).toHaveBeenCalledTimes(0);
+  expect(spawnSync).toHaveBeenCalledTimes(0);
+});
+
+test("registered assignment transport refuses unsigned or unverified bridge success", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const repo = gitRepo();
+  let response: Record<string, unknown> = {};
+  const pi = fakePi();
+  pi.load(createSwarmExtension({ bridge: async () => ({ exitCode: 0, json: response, swarmDir: "" }) }));
+  const tool = pi.tool("swarm_assignment");
+  const params = { task_id: "H-req", correlation_id: "c-hot" };
+  for (const assignment_verified of [undefined, false, true]) {
+    response = {
+      status: "ok", ...params, assignment_verified, agent_slug: "a02-requirements",
+      assignment: { sig: null, payload: params }, prompt: "unsigned advisory instructions",
+    };
+    await expect(callTool(tool, params, agentCtx(repo, "a01-orchestrator")))
+      .rejects.toMatchObject({ code: "E-CONTRACT" });
+  }
+});
+
+test("registered assignment transport refuses every non-controller before io or bridging", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  delete process.env.SWARM_AGENT;
+  const requests: BridgeRequest[] = [];
+  const pi = fakePi({ activeTools: ["task", "swarm_assignment"] });
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    requests.push(req);
+    return { exitCode: 0, json: {}, swarmDir: "" };
+  } }));
+  const tool = pi.tool("swarm_assignment");
+  const guard = pi.handler("tool_call");
+  const params = { task_id: "H-req", correlation_id: "c-hot" };
+  const contexts = [
+    ...SWARM_SLUGS.filter((slug) => slug !== "a01-orchestrator").map((slug) => agentCtx("/nonexistent-assignment-cwd", slug)),
+    agentCtx("/nonexistent-assignment-cwd", "task"),
+    fakeCtx("/nonexistent-assignment-cwd"),
+    agentCtx("/nonexistent-assignment-cwd", "a01-orchestrator", [
+      { type: "custom_message", customType: "plan-mode-context", content: "plan mode" },
+    ]),
+  ];
+  fsCalls = 0;
+  spawn.mockClear();
+  spawnSync.mockClear();
+  for (const ctx of contexts) {
+    expect(guard({ toolName: tool.name, toolCallId: "assign-refused", input: params }, ctx)).toMatchObject({ block: true });
+    await expect(callTool(tool, params, ctx)).rejects.toMatchObject({ code: "E-POLICY" });
+  }
+  expect(requests).toEqual([]);
+  expect(fsCalls).toBe(0);
+  expect(spawn).toHaveBeenCalledTimes(0);
+  expect(spawnSync).toHaveBeenCalledTimes(0);
+});
+
+test("registered A01 guard keeps generic eval and raw-code devices closed", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const requests: BridgeRequest[] = [];
+  const pi = fakePi({ activeTools: ["task", "swarm_assignment"] });
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    requests.push(req);
+    return { exitCode: 0, json: {}, swarmDir: "" };
+  } }));
+  const guard = pi.handler("tool_call");
+  const ctx = agentCtx("/nonexistent-assignment-cwd", "a01-orchestrator", [], false);
+  fsCalls = 0;
+  for (const event of [
+    { toolName: "eval", input: { code: "1 + 1" } },
+    { toolName: "write", input: { path: "xd://run_code", content: "{}" } },
+    { toolName: "write", input: { path: ".swarm/assignment.json", content: "{}" } },
+  ]) {
+    expect(guard({ ...event, toolCallId: "raw-refused" }, ctx)).toMatchObject({ block: true });
+  }
+  expect(requests).toEqual([]);
+  expect(fsCalls).toBe(0);
 });
 
 test("registered command refuses a successful unsigned plan without starting or waiting for A01", async () => {

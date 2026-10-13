@@ -53,14 +53,14 @@ TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Wri
 BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
 # D-01: the omp package's hidden swarm_* tools reach only the agents granted here (omp frontmatter only).
 SWARM_TOOLS = {
-    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"],
+    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"],
     "A08": ["swarm_gate"],
     "A09": ["swarm_gate"],
     "A10": ["swarm_gate"],
     "A12": ["swarm_gate"],
 }
-# Fail-closed ceiling for SWARM_TOOLS: A01 moves task state, the gate agents record verdicts, no agent does both.
-ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"}
+# Fail-closed ceiling: only A01 leases and requests canonical assignments; only gate agents record verdicts.
+ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"}
 # gate agent → (swarm_gate gate name, gate script stem); mirrors GATE_AGENTS in omp/src/context.ts
 GATES = {"A08": ("quality", "qa_gate"), "A09": ("review", "rev_gate"), "A10": ("security", "sec_gate"), "A12": ("release", "rel_plan")}
 GATE_AGENTS = set(GATES)
@@ -322,7 +322,9 @@ OMP_ORCH_PREAMBLE = """<swarm_runtime>
 - Step 0 (mandatory, before reading any file, running any script or writing anything): check your tool definitions and apply the first matching rule below; only then continue with the assignment.
   - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
   - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first.
-""" + _OMP_COMMON + """- Dispatch: spawn specialists via the omp `task` tool with `agent: <slug>` (a02-requirements … a15-docs), batching independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
+""" + _OMP_COMMON + """- Lease: use `swarm_transition` to move each ready task through CLAIMED to IN_PROGRESS before requesting its specialist assignment. Preserve the normal approval controls and single-writer artifact zones.
+- Assignment: call only `swarm_assignment` with the leased `task_id` and its `correlation_id`. It reads the current Task Store lease and returns the canonical signed `task.assign` envelope, exact `assignment_prompt` text in `prompt`, and manifest `agent_slug`. Require `status: "ok"` and `assignment_verified: true`; unsigned, advisory, dry-run, refused or missing assignments confer no dispatch authority. Never construct or sign an assignment yourself, provide a signing payload, access signing material, use generic `eval`/`xd://run_code`, or write raw swarm state to obtain one.
+- Dispatch: only after the verified assignment, spawn the specialist via the omp `task` tool with `agent` set to the returned `agent_slug` (a02-requirements … a15-docs) and `task` set to the returned `prompt` unchanged; do not reconstruct the envelope or prompt. Batch independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
 - Final yield (omp): your final `yield` is the task.result that swarm-orchestrate step 8 defines (`task_id`, `state`, `summary_md`). The swarm.status block from <output_format> goes into `summary_md`; it is never yielded as-is.
 </swarm_runtime>
 """

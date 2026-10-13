@@ -51,7 +51,7 @@ function guardHandler(opts: FakePiOptions = {}) {
 const a01Ctx = (entries: SessionEntry[] = []) => agentCtx(CWD, A01, entries, false);
 
 describe("HOOK-04", () => {
-  test.each(["bash", "read", "write", "edit", "swarm_plan", "swarm_status", "eval", "grep"])(
+  test.each(["bash", "read", "write", "edit", "swarm_plan", "swarm_status", "swarm_assignment", "eval", "grep"])(
     "at the cap, %s is blocked with the depth reason naming the one permitted yield",
     (toolName) => {
       const res = guardToolCall(call(toolName, { command: "ls" }), capped);
@@ -284,6 +284,60 @@ describe("HOOK-03", () => {
     const { run } = guardHandler({ activeTools: ["task"] });
     expect(run(call(toolName, { brief: "x" }), specialist)).toBeUndefined();
     expect(run(call(toolName, { brief: "x" }), fakeCtx(CWD))).toBeUndefined();
+  });
+});
+
+describe("canonical assignment authority", () => {
+  const denied = { block: true, reason: "BLOCKED needs: human-approval (swarm-assignment)" };
+  const assignment = call("swarm_assignment", { task_id: "T-req", correlation_id: "c1" });
+
+  test.each([...SWARM_SLUGS.filter((slug) => slug !== A01), "task", undefined])(
+    "pure guard denies assignment to %p before the outside-swarm return",
+    (agent) => {
+      expect(guardToolCall(assignment, { ...capped, agent, hasTask: true, topLevel: agent === undefined })).toEqual(denied);
+    },
+  );
+
+  test("authenticated A01 outside plan mode is allowed, but plan mode and the depth cap remain denied", () => {
+    expect(guardToolCall(assignment, { ...capped, hasTask: true })).toBeUndefined();
+    expect(guardToolCall(assignment, { ...capped, hasTask: true, planMode: true })).toEqual(denied);
+    expect(guardToolCall(assignment, capped)?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
+  });
+
+  test("registered handler respects controller identity, plan mode and env isolation", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    expect(run(assignment, fakeCtx(CWD))).toEqual(denied);
+    expect(run(assignment, a01Ctx())).toBeUndefined();
+    expect(run(assignment, a01Ctx([{ type: "mode_change", mode: "plan" }]))).toEqual(denied);
+    process.env.SWARM_AGENT = A01;
+    expect(run(assignment, fakeCtx(CWD))).toBeUndefined();
+    expect(run(assignment, agentCtx(CWD, "task", [], false))).toEqual(denied);
+    expect(run(assignment, agentCtx(CWD, "a05-backend", [], false))).toEqual(denied);
+  });
+
+  test("A01 and specialists cannot obtain assignment authority through shell script execution or relocation", () => {
+    for (const agent of SWARM_SLUGS) {
+      for (const command of [
+        "python3 scripts/orch_assign.py --task-id T-req --correlation-id c1",
+        "python3 -m scripts.orch_assign --task-id T-req --correlation-id c1",
+        "python3 - --task-id T-req < scripts/orch_assign.py",
+        "cp scripts/orch_assign.py /tmp/assign.py && python3 /tmp/assign.py",
+      ]) {
+        expect(guardToolCall(call("bash", { command }), { ...capped, agent, hasTask: true })).toEqual(denied);
+      }
+    }
+  });
+
+  test("typed assignment does not reopen eval, raw code, signer reads or protected state writes", () => {
+    const facts: GuardFacts = { ...capped, hasTask: true };
+    for (const event of [
+      call("eval", { code: "arbitrary" }),
+      call("write", { path: "xd://run_code", content: "{}" }),
+      call("write", { path: `${CWD}/.swarm/tasks.db`, content: "forged" }),
+      call("read", { path: `${HOME}/.config/agent-swarm/signing-key.hex` }),
+    ]) {
+      expect(guardToolCall(event, facts)?.block).toBe(true);
+    }
   });
 });
 

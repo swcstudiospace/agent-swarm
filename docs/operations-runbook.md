@@ -47,6 +47,14 @@ OMP receives separate `SWARM_SIGNER_DENY_PATHS` metadata so its guard also prote
 controller key locations. This deny-only policy cannot load a signer, grants no authority,
 and is excluded from prompts, argv, and dry-run diagnostics.
 
+After leasing a specialist task `IN_PROGRESS`, A01 obtains its exact canonical prompt with
+`swarm_assignment({task_id, correlation_id})`. The fixed `orch_assign` operation verifies
+the persisted task/correlation/manifest target and real signature without changing state,
+attempts, history, or logs. Only A01 can call it; no arbitrary code, envelope, agent, payload,
+key, or path is accepted. Pass the verified prompt unchanged to the specialist.
+Missing, unleased, child/advisory, mismatched, and dry-run requests fail closed.
+Generic code-execution devices remain forbidden; this operation is not an eval exception.
+
 Use normal OMP `write` approvals or `--omp-approval-mode always-ask`; do not substitute a bypass.
 Grok's unsupported headless transport is rejected before claims. The lexical shell guard protects
 deterministically resolved signer reads, but is not an OS sandbox for opaque code or symlink aliases.
