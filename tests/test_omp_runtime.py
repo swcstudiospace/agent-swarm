@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ROOT, _scrubbed_base_env, omp_calls, omp_grandchild, run_script, stub_claude, stub_omp
+from conftest import ROOT, _scrubbed_base_env, omp_calls, omp_grandchild, run_script, stub_omp
 
 FIXTURE = ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl"
-KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY")
 RESULT = {"task_id": "T-one", "state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
           "metrics": {"tests": 3}, "summary_md": "ok"}
 ONE_TASK = {"tasks": [{"id": "one", "capability": "code.backend", "agent": "A05", "title": "one", "depends_on": [], "gates": []}]}
@@ -26,6 +26,7 @@ ONE_TASK = {"tasks": [{"id": "one", "capability": "code.backend", "agent": "A05"
 @pytest.fixture()
 def sr(tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    monkeypatch.delenv("SWARM_SIGNER_DENY_PATHS", raising=False)
     spec = importlib.util.spec_from_file_location("swarm_run_omp_under_test", ROOT / "scripts" / "swarm_run.py")
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -159,19 +160,189 @@ def test_yield_error_adds_no_block(sr):
 
 
 # ---------------------------------------------------------------- headless_command (omp)
-def test_omp_command_shape(sr, tmp_path, monkeypatch):
-    monkeypatch.setenv("SWARM_SIGNING_KEY", "secret")
-    args = type("A", (), {"omp_bin": "/opt/omp", "model": "@smol", "task_timeout": 90})()
-    sdir = tmp_path / ".swarm"
-    argv, env, cwd = sr.headless_command("omp", {"slug": "a12-release", "id": "A12"}, tmp_path, sdir, args)
-    assert argv[:7] == ["/opt/omp", "-p", "--mode", "json", "--no-session", "--no-title", "--no-extensions"]
-    opt = dict(zip(argv[7::2], argv[8::2]))
-    assert opt == {"-e": str(ROOT / "omp"), "--cwd": str(tmp_path), "--approval-mode": "yolo",
-                   "--tools": "read,grep,glob,bash,write,swarm_gate,yield", "--append-system-prompt": str(sdir / "agents" / "a12-release.md"),
-                   "--max-time": "81s", "--model": "@smol"}
-    body = (sdir / "agents" / "a12-release.md").read_text()
+@pytest.mark.parametrize("approval_mode", [None, "write", "always-ask"])
+def test_omp_retains_normal_approval_guard_and_child_tools(sr, tmp_path, approval_mode):
+    args = type("A", (), {"omp_bin": "/opt/omp", "model": "", "task_timeout": 90})()
+    if approval_mode is not None:
+        args.approval_mode = approval_mode
+    argv, env, cwd = sr.headless_command("omp", {"slug": "a12-release", "id": "A12"}, tmp_path, tmp_path / ".swarm", args)
+    assert argv[argv.index("--approval-mode") + 1] == (approval_mode or "write")
+    assert "--no-extensions" not in argv
+    assert argv[argv.index("-e") + 1] == str((ROOT / "omp").resolve())
+    assert not {"--auto-approve", "--yolo", "--dangerously-skip-permissions"} & set(argv)
+    tools = argv[argv.index("--tools") + 1].split(",")
+    assert "yield" in tools and "task" not in tools
+    body = Path(argv[argv.index("--append-system-prompt") + 1]).read_text()
     assert not body.startswith("---") and "<swarm_runtime>" in body
-    assert cwd == tmp_path and "SWARM_SIGNING_KEY" not in env and env["SWARM_AGENT"] == "a12-release"
+    assert cwd == tmp_path and env["SWARM_AGENT"] == "a12-release"
+
+
+@pytest.mark.parametrize(("runtime", "mode"), [
+    ("omp", "yolo"), ("omp", "bypassPermissions"), ("omp", "dontAsk"),
+    ("claude", "bypassPermissions"), ("claude", "dontAsk"), ("claude", "yolo"),
+])
+def test_headless_command_refuses_bypass_modes(sr, tmp_path, runtime, mode):
+    from swarm.errors import SwarmError
+    args = type("A", (), {"approval_mode": mode, "permission_mode": mode})()
+    with pytest.raises(SwarmError) as e:
+        sr.headless_command(runtime, {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    assert e.value.code.value == "E-INPUT"
+
+
+@pytest.mark.parametrize("mode", ["default", "acceptEdits", "plan"])
+def test_claude_keeps_normal_permission_modes(sr, tmp_path, mode):
+    args = type("A", (), {"permission_mode": mode, "model": "", "max_turns": 5, "allowed_tools": ""})()
+    argv, _, _ = sr.headless_command("claude", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    assert argv[argv.index("--permission-mode") + 1] == mode
+    assert not {"--dangerously-skip-permissions", "--yolo", "--auto-approve"} & set(argv)
+
+
+@pytest.mark.parametrize(("flag", "mode"), [
+    ("--approval-mode", "yolo"), ("--approval-mode", "bypassPermissions"), ("--approval-mode", "dontAsk"),
+    ("--permission-mode", "bypassPermissions"), ("--permission-mode", "dontAsk"), ("--permission-mode", "yolo"),
+])
+def test_runner_cli_rejects_bypass_modes(sr, flag, mode):
+    import argparse
+    parser = argparse.ArgumentParser()
+    sr.add_args(parser)
+    with pytest.raises(SystemExit) as e:
+        parser.parse_args([flag, mode])
+    assert e.value.code == 2
+
+
+@pytest.mark.parametrize("runtime", ["omp", "claude"])
+def test_specialists_cannot_inherit_signing_values_or_file_references(sr, tmp_path, monkeypatch, runtime):
+    refs = {
+        "SWARM_SIGNING_KEY": "test-owned-signing-value",
+        "SWARM_ED25519_KEY": "test-owned-ed25519-value",
+        "SWARM_ED25519_KEY_FILE": str(tmp_path / "private-test-reference.hex"),
+        "SWARM_REQUIRE_KEY": "1",
+    }
+    for key, value in refs.items():
+        monkeypatch.setenv(key, value)
+    args = type("A", (), {"model": "", "task_timeout": 90, "permission_mode": "acceptEdits",
+                         "max_turns": 5, "allowed_tools": ""})()
+    argv, env, _ = sr.headless_command(runtime, {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    secret_values = [value for key, value in refs.items() if key != "SWARM_REQUIRE_KEY"]
+    assert not set(refs) & set(env)
+    assert all(value not in json.dumps(env) for value in (refs["SWARM_SIGNING_KEY"], refs["SWARM_ED25519_KEY"]))
+    if runtime == "omp":
+        assert json.loads(env["SWARM_SIGNER_DENY_PATHS"]) == [refs["SWARM_ED25519_KEY_FILE"]]
+    else:
+        assert "SWARM_SIGNER_DENY_PATHS" not in env
+    assert all(value not in " ".join(argv) for value in secret_values)
+    if runtime == "omp":
+        body = Path(argv[argv.index("--append-system-prompt") + 1]).read_text()
+        assert all(value not in body for value in secret_values)
+    assert all(os.environ[key] == value for key, value in refs.items())
+
+
+@pytest.mark.parametrize("reference", [
+    "outside-discovery/../custom-source.hex", "~operator/custom-source.hex", "$SIGNER_DIR/custom-source.hex",
+])
+def test_omp_captures_relative_signer_source_from_controller_cwd(sr, tmp_path, monkeypatch, reference):
+    controller = tmp_path / "controller"
+    controller.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(controller)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", reference)
+    monkeypatch.setenv("SWARM_SIGNER_DENY_PATHS", json.dumps([
+        str(tmp_path / "prior" / ".." / "prior-source.hex"), str(tmp_path / "prior-source.hex"),
+    ]))
+    original = dict(os.environ)
+    args = type("A", (), {"model": "", "task_timeout": 90})()
+    argv, env, cwd = sr.headless_command(
+        "omp", {"slug": "a05-backend", "id": "A05"}, workspace, workspace / ".swarm", args)
+    expected = str(controller / ("custom-source.hex" if reference.startswith("outside-discovery/") else reference))
+    assert json.loads(env["SWARM_SIGNER_DENY_PATHS"]) == [expected, str(tmp_path / "prior-source.hex")]
+    assert cwd == workspace and cwd != controller
+    assert "SWARM_ED25519_KEY_FILE" not in env
+    assert not set(KEY_VARS) & set(env)
+    body = Path(argv[argv.index("--append-system-prompt") + 1]).read_text()
+    assert all(value not in " ".join(argv) + body for value in (reference, expected, env["SWARM_SIGNER_DENY_PATHS"]))
+    assert dict(os.environ) == original
+
+
+def test_only_omp_receives_trusted_prior_signer_denials(sr, tmp_path, monkeypatch):
+    prior = str(tmp_path / "synthetic-denied-source.hex")
+    monkeypatch.delenv("SWARM_ED25519_KEY_FILE", raising=False)
+    monkeypatch.setenv("SWARM_SIGNER_DENY_PATHS", json.dumps([prior]))
+    original = dict(os.environ)
+    args = type("A", (), {"model": "", "task_timeout": 90, "permission_mode": "acceptEdits",
+                         "max_turns": 5, "allowed_tools": ""})()
+    _, omp_env, _ = sr.headless_command("omp", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    _, claude_env, _ = sr.headless_command(
+        "claude", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    assert json.loads(omp_env["SWARM_SIGNER_DENY_PATHS"]) == [prior]
+    assert "SWARM_SIGNER_DENY_PATHS" not in claude_env
+    assert dict(os.environ) == original
+
+
+@pytest.mark.parametrize("policy", [
+    "not-json", "{}", '["relative.hex"]', "[1]", '["/synthetic\\u0000source.hex"]',
+    json.dumps(["/" + "x" * 4096]), json.dumps([f"/source-{i}.hex" for i in range(33)]),
+    " " * 131073,
+])
+def test_omp_rejects_invalid_prior_deny_policy_without_disclosing_it(sr, tmp_path, monkeypatch, policy):
+    from swarm.errors import SwarmError
+    monkeypatch.setenv("SWARM_SIGNER_DENY_PATHS", policy)
+    args = type("A", (), {"model": "", "task_timeout": 90})()
+    with pytest.raises(SwarmError) as e:
+        sr.headless_command("omp", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    assert e.value.code.value == "E-INPUT"
+    assert str(e.value) == "E-INPUT: invalid or oversized signer deny-path policy"
+    assert os.environ["SWARM_SIGNER_DENY_PATHS"] == policy
+
+
+def test_omp_never_truncates_prior_denials_for_new_source(sr, tmp_path, monkeypatch):
+    from swarm.errors import SwarmError
+    monkeypatch.setenv("SWARM_SIGNER_DENY_PATHS", json.dumps([f"/prior-source-{i}.hex" for i in range(32)]))
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(tmp_path / "additional-source.hex"))
+    args = type("A", (), {"model": "", "task_timeout": 90})()
+    with pytest.raises(SwarmError) as e:
+        sr.headless_command("omp", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    assert e.value.code.value == "E-INPUT"
+
+
+def test_dry_run_omits_deny_metadata_and_private_sources(sr, tmp_path, monkeypatch, capsys):
+    configured = str(tmp_path / "outside-discovery" / "configured-source.hex")
+    prior = str(tmp_path / "prior-source.hex")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", configured)
+    monkeypatch.setenv("SWARM_SIGNER_DENY_PATHS", json.dumps([prior]))
+    args = type("A", (), {"runtime": "omp", "model": "", "task_timeout": 90})()
+    meta = sr.dry_run_invocation({"task_id": "T-one", "attempt": 1},
+                                 {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    captured = capsys.readouterr()
+    output = captured.out + captured.err + json.dumps(meta)
+    assert all(value not in output for value in ("SWARM_SIGNER_DENY_PATHS", configured, prior))
+
+
+
+def test_canonical_gate_keeps_trusted_signing_reference(sr, tmp_path, monkeypatch):
+    ref = str(tmp_path / "private-test-reference.hex")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", ref)
+    monkeypatch.setenv("SWARM_CHILD", "1")
+    monkeypatch.setenv("SWARM_AGENT_SESSION", "1")
+    seen = {}
+
+    class GateGroup:
+        stopped = []
+
+        def __init__(self, cmd, **kw):
+            seen.update(argv=cmd, env=kw["env"])
+            self.proc = type("P", (), {"returncode": 0, "communicate": lambda self, timeout: ("", "")})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sr, "ChildGroup", GateGroup)
+    task = {"task_id": "T-review", "correlation_id": "test-correlation", "notes_json": {"gate": "review"}}
+    sr.run_gate_script(task, tmp_path, tmp_path / ".swarm", dry_run=False)
+    assert seen["env"]["SWARM_ED25519_KEY_FILE"] == ref
+    assert "SWARM_AGENT_SESSION" not in seen["env"] and "SWARM_CHILD" not in seen["env"]
+    assert ref not in " ".join(seen["argv"])
+    assert Path(seen["argv"][1]) == ROOT / "scripts" / "rev_gate.py"
 
 
 def test_omp_command_missing_body_is_e_dep(sr, tmp_path):
@@ -224,14 +395,18 @@ def test_dry_run_prints_omp_invocation(tmp_path):
     assert len(lines) == 1
     tokens = shlex.split(lines[0].removeprefix("dry-run T-one [A05]: "))
     # WR-06 / T-06-19: a replay from the runner's shell drops the key vars and the parent's task ids.
-    assert tokens[:11] == ["env", "-u", "SWARM_SIGNING_KEY", "-u", "SWARM_ED25519_KEY", "-u", "SWARM_REQUIRE_KEY",
-                           "-u", "SWARM_TASK_ID", "-u", "SWARM_CORRELATION_ID"]
-    assert dict(t.split("=", 1) for t in tokens[11:17]) == {
-        "SWARM_DIR": str(swarm), "SWARM_CHILD": "1", "SWARM_AGENT_SESSION": "1", "SWARM_AGENT": "a05-backend",
-        "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
-    argv, (redirect, stdin) = tokens[17:-2], tokens[-2:]
-    assert argv[0] == "omp" and "--no-extensions" in argv
+    i, unset = 1, []
+    assert tokens[0] == "env"
+    while tokens[i] == "-u":
+        unset.append(tokens[i + 1])
+        i += 2
+    assert set(unset) == {*KEY_VARS, "SWARM_TASK_ID", "SWARM_CORRELATION_ID"}
+    while "=" in tokens[i]:
+        i += 1
+    argv, (redirect, stdin) = tokens[i:-2], tokens[-2:]
+    assert "--no-extensions" not in argv
     opt = lambda k: argv[argv.index(k) + 1]  # noqa: E731
+    assert opt("--approval-mode") == "write"
     assert opt("-e") == str(ROOT / "omp")
     assert opt("--tools").endswith(",yield")
     body = Path(opt("--append-system-prompt"))
@@ -246,7 +421,8 @@ def test_dry_run_prints_omp_invocation(tmp_path):
 def test_dry_run_line_replays_without_keys(tmp_path):
     """WR-06: the printed line, run by a shell that exports the runner's keys, starts a key-less session."""
     swarm = tmp_path / ".swarm"
-    keys = {"SWARM_SIGNING_KEY": "runner-secret", "SWARM_ED25519_KEY": "11" * 32, "SWARM_REQUIRE_KEY": "1"}
+    keys = {"SWARM_SIGNING_KEY": "runner-secret", "SWARM_ED25519_KEY": "11" * 32, "SWARM_REQUIRE_KEY": "1",
+            "SWARM_ED25519_KEY_FILE": str(tmp_path / "private-test-reference.hex")}
     env = _env(swarm, **keys)
     work = _plan(tmp_path, env)
     stub = stub_omp(tmp_path, RESULT)
@@ -263,6 +439,9 @@ def test_dry_run_line_replays_without_keys(tmp_path):
     assert not set(KEY_VARS) & set(call["env"])
     assert "SWARM_TASK_ID" not in call["env"] and "SWARM_CORRELATION_ID" not in call["env"]
     assert call["env"]["SWARM_AGENT"] == "a05-backend" and call["env"]["SWARM_AGENT_SESSION"] == "1"
+    assert all(value not in call["stdin"] and value not in " ".join(call["argv"]) for value in keys.values()
+               if value != "1")
+    assert keys["SWARM_ED25519_KEY_FILE"] not in r.stdout + r.stderr
 
 
 # ---------------------------------------------------------------- (c) preflight checks only the selected runtime
@@ -279,16 +458,15 @@ def test_omp_preflight_without_claude(tmp_path):
     assert [Path(c["argv"][0]).name for c in omp_calls(stub)] == ["omp-alt"]
 
 
-def test_grok_preflight_without_claude(tmp_path):
+def test_grok_refuses_unsupported_safe_stdin_transport(tmp_path):
     swarm = tmp_path / ".swarm"
     env = _env(swarm)
     work = _plan(tmp_path, env)
-    bin_dir = tmp_path / "grok-bin"
-    bin_dir.mkdir()
-    shutil.copy(stub_claude(tmp_path, RESULT), bin_dir / "grok")
-    r = run_script("swarm_run.py", "--runtime", "grok", "--repo", str(work), "--json", env={**env, "PATH": str(bin_dir)})
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert json.loads(r.stdout)["complete"] is True
+    r = run_script("swarm_run.py", "--runtime", "grok", "--repo", str(work), "--json", env=env)
+    assert r.returncode == 2, r.stdout + r.stderr
+    err = json.loads(r.stdout)["error"]
+    assert err["code"] == "E-DEP" and "stdin assignment transport" in err["message"]
+    assert _states(swarm) == {"T-one": "PLANNED"}
 
 
 def test_missing_omp_is_e_dep(tmp_path):

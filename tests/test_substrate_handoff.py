@@ -685,7 +685,7 @@ def test_with_no_handoff_key_packets_are_unsigned_say_so_and_the_run_completes(t
     repo.mkdir()
     _deliver(repo)  # the run's workspace is its --repo: the runner reads the agents' env files for it
     args = _args(repo=str(repo), max_parallel=2, max_rounds=10, once=False)
-    args.runtime, args.grok_bin = "grok", sys.executable  # any executable: the sessions are stubbed
+    args.claude_bin = sys.executable  # sessions are stubbed; the runtime retains normal approval
     ctx = SimpleNamespace(correlation_id=CORR, emit=lambda t, p, **k: events.append((t, p)))
     out = runner.run(args, ctx)
     assert out["complete"] is True and out["counts"] == {"DONE": 2}

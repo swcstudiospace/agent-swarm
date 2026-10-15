@@ -1,18 +1,15 @@
 """G1 (Phase 6, RUN-01/SC1, D-04): the invocation `--dry-run` prints is the one the live runner spawns — argv, env
 deltas and unsets, cwd and stdin — compared across two sibling stores with the same one-task plan."""
 import json
-import os
 import re
 import shlex
 from pathlib import Path
 
-from conftest import ROOT, omp_calls, run_script, stub_omp
+from conftest import ROOT, _scrubbed_base_env, omp_calls, run_script, stub_omp
 
-KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY")
 # T-06-19: the dry-run line also unsets the runner's task and correlation ids, matching the live child env.
 SESSION_UNSET = (*KEY_VARS, "SWARM_TASK_ID", "SWARM_CORRELATION_ID")
-_ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_AGENT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
-              "SWARM_DRYRUN_FAIL", "SWARM_RUNTIME", "ANTHROPIC_API_KEY")
 KEYS = {"SWARM_SIGNING_KEY": "runner-secret", "SWARM_ED25519_KEY": "11" * 32, "SWARM_REQUIRE_KEY": "1"}
 RESULT = {"state": "IN_REVIEW", "outputs": [{"kind": "code.backend", "uri": "file://x", "version": "1", "digest": ""}],
           "metrics": {}, "summary_md": "ok"}
@@ -23,7 +20,8 @@ ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 def _store(base: Path) -> tuple[dict, Path]:
     """A planned one-task store under base/.swarm for repo base/work; the runner env (with the runner's keys)."""
     base.mkdir()
-    env = {**{k: v for k, v in os.environ.items() if k not in _ENV_NOISE}, "SWARM_DIR": str(base / ".swarm"), **KEYS}
+    env = {**_scrubbed_base_env(), "SWARM_DIR": str(base / ".swarm"), **KEYS,
+           "SWARM_ED25519_KEY_FILE": str(base / "private-test-reference.hex")}
     work = base / "work"
     work.mkdir()
     plan = base / "plan.json"
@@ -70,6 +68,9 @@ def test_dry_run_invocation_matches_live_omp_call(tmp_path):
     assert {k: call["env"].get(k) for k in deltas} == deltas
     assert sorted(unset) == sorted(SESSION_UNSET)
     assert not set(unset) & set(call["env"])  # the runner had them all; the child has none
+    assert env_b["SWARM_ED25519_KEY_FILE"] not in " ".join(call["argv"]) + call["stdin"]
+    assert "--no-extensions" not in argv
+    assert argv[argv.index("--approval-mode") + 1] == "write"
     assert Path(argv[argv.index("--cwd") + 1]).resolve() == Path(call["cwd"]).resolve() == work_b.resolve()
     assert Path(stdin) == b / ".swarm" / "assignments" / "T-one.a1.md"
     assert Path(stdin).read_text() == call["stdin"]
