@@ -10,9 +10,9 @@ import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import * as nodeFs from "node:fs";
 import type { BridgeRequest, BridgeResult } from "../src/bridge.ts";
 import type * as EntryModule from "../src/index.ts";
-import { agentCtx, callTool, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
+import { agentCtx, type CallLog, callTool, commandCtx, fakeCtx, fakePi, gitRepo, isolateEnv, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT");
+isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT", "SWARM_ED25519_KEY_FILE", "SWARM_SIGNER_DENY_PATHS");
 
 // Capture the real functions before mocking, so the wrappers never call themselves.
 const realFs: Record<string, unknown> = { ...nodeFs };
@@ -122,6 +122,47 @@ test("guard with no io: the tool_call handler decides without fs, spawn, spawnSy
   expect(pi.runtimeCalls).toEqual(["getActiveTools", "getActiveTools"]);
 });
 
+test("registered headless guard consumes custom deny metadata without signer loading or io", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const source = "/nonexistent-controller-private/custom-signer.source";
+  process.env.SWARM_AGENT = "a05-backend";
+  process.env.SWARM_SIGNER_DENY_PATHS = JSON.stringify([source]);
+  delete process.env.SWARM_ED25519_KEY_FILE;
+  const bridged: BridgeRequest[] = [];
+  const pi = fakePi();
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    bridged.push(req);
+    return { exitCode: 0, json: {}, swarmDir: "" };
+  } }));
+  const guard = pi.handler("tool_call");
+  const ctx = fakeCtx("/nonexistent-guard-cwd");
+  fsCalls = 0;
+  spawn.mockClear();
+  spawnSync.mockClear();
+  const events = [
+    { toolName: "read", input: { path: `${source}:raw` } },
+    { toolName: "grep", input: { path: "/nonexistent-controller-private", pattern: "." } },
+    { toolName: "bash", input: { command: `cat ${source}` } },
+    { toolName: "bash", input: { command: `cat < ${source}` } },
+    { toolName: "bash", input: { command: `cp ${source} /tmp/public-copy`, cwd: "/unrelated",
+      env: { HOME: "/unrelated", SWARM_ED25519_KEY_FILE: "/unrelated/public", SWARM_SIGNER_DENY_PATHS: "[]" } } },
+  ];
+  for (const [index, event] of events.entries()) {
+    expect(guard({ ...event, toolCallId: `custom-${index}` }, ctx)).toEqual({
+      block: true, reason: `BLOCKED needs: human-approval (signer_credential: signer-file-${event.toolName === "bash" ? "shell" : "read"})`,
+    });
+  }
+  expect(guard({ toolName: "bash", toolCallId: "custom-stat", input: { command: `stat ${source}` } }, ctx)).toBeUndefined();
+  expect(guard({ toolName: "read", toolCallId: "custom-public", input: { path: "src/guard.ts" } }, ctx)).toBeUndefined();
+  expect(process.env.SWARM_ED25519_KEY_FILE).toBeUndefined();
+  expect(fsCalls).toBe(0);
+  expect(spawn).toHaveBeenCalledTimes(0);
+  expect(spawnSync).toHaveBeenCalledTimes(0);
+  expect(bridged).toEqual([]);
+  expect(pi.actionCalls).toEqual([]);
+  expect(pi.runtimeCalls).toEqual([]);
+});
+
 test("factory twice: two sessions each get five unique tools and share no mutable object", async () => {
   const { default: factory } = await loadEntry();
   const [pi1, pi2] = [fakePi(), fakePi()];
@@ -184,4 +225,22 @@ test("bridge once per tool: one recorded bridge call each with the expected scri
     expect(res.content[0].text).toBe(`${script} ok`);
   }
   expect(spawn).toHaveBeenCalledTimes(0);
+});
+
+test("registered command refuses a successful unsigned plan without starting or waiting for A01", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const requests: BridgeRequest[] = [];
+  const log: CallLog = [];
+  const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    requests.push(req);
+    return { exitCode: 0, json: { status: "ok", correlation_id: "unsigned-plan", tasks: [] }, swarmDir: "" };
+  } }));
+  await pi.command("swarm").handler("plan this brief", commandCtx(gitRepo(), [], { log }));
+  expect(requests).toHaveLength(1);
+  expect(requests[0].script).toBe("orch_plan");
+  expect(requests[0].inflight).toBeInstanceOf(Set);
+  expect(log.map((entry) => entry.call)).toEqual(["notify"]);
+  expect(log[0].message).toContain("dispatch refused");
+  expect(log[0].level).toBe("error");
 });

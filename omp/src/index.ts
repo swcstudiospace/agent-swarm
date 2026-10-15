@@ -9,7 +9,7 @@ import { resolve } from "node:path";
 import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
 import { swarmCommand } from "./commands.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
-import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR } from "./guard.ts";
+import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR, parseSignerDenyPaths } from "./guard.ts";
 import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionFactory } from "./omp-api.ts";
 import { buildTools } from "./tools.ts";
@@ -47,7 +47,8 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         // D-08: the runtime roots bridge.swarmRoot() picks from (env SWARM_ROOT, the package's repo), spelled without fs
         const root = env.SWARM_ROOT?.trim();
         const runtimeRoots = [...(root ? [resolve(root)] : []), resolve(import.meta.dir, "..", "..")];
-        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots };
+        const signerReadPaths = parseSignerDenyPaths(env.SWARM_SIGNER_DENY_PATHS);
+        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots, signerReadPaths };
         return guardToolCall(event, facts);
       } catch (err) {
         if (!inSwarm({ ...known, env })) return undefined;
