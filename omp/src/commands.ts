@@ -6,7 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import type { Bridge, BridgeResult } from "./bridge.ts";
-import { inPlanMode } from "./context.ts";
+import { inPlanMode, sessionAgent } from "./context.ts";
 import { DISPATCH_MARKER } from "./hooks.ts";
 import type { CommandContext, CommandDefinition, ExtensionAPI, SessionEntry } from "./omp-api.ts";
 import { PATTERNS, type PlanParams, planArgs, RISK_CLASSES } from "./tools.ts";
@@ -53,30 +53,77 @@ export function swarmCorrelationId({ brief, pattern, risk_class }: SwarmArgs): s
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/** Ready = the plan's tasks with an empty depends_on list (the only definition; no Task Store re-read). */
-function readyTaskIds(json: Record<string, unknown>): string[] {
-  const tasks = Array.isArray(json.tasks) ? json.tasks : [];
-  const ids: string[] = [];
-  for (const t of tasks) {
-    if (typeof t !== "object" || t === null) continue;
-    const { task_id, depends_on } = t as { task_id?: unknown; depends_on?: unknown };
-    if (typeof task_id === "string" && Array.isArray(depends_on) && depends_on.length === 0) ids.push(task_id);
-  }
-  return ids;
+function object(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-/** The marker-tagged prompt that hands the plan to one A01, which then fans the lanes out. */
-function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs): string {
+/** Match TaskStore.ready(): schedulable states whose dependencies have completed their work. */
+function readyTaskIds(json: Record<string, unknown>): string[] {
+  const tasks = json.tasks as Array<{ task_id: string; depends_on: string[]; state: string }>;
+  const complete = new Set(tasks.filter((t) => ["IN_REVIEW", "APPROVED", "DONE"].includes(t.state)).map((t) => t.task_id));
+  return tasks.filter((t) => ["CREATED", "VALIDATED", "PLANNED", "RETRY"].includes(t.state) &&
+    t.depends_on.every((id) => complete.has(id))).map((t) => t.task_id);
+}
+
+/**
+ * Python alone authenticates the signature with a real key. This boundary checks its attestation and binds the
+ * canonical envelope to the persisted plan; it never signs, reads keys, or reconstructs an assignment.
+ * Errors are fixed text: neither an invalid envelope nor bridge diagnostics belong in an A01 prompt.
+ */
+function executionAssignment(json: Record<string, unknown>): Record<string, unknown> | string {
+  if (json.status !== "ok") return "canonical orch_plan did not return a successful persisted plan";
+  if (json.execution_assignment_verified !== true) return "canonical orch_plan did not authenticate an execution assignment";
+  const assignment = object(json.execution_assignment);
+  if (!assignment) return "canonical execution assignment is absent or malformed";
+  if (assignment.schema !== "swarm.v1.task.assign" || assignment.type !== "task.assign" ||
+      assignment.source !== "A01@controller" || assignment.target !== "A01") return "execution assignment has an invalid controller envelope";
+  if (typeof assignment.sig !== "string" ||
+      !/^(?:hmac:[A-Za-z0-9+/]{43}=|ed25519:[A-Za-z0-9+/]{86}==)$/.test(assignment.sig)) {
+    return "execution assignment lacks a canonical signature";
+  }
+  if (["msg_id", "trace_id", "ts"].some((field) => typeof assignment[field] !== "string" || !assignment[field]) ||
+      typeof assignment.ttl_s !== "number" || !Number.isInteger(assignment.ttl_s) || assignment.ttl_s <= 0 ||
+      !["P0", "P1", "P2", "P3"].includes(String(assignment.priority)) ||
+      !RISK_CLASSES.includes(assignment.risk_class as typeof RISK_CLASSES[number])) return "execution assignment envelope is malformed";
+  const corr = json.correlation_id;
+  const payload = object(assignment.payload);
+  if (typeof corr !== "string" || !corr || !payload || assignment.correlation_id !== corr ||
+      payload.correlation_id !== corr || payload.task_id !== corr) return "execution assignment does not match the persisted controller identity";
+  if (payload.capability !== "plan.execute" || payload.agent_id !== "A01") return "execution assignment is not authorized for A01 plan.execute";
+  const tasks = json.tasks;
+  if (!Array.isArray(tasks) || tasks.some((task) => {
+    const t = object(task);
+    return !t || typeof t.task_id !== "string" || !t.task_id || typeof t.state !== "string" ||
+      !Array.isArray(t.depends_on) || t.depends_on.some((id) => typeof id !== "string");
+  }) || new Set(tasks.map((task) => task.task_id)).size !== tasks.length) return "persisted plan tasks are malformed";
+  const ready = readyTaskIds(json);
+  if (!Array.isArray(payload.ready_tasks) || payload.ready_tasks.length !== ready.length ||
+      new Set(payload.ready_tasks).size !== ready.length || payload.ready_tasks.some((id) => typeof id !== "string" || !ready.includes(id))) {
+    return "execution assignment ready tasks do not match the persisted plan";
+  }
+  const plan = Array.isArray(payload.inputs) && payload.inputs.length === 1 ? object(payload.inputs[0]) : undefined;
+  if (!plan || plan.correlation_id !== corr || !Array.isArray(plan.tasks) ||
+      plan.tasks.length !== tasks.length || plan.tasks.some((task, index) => {
+        const t = object(task);
+        const expected = tasks[index];
+        return !t || t.task_id !== expected.task_id || t.state !== expected.state ||
+          JSON.stringify(t.depends_on) !== JSON.stringify(expected.depends_on);
+      }) || !Array.isArray(payload.acceptance) || payload.acceptance.some((criterion) => typeof criterion !== "string") ||
+      !object(payload.budget) || payload.risk_class !== assignment.risk_class) return "execution assignment does not carry the persisted plan contract";
+  return assignment;
+}
+
+/** Hand the exact authenticated envelope to the task tool, never an unsigned payload copy. */
+function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs, assignment: Record<string, unknown>): string {
   const { json } = res;
-  const corr = typeof json.correlation_id === "string" ? json.correlation_id : "";
-  const count = Array.isArray(json.tasks) ? json.tasks.length : 0;
-  const assign = { correlation_id: corr, capability: "plan.execute", ready_tasks: readyTaskIds(json) };
-  const summary = typeof json.summary === "string" ? json.summary : JSON.stringify(json);
+  const corr = json.correlation_id as string;
+  const count = (json.tasks as unknown[]).length;
+  const summary = typeof json.summary === "string" ? json.summary : `${count} planned tasks`;
   return [
     `${DISPATCH_MARKER} AgentSwarm plan ${corr} is ${json.reused === true ? "reused" : "ready"}: ${count} tasks ` +
       `(pattern ${parsed.pattern}, risk ${parsed.risk_class}).`,
-    'Call the `task` tool exactly once with agent "a01-orchestrator" and this task.assign payload as the task text:',
-    JSON.stringify(assign),
+    'Call the `task` tool exactly once with agent "a01-orchestrator" and this canonical signed task.assign envelope as the task text, unchanged:',
+    JSON.stringify(assignment),
     "A01 executes the plan and reports back; do not implement the brief in this session.",
     "A01 fans out every ready lane in that same turn, including several calls to the same slug when the plan repeats it. Disjoint blast radii stay parallel. Lane agents do not review. After the join merges their branches, one Greptile review covers the merged result.",
     "",
@@ -182,6 +229,9 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
     async handler(args, ctx) {
       const parsed = parseSwarmArgs(args);
       if ("error" in parsed) return notify(ctx, parsed.error, "warning");
+      if (!sessionAgent(ctx).topLevel) {
+        return notify(ctx, "E-POLICY: /swarm refused: only the top-level controller session may dispatch A01", "warning");
+      }
       // D-03 parity (T-04-16): refused before any bridge call
       if (inPlanMode(ctx)) {
         return notify(ctx, "E-POLICY: /swarm refused: omp is in plan mode (read-only), so nothing was planned; leave plan mode first", "warning");
@@ -201,9 +251,11 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
           typeof err?.message === "string" ? err.message : typeof res.json.summary === "string" ? res.json.summary : JSON.stringify(res.json);
         return notify(ctx, `/swarm: orch_plan exit ${res.exitCode}: ${detail}`, "error");
       }
-      const corr = typeof res.json.correlation_id === "string" ? res.json.correlation_id : "?";
+      const assignment = executionAssignment(res.json);
+      if (typeof assignment === "string") return notify(ctx, `E-POLICY: /swarm dispatch refused: ${assignment}`, "error");
+      const corr = res.json.correlation_id as string;
       const from = ctx.sessionManager.getBranch().length;
-      pi.sendUserMessage(dispatchPrompt(res, parsed));
+      pi.sendUserMessage(dispatchPrompt(res, parsed, assignment));
       // sendUserMessage starts the turn asynchronously: wait for it to start, then hold until it ends (G-04-05-1)
       if (!(await awaitDispatchStart(ctx, corr, from, opts))) {
         const seconds = (opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS) / 1000;

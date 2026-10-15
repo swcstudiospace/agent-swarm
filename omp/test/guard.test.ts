@@ -1636,6 +1636,20 @@ describe("private signer file reads", () => {
   });
 
   test.each([
+    "", "not-json", "null", "{}", JSON.stringify(CONFIGURED), JSON.stringify([null]),
+    JSON.stringify([1]), JSON.stringify(["relative/private.source"]), JSON.stringify(["/private\0source"]),
+    JSON.stringify(Array(33).fill(CONFIGURED)), JSON.stringify([`/${"x".repeat(4096)}`]), " ".repeat(131073),
+  ])("malformed or excessive deny metadata fails closed without echoing its value: %p", (value) => {
+    expect(() => parseSignerDenyPaths(value)).toThrow("invalid signer deny-path policy");
+    process.env.SWARM_SIGNER_DENY_PATHS = value;
+    const { run } = guardHandler();
+    expect(run(call("read", { path: "src/guard.ts" }), agentCtx(CWD, "a05-backend", [], false))).toEqual({
+      block: true, reason: `${GUARD_ERROR_PREFIX}invalid signer deny-path policy)`,
+    });
+    expect(run(call("read", { path: "src/guard.ts" }), fakeCtx(CWD))).toBeUndefined();
+  });
+
+  test.each([
     KEY, `${KEY}:1-4`, `${KEY}:raw`, `${KEY}:img`,
     "~/.config/agent-swarm/signing-key.hex", "$HOME/.config/agent-swarm/signing-key.hex",
     "${HOME}/.config/agent-swarm/signing-key.hex",
@@ -1766,4 +1780,52 @@ describe("private signer file reads", () => {
     expect(run(call("read", { path: "src/guard.ts" }), ctx)).toBeUndefined();
   });
 
+  test("registered headless consumer protects deny-only custom sources after loadable signer input is stripped", () => {
+    const source = "/nonexistent-controller-private/custom-signer.source";
+    process.env.SWARM_AGENT = "a05-backend";
+    process.env.SWARM_SIGNER_DENY_PATHS = JSON.stringify([
+      "/nonexistent-controller-private/intermediate/../custom-signer.source",
+    ]);
+    process.env.XDG_CONFIG_HOME = "/nonexistent-controller-xdg";
+    expect(process.env.SWARM_ED25519_KEY_FILE).toBeUndefined();
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const ctx = fakeCtx(CWD);
+    for (const path of [source, `${source}:raw`, `file://${source}`, "~/.config/agent-swarm/signing-key.hex",
+      "/nonexistent-controller-xdg/agent-swarm/signing-key.hex"]) {
+      expect(run(call("read", { path }), ctx)).toEqual(blockedRead);
+      expect(run(call("grep", { path, pattern: "." }), ctx)).toEqual(blockedRead);
+    }
+    expect(run(call("grep", { path: "/nonexistent-controller-private", pattern: "." }), ctx)).toEqual(blockedRead);
+    for (const command of [
+      `cat ${source}`, `cat < ${source}`, `read -r value < ${source}`,
+      `cp ${source} /tmp/public-copy`, `dd if=${source} of=/tmp/public-copy`,
+      `grep -n . ${source}`, `cd /nonexistent-controller-private && cat custom-signer.source`,
+      `SWARM_SIGNER_DENY_PATHS='[]' HOME=/unrelated cat ${source}`,
+    ]) {
+      expect(run(call("bash", { command }), ctx)).toEqual(blockedShell);
+      expect(run(call("bash", {
+        command, cwd: "/unrelated",
+        env: { HOME: "/unrelated", XDG_CONFIG_HOME: "/unrelated", SWARM_ED25519_KEY_FILE: "/unrelated/public",
+          SWARM_SIGNER_DENY_PATHS: "[]" },
+      }), ctx)).toEqual(blockedShell);
+    }
+    expect(run(call("bash", {
+      command: "cat custom-signer.source", cwd: "/nonexistent-controller-private",
+      env: { SWARM_SIGNER_DENY_PATHS: "[]" },
+    }), ctx)).toEqual(blockedShell);
+    // Captured policy is additive: a tool override may name another source, never erase the controller's.
+    expect(run(call("bash", {
+      command: 'cat "$SWARM_ED25519_KEY_FILE"', env: { SWARM_ED25519_KEY_FILE: "/nonexistent-tool-private/other.source" },
+    }), ctx)).toEqual(blockedShell);
+    for (const command of [
+      `stat ${source}`, `ls -l ${source}`, `[ -f ${source} ] && echo exists`,
+      `printf '%s' ${source}`, `grep '${source}' src/guard.ts`, "cat src/guard.ts",
+      "cat tests/fixtures/signing-key.hex",
+    ]) expect(run(call("bash", { command }), ctx)).toBeUndefined();
+    expect(run(call("read", { path: "/nonexistent-controller-private" }), ctx)).toBeUndefined();
+    expect(run(call("glob", { path: "/nonexistent-controller-private/*" }), ctx)).toBeUndefined();
+    expect(run(call("read", { path: "src/guard.ts" }), ctx)).toBeUndefined();
+    expect(run(call("grep", { path: "src", pattern: "signer" }), ctx)).toBeUndefined();
+    expect(process.env.SWARM_ED25519_KEY_FILE).toBeUndefined();
+  });
 });

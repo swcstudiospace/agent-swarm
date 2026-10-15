@@ -68,8 +68,8 @@ lifecycle state machine, fail-closed gates, manifest registry). [agents.json](ag
 
 ```bash
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature   # brief → task DAG in <repo>/.swarm
-python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>; --runtime omp [--omp-bin omp] for headless omp -p
-python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
+python3 scripts/swarm_run.py --repo /path/to/codebase --runtime omp  # normal OMP approvals; --runtime claude also supported
+python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime omp   # simulate the DAG offline; not acceptance
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
 python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, .cursor/agents, omp/agents, omp/skills (--check)
 python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # list the Cursor files a target repo would gain; writes nothing
@@ -80,6 +80,19 @@ python3 -m pytest -q                                                # runtime + 
 ```
 
 `scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
+
+Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE`,
+or from `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when neither raw signing
+variable is set. References must resolve to an owner-only regular file without symlink components;
+the conventional directory must also be private. Key contents never belong in prompts, argv,
+logs, or tracked files. See [private signer bootstrap](docs/operations-runbook.md#private-signer-bootstrap).
+
+Live/reused `orch_plan` responses include a cryptographically verified `execution_assignment`
+when a real signer is available. `/swarm` refuses missing, unsigned, or mismatched kickoff
+assignments instead of dispatching an unauthenticated A01 turn. Specialist sessions cannot
+auto-load private references. OMP uses normal `write` approvals (or `--approval-mode always-ask`);
+Grok headless dispatch currently fails closed because its installed interface does not support
+the old stdin transport. Start a fresh OMP process after updating the extension.
 
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
 `a02-requirements` … `a15-docs` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.

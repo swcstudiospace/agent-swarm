@@ -32,6 +32,7 @@ from swarm.paths import swarm_dir  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm import substrate_client, substrate_tee  # noqa: E402
 from swarm.blast_radius import lane_notes, load_slices, parallel_rows  # noqa: E402
+from swarm.envelope import build_envelope, sign_envelope, verify_envelope, real_key_configured, signing_config_error  # noqa: E402
 
 # (suffix, capability, agent, title, depends_on suffixes, gate spec)
 # gate spec: None = derive from risk class; [] = no gates; {"gate": "quality", "for": [...]} = this IS a gate task
@@ -159,7 +160,8 @@ def _reusable(existing, rows, pattern, brief, brief_sha, plan_sha, want_corr, ar
 
 
 def _tasks_from_store(store: TaskStore, corr: str) -> list:
-    return [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
+    return [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth",
+                              "inputs", "acceptance", "budget", "priority")}
             | {"gates": store.required_gates(t["task_id"]), "notes": t["notes_json"]}
             for t in store.list(correlation_id=corr)]
 
@@ -196,14 +198,58 @@ def _write_text_atomic(path: Path, text: str) -> None:
 def _reuse_result(store: TaskStore, ctx, corr: str, pattern: str) -> dict:
     # corr comes from the Task Store here, not argv: re-check it before it names a file (WR-05)
     plan_file = swarm_dir(ctx.root, create=True) / "plans" / f"{check_task_id(corr, 'correlation id')}.json"
-    tasks = _read_plan_tasks(plan_file)
-    recorded = str(plan_file) if tasks is not None else None
-    if tasks is None:
-        tasks = _tasks_from_store(store, corr)
+    recorded = str(plan_file) if _read_plan_tasks(plan_file) is not None else None
+    tasks = _tasks_from_store(store, corr)
     ctx.correlation_id = corr
-    return {"status": "ok", "correlation_id": corr, "pattern": pattern, "reused": True, "tasks": tasks,
-            "plan_file": recorded,
-            "summary": f"reused existing plan for correlation {corr} ({len(tasks)} tasks, no changes)"}
+    return _execution_result(store, ctx, {
+        "status": "ok", "correlation_id": corr, "pattern": pattern, "reused": True, "tasks": tasks,
+        "plan_file": recorded,
+        "summary": f"reused existing plan for correlation {corr} ({len(tasks)} tasks, no changes)"})
+
+
+def _execution_result(store: TaskStore, ctx, result: dict) -> dict:
+    """Authenticate a controller kickoff from persisted tasks, without claiming any work."""
+    if any(os.environ.get(name) == "1" for name in ("SWARM_AGENT_SESSION", "SWARM_CHILD")):
+        return result
+    error = signing_config_error()
+    if error:
+        raise SwarmError(ErrorCode.E_POLICY, error)
+    if not real_key_configured():
+        return result
+    corr = result["correlation_id"]
+    tasks = _tasks_from_store(store, corr)
+    if not tasks:
+        raise SwarmError(ErrorCode.E_CONTRACT, "controller assignment requires a persisted plan")
+    result["tasks"] = tasks
+    # All authority-bearing fields come from the Task Store, never an offered envelope.
+    pattern = tasks[0]["notes"]["pattern"]
+    result["pattern"] = pattern
+    plan = {}
+    if result.get("plan_file"):
+        try:
+            plan = json.loads(Path(result["plan_file"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise SwarmError(ErrorCode.E_CONTRACT, "controller assignment requires a readable persisted plan") from None
+        if not isinstance(plan, dict) or plan.get("correlation_id") != corr:
+            raise SwarmError(ErrorCode.E_CONTRACT, "persisted controller plan correlation mismatch")
+    plan = {**plan, "correlation_id": corr, "pattern": pattern, "tasks": tasks}
+    risk = max((t["risk_class"] for t in tasks), key=("low", "medium", "high").index)
+    acceptance = list(dict.fromkeys(criterion for t in tasks for criterion in t["acceptance"]))
+    budget = {name: sum(t["budget"].get(name, 0) for t in tasks)
+              for name in ("max_tokens", "max_wall_s", "max_cost_usd")}
+    payload = {"task_id": corr, "correlation_id": corr, "agent_id": "A01", "capability": "plan.execute",
+               "ready_tasks": [t["task_id"] for t in tasks
+                               if t["state"] in ("CREATED", "VALIDATED", "PLANNED", "RETRY")
+                               and store.deps_satisfied(t, tasks)], "inputs": [plan],
+               "acceptance": acceptance, "budget": budget, "risk_class": risk}
+    assignment = build_envelope(source="A01@controller", target="A01", msg_type="task.assign",
+                                correlation_id=corr, payload=payload, risk_class=risk)
+    sign_envelope(assignment, root=ctx.root)
+    if not real_key_configured() or not verify_envelope(assignment):
+        raise SwarmError(ErrorCode.E_POLICY, "fail-closed: controller assignment signature invalid")
+    result["execution_assignment"] = assignment
+    result["execution_assignment_verified"] = True
+    return result
 
 
 def _bind_graph(args, ctx, corr: str, brief: str, tasks: list[dict]) -> None:
@@ -263,6 +309,11 @@ def run(args, ctx) -> dict:
                 "tasks": [{"task_id": f"{prefix}-{r[0]}", "capability": r[1], "agent": r[2], "depends_on": r[4]} for r in rows],
                 "summary": f"dry-run: {lead}would create {len(rows)} tasks"}
 
+    if not any(os.environ.get(name) == "1" for name in ("SWARM_AGENT_SESSION", "SWARM_CHILD")):
+        error = signing_config_error()
+        if error:
+            raise SwarmError(ErrorCode.E_POLICY, error)
+
     store = TaskStore(root=ctx.root)
     created = []
     depth = {}
@@ -314,8 +365,7 @@ def run(args, ctx) -> dict:
         return _reuse_result(store, ctx, reused, args.pattern)
 
     plan = {"correlation_id": corr, "pattern": args.pattern, "risk_class": args.risk_class, "brief": brief,
-            "tasks": [{k: t[k] for k in ("task_id", "capability", "agent_id", "title", "depends_on", "risk_class", "state", "dag_depth")}
-                      | {"gates": store.required_gates(t["task_id"]), "notes": t["notes_json"]} for t in created]}
+            "tasks": _tasks_from_store(store, corr)}
     sdir = swarm_dir(ctx.root, create=True)
     plans = sdir / "plans"
     plans.mkdir(parents=True, exist_ok=True)
@@ -326,9 +376,10 @@ def run(args, ctx) -> dict:
     ctx.emit("plan.updated", {"pattern": args.pattern, "task_count": len(created)})
     lines = [f"{t['task_id']:<14} {t['agent_id']:<4} d={t['dag_depth']} ← {','.join(t['depends_on']) or '-'}" for t in created]
     lead = f"parallel blast radii: {lanes} lanes, Greptile review after merge\n" if lanes else ""
-    return {"status": "ok", "correlation_id": corr, "pattern": args.pattern, "tasks": plan["tasks"],
-            "plan_file": str(plans / f"{corr}.json"),
-            "summary": lead + f"created {len(created)} tasks for correlation {corr}\n" + "\n".join(lines)}
+    return _execution_result(store, ctx, {
+        "status": "ok", "correlation_id": corr, "pattern": args.pattern, "tasks": plan["tasks"],
+        "plan_file": str(plans / f"{corr}.json"),
+        "summary": lead + f"created {len(created)} tasks for correlation {corr}\n" + "\n".join(lines)})
 
 
 def add_args(p):
