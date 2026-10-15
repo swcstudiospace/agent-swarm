@@ -4,17 +4,19 @@
 Each ready task is dispatched to its agent as a headless session, run with the task.assign prompt on stdin:
     claude -p --agent <slug> --output-format json --permission-mode <mode> …
         [--mcp-config <repo>/.mcp.json --strict-mcp-config] --allowedTools … [mcp__substrate]   (--runtime claude)
-    grok -p --agent <slug> --output-format json --yolo [--trust] --cwd <repo>               (--runtime grok)
-    omp -p --mode json --no-session --no-title --no-extensions -e <agent-swarm>/omp --cwd <repo>
-        --approval-mode yolo --tools <frontmatter tools>,yield
+    omp -p --mode json --no-session --no-title -e <agent-swarm>/omp --cwd <repo>
+        --approval-mode write --tools <frontmatter tools>,yield
         --append-system-prompt $SWARM_DIR/agents/<slug>.md --max-time <n>s                   (--runtime omp)
 --runtime auto picks grok when SWARM_RUNTIME=grok or grok is on PATH and claude is not, else claude; it never
 picks omp (use --runtime omp or SWARM_RUNTIME=omp). Preflight checks only the selected runtime's binary (and
 `claude auth status` for claude). The omp result is the `yield` payload of the terminal agent_end, falling back
 to the last fenced json block in the final assistant text.
+Grok dispatch is refused: its documented single-prompt interface does not support this runner's stdin assignment
+transport. No runtime is launched with permission bypasses; OMP keeps extension discovery and its explicit guard.
 
-Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>), so a gate
-script they run records nothing. For each gate task the runner itself runs the gate script on the gate task's own
+Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>); OMP receives
+only bounded deny-path guard metadata, never loading references. A gate script they run records nothing.
+For each gate task the runner itself runs the gate script on the gate task's own
 id after the session, while the task is still leased; the script records signed verdicts on the gate task's Task
 Store gate_for targets (the runner writes no rows itself).
 A01 rules (fail-closed gates, bounded rework, escalation) are
@@ -73,9 +75,58 @@ from swarm import memory as swarm_memory, substrate_client, substrate_handoff, s
 # SWARM_TASK_ID and SWARM_CORRELATION_ID are the runner's own defaults for script flags. A child that
 # inherits them binds its gate scripts to the parent's task (T-06-19).
 AGENT_SESSION_STRIPPED = (
-    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY",
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
     "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
 )
+
+# Deny-only guard policy, never a signer loading reference. Keep the bounds aligned
+# with the OMP extension parser; rejecting overflow avoids silently losing a denial.
+SIGNER_DENY_PATHS = "SWARM_SIGNER_DENY_PATHS"
+SIGNER_DENY_MAX_PATHS = 32
+SIGNER_DENY_MAX_PATH_LENGTH = 4096
+SIGNER_DENY_MAX_JSON_LENGTH = 131072
+
+
+def signer_deny_metadata(controller_env: dict[str, str]) -> str | None:
+    """Capture configured/private-source denials before removing loadable references.
+
+    Paths are lexical and relative to the controller's actual cwd, just like the
+    signer. Do not expand home/env syntax, resolve symlinks, or inspect any file.
+    """
+    def invalid():
+        raise SwarmError(ErrorCode.E_INPUT, "invalid or oversized signer deny-path policy")
+
+    prior = controller_env.get(SIGNER_DENY_PATHS)
+    paths = []
+    if prior is not None:
+        if len(prior) > SIGNER_DENY_MAX_JSON_LENGTH:
+            invalid()
+        try:
+            paths = json.loads(prior)
+        except (ValueError, RecursionError):
+            invalid()
+        if not isinstance(paths, list) or len(paths) > SIGNER_DENY_MAX_PATHS:
+            invalid()
+        if any(not isinstance(path, str) or not path.startswith("/") or "\0" in path
+               or len(path.encode("utf-8", errors="surrogatepass")) > SIGNER_DENY_MAX_PATH_LENGTH
+               for path in paths):
+            invalid()
+    reference = controller_env.get("SWARM_ED25519_KEY_FILE")
+    if reference:
+        if "\0" in reference:
+            invalid()
+        paths = [os.path.abspath(reference), *paths]
+    # Python preserves exactly two leading slashes; OMP's POSIX normalizer does not.
+    paths = list(dict.fromkeys("/" + os.path.normpath(path).lstrip("/") for path in paths))
+    if len(paths) > SIGNER_DENY_MAX_PATHS or any(
+            len(path.encode("utf-8", errors="surrogatepass")) > SIGNER_DENY_MAX_PATH_LENGTH for path in paths):
+        invalid()
+    if not paths:
+        return None
+    encoded = json.dumps(paths, separators=(",", ":"))
+    if len(encoded) > SIGNER_DENY_MAX_JSON_LENGTH:
+        invalid()
+    return encoded
 
 
 def upstream_context(store: TaskStore, task: dict) -> str:
@@ -196,6 +247,8 @@ def preflight_auth(claude_bin: str) -> None:
 
 
 RUNTIMES = ("claude", "grok", "omp")
+CLAUDE_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+OMP_APPROVAL_MODES = ("write", "always-ask")
 # the child-env deltas every runtime gets; --dry-run prints exactly these (never key material)
 CHILD_ENV_KEYS = ("SWARM_DIR", "SWARM_CHILD", "SWARM_AGENT_SESSION", "SWARM_AGENT", "AIO_UPLIFT", "AIO_SWARM")
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n?", re.S)
@@ -217,6 +270,18 @@ def resolve_runtime(explicit: str) -> str:
 def runtime_bin(runtime: str, args) -> str:
     return {"claude": getattr(args, "claude_bin", "claude"), "grok": getattr(args, "grok_bin", "grok"),
             "omp": getattr(args, "omp_bin", "omp")}[runtime]
+
+def validate_runtime_approval(runtime: str, args) -> None:
+    """Refuse unsupported transports and bypass modes before a task or lease is claimed."""
+    if runtime == "grok":
+        raise SwarmError(ErrorCode.E_DEP, "grok headless dispatch is unsupported: its documented single-prompt "
+                         "interface does not accept this runner's stdin assignment transport; use --runtime claude "
+                         "or --runtime omp with normal approval controls")
+    if runtime == "omp" and getattr(args, "approval_mode", "write") not in OMP_APPROVAL_MODES:
+        raise SwarmError(ErrorCode.E_INPUT, "omp requires normal approval mode: write or always-ask")
+    if runtime == "claude" and args.permission_mode not in CLAUDE_PERMISSION_MODES:
+        raise SwarmError(ErrorCode.E_INPUT, "claude requires normal permission mode: default, acceptEdits or plan")
+
 
 
 def omp_agent(slug: str, sdir: Path) -> tuple[str, Path]:
@@ -251,13 +316,19 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
     calls use too (swarm/workspace.py). Each runtime reads the `substrate` MCP entry the install wrote:
     - claude runs in this checkout, where a workspace `.mcp.json` is never read, so it is passed as --mcp-config
       (strict: the agent's tools list admits no other server anyway) and its tools are added to --allowedTools;
-    - grok reads `.grok/config.toml` only in a trusted folder, so it gets --trust, which a --yolo session implies;
+    - grok is refused until a supported stdin assignment transport is available;
     - omp reads `.mcp.json` from its --cwd, and its --tools list does not hide MCP tools (they are xd:// devices)."""
+    validate_runtime_approval(runtime, args)
     slug = agent["slug"]
     # Child sessions are full CLI sessions: their brief fires UserPromptSubmit. Mark them so
     # Prompt Uplift (20 min/agent) and the swarm kickoff hooks stay off — uplift runs once, on the user's prompt.
+    controller_env = dict(os.environ)
+    deny_metadata = signer_deny_metadata(controller_env) if runtime == "omp" else None
     env, _source, _problem = workspace.child_env(
-        {k: v for k, v in os.environ.items() if k not in AGENT_SESSION_STRIPPED}, repo, agent["id"])
+        {k: v for k, v in controller_env.items()
+         if k not in AGENT_SESSION_STRIPPED and k != SIGNER_DENY_PATHS}, repo, agent["id"])
+    if deny_metadata is not None:
+        env[SIGNER_DENY_PATHS] = deny_metadata
     env.pop("SWARM_SUBSTRATE_AGENT", None)  # never inherit another process's MCP authorization marker
     # SWARM_AGENT: the session's agent identity; the omp swarm_gate tool runs only that agent's gate (WR-03)
     env.update(SWARM_DIR=str(sdir), SWARM_CHILD="1", SWARM_AGENT_SESSION="1", SWARM_AGENT=slug,
@@ -270,10 +341,6 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         env.pop(workspace.TOKEN, None)
         env.pop("SUBSTRATE_URL", None)
         env.pop("SWARM_SUBSTRATE_AGENT", None)
-    if runtime == "grok":
-        trust = ["--trust"] if wired else []
-        return [binary, "-p", "--agent", slug, "--output-format", "json", "--yolo", *trust, "--cwd", str(repo),
-                *model], env, repo
     if runtime == "omp":
         if wired and env.get(workspace.TOKEN):
             env["SWARM_SUBSTRATE_AGENT"] = slug
@@ -281,8 +348,9 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
         margin = min(60, max(5, args.task_timeout // 10))
         # -e spelled as omp's absolute root path: omp dedups extension roots by that string, not realpath (D-01)
-        return [binary, "-p", "--mode", "json", "--no-session", "--no-title", "--no-extensions",
-                "-e", str((ROOT / "omp").resolve()), "--cwd", str(repo), "--approval-mode", "yolo",
+        return [binary, "-p", "--mode", "json", "--no-session", "--no-title",
+                "-e", str((ROOT / "omp").resolve()), "--cwd", str(repo),
+                "--approval-mode", getattr(args, "approval_mode", "write"),
                 "--tools", tools, "--append-system-prompt", str(body),
                 "--max-time", f"{max(1, args.task_timeout - margin)}s", *model], env, repo
     cmd = [binary, "-p", "--agent", slug, "--output-format", "json",
@@ -550,7 +618,7 @@ class ChildGroup:
 
 
 # omp 18.3.1 `-e`: a package that fails to load is only this stderr line (main.ts formatExtensionLoadNotifications),
-# rc 0, and the session runs on without it — for ours, without the swarm guard, in yolo (T-06-06).
+# rc 0, and the session runs on without it — for ours, without the swarm guard (T-06-06).
 # T-06-27: the runner watches stderr while the session runs and stops the group on this line, before the unguarded
 # session does any work. The pattern matches a line that has not been newline-terminated yet, so a chunk that ends
 # on the message is enough; a match split across reads still hits once both halves are in the window.
@@ -1226,6 +1294,7 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
                          "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
     args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
+    validate_runtime_approval(args.runtime, args)
     if not args.dry_run:
         name = runtime_bin(args.runtime, args)
         binary = shutil.which(name)
@@ -1317,14 +1386,17 @@ def add_args(p):
     p.add_argument("--once", action="store_true", help="single scheduling round")
     p.add_argument("--max-turns", type=int, default=40)
     p.add_argument("--task-timeout", type=int, default=1800)
-    p.add_argument("--permission-mode", default="acceptEdits", choices=["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"])
+    p.add_argument("--permission-mode", default="acceptEdits", choices=CLAUDE_PERMISSION_MODES,
+                   help="normal Claude permission mode; bypass modes are not supported")
+    p.add_argument("--approval-mode", default="write", choices=OMP_APPROVAL_MODES,
+                   help="normal OMP tool approval mode (default: write)")
     p.add_argument("--model", help="override model for all agents")
     p.add_argument("--claude-bin", default="claude")
     p.add_argument("--grok-bin", default="grok")
     p.add_argument("--omp-bin", default="omp")
     p.add_argument("--runtime", choices=["auto", *RUNTIMES], default="auto",
-                   help="headless runner: claude -p --agent, grok -p --agent --yolo, omp -p --mode json, or auto "
-                        "(claude/grok; omp only when explicit or SWARM_RUNTIME=omp)")
+                   help="headless runner: claude -p --agent, omp -p --mode json, or auto "
+                        "(claude/grok; Grok dispatch is currently refused; omp only when explicit or SWARM_RUNTIME=omp)")
     p.add_argument("--allowed-tools", default="Bash(python3:*),Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Read,Grep,Glob",
                    help="comma list passed to claude --allowedTools so headless agents can run their scripts unattended")
 

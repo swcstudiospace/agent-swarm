@@ -8,17 +8,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { callingAgent } from "../src/context.ts";
-import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, RULES, ruleReason, SWARM_SLUGS } from "../src/guard.ts";
+import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, normalize, parseSignerDenyPaths, RULES, ruleReason, SWARM_SLUGS } from "../src/guard.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext, SessionEntry, ToolCallEvent } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, type FakePiOptions, isolateEnv, REPO_ROOT } from "./helpers.ts";
 
-isolateEnv("SWARM_AGENT", "SWARM_TASK_ID", "SWARM_SUBSTRATE_AGENT", "SUBSTRATE_TOKEN");
+isolateEnv("SWARM_AGENT", "SWARM_TASK_ID", "SWARM_SUBSTRATE_AGENT", "SUBSTRATE_TOKEN", "SWARM_ED25519_KEY_FILE", "SWARM_SIGNER_DENY_PATHS", "XDG_CONFIG_HOME");
 beforeEach(() => {
   delete process.env.SWARM_AGENT;
   delete process.env.SWARM_TASK_ID;
   delete process.env.SWARM_SUBSTRATE_AGENT;
   delete process.env.SUBSTRATE_TOKEN;
+  delete process.env.SWARM_ED25519_KEY_FILE;
+  delete process.env.SWARM_SIGNER_DENY_PATHS;
+  delete process.env.XDG_CONFIG_HOME;
 });
 
 const A01 = "a01-orchestrator";
@@ -1591,4 +1594,176 @@ describe("HOOK-03 shell twin and D-08", () => {
     }
     expect(guardToolCall(call(tool, input), facts(undefined))).toBeUndefined();
   });
+});
+
+describe("private signer file reads", () => {
+  const KEY = `${HOME}/.config/agent-swarm/signing-key.hex`;
+  const CONFIGURED = "/nonexistent-private/signer.hex";
+  const facts: GuardFacts = {
+    ...capped, agent: "a05-backend", hasTask: true, cwd: CWD, home: HOME,
+  };
+  const blockedRead = { block: true, reason: "BLOCKED needs: human-approval (signer_credential: signer-file-read)" };
+  const blockedShell = { block: true, reason: "BLOCKED needs: human-approval (signer_credential: signer-file-shell)" };
+
+  test("signer files are protected against writes, output redirects and diff/cmp reads", () => {
+    const blockedWrite = { block: true, reason: "BLOCKED needs: human-approval (signer_credential: signer-file-write)" };
+    expect(guardToolCall(call("write", { path: KEY, content: "x" }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("edit", { path: KEY, old: "a", new: "b" }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("write", { path: `${CWD}/notes.txt`, content: "x" }), facts)).toBeUndefined();
+    const bash = (command: string) => guardToolCall(call("bash", { command }), facts);
+    expect(bash(`echo x > ${KEY}`)).toEqual(blockedShell);
+    expect(bash(`echo x >> ${KEY}`)).toEqual(blockedShell);
+    expect(bash(`echo x &> ${KEY}`)).toEqual(blockedShell);
+    expect(bash(`echo x >& ${KEY}`)).toEqual(blockedShell);
+    expect(bash("echo x > /dev/null 2>&1")).toBeUndefined();
+    expect(bash(`diff /dev/null ${KEY}`)).toEqual(blockedShell);
+    expect(bash(`cmp ${KEY} /dev/null`)).toEqual(blockedShell);
+  });
+
+  test("bounded deny-only metadata normalizes absolute paths without replacing ordinary private sources", () => {
+    expect(parseSignerDenyPaths(undefined)).toEqual([]);
+    expect(parseSignerDenyPaths("[]")).toEqual([]);
+    expect(parseSignerDenyPaths(JSON.stringify([`${CONFIGURED}/../signer.hex`, CONFIGURED]))).toEqual([CONFIGURED]);
+    expect(parseSignerDenyPaths(JSON.stringify(Array(32).fill(CONFIGURED)))).toEqual([CONFIGURED]);
+    const inheritedFacts = {
+      ...facts, signerReadPaths: parseSignerDenyPaths(JSON.stringify([CONFIGURED])),
+      env: { SWARM_ED25519_KEY_FILE: "/different-private/custom.source", XDG_CONFIG_HOME: "/nonexistent-xdg" },
+    };
+    for (const path of [CONFIGURED, KEY, "/different-private/custom.source", "/nonexistent-xdg/agent-swarm/signing-key.hex"]) {
+      expect(guardToolCall(call("read", { path }), inheritedFacts)).toEqual(blockedRead);
+      expect(guardToolCall(call("bash", { command: `cat ${path}` }), inheritedFacts)).toEqual(blockedShell);
+    }
+  });
+
+  test.each([
+    KEY, `${KEY}:1-4`, `${KEY}:raw`, `${KEY}:img`,
+    "~/.config/agent-swarm/signing-key.hex", "$HOME/.config/agent-swarm/signing-key.hex",
+    "${HOME}/.config/agent-swarm/signing-key.hex",
+    `${HOME}/.config/agent-swarm/../agent-swarm/signing-key.hex`,
+    `../${HOME.slice(1)}/.config/agent-swarm/signing-key.hex`,
+    `file://${KEY}`, `${HOME}/.config/agent-swarm/signing-*.hex`,
+  ])("read and grep refuse %s without exposing contents", (path) => {
+    for (const tool of ["read", "grep"]) {
+      expect(guardToolCall(call(tool, { path, pattern: "." }), facts)).toEqual(blockedRead);
+      expect(guardToolCall(call(tool, { file_path: path, pattern: "." }), facts)).toEqual(blockedRead);
+    }
+  });
+
+  test.each([
+    { SWARM_ED25519_KEY_FILE: CONFIGURED },
+    { SWARM_ED25519_KEY_FILE: "../nonexistent-private/signer.hex" },
+    { XDG_CONFIG_HOME: "/nonexistent-private", SWARM_ED25519_KEY_FILE: CONFIGURED },
+  ])("configured references remain private with env %p", (env) => {
+    const configuredFacts = { ...facts, env };
+    for (const path of [CONFIGURED, "$SWARM_ED25519_KEY_FILE", "${SWARM_ED25519_KEY_FILE}"]) {
+      expect(guardToolCall(call("read", { path }), configuredFacts)).toEqual(blockedRead);
+      expect(guardToolCall(call("grep", { path, pattern: "." }), configuredFacts)).toEqual(blockedRead);
+    }
+    expect(guardToolCall(call("read", { path: KEY }), configuredFacts)).toEqual(blockedRead);
+  });
+
+  test.each(["secrets/key.hex", "~/literal-key.hex", " private-key.hex", "$literal-key.hex"])(
+    "literal configured Path references remain protected: %s", (reference) => {
+      const configuredFacts = { ...facts, env: { SWARM_ED25519_KEY_FILE: reference } };
+      expect(guardToolCall(call("read", { path: reference }), configuredFacts)).toEqual(blockedRead);
+      expect(guardToolCall(call("grep", { path: reference, pattern: "." }), configuredFacts)).toEqual(blockedRead);
+      expect(guardToolCall(call("bash", { command: `cat '${reference}'` }), configuredFacts)).toEqual(blockedShell);
+    },
+  );
+
+  test("XDG source and recursive grep roots are protected, directory discovery is not a content read", () => {
+    const xdgFacts = { ...facts, env: { XDG_CONFIG_HOME: "/nonexistent-private" } };
+    for (const path of ["/nonexistent-private/agent-swarm/signing-key.hex", "$XDG_CONFIG_HOME/agent-swarm/signing-key.hex"]) {
+      expect(guardToolCall(call("read", { path }), xdgFacts)).toEqual(blockedRead);
+    }
+    for (const path of [HOME, `${HOME}/.config`, `${HOME}/**/signing-key.hex`, "/", `src;${HOME}/.config`]) {
+      expect(guardToolCall(call("grep", { path, pattern: "." }), facts)).toEqual(blockedRead);
+    }
+    expect(guardToolCall(call("grep", { pattern: "." }), { ...facts, cwd: HOME })).toEqual(blockedRead);
+    expect(guardToolCall(call("grep", { path: "*.hex", pattern: "." }), { ...facts, cwd: HOME })).toEqual(blockedRead);
+    expect(guardToolCall(call("grep", { path: "*.ts", pattern: "." }), { ...facts, cwd: HOME })).toBeUndefined();
+    for (const path of [HOME, `${HOME}/.config`, `${HOME}/.config/agent-swarm`]) {
+      expect(guardToolCall(call("read", { path }), facts)).toBeUndefined();
+      expect(guardToolCall(call("glob", { path: `${path}/*` }), facts)).toBeUndefined();
+    }
+  });
+
+  test.each([
+    `cat ${KEY}`, `head -c 1 ${KEY}`, `tail -n 1 ${KEY}`, `xxd ${KEY}`, `od -An -tx1 ${KEY}`,
+    `strings ${KEY}`, `base64 ${KEY}`, `wc -c ${KEY}`,
+    `sed -n '1p' ${KEY}`, `awk '{print}' ${KEY}`,
+    `grep -n . ${KEY}`, `grep -e . ${KEY}`, `grep -f ${KEY} public.txt`,
+    `grep -ne. ${KEY}`, `grep -nf${KEY} public.txt`, `sed -nf${KEY} public.txt`,
+    `sort --files0-from=${KEY}`, `openssl base64 -in ${KEY}`, `jq -R . ${KEY}`,
+    `git diff --no-index /dev/null ${KEY}`,
+    `rg . ${KEY}`, `rg --file=${KEY} public.txt`, `grep -R . ${HOME}/.config`,
+    `rg . ${HOME}/.config`, `cat ${HOME}/.config/agent-swarm/signing-*.hex`,
+    `cat ${HOME}/.config/agent-swarm/{public.txt,signing-key.hex}`,
+    `dd if=${KEY} of=/tmp/public-copy`, `cp ${KEY} /tmp/public-copy`,
+    `tar -czf /tmp/copy.tgz ${KEY}`, `rsync -a ${HOME}/.config/agent-swarm/ /tmp/public-copy/`,
+    `cp -r ${HOME}/.config /tmp/public-copy`, `tar -czf /tmp/copy.tgz ${HOME}/.config`,
+    `zip -r /tmp/copy.zip ${HOME}/.config`,
+    `cat < ${KEY}`, `cat 3<${KEY} /dev/fd/3`, `read -r value < ${KEY}`,
+    `cat <> ${KEY}`, `printf '%s' "$(cat ${KEY})"`,
+    `sh -c 'cat ${KEY}'`, `/usr/bin/env cat ${KEY}`, `busybox cat ${KEY}`,
+    `cd ${HOME}/.config/agent-swarm && cat signing-key.hex`,
+    `env -C ${HOME}/.config/agent-swarm cat signing-key.hex`,
+    'cat "$HOME/.config/agent-swarm/signing-key.hex"',
+    `HOME=/unrelated cat ${KEY}`,
+    'cd "$DIR" && cat signing-key.hex',
+  ])("recognized shell reader refuses %s", (command) => {
+    expect(guardToolCall(call("bash", { command }), facts)).toEqual(blockedShell);
+    expect(guardToolCall(call("bash", { command }), { ...facts, agent: undefined, topLevel: true })).toBeUndefined();
+  });
+
+  test("configured shell references and bash cwd/env cannot unprotect the original source", () => {
+    const configuredFacts = { ...facts, env: { SWARM_ED25519_KEY_FILE: CONFIGURED } };
+    for (const command of [`cat ${CONFIGURED}`, 'cat "$SWARM_ED25519_KEY_FILE"', 'cat "${SWARM_ED25519_KEY_FILE}"']) {
+      expect(guardToolCall(call("bash", { command }), configuredFacts)).toEqual(blockedShell);
+    }
+    expect(guardToolCall(call("bash", { command: "cat signing-key.hex", cwd: `${HOME}/.config/agent-swarm` }), facts)).toEqual(blockedShell);
+    expect(guardToolCall(call("bash", { command: `cat ${KEY}`, env: { HOME: "/unrelated" } }), facts)).toEqual(blockedShell);
+    expect(guardToolCall(call("bash", {
+      command: 'cat "$SWARM_ED25519_KEY_FILE"', env: { SWARM_ED25519_KEY_FILE: KEY },
+    }), facts)).toEqual(blockedShell);
+    expect(guardToolCall(call("bash", {
+      command: 'cat "$XDG_CONFIG_HOME/agent-swarm/signing-key.hex"', env: { XDG_CONFIG_HOME: `${HOME}/.config` },
+    }), facts)).toEqual(blockedShell);
+  });
+
+  test.each([
+    "src/guard.ts", "tests/fixtures/signing-key.hex", `${CWD}/.config/agent-swarm/signing-key.hex`,
+    `${KEY}.public`, `${HOME}/.config/agent-swarmish/signing-key.hex`, `${HOME}-other/.config/agent-swarm/signing-key.hex`,
+  ])("unrelated source and misleading paths remain readable: %s", (path) => {
+    for (const tool of ["read", "grep"]) expect(guardToolCall(call(tool, { path, pattern: "." }), facts)).toBeUndefined();
+    expect(guardToolCall(call("bash", { command: `cat ${path}` }), facts)).toBeUndefined();
+  });
+
+  test.each([
+    `stat ${KEY}`, `ls -l ${KEY}`, `[ -f ${KEY} ] && echo exists`, `printf '%s' ${KEY}`,
+    `rg --files ${HOME}/.config`, `grep '${KEY}' src/guard.ts`, `sed 's|${KEY}|private|' src/guard.ts`,
+    `cat <<'EOF'\n${KEY}\nEOF`, `cat <<< '${KEY}'`, `cat '${KEY}:1-4'`,
+    "cat scripts/orch_plan.py", "grep -n signer swarm/envelope.py", "cat tests/fixtures/signing-key.hex",
+  ])("metadata, path-as-data and public-source shell reads remain available: %s", (command) => {
+    expect(guardToolCall(call("bash", { command }), facts)).toBeUndefined();
+  });
+
+  test("every swarm identity is protected; unsigned legacy planning and canonical bridge calls stay untouched", () => {
+    for (const agent of SWARM_SLUGS) expect(guardToolCall(call("read", { path: KEY }), { ...facts, agent })).toEqual(blockedRead);
+    expect(guardToolCall(call("read", { path: KEY }), { ...facts, agent: undefined, topLevel: true, env: { SWARM_TASK_ID: "T" } })).toEqual(blockedRead);
+    expect(guardToolCall(call("read", { path: KEY }), { ...facts, agent: undefined, topLevel: true })).toBeUndefined();
+    expect(guardToolCall(call("swarm_plan", { description: "plan" }), { ...facts, agent: A01 })).toBeUndefined();
+    expect(guardToolCall(call("read", { path: KEY }), { ...facts, agent: A01, hasTask: false })?.reason).toStartWith(DEPTH_PREFIX);
+  });
+
+  test("registered consumer handler protects the configured source without bridge or filesystem reads", () => {
+    process.env.SWARM_ED25519_KEY_FILE = CONFIGURED;
+    const { run } = guardHandler({ activeTools: ["task"] });
+    const ctx = agentCtx(CWD, "a05-backend", [], false);
+    expect(run(call("read", { path: `${CONFIGURED}:raw` }), ctx)).toEqual(blockedRead);
+    expect(run(call("grep", { path: CONFIGURED, pattern: "." }), ctx)).toEqual(blockedRead);
+    expect(run(call("bash", { command: `head -c 1 ${CONFIGURED}` }), ctx)).toEqual(blockedShell);
+    expect(run(call("read", { path: "src/guard.ts" }), ctx)).toBeUndefined();
+  });
+
 });

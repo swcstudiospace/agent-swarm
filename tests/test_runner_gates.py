@@ -1,5 +1,5 @@
-"""WR-12 / WR-08: headless agent sessions get no signing keys, the key-holding runner runs each gate script,
-and a gate task cannot finish without its script's verdicts."""
+"""WR-12 / WR-08: supported headless sessions get no signing values or private references,
+and the trusted runner records authoritative signed gates before a gate task can finish."""
 import importlib.util
 import io
 import json
@@ -16,7 +16,7 @@ import pytest
 from conftest import run_script
 
 ROOT = Path(__file__).resolve().parent.parent
-KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY")
 # inherited vars that would change what the runner or its gate scripts do
 _ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
               "SWARM_DRYRUN_FAIL", "SWARM_RUNTIME", "ANTHROPIC_API_KEY")
@@ -63,16 +63,17 @@ def _events(swarm, etype):
 
 
 # ---------------------------------------------------------------- WR-12: no key material in agent sessions
-@pytest.mark.parametrize("runtime", ["claude", "grok", "omp"])
+@pytest.mark.parametrize("runtime", ["claude", "omp"])
 def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     monkeypatch.setenv("SWARM_SIGNING_KEY", "s")
     monkeypatch.setenv("SWARM_ED25519_KEY", "11" * 32)
     monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(tmp_path / "private-test-reference.hex"))
     monkeypatch.setenv("SWARM_TASK_ID", "T-parent")
     monkeypatch.setenv("SWARM_CORRELATION_ID", "corr-parent")
     mod = _load_swarm_run(tmp_path, monkeypatch)
     seen = {}
-    # each runtime's own stdout shape: omp streams JSONL, claude/grok print one JSON object
+    # Each supported runtime's own stdout shape: omp streams JSONL, Claude prints one JSON object.
     stdout = (ROOT / "tests" / "fixtures" / "omp_agent_end.jsonl").read_text() if runtime == "omp" else '{"result":"ok"}'
     # ChildGroup patches this module's Popen. The dead-pid spawn has to use the real one, or it re-enters the double.
     real_popen = subprocess.Popen
@@ -98,11 +99,13 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
 
     monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
     args = SimpleNamespace(runtime=runtime, claude_bin="claude", grok_bin="grok", omp_bin="omp",
-                           permission_mode="bypassPermissions", max_turns=5, model="", allowed_tools="", task_timeout=10)
+                           permission_mode="acceptEdits", max_turns=5, model="", allowed_tools="", task_timeout=10)
     mod.run_agent_headless({"slug": "a09-reviewer", "id": "A09"}, "review the thing", tmp_path, args)
     env = seen["env"]
     assert seen["cmd"][0] == runtime
     assert not set(KEY_VARS) & set(env)
+    assert str(tmp_path / "private-test-reference.hex") not in " ".join(seen["cmd"])
+    assert os.environ["SWARM_ED25519_KEY_FILE"] == str(tmp_path / "private-test-reference.hex")
     assert "SWARM_TASK_ID" not in env and "SWARM_CORRELATION_ID" not in env  # T-06-19: the parent's ids stay with the runner
     assert os.environ["SWARM_TASK_ID"] == "T-parent"
     assert env["SWARM_AGENT_SESSION"] == "1"
@@ -110,7 +113,7 @@ def test_headless_child_env_has_no_keys(tmp_path, monkeypatch, runtime):
     assert env["SWARM_CHILD"] == "1"
     assert os.environ["SWARM_SIGNING_KEY"] == "s"  # the runner keeps its own key
     if runtime == "omp":  # the gate agent's hidden swarm_gate tool is only active when named
-        assert seen["cmd"][seen["cmd"].index("--tools") + 1].split(",")[-2:] == ["swarm_gate", "yield"]
+        assert {"swarm_gate", "yield"} <= set(seen["cmd"][seen["cmd"].index("--tools") + 1].split(","))
 
 
 _STUB = r'''#!@PY@
@@ -123,6 +126,7 @@ tid = re.search(r'"task_id": "([^"]+)"', prompt).group(1)
 with open(@DUMP@, "a") as fh:
     fh.write(json.dumps({"task_id": tid, "has_hmac": "SWARM_SIGNING_KEY" in os.environ,
                          "has_ed": "SWARM_ED25519_KEY" in os.environ,
+                         "has_ed_file": "SWARM_ED25519_KEY_FILE" in os.environ,
                          "agent_session": os.environ.get("SWARM_AGENT_SESSION")}) + "\n")
 res = {"task_id": tid, "state": "IN_REVIEW", "summary_md": "stub session: ran no script"}
 if '"gate": "quality"' in prompt:
@@ -146,7 +150,8 @@ def test_runner_records_gate_after_session(tmp_path, monkeypatch):
          "gates": {"gate": "quality", "for": ["be"]}},
     ]}))
     swarm = tmp_path / ".swarm"
-    env = _clean_env(SWARM_DIR=str(swarm), SWARM_SIGNING_KEY="runner-secret")
+    env = _clean_env(SWARM_DIR=str(swarm), SWARM_SIGNING_KEY="runner-secret",
+                     SWARM_ED25519_KEY_FILE=str(tmp_path / "private-test-reference.hex"))
     p = subprocess.run([sys.executable, str(ROOT / "scripts" / "orch_plan.py"), "--plan", str(plan), "--prefix", "T",
                         "--repo", str(work), "--json"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert p.returncode == 0, p.stdout + p.stderr
@@ -157,7 +162,7 @@ def test_runner_records_gate_after_session(tmp_path, monkeypatch):
     assert json.loads(r.stdout)["complete"] is True
     sessions = [json.loads(ln) for ln in dump.read_text().splitlines()]
     assert {s["task_id"] for s in sessions} == {"T-be", "T-qa"}
-    assert all(not s["has_hmac"] and not s["has_ed"] and s["agent_session"] == "1" for s in sessions)
+    assert all(not s["has_hmac"] and not s["has_ed"] and not s["has_ed_file"] and s["agent_session"] == "1" for s in sessions)
     rows = [x for x in _rows(swarm, "T-be") if x["gate"] == "quality"]
     assert rows, "the runner recorded no quality verdict on T-be"
     row = rows[-1]

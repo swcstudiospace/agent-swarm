@@ -8,8 +8,16 @@ import pytest
 
 from conftest import ROOT, run_script
 
-KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY")
+KEY_VARS = ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY")
 ED_SEED = "11" * 32
+
+
+@pytest.fixture(autouse=True)
+def isolated_private_references(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    for name in ("SWARM_ED25519_KEY_FILE", "SWARM_AGENT_SESSION", "SWARM_CHILD"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _clear_keys(monkeypatch):
@@ -194,3 +202,170 @@ def test_empty_signing_key_is_not_an_implicit_dev_key(swarm_dir, monkeypatch):
     assert verify_envelope(env)
     monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY")
     assert verify_envelope(env) is False
+
+
+def _private_file(tmp_path, content=ED_SEED):
+    path = tmp_path / "private" / "signing-key.hex"
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_text(content, encoding="ascii")
+    path.chmod(0o600)
+    return path
+
+
+def _assignment():
+    from swarm.envelope import build_envelope
+    return build_envelope(source="A01@controller", target="A01", msg_type="task.assign",
+                          correlation_id="fixture-correlation", payload={"task_id": "fixture-task"})
+
+
+@pytest.mark.parametrize("newline", ["", "\n"])
+def test_private_reference_signs_and_verifies_without_exposing_seed(tmp_path, monkeypatch, newline, capsys):
+    pytest.importorskip("cryptography")
+    from swarm.envelope import sign_envelope, verify_envelope, real_key_configured, signing_config_error
+    _clear_keys(monkeypatch)
+    path = _private_file(tmp_path, ED_SEED + newline)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(path))
+    assert real_key_configured() and signing_config_error() is None
+    signed = sign_envelope(_assignment())
+    assert signed["sig"].startswith("ed25519:") and verify_envelope(signed)
+    assert ED_SEED not in json.dumps(signed)
+    assert ED_SEED not in "".join(capsys.readouterr())
+    signed["payload"]["task_id"] = "tampered"
+    assert not verify_envelope(signed)
+    assert "SWARM_ED25519_KEY" not in os.environ
+
+
+@pytest.mark.parametrize("case", ["missing", "symlink", "directory", "fifo", "malformed", "spaces", "oversize",
+                                  "group-read", "world-read", "wrong-owner", "parent-symlink"])
+def test_invalid_private_reference_fails_closed_and_redacts(tmp_path, monkeypatch, case):
+    from swarm import envelope
+    from swarm.errors import SwarmError, ErrorCode
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("SWARM_ALLOW_INSECURE_DEV_KEY", "1")
+    path = _private_file(tmp_path)
+    if case == "missing":
+        path = path.with_name("missing")
+    elif case == "symlink":
+        link = path.with_name("link")
+        link.symlink_to(path)
+        path = link
+    elif case == "parent-symlink":
+        link = tmp_path / "link-directory"
+        link.symlink_to(path.parent, target_is_directory=True)
+        path = link / path.name
+    elif case == "directory":
+        path = path.parent
+    elif case == "fifo":
+        path = path.with_name("fifo")
+        os.mkfifo(path, mode=0o600)
+    elif case in ("malformed", "spaces", "oversize"):
+        path.write_text({"malformed": "zz" * 32, "spaces": ED_SEED + " ", "oversize": ED_SEED * 100}[case])
+    elif case in ("group-read", "world-read"):
+        path.chmod(0o640 if case == "group-read" else 0o604)
+    elif case == "wrong-owner":
+        uid = os.geteuid()
+        monkeypatch.setattr(envelope.os, "geteuid", lambda: uid + 1)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(path))
+    assert not envelope.real_key_configured()
+    assert envelope.insecure_dev_key() is None
+    error = envelope.signing_config_error()
+    assert error == "fail-closed: private Ed25519 signing reference cannot be loaded safely"
+    with pytest.raises(SwarmError) as exc:
+        envelope.sign_envelope(_assignment())
+    assert exc.value.code is ErrorCode.E_POLICY
+    assert str(path) not in str(exc.value) and ED_SEED not in str(exc.value)
+
+
+@pytest.mark.parametrize("source", ["xdg", "home"])
+def test_conventional_private_reference_uses_private_directory(tmp_path, monkeypatch, source):
+    pytest.importorskip("cryptography")
+    from swarm import envelope
+    _clear_keys(monkeypatch)
+    if source == "home":
+        monkeypatch.delenv("XDG_CONFIG_HOME")
+        directory = tmp_path / "home" / ".config" / "agent-swarm"
+    else:
+        directory = tmp_path / "config" / "agent-swarm"
+    directory.mkdir(parents=True, mode=0o700)
+    path = directory / "signing-key.hex"
+    path.write_text(ED_SEED)
+    path.chmod(0o600)
+    assert envelope.verify_envelope(envelope.sign_envelope(_assignment()))
+    directory.chmod(0o750)
+    assert not envelope.real_key_configured()
+    assert envelope.signing_config_error() is not None
+
+
+def test_missing_conventional_reference_remains_keyless(monkeypatch):
+    from swarm.envelope import real_key_configured, signing_config_error
+    _clear_keys(monkeypatch)
+    assert not real_key_configured() and signing_config_error() is None
+
+
+def test_configured_bad_reference_never_falls_back_to_conventional_seed(tmp_path, monkeypatch):
+    from swarm.envelope import real_key_configured, signing_config_error
+    _clear_keys(monkeypatch)
+    directory = tmp_path / "config" / "agent-swarm"
+    directory.mkdir(parents=True, mode=0o700)
+    path = directory / "signing-key.hex"
+    path.write_text(ED_SEED)
+    path.chmod(0o600)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(tmp_path / "missing"))
+    assert not real_key_configured() and signing_config_error() is not None
+
+
+@pytest.mark.parametrize("raw", ["SWARM_SIGNING_KEY", "SWARM_ED25519_KEY"])
+def test_raw_signers_take_precedence_without_reading_reference(tmp_path, monkeypatch, raw):
+    pytest.importorskip("cryptography")
+    from swarm import envelope
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(tmp_path / "missing"))
+    monkeypatch.setenv(raw, ED_SEED if raw == "SWARM_ED25519_KEY" else "fixture-hmac")
+    calls = []
+    monkeypatch.setattr(envelope, "_private_seed", lambda *a, **k: calls.append((a, k)))
+    signed = envelope.sign_envelope(_assignment())
+    assert envelope.verify_envelope(signed) and envelope.real_key_configured()
+    assert calls == []
+
+
+@pytest.mark.parametrize("flag", ["SWARM_AGENT_SESSION", "SWARM_CHILD"])
+@pytest.mark.parametrize("explicit", [True, False])
+def test_agent_sessions_never_read_private_files_or_acquire_signing_authority(tmp_path, monkeypatch, flag, explicit):
+    from swarm import envelope
+    from swarm.errors import SwarmError
+    _clear_keys(monkeypatch)
+    path = _private_file(tmp_path)
+    if explicit:
+        monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(path))
+    else:
+        directory = tmp_path / "config" / "agent-swarm"
+        directory.mkdir(parents=True, mode=0o700)
+        conventional = directory / "signing-key.hex"
+        conventional.write_text(ED_SEED)
+        conventional.chmod(0o600)
+    monkeypatch.setenv(flag, "1")
+    calls = []
+    monkeypatch.setattr(envelope.os, "open", lambda *a, **k: calls.append((a, k)))
+    assert not envelope.real_key_configured()
+    envelope.signing_config_error()
+    with pytest.raises(SwarmError):
+        envelope.sign_envelope(_assignment())
+    assert not envelope.verify_envelope({**_assignment(), "sig": "ed25519:" + "A" * 88})
+    assert calls == []
+
+
+def test_private_reference_detects_metadata_change_during_read(tmp_path, monkeypatch):
+    from swarm import envelope
+    _clear_keys(monkeypatch)
+    path = _private_file(tmp_path)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(path))
+    real_read = envelope.os.read
+
+    def changed(fd, size):
+        data = real_read(fd, size)
+        path.chmod(0o640)
+        return data
+
+    monkeypatch.setattr(envelope.os, "read", changed)
+    assert not envelope.real_key_configured()
+    assert envelope.signing_config_error() is not None

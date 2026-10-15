@@ -17,6 +17,7 @@ from swarm.script_base import Ctx
 _KEY_VARS = (
     "SWARM_SIGNING_KEY",
     "SWARM_ED25519_KEY",
+    "SWARM_ED25519_KEY_FILE",
     "SWARM_REQUIRE_KEY",
     "SWARM_ALLOW_INSECURE_DEV_KEY",
 )
@@ -24,6 +25,10 @@ _KEY_VARS = (
 
 def _load(monkeypatch, swarm_dir: Path):
     monkeypatch.setenv("SWARM_DIR", str(swarm_dir))
+    monkeypatch.setenv("HOME", str(swarm_dir.parent / "fixture-home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(swarm_dir.parent / "fixture-config"))
+    for flag in ("SWARM_AGENT_SESSION", "SWARM_CHILD"):
+        monkeypatch.delenv(flag, raising=False)
     for name in _KEY_VARS:
         monkeypatch.delenv(name, raising=False)
     spec = importlib.util.spec_from_file_location("swarm_run_key_preflight", ROOT / "scripts" / "swarm_run.py")
@@ -107,3 +112,62 @@ def test_keyless_run_leaves_tasks_unclaimed(tmp_path, monkeypatch, dry_run):
     assert tasks
     assert all(t["attempt"] == 0 for t in tasks)
     assert all(t["state"] == "PLANNED" for t in tasks)
+
+
+def _private_signer(tmp_path):
+    path = tmp_path / "signer" / "signing-key.hex"
+    path.parent.mkdir(mode=0o700)
+    path.write_text("11" * 32)
+    path.chmod(0o600)
+    return path
+
+
+def test_preflight_signing_accepts_private_reference(tmp_path, monkeypatch):
+    pytest.importorskip("cryptography")
+    mod = _load(monkeypatch, tmp_path / ".swarm")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(_private_signer(tmp_path)))
+    mod.preflight_signing()
+
+
+@pytest.mark.parametrize("bad", ["missing", "insecure", "malformed"])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_invalid_private_signer_leaves_plan_unclaimed(tmp_path, monkeypatch, bad, dry_run):
+    from swarm.errors import ErrorCode, SwarmError
+    from swarm.taskstore import TaskStore
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    swarm = repo / ".swarm"
+    corr = _plan(repo, swarm)
+    mod = _load(monkeypatch, swarm)
+    path = _private_signer(tmp_path)
+    if bad == "missing":
+        path = path.with_name("missing")
+    elif bad == "insecure":
+        path.chmod(0o644)
+    else:
+        path.write_text("zz" * 32)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(path))
+    if not dry_run:
+        monkeypatch.setattr(mod.shutil, "which", lambda _name: "/bin/true")
+        monkeypatch.setattr(mod, "preflight_auth", lambda *_a, **_k: None)
+    _guard(mod, monkeypatch)
+    ctx = Ctx("A01", "swarm_run", None, corr, dry_run, repo)
+    with pytest.raises(SwarmError, match="private Ed25519 signing reference") as exc:
+        mod.run(_args(repo, dry_run=dry_run), ctx)
+    assert exc.value.code is ErrorCode.E_POLICY
+    tasks = TaskStore(swarm / "tasks.db").list(correlation_id=corr)
+    assert tasks and all(t["attempt"] == 0 and t["state"] == "PLANNED" for t in tasks)
+
+
+@pytest.mark.parametrize("flag", ["SWARM_AGENT_SESSION", "SWARM_CHILD"])
+def test_child_preflight_cannot_use_private_signer(tmp_path, monkeypatch, flag):
+    from swarm.errors import SwarmError
+    from swarm import envelope
+    mod = _load(monkeypatch, tmp_path / ".swarm")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(_private_signer(tmp_path)))
+    monkeypatch.setenv(flag, "1")
+    reads = []
+    monkeypatch.setattr(envelope, "_private_seed", lambda *a, **k: reads.append((a, k)))
+    with pytest.raises(SwarmError, match="unavailable in agent sessions"):
+        mod.preflight_signing()
+    assert reads == []
