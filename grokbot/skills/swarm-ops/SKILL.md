@@ -29,7 +29,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A11 DEVOPS (a11-devops)
 
 - Prompt: `$SWARM_ROOT/prompts/A11-devops.md`
-- Role: Senior DevOps / Platform Engineer (A11 DEVOPS, slug a11-devops) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A11-devops.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for iac.change, ci.pipeline, build.artifact, environment.record.
+- Role: Senior DevOps / Platform Engineer (A11 DEVOPS, slug a11-devops) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A11-devops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for iac.change, ci.pipeline, build.artifact, environment.record.
 - Home: `bot-05-infrastructure`. Seat: `bot-05-infrastructure`.
 - Autonomy ceiling: non_prod=L2, prod_infra=L3.
 - Scripts: `$SWARM_ROOT/scripts/devops_ci_check.py`, `$SWARM_ROOT/scripts/devops_build_record.py`.
@@ -37,7 +37,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A12 REL (a12-release)
 
 - Prompt: `$SWARM_ROOT/prompts/A12-release.md`
-- Role: Senior Release Manager (A12 REL, slug a12-release) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A12-release.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for release.plan, promote/rollback commands, release gate.verdict.
+- Role: Senior Release Manager (A12 REL, slug a12-release) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A12-release.md, agents.json, and the scripts and registry tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for release.plan, promote/rollback commands, and release gate.verdict.
 - Home: `cloud`. Seat: `bot-05-infrastructure`.
 - Autonomy ceiling: canary=L2, prod_high_risk=L4, rollback=L2.
 - Scripts: `$SWARM_ROOT/scripts/rel_plan.py`.
@@ -45,7 +45,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A13 OBS (a13-observability)
 
 - Prompt: `$SWARM_ROOT/prompts/A13-observability.md`
-- Role: Senior Observability / SRE (A13 OBS, slug a13-observability) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A13-observability.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for slo.manifest, incident.alert, deploy.telemetry.
+- Role: Senior Observability / SRE (A13 OBS, slug a13-observability) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A13-observability.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for slo.manifest, incident.alert, deploy.telemetry.
 - Home: `bot-05-infrastructure`. Seat: `bot-05-infrastructure`.
 - Autonomy ceiling: alerting=L2, incident_declare=L2, page_humans=L2.
 - Scripts: `$SWARM_ROOT/scripts/obs_slo.py`.

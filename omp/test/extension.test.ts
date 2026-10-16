@@ -71,7 +71,7 @@ test("registers hidden essential swarm operations without fs, spawn or spawnSync
   expect(spawn).toHaveBeenCalledTimes(0);
   expect(spawnSync).toHaveBeenCalledTimes(0);
   // registration order is not part of the contract
-  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call", "tool_result"]);
   expect([...pi.commands.keys()]).toEqual(["swarm"]);
   for (const tool of pi.tools) {
     expect(tool.hidden).toBe(true);
@@ -86,7 +86,7 @@ test("no action at load: the factory never calls a runtime pi action", async () 
   const pi = fakePi();
   factory(pi.api);
   expect(pi.actionCalls).toEqual([]);
-  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call", "tool_result"]);
   expect([...pi.commands.keys()]).toEqual(["swarm"]);
 });
 

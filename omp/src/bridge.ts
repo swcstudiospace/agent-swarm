@@ -21,8 +21,14 @@ const ERROR_CODES: Record<ErrorCode, true> = {
 
 export class SwarmToolError extends Error {
   constructor(readonly code: ErrorCode, detail: string, readonly details?: unknown) {
-    // swarm/errors.py messages already start "E-XXX: " — never double-prefix
-    super(detail.startsWith(`${code}:`) ? detail : `${code}: ${detail}`);
+    // swarm/errors.py messages already start "E-XXX: " — never double-prefix.
+    // Policy refusals keep the code for callers but must not put that token in Error.message.
+    const prefixed = detail.startsWith(`${code}:`) ? detail : `${code}: ${detail}`;
+    const message =
+      code === "E-POLICY"
+        ? prefixed.replace(/^E-POLICY:\s*/, "").replaceAll("E-POLICY", "").trim() || "refused"
+        : prefixed;
+    super(message);
     this.name = "SwarmToolError";
   }
 }

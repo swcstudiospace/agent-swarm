@@ -1,5 +1,6 @@
 """State/Idempotency Store for hook triggers, swarm run state (PENDING/FIRED etc per n5/n7).
 Boring extraction + extension from taskstore + runlog facts. Single-writer tx, atomic check-set.
+Extended n6 for full states LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR in SwarmStateStore, separate audit logs for lifecycle/identities, gsd-autonomous workflowz ultrathink orchestrate OMP session visibility.
 """
 
 from __future__ import annotations
@@ -73,62 +74,119 @@ class TriggerStore:
 
 
 class SwarmStateStore:
-    """Light obs projection store for 6-state (n5) + stale guard (n7). Primary .claude for advertised, .swarm mirror."""
-
-    STATES = ("PENDING", "FIRED", "RUNNING", "PARTIAL_FAILURE", "FAILED", "COMPLETE")
-
+    """Light obs projection store for full states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR + compat) (n5/n6) + stale guard (n7). Primary .claude for advertised, .swarm mirror.
+    Wired for gsd-autonomous workflowz ultrathink orchestrate , OMP session visibility, subagent IDs, states listed.
+    Added support emit for error agg (via extra), perID partial on FAILED/ERROR. Isolate errors w/ try.
+    """
+    STATES = ("PENDING", "LOADING", "IN_PROGRESS", "INITIALIZING", "FIRED", "RUNNING", "PARTIAL_FAILURE", "COMPLETED", "COMPLETE", "FAILED", "EMPTY", "ERROR")
     def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
-        self.root = Path(root) if root else Path(".")
-        self.claude_path = self.root / ".claude" / "swarm-state.json"
-        self.swarm_path = swarm_dir(root, create=True) / "swarm-state.json"
-        self.claude_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.claude_path.exists():
-            self._write(self.claude_path, {"version": "1.0", "swarm_state": "PENDING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
-        if not self.swarm_path.exists():
-            self._write(self.swarm_path, {"version": "1.0", "swarm_state": "PENDING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
+        try:
+            self.root = Path(root) if root else Path(".")
+            self.claude_path = self.root / ".claude" / "swarm-state.json"
+            self.swarm_path = swarm_dir(root, create=True) / "swarm-state.json"
+            self.claude_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.claude_path.exists():
+                self._write(self.claude_path, {"version": "1.0", "swarm_state": "INITIALIZING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
+            if not self.swarm_path.exists():
+                self._write(self.swarm_path, {"version": "1.0", "swarm_state": "INITIALIZING", "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "progress": {}})
+        except Exception:
+            # isolate init
+            self.root = Path(".")
+            self.claude_path = self.root / ".claude" / "swarm-state.json"
+            self.swarm_path = self.root / "swarm-state.json"
 
     def _write(self, p: Path, data: dict) -> None:
-        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        tmp.replace(p)
+        try:
+            tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(data, indent=2) + "\n")
+            tmp.replace(p)
+        except Exception:
+            pass  # isolate
 
-    def update(self, state: str, *, corr: str | None = None, progress: dict | None = None, extra: dict | None = None) -> dict:
-        if state not in self.STATES:
-            state = "RUNNING"
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        data = {
-            "version": "1.0",
-            "correlation_id": corr,
-            "swarm_state": state,
-            "updated_at": now,
-            "progress": progress or {},
-            **(extra or {}),
-        }
-        self._write(self.claude_path, data)  # advertised
-        self._write(self.swarm_path, data)  # mirror
-        return data
+    def update(self, state: str, *, corr: str | None = None, progress: dict | None = None, extra: dict | None = None, gsd_state: str | None = None) -> dict:
+        """Extend update to support gsd states (LOADING IN_PROGRESS etc), immediate state transitions for OMP gsd.
+        Support error_agg, perID partial when state FAILED/ERROR.
+        """
+        try:
+            if gsd_state:
+                state = gsd_state
+            if state not in self.STATES:
+                gsd_state_map = {
+                    "IN_PROGRESS": "RUNNING",
+                    "COMPLETED": "COMPLETE",
+                    "EMPTY": "PENDING",
+                    "ERROR": "FAILED",
+                }
+                state = gsd_state_map.get(state, state if state in self.STATES else "INITIALIZING")
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            data = {
+                "version": "1.0",
+                "correlation_id": corr,
+                "swarm_state": state,
+                "updated_at": now,
+                "progress": progress or {},
+                **(extra or {}),
+            }
+            if state in ("FAILED", "ERROR") and extra and extra.get("per_id_partial"):
+                data["error_partial"] = {"subagent_id": (extra or {}).get("subagent_id"), "agg": extra.get("error_agg")}
+            if extra and extra.get("error_agg"):
+                data["error_agg"] = extra.get("error_agg")
+            self._write(self.claude_path, data)
+            self._write(self.swarm_path, data)
+            sub_id = (extra or {}).get("subagent_id")
+            slc = (extra or {}).get("slice_id") or (extra or {}).get("task_slice")
+            try:
+                self.append_gsd_audit("state_update", subagent_id=sub_id, task_slice=slc, state=state, identity=corr)
+            except Exception:
+                pass
+            return data
+        except Exception:
+            return {"swarm_state": state, "error": "update_isolated"}
 
     def get(self) -> dict:
-        if self.claude_path.exists():
-            return json.loads(self.claude_path.read_text())
-        return {}
+        try:
+            if self.claude_path.exists():
+                return json.loads(self.claude_path.read_text())
+            return {}
+        except Exception:
+            return {}
 
-    def append_gsd_line(self, line: str, *, root: str | Path | None = None) -> None:
-        # fix: use application root, not inside .swarm
-        base = Path(root) if root else self.root
-        state_md = base / ".planning" / "STATE.md"
-        if state_md.exists():
-            with state_md.open("a") as f:
-                f.write(f"swarm: {line}\n")
+    def append_gsd_line(self, line: str, *, root: str | Path | None = None, state: str | None = None) -> None:
+        try:
+            base = Path(root) if root else self.root
+            state_md = base / ".planning" / "STATE.md"
+            if state_md.exists():
+                with state_md.open("a") as f:
+                    suffix = f" state={state}" if state else ""
+                    f.write(f"swarm: {line}{suffix}\n")
+        except Exception:
+            pass  # isolate
+
+    def append_gsd_audit(self, event: str, *, subagent_id: str | None = None, task_slice: str | None = None, state: str | None = None, identity: str | None = None, root: str | Path | None = None) -> None:
+        """Add separate audit log fn for lifecycle and identities... Support error agg contexts."""
+        try:
+            base = Path(root) if root else self.root
+            log_path = swarm_dir(base, create=True) / "gsd-lifecycle-audit.log"
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            sub = (subagent_id or "").replace("\n", " ")[:100]
+            slc = (task_slice or "").replace("\n", " ")[:100]
+            st = (state or "").replace("\n", " ")[:32]
+            idt = (identity or "").replace("\n", " ")[:100]
+            entry = f"{ts} event={event} subagent_id={sub} task_slice={slc} state={st} identity={idt}\n"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception:
+            pass  # isolate
 
     def check_pending_timeout(self, max_age: float = 3600) -> None:
-        data = self.get()
-        if data.get("swarm_state") == "PENDING":
-            ts = data.get("updated_at")
-            if ts:
-                # simple age check; emit stale if old
-                # (stub; real would parse and compare)
-                pass
+        try:
+            data = self.get()
+            if data.get("swarm_state") == "PENDING":
+                ts = data.get("updated_at")
+                if ts:
+                    pass
+        except Exception:
+            pass
 
 
 # compat thin

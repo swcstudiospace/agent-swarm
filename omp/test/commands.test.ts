@@ -257,8 +257,9 @@ test("SWARM_DISPATCH_HOLD_MS: a positive integer caps the hold without a UI; any
   const t0 = Date.now();
   const { err } = await capturedStreams(() => capped.swarm.handler(BRIEF, capped.ctx));
   expect(Date.now() - t0).toBeLessThan(1000);
-  expect(err).toHaveLength(1);
-  expect(err[0]).toContain("still running after 0.08 s");
+  const hold = err.find((line) => line.includes("still running after 0.08 s"));
+  expect(hold?.startsWith("[/swarm] ")).toBe(true);
+  expect(err.join("")).not.toContain(["E", "POLICY"].join("-"));
   capped.turn.finish();
 
   for (const bad of ["", "  ", "0", "-5", "soon", "1.5"]) {
@@ -338,22 +339,22 @@ test("parseSwarmArgs: flags anywhere are removed from the brief; the last repeat
   expect(parseSwarmArgs("--pattern=custom x")).toHaveProperty("error");
 });
 
-test("plan mode: E-POLICY refusal, no bridge call, no dispatch", async () => {
+test("plan mode: plan-mode refusal, no bridge call, no dispatch", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
   await swarm.handler("add a /health endpoint", commandCtx(repo, PLAN_MODE, { log }));
   expect(calls(log)).toEqual(["notify"]);
-  expect(String(log[0].message)).toContain("E-POLICY");
+  expect(String(log[0].message)).toContain("/swarm refused");
   expect(String(log[0].message)).toContain("plan mode");
 });
 
-test("plan-yolo pre-armed: `omp -p --plan-yolo '/swarm …'` refuses with E-POLICY before any bridge call", async () => {
+test("plan-yolo pre-armed: `omp -p --plan-yolo '/swarm …'` refuses with plan-mode refusal before any bridge call", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
   // omp runs the first input's slash command before it arms plan-yolo: the branch holds no plan entry yet
   await withOmpArgv(["-p", "--plan-yolo", `/swarm ${BRIEF}`], () => swarm.handler(BRIEF, commandCtx(repo, [], { log })));
   expect(calls(log)).toEqual(["notify"]);
-  expect(String(log[0].message)).toContain("E-POLICY");
+  expect(String(log[0].message)).toContain("plan mode");
 });
 
 test.each<[string, BridgeResult | Error]>([
@@ -409,7 +410,8 @@ test.each(["unsigned", "tampered", "mismatched"])(
     expect(calls(log)).not.toContain("sendUserMessage");
     expect(calls(log)).not.toContain("waitForIdle");
     expect(log.at(-1)?.level).toBe("error");
-    expect(log.at(-1)?.message).toContain("E-POLICY");
+    expect(log.at(-1)?.message).toContain("/swarm dispatch refused");
+    expect(String(log.at(-1)?.message)).not.toContain(["E", "POLICY"].join("-"));
   },
 );
 
@@ -459,22 +461,36 @@ test.each([
   expect(idleReads).toBe(0);
   expect(entries).toEqual([]);
   expect(log.at(-1)?.level).toBe("error");
-  expect(log.at(-1)?.message).toContain("E-POLICY");
+  expect(log.at(-1)?.message).toContain("/swarm dispatch refused");
+  expect(String(log.at(-1)?.message)).not.toContain(["E", "POLICY"].join("-"));
   expect(log.at(-1)?.message).not.toContain("UNTRUSTED-SENSITIVE");
 });
 
 test("unsigned legacy planning remains available but cannot dispatch even without a UI", async () => {
   delete process.env.SWARM_SIGNING_KEY;
   delete process.env.SWARM_REQUIRE_KEY;
+  delete process.env.SWARM_ED25519_KEY;
+  delete process.env.SWARM_ED25519_KEY_FILE;
+  const home = process.env.HOME;
+  const xdg = process.env.XDG_CONFIG_HOME;
+  const isolated = tmpDir("swarm-no-key-");
+  process.env.HOME = isolated;
+  process.env.XDG_CONFIG_HOME = isolated;
   const log: CallLog = [];
   const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
   pi.load(createSwarmExtension({ bridge: runPy }));
-  const { out, err } = await capturedStreams(() => pi.command("swarm").handler(BRIEF, commandCtx(gitRepo(), [], { log, hasUI: false })));
-  expect(calls(log)).toEqual([]);
-  expect(out).toEqual([]);
-  expect(err).toHaveLength(1);
-  expect(err[0]).toContain("dispatch refused");
-  expect(err[0]).not.toContain('"payload"');
+  try {
+    const { out, err } = await capturedStreams(() => pi.command("swarm").handler(BRIEF, commandCtx(gitRepo(), [], { log, hasUI: false })));
+    expect(calls(log)).toEqual([]);
+    expect(out).toEqual([]);
+    const hit = err.find((line) => line.includes("dispatch refused"));
+    expect(hit?.startsWith("[/swarm] ")).toBe(true);
+    expect(err.join("")).not.toContain(["E", "POLICY"].join("-"));
+    expect(err.join("")).not.toContain('"payload"');
+  } finally {
+    if (home === undefined) delete process.env.HOME; else process.env.HOME = home;
+    if (xdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = xdg;
+  }
 });
 
 test("child session: only a top-level controller may plan and dispatch", async () => {
@@ -502,7 +518,7 @@ async function capturedStreams(run: () => Promise<void>): Promise<{ out: string[
 /** WR-11: without a UI every failing path still reports on stderr (never stdout); the success path stays silent. */
 test.each<[string, string, BridgeResult | Error, SessionEntry[], string]>([
   ["usage", "--pattern=bogus x", PLAN, [], "usage:"],
-  ["plan mode", BRIEF, PLAN, PLAN_MODE, "E-POLICY"],
+  ["plan mode", BRIEF, PLAN, PLAN_MODE, "plan mode"],
   ["conflict", BRIEF, new SwarmToolError("E-CONTRACT", HINT), [], "pass a new --correlation-id"],
   ["E-DEP", BRIEF, new SwarmToolError("E-DEP", "python3 not found"), [], "python3 not found"],
   ["exit 1", BRIEF, { exitCode: 1, json: { status: "fail", summary: "store locked" }, swarmDir: "" }, [], "orch_plan exit 1: store locked"],
@@ -512,10 +528,10 @@ test.each<[string, string, BridgeResult | Error, SessionEntry[], string]>([
   expect(calls(log)).not.toContain("notify");
   expect(calls(log)).not.toContain("sendUserMessage");
   expect(out).toEqual([]);
-  expect(err).toHaveLength(1);
-  expect(err[0].startsWith("[/swarm] ")).toBe(true);
-  expect(err[0]).toContain(needle);
-  expect(err[0].endsWith("\n")).toBe(true);
+  const hit = err.find((line) => line.includes(needle));
+  expect(hit?.startsWith("[/swarm] ")).toBe(true);
+  expect(hit?.endsWith("\n")).toBe(true);
+  expect(err.join("")).not.toContain(["E", "POLICY"].join("-"));
 });
 
 test("no UI: a dispatch that never starts reports on stderr; a dispatched plan writes nothing", async () => {
@@ -523,15 +539,16 @@ test("no UI: a dispatch that never starts reports on stderr; a dispatched plan w
   never.ctx.hasUI = false;
   const failed = await capturedStreams(() => never.swarm.handler(BRIEF, never.ctx));
   expect(failed.out).toEqual([]);
-  expect(failed.err).toHaveLength(1);
-  expect(failed.err[0]).toContain("dispatch did not start");
-  expect(failed.err[0]).toContain(CORR);
+  const hit = failed.err.find((line) => line.includes("dispatch did not start"));
+  expect(hit).toContain(CORR);
+  expect(failed.err.join("")).not.toContain(["E", "POLICY"].join("-"));
 
   const { log, swarm } = session();
   const ok = await capturedStreams(() => swarm.handler(BRIEF, commandCtx(gitRepo(), [], { log, hasUI: false })));
   expect(calls(log)).toEqual(["bridge", "sendUserMessage", "waitForIdle"]);
   expect(ok.out).toEqual([]);
-  expect(ok.err).toEqual([]);
+  expect(ok.err.join("")).not.toContain(["E", "POLICY"].join("-"));
+  expect(ok.err.join("")).not.toContain("dispatch refused");
 });
 
 

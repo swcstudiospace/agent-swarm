@@ -1,7 +1,10 @@
-"""Append-only JSONL run log — the local stand-in for the NATS bus / OTel plane.
+"""Append-only JSONL run log (the logger unit) — local stand-in for NATS/OTel.
 
-Every agent script emits its inputs, outputs and verdicts here so the orchestrator
-(and humans) can audit the causal chain by correlation_id.
+Emits structured logs at every phase of init, lifecycle, run loop (via log_phase) +
+end-of-run summary reports (via log_summary).
+
+Every agent script + swarm_run + hooks + subagent_lifecycle use it for causal audit by correlation_id.
+Logging paths spec lives in swarm.paths.logging_paths().
 """
 from __future__ import annotations
 import json
@@ -76,3 +79,20 @@ def read_events(*, correlation_id: str | None = None, task_id: str | None = None
             continue
         out.append(rec)
     return out
+
+
+def log_phase(phase: str, payload: dict, *, source: str = "swarm", correlation_id: str | None = None,
+              task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
+    """Logger unit: emit structured log at a run phase (e.g. 'init', 'reconcile', 'dispatch', 'execute', 'summary').
+    Every phase of init/lifecycle/run gets a typed event in events.jsonl.
+    """
+    p = {"phase": phase, **(payload or {})}
+    return emit(f"phase.{phase}", p, source=source, correlation_id=correlation_id, task_id=task_id, root=root, tee=tee)
+
+
+def log_summary(report: dict, *, source: str = "swarm_run", correlation_id: str | None = None,
+                root: str | Path | None = None, tee: bool = True) -> dict:
+    """Logger unit: emit end-of-run summary report (counts, complete, escalated, timings, log excerpts).
+    Called at lifecycle end.
+    """
+    return emit("run.summary", report, source=source, correlation_id=correlation_id, root=root, tee=tee)

@@ -60,7 +60,7 @@ trail fail open, so the agent would look almost healthy. The installer never rea
 
 It also refuses (exit 2, nothing written):
 
-- a runtime that cannot call MCP as an executing agent (`--runtimes claude,trae`): a node is leased over MCP only, and
+- a runtime that cannot call MCP as an executing agent (`--runtimes claude,<unknown>` (an unregistered name is refused)): a node is leased over MCP only, and
   there is no REST `graph_claim` (ADR 0001 S4 criterion 6);
 - an env-file directory inside the workspace, inside this checkout or inside any git checkout (a dotfiles repo behind
   `~/.config`, say); point `XDG_CONFIG_HOME` elsewhere for the install and `swarm_run.py` alike;

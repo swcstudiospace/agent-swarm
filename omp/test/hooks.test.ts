@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { Bridge } from "../src/bridge.ts";
 import { SWARM_SLUGS } from "../src/guard.ts";
-import { classifiedText, classifyPrompt, RUNTIME_HEADING, runtimeContext, runtimePart, shellQuote, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
+import { classifiedText, classifyPrompt, GSD_HANDOFF, RUNTIME_HEADING, runtimeContext, runtimePart, shellQuote, SWARM_CONTEXT, swarmContext } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { ExtensionContext } from "../src/omp-api.ts";
 import { agentCtx, fakeCtx, fakePi, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
@@ -61,12 +61,24 @@ describe("fixture positives inject once, after the prior parts", () => {
   }
 });
 
-describe("fixture negatives are silent", () => {
+describe("fixture negatives are silent except the gsd-autonomous handoff", () => {
   for (const prompt of FIXTURE.negative) {
     test(`negative: ${JSON.stringify(prompt.slice(0, 60))}`, () => {
-      expect(hook()({ prompt, systemPrompt: PRIOR }, top())).toBeUndefined();
+      const out = hook()({ prompt, systemPrompt: PRIOR }, top());
+      if (prompt.toLowerCase().includes("gsd-autonomous")) {
+        const added = parts(out).at(-1);
+        expect(added).toBe(GSD_HANDOFF);
+        expect(added).not.toContain(["E", "POLICY"].join("-"));
+      } else {
+        expect(out).toBeUndefined();
+      }
     });
   }
+});
+
+test("gsd-autonomous handoff text does not name the retired policy token", () => {
+  expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join("-"));
+  expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join(""));
 });
 
 // ── WR-01: an Ultrathink/Prompt-Uplift XML is classified by the user's <ORIGINAL> ─────────
@@ -96,8 +108,13 @@ describe("uplift XML: HOOK-01 classifies the user's ORIGINAL (WR-01)", () => {
     });
   }
   for (const prompt of FIXTURE.negative) {
-    test(`research uplift of a negative is silent: ${JSON.stringify(prompt.slice(0, 50))}`, () => {
-      expect(hook()({ prompt: researchUplift(prompt), systemPrompt: PRIOR }, top())).toBeUndefined();
+    test(`research uplift of a negative is silent unless it is gsd-autonomous: ${JSON.stringify(prompt.slice(0, 50))}`, () => {
+      const out = hook()({ prompt: researchUplift(prompt), systemPrompt: PRIOR }, top());
+      if (prompt.toLowerCase().includes("gsd-autonomous")) {
+        expect(parts(out).at(-1)).toBe(GSD_HANDOFF);
+      } else {
+        expect(out).toBeUndefined();
+      }
     });
   }
   test("an uplift root without an ORIGINAL is classified whole", () => {

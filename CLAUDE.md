@@ -2,7 +2,7 @@
 
 This repo is both the **design spec** (`01-*.md` … `07-*.md`, `03-agents/`) and a **runnable
 Claude Code subagent swarm** built from it. Fifteen agents (A01–A15) cover the SDLC; each one is
-a Claude Code and Grok Build subagent, an omp task agent and a Trae SOLO prompt, generated from the Prompt-Uplift XML prompt in `prompts/`; its tools are Python plus TypeScript twins (`scripts/ts/`). Skills: `skills/<slug>/SKILL.md`. Orchestration: `skills/orchestrate/SKILL.md` + `hooks/user_prompt_submit.py` (Claude Code), or `/swarm <brief>` + the `before_agent_start` context hook (omp).
+a Claude Code and Grok Build subagent and an omp task agent, generated from the Prompt-Uplift XML prompt in `prompts/`; its tools are Python plus TypeScript twins (`scripts/ts/`). Skills: `skills/<slug>/SKILL.md`. Orchestration: `skills/orchestrate/SKILL.md` + `hooks/user_prompt_submit.py` (Claude Code), or `/swarm <brief>` + the `before_agent_start` context hook (omp).
 
 ## Layout
 
@@ -18,13 +18,12 @@ a Claude Code and Grok Build subagent, an omp task agent and a Trae SOLO prompt,
 | `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: five typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`), the `tool_call` guard (`guard.ts`), the `before_agent_start` context hook (`hooks.ts`) and the `/swarm` command (`commands.ts`) |
 | `omp/test/` | **Hand-written** `bun:test` suite for the package (`cd omp && bun run test`) |
 | `.omp/config.yml` | Committed omp project wiring: `extensions:` → `- omp` (the only file in `.omp/`) |
-| `.trae/` | **Generated** Trae SOLO kit (`python3 scripts/build_trae_agents.py`): 15 XML prompts ≤ 10,000 chars, `registration.json`, `commands/swarm.md` |
 | `skills/<slug>/SKILL.md` | Per-agent + `orchestrate` skills (copy with `--install-workspace`) |
 | `scripts/ts/` | TypeScript twins of every `scripts/*.py` tool |
 | `hooks/user_prompt_submit.py` | Fail-open UserPromptSubmit classifier: injects swarm context only on SDLC-shaped prompts (`tests/fixtures/classifier_prompts.json` pins it together with the omp hook) |
 | `hooks/autonomous_run.py` | Plan + run in one detached process (120 s dedupe lock, log at `$SWARM_DIR/autonomous.log`). The run cap (`SWARM_AUTONOMOUS_RUN_CAP_S`, default 3600) SIGTERMs the runner so it can end its sessions, and SIGKILLs only after `SWARM_AUTONOMOUS_RUN_GRACE_S` (default 15). Started by an external plugin; `--runtime` forwarded to `swarm_run.py` |
 | `swarm/` | Runtime toolkit: envelope (signed `swarm.v1`), Task Store (SQLite state machine), gates, manifest, run log |
-| `scripts/` | Per-agent tools (see table below) + orchestration (`orch_plan.py`, `orch_status.py`, `swarm_run.py`) + generators (`build_agents.py`, `build_trae_agents.py`, `_write_skills.py`, `_install_omp.py`) |
+| `scripts/` | Per-agent tools (see table below) + orchestration (`orch_plan.py`, `orch_status.py`, `swarm_run.py`) + generators (`build_agents.py`, `_write_skills.py`, `_install_omp.py`) |
 | `.swarm/` | Runtime state (task DB, plans, verdicts, assignments, results, `events.jsonl`). Resolved per call: `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. Created with its own `.gitignore` of `*`. |
 | `tests/` | `pytest -q` |
 
@@ -142,7 +141,6 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 ## Editing
 
 - Change behaviour in `prompts/` (keep the XML tag set — `tests/test_swarm.py` checks it), then run
-  `python3 scripts/build_agents.py` (`.claude/agents/`, `.grok/agents/`, `omp/agents/`, `omp/skills/`) and
-  `python3 scripts/build_trae_agents.py` (`.trae/`), and commit the regenerated files.
+  `python3 scripts/build_agents.py` (`.claude/agents/`, `.grok/agents/`, `omp/agents/`, `omp/skills/`), and commit the regenerated files.
 - New agent: add to `agents.json`, write `prompts/`, scripts, regenerate. See `07-scalability.md`.
 - Keep scripts stdlib-only; optional tools must degrade to `skipped:tool-missing`.

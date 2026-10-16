@@ -1,9 +1,14 @@
 """Thin obs facade over runlog + state_store (n5/n2). 6-state, events, projection.
 Boring; no mutation of source.
+
+Enhanced n6 for gsd-autonomous workflowz ultrathink orchestrate : full states LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR in SwarmStateStore,
+separate audit logs, enhance emits/stream for immediate spawn/ID/slices/status to OMP, support consolidated metrics.
+OMP session visibility, subagent IDs. SPE-13823 n6.
 """
 
 from __future__ import annotations
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +17,6 @@ from .runlog import emit, read_events
 from .state_store import get_swarm_state_store
 def emit_hook_fired(hook: str, *, corr: str | None = None, deduped: bool = False, root: str | Path | None = None, **kw: Any) -> dict:
     return emit("hook-fired", {"hook": hook, "deduped": deduped, **kw}, source="hook_trigger", correlation_id=corr, root=root)
-
-
 def emit_per_unit(task_id: str, agent: str, phase: str, state: str, *, corr: str | None = None, root: str | Path | None = None) -> dict:
     return emit("per-unit", {"task_id": task_id, "agent": agent, "phase": phase, "state": state}, source="execution", correlation_id=corr, task_id=task_id, root=root)
 
@@ -26,12 +29,16 @@ def emit_stale(kind: str, reason: str, *, task_id: str | None = None, corr: str 
     return emit("stale", {"kind": kind, "reason": reason}, source="watchdog", correlation_id=corr, task_id=task_id, root=root)
 
 
-def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None) -> dict:
-    """Build 6-state projection (n5)."""
+def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None, slice_id: str | None = None, subagent_id: str | None = None) -> dict:
+    """Build 6-state projection (n5). Extended for full states LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR, immediate transitions.
+    Supports gsd-autonomous, wires OMP gsd command use, calls audit for lifecycle/ids.
+    Add support perID partial on FAILED/ERROR states. Isolate errors with try.
+    """
     store = get_swarm_state_store(root=root)
     done = 0
     total = 0
-    state = "RUNNING"
+    active = 0
+    state = "IN_PROGRESS"
     try:
         from .taskstore import TaskStore
         ts = TaskStore(root=root)
@@ -40,22 +47,43 @@ def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None
         if total > 0:
             done = sum(1 for t in tasks if t.get("state") in ("DONE", "APPROVED"))
             failures = sum(1 for t in tasks if t.get("state") in ("FAILED", "ESCALATED"))
+            active = sum(1 for t in tasks if t.get("state") in ("PENDING", "RUNNING", "IN_PROGRESS"))
             if done == total:
-                state = "COMPLETE"
+                state = "COMPLETED"
             elif failures > 0:
-                state = "PARTIAL_FAILURE" if done > 0 else "FAILED"
+                state = "PARTIAL_FAILURE" if done > 0 else "ERROR"
             else:
-                state = "RUNNING"
+                state = "IN_PROGRESS"
+        else:
+            state = "EMPTY"
     except Exception:
-        events = read_events(correlation_id=corr, root=root) if corr else []
-        done = sum(1 for e in events if isinstance(e, dict) and e.get("type") in ("task.done", "task.approved", "task_done"))
-        total = max(1, len(events))
-        state = "COMPLETE" if done >= total else "RUNNING"
+        try:
+            events = read_events(correlation_id=corr, root=root) if corr else []
+            done = sum(1 for e in events if isinstance(e, dict) and e.get("type") in ("task.done", "task.approved", "task_done"))
+            total = max(1, len(events))
+            state = "COMPLETED" if done >= total else "IN_PROGRESS"
+            if total == 0:
+                state = "EMPTY"
+        except Exception:
+            state = "ERROR"
+            # isolate
 
-    progress = {"done": done, "total": total}
-    data = store.update(state, corr=corr, progress=progress)
-    # gsd append
-    store.append_gsd_line(f"{corr or 'no-corr'} {state} {done}/{total}", root=root)
+    progress = {"done": done, "total": total, "active": active}
+    # support consolidated metrics
+    consolidated = {"done": done, "total": total, "active": active, "completion": (done / total * 100) if total else 0}
+    extra = {"consolidated_metrics": consolidated, "slice_id": slice_id}
+    if subagent_id and state in ("FAILED", "ERROR"):
+        extra["per_id_partial"] = {"subagent_id": subagent_id, "state": state, "partial": True}
+    try:
+        data = store.update(state, corr=corr, progress=progress, extra=extra)
+    except Exception:
+        data = {"swarm_state": state, "progress": progress}
+    # gsd append extended
+    try:
+        store.append_gsd_line(f"{corr or 'no-corr'} {state} {done}/{total}", root=root, state=state)
+        store.append_gsd_audit("build_swarm_state", subagent_id=subagent_id, task_slice=slice_id, state=state, identity=corr, root=root)
+    except Exception:
+        pass  # isolate
     return data
 
 
@@ -70,7 +98,113 @@ def write_claude_state(data: dict, *, root: str | Path | None = None) -> Path:
     return p
 
 
-def update_from_events(corr: str | None = None, *, root: str | Path | None = None) -> dict:
-    data = build_swarm_state(corr=corr, root=root)
+def update_from_events(corr: str | None = None, *, root: str | Path | None = None, slice_id: str | None = None, subagent_id: str | None = None) -> dict:
+    """Update from events, wired to support slice, sub ID for gsd OMP visibility."""
+    data = build_swarm_state(corr=corr, root=root, slice_id=slice_id)
     write_claude_state(data, root=root)
+    # emit gsd for OMP
+    if subagent_id or slice_id:
+        emit_gsd_omp("updated", subagent_id=subagent_id, task_id=None, corr=corr, root=root, task_slice=slice_id, state=data.get("swarm_state"))
     return data
+def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, error_agg: dict | None = None, **kw: Any) -> dict:
+    """Integrate emit for OMP gsd-autonomous. Per-subagent status streaming for OMP session visibility in concurrent launches.
+    Enhanced for real-time per-sub, spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR etc).
+    Add support emit for error agg, perID partial on FAILED/ERROR. Isolate with try. Wire to gsd states.
+    Support consolidated metrics. Wire for OMP gsd command use.
+    """
+    effective_state = state or status
+    payload = {
+        "subagent_id": subagent_id,
+        "status": status,
+        "state": effective_state,
+        "task_id": task_id,
+        "task_slice": task_slice,
+        "spawn_event": spawn_event,
+        "ts": time.time(),
+        "consolidated": kw.get("consolidated"),
+        "error_agg": error_agg,
+        **kw
+    }
+    if effective_state in ("FAILED", "ERROR") and subagent_id:
+        payload.setdefault("per_id_partial", True)
+    # audit for lifecycle/identities , isolate
+    try:
+        store = get_swarm_state_store(root=root)
+        store.append_gsd_audit("emit_gsd_omp", subagent_id=subagent_id, task_slice=task_slice, state=effective_state, identity=subagent_id or corr, root=root)
+    except Exception:
+        pass
+    return emit("gsd.autonomous.omp", payload, source="omp_gsd", correlation_id=corr, task_id=task_id, root=root)
+def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None = None, phase: str = "exec", corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, consolidated: dict | None = None, error_agg: dict | None = None, **kw: Any) -> dict:
+    """Stream per-subagent identifier + real-time status directly to OMP session.
+    Enhanced for immediate spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR).
+    Add support emit for error agg, perID partial on FAILED/ERROR. Isolate errors with try.
+    Used for gsd-autonomous workflowz ultrathink orchestrate concurrent visibility.
+    Support consolidated metrics. Also emits per-unit. Wire OMP gsd command.
+    """
+    effective_state = state or status
+    payload = {
+        "subagent_id": subagent_id,
+        "status": status,
+        "state": effective_state,
+        "task_id": task_id,
+        "phase": phase,
+        "task_slice": task_slice,
+        "spawn_event": spawn_event,
+        "ts": time.time(),
+        "consolidated": consolidated,
+        "error_agg": error_agg,
+        **kw,
+    }
+    if effective_state in ("FAILED", "ERROR") and subagent_id:
+        payload.setdefault("per_id_partial", True)
+    if task_id:
+        try:
+            emit_per_unit(task_id, "subagent", phase, effective_state, corr=corr, root=root)
+        except Exception:
+            pass  # isolate
+    # audit lifecycle identities , isolate
+    try:
+        store = get_swarm_state_store(root=root)
+        store.append_gsd_audit("stream_subagent_status", subagent_id=subagent_id, task_slice=task_slice, state=effective_state, identity=subagent_id, root=root)
+    except Exception:
+        pass
+    return emit("subagent.status.stream", payload, source="subagent_lifecycle", correlation_id=corr, task_id=task_id, root=root)
+def even_partition(workload: list, n: int = 4) -> list[list]:
+    """Even partition hook for workload slices at OMP gsd-autonomous launch time.
+    Partitions evenly by count (round-robin) for default 4 concurrent subagents.
+    Supports states LOADING IN_PROGRESS etc for gsd-autonomous workflowz ultrathink orchestrate.
+    Configurable, degrades if n>len etc. Used with subagent IDs, task slices for OMP session visibility.
+    """
+    if not workload:
+        return [[]]
+    n = max(1, min(n, len(workload)))
+    parts: list[list] = [[] for _ in range(n)]
+    for i, item in enumerate(workload):
+        parts[i % n].append(item)
+    return parts
+def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, state: str = "ERROR", **kw: Any) -> dict:
+    """Dedicated support emit for error agg from CentralErrorAggregator.
+    Per sub ID details/partials/retry surfaced. Called on FAILED/ERROR.
+    Wire to gsd states, isolate with try.
+    """
+    try:
+        payload = {
+            "subagent_id": subagent_id,
+            "error_agg": agg,
+            "state": state,
+            "task_id": task_id,
+            "ts": time.time(),
+            "per_id_partial": True,
+            **kw
+        }
+        store = get_swarm_state_store(root=root)
+        store.append_gsd_audit("emit_error_agg", subagent_id=subagent_id, state=state, identity=corr, root=root)
+        # also stream via status
+        try:
+            stream_subagent_status(subagent_id, "error", task_id=task_id, state=state, error_agg=agg, root=root)
+        except Exception:
+            pass
+        return emit("error.agg", payload, source="error_aggregator", correlation_id=corr, task_id=task_id, root=root)
+    except Exception:
+        # isolate
+        return {"subagent_id": subagent_id, "error_agg": agg, "state": state}

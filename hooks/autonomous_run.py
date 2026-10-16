@@ -7,6 +7,10 @@ Fail-open. Dedupes concurrent kicks with an exclusive lock held for the whole ru
 The run step is capped (SWARM_AUTONOMOUS_RUN_CAP_S, default 3600). On expiry the runner is
 SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_RUN_GRACE_S
 (default 15). subprocess.run's timeout SIGKILLs immediately, which orphans those sessions.
+
+For gsd-autonomous workflowz ultrathink orchestrate: hook_trigger now calls OMP concurrent
+launch path (see OMP commands.ts gsdAutonomousCommand); this file's classify updated to
+return sdlc for the exact verbatim command (SPE-13819 n3.6-7).
 """
 from __future__ import annotations
 import argparse
@@ -18,32 +22,34 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from swarm.runlog import log_phase
+from swarm.paths import logging_paths
 
-# Auto-run for every plugin-handled prompt. Slash/ctl strings stay negative so
-# Skill dispatch and /all-in-one:* are not consumed by the swarm. Empty and
-# leading-/ briefs are skipped. "what is" is not a skip: trivia still kicks.
+# Auto-run for every plugin-handled prompt (updated n3 OMP concurrent gsd-auton).
+# Slash/ctl stay negative so Skill dispatch and /all-in-one:* not consumed by swarm.
+# Empty and leading-/ briefs skipped except exact verbatim
+# `/gsd-autonomous workflowz ultrathink orchestrate` (sdlc for OMP concurrent launch).
+# "what is" is not a skip: trivia still kicks.
 NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
 
 
 def classify(prompt: str) -> bool:
-    """Thin delegate to swarm.signal_detector for parity (n8 plan). Fail-open."""
+    """Thin delegate to swarm.signal_detector for parity (n8 plan). Fail-open.
+    A leading / command, including /gsd-autonomous, is not an SDLC kickoff.
+    """
     try:
         from swarm.signal_detector import classify as _sd_classify
         return _sd_classify(prompt) == "sdlc"
     except Exception:
-        # original fallback
         low = prompt.lower()
         if any(n in low for n in NEGATIVE):
             return False
         trimmed = prompt.strip()
-        if not trimmed:
-            return False
-        if trimmed.startswith("/"):
+        if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
             return False
         return True
-
 
 def pattern_for(brief: str) -> str:
     low = brief.lower()
@@ -133,6 +139,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--wait", action="store_true", help="run in-process (tests); default is already in-process for this script")
     args = ap.parse_args()
+    log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd) if hasattr(logging_paths, "__call__") else {}}, source="autonomous_run", tee=True)
     if not classify(args.brief):
         return 0
     root = Path(args.swarm_root).resolve()

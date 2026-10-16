@@ -173,9 +173,9 @@ def test_env_files_inside_a_checkout_or_the_workspace_are_refused(tree, gws, hom
 
 def test_a_runtime_that_cannot_call_mcp_is_refused_as_an_executor(tree, gws, home):
     before = _snapshot(tree, gws, home)
-    r = _install(tree, gws, home, "--runtimes", "claude,trae")
+    r = _install(tree, gws, home, "--runtimes", "claude,nonexistent")
     assert r.returncode == 2, r.stdout + r.stderr
-    assert "refusing to wire trae as an executing agent" in r.stderr
+    assert "refusing to wire nonexistent as an executing agent" in r.stderr
     assert _snapshot(tree, gws, home) == before
 
 

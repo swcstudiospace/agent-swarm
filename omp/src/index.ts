@@ -12,9 +12,16 @@ import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR, parseSignerDenyPaths } from "./guard.ts";
 import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionFactory } from "./omp-api.ts";
+import { dockUi, publishTaskSpawn, settleTaskResult, type TaskResultEvent } from "./swarm_dock.ts";
 import { buildTools } from "./tools.ts";
 
-/** DI seam: tests inject a recording bridge; production uses the single python bridge. */
+function taskResult(event: unknown): TaskResultEvent | undefined {
+  if (!event || typeof event !== "object" || !("toolName" in event) || event.toolName !== "task") return undefined;
+  const toolCallId = "toolCallId" in event && typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+  const isError = "isError" in event && event.isError === true;
+  return { toolName: "task", toolCallId, isError };
+}
+
 export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionFactory {
   return (pi) => {
     // WR-01: this session's children only — a sibling session's shutdown never reaches them
@@ -49,10 +56,28 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         const runtimeRoots = [...(root ? [resolve(root)] : []), resolve(import.meta.dir, "..", "..")];
         const signerReadPaths = parseSignerDenyPaths(env.SWARM_SIGNER_DENY_PATHS);
         const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots, signerReadPaths };
-        return guardToolCall(event, facts);
+        const decision = guardToolCall(event, facts);
+        if (!decision?.block && event.toolName === "task") {
+          try {
+            publishTaskSpawn(dockUi(ctx), event.input, event.toolCallId);
+          } catch {
+            // dock is display-only; a render failure must not change the tool decision
+          }
+        }
+        return decision;
       } catch (err) {
         if (!inSwarm({ ...known, env })) return undefined;
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };
+      }
+    });
+    // The dock paints a task spawn as running. tool_result is the only parent-side signal
+    // that the spawn finished; without it the card stays on that first status forever.
+    pi.on("tool_result", (event, ctx) => {
+      try {
+        const result = taskResult(event);
+        if (result) settleTaskResult(dockUi(ctx), result);
+      } catch {
+        // dock is display-only; a render failure must not change the tool result
       }
     });
   };

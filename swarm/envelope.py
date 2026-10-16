@@ -20,12 +20,13 @@ import hmac
 import json
 import os
 import stat
+import sys
 import time
 import uuid
 from pathlib import Path
 
 from .errors import SwarmError, ErrorCode
-
+from .state_store import get_swarm_state_store
 SCHEMA_PREFIX = "swarm.v1."
 PRIORITIES = {"P0", "P1", "P2", "P3"}
 RISK_CLASSES = {"low", "medium", "high"}
@@ -35,6 +36,7 @@ SIGNATURE_REQUIRED = {
 }
 REQUIRED_FIELDS = ("msg_id", "correlation_id", "trace_id", "source", "target", "type",
                    "schema", "ts", "ttl_s", "priority", "risk_class", "payload")
+
 
 
 def _uuid7() -> str:
@@ -245,7 +247,14 @@ def _signing_hmac() -> tuple[bytes, bool] | None:
 
 
 def signing_config_error() -> str | None:
-    """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None."""
+    """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None.
+
+    Per q1: the check (and any material loads) is performed only if a key is supplied
+    via env (optional case); enterprise REQUIRE=1 always forces the path.
+    """
+    require = os.environ.get("SWARM_REQUIRE_KEY") == "1"
+    if not _signing_key_supplied() and not require:
+        return None
     _key, error = _ed25519_material()
     if error and (not os.environ.get("SWARM_SIGNING_KEY")
                   or not os.environ.get("SWARM_ED25519_KEY")):
@@ -253,8 +262,68 @@ def signing_config_error() -> str | None:
     if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
         return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
     return None
+def _signing_key_supplied() -> bool:
+    """Constant-time check (no short-circuit timing variance) whether signing key supplied via env.
+    Per q1: perform validation+loads ONLY if supplied (optional). REQUIRE=1 forces.
+    """
+    a = bool(os.environ.get("SWARM_SIGNING_KEY"))
+    b = bool(os.environ.get("SWARM_ED25519_KEY"))
+    c = bool(os.environ.get("SWARM_ED25519_KEY_FILE"))
+    d = (os.environ.get("SWARM_REQUIRE_KEY") == "1")
+    return (a + b + c + d) > 0
+def perform_signing_key_lifecycle() -> dict:
+    """Signing key lifecycle as FIRST step in swarm coordinator init.
+
+    Uses existing _ed25519_material/_signing_key_supplied/validate_signing_key/
+    real_key_configured/signing_config_error (never raw keys).
+    Sets LOADING first.
+    Decides reduced for keyless non-mand (q1).
+    Exact enterprise msgs to sys.stderr .
+    Raise on mand fail.
+    Return {'status': 'full'|'reduced'|'blocked', 'message': str}
+    """
+    get_swarm_state_store().update("LOADING")
+
+    supplied = _signing_key_supplied()
+    require = os.environ.get("SWARM_REQUIRE_KEY") == "1"
+    err = validate_signing_key()
+    configured = real_key_configured()
+
+    if require and (err or not configured):
+        detail = err or "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
+        msg = f"Signing key required for enterprise audit/integrity of parallel swarm. {detail} Actionable: provide via env; swarm start blocked."
+        print(msg, file=sys.stderr)
+        raise SwarmError(ErrorCode.E_POLICY, detail)
+
+    if err:
+        # supplied but invalid, not mandatory: actionable, do not block unrelated work
+        msg = (
+            "Signing key required for enterprise audit/integrity of parallel swarm. "
+            f"{err} Actionable: provide a valid key via env. Proceeding reduced-privilege."
+        )
+        print(msg, file=sys.stderr)
+        return {"status": "reduced", "message": msg}
+
+    if supplied and configured:
+        # present/valid (purpose)
+        msg = "Signing key required for enterprise audit/integrity of parallel swarm; validated successfully."
+        print(msg, file=sys.stderr)
+        return {"status": "full", "message": msg}
+
+    # absent non-mand
+    msg = "Signing key absent: purpose is enterprise audit/integrity of parallel swarm. Proceeding reduced-privilege."
+    print(msg, file=sys.stderr)
+    return {"status": "reduced", "message": msg}
 
 
+def validate_signing_key() -> str | None:
+    """Signing key validation routine: constant-time conditional validation only if key supplied (q1).
+    Delegates to guarded signing_config_error. Clear messages for optional vs enterprise REQUIRE=1
+    (REQUIRE produces dedicated "fail-closed: SWARM_REQUIRE_KEY=1 ..." message; optional non-supplied
+    yields no error from validation path).
+    Acceptance: const time branch decision when present; clear msgs; used by init/preflight.
+    """
+    return signing_config_error()
 def _warn_dev_key(env: dict, root: str | Path | None) -> None:
     try:
         from .runlog import emit

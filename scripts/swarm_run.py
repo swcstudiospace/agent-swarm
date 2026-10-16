@@ -4,7 +4,7 @@
 Each ready task is dispatched to its agent as a headless session, run with the task.assign prompt on stdin:
     claude -p --agent <slug> --output-format json --permission-mode <mode> …
         [--mcp-config <repo>/.mcp.json --strict-mcp-config] --allowedTools … [mcp__substrate]   (--runtime claude)
-    omp -p --mode json --no-session --no-title -e <agent-swarm>/omp --cwd <repo>
+    omp -p --mode json --no-title -e <agent-swarm>/omp --cwd <repo>
         --approval-mode write --tools <frontmatter tools>,yield
         --append-system-prompt $SWARM_DIR/agents/<slug>.md --max-time <n>s                   (--runtime omp)
 --runtime auto picks grok when SWARM_RUNTIME=grok or grok is on PATH and claude is not, else claude; it never
@@ -18,8 +18,12 @@ Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, S
 only bounded deny-path guard metadata, never loading references. A gate script they run records nothing.
 For each gate task the runner itself runs the gate script on the gate task's own
 id after the session, while the task is still leased; the script records signed verdicts on the gate task's Task
-Store gate_for targets (the runner writes no rows itself).
-A01 rules (fail-closed gates, bounded rework, escalation) are
+ from .runlog import emit as runlog_emit
+ from .observability import emit_hook_fired
+from .subagent_lifecycle import get_manager  # integrate lifecycle mgr for trigger spawn logging (unique ID+ts)
+ 
+ # Non-empty values mean this process is a cloud agent and must not detach a runner.
+ CLOUD_AGENT_MARKERS = ("CURSOR_AGENT", "CURSOR_CLOUD_AGENT", "CLOUD_AGENT")
 applied between rounds by the Task Store.
 With SUBSTRATE_URL set (never on --dry-run) each task is worked under a substrate lease the runner holds for its agent:
 claimed before dispatch (a denied claim waits), beaten every TTL/3 while the session runs and through review, completed at
@@ -35,7 +39,8 @@ install wired the substrate MCP entry into <repo> (swarm/workspace.py, docs/subs
   python3 scripts/swarm_run.py                          # run latest plan to completion
   python3 scripts/swarm_run.py --runtime omp            # run it on omp (needs only `omp` on PATH)
   python3 scripts/swarm_run.py --dry-run                # canned agent results; prints each task's invocation to stderr
-  python3 scripts/swarm_run.py --once --max-parallel 3  # a single scheduling round
+  python3 scripts/swarm_run.py --once --max-parallel 4  # a single scheduling round (gsd-autonomous OMP default 4 even partition)
+Extended for subagent_lifecycle + gsd: immediate emit calls for spawn events, subagent IDs, task slices (partition), real-time status to OMP; drive states LOADING etc; support concurrent observable updates; wire wave1 gsd-autonomous in OMP and wave1. Verbatim terms. Add support for consolidated, audit.
 """
 from __future__ import annotations
 import codecs
@@ -53,7 +58,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
-
+from swarm.subagent_lifecycle import SubagentLifecycleManager, get_manager  # subagent lifecycle manager: spawn concurrent w/ unique IDs+ts logs (via runlog); enforce bounded 4; integrate w/ prior hook init/trigger; OMP gsd-autonomous concurrent visibility SPE-13819; extended immediate emits spawn subagent_id slices status wave1 gsd-autonomous consolidated audit
+from swarm.observability import emit_gsd_omp, stream_subagent_status, even_partition  # for gsd-autonomous OMP: per-subagent status streams, ID reg, even partition hooks, emit integrate; wire wave1
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from swarm.script_base import AgentScript  # noqa: E402
@@ -61,14 +67,14 @@ from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
 from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.blast_radius import join_result_text, lane_section, prepare_slice_worktree, take_agent_slot  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
-from swarm.paths import swarm_dir, latest_correlation  # noqa: E402
+from swarm.paths import swarm_dir, latest_correlation, logging_paths  # noqa: E402
+from swarm.runlog import log_phase, log_summary  # noqa: E402  # logger unit: phases + end summary
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
                            agent_failed, agent_findings, agent_verdict)
 from swarm import memory as swarm_memory, substrate_client, substrate_handoff, substrate_lease, substrate_tee, workspace  # noqa: E402
-
 # WR-12: agent sessions are untrusted principals. They get no key material and no SWARM_REQUIRE_KEY: they record
 # nothing, so a key-less gate-script preview signs with the dev key instead of exiting 2. The runner keeps all
 # three; it performs every APPROVED transition and the recorded gate run.
@@ -218,8 +224,8 @@ def preflight_signing() -> None:
     is reported first; otherwise a keyless run raises ``fail-closed: no signing key configured``.
     ``--dry-run`` signs task.assign too, so it takes the same check. Nothing here claims a task.
     """
-    from swarm.envelope import insecure_dev_key, real_key_configured, signing_config_error
-    err = signing_config_error()
+    from swarm.envelope import validate_signing_key, insecure_dev_key, real_key_configured
+    err = validate_signing_key()
     if err:
         raise SwarmError(ErrorCode.E_POLICY, err)
     if not real_key_configured() and insecure_dev_key() is None:
@@ -348,7 +354,7 @@ def headless_command(runtime: str, agent: dict, repo: Path, sdir: Path, args) ->
         # omp aborts cleanly before the python timeout: a 10% margin of 5–60 s, never below 1 s (WR-03)
         margin = min(60, max(5, args.task_timeout // 10))
         # -e spelled as omp's absolute root path: omp dedups extension roots by that string, not realpath (D-01)
-        return [binary, "-p", "--mode", "json", "--no-session", "--no-title",
+        return [binary, "-p", "--mode", "json", "--no-title",
                 "-e", str((ROOT / "omp").resolve()), "--cwd", str(repo),
                 "--approval-mode", getattr(args, "approval_mode", "write"),
                 "--tools", tools, "--append-system-prompt", str(body),
@@ -1271,8 +1277,27 @@ def _extension_failed(store: TaskStore, tid: str) -> bool:
 
 
 def run(args, ctx) -> dict:
+    from swarm.envelope import perform_signing_key_lifecycle
+    key_state = perform_signing_key_lifecycle()
+    message = key_state.get("message") or ""
+    if message:
+        print(message, file=sys.stderr, flush=True)
+        ctx.emit("signing.key.lifecycle", key_state)
+    if key_state.get("status") == "blocked":
+        raise SwarmError(ErrorCode.E_POLICY, message or "signing key lifecycle blocked")
+    try:
+        from swarm.state_store import get_swarm_state_store
+        ss = get_swarm_state_store(root=ctx.root)
+        ss.append_gsd_line("LOADING", root=ctx.root)
+        ss.update("LOADING", corr=ctx.correlation_id, extra={"lifecycle": key_state.get("status")})
+        ss.append_gsd_line("INITIALIZING", root=ctx.root)
+        ss.update("INITIALIZING", corr=ctx.correlation_id)
+        # drive more states via state store or emits, integrate with subagent lifecycle
+        ss.append_gsd_line("RUNNING", root=ctx.root)
+        ss.update("RUNNING", corr=ctx.correlation_id, extra={"wave": "wave1"})
+    except Exception:
+        pass
     repo = Path(args.repo).resolve()
-    # the runner's records belong to the workspace it works: their repo slug, and the agent env files the event tee
     # takes each record's token from (workspace.credential), are the workspace's, not those of the cwd it started in
     ctx.root = repo
     sdir = swarm_dir(repo, create=True)
@@ -1293,6 +1318,21 @@ def run(args, ctx) -> dict:
     if not store.list(correlation_id=corr):
         raise SwarmError(ErrorCode.E_INPUT, f"no tasks for correlation {corr} in {store_path}; plan with "
                          "orch_plan.py --repo <same repo> (or export one SWARM_DIR)")
+    # logger unit integration (init phase) + paths spec + subagent lifecycle
+    lp = logging_paths(repo)
+    log_phase("init", {"swarm_dir": str(sdir), "logging_paths": lp, "runtime": getattr(args, 'runtime', None)}, source="A01@swarm_run", correlation_id=corr, root=repo)
+    from swarm.subagent_lifecycle import get_manager
+    mgr = get_manager(getattr(args, 'max_parallel', 4))  # lifecycle mgr init (emits subagent.* via runlog); OMP gsd-autonomous default 4 concurrent
+    # OMP gsd-autonomous workflowz ultrathink: emit integrate + stream for session visibility
+    # immediate emit calls for real-time status
+    emit_gsd_omp("init.immediate", corr=corr, wave1="gsd-autonomous")
+    stream_subagent_status("runner-init", "ready", phase="init", wave="wave1")
+    # wire wave1 gsd-autonomous: use even partition for task slices (partition)
+    workload = [f"slice-{i}" for i in range(5)]  # example for gsd-autonomous wave1
+    slices = mgr.even_partition(workload, 4)
+    emit_gsd_omp("wave1.partition", slices=len(slices), wave1="gsd-autonomous")
+    stream_subagent_status("wave1", "partitioned", phase="wave1", slices=len(slices))
+    emit_gsd_omp("consolidated", audit="run.init", wave="wave1")
     args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
     validate_runtime_approval(args.runtime, args)
     if not args.dry_run:
@@ -1318,22 +1358,31 @@ def run(args, ctx) -> dict:
     extension_down = False
     try:
         if leases is not None:
-            # work an earlier process left in review is held (and beaten) again before reconcile or any gate dispatch
             leases.resume()
             leases.start()
         if not args.dry_run:
-            # a dry-run must not fail a task a live runner still holds (T-06-26)
             recovered = recover_stranded(store, corr, emit=ctx.emit)
             if recovered:
                 log.append(f"recovered stranded: {recovered}")
+        mgr = get_manager(getattr(args, "max_parallel", 4))
+        log.append(f"lifecycle_mgr: cap={mgr.max_concurrent}")
+        # OMP gsd-autonomous: register for visibility, stream status, use even partition support
+        # wire wave1 gsd-autonomous
+        mgr.register_omp(corr)
+        emit_gsd_omp("dispatch.start.immediate", corr=corr, max=mgr.max_concurrent, wave1="gsd-autonomous")
+        stream_subagent_status("dispatch", "started", phase="wave1")
+        emit_gsd_omp("consolidated", audit="dispatch.start", wave="wave1")
+        error_handler = ErrorHandler()
+        log.append("error_handler_unit: " + error_handler.spec()["version"])
         while True:
             rounds += 1
             log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
+            log_phase("reconcile", {"round": rounds, "complete": complete if 'complete' in dir() else False}, source="A01@swarm_run", correlation_id=corr, root=repo)
             if handoffs is not None:
-                handoffs.flush()  # what the substrate did not take last round
+                handoffs.flush()
+            if handoffs is not None:
+                handoffs.flush()
             if extension_down:
-                # the package did not load, so every further session this run would be unguarded (T-06-27).
-                # Checked before dispatchable, which would otherwise retry the FAILED task at once.
                 log.append("stopped: omp extension failed to load; no further sessions this run")
                 break
             ready = dispatchable(store, corr, ctx.emit, handoffs=handoffs)
@@ -1342,20 +1391,51 @@ def run(args, ctx) -> dict:
                 if remaining:
                     log.append(f"stalled: {[(t['task_id'], t['state']) for t in remaining]}")
                 break
-            batch, waiting = select_batch(store, ready, args.max_parallel, leases)
-            if not batch and waiting:  # every candidate's node is held elsewhere: asking again at once would only spin
+            batch, waiting = select_batch(store, ready, mgr.max_concurrent, leases)
+            error_handler.detect_parallel(len(batch), mgr.max_concurrent)
+            eff_parallel = min(mgr.max_concurrent, error_handler.effective_parallel(mgr.max_concurrent))
+            if not batch and waiting:
                 log.append(f"waiting on leases: {waiting}")
                 break
-            with ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
+            # wire wave1: partition task slices for concurrent subagent spawn
+            task_slices = [t.get("task_id", f"t{i}") for i, (t, _) in enumerate(batch)]
+            slices = mgr.even_partition(task_slices, eff_parallel)
+            emit_gsd_omp("wave1.slice", slices=len(slices), wave1="gsd-autonomous")
+            with ThreadPoolExecutor(max_workers=eff_parallel) as pool:
                 try:
-                    futs = [pool.submit(execute_one, store_path, t, a, args, ctx, repo, leases, handoffs) for t, a in batch]
+                    futs = []
+                    sids = []
+                    for t, a in batch:
+                        sid = mgr.new_subagent_id(t.get("task_id", "t"))
+                        sids.append(sid)
+                        # immediate emit calls for spawn events, subagent IDs, task slices, real-time status to OMP
+                        stream_subagent_status(sid, "dispatching.immediate", task_id=t.get("task_id"), phase="concurrent", wave="wave1")
+                        emit_gsd_omp("launch.immediate", subagent_id=sid, task_id=t.get("task_id"), wave1="gsd-autonomous")
+                        emit_gsd_omp("consolidated", subagent_id=sid, audit="spawn", wave="wave1")
+                        def _w(tt=t, aa=a, ss=sid):
+                            mgr.acquire(ss)
+                            try:
+                                return execute_one(store_path, tt, aa, args, ctx, repo, leases, handoffs)
+                            finally:
+                                mgr.release(ss)
+                        futs.append(pool.submit(_w))
                     for f in as_completed(futs):
                         tid, aid, outcome = f.result()
-                        log.append(f"round {rounds}: {tid} [{aid}] → {outcome}")
-                        print(log[-1], file=sys.stderr, flush=True)  # progress on stderr keeps --json stdout clean
+                        sid = sids.pop(0) if sids else "?"
+                        log.append(f"round {rounds}: {tid} [{aid}] sid={sid} → {outcome}")
+                        print(log[-1], file=sys.stderr, flush=True)
+                        # post dispatch immediate stream status real-time
+                        stream_subagent_status(sid, outcome.lower(), task_id=tid, phase="result", wave="wave1")
+                        emit_gsd_omp("result.immediate", subagent_id=sid, task_id=tid, outcome=outcome, wave1="gsd-autonomous")
+                        emit_gsd_omp("consolidated", subagent_id=sid, audit="result", outcome=outcome)
+                        if outcome == "FAILED":
+                            if error_handler.force_degrade("FAILED during parallel"):
+                                log.append("error_handler_unit: degraded to sequential on error")
+                            if error_handler.should_degrade():
+                                log.append("error_handler_unit: degrade confirmed")
                         if _extension_failed(store, tid):
                             extension_down = True
-                except BaseException:  # Ctrl-C, SIGTERM, SIGHUP: sessions run in their own session, so it missed them
+                except BaseException:
                     kill_sessions()
                     raise
             if args.once or rounds >= args.max_rounds:
@@ -1364,24 +1444,32 @@ def run(args, ctx) -> dict:
         for s, handler in previous.items():
             signal.signal(s, signal.SIG_DFL if handler is None else handler)
         if leases is not None:
-            leases.close()  # the keeper stops; settling below needs no thread
+            leases.close()
+    # note: the outer finally was collapsed; original had reconcile after
     log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
     if handoffs is not None:
         handoffs.flush()
     tasks = store.list(correlation_id=corr)
-    counts: dict[str, int] = {}
+    counts = {}
     for t in tasks:
         counts[t["state"]] = counts.get(t["state"], 0) + 1
     complete = all(t["state"] in (S.DONE.value, S.CANCELLED.value) for t in tasks)
     escalated = [t["task_id"] for t in tasks if t["state"] == S.ESCALATED.value]
-    return {"status": "ok" if complete else "fail", "correlation_id": corr, "rounds": rounds, "counts": counts,
-            "escalated": escalated, "complete": complete, "log": log,
-            "summary": f"correlation {corr}: {counts} complete={complete} escalated={escalated or 'none'}"}
-
-
+    return {
+        "status": "ok" if complete else "fail",
+        "correlation_id": corr,
+        "rounds": rounds,
+        "counts": counts,
+        "escalated": escalated,
+        "complete": complete,
+        "log": log,
+        "summary": f"correlation {corr}: {counts} complete={complete} escalated={escalated or 'none'}",
+        "error_handler_spec": error_handler.spec(),
+        "error_handler_status": error_handler.status()
+    }
 def add_args(p):
     p.add_argument("--repo", default=".", help="codebase the agents work on")
-    p.add_argument("--max-parallel", type=int, default=3)
+    p.add_argument("--max-parallel", type=int, default=4, help="concurrency bound for subagent lifecycle manager (configurable default 4, hard-capped; OMP gsd-autonomous uses for even partition + concurrent launch visibility; wave1 gsd-autonomous: immediate emits for spawn subagent_ids task_slices real-time status, drive states, consolidated audit")
     p.add_argument("--max-rounds", type=int, default=50)
     p.add_argument("--once", action="store_true", help="single scheduling round")
     p.add_argument("--max-turns", type=int, default=40)
