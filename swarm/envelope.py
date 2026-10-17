@@ -11,6 +11,7 @@ Without a real key and without the opt-in, signing refuses and APPROVED fails cl
 Raw signing variables take precedence over SWARM_ED25519_KEY_FILE and the conventional
 XDG_CONFIG_HOME-or-HOME/.config/agent-swarm/signing-key.hex source. Private references
 are never read inside agent/child sessions. Configuration failures are redacted.
+Private references must be absolute; a relative one fails closed instead of resolving against the caller's cwd.
 """
 from __future__ import annotations
 import base64
@@ -155,6 +156,15 @@ def _private_seed(path: Path, *, fallback: bool) -> bytes | None:
         os.close(directory)
 
 
+def _conventional_reference() -> Path | None:
+    """`${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex`, or None without a base directory."""
+    config = os.environ.get("XDG_CONFIG_HOME")
+    home = os.environ.get("HOME")
+    if not config and not home:
+        return None
+    return (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
+
+
 def _ed25519_material() -> tuple[object | None, str | None]:
     raw = os.environ.get("SWARM_ED25519_KEY")
     if raw:
@@ -177,11 +187,12 @@ def _ed25519_material() -> tuple[object | None, str | None]:
                 raise ValueError("empty reference")
             path = Path(reference)
         else:
-            config = os.environ.get("XDG_CONFIG_HOME")
-            home = os.environ.get("HOME")
-            if not config and not home:
+            path = _conventional_reference()
+            if path is None:
                 return None, None
-            path = (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
+        if not path.is_absolute():
+            # A relative reference would name a different file for each caller's working directory.
+            return None, "fail-closed: private Ed25519 signing reference must be an absolute path"
         seed = _private_seed(path, fallback=reference is None)
         if seed is None:
             return None, None
@@ -263,15 +274,18 @@ def signing_config_error() -> str | None:
         return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
     return None
 def _signing_key_supplied() -> bool:
-    """Constant-time check (no short-circuit timing variance) whether signing key supplied via env.
-    Per q1: perform validation+loads ONLY if supplied (optional). REQUIRE=1 forces.
+    """Whether a signing key is supplied via env, or a conventional reference file exists.
+    Presence only (no open or read): a present but invalid conventional file must surface its
+    configuration error, while a missing one stays keyless. Per q1: REQUIRE=1 forces the path.
     """
     a = bool(os.environ.get("SWARM_SIGNING_KEY"))
     b = bool(os.environ.get("SWARM_ED25519_KEY"))
     c = bool(os.environ.get("SWARM_ED25519_KEY_FILE"))
     d = (os.environ.get("SWARM_REQUIRE_KEY") == "1")
-    return (a + b + c + d) > 0
-def perform_signing_key_lifecycle() -> dict:
+    conventional = _conventional_reference()
+    e = conventional is not None and os.path.lexists(conventional)
+    return (a + b + c + d + e) > 0
+def perform_signing_key_lifecycle(*, root=None) -> dict:
     """Signing key lifecycle as FIRST step in swarm coordinator init.
 
     Uses existing _ed25519_material/_signing_key_supplied/validate_signing_key/
@@ -282,7 +296,7 @@ def perform_signing_key_lifecycle() -> dict:
     Raise on mand fail.
     Return {'status': 'full'|'reduced'|'blocked', 'message': str}
     """
-    get_swarm_state_store().update("LOADING")
+    get_swarm_state_store(root=root).update("LOADING")
 
     supplied = _signing_key_supplied()
     require = os.environ.get("SWARM_REQUIRE_KEY") == "1"

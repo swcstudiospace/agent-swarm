@@ -302,6 +302,16 @@ def test_missing_conventional_reference_remains_keyless(monkeypatch):
     assert not real_key_configured() and signing_config_error() is None
 
 
+def test_relative_private_reference_fails_closed_for_every_cwd(tmp_path, monkeypatch):
+    from swarm.envelope import real_key_configured, signing_config_error
+    _clear_keys(monkeypatch)
+    _private_file(tmp_path)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", "private/signing-key.hex")
+    monkeypatch.chdir(tmp_path)
+    assert not real_key_configured()
+    assert signing_config_error() == "fail-closed: private Ed25519 signing reference must be an absolute path"
+
+
 def test_configured_bad_reference_never_falls_back_to_conventional_seed(tmp_path, monkeypatch):
     from swarm.envelope import real_key_configured, signing_config_error
     _clear_keys(monkeypatch)
