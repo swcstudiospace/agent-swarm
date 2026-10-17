@@ -476,13 +476,30 @@ test("unsigned legacy planning remains available but cannot dispatch even withou
   }
 });
 
-test.each<[string, SessionEntry[]]>([
-  ["plan mode", PLAN_MODE],
-  ["child session", [{ type: "session_init", agent: "a08-qa" }]],
-])("%s: /swarm plans and dispatches with no refusal notice", async (_name, entries) => {
+test("plan mode: /swarm refuses before any write or bridge call", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
-  await swarm.handler(BRIEF, commandCtx(repo, entries, { log }));
+  const stderr: string[] = [];
+  const errSpy = spyOn(process.stderr, "write").mockImplementation((chunk) => (stderr.push(String(chunk)), true));
+  try {
+    await swarm.handler(BRIEF, commandCtx(repo, PLAN_MODE, { log }));
+  } finally {
+    errSpy.mockRestore();
+  }
+  expect(calls(log)).not.toContain("bridge");
+  expect(calls(log)).not.toContain("sendUserMessage");
+  expect(calls(log)).not.toContain("waitForIdle");
+  expect(stderr.join("")).not.toContain("[/swarm]");
+  const notify = log.filter((e) => e.call === "notify");
+  expect(notify).toHaveLength(1);
+  expect(String(notify[0]?.message)).toBe("/swarm refused: omp is in plan mode (read-only), so nothing was planned; leave plan mode first");
+  expect(notify[0]?.level).toBe("warning");
+});
+
+test("child session: /swarm plans and dispatches with no refusal notice", async () => {
+  const repo = gitRepo();
+  const { log, swarm } = session();
+  await swarm.handler(BRIEF, commandCtx(repo, [{ type: "session_init", agent: "a08-qa" }], { log }));
   expect(calls(log)).toContain("bridge");
   expect(dispatchEvidence(payload(dispatchText(log) ?? ""), CORR)).toEqual({ verified: true, authorized: true });
   expect(calls(log)).toContain("waitForIdle");
