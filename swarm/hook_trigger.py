@@ -140,7 +140,7 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
             "--no-session", "--no-title", "--no-extensions",
             "-e", str(omp_ext),
             "--cwd", str(target_repo),
-            "--approval-mode", "yolo",
+            "--approval-mode", "write",
             f"/gsd-autonomous workflowz ultrathink orchestrate after a01 {corr or ''} sid={sid}",
         ]
         proc = subprocess.Popen(

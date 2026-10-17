@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SwarmDockComponent, SwarmDockTheme } from "../src/swarm_dock.ts";
-import { createDockState, publishTaskSpawn, settleTaskResult, swarmDockWidget } from "../src/swarm_dock.ts";
+import { createDockState, noteToolActivity, publishTaskSpawn, settleTaskResult, swarmDockWidget } from "../src/swarm_dock.ts";
 import { fakeCtx, fakePi } from "./helpers.ts";
 
 function cardUi() {
@@ -22,9 +22,9 @@ function cardUi() {
   };
 }
 
-/** Painted card lines that belong to a subagent row (the agent name appears only on rows). */
-function rowLines(painted: string): number {
-  return painted.split("\n").filter((line) => line.includes("a05-backend")).length;
+/** Agent mentions on the status bar. One line can carry several agents. */
+function agentMentions(painted: string): number {
+  return painted.split("a05-backend").length - 1;
 }
 
 const SPAWN = { tasks: [{ name: "be", agent: "a05-backend" }] };
@@ -83,13 +83,14 @@ describe("swarm dock card identity", () => {
     // Two overlapping calls reuse the same task name; settling one must not touch the other's card.
     publishTaskSpawn(dock, card.ui, SPAWN, "call-a");
     publishTaskSpawn(dock, card.ui, SPAWN, "call-b");
-    expect(rowLines(card.paint())).toBe(2);
+    expect(agentMentions(card.paint())).toBe(2);
     settleTaskResult(dock, card.ui, { toolName: "task", toolCallId: "call-a", isError: true });
     const painted = card.paint();
-    expect(rowLines(painted)).toBe(2);
+    expect(agentMentions(painted)).toBe(2);
     expect(painted).toContain("failed");
     expect(painted).toContain("running");
     expect(painted).toContain("1 running");
+    expect(painted).not.toContain("╭");
   });
 
   test("two sessions keep separate card sets", () => {
@@ -104,5 +105,31 @@ describe("swarm dock card identity", () => {
     expect(secondCard.paint()).toContain("completed");
     expect(firstCard.paint()).toContain("running");
     expect(firstCard.paint()).not.toContain("completed");
+  });
+});
+
+describe("swarm status bar", () => {
+  test("an in-flight tool is painted before it completes", () => {
+    const pi = fakePi({ activeTools: ["bash"] });
+    pi.load(createSwarmExtension({ bridge: async () => { throw new Error("bridge must not run"); } }));
+    const card = cardUi();
+    const ctx = { ...fakeCtx("/tmp/swarm-dock"), ui: card.ui };
+    pi.handler("tool_call")({ toolName: "bash", toolCallId: "call-bash", input: { command: "pytest" } }, ctx);
+    const live = card.paint();
+    expect(live).toContain("bash");
+    expect(live).toContain("agent swarm");
+    expect(live.split("\n")).toHaveLength(1);
+    pi.handler("tool_result")({ toolName: "bash", toolCallId: "call-bash", isError: false }, ctx);
+    expect(card.paint()).not.toContain("bash");
+  });
+
+  test("a host that keeps the first component is asked to repaint while work is live", () => {
+    const dock = createDockState();
+    let renders = 0;
+    const tui = { requestRender: () => { renders += 1; } };
+    swarmDockWidget(dock)(tui, undefined);
+    noteToolActivity(dock, undefined, "bash");
+    expect(renders).toBeGreaterThan(0);
+    dock.ticker?.stop();
   });
 });

@@ -12,7 +12,7 @@ import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
 import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR, parseSignerDenyPaths } from "./guard.ts";
 import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionFactory } from "./omp-api.ts";
-import { createDockState, dockUi, publishTaskSpawn, settleTaskResult, type TaskResultEvent } from "./swarm_dock.ts";
+import { clearToolActivity, createDockState, dockUi, noteToolActivity, publishTaskSpawn, settleTaskResult, stopDock, type TaskResultEvent } from "./swarm_dock.ts";
 import { buildTools } from "./tools.ts";
 
 function taskResult(event: unknown): TaskResultEvent | undefined {
@@ -26,14 +26,17 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
   return (pi) => {
     // WR-01: this session's children only — a sibling session's shutdown never reaches them
     const inflight: Inflight = new Set();
-    // the status card is per session, like inflight: a sibling session never paints this session's rows
+    // the status bar is per session, like inflight: a sibling session never paints this session's rows
     const dock = createDockState();
     const scoped: Bridge = (req) => bridge({ ...req, inflight });
     for (const tool of buildTools(scoped)) pi.registerTool(tool);
     // ORCH-03 (D-11): the same scoped bridge, so session_shutdown also sweeps the command's python child
     pi.registerCommand("swarm", swarmCommand(pi, scoped, { dock }));
     // D-07: group-kill this session's in-flight python children when it ends (registration only, no I/O)
-    pi.on("session_shutdown", () => killInflight(inflight));
+    pi.on("session_shutdown", () => {
+      killInflight(inflight);
+      stopDock(dock);
+    });
     // HOOK-01 (D-09): SDLC prompts in a top-level session get the AgentSwarm context; fail-open on any error.
     // OPEN-3 R1: swarm-slug sessions get the runtime part instead (the two never apply to the same session).
     pi.on("before_agent_start", (event, ctx) => {
@@ -59,9 +62,10 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         const signerReadPaths = parseSignerDenyPaths(env.SWARM_SIGNER_DENY_PATHS);
         const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots, signerReadPaths };
         const decision = guardToolCall(event, facts);
-        if (!decision?.block && event.toolName === "task") {
+        if (!decision?.block) {
           try {
-            publishTaskSpawn(dock, dockUi(ctx), event.input, event.toolCallId);
+            if (event.toolName === "task") publishTaskSpawn(dock, dockUi(ctx), event.input, event.toolCallId);
+            else noteToolActivity(dock, dockUi(ctx), event.toolName);
           } catch {
             // dock is display-only; a render failure must not change the tool decision
           }
@@ -72,12 +76,14 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };
       }
     });
-    // The dock paints a task spawn as running. tool_result is the only parent-side signal
-    // that the spawn finished; without it the card stays on that first status forever.
+    // The bar paints a task spawn as running and any other tool as the current activity.
+    // tool_result is the parent-side signal that the call finished; without a repaint the
+    // host would keep the last settled "completed" until the next event.
     pi.on("tool_result", (event, ctx) => {
       try {
         const result = taskResult(event);
         if (result) settleTaskResult(dock, dockUi(ctx), result);
+        clearToolActivity(dock, dockUi(ctx));
       } catch {
         // dock is display-only; a render failure must not change the tool result
       }
