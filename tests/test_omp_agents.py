@@ -14,6 +14,9 @@ from swarm.manifest import load_manifest
 ROOT = Path(__file__).resolve().parent.parent
 OMP_AGENTS = ROOT / "omp" / "agents"
 OMP_SKILLS = ROOT / "omp" / "skills"
+# Generated omp agent files are intentionally long XML prompts (the user explicitly accepted long
+# prompts). The largest, a01-orchestrator.md, is ~56 KiB today; 64 KiB leaves headroom for growth.
+OMP_AGENT_MAX_BYTES = 64 * 1024
 
 
 def _load(name):
@@ -68,6 +71,7 @@ SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
 SWARM_NAMES = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment", "swarm_gate"}
 OMP_TOOLS = {"read", "grep", "glob", "bash", "write", "edit", "task"} | SWARM_NAMES
 GATE_AGENTS = {"A08", "A09", "A10", "A12"}
+KEY_ORDER = ["name", "description", "tools", "spawns", "blocking", "autoloadSkills", "output"]
 
 
 def _agents():
@@ -82,12 +86,25 @@ def _keys(text):
     return [line.split(": ", 1)[0] for line in _fm_lines(text)]
 
 
+# Contract written from the spec, not from build_agents: manifest tool names map to the fixed omp
+# tool names, and only A01 (orchestrator) and the gate agents receive hidden swarm_* grants.
+OMP_TOOL_SPEC = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
+SWARM_GRANT_SPEC = {
+    "A01": {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"},
+    "A08": {"swarm_gate"},
+    "A09": {"swarm_gate"},
+    "A10": {"swarm_gate"},
+    "A12": {"swarm_gate"},
+}
+
+
 def test_omp_tools_follow_manifest_and_authority_ceiling():
     for a in _agents():
         tools = _fm(_omp(a))["tools"].split(", ")
         assert len(tools) == len(set(tools)), a["id"]
         assert set(tools) <= OMP_TOOLS, a["id"]
-        assert {builder.TOOL_MAP[t] for t in a["tools"]} <= set(tools), a["id"]
+        expected = {OMP_TOOL_SPEC[t] for t in a["tools"]} | SWARM_GRANT_SPEC.get(a["id"], set())
+        assert set(tools) == expected, a["id"]
         assert not {"eval", "run_code"} & set(tools), a["id"]
 
 
@@ -98,7 +115,7 @@ def test_swarm_tool_grants():
         if a["id"] == "A01":
             assert "swarm_assignment" in swarm
             assert {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"} <= swarm
-            assert swarm <= builder.ORCH_SWARM_TOOLS
+            assert swarm == SWARM_GRANT_SPEC["A01"]
             assert "swarm_gate" not in swarm
         elif a["id"] in GATE_AGENTS:
             assert swarm == {"swarm_gate"}, a["id"]
@@ -214,6 +231,13 @@ def test_omp_frontmatter_contract_fields():
         assert required <= set(keys) <= required | {"blocking"}, a["id"]
 
 
+def test_omp_frontmatter_key_order():
+    for a in _agents():
+        keys = _keys(_omp(a))
+        assert keys == [k for k in KEY_ORDER if k in keys] and len(keys) == len(set(keys))
+        assert set(KEY_ORDER) - {"blocking"} <= set(keys)
+
+
 def test_omp_no_bundled_name_collision():
     slugs = {a["slug"] for a in _agents()}
     assert not slugs & {"scout", "reviewer", "security-reviewer", "task", "sonic", "main", "sub"}
@@ -227,6 +251,7 @@ def test_a01_strict_dispatch():
         rule = next(line for line in text.splitlines() if 'schemaMode: "strict"' in line)
         for gate in GATES:
             assert gate in rule, gate
+    assert _omp(_a("A01")).count(rule) == 1
 
 
 def test_a01_lease_assignment_dispatch_protocol():
@@ -310,6 +335,10 @@ def test_omp_preamble_keeps_autonomy_ceiling():
         assert 'L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`' in _omp(a), a["id"]
 
 
+def test_omp_size_bound():
+    sizes = {p.stem: p.stat().st_size for p in OMP_AGENTS.glob("*.md")}
+    assert max(sizes.values()) <= OMP_AGENT_MAX_BYTES
+    assert max(sizes, key=sizes.get) == "a01-orchestrator"
 
 
 def test_omp_no_host_paths():
@@ -317,6 +346,35 @@ def test_omp_no_host_paths():
     for p in files:
         assert "/root/" not in p.read_text(encoding="utf-8"), p
 
+
+def _yaml_lists(text):
+    """Minimal reader for a YAML mapping of block lists (`key:` then `  - item` lines); stdlib only."""
+    out, key = {}, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            assert line.endswith(":"), line
+            key = line[:-1]
+            out[key] = []
+        else:
+            item = line.strip()
+            assert key is not None and item.startswith("- "), line
+            out[key].append(item[2:].strip())
+    return out
+
+
+def test_omp_wiring():
+    """D-11 / PKG-04: the repo loads its own package through `.omp/config.yml` only, never a symlink or copies."""
+    config = ROOT / ".omp" / "config.yml"
+    assert _yaml_lists(config.read_text(encoding="utf-8")) == {"extensions": ["omp"]}
+    for name in ("agents", "skills", "extensions"):
+        assert not os.path.lexists(ROOT / ".omp" / name), name
+    ignored = subprocess.run(["git", "check-ignore", "-q", ".omp/config.yml"], cwd=ROOT)
+    assert ignored.returncode == 1  # 1 = not ignored (0 would mean .gitignore hides the wiring)
+    pkg = json.loads((ROOT / "omp" / "package.json").read_text(encoding="utf-8"))
+    assert pkg["omp"]["extensions"] == ["./src/index.ts"]
 
 
 

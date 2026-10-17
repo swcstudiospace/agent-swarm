@@ -26,7 +26,7 @@ The raw shell scanners retain literal spans by index, and plain unquoted words a
 ## Private signer bootstrap
 
 Use an existing operator-provisioned signer; never print it or paste it into an agent prompt.
-The trusted signer accepts `SWARM_ED25519_KEY_FILE`, or the conventional
+The trusted signer accepts `SWARM_ED25519_KEY_FILE` (an absolute path; relative paths are rejected), or the conventional
 `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when raw signing variables are unset.
 The file must be owned by the controller user, have no group/world permissions, and contain
 exactly a 64-hex Ed25519 seed with an optional final newline. Symlink components, nonregular
@@ -55,7 +55,7 @@ key, or path is accepted. Pass the verified prompt unchanged to the specialist.
 Missing, unleased, child/advisory, mismatched, and dry-run requests fail closed.
 Generic code-execution devices remain forbidden; this operation is not an eval exception.
 
-Use normal OMP `write` approvals or `--omp-approval-mode always-ask`; do not substitute a bypass.
+Use normal OMP `write` approvals or `--approval-mode always-ask`; do not substitute a bypass.
 Grok's unsupported headless transport is rejected before claims. The lexical shell guard protects
 deterministically resolved signer reads, but is not an OS sandbox for opaque code or symlink aliases.
 Run only trusted controller code and preserve normal approvals. Restart the OMP process to load

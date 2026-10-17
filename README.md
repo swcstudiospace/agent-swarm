@@ -81,7 +81,7 @@ python3 -m pytest -q                                                # runtime + 
 
 `scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
 
-Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE`,
+Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE` (which must be an absolute path),
 or from `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when neither raw signing
 variable is set. References must resolve to an owner-only regular file without symlink components;
 the conventional directory must also be private. Key contents never belong in prompts, argv,
@@ -90,7 +90,7 @@ logs, or tracked files. See [private signer bootstrap](docs/operations-runbook.m
 Live/reused `orch_plan` responses include a cryptographically verified `execution_assignment`
 when a real signer is available. `/swarm` refuses missing, unsigned, or mismatched kickoff
 assignments instead of dispatching an unauthenticated A01 turn. Specialist sessions cannot
-auto-load private references. OMP uses normal `write` approvals (or `--omp-approval-mode always-ask`);
+auto-load private references. OMP uses normal `write` approvals (or `--approval-mode always-ask`);
 Grok headless dispatch currently fails closed because its installed interface does not support
 the old stdin transport. Start a fresh OMP process after updating the extension.
 
