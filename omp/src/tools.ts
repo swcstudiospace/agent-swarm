@@ -152,6 +152,8 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const ASSIGNMENT_HEADING = "# task.assign (signed envelope)\n```json\n";
+
 /** Python verifies the signature; this consumer refuses mismatched dispatch metadata or an unrelated prompt. */
 function validAssignment(res: BridgeResult, params: AssignmentParams): boolean {
   const result = res.json;
@@ -168,15 +170,18 @@ function validAssignment(res: BridgeResult, params: AssignmentParams): boolean {
       typeof envelope.target !== "string" || result.agent_slug.split("-")[0].toUpperCase() !== envelope.target ||
       !isObject(payload) || payload.task_id !== params.task_id || payload.correlation_id !== params.correlation_id ||
       payload.agent_id !== envelope.target) return false;
-  const embedded = /(?:^|\n)# task\.assign \(signed envelope\)\n```json\n([\s\S]*?)\n```/.exec(result.prompt);
-  if (!embedded) return false;
-  try {
-    return JSON.stringify(JSON.parse(embedded[1])) === JSON.stringify(envelope);
-  } catch {
-    return false;
-  }
+  // Memory precedes the real envelope and may quote the same heading and fence. Like orch_assign.py, count only
+  // blocks that carry the verified envelope and require exactly one; forged or unrelated blocks never match.
+  const expected = JSON.stringify(envelope);
+  const matches = result.prompt.split(ASSIGNMENT_HEADING).slice(1).filter((block) => {
+    try {
+      return JSON.stringify(JSON.parse(block.split("\n```", 1)[0])) === expected;
+    } catch {
+      return false;
+    }
+  });
+  return matches.length === 1;
 }
-
 
 export function buildTools(bridge: Bridge): SwarmTool[] {
   const status = define<StatusParams>({
