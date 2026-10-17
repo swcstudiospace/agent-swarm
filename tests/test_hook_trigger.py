@@ -231,6 +231,8 @@ def test_follow_on_env_has_no_signing_material(state, monkeypatch):
         assert name not in env
     assert env["SWARM_KEEP_ME"] == "kept"
     assert env["SWARM_CHILD"] == "0"
+    assert env["SWARM_AGENT"] == "a01-orchestrator"
+    assert "SWARM_SIGNING_KEY" not in env
 
 
 def test_failed_spawn_releases_its_slot(state, monkeypatch):

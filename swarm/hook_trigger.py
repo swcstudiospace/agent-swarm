@@ -36,8 +36,12 @@ SIGNING_ENV_STRIPPED = (
 
 
 def _follow_on_env() -> dict[str, str]:
-    """Controller environment minus signing material, for follow-on sessions."""
+    """Controller environment minus signing material, for follow-on sessions.
+
+    The session runs with the controller identity (SWARM_AGENT=a01-orchestrator), so the swarm guard applies to it.
+    """
     env = {k: v for k, v in os.environ.items() if k not in SIGNING_ENV_STRIPPED}
+    env["SWARM_AGENT"] = "a01-orchestrator"
     env["SWARM_CHILD"] = "0"
     env["AIO_SWARM_AFTER_ORCH"] = "1"
     return env
