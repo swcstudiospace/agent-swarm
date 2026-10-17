@@ -4,6 +4,10 @@ from enum import Enum
 import random
 import threading
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .taskstore import TaskStore
 
 
 class ErrorCode(str, Enum):
@@ -178,9 +182,12 @@ class ErrorHandler:
             # isolate error handling
             try:
                 store.transition(tid, S.FAILED, reason="E-INTERNAL: handler isolate")
-            except:
+            except Exception:
                 pass
             return "FAILED"
+
+    def spec(self) -> dict:
+        """Static contract for this handler unit: ladder, degrade paths, version."""
         return {
             "retries": self.max_attempts,
             "retry_ladder": "dispatchable: FAILED (attempt < max_attempts) -> RETRY -> re-dispatch; max reached -> ESCALATED",

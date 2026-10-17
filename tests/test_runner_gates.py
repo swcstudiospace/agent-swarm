@@ -23,7 +23,7 @@ _ENV_NOISE = (*KEY_VARS, "SWARM_AGENT_SESSION", "SWARM_CHILD", "SWARM_TASK_ID", 
 
 
 def _clean_env(**extra) -> dict:
-    return {**{k: v for k, v in os.environ.items() if k not in _ENV_NOISE}, **extra}
+    return {**{k: v for k, v in os.environ.items() if k not in _ENV_NOISE and not k.startswith("SUBSTRATE_")}, **extra}
 
 
 def _load_swarm_run(tmp_path, monkeypatch):

@@ -16,15 +16,8 @@ transport. No runtime is launched with permission bypasses; OMP keeps extension 
 
 Agent sessions run without signing keys (SWARM_AGENT_SESSION=1, SWARM_CHILD=1, SWARM_AGENT=<slug>); OMP receives
 only bounded deny-path guard metadata, never loading references. A gate script they run records nothing.
-For each gate task the runner itself runs the gate script on the gate task's own
-id after the session, while the task is still leased; the script records signed verdicts on the gate task's Task
- from .runlog import emit as runlog_emit
- from .observability import emit_hook_fired
-from .subagent_lifecycle import get_manager  # integrate lifecycle mgr for trigger spawn logging (unique ID+ts)
- 
- # Non-empty values mean this process is a cloud agent and must not detach a runner.
- CLOUD_AGENT_MARKERS = ("CURSOR_AGENT", "CURSOR_CLOUD_AGENT", "CLOUD_AGENT")
-applied between rounds by the Task Store.
+For each gate task the runner itself runs the gate script on the gate task's own id after the session, while the task is
+still leased; the script records signed verdicts, which are applied between rounds by the Task Store.
 With SUBSTRATE_URL set (never on --dry-run) each task is worked under a substrate lease the runner holds for its agent:
 claimed before dispatch (a denied claim waits), beaten every TTL/3 while the session runs and through review, completed at
 DONE, released and re-claimed on CHANGES_REQUESTED, released otherwise; work left in review by an earlier run is claimed
@@ -58,18 +51,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
-from swarm.subagent_lifecycle import SubagentLifecycleManager, get_manager  # subagent lifecycle manager: spawn concurrent w/ unique IDs+ts logs (via runlog); enforce bounded 4; integrate w/ prior hook init/trigger; OMP gsd-autonomous concurrent visibility SPE-13819; extended immediate emits spawn subagent_id slices status wave1 gsd-autonomous consolidated audit
-from swarm.observability import emit_gsd_omp, stream_subagent_status, even_partition  # for gsd-autonomous OMP: per-subagent status streams, ID reg, even partition hooks, emit integrate; wire wave1
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from swarm.observability import emit_gsd_omp, stream_subagent_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.taskstore import TaskStore, TaskState as S  # noqa: E402
 from swarm.manifest import get_agent, by_capability  # noqa: E402
 from swarm.blast_radius import join_result_text, lane_section, prepare_slice_worktree, take_agent_slot  # noqa: E402
 from swarm.envelope import build_envelope, sign_envelope  # noqa: E402
 from swarm.paths import swarm_dir, latest_correlation, logging_paths  # noqa: E402
-from swarm.runlog import log_phase, log_summary  # noqa: E402  # logger unit: phases + end summary
-from swarm.errors import SwarmError, ErrorCode  # noqa: E402
+from swarm.runlog import log_phase  # noqa: E402  # logger unit: phases
+from swarm.errors import SwarmError, ErrorCode, ErrorHandler  # noqa: E402
 from swarm.gates import SEVERITIES  # noqa: E402
 from swarm.verdicts import GATE_SCRIPTS, simulated_failures  # noqa: E402
 from swarm.results import (parse_result, validate_result, apply_result, reconcile, reject,  # noqa: E402
@@ -1278,7 +1270,10 @@ def _extension_failed(store: TaskStore, tid: str) -> bool:
 
 def run(args, ctx) -> dict:
     from swarm.envelope import perform_signing_key_lifecycle
-    key_state = perform_signing_key_lifecycle()
+    repo = Path(args.repo).resolve()
+    # the run's workspace: its keys, state and status writes are scoped to it, not to the cwd it started in
+    ctx.root = repo
+    key_state = perform_signing_key_lifecycle(root=ctx.root)
     message = key_state.get("message") or ""
     if message:
         print(message, file=sys.stderr, flush=True)
@@ -1297,9 +1292,6 @@ def run(args, ctx) -> dict:
         ss.update("RUNNING", corr=ctx.correlation_id, extra={"wave": "wave1"})
     except Exception:
         pass
-    repo = Path(args.repo).resolve()
-    # takes each record's token from (workspace.credential), are the workspace's, not those of the cwd it started in
-    ctx.root = repo
     sdir = swarm_dir(repo, create=True)
     # one absolute state dir for this process and every child it spawns (D-10)
     os.environ["SWARM_DIR"] = str(sdir)
@@ -1322,7 +1314,7 @@ def run(args, ctx) -> dict:
     lp = logging_paths(repo)
     log_phase("init", {"swarm_dir": str(sdir), "logging_paths": lp, "runtime": getattr(args, 'runtime', None)}, source="A01@swarm_run", correlation_id=corr, root=repo)
     from swarm.subagent_lifecycle import get_manager
-    mgr = get_manager(getattr(args, 'max_parallel', 4))  # lifecycle mgr init (emits subagent.* via runlog); OMP gsd-autonomous default 4 concurrent
+    mgr = get_manager(getattr(args, 'max_parallel', 4), root=ctx.root, overdue_after_s=args.task_timeout)  # lifecycle mgr init (emits subagent.* via runlog); OMP gsd-autonomous default 4 concurrent
     # OMP gsd-autonomous workflowz ultrathink: emit integrate + stream for session visibility
     # immediate emit calls for real-time status
     emit_gsd_omp("init.immediate", corr=corr, wave1="gsd-autonomous")
@@ -1364,7 +1356,7 @@ def run(args, ctx) -> dict:
             recovered = recover_stranded(store, corr, emit=ctx.emit)
             if recovered:
                 log.append(f"recovered stranded: {recovered}")
-        mgr = get_manager(getattr(args, "max_parallel", 4))
+        mgr = get_manager(getattr(args, "max_parallel", 4), root=ctx.root, overdue_after_s=args.task_timeout)
         log.append(f"lifecycle_mgr: cap={mgr.max_concurrent}")
         # OMP gsd-autonomous: register for visibility, stream status, use even partition support
         # wire wave1 gsd-autonomous
@@ -1377,7 +1369,7 @@ def run(args, ctx) -> dict:
         while True:
             rounds += 1
             log += reconcile(store, corr, ctx.emit, leases=leases, handoffs=handoffs)
-            log_phase("reconcile", {"round": rounds, "complete": complete if 'complete' in dir() else False}, source="A01@swarm_run", correlation_id=corr, root=repo)
+            log_phase("reconcile", {"round": rounds}, source="A01@swarm_run", correlation_id=corr, root=repo)
             if handoffs is not None:
                 handoffs.flush()
             if handoffs is not None:
@@ -1403,11 +1395,9 @@ def run(args, ctx) -> dict:
             emit_gsd_omp("wave1.slice", slices=len(slices), wave1="gsd-autonomous")
             with ThreadPoolExecutor(max_workers=eff_parallel) as pool:
                 try:
-                    futs = []
-                    sids = []
+                    futs = {}  # future -> the subagent id it was submitted under
                     for t, a in batch:
-                        sid = mgr.new_subagent_id(t.get("task_id", "t"))
-                        sids.append(sid)
+                        sid = mgr.new_subagent_id(t.get("task_id", "t"), root=ctx.root)
                         # immediate emit calls for spawn events, subagent IDs, task slices, real-time status to OMP
                         stream_subagent_status(sid, "dispatching.immediate", task_id=t.get("task_id"), phase="concurrent", wave="wave1")
                         emit_gsd_omp("launch.immediate", subagent_id=sid, task_id=t.get("task_id"), wave1="gsd-autonomous")
@@ -1418,10 +1408,10 @@ def run(args, ctx) -> dict:
                                 return execute_one(store_path, tt, aa, args, ctx, repo, leases, handoffs)
                             finally:
                                 mgr.release(ss)
-                        futs.append(pool.submit(_w))
+                        futs[pool.submit(_w)] = sid
                     for f in as_completed(futs):
                         tid, aid, outcome = f.result()
-                        sid = sids.pop(0) if sids else "?"
+                        sid = futs[f]
                         log.append(f"round {rounds}: {tid} [{aid}] sid={sid} → {outcome}")
                         print(log[-1], file=sys.stderr, flush=True)
                         # post dispatch immediate stream status real-time
