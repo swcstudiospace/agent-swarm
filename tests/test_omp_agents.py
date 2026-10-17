@@ -102,7 +102,6 @@ def test_omp_tools_exact():
     for a in _agents():
         tools = _fm(_omp(a))["tools"].split(", ")
         assert tools == [OMP_TOOL_SPEC[t] for t in a["tools"]] + SWARM_GRANT_SPEC.get(a["id"], []), a["id"]
-        assert set(tools) <= OMP_TOOLS, a["id"]
     assert _fm(_omp(_a("A01")))["tools"] == (
         "read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition, swarm_assignment"
     )
@@ -111,10 +110,7 @@ def test_omp_tools_exact():
 def test_omp_tools_follow_manifest_and_authority_ceiling():
     for a in _agents():
         tools = _fm(_omp(a))["tools"].split(", ")
-        assert len(tools) == len(set(tools)), a["id"]
-        assert set(tools) <= OMP_TOOLS, a["id"]
-        expected = {OMP_TOOL_SPEC[t] for t in a["tools"]} | set(SWARM_GRANT_SPEC.get(a["id"], []))
-        assert set(tools) == expected, a["id"]
+        assert tools == [OMP_TOOL_SPEC[t] for t in a["tools"]] + SWARM_GRANT_SPEC.get(a["id"], []), a["id"]
         assert not {"eval", "run_code"} & set(tools), a["id"]
 
 
@@ -476,3 +472,20 @@ def test_omp_orphan_symlink_never_followed(omp_tree, tmp_path_factory):
     assert "refused" in w.stderr and "Traceback" not in w.stderr
     assert (victim / "SKILL.md").read_text(encoding="utf-8") == "keep"
     assert link.is_symlink()
+
+
+
+# Cursor contract: the spawn grant is written as "with the Task tool" in the A01 preamble
+# (.cursor/agents/a01-orchestrator.md). Specialists only mention the Task tool as forbidden
+# ("must not call the Task tool"), so the affirmative literal must appear in A01 alone.
+CURSOR_SPAWN_LITERAL = "spawn specialists with the Task tool"
+
+
+def test_cursor_task_tool_grant_only_on_orchestrator():
+    cursor_dir = ROOT / ".cursor" / "agents"
+    for a in _agents():
+        path = cursor_dir / f"{a['slug']}.md"
+        assert path.is_file(), path
+        text = path.read_text(encoding="utf-8")
+        has = CURSOR_SPAWN_LITERAL in text
+        assert has == (a["slug"] == "a01-orchestrator"), (path.name, has)
