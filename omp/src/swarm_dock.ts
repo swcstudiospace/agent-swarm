@@ -189,13 +189,22 @@ export function renderSwarmDock(dock: SwarmDock, width: number, theme?: SwarmDoc
       : dock.rows.length > 0
         ? paintFg(theme, "success", glyphOf(theme, "success"))
         : paintFg(theme, "dim", glyphOf(theme, "pending"));
-  let name = "agent swarm";
+  const plainName = "agent swarm";
+  let name = plainName;
   try {
-    name = theme?.bold?.(name) ?? name;
+    name = theme?.bold?.(plainName) ?? plainName;
   } catch {
-    name = "agent swarm";
+    name = plainName;
   }
   const elapsed = working && dock.startedAt !== undefined ? ` ${formatElapsed(now - dock.startedAt)}` : "";
+  const plainMark = working
+    ? PLAIN_GLYPHS.running
+    : failed
+      ? PLAIN_GLYPHS.error
+      : dock.rows.length > 0
+        ? PLAIN_GLYPHS.success
+        : PLAIN_GLYPHS.pending;
+  const plainChip = `${plainMark} ${plainName}${elapsed}`;
   const nameChip = `${mark} ${name}${elapsed}`;
   const segments = [nameChip];
   if (dock.activity) segments.push(paintFg(theme, "accent", dock.activity));
@@ -212,7 +221,8 @@ export function renderSwarmDock(dock: SwarmDock, width: number, theme?: SwarmDoc
   while (shown.length > minimum && visibleWidth(band(theme, shown)) > width) shown = shown.slice(0, -1);
   const line = band(theme, shown);
   if (visibleWidth(line) <= width) return [line];
-  return [clip(nameChip, width)];
+  // Color is applied only to text that already fits. A narrow pane gets plain text, never a cut escape.
+  return [clip(plainChip, width)];
 }
 
 function touch(state: DockState): void {
@@ -351,9 +361,11 @@ export function noteToolActivity(state: DockState, ui: SwarmDockUi | undefined, 
 
 /** Drop the in-flight tool chip when that call returns. Rows settle on their own path. */
 export function clearToolActivity(state: DockState, ui: SwarmDockUi | undefined): void {
-  if (!state.live.activity) return;
+  const hadActivity = state.live.activity !== undefined;
   state.live.activity = undefined;
+  const clock = state.startedAt;
   if (!dockIsLive(state)) state.startedAt = undefined;
+  if (!hadActivity && state.startedAt === clock) return;
   flushDock(state, ui);
 }
 
@@ -402,6 +414,7 @@ export function settleTaskResult(state: DockState, ui: SwarmDockUi | undefined, 
     if (!existing) continue;
     upsertDockRow(state, { id, agent: existing.agent, status });
   }
+  if (!dockIsLive(state)) state.startedAt = undefined;
   setDockFooter(state, liveFooter(state));
   flushDock(state, ui);
 }

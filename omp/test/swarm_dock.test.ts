@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SwarmDockComponent, SwarmDockTheme } from "../src/swarm_dock.ts";
-import { createDockState, noteToolActivity, publishTaskSpawn, settleTaskResult, swarmDockWidget } from "../src/swarm_dock.ts";
+import { clearToolActivity, createDockState, noteToolActivity, publishTaskSpawn, renderSwarmDock, settleTaskResult, swarmDockWidget } from "../src/swarm_dock.ts";
 import { fakeCtx, fakePi } from "./helpers.ts";
 
 function cardUi() {
@@ -131,5 +131,32 @@ describe("swarm status bar", () => {
     noteToolActivity(dock, undefined, "bash");
     expect(renders).toBeGreaterThan(0);
     dock.ticker?.stop();
+  });
+
+  test("a narrow pane clips plain text and does not cut a color sequence", () => {
+    const theme: SwarmDockTheme = {
+      fg: (_color, text) => `\x1b[31m${text}\x1b[0m`,
+      bold: (text) => `\x1b[1m${text}\x1b[0m`,
+    };
+    const line = renderSwarmDock(
+      { title: "Agent Swarm", rows: [{ id: "1", agent: "a05-backend", status: "running" }], startedAt: 1 },
+      4,
+      theme,
+    )[0] ?? "";
+    expect(line).not.toContain("\x1b");
+    expect(line.length).toBeLessThanOrEqual(4);
+  });
+
+  test("a finished task wave does not lend its clock to the next wave", () => {
+    const dock = createDockState();
+    dock.startedAt = 1;
+    publishTaskSpawn(dock, undefined, SPAWN, "call-1");
+    expect(dock.startedAt).toBe(1);
+    settleTaskResult(dock, undefined, { toolName: "task", toolCallId: "call-1", isError: false });
+    clearToolActivity(dock, undefined);
+    expect(dock.startedAt).toBeUndefined();
+    const before = Date.now();
+    publishTaskSpawn(dock, undefined, SPAWN, "call-2");
+    expect(dock.startedAt).toBeGreaterThanOrEqual(before);
   });
 });
