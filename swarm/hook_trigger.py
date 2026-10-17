@@ -16,6 +16,8 @@ SPE-13819 n3.6-7.
 from __future__ import annotations
 import hashlib
 import os
+import subprocess
+import threading
 from pathlib import Path
 
 from .envelope import real_key_configured
@@ -23,9 +25,35 @@ from .signal_detector import detect_completion
 from .state_store import get_trigger_store, get_swarm_state_store
 from .runlog import emit as runlog_emit
 from .observability import emit_hook_fired
-from .subagent_lifecycle import get_manager  # for subagent lifecycle on trigger spawn (unique ID + ts log; prior init/trigger integration)
+from .subagent_lifecycle import SubagentLifecycleManager, get_manager  # for subagent lifecycle on trigger spawn (unique ID + ts log; prior init/trigger integration)
 # Non-empty values mean this process is a cloud agent and must not detach a runner.
 CLOUD_AGENT_MARKERS = ("CURSOR_AGENT", "CURSOR_CLOUD_AGENT", "CLOUD_AGENT")
+# Same names scripts/swarm_run.py strips (AGENT_SESSION_STRIPPED). Follow-on model sessions get no signing material.
+SIGNING_ENV_STRIPPED = (
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
+    "SWARM_TASK_ID", "SWARM_CORRELATION_ID",
+)
+
+
+def _follow_on_env() -> dict[str, str]:
+    """Controller environment minus signing material, for follow-on sessions."""
+    env = {k: v for k, v in os.environ.items() if k not in SIGNING_ENV_STRIPPED}
+    env["SWARM_CHILD"] = "0"
+    env["AIO_SWARM_AFTER_ORCH"] = "1"
+    return env
+
+
+def _release_when_ended(mgr: SubagentLifecycleManager, sid: str, proc: subprocess.Popen, *, root: str | Path | None) -> None:
+    """Free sid's lifecycle slot once the detached follow-on session exits. A daemon thread waits on proc."""
+    def _watch() -> None:
+        try:
+            proc.wait()
+        except Exception as exc:
+            # The session can no longer be observed; free the slot rather than hold it forever.
+            runlog_emit("follow_on.wait_failed", {"subagent_id": sid, "error": type(exc).__name__}, source="hook_trigger", root=root)
+        finally:
+            mgr.release(sid)
+    threading.Thread(target=_watch, name=f"follow-on-{sid}", daemon=True).start()
 
 
 def is_opt_in() -> bool:
@@ -90,14 +118,16 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
     emit_hook_fired("a01_complete", corr=corr, deduped=False, root=root, event=event, swarm_id=swarm_id)
     ss = get_swarm_state_store(root=root)
     ss.update("INITIALIZING", corr=corr, extra={"last_trigger": tid, "swarm_id": swarm_id})
+    mgr = None
+    sid = None
     try:
-        import subprocess
         target_repo = Path(root).resolve() if root else Path.cwd().resolve()
         omp_ext = Path(__file__).resolve().parent.parent / "omp"
-        env = dict(os.environ)
-        env["SWARM_CHILD"] = "0"
-        env["AIO_SWARM_AFTER_ORCH"] = "1"
-        sid = get_manager().new_subagent_id(corr or "autonomous")
+        env = _follow_on_env()
+        mgr = get_manager()
+        sid = mgr.new_subagent_id(corr or "autonomous", root=root)
+        # hold a lifecycle slot for the follow-on session: acquired before spawn, released on spawn failure or session exit
+        mgr.acquire(sid)
         # lifecycle: spawn logged with unique ID+ts; use OMP -p + verbatim command for concurrent
         # visibility of spawn/IDs/tasks/status to OMP session (replaces sequential autonomous_run)
         omp_cmd = [
@@ -109,7 +139,7 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
             "--approval-mode", "yolo",
             f"/gsd-autonomous workflowz ultrathink orchestrate after a01 {corr or ''} sid={sid}",
         ]
-        subprocess.Popen(
+        proc = subprocess.Popen(
             omp_cmd,
             cwd=str(target_repo),
             env=env,
@@ -117,7 +147,10 @@ def fire_if_ready(payload: str | dict, *, session_id: str = "unknown", corr: str
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        _release_when_ended(mgr, sid, proc, root=root)
     except Exception as exc:
+        if mgr is not None and sid is not None:
+            mgr.release(sid)
         emit_hook_fired("a01_complete", corr=corr, deduped=False, root=root,
                         reason="spawn-failed", error=type(exc).__name__)
         return {"fired": False, "reason": "spawn-failed", "id": tid}

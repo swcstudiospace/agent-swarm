@@ -11,6 +11,7 @@ import pytest
 
 from swarm.envelope import insecure_dev_key
 from swarm.hook_trigger import fire_if_ready, is_opt_in
+from swarm.subagent_lifecycle import get_manager, reset_manager
 
 _COMPLETE = "a01-orchestrator task.result state IN_REVIEW"
 _CLOUD_MARKERS = ("CURSOR_AGENT", "CURSOR_CLOUD_AGENT", "CLOUD_AGENT")
@@ -197,6 +198,52 @@ def test_real_key_and_second_opt_in_reaches_spawn(state, monkeypatch):
     assert result["fired"] is True
     assert len(calls) == 1
     argv = calls[0]
-    assert argv[0] == "python3"
-    assert argv[1].endswith("hooks/autonomous_run.py")
-    assert "autonomous_run.py" in Path(argv[1]).name
+    assert argv[0] == "omp"
+    assert "-p" in argv
+    assert argv[-1].startswith("/gsd-autonomous workflowz ultrathink orchestrate after a01")
+
+
+def test_follow_on_env_has_no_signing_material(state, monkeypatch):
+    _clear_cloud(monkeypatch)
+    monkeypatch.setenv("SWARM_ALLOW_AUTONOMOUS", "1")
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "a" * 64)
+    monkeypatch.setenv("SWARM_ED25519_KEY", "b" * 64)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", "/tmp/key-ref")
+    monkeypatch.setenv("SWARM_REQUIRE_KEY", "1")
+    monkeypatch.setenv("SWARM_TASK_ID", "T-1")
+    monkeypatch.setenv("SWARM_CORRELATION_ID", "corr-1")
+    monkeypatch.setenv("SWARM_KEEP_ME", "kept")
+    envs = []
+
+    def _fake(argv, **kwargs):
+        envs.append(kwargs["env"])
+        return _NotAProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", _fake)
+
+    result = fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)
+
+    assert result["fired"] is True
+    assert len(envs) == 1
+    env = envs[0]
+    for name in ("SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE",
+                 "SWARM_REQUIRE_KEY", "SWARM_TASK_ID", "SWARM_CORRELATION_ID"):
+        assert name not in env
+    assert env["SWARM_KEEP_ME"] == "kept"
+    assert env["SWARM_CHILD"] == "0"
+
+
+def test_failed_spawn_releases_its_slot(state, monkeypatch):
+    _clear_cloud(monkeypatch)
+    monkeypatch.setenv("SWARM_ALLOW_AUTONOMOUS", "1")
+    reset_manager()
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("spawn refused by test")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+
+    result = fire_if_ready(_COMPLETE, session_id="s", corr="c", root=state)
+
+    assert result["reason"] == "spawn-failed"
+    assert get_manager().active_ids() == []

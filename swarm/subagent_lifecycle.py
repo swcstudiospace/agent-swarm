@@ -9,7 +9,8 @@ subagent IDs, task slices (partition), real-time status to OMP; drive states;
 support concurrent observable updates; add support for consolidated, audit. Verbatim.
 
 Resilience wave3 match: wrap acquire/release/spawn (new_subagent_id) with 5x exp backoff 1s base+jitter;
-300s per sub timeout + cleanup (threading.Timer cancel, release on timeout); pre spawn val;
+300s per-sub overdue watchdog (threading.Timer, started when the slot is acquired; it flags the
+subagent and never releases it or reports completion); pre spawn val;
 isolate errors with try; wire to gsd states.
 
 - unique IDs: subagent-<task>-<shortuuid>-<ts>
@@ -20,13 +21,15 @@ isolate errors with try; wire to gsd states.
 - prior init/trigger + OMP: trigger can call for detached; supports OMP session visibility
 - immediate emits: spawn, subagent_id, slices, status, consolidated, audit
 - states: integrate LOADING, INITIALIZING, RUNNING, SPAWNING, PARTITIONING, etc via state_store or emits
+- workspace: state and status writes go to the root of the task they report
 
 Acceptance: concurrent spawns succeed with unique logged IDs, per-unit status/IDs visible,
 never >4 active. SPE-13819 n3.3-5. wave1 gsd-autonomous consolidated audit.
-Resilience: 5x backoff+ jit, 300s timeout+cleanup, pre-val, err-isolate with try, gsd wire.
+Resilience: 5x backoff+ jit, 300s overdue watchdog, pre-val, err-isolate with try, gsd wire.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
@@ -56,22 +59,36 @@ def _pre_spawn_validate(task_id: str) -> bool:
         raise
 
 
+DEFAULT_OVERDUE_S = 300.0
+
+
+def _resolve_overdue(overdue_after_s: float | None) -> float:
+    """Overdue threshold in seconds: DEFAULT_OVERDUE_S when None; otherwise must be finite and positive."""
+    if overdue_after_s is None:
+        return DEFAULT_OVERDUE_S
+    value = float(overdue_after_s)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"overdue_after_s must be a finite positive number of seconds, got {overdue_after_s!r}")
+    return value
+
+
 class _SubTimeout:
-    """300s per-sub timeout + cleanup: Timer cancel, release on timeout."""
-    def __init__(self, sid: str, release_fn):
+    """Overdue watchdog: calls on_overdue(sid) once after after_s seconds if the subagent is still running. Cancel on release."""
+    def __init__(self, sid: str, on_overdue, after_s: float):
         self.sid = sid
-        self.release_fn = release_fn
+        self.on_overdue = on_overdue
+        self.after_s = after_s
         self.timer: threading.Timer | None = None
     def start(self) -> None:
         try:
-            self.timer = threading.Timer(300.0, self._on_timeout)
+            self.timer = threading.Timer(self.after_s, self._on_timeout)
             self.timer.daemon = True
             self.timer.start()
         except Exception:
             pass  # isolate
     def _on_timeout(self) -> None:
         try:
-            self.release_fn(self.sid)
+            self.on_overdue(self.sid)
         except Exception:
             pass  # isolate errors
     def cancel(self) -> None:
@@ -83,21 +100,21 @@ class _SubTimeout:
             pass  # isolate
 
 
-def _drive_gsd_state(state: str, **extra) -> None:
+def _drive_gsd_state(state: str, *, root: str | Path | None = None, **extra) -> None:
     """Drive states LOADING etc via state store calls or emits. For wave1 gsd-autonomous OMP concurrent.
     Verbatim integration of all states. Immediate real-time to OMP. Support consolidated, audit.
-    Errors isolated with try."""
+    State is written to the workspace at `root` (current directory when None). Errors isolated with try."""
     try:
         from swarm.state_store import get_swarm_state_store
-        ss = get_swarm_state_store()
+        ss = get_swarm_state_store(root=root)
         ss.append_gsd_line(state)
         ss.update(state, extra=extra or None)
     except Exception:
         # fallback immediate emit
-        emit("gsd.state", {"state": state, **extra}, source="subagent_lifecycle")
+        emit("gsd.state", {"state": state, **extra}, source="subagent_lifecycle", root=root)
     # immediate real-time status emit to OMP
     try:
-        emit_gsd_omp("state", state=state, **extra)
+        emit_gsd_omp("state", state=state, root=root, **extra)
     except Exception:
         pass  # isolate
 
@@ -113,32 +130,39 @@ class SubagentLifecycleManager:
     add support for consolidated, audit. Verbatim.
 
     Resilience adds (match python side): wrap acquire/release/spawn(new_subagent_id) w/ 5x exp backoff 1s+jit;
-    per-sub 300s timeout + Timer cleanup, release on timeout; pre-spawn-val; isolate w/ try; wire gsd states.
+    per-sub overdue watchdog (300s by default; overdue_after_s overrides; flags only, release happens when the task ends); pre-spawn-val; isolate w/ try; wire gsd states.
+
+    root: default workspace for status writes; new_subagent_id(root=...) overrides it per task.
     """
     HARD_MAX = 4
 
-    def __init__(self, max_concurrent: int = 4) -> None:
+    def __init__(self, max_concurrent: int = 4, *, root: str | Path | None = None, overdue_after_s: float | None = None) -> None:
+        overdue = _resolve_overdue(overdue_after_s)
         try:
-            _drive_gsd_state("LOADING", lifecycle="init", wave="wave1", consolidated=False)
+            self.root = Path(root) if root is not None else None
+            self.overdue_after_s = overdue
+            _drive_gsd_state("LOADING", lifecycle="init", wave="wave1", consolidated=False, root=self.root)
             self.max_concurrent = min(self.HARD_MAX, max(1, int(max_concurrent or 1)))
             self._sem = threading.BoundedSemaphore(self.max_concurrent)
             self._active: dict[str, dict[str, Any]] = {}
             self._lock = threading.Lock()
             self._timeouts: dict[str, _SubTimeout] = {}
-            _drive_gsd_state("INITIALIZING", max=self.max_concurrent, wave="wave1")
+            _drive_gsd_state("INITIALIZING", max=self.max_concurrent, wave="wave1", root=self.root)
             # immediate emit for concurrent observable updates + OMP session
-            emit_gsd_omp("init.concurrent", max=self.max_concurrent, wave1="gsd-autonomous", audit="ready")
-            stream_subagent_status("lifecycle", "initialized", phase="wave1")
+            emit_gsd_omp("init.concurrent", max=self.max_concurrent, wave1="gsd-autonomous", audit="ready", root=self.root)
+            stream_subagent_status("lifecycle", "initialized", phase="wave1", root=self.root)
         except Exception:
             # isolate init errors
             self._timeouts = {}
             raise
-    def new_subagent_id(self, task_id: str) -> str:
-        """Return unique ID... (resilience wrapped: 5x backoff, pre val, 300s timeout start)."""
+    def new_subagent_id(self, task_id: str, *, root: str | Path | None = None) -> str:
+        """Return unique ID for a task whose status goes to workspace `root` (manager root when None).
+        The overdue watchdog starts at acquire, not here, so tasks queued behind the semaphore are not flagged."""
         _pre_spawn_validate(task_id)
+        task_root = self.root if root is None else Path(root)
         for attempt in range(5):
             try:
-                _drive_gsd_state("SPAWNING", task_id=task_id, wave="wave1")
+                _drive_gsd_state("SPAWNING", task_id=task_id, wave="wave1", root=task_root)
                 ts = time.time()
                 short = uuid.uuid4().hex[:12]
                 sid = f"subagent-{task_id}-{short}-{int(ts * 1000)}"
@@ -147,6 +171,9 @@ class SubagentLifecycleManager:
                         "task_id": task_id,
                         "spawn_ts": ts,
                         "mono_start": time.monotonic(),
+                        "root": task_root,
+                        "holds_slot": False,
+                        "overdue": False,
                     }
                 emit(
                     "subagent.spawn.immediate",
@@ -159,23 +186,18 @@ class SubagentLifecycleManager:
                     },
                     source="subagent_lifecycle",
                     task_id=task_id,
+                    root=task_root,
                 )
                 emit(
                     "spawn.event",
                     {"subagent_id": sid, "task_id": task_id, "slice": task_id},
                     source="subagent_lifecycle",
+                    root=task_root,
                 )
-                stream_subagent_status(sid, "spawned", task_id=task_id, phase="launch", wave="wave1")
-                emit_gsd_omp("spawn", subagent_id=sid, task_id=task_id, max=self.max_concurrent, wave1="gsd-autonomous")
-                _drive_gsd_state("RUNNING", subagent_id=sid, task_id=task_id, wave="wave1")
-                emit_gsd_omp("consolidated", subagent_id=sid, task_id=task_id, audit="spawn")
-                try:
-                    tmo = _SubTimeout(sid, self.release)
-                    tmo.start()
-                    with self._lock:
-                        self._timeouts[sid] = tmo
-                except Exception:
-                    pass
+                stream_subagent_status(sid, "spawned", task_id=task_id, phase="launch", wave="wave1", root=task_root)
+                emit_gsd_omp("spawn", subagent_id=sid, task_id=task_id, max=self.max_concurrent, wave1="gsd-autonomous", root=task_root)
+                _drive_gsd_state("RUNNING", subagent_id=sid, task_id=task_id, wave="wave1", root=task_root)
+                emit_gsd_omp("consolidated", subagent_id=sid, task_id=task_id, audit="spawn", root=task_root)
                 return sid
             except Exception:
                 if attempt == 4:
@@ -183,82 +205,107 @@ class SubagentLifecycleManager:
                 time.sleep(_exp_backoff(attempt))
         raise RuntimeError("spawn backoff exhausted")
 
+    def _root_of(self, sid: str) -> Path | None:
+        """Workspace root recorded for sid at spawn; manager root if sid is untracked."""
+        with self._lock:
+            info = self._active.get(sid)
+        return info["root"] if info is not None else self.root
+
+    def _mark_slot_held(self, sid: str) -> None:
+        """Record that sid now holds a semaphore slot and start its overdue watchdog.
+        Caller has just acquired the semaphore; if sid is untracked, nothing would ever free that slot, so it is given back."""
+        with self._lock:
+            info = self._active.get(sid)
+            if info is None:
+                tmo = None
+            else:
+                info["acquired_ts"] = time.time()
+                info["holds_slot"] = True
+                tmo = _SubTimeout(sid, self._on_overdue, self.overdue_after_s)
+                self._timeouts[sid] = tmo
+        if tmo is None:
+            self._sem.release()
+            return
+        tmo.start()
+
+    def _on_overdue(self, sid: str) -> None:
+        """Watchdog expiry: flag sid as still running past the threshold. It does not free the slot or report
+        completion; release() does that once the task has actually ended."""
+        with self._lock:
+            info = self._active.get(sid)
+            if info is None:
+                return  # already released; not overdue
+            info["overdue"] = True
+            # Streamed under the lock so a concurrent release() cannot publish "complete" before this "overdue".
+            stream_subagent_status(sid, "overdue", task_id=info.get("task_id"), phase="run", wave="wave1", root=info["root"])
+
     def acquire(self, sid: str) -> None:
-        """Acquire wrapped with 5x exp backoff 1s+jit + try isolate."""
+        """Acquire wrapped with 5x exp backoff 1s+jit + try isolate. Execution begins once the slot is held."""
+        root = self._root_of(sid)
         for attempt in range(5):
             try:
-                _drive_gsd_state("ACQUIRED", subagent_id=sid, wave="wave1")
+                _drive_gsd_state("ACQUIRED", subagent_id=sid, wave="wave1", root=root)
                 if not self._sem.acquire(timeout=30.0):
                     time.sleep(_exp_backoff(attempt))
                     continue
-                with self._lock:
-                    if sid in self._active:
-                        self._active[sid]["acquired_ts"] = time.time()
-                stream_subagent_status(sid, "acquired", phase="run", wave="wave1")
-                emit_gsd_omp("acquired.immediate", subagent_id=sid, wave1="gsd-autonomous")
-                emit_gsd_omp("consolidated", subagent_id=sid, audit="acquire")
+                self._mark_slot_held(sid)
+                stream_subagent_status(sid, "acquired", phase="run", wave="wave1", root=root)
+                emit_gsd_omp("acquired.immediate", subagent_id=sid, wave1="gsd-autonomous", root=root)
+                emit_gsd_omp("consolidated", subagent_id=sid, audit="acquire", root=root)
                 return
             except Exception:
                 if attempt == 4:
                     self._sem.acquire()
-                    with self._lock:
-                        if sid in self._active:
-                            self._active[sid]["acquired_ts"] = time.time()
-                    stream_subagent_status(sid, "acquired", phase="run", wave="wave1")
+                    self._mark_slot_held(sid)
+                    stream_subagent_status(sid, "acquired", phase="run", wave="wave1", root=root)
                     return
                 time.sleep(_exp_backoff(attempt))
 
     def release(self, sid: str) -> dict[str, Any] | None:
-        """Release wrapped w/ 5x backoff, timeout cancel, try isolate."""
+        """Release sid after its task has ended: cancel the watchdog, free the slot once, report completion.
+        Idempotent: a repeat call for the same sid frees nothing and reports nothing, returning None."""
+        with self._lock:
+            info = self._active.pop(sid, None)
+            tmo = self._timeouts.pop(sid, None)
+        if tmo is not None:
+            tmo.cancel()
+        if info is None:
+            return None
+        if info.get("holds_slot"):
+            self._sem.release()
+        self._report_complete(sid, info)
+        return info
+
+    def _report_complete(self, sid: str, info: dict[str, Any]) -> None:
+        """Emit completion for a released subagent. Retried with 5x backoff; errors isolated."""
+        root = info.get("root")
+        task_id = info.get("task_id")
+        dur = time.monotonic() - info.get("mono_start", time.monotonic())
         for attempt in range(5):
             try:
-                _drive_gsd_state("COMPLETE", subagent_id=sid, wave="wave1")
-                tmo = None
-                with self._lock:
-                    tmo = self._timeouts.pop(sid, None)
-                if tmo:
-                    try:
-                        tmo.cancel()
-                    except Exception:
-                        pass
-                self._sem.release()
-                with self._lock:
-                    info = self._active.pop(sid, None)
-                if info:
-                    dur = time.monotonic() - info.get("mono_start", time.monotonic())
-                    emit(
-                        "subagent.complete.immediate",
-                        {
-                            "subagent_id": sid,
-                            "task_id": info.get("task_id"),
-                            "duration_s": round(dur, 3),
-                            "complete_ts": time.time(),
-                            "wave": "wave1",
-                            "slice": info.get("task_id"),
-                        },
-                        source="subagent_lifecycle",
-                        task_id=info.get("task_id"),
-                    )
-                    stream_subagent_status(sid, "complete", task_id=info.get("task_id"), phase="done", wave="wave1")
-                    emit_gsd_omp("complete.immediate", subagent_id=sid, task_id=info.get("task_id"), duration=round(dur, 3), wave1="gsd-autonomous")
-                    emit_gsd_omp("consolidated", subagent_id=sid, task_id=info.get("task_id"), audit="release")
-                    return info
-                return None
+                _drive_gsd_state("COMPLETE", subagent_id=sid, wave="wave1", root=root)
+                emit(
+                    "subagent.complete.immediate",
+                    {
+                        "subagent_id": sid,
+                        "task_id": task_id,
+                        "duration_s": round(dur, 3),
+                        "complete_ts": time.time(),
+                        "wave": "wave1",
+                        "slice": task_id,
+                    },
+                    source="subagent_lifecycle",
+                    task_id=task_id,
+                    root=root,
+                )
+                stream_subagent_status(sid, "complete", task_id=task_id, phase="done", wave="wave1", root=root)
+                emit_gsd_omp("complete.immediate", subagent_id=sid, task_id=task_id, duration=round(dur, 3), wave1="gsd-autonomous", root=root)
+                emit_gsd_omp("consolidated", subagent_id=sid, task_id=task_id, audit="release", root=root)
+                return
             except Exception:
                 if attempt == 4:
-                    try:
-                        self._sem.release()
-                    except Exception:
-                        pass
-                    with self._lock:
-                        info = self._active.pop(sid, None)
-                        tmo = self._timeouts.pop(sid, None)
-                    if tmo:
-                        try: tmo.cancel()
-                        except: pass
-                    return info
+                    return
                 time.sleep(_exp_backoff(attempt))
-        return None
 
     def active_count(self) -> int:
         with self._lock:
@@ -272,52 +319,63 @@ class SubagentLifecycleManager:
         return self.active_count()
 
     def even_partition(self, workload: list, n: int | None = None) -> list[list]:
-        _drive_gsd_state("PARTITIONING", workload_len=len(workload), wave="wave1")
+        _drive_gsd_state("PARTITIONING", workload_len=len(workload), wave="wave1", root=self.root)
         n = n or self.max_concurrent
         slices = even_partition(workload, n)
-        emit_gsd_omp("partition.slice.immediate", slices=len(slices), n=n, wave1="gsd-autonomous", subagent_slices=slices)
-        stream_subagent_status("partition", "sliced", phase="wave1", slices=len(slices))
-        emit_gsd_omp("consolidated", audit="partition", slices=len(slices))
+        emit_gsd_omp("partition.slice.immediate", slices=len(slices), n=n, wave1="gsd-autonomous", subagent_slices=slices, root=self.root)
+        stream_subagent_status("partition", "sliced", phase="wave1", slices=len(slices), root=self.root)
+        emit_gsd_omp("consolidated", audit="partition", slices=len(slices), root=self.root)
         return slices
 
     def register_omp(self, session_ref: str | None = None) -> dict:
-        _drive_gsd_state("REGISTERED", session=session_ref, wave="wave1")
+        _drive_gsd_state("REGISTERED", session=session_ref, wave="wave1", root=self.root)
         with self._lock:
             active = dict(self._active)
-        emit_gsd_omp("omp.register.immediate", subagent_ids=list(active.keys()), session=session_ref, wave1="gsd-autonomous")
-        for sid in list(active.keys()):
-            stream_subagent_status(sid, "registered", phase="omp", wave="wave1")
-            emit_gsd_omp("status", subagent_id=sid, status="omp-registered")
-        emit_gsd_omp("consolidated", audit="register", session=session_ref)
+        emit_gsd_omp("omp.register.immediate", subagent_ids=list(active.keys()), session=session_ref, wave1="gsd-autonomous", root=self.root)
+        for sid, info in active.items():
+            stream_subagent_status(sid, "registered", phase="omp", wave="wave1", root=info["root"])
+            emit_gsd_omp("status", subagent_id=sid, status="omp-registered", root=info["root"])
+        emit_gsd_omp("consolidated", audit="register", session=session_ref, root=self.root)
         return {"max": self.max_concurrent, "active": list(active.keys()), "count": len(active)}
 
     def stream_all_status(self, status: str = "active") -> None:
-        _drive_gsd_state("STREAMING", status=status, wave="wave1")
+        _drive_gsd_state("STREAMING", status=status, wave="wave1", root=self.root)
         with self._lock:
             for sid, info in list(self._active.items()):
-                stream_subagent_status(sid, status, task_id=info.get("task_id"), phase="omp", wave="wave1")
-                emit_gsd_omp(status, subagent_id=sid, task_id=info.get("task_id"), wave1="gsd-autonomous")
-                emit_gsd_omp("consolidated", subagent_id=sid, audit="stream", status=status)
+                root = info["root"]
+                stream_subagent_status(sid, status, task_id=info.get("task_id"), phase="omp", wave="wave1", root=root)
+                emit_gsd_omp(status, subagent_id=sid, task_id=info.get("task_id"), wave1="gsd-autonomous", root=root)
+                emit_gsd_omp("consolidated", subagent_id=sid, audit="stream", status=status, root=root)
 
 # Singleton-ish for hook integration without passing everywhere (boring).
 # Init on first use; runner overrides with its arg.
 _global_mgr: SubagentLifecycleManager | None = None
 
 
-def get_manager(max_concurrent: int | None = None) -> SubagentLifecycleManager:
+def get_manager(
+    max_concurrent: int | None = None,
+    *,
+    root: str | Path | None = None,
+    overdue_after_s: float | None = None,
+) -> SubagentLifecycleManager:
     """Get (or init) the lifecycle mgr. Default 4 for gsd-autonomous OMP concurrent (even partition default).
-    OMP command registers for status streams. wire wave1 gsd-autonomous immediate emits."""
+    OMP command registers for status streams. wire wave1 gsd-autonomous immediate emits.
+    root: default workspace for status writes; None keeps the existing manager's root.
+    overdue_after_s: overdue threshold in seconds; None keeps the existing manager's threshold (300 by default)."""
     global _global_mgr
     if _global_mgr is None:
-        _drive_gsd_state("MANAGER_INIT", max=max_concurrent or 4, wave="wave1")
-        _global_mgr = SubagentLifecycleManager(max_concurrent or 4)
-    elif max_concurrent is not None:
+        _drive_gsd_state("MANAGER_INIT", max=max_concurrent or 4, wave="wave1", root=root)
+        _global_mgr = SubagentLifecycleManager(max_concurrent or 4, root=root, overdue_after_s=overdue_after_s)
+    else:
         # rebind only if caller wants different (runner does)
-        if max_concurrent != _global_mgr.max_concurrent:
-            _drive_gsd_state("MANAGER_REBIND", max=max_concurrent, wave="wave1")
-            _global_mgr = SubagentLifecycleManager(max_concurrent)
-    emit_gsd_omp("manager.get", wave1="gsd-autonomous")
-    emit_gsd_omp("consolidated", audit="get_manager")
+        want_max = _global_mgr.max_concurrent if max_concurrent is None else max_concurrent
+        want_root = _global_mgr.root if root is None else Path(root)
+        want_overdue = _global_mgr.overdue_after_s if overdue_after_s is None else _resolve_overdue(overdue_after_s)
+        if want_max != _global_mgr.max_concurrent or want_root != _global_mgr.root or want_overdue != _global_mgr.overdue_after_s:
+            _drive_gsd_state("MANAGER_REBIND", max=want_max, wave="wave1", root=want_root)
+            _global_mgr = SubagentLifecycleManager(want_max, root=want_root, overdue_after_s=want_overdue)
+    emit_gsd_omp("manager.get", wave1="gsd-autonomous", root=_global_mgr.root)
+    emit_gsd_omp("consolidated", audit="get_manager", root=_global_mgr.root)
     return _global_mgr
 
 
