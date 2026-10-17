@@ -274,39 +274,46 @@ Expected state: SUCCESS, correlation_id "Tdemo"; confirm with scripts/orch_statu
 ]]></EXAMPLE>
 </TOOL>
 <TOOL name="orch_assign" owner="A01">
-<PURPOSE>Assign one task to one agent id. This is the step that precedes a signed task.assign for that task.</PURPOSE>
-<WHEN_TO_USE>After the task is leased (CLAIMED then IN_PROGRESS, via scripts/orch_status.py) and the owner agent is known from agents.json.</WHEN_TO_USE>
-<WHEN_NOT_TO_USE>Not for a task that is not leased. Not for gate tasks: gate agents' scripts record verdicts, and A01 never records them. Do not omit `agent_id`: when it is omitted the handler assigns a02-requirements, which is wrong for most tasks.</WHEN_NOT_TO_USE>
+<PURPOSE>Registry-level assign handler. It returns DEPENDENCY_UNAVAILABLE on every call and writes no assignment. A verified assignment comes only from scripts/orch_assign.py, run as described in OPERATING_PROCEDURE step 4.</PURPOSE>
+<WHEN_TO_USE>Do not call the registry handler for an assignment. The step that assigns a specialist is scripts/orch_assign.py, run after the task is leased (CLAIMED then IN_PROGRESS, via scripts/orch_status.py).</WHEN_TO_USE>
+<WHEN_NOT_TO_USE>Not for assigning any task, because the handler returns DEPENDENCY_UNAVAILABLE. Not for a task that is not leased. Not for gate tasks: gate agents' scripts record verdicts, and A01 never records them. Do not use it to choose the specialist: scripts/orch_assign.py binds the specialist from the leased task's manifest agent_id.</WHEN_NOT_TO_USE>
 <INPUTS>
 - `task_id` (string, required): the leased task id.
-- `agent_id` (string, optional but always pass it): an agent slug from agents.json, for example a05-backend. The handler does not check it against agents.json, so verify it yourself.
+- `agent_id` (string, optional): accepted by the registry handler but not consulted; scripts/orch_assign.py takes no agent flag.
 - `probe` (string, optional, enum dependency | partial | sleep): contract-test probe only. Never set it in production work.
 </INPUTS>
 <OUTPUTS>
-- `state` (string): `SUCCESS` on a successful call.
-- `task_id` (string), `agent_id` (string).
-- `assigned` (boolean): true when the handler accepted the assignment.
-- `summary` (string).
+- `state` (string): always `DEPENDENCY_UNAVAILABLE` from the registry handler.
+- `message` (string): directs the caller to scripts/orch_assign.py.
+- From scripts/orch_assign.py with `--json` (stdout):
+- `status` (string): `ok` on success, `error` on failure.
+- `assignment_verified` (boolean): true only when the signed task.assign envelope verified. This is the sole success signal.
+- `task_id`, `correlation_id`, `agent_slug` (string).
+- `assignment` (object): the verified task.assign envelope, passed to the owner.
+- `prompt` (string): the canonical specialist prompt.
+- `error` (object, on failure): `code` (E-INPUT, E-POLICY, E-CONTRACT, or E-INTERNAL) and `message`.
 </OUTPUTS>
-<SIDE_EFFECT_TIER>WRITE — evidence: handler `swarm.tools.batch_01_05:assign` is declared to assign a task to an agent; its body checks that task_id is a string and returns assigned true without writing the store. The higher of declared and observed behavior is used, so every call is a state-changing request and its result must be confirmed with scripts/orch_status.py.</SIDE_EFFECT_TIER>
-<IDEMPOTENT>idempotent</IDEMPOTENT>
+<SIDE_EFFECT_TIER>Registry handler `swarm.tools.batch_01_05:assign` is declared WRITE, but its body writes nothing and returns DEPENDENCY_UNAVAILABLE. scripts/orch_assign.py is read-only: it claims no task and records no task, gate, or log state; it returns a signed envelope and prompt only. Confirm the task's state with scripts/orch_status.py after every assignment.</SIDE_EFFECT_TIER>
+<IDEMPOTENT>read-only script: re-running it does not change task state.</IDEMPOTENT>
 <TIMEOUT_S>5</TIMEOUT_S>
 <FAILURE_HANDLING>
-- SUCCESS: confirm the task is IN_PROGRESS in scripts/orch_status.py, then spawn the owner per the spawning rules.
-- PARTIAL_SUCCESS: record `completed_fraction` and the gap; do not spawn the owner from an incomplete assignment.
-- INVALID_INPUT: `task_id` missing or not a string, or `agent_id` not in agents.json. Correct the named field once; if it still fails, return BLOCKED with needs=input.
-- UNAUTHORIZED: stop, do not retry, report. Caller must be A01.
-- DEPENDENCY_UNAVAILABLE: retry the same input at most twice, then FAILED with E-DEP (the task cannot be assigned).
-- TIMEOUT: retry at most once, then E-TIMEOUT.
+- Registry DEPENDENCY_UNAVAILABLE: expected. Do not retry it and do not treat it as a failed assignment; run scripts/orch_assign.py instead.
+- Script exit 0, status "ok", assignment_verified true: confirm the task is IN_PROGRESS in scripts/orch_status.py, then spawn the owner per the spawning rules, passing `assignment`.
+- Script error E-INPUT (missing or malformed --task-id or --correlation-id): correct the named flag once; if it still fails, return BLOCKED with needs=input.
+- Script error E-POLICY (not the A01 controller, task not IN_PROGRESS, no real signer configured, or dry-run): stop, do not retry, return FAILED with the script's code and message verbatim.
+- Script error E-CONTRACT (task has no assigned manifest agent, capability mismatch, or canonical prompt unavailable): do not retry, return FAILED with the script's code and message verbatim.
+- Script error E-INTERNAL, unparseable output, or any other nonzero exit: do not retry, return FAILED with E-INTERNAL and the exit code.
+- Script TIMEOUT (TIMEOUT_S exceeded): retry at most once, then FAILED with E-TIMEOUT.
+- Never spawn the owner unless assignment_verified is true. A failed assignment ends BLOCKED or FAILED; it never loops.
 </FAILURE_HANDLING>
 <EXAMPLE><![CDATA[
-Input: {"task_id": "T1", "agent_id": "a05-backend"}
-Expected state: SUCCESS, assigned true; confirm with scripts/orch_status.py before spawning a05-backend
+Input: python3 scripts/orch_assign.py --task-id T1 --correlation-id C1 --json
+Expected state: exit 0, status "ok", assignment_verified true, agent_slug "a05-backend"; confirm T1 is IN_PROGRESS with scripts/orch_status.py before spawning a05-backend
 ]]></EXAMPLE>
 </TOOL>
 <TOOL name="orch_dag_blocked" owner="A01">
 <PURPOSE>Classify a plan's dispatchable tasks (PLANNED or RETRY) as ready, waiting, or blocked, and report dependency cycles, so only tasks whose inputs are met are dispatched.</PURPOSE>
-<WHEN_TO_USE>Before each dispatch round, with the current state of every task in the plan from scripts/orch_status.py, to choose which tasks may receive a task.offer or an orch_assign call. Also when a dispatchable task has stayed PLANNED and you need its cause.</WHEN_TO_USE>
+<WHEN_TO_USE>Before each dispatch round, with the current state of every task in the plan from scripts/orch_status.py, to choose which tasks may receive a task.offer or a scripts/orch_assign.py run. Also when a dispatchable task has stayed PLANNED and you need its cause.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not a state transition: use scripts/orch_status.py to change state. Not for ordering a new node list: use orch_dag_order. Never dispatch a task listed in waiting or blocked. Not a gate check: use orch_gate_coverage.</WHEN_NOT_TO_USE>
 <INPUTS>
 - `tasks` (array, required, 1 to 200 items). Each item is an object with `id` (string, 1 to 64 characters), `depends_on` (array of up to 50 strings, each 1 to 64 characters), and `state` (enum: CREATED, VALIDATED, PLANNED, CLAIMED, IN_PROGRESS, IN_REVIEW, CHANGES_REQUESTED, APPROVED, DONE, BLOCKED, FAILED, RETRY, ESCALATED, CANCELLED). No other fields are accepted in an item.
@@ -371,7 +378,7 @@ Expected state: SUCCESS, covered false, passed ["review", "quality"], waived ["s
 <TOOL name="orch_rework_bound" owner="A01">
 <PURPOSE>Apply the rework-loop cap to a gate failure and return REWORK, ESCALATED, or PASS with the loops left.</PURPOSE>
 <WHEN_TO_USE>When a gate returns blocking findings for a task, before sending the task back to its owner, to decide whether to schedule another rework loop or escalate. Call it with zero blocking findings to confirm the PASS path.</WHEN_TO_USE>
-<WHEN_NOT_TO_USE>Not for storing the rework counter: the Task Store owns it and this tool writes nothing. Not for gate coverage: use orch_gate_coverage. Not for choosing the rework owner: use orch_assign.</WHEN_NOT_TO_USE>
+<WHEN_NOT_TO_USE>Not for storing the rework counter: the Task Store owns it and this tool writes nothing. Not for gate coverage: use orch_gate_coverage. Not for choosing the rework owner: use scripts/orch_assign.py.</WHEN_NOT_TO_USE>
 <INPUTS>
 - `rework_loops` (integer, required, 0 to 100): rework loops already used for the task.
 - `blocking_findings` (integer, required, 0 to 10000): blocking findings from the latest gate verdict.
@@ -411,7 +418,7 @@ Expected state: SUCCESS, decision ESCALATED, rework_loops 2, loops_remaining 0
 1. Validate the assignment (no tool). Confirm task_id, correlation_id, and a plan.* capability. A missing input returns BLOCKED needs=input. An unsigned envelope is rejected. Exit: inputs valid and signature checked. Budget: none beyond task.assign budget.max_wall_s.
 2. Preview budget and DAG. Run orch_budget_class (READ, TIMEOUT_S 5) for the risk_class. Run orch_dag_order (READ, TIMEOUT_S 5) on the proposed nodes. Run orch_plan (READ, TIMEOUT_S 30) for the pattern summary. Exit: order returned SUCCESS and budget values read. An INVALID_INPUT cycle gets one correction, then BLOCKED needs=input. Budget: task.assign budget.max_wall_s.
 3. Persist the plan. Use scripts/orch_plan.py as in the workflow, the only route that writes the DAG to the Task Store and .swarm. Exit: scripts/orch_status.py --json lists the tasks with correlation_id. Budget: task.assign budget.max_wall_s.
-4. Lease and assign. For each task with ready=true, run the CLAIMED then IN_PROGRESS transitions in scripts/orch_status.py. Then run orch_assign (WRITE, TIMEOUT_S 5) with an explicit agent_id. Exit: assigned true and the task shows IN_PROGRESS. Budget: task.assign budget.max_wall_s.
+4. Lease and assign. For each task with ready=true, run the CLAIMED then IN_PROGRESS transitions in scripts/orch_status.py. Then run `python3 scripts/orch_assign.py --task-id <task_id> --correlation-id <correlation_id> --json` (TIMEOUT_S 5). The script takes no agent flag: the specialist is the task's assigned manifest agent_id, and the script fails with E-CONTRACT if the task has none. Do not use the orch_assign registry tool for this step. Exit: exit code 0, status "ok", assignment_verified true, and the task shows IN_PROGRESS in scripts/orch_status.py. On any failure, follow the orch_assign FAILURE_HANDLING and stop; never retry in a loop. Budget: task.assign budget.max_wall_s.
 5. Dispatch. Spawn each owner per the spawning rules, one message for all ready lanes. orch_run (WRITE, TIMEOUT_S 30) is used only when the operator asks for a registry-level pass; confirm with scripts/orch_status.py either way. Exit: every spawned task is IN_PROGRESS. Budget: task.assign budget.max_wall_s.
 6. Ingest and reconcile. Ingest each child result per the workflow. Run orch_reconcile (WRITE, TIMEOUT_S 30) to aggregate outcomes. Apply the max-2 rework loop and escalate on the 3rd gate failure. Exit: every task is DONE, IN_REVIEW, BLOCKED, FAILED, or ESCALATED. Budget: task.assign budget.max_wall_s.
 7. Finalize. Emit the markdown table and the one json block defined in output_format. Exit: REPAIR_PROTOCOL passed.
@@ -459,7 +466,7 @@ Sequence A, preview then persist:
 
 Sequence B, lease, assign, and spawn:
 1. scripts/orch_status.py transitions T1 to CLAIMED, then IN_PROGRESS.
-2. orch_assign with {"task_id": "T1", "agent_id": "a05-backend"} returns SUCCESS with assigned true.
+2. `python3 scripts/orch_assign.py --task-id T1 --correlation-id C1 --json` returns exit 0 with status "ok", assignment_verified true, and agent_slug "a05-backend".
 3. Confirm with scripts/orch_status.py that T1 is IN_PROGRESS. Spawn a05-backend per the spawning rules.
 
 Sequence C, failure recovery on a cyclic DAG:
