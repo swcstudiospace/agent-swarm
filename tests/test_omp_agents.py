@@ -90,12 +90,22 @@ def _keys(text):
 # tool names, and only A01 (orchestrator) and the gate agents receive hidden swarm_* grants.
 OMP_TOOL_SPEC = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
 SWARM_GRANT_SPEC = {
-    "A01": {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"},
-    "A08": {"swarm_gate"},
-    "A09": {"swarm_gate"},
-    "A10": {"swarm_gate"},
-    "A12": {"swarm_gate"},
+    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"],
+    "A08": ["swarm_gate"],
+    "A09": ["swarm_gate"],
+    "A10": ["swarm_gate"],
+    "A12": ["swarm_gate"],
 }
+
+
+def test_omp_tools_exact():
+    for a in _agents():
+        tools = _fm(_omp(a))["tools"].split(", ")
+        assert tools == [OMP_TOOL_SPEC[t] for t in a["tools"]] + SWARM_GRANT_SPEC.get(a["id"], []), a["id"]
+        assert set(tools) <= OMP_TOOLS, a["id"]
+    assert _fm(_omp(_a("A01")))["tools"] == (
+        "read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition, swarm_assignment"
+    )
 
 
 def test_omp_tools_follow_manifest_and_authority_ceiling():
@@ -103,7 +113,7 @@ def test_omp_tools_follow_manifest_and_authority_ceiling():
         tools = _fm(_omp(a))["tools"].split(", ")
         assert len(tools) == len(set(tools)), a["id"]
         assert set(tools) <= OMP_TOOLS, a["id"]
-        expected = {OMP_TOOL_SPEC[t] for t in a["tools"]} | SWARM_GRANT_SPEC.get(a["id"], set())
+        expected = {OMP_TOOL_SPEC[t] for t in a["tools"]} | set(SWARM_GRANT_SPEC.get(a["id"], []))
         assert set(tools) == expected, a["id"]
         assert not {"eval", "run_code"} & set(tools), a["id"]
 
@@ -111,21 +121,19 @@ def test_omp_tools_follow_manifest_and_authority_ceiling():
 def test_swarm_tool_grants():
     """Only A01 leases and requests assignments; gate agents retain only their verdict authority."""
     for a in _agents():
-        swarm = {t for t in _fm(_omp(a))["tools"].split(", ") if t.startswith("swarm_")}
+        swarm = [t for t in _fm(_omp(a))["tools"].split(", ") if t.startswith("swarm_")]
         if a["id"] == "A01":
-            assert "swarm_assignment" in swarm
-            assert {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"} <= swarm
-            assert swarm == SWARM_GRANT_SPEC["A01"]
-            assert "swarm_gate" not in swarm
+            assert swarm == ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"]
         elif a["id"] in GATE_AGENTS:
-            assert swarm == {"swarm_gate"}, a["id"]
+            assert swarm == ["swarm_gate"], a["id"]
         else:
-            assert not swarm, a["id"]
+            assert swarm == [], a["id"]
 
 
 @pytest.mark.parametrize(
     ("aid", "grant"),
     [
+        ("A01", ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"]),
         ("A01", ["swarm_gate"]),
         ("A05", ["swarm_status"]),
         ("A09", ["swarm_gate", "swarm_transition"]),
@@ -247,11 +255,15 @@ GATES = ("a08-qa", "a09-reviewer", "a10-security", "a12-release")
 
 
 def test_a01_strict_dispatch():
-    for text in (builder.OMP_ORCH_PREAMBLE, _omp(_a("A01"))):
-        rule = next(line for line in text.splitlines() if 'schemaMode: "strict"' in line)
-        for gate in GATES:
-            assert gate in rule, gate
+    text = builder.OMP_ORCH_PREAMBLE
+    assert 'schemaMode: "strict"' in text
+    rule = next(line for line in text.splitlines() if 'schemaMode: "strict"' in line)
+    for gate in GATES:
+        assert gate in rule, gate
     assert _omp(_a("A01")).count(rule) == 1
+    omp_rule = next(line for line in _omp(_a("A01")).splitlines() if 'schemaMode: "strict"' in line)
+    for gate in GATES:
+        assert gate in omp_rule, gate
 
 
 def test_a01_lease_assignment_dispatch_protocol():
@@ -375,7 +387,6 @@ def test_omp_wiring():
     assert ignored.returncode == 1  # 1 = not ignored (0 would mean .gitignore hides the wiring)
     pkg = json.loads((ROOT / "omp" / "package.json").read_text(encoding="utf-8"))
     assert pkg["omp"]["extensions"] == ["./src/index.ts"]
-
 
 
 _TREE = ("scripts", "swarm", "prompts", "agents.json", ".claude", ".grok", ".cursor", "omp", "grokbot")
