@@ -23,6 +23,44 @@ From `omp/`, run `bun run test`, not a bare full `bun test`: the extension regis
 
 The raw shell scanners retain literal spans by index, and plain unquoted words are reused instead of rebuilt character by character. Quote, escape, comment, heredoc and operator handling is unchanged. The WR-09 regression still checks the original million-byte inputs, the 40× differential cap, and the 3× cap for doubling the same input shape from 400 KB to 800 KB.
 
+## Private signer bootstrap
+
+Use an existing operator-provisioned signer; never print it or paste it into an agent prompt.
+The trusted signer accepts `SWARM_ED25519_KEY_FILE` (an absolute path; relative paths are rejected), or the conventional
+`${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when raw signing variables are unset.
+The file must be owned by the controller user, have no group/world permissions, and contain
+exactly a 64-hex Ed25519 seed with an optional final newline. Symlink components, nonregular
+files, unsafe modes, changed-during-read metadata, and invalid contents fail closed with redacted
+errors. The conventional containing directory must also be owner-only.
+
+```bash
+export SWARM_ED25519_KEY_FILE="$HOME/.config/agent-swarm/signing-key.hex"
+export SWARM_REQUIRE_KEY=1
+python3 -c 'from swarm.envelope import real_key_configured, signing_config_error; print({"ready": real_key_configured(), "error": signing_config_error()})'
+```
+
+The probe reports readiness only; it does not emit key material. Canonical live/reused planning
+signs and verifies the persisted-plan execution assignment before `/swarm` dispatches A01.
+Dry-run/keyless/advisory planning is not authenticated execution. Specialist environments omit
+raw signing variables and loadable private references, and agent-session flags disable discovery.
+OMP receives separate `SWARM_SIGNER_DENY_PATHS` metadata so its guard also protects custom
+controller key locations. This deny-only policy cannot load a signer, grants no authority,
+and is excluded from prompts, argv, and dry-run diagnostics.
+
+After leasing a specialist task `IN_PROGRESS`, A01 obtains its exact canonical prompt with
+`swarm_assignment({task_id, correlation_id})`. The fixed `orch_assign` operation verifies
+the persisted task/correlation/manifest target and real signature without changing state,
+attempts, history, or logs. Only A01 can call it; no arbitrary code, envelope, agent, payload,
+key, or path is accepted. Pass the verified prompt unchanged to the specialist.
+Missing, unleased, child/advisory, mismatched, and dry-run requests fail closed.
+Generic code-execution devices remain forbidden; this operation is not an eval exception.
+
+Use normal OMP `write` approvals or `--approval-mode always-ask`; do not substitute a bypass.
+Grok's unsupported headless transport is rejected before claims. The lexical shell guard protects
+deterministically resolved signer reads, but is not an OS sandbox for opaque code or symlink aliases.
+Run only trusted controller code and preserve normal approvals. Restart the OMP process to load
+updated extension code; changing a separate shell cannot refresh an already-running host.
+
 
 ## Add a lane tool
 

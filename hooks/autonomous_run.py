@@ -2,7 +2,12 @@
 """Detached AgentSwarm runner used after the all-in-one Prompt Uplift hook.
 
 Fail-open. Dedupes concurrent kicks with an exclusive lock held for the whole run, plus a
-120s mtime debounce after it finishes. Always writes a log under $SWARM_DIR/autonomous.log.
+120s mtime debounce after it finishes. An accepted kick creates $SWARM_DIR/autonomous.log before the
+run starts and overwrites it with the result.
+
+The kick gate is swarm.signal_detector.classify: a brief starts a plan and a run only when it returns
+"sdlc". Questions, trivia, slash and system-reminder prompts, opt-out tokens and the dispatch marker exit
+0 without starting anything. An exact gsd-autonomous command gets no special case.
 
 The run step is capped (SWARM_AUTONOMOUS_RUN_CAP_S, default 3600). On expiry the runner is
 SIGTERMed so it can end its sessions, and SIGKILLed only after SWARM_AUTONOMOUS_RUN_GRACE_S
@@ -20,30 +25,19 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-# Auto-run for every plugin-handled prompt. Slash/ctl strings stay negative so
-# Skill dispatch and /all-in-one:* are not consumed by the swarm. Empty and
-# leading-/ briefs are skipped. "what is" is not a skip: trivia still kicks.
-NEGATIVE = ("/uplift", "/think", "explain only", "/all-in-one:")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from swarm.runlog import log_phase
+from swarm.paths import logging_paths
+from swarm.signal_detector import classify as sd_classify
 
 
 def classify(prompt: str) -> bool:
-    """Thin delegate to swarm.signal_detector for parity (n8 plan). Fail-open."""
+    """True only when swarm.signal_detector.classify marks the prompt "sdlc"; its skip rules and original-text
+    extraction apply unchanged. A classifier fault starts nothing."""
     try:
-        from swarm.signal_detector import classify as _sd_classify
-        return _sd_classify(prompt) == "sdlc"
+        return sd_classify(prompt) == "sdlc"
     except Exception:
-        # original fallback
-        low = prompt.lower()
-        if any(n in low for n in NEGATIVE):
-            return False
-        trimmed = prompt.strip()
-        if not trimmed:
-            return False
-        if trimmed.startswith("/"):
-            return False
-        return True
-
+        return False
 
 def pattern_for(brief: str) -> str:
     low = brief.lower()
@@ -133,6 +127,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--wait", action="store_true", help="run in-process (tests); default is already in-process for this script")
     args = ap.parse_args()
+    log_phase("hook.main", {"brief_excerpt": args.brief[:80], "cwd": args.cwd, "paths_spec": logging_paths(args.cwd) if hasattr(logging_paths, "__call__") else {}}, source="autonomous_run", tee=True)
     if not classify(args.brief):
         return 0
     root = Path(args.swarm_root).resolve()
@@ -147,7 +142,12 @@ def main() -> int:
     if held is None:
         log.write_text((log.read_text() if log.exists() else "") + f"skip duplicate {digest}\n")
         return 0
+    log.touch()  # created before the run starts writing it; the run overwrites it with the result
     env = {**os.environ, "SWARM_DIR": str(swarm_dir), "SWARM_CHILD": "1", "AIO_UPLIFT": "0", "AIO_SWARM": "0"}
+    key_ref = os.environ.get("SWARM_ED25519_KEY_FILE", "")
+    if key_ref and not os.path.isabs(key_ref):
+        # A relative reference names the kickoff workspace's file; the signer refuses relative refs, so export it absolute.
+        env["SWARM_ED25519_KEY_FILE"] = os.path.normpath(os.path.join(str(repo), key_ref))
     spec = Path(args.spec) if args.spec and Path(args.spec).is_file() else None
     plan = [sys.executable, str(root / "scripts" / "orch_plan.py"), "--pattern", pattern_for(args.brief), "--json"]
     plan += ["--brief", str(spec)] if spec else ["--brief-text", args.brief]

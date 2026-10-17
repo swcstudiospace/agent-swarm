@@ -53,14 +53,14 @@ TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Wri
 BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
 # D-01: the omp package's hidden swarm_* tools reach only the agents granted here (omp frontmatter only).
 SWARM_TOOLS = {
-    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"],
+    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"],
     "A08": ["swarm_gate"],
     "A09": ["swarm_gate"],
     "A10": ["swarm_gate"],
     "A12": ["swarm_gate"],
 }
-# Fail-closed ceiling for SWARM_TOOLS: A01 moves task state, the gate agents record verdicts, no agent does both.
-ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"}
+# Fail-closed ceiling: only A01 leases and requests canonical assignments; only gate agents record verdicts.
+ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"}
 # gate agent → (swarm_gate gate name, gate script stem); mirrors GATE_AGENTS in omp/src/context.ts
 GATES = {"A08": ("quality", "qa_gate"), "A09": ("review", "rev_gate"), "A10": ("security", "sec_gate"), "A12": ("release", "rel_plan")}
 GATE_AGENTS = set(GATES)
@@ -71,7 +71,8 @@ GATE_AGENTS = set(GATES)
 # It must not contain the literal pre-change branch text: tests/test_cursor_agents.py forbids it in Cursor output.
 SHARED_RULES = """- Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch. Work ends at a draft PR and a report; a human merges. Where the body below grants merge or auto-merge rights, open a draft PR and report instead.
 - Branches are `<seat-prefix>/<task_id>`. In a Programming Desk repo `<seat-prefix>` is the ownership.yaml owner of the files you change, so the branch is bot-0N-<seat>/<task_id> (gates.yml rejects any prefix not matching ^bot-0[0-6]-[a-z0-9-]+$); with more than one owner, stop BLOCKED with needs naming the seats. In any other repo `<seat-prefix>` is swarm.
-- Without a real signing key (SWARM_ED25519_KEY and SWARM_SIGNING_KEY unset) gate scripts record no verdict rows and nothing counts as APPROVED: report such results as advisory, never as a pass. Never set a signing key or SWARM_ALLOW_INSECURE_DEV_KEY, never sign or hand-write a verdict, never move a task to APPROVED or DONE yourself.
+- Gate authority comes from the trusted runtime's real signer and verified script-written verdict rows. Unset SWARM_ED25519_KEY/SWARM_SIGNING_KEY alone does not prove a controller is keyless: it may resolve an existing private Ed25519 reference. Agent-session flags disable private-reference discovery; keyless or advisory runs never count as APPROVED.
+- Never read, print, inject, or replace signing material, enable SWARM_ALLOW_INSECURE_DEV_KEY, sign or hand-write a verdict, or move a task to APPROVED or DONE yourself. Use canonical controller/gate operations and report unsigned or unrecorded results as advisory, never as a pass.
 - Never start scripts/swarm_run.py or hooks/autonomous_run.py unless the operator's assignment tells you to (specialists never do). Never use or ask for a permission-bypass mode (bypassPermissions, --dangerously-skip-permissions, --yolo).
 """
 
@@ -321,7 +322,9 @@ OMP_ORCH_PREAMBLE = """<swarm_runtime>
 - Step 0 (mandatory, before reading any file, running any script or writing anything): check your tool definitions and apply the first matching rule below; only then continue with the assignment.
   - (a) If your system prompt says you are in plan mode, or no `bash` (or `_bash`) tool is among your tool definitions: yield state IN_REVIEW with the wave plan in summary_md and spawn nothing.
   - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first.
-""" + _OMP_COMMON + """- Dispatch: spawn specialists via the omp `task` tool with `agent: <slug>` (a02-requirements … a15-docs), batching independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
+""" + _OMP_COMMON + """- Lease: use `swarm_transition` to move each ready task through CLAIMED to IN_PROGRESS before requesting its specialist assignment. Preserve the normal approval controls and single-writer artifact zones.
+- Assignment: call only `swarm_assignment` with the leased `task_id` and its `correlation_id`. It reads the current Task Store lease and returns the canonical signed `task.assign` envelope, exact `assignment_prompt` text in `prompt`, and manifest `agent_slug`. Require `status: "ok"` and `assignment_verified: true`; unsigned, advisory, dry-run, refused or missing assignments confer no dispatch authority. Never construct or sign an assignment yourself, provide a signing payload, access signing material, use generic `eval`/`xd://run_code`, or write raw swarm state to obtain one.
+- Dispatch: only after the verified assignment, spawn the specialist via the omp `task` tool with `agent` set to the returned `agent_slug` (a02-requirements … a15-docs) and `task` set to the returned `prompt` unchanged; do not reconstruct the envelope or prompt. Batch independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
 - Final yield (omp): your final `yield` is the task.result that swarm-orchestrate step 8 defines (`task_id`, `state`, `summary_md`). The swarm.status block from <output_format> goes into `summary_md`; it is never yielded as-is.
 </swarm_runtime>
 """

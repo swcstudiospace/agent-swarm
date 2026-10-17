@@ -671,21 +671,34 @@ def _emit_type_arg(call: ast.Call) -> ast.expr | None:
     return next((kw.value for kw in call.keywords if kw.arg == "event_type"), None)
 
 
+def _emit_names(tree: ast.AST) -> set[str]:
+    """`emit` plus every name bound by `from <pkg>.runlog import emit as X` (hook_trigger imports it as runlog_emit)."""
+    names = {"emit"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "runlog":
+            names.update(a.asname for a in node.names if a.name == "emit" and a.asname)
+    return names
+
+
 def _emit_sites():
-    """(literal swarm types -> files, non-literal emit sites) over every `emit(...)`/`x.emit(...)` call in the AST."""
+    """(literal swarm types -> files, non-literal emit sites) over every emit call (direct, aliased or method) in the AST."""
     literal, other = {}, []
     for path in _SOURCES:
         rel = path.relative_to(ROOT).as_posix()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=rel)):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+        names = _emit_names(tree)
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             f = node.func
-            if not ((isinstance(f, ast.Name) and f.id == "emit") or (isinstance(f, ast.Attribute) and f.attr == "emit")):
+            if not ((isinstance(f, ast.Name) and f.id in names) or (isinstance(f, ast.Attribute) and f.attr == "emit")):
                 continue
             arg = _emit_type_arg(node)
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 literal.setdefault(arg.value, []).append(path.name)
             elif isinstance(arg, ast.JoinedStr):
+                # an f-string is a family: its leading literal names it (f"phase.{phase}" is the phase. family), and the
+                # placeholder is rendered as `x` so PREFIX_KINDS resolves it like any other member of that family
                 text = "".join(p.value if isinstance(p, ast.Constant) else "x" for p in arg.values)
                 literal.setdefault(text, []).append(path.name)
             elif not (rel == _PASS_THROUGH and isinstance(arg, ast.Name) and arg.id == "event_type"):
@@ -700,7 +713,9 @@ def test_every_emitted_type_is_mapped_and_nothing_is_stale():
     unmapped = sorted(t for t in literal if tee_mod.kind_for(t) is None)
     assert unmapped == [], f"unmapped swarm event types (add to substrate_tee.TYPE_KINDS): {unmapped}"
     assert set(tee_mod.TYPE_KINDS) <= set(literal), "TYPE_KINDS lists a type nothing emits"
-    assert {"script.x", "script.x.error"} <= set(literal)
+    for prefix, _ in tee_mod.PREFIX_KINDS:
+        assert any(t.startswith(prefix) and len(t) > len(prefix) for t in literal), f"PREFIX_KINDS family with no emit site: {prefix}"
+    assert {"script.x", "script.x.error", "phase.x", "swarm.start"} <= set(literal)
 
 
 def test_kinds_are_valid_and_follow_the_documented_rules():
@@ -863,6 +878,33 @@ def test_build_event_carries_the_repo_slug(tmp_path, monkeypatch):
     rec = {"type": "task.claimed", "source": "A05@x", "correlation_id": CORR, "msg_id": "m", "task_id": "T1", "payload": {}}
     assert tee_mod.build_event(rec, GID_A, root=tmp_path)["repo"] == "o/r"
     assert "repo" not in tee_mod.build_event(rec, GID_A)
+
+
+def test_observability_progress_events_are_attributed_and_forwarded(tmp_path):
+    from swarm import observability
+    sid = "subagent-T1-abc123-1"
+    recs = [
+        observability.emit_gsd_omp("spawn", subagent_id=sid, task_id="T1", corr=CORR, root=tmp_path),
+        observability.stream_subagent_status(sid, "spawned", task_id="T1", corr=CORR, root=tmp_path),
+        observability.emit_error_agg(sid, {"errors": 1}, task_id="T1", corr=CORR, root=tmp_path),
+    ]
+    for rec in recs:
+        assert tee_mod.agent_of(rec) == "A01", rec["source"]
+        body = tee_mod.build_event(rec, GID_A)
+        assert body is not None and body["surface"] == tee_mod.AGENT_SURFACES["A01"]
+        assert body["payload"]["swarm_type"] == rec["type"]
+
+def test_dry_run_gsd_progress_is_not_forwarded_but_real_progress_is(tmp_path, on, fake):
+    from swarm import observability
+    fake.bindings[CORR] = GID_A
+    sid = "subagent-T1-abc123-1"
+    simulated = observability.emit_gsd_omp("spawn", subagent_id=sid, task_id="T1", corr=CORR, root=tmp_path, dry_run=True)
+    assert tee_mod.build_event(simulated, GID_A) is not None  # attributable on its own: only tee=False keeps it local
+    assert fake.events == [] and fake.at("/events") == []
+    real = observability.emit_gsd_omp("spawn", subagent_id=sid, task_id="T1", corr=CORR, root=tmp_path)
+    (body,) = fake.events
+    assert body["surface"] == tee_mod.AGENT_SURFACES["A01"] and body["payload"]["msg_id"] == real["msg_id"]
+    assert body["payload"]["swarm_type"] == "gsd.autonomous.omp"
 
 
 def test_tee_event_fields(tmp_path, on, fake, monkeypatch):

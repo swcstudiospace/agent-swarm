@@ -1,0 +1,232 @@
+"""A13 observability analysis tools: pure checks over supplied telemetry facts.
+
+Tools: obs_multiwindow_alert (burn-rate paging), obs_budget_remaining (error budget),
+obs_alert_fatigue (noise ratio of pages), obs_incident_mttd_mttr (detection and repair time),
+obs_ingestion_lag_p95 (telemetry lag), obs_dashboard_staleness (dashboard freshness),
+obs_runbook_link_coverage (alert-to-runbook links), obs_cardinality_estimate (series explosion),
+obs_probe_availability (synthetic probe availability and failure streaks).
+"""
+from __future__ import annotations
+
+import math
+from datetime import datetime
+
+from swarm.tools.support import respond
+
+PAGE_BURN_1H = 14.4
+PAGE_BURN_6H = 6.0
+TICKET_BURN_3D = 1.0
+
+
+def _ts(value: str) -> datetime:
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp needs a timezone: {value!r}")
+    return parsed
+
+
+def multiwindow_alert(payload: dict) -> dict:
+    """Multi-window burn rate: page when 1h >= 14.4x and 6h >= 6x; ticket when 3d >= 1x."""
+
+    def work() -> dict:
+        budget = 1.0 - payload["slo_target"]
+        burn_1h = payload["error_ratio_1h"] / budget
+        burn_6h = payload["error_ratio_6h"] / budget
+        burn_3d = payload["error_ratio_3d"] / budget
+        page = burn_1h >= PAGE_BURN_1H and burn_6h >= PAGE_BURN_6H
+        ticket = burn_3d >= TICKET_BURN_3D
+        severity = "page" if page else "ticket" if ticket else "none"
+        return {
+            "state": "SUCCESS",
+            "burn_1h": round(burn_1h, 4),
+            "burn_6h": round(burn_6h, 4),
+            "burn_3d": round(burn_3d, 4),
+            "page": page,
+            "ticket": ticket,
+            "severity": severity,
+        }
+
+    return respond(payload, work)
+
+
+def budget_remaining(payload: dict) -> dict:
+    """Error budget left in a window, from good and total event counts."""
+
+    def work() -> dict:
+        good, total = payload["good"], payload["total"]
+        if good > total:
+            return {"state": "INVALID_INPUT", "field": "good", "message": "good events exceed total events"}
+        allowed = total * (1.0 - payload["slo_target"])
+        bad = total - good
+        remaining = allowed - bad
+        return {
+            "state": "SUCCESS",
+            "allowed_bad_events": round(allowed, 2),
+            "bad_events": bad,
+            "remaining_events": round(remaining, 2),
+            "remaining_fraction": round(remaining / allowed, 4),
+            "exhausted": remaining <= 0,
+        }
+
+    return respond(payload, work)
+
+
+def alert_fatigue(payload: dict) -> dict:
+    """Share of pages that were not actionable, compared with the allowed noise ratio."""
+
+    def work() -> dict:
+        pages, actionable = payload["pages"], payload["actionable"]
+        if actionable > pages:
+            return {"state": "INVALID_INPUT", "field": "actionable", "message": "actionable pages exceed pages"}
+        noise = pages - actionable
+        noise_ratio = noise / pages if pages else 0.0
+        return {
+            "state": "SUCCESS",
+            "noise_ratio": round(noise_ratio, 4),
+            "actionable_count": actionable,
+            "noise_count": noise,
+            "fatigued": noise_ratio > payload["max_noise_ratio"],
+        }
+
+    return respond(payload, work)
+
+
+def incident_timing(payload: dict) -> dict:
+    """MTTD = detected - started; MTTR = resolved - started (time to restore); both averaged in seconds."""
+
+    def work() -> dict:
+        mttd: list[float] = []
+        mttr: list[float] = []
+        for index, item in enumerate(payload["incidents"]):
+            try:
+                started = _ts(item["started"])
+                detected = _ts(item["detected"])
+                resolved = _ts(item["resolved"])
+            except ValueError as exc:
+                return {"state": "INVALID_INPUT", "field": "incidents", "message": f"incident {index}: {exc}"}
+            if not started <= detected <= resolved:
+                return {
+                    "state": "INVALID_INPUT",
+                    "field": "incidents",
+                    "message": f"incident {index}: expected started <= detected <= resolved",
+                }
+            mttd.append((detected - started).total_seconds())
+            mttr.append((resolved - started).total_seconds())
+        return {
+            "state": "SUCCESS",
+            "incident_count": len(mttd),
+            "mttd_seconds": round(sum(mttd) / len(mttd), 1),
+            "mttr_seconds": round(sum(mttr) / len(mttr), 1),
+            "max_mttr_seconds": round(max(mttr), 1),
+        }
+
+    return respond(payload, work)
+
+
+def ingestion_lag_p95(payload: dict) -> dict:
+    """Nearest-rank P95 of telemetry ingestion lag, compared with a target."""
+
+    def work() -> dict:
+        lags = sorted(float(value) for value in payload["lags_seconds"])
+        p95 = lags[math.ceil(0.95 * len(lags)) - 1]
+        return {
+            "state": "SUCCESS",
+            "count": len(lags),
+            "p95_seconds": p95,
+            "max_seconds": lags[-1],
+            "within_target": p95 <= payload["target_s"],
+        }
+
+    return respond(payload, work)
+
+
+def dashboard_staleness(payload: dict) -> dict:
+    """Age in hours of a dashboard's last refresh at a supplied check time."""
+
+    def work() -> dict:
+        try:
+            updated = _ts(payload["last_updated_at"])
+        except ValueError as exc:
+            return {"state": "INVALID_INPUT", "field": "last_updated_at", "message": str(exc)}
+        try:
+            checked = _ts(payload["checked_at"])
+        except ValueError as exc:
+            return {"state": "INVALID_INPUT", "field": "checked_at", "message": str(exc)}
+        if checked < updated:
+            return {
+                "state": "INVALID_INPUT",
+                "field": "checked_at",
+                "message": "checked_at precedes last_updated_at",
+            }
+        age_hours = (checked - updated).total_seconds() / 3600
+        return {
+            "state": "SUCCESS",
+            "age_hours": round(age_hours, 2),
+            "stale": age_hours > payload["max_age_hours"],
+        }
+
+    return respond(payload, work)
+
+
+def runbook_link_coverage(payload: dict) -> dict:
+    """Share of alerts whose runbook reference resolves to a known runbook."""
+
+    def work() -> dict:
+        known = set(payload["known_runbooks"])
+        alerts = payload["alerts"]
+        unlinked = [alert["name"] for alert in alerts if alert["runbook"] not in known]
+        total = len(alerts)
+        linked = total - len(unlinked)
+        return {
+            "state": "SUCCESS",
+            "alert_count": total,
+            "linked_count": linked,
+            "coverage_ratio": round(linked / total, 4),
+            "unlinked_alerts": unlinked,
+        }
+
+    return respond(payload, work)
+
+
+def cardinality_estimate(payload: dict) -> dict:
+    """Worst-case series count: product of distinct values per label."""
+
+    def work() -> dict:
+        labels = payload["labels"]
+        names = [label["label"] for label in labels]
+        if len(set(names)) != len(names):
+            return {"state": "INVALID_INPUT", "field": "labels", "message": "duplicate label names"}
+        series = math.prod(label["distinct_values"] for label in labels)
+        top = max(labels, key=lambda label: label["distinct_values"])["label"]
+        return {
+            "state": "SUCCESS",
+            "series_estimate": series,
+            "exceeds_budget": series > payload["series_budget"],
+            "highest_cardinality_label": top,
+        }
+
+    return respond(payload, work)
+
+
+def probe_availability(payload: dict) -> dict:
+    """Availability ratio of boolean probe results and the longest run of consecutive failures."""
+
+    def work() -> dict:
+        results = payload["results"]
+        up = sum(1 for ok in results if ok)
+        longest = 0
+        run = 0
+        for ok in results:
+            run = 0 if ok else run + 1
+            longest = max(longest, run)
+        availability = up / len(results)
+        return {
+            "state": "SUCCESS",
+            "probe_count": len(results),
+            "availability": round(availability, 4),
+            "longest_failure_run": longest,
+            "meets_target": availability >= payload["min_availability"],
+        }
+
+    return respond(payload, work)

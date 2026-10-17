@@ -20,16 +20,17 @@ DISPATCH_MARKER = "[agent-swarm:dispatch]"
 QUESTION = re.compile(r"^(what|why|how|when|where|who|which|is|are|can|could|does|do|should|explain|describe)\b", re.I | re.A)
 TRIVIAL = re.compile(r"\btypos?\b|^rename\b", re.I | re.A)
 SDLC = re.compile(
-    r"\b(build|implement|add|create|fix|refactor|migrate|deploy|release|ship|write tests?|set up|setup|integrate|scaffold|upgrade)\b",
+    r"\b(build|implement|add|create|fix|refactor|migrate|deploy|release|ship|write tests?|set up|setup|integrate|scaffold|upgrade|orchestrate)\b",
     re.I | re.A,
 )
 
 CONTEXT = """## AgentSwarm orchestration (mandatory)
 
-Load skill `agent-swarm-orchestrate` (path: agent-swarm/skills/orchestrate/SKILL.md or .claude/skills/agent-swarm/orchestrate/SKILL.md).
+This is SDLC work (prompts containing "orchestrate", "build", "implement" etc. trigger this): route through AgentSwarm.
+Load skill `agent-swarm-orchestrate`.
+Spawn subagent `a01-orchestrator` with the user request as the brief.
+A01 plans and spawns a02–a15 by slug for parallel orchestrated execution.
 Do not implement domain work in the parent session.
-Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok spawn_subagent subagent_type=a01-orchestrator) with the user request as the brief.
-A01 plans with orch_plan.py and spawns a02–a15 by slug.
 """
 
 
@@ -57,9 +58,9 @@ def classify(prompt: str) -> bool:
     except Exception:
         # fail-open fallback to original logic
         trimmed = prompt.strip()
+        low = trimmed.lower()
         if not trimmed or trimmed.startswith("/") or trimmed.startswith("<system-reminder"):
             return False
-        low = trimmed.lower()
         if DISPATCH_MARKER in low or any(n in low for n in NEGATIVE):
             return False
         if trimmed.endswith("?") or QUESTION.search(trimmed) or TRIVIAL.search(trimmed):

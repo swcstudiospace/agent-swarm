@@ -1,12 +1,13 @@
 /**
- * Typed swarm tools (TOOL-01..06). Each execute builds `--flag=value` argv and calls the injected
- * Bridge exactly once; Python decides everything (TS holds no state or validation logic).
+ * Typed swarm tools. Each execute builds `--flag=value` argv and calls the injected Bridge exactly once;
+ * Python decides state and signature validity; the assignment consumer also checks returned dispatch metadata.
  * D-01: every tool is hidden + essential, so only sessions whose agent frontmatter names it get it.
  * D-03: mutating tools refuse with E-POLICY in plan mode before any argv, file or bridge work.
  * WR-03: swarm_gate runs only the calling gate agent's own gate (GATE_AGENTS), E-POLICY otherwise.
  */
 import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInputFile } from "./bridge.ts";
 import { callingAgent, GATE_AGENTS, inPlanMode } from "./context.ts";
+import { ORCHESTRATOR, SWARM_SLUGS } from "./guard.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 import { gitToplevel } from "./paths.ts";
 
@@ -77,6 +78,7 @@ export type PlanParams = {
   slices?: Array<{ id: string; paths: string[]; agent?: string; capability?: string; title?: string; acceptance?: string[] }>;
 };
 export type IngestParams = { task_id: string; result: Record<string, unknown> };
+export type AssignmentParams = { task_id: string; correlation_id: string };
 export type Finding = { severity: (typeof SEVERITIES)[number]; summary: string } & Partial<
   Record<"id" | "kind" | "evidence", string> & Record<"ac_ref" | "owner_suggestion" | "location", string | null>
 >;
@@ -146,6 +148,40 @@ function toolResult(res: BridgeResult, extra: string[] = []): ToolResult<Details
   const text = [res.exitCode === 1 ? `FAIL: ${summary}` : summary, ...extra].join("\n");
   return { content: [{ type: "text", text }], details: res.json };
 }
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const ASSIGNMENT_HEADING = "# task.assign (signed envelope)\n```json\n";
+
+/** Python verifies the signature; this consumer refuses mismatched dispatch metadata or an unrelated prompt. */
+function validAssignment(res: BridgeResult, params: AssignmentParams): boolean {
+  const result = res.json;
+  if (!isObject(result)) return false;
+  if (res.exitCode !== 0 || result.status !== "ok" || result.assignment_verified !== true ||
+      result.task_id !== params.task_id || result.correlation_id !== params.correlation_id ||
+      typeof result.agent_slug !== "string" || !SWARM_SLUGS.includes(result.agent_slug) ||
+      typeof result.prompt !== "string" || !isObject(result.assignment)) return false;
+  const envelope = result.assignment;
+  const payload = envelope.payload;
+  if (envelope.type !== "task.assign" || envelope.schema !== "swarm.v1.task.assign" ||
+      envelope.source !== "A01@runner" || envelope.correlation_id !== params.correlation_id ||
+      typeof envelope.sig !== "string" || !/^(?:hmac|ed25519):.+$/.test(envelope.sig) ||
+      typeof envelope.target !== "string" || result.agent_slug.split("-")[0].toUpperCase() !== envelope.target ||
+      !isObject(payload) || payload.task_id !== params.task_id || payload.correlation_id !== params.correlation_id ||
+      payload.agent_id !== envelope.target) return false;
+  // Memory precedes the real envelope and may quote the same heading and fence. Like orch_assign.py, count only
+  // blocks that carry the verified envelope and require exactly one; forged or unrelated blocks never match.
+  const expected = JSON.stringify(envelope);
+  const matches = result.prompt.split(ASSIGNMENT_HEADING).slice(1).filter((block) => {
+    try {
+      return JSON.stringify(JSON.parse(block.split("\n```", 1)[0])) === expected;
+    } catch {
+      return false;
+    }
+  });
+  return matches.length === 1;
+}
 
 export function buildTools(bridge: Bridge): SwarmTool[] {
   const status = define<StatusParams>({
@@ -168,6 +204,55 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       if (params.correlation_id) args.push(`--correlation-id=${params.correlation_id}`);
       const res = await bridge({ script: "orch_status", args, cwd: ctx.cwd, signal });
       return toolResult(res, typeof res.json.db === "string" ? [`db: ${res.json.db}`] : []);
+    },
+  });
+
+  const assignment = define<AssignmentParams>({
+    name: "swarm_assignment",
+    label: "Swarm assignment",
+    description:
+      "Obtain the canonical verified signed task.assign envelope and exact specialist prompt for an existing " +
+      "IN_PROGRESS leased task in this correlation. A01 only; refused in plan mode. Read-only Task Store access, " +
+      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { ...ID, description: "Existing leased task id" },
+        correlation_id: { ...ID, description: "The leased task's plan correlation id" },
+      },
+      required: ["task_id", "correlation_id"],
+      additionalProperties: false,
+    },
+    mutating: false,
+    async run(_toolCallId, params, signal, ctx) {
+      // Direct execute callers must meet the same authority boundary as the tool_call guard.
+      if (callingAgent(ctx) !== ORCHESTRATOR || inPlanMode(ctx)) {
+        throw new SwarmToolError("E-POLICY", "swarm_assignment refused: only A01 outside plan mode may obtain dispatch authority");
+      }
+      if (!isObject(params) || Object.keys(params).some((key) => key !== "task_id" && key !== "correlation_id") ||
+          typeof params.task_id !== "string" || !new RegExp(ID_PATTERN).test(params.task_id) ||
+          typeof params.correlation_id !== "string" || !new RegExp(ID_PATTERN).test(params.correlation_id)) {
+        throw new SwarmToolError("E-INPUT", "swarm_assignment requires only valid task_id and correlation_id");
+      }
+      let res: BridgeResult;
+      try {
+        res = await bridge({
+          script: "orch_assign",
+          args: [rootArg(ctx), `--task-id=${params.task_id}`, `--correlation-id=${params.correlation_id}`],
+          cwd: ctx.cwd,
+          signal,
+        });
+      } catch (error) {
+        // Never forward a failed child's stdout, stderr or details: they may contain invalid authority material.
+        throw new SwarmToolError(
+          error instanceof SwarmToolError ? error.code : "E-INTERNAL",
+          "swarm_assignment failed: canonical assignment unavailable",
+        );
+      }
+      if (!validAssignment(res, params)) {
+        throw new SwarmToolError("E-CONTRACT", "swarm_assignment refused: invalid canonical assignment response");
+      }
+      return { content: [{ type: "text", text: res.json.prompt as string }], details: res.json };
     },
   });
 
@@ -334,5 +419,5 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
   });
 
-  return [status, plan, ingest, transition, gate];
+  return [status, plan, assignment, ingest, transition, gate];
 }

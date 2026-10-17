@@ -78,7 +78,15 @@ export interface BeforeAgentStartResult {
 /** omp's extension command context: `hasUI` is false in print/RPC mode, where `ui.notify` is a no-op. */
 export interface CommandContext extends ExtensionContext {
   hasUI: boolean;
-  ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
+  ui?: {
+    notify(message: string, level?: "info" | "warning" | "error"): void;
+    /** Custom card above (`aboveEditor`) or below the composer. Not a transcript toast. */
+    setWidget?(
+      key: string,
+      content: unknown,
+      options?: { placement?: "aboveEditor" | "belowEditor" },
+    ): void;
+  };
   /**
    * Resolves once the agent loop is not running. During a prompt's pre-loop window (right after `sendUserMessage`)
    * it resolves at once (G-04-05-1), so it is a post-turn drain, not the turn signal; `/swarm` holds on `isIdle`.

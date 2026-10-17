@@ -37,11 +37,11 @@ def test_autonomous_dry_run(tmp_path):
     assert "DONE" in log["run_out"] or "complete" in log["run_out"].lower() or '"complete": true' in log["run_out"]
 
 
-def test_autonomous_runs_trivia(tmp_path):
-    """Auto-run for all prompts: trivia still plans + dry-runs."""
+def test_autonomous_kicks_sdlc_prompt(tmp_path):
+    """An SDLC-shaped brief passes the gate: plan and dry-run happen, and the log records both."""
     env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
     r = subprocess.run(
-        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "what is a monad", "--swarm-root", str(ROOT), "--dry-run"],
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "add a /health endpoint", "--swarm-root", str(ROOT), "--dry-run"],
         capture_output=True,
         text=True,
         env=env,
@@ -51,6 +51,26 @@ def test_autonomous_runs_trivia(tmp_path):
     log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
     assert log["plan_rc"] == 0
     assert log["run_rc"] == 0
+
+
+def test_autonomous_skips_question_without_starting_a_run(tmp_path):
+    """A question is non-sdlc: the gate exits 0 before any plan or run, so no child starts and no log is written."""
+    import shutil
+    root = tmp_path / "swarm-root"
+    shutil.copytree(ROOT / "swarm", root / "swarm")
+    (root / "scripts").mkdir()
+    started = tmp_path / "started"
+    for name in ("orch_plan.py", "swarm_run.py"):
+        (root / "scripts" / name).write_text(f"open({str(started)!r}, 'a').write({name!r} + chr(10))\n")
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm")}
+    r = subprocess.run(
+        [sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", "what is a monad",
+         "--swarm-root", str(root), "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert not started.exists()
+    assert not (tmp_path / ".swarm" / "autonomous.log").exists()
 
 
 def test_autonomous_skips_slash(tmp_path):

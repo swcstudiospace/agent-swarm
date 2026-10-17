@@ -14,6 +14,9 @@ from swarm.manifest import load_manifest
 ROOT = Path(__file__).resolve().parent.parent
 OMP_AGENTS = ROOT / "omp" / "agents"
 OMP_SKILLS = ROOT / "omp" / "skills"
+# Generated omp agent files are intentionally long XML prompts (the user explicitly accepted long
+# prompts). The largest, a01-orchestrator.md, is ~56 KiB today; 64 KiB leaves headroom for growth.
+OMP_AGENT_MAX_BYTES = 64 * 1024
 
 
 def _load(name):
@@ -65,7 +68,7 @@ def test_omp_skill_matches_renderer():
 
 builder = _load("build_agents")
 SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
-SWARM_NAMES = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"}
+SWARM_NAMES = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment", "swarm_gate"}
 OMP_TOOLS = {"read", "grep", "glob", "bash", "write", "edit", "task"} | SWARM_NAMES
 GATE_AGENTS = {"A08", "A09", "A10", "A12"}
 KEY_ORDER = ["name", "description", "tools", "spawns", "blocking", "autoloadSkills", "output"]
@@ -83,23 +86,40 @@ def _keys(text):
     return [line.split(": ", 1)[0] for line in _fm_lines(text)]
 
 
+# Contract written from the spec, not from build_agents: manifest tool names map to the fixed omp
+# tool names, and only A01 (orchestrator) and the gate agents receive hidden swarm_* grants.
+OMP_TOOL_SPEC = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
+SWARM_GRANT_SPEC = {
+    "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"],
+    "A08": ["swarm_gate"],
+    "A09": ["swarm_gate"],
+    "A10": ["swarm_gate"],
+    "A12": ["swarm_gate"],
+}
+
+
 def test_omp_tools_exact():
     for a in _agents():
         tools = _fm(_omp(a))["tools"].split(", ")
-        assert tools == [builder.TOOL_MAP[t] for t in a["tools"]] + builder.SWARM_TOOLS.get(a["id"], []), a["id"]
-        assert set(tools) <= OMP_TOOLS
-    a01 = next(a for a in _agents() if a["id"] == "A01")
-    assert _fm(_omp(a01))["tools"] == (
-        "read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition"
+        assert tools == [OMP_TOOL_SPEC[t] for t in a["tools"]] + SWARM_GRANT_SPEC.get(a["id"], []), a["id"]
+    assert _fm(_omp(_a("A01")))["tools"] == (
+        "read, grep, glob, bash, task, write, swarm_plan, swarm_status, swarm_ingest, swarm_transition, swarm_assignment"
     )
 
 
+def test_omp_tools_follow_manifest_and_authority_ceiling():
+    for a in _agents():
+        tools = _fm(_omp(a))["tools"].split(", ")
+        assert tools == [OMP_TOOL_SPEC[t] for t in a["tools"]] + SWARM_GRANT_SPEC.get(a["id"], []), a["id"]
+        assert not {"eval", "run_code"} & set(tools), a["id"]
+
+
 def test_swarm_tool_grants():
-    """D-01: only A01 moves task state and only the four gate agents record verdicts; nobody does both."""
+    """Only A01 leases and requests assignments; gate agents retain only their verdict authority."""
     for a in _agents():
         swarm = [t for t in _fm(_omp(a))["tools"].split(", ") if t.startswith("swarm_")]
         if a["id"] == "A01":
-            assert swarm == ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition"]
+            assert swarm == ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"]
         elif a["id"] in GATE_AGENTS:
             assert swarm == ["swarm_gate"], a["id"]
         else:
@@ -110,6 +130,7 @@ def test_swarm_tool_grants():
     ("aid", "grant"),
     [
         ("A01", ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_gate"]),
+        ("A01", ["swarm_gate"]),
         ("A05", ["swarm_status"]),
         ("A09", ["swarm_gate", "swarm_transition"]),
         ("A08", ["swarm_nope"]),
@@ -117,6 +138,13 @@ def test_swarm_tool_grants():
 )
 def test_swarm_tools_guard(monkeypatch, aid, grant):
     monkeypatch.setitem(builder.SWARM_TOOLS, aid, grant)
+    with pytest.raises(ValueError, match=aid):
+        builder.render_omp(_a(aid), _agents())
+
+
+@pytest.mark.parametrize("aid", [a["id"] for a in _agents() if a["id"] != "A01"])
+def test_specialists_cannot_receive_assignment_transport(monkeypatch, aid):
+    monkeypatch.setitem(builder.SWARM_TOOLS, aid, ["swarm_assignment"])
     with pytest.raises(ValueError, match=aid):
         builder.render_omp(_a(aid), _agents())
 
@@ -199,6 +227,14 @@ def test_omp_blocking_set():
     assert blocking == {"A01", "A08", "A09", "A10", "A12"}
 
 
+def test_omp_frontmatter_contract_fields():
+    required = {"name", "description", "tools", "spawns", "autoloadSkills", "output"}
+    for a in _agents():
+        keys = _keys(_omp(a))
+        assert len(keys) == len(set(keys)), a["id"]
+        assert required <= set(keys) <= required | {"blocking"}, a["id"]
+
+
 def test_omp_frontmatter_key_order():
     for a in _agents():
         keys = _keys(_omp(a))
@@ -221,6 +257,28 @@ def test_a01_strict_dispatch():
     for gate in GATES:
         assert gate in rule, gate
     assert _omp(_a("A01")).count(rule) == 1
+    omp_rule = next(line for line in _omp(_a("A01")).splitlines() if 'schemaMode: "strict"' in line)
+    for gate in GATES:
+        assert gate in omp_rule, gate
+
+
+def test_a01_lease_assignment_dispatch_protocol():
+    for text in (builder.OMP_ORCH_PREAMBLE, _omp(_a("A01"))):
+        block = text[text.index("<swarm_runtime>\n"):text.index("</swarm_runtime>")]
+        lines = block.splitlines()
+        lease = _rule(lines, "- Lease:")
+        assignment = _rule(lines, "- Assignment:")
+        dispatch = _rule(lines, "- Dispatch:")
+        assert lease < assignment < dispatch
+        assert {"CLAIMED", "IN_PROGRESS"} <= set(lines[lease].split())
+        for token in ("swarm_assignment", "task_id", "correlation_id", "assignment_prompt",
+                      'status: "ok"', "assignment_verified: true"):
+            assert token in lines[assignment], token
+        for token in ("unsigned", "advisory", "dry-run", "no dispatch authority",
+                      "Never construct or sign", "signing material", "eval", "xd://run_code", "raw swarm state"):
+            assert token in lines[assignment], token
+        for token in ("verified assignment", "`agent_slug`", "`prompt` unchanged"):
+            assert token in lines[dispatch], token
 
 
 def _a01_runtime_lines():
@@ -287,7 +345,7 @@ def test_omp_preamble_keeps_autonomy_ceiling():
 
 def test_omp_size_bound():
     sizes = {p.stem: p.stat().st_size for p in OMP_AGENTS.glob("*.md")}
-    assert max(sizes.values()) <= 24 * 1024
+    assert max(sizes.values()) <= OMP_AGENT_MAX_BYTES
     assert max(sizes, key=sizes.get) == "a01-orchestrator"
 
 
@@ -414,3 +472,20 @@ def test_omp_orphan_symlink_never_followed(omp_tree, tmp_path_factory):
     assert "refused" in w.stderr and "Traceback" not in w.stderr
     assert (victim / "SKILL.md").read_text(encoding="utf-8") == "keep"
     assert link.is_symlink()
+
+
+
+# Cursor contract: the spawn grant is written as "with the Task tool" in the A01 preamble
+# (.cursor/agents/a01-orchestrator.md). Specialists only mention the Task tool as forbidden
+# ("must not call the Task tool"), so the affirmative literal must appear in A01 alone.
+CURSOR_SPAWN_LITERAL = "spawn specialists with the Task tool"
+
+
+def test_cursor_task_tool_grant_only_on_orchestrator():
+    cursor_dir = ROOT / ".cursor" / "agents"
+    for a in _agents():
+        path = cursor_dir / f"{a['slug']}.md"
+        assert path.is_file(), path
+        text = path.read_text(encoding="utf-8")
+        has = CURSOR_SPAWN_LITERAL in text
+        assert has == (a["slug"] == "a01-orchestrator"), (path.name, has)

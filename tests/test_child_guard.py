@@ -8,11 +8,14 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 HOOK = ROOT / "hooks" / "user_prompt_submit.py"
 
 
 def _load_swarm_run(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWARM_SIGNER_DENY_PATHS", raising=False)
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
     spec = importlib.util.spec_from_file_location("swarm_run_under_test", ROOT / "scripts" / "swarm_run.py")
     mod = importlib.util.module_from_spec(spec)
@@ -49,13 +52,50 @@ def test_headless_agent_env_marks_child(tmp_path, monkeypatch):
             return self.returncode
 
     monkeypatch.setattr(mod.subprocess, "Popen", FakePopen)
-    args = SimpleNamespace(runtime="claude", claude_bin="claude", permission_mode="bypassPermissions",
+    args = SimpleNamespace(runtime="claude", claude_bin="claude", permission_mode="acceptEdits",
                            max_turns=5, model="", allowed_tools="", task_timeout=10)
     mod.run_agent_headless({"slug": "a05-backend", "id": "A05"}, "implement the thing", tmp_path, args)
     env = seen["env"]
     assert env["AIO_UPLIFT"] == "0"
     assert env["AIO_SWARM"] == "0"
     assert env["SWARM_CHILD"] == "1"
+
+
+def test_deny_metadata_cannot_supply_a_child_signer(tmp_path, monkeypatch):
+    from swarm import envelope
+    from swarm.errors import SwarmError
+
+    mod = _load_swarm_run(tmp_path, monkeypatch)
+    reference = str(tmp_path / "outside-home-and-xdg" / "synthetic-private-source.hex")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", reference)
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "synthetic-controller-secret")
+    monkeypatch.setenv("SWARM_ED25519_KEY", "synthetic-controller-seed-value")
+    monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY", raising=False)
+    original = dict(os.environ)
+    args = SimpleNamespace(model="", task_timeout=10)
+    argv, child_env, _ = mod.headless_command(
+        "omp", {"slug": "a05-backend", "id": "A05"}, tmp_path, tmp_path / ".swarm", args)
+    assert json.loads(child_env["SWARM_SIGNER_DENY_PATHS"]) == [reference]
+    assert not {"SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE"} & child_env.keys()
+    prompt = Path(argv[argv.index("--append-system-prompt") + 1]).read_text()
+    assert all(value not in " ".join(argv) + prompt for value in (
+        reference, original["SWARM_SIGNING_KEY"], original["SWARM_ED25519_KEY"], "SWARM_SIGNER_DENY_PATHS",
+    ))
+    reads = []
+
+    def trap_private_read(path, *, fallback):
+        reads.append(path)
+        raise AssertionError("a child must not open any private signer source")
+
+    with monkeypatch.context() as child:
+        child.setattr(os, "environ", child_env)
+        child.setattr(envelope, "_private_seed", trap_private_read)
+        assert envelope._ed25519_material() == (None, None)
+        assert not envelope.real_key_configured()
+        with pytest.raises(SwarmError, match="E-POLICY: fail-closed: no signing key configured"):
+            envelope.sign_envelope({"type": "task.assign"}, audit=False)
+        assert reads == []
+    assert dict(os.environ) == original
 
 
 def test_hook_silent_inside_swarm_child():

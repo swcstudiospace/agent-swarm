@@ -9,20 +9,29 @@ import { resolve } from "node:path";
 import { type Bridge, type Inflight, killInflight, runPy } from "./bridge.ts";
 import { swarmCommand } from "./commands.ts";
 import { callingAgent, inPlanMode, sessionAgent } from "./context.ts";
-import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR } from "./guard.ts";
+import { GUARD_ERROR_PREFIX, type GuardFacts, guardToolCall, inSwarm, ORCHESTRATOR, parseSignerDenyPaths } from "./guard.ts";
 import { runtimeContext, swarmContext } from "./hooks.ts";
 import type { ExtensionFactory } from "./omp-api.ts";
+import { createDockState, dockUi, publishTaskSpawn, settleTaskResult, type TaskResultEvent } from "./swarm_dock.ts";
 import { buildTools } from "./tools.ts";
 
-/** DI seam: tests inject a recording bridge; production uses the single python bridge. */
+function taskResult(event: unknown): TaskResultEvent | undefined {
+  if (!event || typeof event !== "object" || !("toolName" in event) || event.toolName !== "task") return undefined;
+  const toolCallId = "toolCallId" in event && typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+  const isError = "isError" in event && event.isError === true;
+  return { toolName: "task", toolCallId, isError };
+}
+
 export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionFactory {
   return (pi) => {
     // WR-01: this session's children only — a sibling session's shutdown never reaches them
     const inflight: Inflight = new Set();
+    // the status card is per session, like inflight: a sibling session never paints this session's rows
+    const dock = createDockState();
     const scoped: Bridge = (req) => bridge({ ...req, inflight });
     for (const tool of buildTools(scoped)) pi.registerTool(tool);
     // ORCH-03 (D-11): the same scoped bridge, so session_shutdown also sweeps the command's python child
-    pi.registerCommand("swarm", swarmCommand(pi, scoped));
+    pi.registerCommand("swarm", swarmCommand(pi, scoped, { dock }));
     // D-07: group-kill this session's in-flight python children when it ends (registration only, no I/O)
     pi.on("session_shutdown", () => killInflight(inflight));
     // HOOK-01 (D-09): SDLC prompts in a top-level session get the AgentSwarm context; fail-open on any error.
@@ -47,11 +56,30 @@ export function createSwarmExtension({ bridge }: { bridge: Bridge }): ExtensionF
         // D-08: the runtime roots bridge.swarmRoot() picks from (env SWARM_ROOT, the package's repo), spelled without fs
         const root = env.SWARM_ROOT?.trim();
         const runtimeRoots = [...(root ? [resolve(root)] : []), resolve(import.meta.dir, "..", "..")];
-        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots };
-        return guardToolCall(event, facts);
+        const signerReadPaths = parseSignerDenyPaths(env.SWARM_SIGNER_DENY_PATHS);
+        const facts = { ...known, restricted, planMode: inPlanMode(ctx), hasTask, env, cwd: ctx.cwd, home: homedir(), tmp: tmpdir(), runtimeRoots, signerReadPaths };
+        const decision = guardToolCall(event, facts);
+        if (!decision?.block && event.toolName === "task") {
+          try {
+            publishTaskSpawn(dock, dockUi(ctx), event.input, event.toolCallId);
+          } catch {
+            // dock is display-only; a render failure must not change the tool decision
+          }
+        }
+        return decision;
       } catch (err) {
         if (!inSwarm({ ...known, env })) return undefined;
         return { block: true, reason: `${GUARD_ERROR_PREFIX}${err instanceof Error ? err.message : String(err)})` };
+      }
+    });
+    // The dock paints a task spawn as running. tool_result is the only parent-side signal
+    // that the spawn finished; without it the card stays on that first status forever.
+    pi.on("tool_result", (event, ctx) => {
+      try {
+        const result = taskResult(event);
+        if (result) settleTaskResult(dock, dockUi(ctx), result);
+      } catch {
+        // dock is display-only; a render failure must not change the tool result
       }
     });
   };

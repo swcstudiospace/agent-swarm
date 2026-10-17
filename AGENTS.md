@@ -8,7 +8,7 @@ AgentSwarm contains two things:
 - **Runnable implementation:**
   - `swarm/` — Python runtime: signed envelopes, a SQLite task state machine, and gates.
   - `scripts/` — per-agent CLI tools, each with a Bun TypeScript twin.
-  - Generated subagent definitions for Claude Code, Grok Build, Trae SOLO and omp.
+  - Generated subagent definitions for Claude Code, Grok Build, Cursor, and omp.
 
 `scripts/swarm_run.py` drives headless `claude -p --agent <slug>`, `grok -p --agent <slug>` or `omp -p` sessions against a target repo. This is not a library or a service.
 
@@ -103,20 +103,19 @@ flowchart LR
   - An omp `Failed to load extension` line stops that session's process group as soon as it is written. The run then starts no further session, so a guard that did not load is not retried unguarded in the same run (T-06-27). The task stays FAILED and a later run may try again.
   - Overwrites `$SWARM_DIR/autonomous.log`.
 
-- New after-orchestrate hook (n3/n8): `hooks/on_a01_complete.py` (thin) + `swarm/hook_trigger.py` + `swarm/signal_detector.py`. Fires (opt-in: `AIO_SWARM_AFTER_ORCH` or `SWARM_AFTER_ORCH` set to `1`, `true`, `yes`, or `on`) on a01-orchestrator IN_REVIEW or uplift end. ID=sha(session+fp+corr), dedup via state_store. Stub side-effect now; later: spawn gsd-autonomous or parallel swarm. Thin shims in user_prompt_submit + autonomous_run delegate classify to detector. Separate .swarm/ state; .claude/swarm-state.json obs projection. The workspace installer does not register it as a Claude/Grok `Stop` hook by default (nor does the committed `.grok/hooks/agent-swarm.json`): `build_agents.py --install-workspace <ws> --with-a01-complete-hook` opts in, and a reinstall without the flag removes an earlier registration of it (other Stop hooks are left alone). Registered, `swarm/hook_trigger.py` detaches `autonomous_run.py` only when that opt-in is on, a real signing key is configured, `SWARM_ALLOW_AUTONOMOUS=1` is set and no cloud-agent marker (`CURSOR_AGENT`, `CURSOR_CLOUD_AGENT`, `CLOUD_AGENT`) is set. Once the opt-in is on and a completion signal was detected, any other case records the refusal reason on the hook-fired event and spawns nothing; with opt-in off, or with no completion signal, it returns without writing that event.
-- Adopted n6 defaults: a01-complete signal, sequential default (until safety), opt-in, separate state.
+- New after-orchestrate hook (n3/n8): `hooks/on_a01_complete.py` (thin) + `swarm/hook_trigger.py` + `swarm/signal_detector.py`. Fires (opt-in: `AIO_SWARM_AFTER_ORCH` or `SWARM_AFTER_ORCH` set to `1`, `true`, `yes`, or `on`) on a01-orchestrator IN_REVIEW or uplift end. ID=sha(session+fp+corr), dedup via state_store. Now forwards gsd-autonomous to OMP concurrent launch (subagent parallel spawn, partition, status stream) via exact verbatim command `/gsd-autonomous workflowz ultrathink orchestrate` (hook_trigger calls OMP -p path; autonomous_run classify updated to treat it sdlc). Thin shims in user_prompt_submit + autonomous_run delegate classify to detector. Separate .swarm/ state; .claude/swarm-state.json obs projection. The workspace installer does not register it as a Claude/Grok `Stop` hook by default (nor does the committed `.grok/hooks/agent-swarm.json`): `build_agents.py --install-workspace <ws> --with-a01-complete-hook` opts in, and a reinstall w…
+- Adopted n6 defaults: a01-complete signal, opt-in, separate state. gsd-autonomous workflowz uses OMP concurrent (SPE-13819 n3.6-7); sequential preserved for other.
 **Generation pipeline**
 - `prompts/` + `agents.json` → `build_agents.py` → `.claude/agents/<slug>.md`, `.grok/agents/<slug>.md`, `.cursor/agents/<slug>.md`, `omp/agents/<slug>.md` and `omp/skills/<slug>/SKILL.md`
   - `build_agents.py` also writes and `--check`s `omp/skills/swarm-orchestrate/SKILL.md` (rendered by `_write_skills.swarm_orchestrate_skill()`).
   - `omp/agents/` and `omp/skills/` are generated; `omp/package.json`, `omp/src/` and `omp/test/` are hand-written (see **omp extension package** below).
   - The omp preamble of the four gate agents (A08, A09, A10, A12; `GATES` in `build_agents.py`) mandates `swarm_gate` for recording their gate and forbids running the gate script through bash; for the review, quality and security gates it requires each failing target in `per_target_findings` with at least one `major` finding. Their `prompts/` bodies, and so the claude and grok renders, still run the scripts, where the headless runner records.
   - omp `tools:` lists are not a sandbox; the `tool_call` guard above enforces the ceiling, swarm-state and depth rules, and read-only stays unenforced.
-- `prompts/` + `agents.json` → `build_trae_agents.py` → `.trae/`: 15 XML prompts of at most 10,000 characters each, `registration.json`, `commands/swarm.md`, `README.md`
 - `_write_skills.py` → `skills/<slug>/SKILL.md`, `skills/orchestrate/SKILL.md`, `omp/skills/<slug>/SKILL.md` and `omp/skills/swarm-orchestrate/SKILL.md`
 
 **Cursor agents** (`.cursor/agents/`, generated by `render_cursor` in `build_agents.py`; `scripts/ts/build_agents.ts` stays a passthrough so the dialects cannot drift)
 - Frontmatter is Cursor's documented subagent fields only: `name`, `description`, and `model: inherit` ([Subagents](https://cursor.com/docs/subagents)). There is no `tools:` key. `readonly` and `is_background` are left at their defaults.
-- The body is the shared `prompts/` file plus rewrites. `SHARED_BODY_SUBSTITUTIONS` (A05, A06, A09, A14) apply to every render (Claude, Grok, omp and Cursor): they rewrite the A14 and A09 merge grants into draft-PR wording and the A05, A06 and A09 branch names into `<seat-prefix>/<task_id>`. `CURSOR_BODY_SUBSTITUTIONS` is those plus the Cursor-only A01 and A10 gate rewrites. A missing or duplicated pattern raises. Every render's preamble also embeds the one `SHARED_RULES` block (no merge or auto-merge, the branch rule, advisory without a signing key, no unattended runner or bypass mode), so the rules cannot drift between runtimes (`tests/test_render_rules.py`). `omp/agents/a01-orchestrator.md` is within about 100 B of its 24 KB cap (`tests/test_omp_agents.py`), so the block stays short. The preamble names Cursor tools (Read, Grep, Glob, Write, StrReplace, Shell, and Task for A01 only). A01 may spawn the other slugs with the Task tool; specialists must not spawn. Cursor allows two levels.
+- The body is the shared `prompts/` file plus rewrites. `SHARED_BODY_SUBSTITUTIONS` (A05, A06, A09, A14) apply to every render (Claude, Grok, omp and Cursor): they rewrite the A14 and A09 merge grants into draft-PR wording and the A05, A06 and A09 branch names into `<seat-prefix>/<task_id>`. `CURSOR_BODY_SUBSTITUTIONS` is those plus the Cursor-only A01 and A10 gate rewrites. A missing or duplicated pattern raises. Every render's preamble also embeds the one `SHARED_RULES` block (no merge or auto-merge, the branch rule, advisory without a signing key, no unattended runner or bypass mode), so the rules cannot drift between runtimes (`tests/test_render_rules.py`). `omp/agents/a01-orchestrator.md` is capped at 64 KiB (`OMP_AGENT_MAX_BYTES` in `tests/test_omp_agents.py`); the prompts are intentionally long, per the user's direction. The preamble names Cursor tools (Read, Grep, Glob, Write, StrReplace, Shell, and Task for A01 only). A01 may spawn the other slugs with the Task tool; specialists must not spawn. Cursor allows two levels.
 - Script calls use `python3 "$SWARM_ROOT/scripts/<tool>.py" --root <target repo>` when `SWARM_ROOT` is a pinned agent-swarm checkout. Repo-local `scripts/` is the fallback only inside agent-swarm itself. A target such as programming-desk does not vendor the runtime and already has its own `scripts/` directory.
 - A Cursor cloud session is advisory: no signing key is present (`SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY`, `SWARM_REQUIRE_KEY` unset), gate scripts record nothing, and nothing counts as APPROVED. A missing signing key is expected and is not E-DEP. A missing Task Store, python3 or git is still E-DEP. The agent accepts an unsigned `task.assign` and does not sign. Every gate script (`qa_gate`, `rev_gate`, `sec_gate`, `rel_plan`) runs only as a non-recording preview through python3 with `SWARM_AGENT_SESSION=1`: the script writes an advisory envelope file and records no verdict rows. The bun twin `scripts/ts/sec_gate.ts` is not that preview; it returns scan JSON and does not write the envelope. Non-gate results are ingested with `orch_status.py --ingest --advisory`, which saves the result and does not attempt APPROVED or DONE. The agent never sets `SWARM_SIGNING_KEY`, `SWARM_ED25519_KEY` or `SWARM_ALLOW_INSECURE_DEV_KEY`, never signs or records a verdict, and never ingests a gate result or transitions a task to APPROVED or DONE. A gate result that fails, is refused or is unrecorded is advisory. When a gate child returns, A01 transitions that gate task to BLOCKED (`advisory preview recorded no verdict rows; human records the gate`), stops the scheduling loop, and does not spawn tasks that depend on it. Those dependents stay unscheduled, and the handoff is not APPROVED. It never merges, enables auto-merge, pushes to a protected branch or deletes a branch. Work ends at a draft PR. The merge gate is Greptile, run by Desk Quality. In a Programming Desk repo the branch is `bot-0N-<seat>/<task_id>` because `gates.yml` requires `^bot-0[0-6]-[a-z0-9-]+$`.
 - `scripts/_install_cursor.py --target <repo>` (also `build_agents.py --install-cursor <repo>`) copies `.cursor/agents/` and `.cursor/rules/agent-swarm.mdc` only. It supports `--dry-run` and `--check`, refuses symlinks and a differing file it did not write, and writes no MCP config and no env files. It does not run the substrate installer. `grokbot/skills/swarm-cloud-dispatch/SKILL.md` is the Grok Bot procedure: install in a PR, then brief a Cursor cloud agent to run `a01-orchestrator`; the result is a draft PR.
@@ -145,7 +144,28 @@ flowchart LR
 - `task.maxRecursionDepth` (the installer never writes it): the default 2 fits main → `a01-orchestrator` (keeps `task`) → specialists (no `task`). Set 3 only when A01 is itself spawned by another subagent, else HOOK-04 makes it yield `BLOCKED needs: depth`: `task:\n  maxRecursionDepth: 3` in `<ws>/.omp/config.yml` or `~/.omp/agent/config.yml`. Never set a negative (unlimited) value; specialists never gain `task` at any depth.
 - Swarm runs expect `task.isolation` off: the Task Store resolves from `SWARM_DIR` or the git toplevel of the session cwd, and isolated worktrees would split it.
 
+**OMP sessions component (clarified; n2/n7 wave 1 assumptions incorporated; swarm init default for orchestrate command flow; SPE-13575)**
+
+Working assumptions (explicit from repo evidence):
+- q1 (signing key): OPTIONAL when supplied (perform validation only if key present; enterprise uses REQUIRE_KEY=1). (AGENTS.md:72,78; swarm/envelope.py:222; docs/operations-runbook.md:38). Dev only with ALLOW_INSECURE and not ED25519/REQUIRE=1. Keyless=advisory (children/cloud/dry-run).
+- q2: Requires prior 'on' (ultrathink classification).
+- q3: Brief plus free text (for /swarm).
+- q4: OMP sessions logic + diagnostics reference assumptions for syntax (ultrathink via unescaped <ORIGINAL>), key, limits (depth/hold/recursion).
+
+Current bypass (classifier/hooks/gsd autonomous evidence confirmed): / commands and gsd own agents bypass to non-sdlc (startswith("/") or "<system-reminder" or NEGATIVE/DISPATCH_MARKER or SWARM_CHILD=1 or non-empty SWARM_AGENT; swarm/signal_detector.py:25, omp/src/hooks.ts:35, hooks/autonomous_run.py:43 (updated), hooks/user_prompt_submit.py:60, AGENTS.md:83; gsd-auton now uses OMP cmd path not CHILD=1 spawn. Exact `/gsd-autonomous workflowz ultrathink orchestrate` classified sdlc for concurrent launch (hook_trigger.py updated to OMP, autonomous_run.py classify updated). Other bypass preserved. SPE-13819 n3.6-7.
+
+Pre: headless always --no-session (no OMP init; swarm_run.py:351); detection: session_init.agent || (topLevel ? env.SWARM_AGENT : undef) (omp/src/context.ts:22,31); *swarm session* = slug or (topLevel && (SWARM_AGENT||TASK_ID)) via inSwarm (guard.ts:66); /swarm requires topLevel !plan (commands.ts:232); HOOKs/guards silent for any session_init/CHILD/AGENT (hooks.ts:121); ambiguities in topLevel/env fallback, plan-yolo timing vs session_init, /swarm bypass vs dispatch, gsd own vs after-orch (n3/n8), diags not ref assump, activation not default obs.
+
+Updated: swarm init DEFAULT for the command (orchestrate /swarm + a01 flow). Removed --no-session from headless OMP cmd; OMP sessions now default for swarm agents. Identity prefers session_init (now present for headless); env fallback only top headless without. inSwarm/callingAgent/runtimeContext use it. /swarm still topLevel but with default session init. Classifier/gsd bypass preserved for others; gsd-autonomous workflowz ultrathink orchestrate now supported as sdlc + OMP concurrent launch in hook_trigger/autonomous_run (SPE-13819 n3.6-7).
+
+Diagnostics reference assumptions (session_id observable in omp_stream_text; keyless/dry-run notes; ultrathink <ORIGINAL> parity; limits). Swarm activation default observable (session events, id, dispatch logs).
+
+Evidence: swarm_run.py:351 (post-edit), context.ts:22+, hooks.ts:114/154/43, guard.ts:66, commands.ts:232/117, signal_detector.py:25/46, AGENTS.md:87/106-107 (n2/n3 n3/n2 n3/n8 n6), envelope.py:105, runbook:44.
+
+This makes swarm activation default observable.
+
 ## Key Directories
+
 
 | Path | Purpose |
 |---|---|
@@ -156,7 +176,7 @@ flowchart LR
 | `03-agents/` | Original 7-section agent specs (Purpose, Stack, Communication, Decision logic, Errors, Metrics, Security) |
 | `hooks/` | `user_prompt_submit.py` and `autonomous_run.py` |
 | `grokbot/` | Grok Bot export: generated `swarm/seat-map.json` and `skills/swarm-<lane>/`, plus the hand-written `skills/swarm-cloud-dispatch/` |
-| `.claude/agents/`, `.grok/agents/`, `.cursor/agents/`, `.trae/`, `skills/`, `omp/agents/`, `omp/skills/` | **Generated.** Never hand-edit. `.cursor/rules/agent-swarm.mdc` is hand-written and copied by the Cursor installer |
+| `.claude/agents/`, `.grok/agents/`, `.cursor/agents/`, `skills/`, `omp/agents/`, `omp/skills/` | **Generated.** Never hand-edit. `.cursor/rules/agent-swarm.mdc` is hand-written and copied by the Cursor installer |
 | `omp/package.json`, `omp/src/`, `omp/test/` | Hand-written omp extension package (tools, single python bridge, `guard.ts` rule table, `hooks.ts` context hook, `commands.ts` `/swarm`) and its `bun:test` suite |
 | `.omp/config.yml` | Committed omp project wiring (`extensions: [omp]`); the only file in `.omp/` |
 | `.swarm/` | Runtime state (own `.gitignore` of `*`, written on creation; the repo's `.gitignore` is never touched): `tasks.db`, `events.jsonl`, `plans/`, `assignments/`, `results/`, `verdicts/`, `kickoffs/`, `releases/`, `artifacts/`, `slo/`, `incidents/`, `patch_tasks/` |
@@ -175,7 +195,6 @@ ruff check .                                          # py312, E/F/W, E501 ignor
 # regenerate after editing prompts/ or agents.json (run BOTH)
 python3 scripts/build_agents.py                       # .claude/agents + .grok/agents + .cursor/agents + omp/agents + omp/skills   (--check, --only A05,a06-frontend)
 python3 scripts/_install_cursor.py --target /path/to/repo   # copy Cursor agents into a repo that does not vendor the swarm (--dry-run, --check). Set SWARM_ROOT to this checkout on that repo.
-python3 scripts/build_trae_agents.py                  # .trae/                          (--check, --dry-run, --json)
 python3 scripts/_write_skills.py                      # skills/ + omp/skills/ (overwrites everything; has no --check)
 python3 scripts/build_agents.py --install-workspace /path/to/ws   # regenerate, then Claude/Grok agents, skills, hooks, omp package + substrate-mcp (--omp-mode link|copy, --dry-run, --runtimes, --no-substrate)
 
@@ -291,8 +310,8 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 
 **Invariants the tests pin** — keep these true when editing:
 - **Prompt tags.** Each `prompts/A*.md` has `<agent id="Axx"` and these 20 tag pairs: role, inputs, outputs, output_format, tools, decision_logic, autonomy, error_handling, metrics, security, constraints, system_role, scope, out_of_scope, workflow, acceptance_criteria, states, graph_of_thought, graceful_degradation, security_and_validation. It must also contain `<script path=`, `python3 scripts/` and `scripts/ts/`, and end with `</agent>`.
-- **Generated files match their generators.** `build_agents.py --check` and `build_trae_agents.py --check` must pass. Each Trae prompt must be at most 10k characters; A01 is already near the limit, and an oversized prompt raises instead of being truncated.
-- **Hard-coded counts.** Exactly 15 agents. DAG sizes feature=13, hotfix=8, dependency=8. The Trae bundle writes 18 files. Adding an agent or changing a pattern means updating these tests.
+- **Generated files match their generators.** `build_agents.py --check` must pass.
+- **Hard-coded counts.** Exactly 15 agents. DAG sizes feature=13, hotfix=8, dependency=8. Adding an agent or changing a pattern means updating these tests.
 - **Script contract.** Every non-`_` script supports `--dry-run --json` and exits 0 or 1 with `status`. Every one has a TS twin whose output includes `agent` and `script`.
 - **Skills.** Each has `name: <slug>`, `disable-model-invocation: false`, and `## When to Use` / `## Procedure` headings.
 - **Generated agent frontmatter.** `.claude/agents` has `model: inherit`. `.grok/agents` has `prompt_mode: full`, `agents_md: true` and `permission_mode: default`.
