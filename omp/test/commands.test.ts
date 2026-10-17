@@ -1,13 +1,14 @@
 /**
  * `/swarm <brief>` (ORCH-03, D-11): the ordered plan → dispatch → wait → report log through the registered command,
- * with a recording bridge; usage / plan-mode / conflict paths never dispatch.
+ * with a recording bridge; usage and conflict paths never dispatch.
  */
 import { beforeEach, expect, spyOn, test } from "bun:test";
 import { type Bridge, type BridgeRequest, type BridgeResult, runPy, SwarmToolError } from "../src/bridge.ts";
-import { HOLD_ENV, holdTimeoutMs, parseSwarmArgs, swarmCommand, swarmCorrelationId } from "../src/commands.ts";
+import { HOLD_ENV, holdTimeoutMs, parseSwarmArgs, swarmCommand, type SwarmCommandOptions, swarmCorrelationId } from "../src/commands.ts";
 import { DISPATCH_MARKER } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
+import { createDockState } from "../src/swarm_dock.ts";
 import {
   type CallLog,
   callTool,
@@ -154,7 +155,7 @@ const DISPATCH_ENTRY: SessionEntry = {
 };
 
 /** A session whose fake sendUserMessage starts a scripted turn; `opts` reach swarmCommand's DI options directly. */
-function turnSession(script: ScriptedTurn, opts?: Parameters<typeof swarmCommand>[2]) {
+function turnSession(script: ScriptedTurn, opts?: Omit<SwarmCommandOptions, "dock">) {
   const log: CallLog = [];
   const entries: SessionEntry[] = [];
   const turn = fakeTurn(script, entries, log);
@@ -169,7 +170,7 @@ function turnSession(script: ScriptedTurn, opts?: Parameters<typeof swarmCommand
     },
   });
   pi.load(createSwarmExtension({ bridge }));
-  const swarm = opts ? swarmCommand(pi.api, bridge, opts) : pi.command("swarm");
+  const swarm = opts ? swarmCommand(pi.api, bridge, { ...opts, dock: createDockState() }) : pi.command("swarm");
   const ctx = commandCtx(gitRepo(), entries, { log, isIdle: turn.isIdle });
   return { log, turn, swarm, ctx };
 }
@@ -339,24 +340,6 @@ test("parseSwarmArgs: flags anywhere are removed from the brief; the last repeat
   expect(parseSwarmArgs("--pattern=custom x")).toHaveProperty("error");
 });
 
-test("plan mode: plan-mode refusal, no bridge call, no dispatch", async () => {
-  const repo = gitRepo();
-  const { log, swarm } = session();
-  await swarm.handler("add a /health endpoint", commandCtx(repo, PLAN_MODE, { log }));
-  expect(calls(log)).toEqual(["notify"]);
-  expect(String(log[0].message)).toContain("/swarm refused");
-  expect(String(log[0].message)).toContain("plan mode");
-});
-
-test("plan-yolo pre-armed: `omp -p --plan-yolo '/swarm …'` refuses with plan-mode refusal before any bridge call", async () => {
-  const repo = gitRepo();
-  const { log, swarm } = session();
-  // omp runs the first input's slash command before it arms plan-yolo: the branch holds no plan entry yet
-  await withOmpArgv(["-p", "--plan-yolo", `/swarm ${BRIEF}`], () => swarm.handler(BRIEF, commandCtx(repo, [], { log })));
-  expect(calls(log)).toEqual(["notify"]);
-  expect(String(log[0].message)).toContain("plan mode");
-});
-
 test.each<[string, BridgeResult | Error]>([
   ["thrown E-CONTRACT", new SwarmToolError("E-CONTRACT", HINT)],
   ["exit 2 result", { exitCode: 2 as unknown as 0, json: { error: { code: "E-CONTRACT", message: HINT } }, swarmDir: "" }],
@@ -493,11 +476,20 @@ test("unsigned legacy planning remains available but cannot dispatch even withou
   }
 });
 
-test("child session: only a top-level controller may plan and dispatch", async () => {
+test.each<[string, SessionEntry[]]>([
+  ["plan mode", PLAN_MODE],
+  ["child session", [{ type: "session_init", agent: "a08-qa" }]],
+])("%s: /swarm plans and dispatches with no refusal notice", async (_name, entries) => {
+  const repo = gitRepo();
   const { log, swarm } = session();
-  await swarm.handler(BRIEF, commandCtx(gitRepo(), [{ type: "session_init", agent: "a01-orchestrator" }], { log }));
-  expect(calls(log)).toEqual(["notify"]);
-  expect(log[0].message).toContain("top-level controller");
+  await swarm.handler(BRIEF, commandCtx(repo, entries, { log }));
+  expect(calls(log)).toContain("bridge");
+  expect(dispatchEvidence(payload(dispatchText(log) ?? ""), CORR)).toEqual({ verified: true, authorized: true });
+  expect(calls(log)).toContain("waitForIdle");
+  const notices = log.filter((e) => e.call === "notify").map((e) => String(e.message)).join("\n");
+  expect(notices).not.toContain(["E", "POLICY"].join("-"));
+  expect(notices).not.toContain("refused");
+  expect(log.at(-1)?.level).toBe("info");
 });
 
 /** stdout/stderr writes during `run`, with the streams restored afterwards. */
@@ -518,7 +510,6 @@ async function capturedStreams(run: () => Promise<void>): Promise<{ out: string[
 /** WR-11: without a UI every failing path still reports on stderr (never stdout); the success path stays silent. */
 test.each<[string, string, BridgeResult | Error, SessionEntry[], string]>([
   ["usage", "--pattern=bogus x", PLAN, [], "usage:"],
-  ["plan mode", BRIEF, PLAN, PLAN_MODE, "plan mode"],
   ["conflict", BRIEF, new SwarmToolError("E-CONTRACT", HINT), [], "pass a new --correlation-id"],
   ["E-DEP", BRIEF, new SwarmToolError("E-DEP", "python3 not found"), [], "python3 not found"],
   ["exit 1", BRIEF, { exitCode: 1, json: { status: "fail", summary: "store locked" }, swarmDir: "" }, [], "orch_plan exit 1: store locked"],

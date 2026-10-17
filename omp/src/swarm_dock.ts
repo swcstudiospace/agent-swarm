@@ -36,7 +36,18 @@ export interface SwarmDockComponent {
   render(width: number): readonly string[];
 }
 
-const live: SwarmDock = { title: "Agent Swarm", rows: [] };
+/** Dock state owned by one session. omp builds the extension once per session, so each owns one. */
+export interface DockState {
+  live: SwarmDock;
+  /** toolCallId → row ids painted for that `task` call. Settled by `tool_result`. */
+  pendingSpawns: Map<string, string[]>;
+  /** Numbers `task` calls that arrive without a toolCallId, so their rows still get distinct ids. */
+  anonymousCalls: number;
+}
+
+export function createDockState(): DockState {
+  return { live: { title: "Agent Swarm", rows: [] }, pendingSpawns: new Map(), anonymousCalls: 0 };
+}
 
 function paint(theme: SwarmDockTheme | undefined, color: string, text: string): string {
   try {
@@ -91,11 +102,12 @@ export function renderSwarmDock(dock: SwarmDock, width: number, theme?: SwarmDoc
   lines.push(rule("╰", "╯", `─ ${foot} `, "muted"));
   return lines;
 }
-export function swarmDockWidget(_dock: SwarmDock): (tui: unknown, theme: SwarmDockTheme) => SwarmDockComponent {
-  // Render from `live`, not a snapshot taken at setWidget time. A host that keeps the
+export function swarmDockWidget(state: DockState): (tui: unknown, theme: SwarmDockTheme) => SwarmDockComponent {
+  // Render from the session's live state, not a snapshot taken at setWidget time. A host that keeps the
   // first component and calls render() again would otherwise stay on the first status.
   return (_tui, theme) => ({
     render(width: number) {
+      const { live } = state;
       return renderSwarmDock(
         { title: live.title, footer: live.footer, rows: live.rows.map((r) => ({ ...r })) },
         width,
@@ -105,33 +117,34 @@ export function swarmDockWidget(_dock: SwarmDock): (tui: unknown, theme: SwarmDo
   });
 }
 
-export function publishSwarmDock(ui: SwarmDockUi | undefined, dock: SwarmDock | undefined): void {
+export function publishSwarmDock(ui: SwarmDockUi | undefined, state: DockState): void {
   if (!ui?.setWidget) return;
-  if (!dock || (dock.rows.length === 0 && !dock.footer)) {
+  const { live } = state;
+  if (live.rows.length === 0 && !live.footer) {
     ui.setWidget(SWARM_DOCK_KEY, undefined, { placement: "aboveEditor" });
     return;
   }
-  ui.setWidget(SWARM_DOCK_KEY, swarmDockWidget(dock), { placement: "aboveEditor" });
+  ui.setWidget(SWARM_DOCK_KEY, swarmDockWidget(state), { placement: "aboveEditor" });
 }
 
-export function upsertDockRow(row: SwarmDockRow): void {
-  const i = live.rows.findIndex((r) => r.id === row.id);
-  if (i >= 0) live.rows[i] = { ...live.rows[i], ...row };
-  else live.rows.push(row);
-  if (live.rows.length > 8) live.rows.splice(0, live.rows.length - 8);
+export function upsertDockRow(state: DockState, row: SwarmDockRow): void {
+  const rows = state.live.rows;
+  const i = rows.findIndex((r) => r.id === row.id);
+  if (i >= 0) rows[i] = { ...rows[i], ...row };
+  else rows.push(row);
+  if (rows.length > 8) rows.splice(0, rows.length - 8);
 }
-/** toolCallId → row ids painted for that `task` call. Settled by `tool_result`. */
-const pendingSpawns = new Map<string, string[]>();
 
-function liveFooter(): string {
-  const running = live.rows.filter((row) => {
+function liveFooter(state: DockState): string {
+  const rows = state.live.rows;
+  const running = rows.filter((row) => {
     const s = row.status.toLowerCase();
     return s === "running" || s === "launching" || s === "in_progress" || s === "loading";
   }).length;
-  const failed = live.rows.filter((row) => row.status === "failed" || row.status === "error").length;
+  const failed = rows.filter((row) => row.status === "failed" || row.status === "error").length;
   if (running > 0) return `${running} running`;
   if (failed > 0) return `${failed} failed`;
-  return `${live.rows.length} done`;
+  return `${rows.length} done`;
 }
 
 /** The `ui` a tool event may carry. Absent when the host has no card surface. */
@@ -142,34 +155,33 @@ export function dockUi(ctx: unknown): SwarmDockUi | undefined {
   return { setWidget: ui.setWidget.bind(ui) };
 }
 
-export function setDockFooter(footer: string): void {
-  live.footer = footer;
+export function setDockFooter(state: DockState, footer: string): void {
+  state.live.footer = footer;
 }
 
-export function flushDock(ui: SwarmDockUi | undefined): void {
-  publishSwarmDock(ui, live.rows.length === 0 && !live.footer ? undefined : { ...live, rows: live.rows.map((r) => ({ ...r })) });
+export function flushDock(state: DockState, ui: SwarmDockUi | undefined): void {
+  publishSwarmDock(ui, state);
 }
 
-export function clearDock(ui: SwarmDockUi | undefined): void {
-  live.rows.length = 0;
-  live.footer = undefined;
-  pendingSpawns.clear();
-  publishSwarmDock(ui, undefined);
+export function clearDock(state: DockState, ui: SwarmDockUi | undefined): void {
+  state.live.rows.length = 0;
+  state.live.footer = undefined;
+  state.pendingSpawns.clear();
+  publishSwarmDock(ui, state);
 }
 
 /** Rows from a `task` tool call. Empty when the call is not a subagent spawn. */
-export function rowsFromTaskInput(input: unknown): SwarmDockRow[] {
-  if (!input || typeof input !== "object") return [];
-  const tasks = (input as { tasks?: unknown }).tasks;
+export function rowsFromTaskInput(input: unknown, callKey: string): SwarmDockRow[] {
+  if (!input || typeof input !== "object" || !("tasks" in input)) return [];
+  const tasks: unknown = input.tasks;
   if (!Array.isArray(tasks)) return [];
   const rows: SwarmDockRow[] = [];
   for (let i = 0; i < tasks.length; i++) {
-    const item = tasks[i];
+    const item: unknown = tasks[i];
     if (!item || typeof item !== "object") continue;
-    const rec = item as { agent?: unknown; name?: unknown };
-    const agent = typeof rec.agent === "string" && rec.agent.trim() ? rec.agent.trim() : "task";
-    const name = typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : `task-${i}`;
-    rows.push({ id: name, agent, status: "running" });
+    const agent = "agent" in item && typeof item.agent === "string" && item.agent.trim() ? item.agent.trim() : "task";
+    // The call and the item index keep ids distinct, even when two calls reuse a task name.
+    rows.push({ id: `${callKey}#${i}`, agent, status: "running" });
   }
   return rows;
 }
@@ -180,27 +192,29 @@ export interface TaskResultEvent {
   isError?: boolean;
 }
 
-export function publishTaskSpawn(ui: SwarmDockUi | undefined, input: unknown, toolCallId?: string): void {
-  const rows = rowsFromTaskInput(input);
+export function publishTaskSpawn(state: DockState, ui: SwarmDockUi | undefined, input: unknown, toolCallId?: string): void {
+  // Without a toolCallId the call is never settled, but its rows still need their own ids.
+  const callKey = toolCallId ?? `anon-${state.anonymousCalls++}`;
+  const rows = rowsFromTaskInput(input, callKey);
   if (rows.length === 0) return;
-  for (const row of rows) upsertDockRow(row);
-  if (toolCallId) pendingSpawns.set(toolCallId, rows.map((row) => row.id));
-  setDockFooter(liveFooter());
-  flushDock(ui);
+  for (const row of rows) upsertDockRow(state, row);
+  if (toolCallId) state.pendingSpawns.set(toolCallId, rows.map((row) => row.id));
+  setDockFooter(state, liveFooter(state));
+  flushDock(state, ui);
 }
 
 /** Move the rows of one accepted `task` call off `running` when the tool returns. */
-export function settleTaskResult(ui: SwarmDockUi | undefined, event: TaskResultEvent): void {
+export function settleTaskResult(state: DockState, ui: SwarmDockUi | undefined, event: TaskResultEvent): void {
   if (event.toolName !== "task" || !event.toolCallId) return;
-  const ids = pendingSpawns.get(event.toolCallId);
-  pendingSpawns.delete(event.toolCallId);
+  const ids = state.pendingSpawns.get(event.toolCallId);
+  state.pendingSpawns.delete(event.toolCallId);
   if (!ids || ids.length === 0) return;
   const status = event.isError ? "failed" : "completed";
   for (const id of ids) {
-    const existing = live.rows.find((row) => row.id === id);
+    const existing = state.live.rows.find((row) => row.id === id);
     if (!existing) continue;
-    upsertDockRow({ id, agent: existing.agent, status });
+    upsertDockRow(state, { id, agent: existing.agent, status });
   }
-  setDockFooter(liveFooter());
-  flushDock(ui);
+  setDockFooter(state, liveFooter(state));
+  flushDock(state, ui);
 }

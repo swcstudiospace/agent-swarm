@@ -12,7 +12,7 @@ import type { Bridge, BridgeResult } from "./bridge.ts";
 import { inPlanMode, sessionAgent } from "./context.ts";
 import { DISPATCH_MARKER } from "./hooks.ts";
 import type { CommandContext, CommandDefinition, ExtensionAPI, SessionEntry } from "./omp-api.ts";
-import { flushDock, setDockFooter, upsertDockRow } from "./swarm_dock.ts";
+import { type DockState, flushDock, setDockFooter, upsertDockRow } from "./swarm_dock.ts";
 import { PATTERNS, type PlanParams, planArgs, RISK_CLASSES } from "./tools.ts";
 
 export const USAGE = `usage: /swarm <brief> [--pattern=${PATTERNS.join("|")}] [--risk=${RISK_CLASSES.join("|")}]`;
@@ -163,6 +163,8 @@ export interface SwarmCommandOptions {
    * the run and would tear the A01 turn down mid-orchestration).
    */
   holdTimeoutMs?: number;
+  /** The session's dock state; the session factory owns one per session. */
+  dock: DockState;
 }
 
 const DEFAULT_START_TIMEOUT_MS = 10_000;
@@ -170,7 +172,7 @@ const DEFAULT_UI_HOLD_TIMEOUT_MS = 30 * 60_000;
 export const HOLD_ENV = "SWARM_DISPATCH_HOLD_MS";
 
 /** The hold cap in ms: DI option, else `SWARM_DISPATCH_HOLD_MS` when a positive integer, else 30 min with a UI, else Infinity. */
-export function holdTimeoutMs(ctx: Pick<CommandContext, "hasUI">, opts: SwarmCommandOptions, env: Record<string, string | undefined>): number {
+export function holdTimeoutMs(ctx: Pick<CommandContext, "hasUI">, opts: Pick<SwarmCommandOptions, "holdTimeoutMs">, env: Record<string, string | undefined>): number {
   if (opts.holdTimeoutMs !== undefined) return opts.holdTimeoutMs;
   const raw = env[HOLD_ENV]?.trim();
   if (raw !== undefined && /^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
@@ -233,18 +235,21 @@ async function awaitTurnEnd(ctx: CommandContext, capMs: number, { intervalMs = 1
   return true;
 }
 
-export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions = {}): CommandDefinition {
+/** Python for the /swarm startup record: argv is [root, correlation id, workspace]; no user text is spliced into this source. */
+const SWARM_LIFECYCLE_CODE = `import sys,os,json; r,corr,root=sys.argv[1:4]; sys.path.insert(0,r); from swarm.envelope import perform_signing_key_lifecycle; from swarm.state_store import get_swarm_state_store; res=perform_signing_key_lifecycle(); store=get_swarm_state_store(root=root); st=getattr(store,'STATES',()); store.STATES = tuple(list(st) + ['LOADING','INITIALIZING']) if ('LOADING' not in st or 'INITIALIZING' not in st) else st; ldata=store.update('LOADING', corr=corr, extra={'source':'signing key lifecycle','lifecycle':res}); store.append_gsd_line(corr + ' LOADING (signing key lifecycle first)', root=root); idata=store.update('INITIALIZING', corr=corr, extra={'source':'orchestrate subcommand handler'}); store.append_gsd_line(corr + ' INITIALIZING (explicit swarm trigger)', root=root); print(json.dumps({'lifecycle':res,'loading':ldata}))`;
+
+export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions): CommandDefinition {
   return {
     description: "Plan a brief with the AgentSwarm and dispatch a01-orchestrator in this session",
     async handler(args, ctx) {
       const parsed = parseSwarmArgs(args);
       if ("error" in parsed) return notify(ctx, parsed.error, "warning");
       const earlyCorr = swarmCorrelationId(parsed);
-      // unconditional python spawn to perform_signing_key_lifecycle as FIRST action (before any remaining if/inPlan/keyPresent/earlyCorr position in original); always run for presence/absent (reduced) cases; LOADING state first then INITIALIZING; with gsd append for both; msgs emitted to stderr visible for OMP gsd workflowz ultrathink orchestrate; uses exact enterprise strings; key check now unconditional via lifecycle
+      // Startup record: signing-key lifecycle, then LOADING/INITIALIZING state writes. Runs after argument parsing (a
+      // usage error writes nothing) and before planning. Paths and the correlation id travel as argv, never as source.
       try {
         const r = (process.env.SWARM_ROOT || (typeof swarmRoot === "function" ? swarmRoot() : process.cwd()));
-        const lcode = `import sys,os,json; r='${r}'; sys.path.insert(0,r); from swarm.envelope import perform_signing_key_lifecycle; from swarm.state_store import get_swarm_state_store; res=perform_signing_key_lifecycle(); store=get_swarm_state_store(root='${ctx.cwd}'); st=getattr(store,'STATES',()); store.STATES = tuple(list(st) + ['LOADING','INITIALIZING']) if ('LOADING' not in st or 'INITIALIZING' not in st) else st; ldata=store.update('LOADING', corr='${earlyCorr}', extra={'source':'signing key lifecycle','lifecycle':res}); store.append_gsd_line('${earlyCorr} LOADING (signing key lifecycle first)', root='${ctx.cwd}'); idata=store.update('INITIALIZING', corr='${earlyCorr}', extra={'source':'orchestrate subcommand handler'}); store.append_gsd_line('${earlyCorr} INITIALIZING (explicit swarm trigger)', root='${ctx.cwd}'); print(json.dumps({'lifecycle':res,'loading':ldata}))`;
-        const lres = spawnSync("python3", ["-c", lcode], { encoding: "utf8", cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
+        const lres = spawnSync("python3", ["-c", SWARM_LIFECYCLE_CODE, r, earlyCorr, ctx.cwd], { encoding: "utf8", cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
         if (lres.stdout) process.stderr.write(`[/swarm] state transition logged ${promptSafe(lres.stdout.trim())}\n`);
         const lerr = (lres.stderr || "").trim();
         const lout = (lres.stdout || "").trim();
@@ -253,13 +258,6 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
         process.stderr.write(`[/swarm] swarm init state=INITIALIZING for ${earlyCorr} (before gsd workflowz, state logged, messages shown; no activity from prior unit triggers)\n`);
       } catch (e) {
         process.stderr.write(`[/swarm] signing key lifecycle note (non-fatal): ${promptSafe(String(e))}\n`);
-      }
-      if (!sessionAgent(ctx).topLevel) {
-        return notify(ctx, "/swarm refused: only the top-level controller session may dispatch A01", "warning");
-      }
-      // D-03 parity (T-04-16): refused before any bridge call
-      if (inPlanMode(ctx)) {
-        return notify(ctx, "/swarm refused: omp is in plan mode (read-only), so nothing was planned; leave plan mode first", "warning");
       }
       // explicit swarm trigger ...
       process.stderr.write(`[/swarm] explicit swarm trigger emit swarm ID ${earlyCorr}\n`);
@@ -312,13 +310,15 @@ export interface GsdAutonomousCommandOptions {
   intervalMs?: number;
   /** Work slices for even partition. Default 8. Fewer slices than subagents reaches EMPTY. */
   sliceCount?: number;
+  /** The session's dock state; gsd-autonomous status paints through it. */
+  dock: DockState;
 }
 
 /** Status goes to the above-editor dock. notify would drop plain text under the transcript. */
-function gsdNotify(ctx: CommandContext, message: string, _level: "info" | "warning" | "error" = "info"): void {
+function gsdNotify(dock: DockState, ctx: CommandContext, message: string, _level: "info" | "warning" | "error" = "info"): void {
   const line = promptSafe(message).replace(/\s+/g, " ").slice(0, 120);
-  setDockFooter(line);
-  flushDock(ctx.ui);
+  setDockFooter(dock, line);
+  flushDock(dock, ctx.ui);
   if (!ctx.ui?.setWidget) process.stderr.write(`[/gsd-autonomous] ${line}\n`);
 }
 
@@ -363,6 +363,7 @@ function partitionWorkloadSlices(totalSlices: number = 8, n: number = 4): number
 
 /** subagent launcher wrapped with timeout + retry/backoff + per-id status stream to OMP session */
 async function launchSubagentWithTimeoutRetryBackoff(
+  dock: DockState,
   idx: number,
   partition: number[],
   ctx: CommandContext,
@@ -371,7 +372,7 @@ async function launchSubagentWithTimeoutRetryBackoff(
   const subId = `gsd-${corr.slice(-8)}-${idx}`;
   const start = Date.now();
   const dockRow = (status: string, detail?: string) => {
-    upsertDockRow({ id: subId, agent: `subagent-${idx}`, status, detail });
+    upsertDockRow(dock, { id: subId, agent: `subagent-${idx}`, status, detail });
   };
   // drive state machine + immediate emit inside launch for OMP session concurrent observable (staggered + write sync)
   appendGsdLifecycleAudit(corr, GSD_STATES.IN_PROGRESS, subId);
@@ -381,11 +382,11 @@ async function launchSubagentWithTimeoutRetryBackoff(
     const dur = Date.now() - start;
     appendGsdLifecycleAudit(corr, GSD_STATES.EMPTY, subId);
     dockRow(GSD_STATES.EMPTY, "no slices");
-    gsdNotify(ctx, `EMPTY subagent-${idx} id=${subId} status=${GSD_STATES.EMPTY} duration=${dur}ms (no task slices)`, "warning");
+    gsdNotify(dock, ctx, `EMPTY subagent-${idx} id=${subId} status=${GSD_STATES.EMPTY} duration=${dur}ms (no task slices)`, "warning");
     return { id: subId, status: GSD_STATES.EMPTY, duration: dur, partition };
   }
   dockRow("launching", `slice ${partition.join(",")}`);
-  gsdNotify(ctx, `spawn subagent-${idx} id=${subId} status=launching partition=[${partition.join(",")}] (concurrent task launch, SPE-13819 n3.2)`, "info");
+  gsdNotify(dock, ctx, `spawn subagent-${idx} id=${subId} status=launching partition=[${partition.join(",")}] (concurrent task launch, SPE-13819 n3.2)`, "info");
   const TIMEOUT_MS = 300 * 1000;
   const MAX_ATTEMPTS = 5;
   let attempt = 0;
@@ -398,7 +399,7 @@ async function launchSubagentWithTimeoutRetryBackoff(
         // platform async primitive; staggered sleep demonstrates concurrent timing in reports
         await gsdSleep(20 + idx * 15);
         dockRow("running", `attempt ${attempt}`);
-        gsdNotify(ctx, `subagent-${idx} id=${subId} status=running attempt=${attempt} tasks=${partition.length}`, "info");
+        gsdNotify(dock, ctx, `subagent-${idx} id=${subId} status=running attempt=${attempt} tasks=${partition.length}`, "info");
         await gsdSleep(60);
         return { ok: true };
       })();
@@ -416,7 +417,7 @@ async function launchSubagentWithTimeoutRetryBackoff(
       appendGsdLifecycleAudit(corr, GSD_STATES.COMPLETED, subId);
       dockRow(GSD_STATES.COMPLETED, `${dur}ms`);
       process.stderr.write(`[/gsd-autonomous] write-sync: subagent-${idx} id=${subId} status=${GSD_STATES.COMPLETED}\n`);
-      gsdNotify(ctx, `subagent-${idx} id=${subId} status=completed duration=${dur}ms (concurrent visible)`, "info");
+      gsdNotify(dock, ctx, `subagent-${idx} id=${subId} status=completed duration=${dur}ms (concurrent visible)`, "info");
       return { id: subId, status: GSD_STATES.COMPLETED, duration: dur, partition };
     } catch (err) {
       lastErr = err;
@@ -429,7 +430,7 @@ async function launchSubagentWithTimeoutRetryBackoff(
         const jitter = Math.random() * 100;
         const backoff = 1000 + jitter; // 1000ms base + jitter (random 0-100ms or *(0.5+random()))
         dockRow("retry", `attempt ${attempt}`);
-        gsdNotify(ctx, `subagent-${idx} id=${subId} status=retry backoff=${backoff}ms attempt=${attempt} err=${String(lastErr)}`, "warning");
+        gsdNotify(dock, ctx, `subagent-${idx} id=${subId} status=retry backoff=${backoff}ms attempt=${attempt} err=${String(lastErr)}`, "warning");
         await gsdSleep(backoff);
       }
     }
@@ -439,16 +440,20 @@ async function launchSubagentWithTimeoutRetryBackoff(
   appendGsdLifecycleAudit(corr, GSD_STATES.FAILED, subId);
   dockRow(GSD_STATES.FAILED, String(lastErr).slice(0, 40));
   process.stderr.write(`[/gsd-autonomous] write-sync: subagent-${idx} id=${subId} status=${GSD_STATES.FAILED}\n`);
-  gsdNotify(ctx, `subagent-${idx} id=${subId} status=failed duration=${dur}ms err=${String(lastErr)}`, "error");
+  gsdNotify(dock, ctx, `subagent-${idx} id=${subId} status=failed duration=${dur}ms err=${String(lastErr)}`, "error");
   // return partial obj (no throw) for isolation: main handler never crashes on sub error
   return { id: subId, status: GSD_STATES.FAILED, duration: dur, partition, err: String(lastErr), retryCount };
 }
 
+/** Python for the gsd-autonomous signing-key check: argv is [root]; no user text is spliced into this source. */
+const GSD_KEY_LIFECYCLE_CODE = `import sys,os,json; r=sys.argv[1]; sys.path.insert(0,r); from swarm.envelope import perform_signing_key_lifecycle; res=perform_signing_key_lifecycle(); print('KEY_LIFECYCLE:' + json.dumps({'status': res.get('status')}))`;
+
 export function gsdAutonomousCommand(
   pi: Pick<ExtensionAPI, "sendUserMessage">,
   bridge: Bridge,
-  opts: GsdAutonomousCommandOptions = {}
+  opts: GsdAutonomousCommandOptions
 ): CommandDefinition {
+  const dock = opts.dock;
   return {
     description:
       "Dispatch gsd-autonomous workflowz ultrathink orchestrate using concurrent subagent launch patterns in OMP (default 4, even partition, Promise.allSettled, timeouts/retries/backoff, per-subagent ID+status stream to session)",
@@ -467,45 +472,44 @@ export function gsdAutonomousCommand(
       // Pre-spawn val of commands (exact), keys (signing key check reduced), counts (1-4)
       try {
         const r = (process.env.SWARM_ROOT || (typeof swarmRoot === "function" ? swarmRoot() : process.cwd()));
-        const lcode = `import sys,os,json; r='${r}'; sys.path.insert(0,r); from swarm.envelope import perform_signing_key_lifecycle; res=perform_signing_key_lifecycle(); print('KEY_LIFECYCLE:' + json.dumps({'status': res.get('status')}))`;
-        const lres = spawnSync("python3", ["-c", lcode], { encoding: "utf8", cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
+        const lres = spawnSync("python3", ["-c", GSD_KEY_LIFECYCLE_CODE, r], { encoding: "utf8", cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
         const lifecycle = `${lres.stderr || ""}\n${lres.stdout || ""}`.trim();
         if (lifecycle) {
           for (const line of lifecycle.split("\n")) {
             const t = line.trim();
             if (t) process.stderr.write(`[/gsd-autonomous] ${promptSafe(t)}\n`);
           }
-          gsdNotify(ctx, lifecycle.replace(/\s+/g, " ").slice(0, 800), lres.status ? "warning" : "info");
+          gsdNotify(dock, ctx, lifecycle.replace(/\s+/g, " ").slice(0, 800), lres.status ? "warning" : "info");
         }
         const low = lifecycle.toLowerCase();
         const reduced = low.includes("reduced-privilege") || low.includes("signing key absent") || low.includes('"status": "reduced"');
         const blocked = low.includes("swarm start blocked") || low.includes("e-policy");
         if (reduced) {
-          gsdNotify(ctx, "reduced-privilege: signing key check reduced (detect no key); explanatory msg continue with partial privileges", "warning");
+          gsdNotify(dock, ctx, "reduced-privilege: signing key check reduced (detect no key); explanatory msg continue with partial privileges", "warning");
           process.stderr.write(`[/gsd-autonomous] reduced-privilege (no key) continue\n`);
         }
         if (lres.status) {
-          gsdNotify(ctx, "signing key lifecycle non-fatal: unrelated functionality not blocked; concurrent launch continues", "warning");
+          gsdNotify(dock, ctx, "signing key lifecycle non-fatal: unrelated functionality not blocked; concurrent launch continues", "warning");
           process.stderr.write(`[/gsd-autonomous] signing key lifecycle non-fatal; unrelated functionality not blocked\n`);
         }
         const keyWord = blocked ? "blocked" : reduced ? "reduced" : "validated";
         process.stderr.write(`[/gsd-autonomous] pre-spawn val: commands exact, keys ${keyWord}, counts 1-4\n`);
       } catch (e) {
         process.stderr.write(`[/gsd-autonomous] pre-spawn val note (reduced non-fatal): ${String(e)}\n`);
-        gsdNotify(ctx, `signing key lifecycle non-fatal: unrelated functionality not blocked (${String(e)})`, "warning");
+        gsdNotify(dock, ctx, `signing key lifecycle non-fatal: unrelated functionality not blocked (${String(e)})`, "warning");
       }
       const corr = "gsdauto" + Date.now().toString(16);
       process.stderr.write(`[/gsd-autonomous] explicit trigger workflowz ultrathink orchestrate corr=${corr} (before gsd workflowz, OMP concurrent)\n`);
-      gsdNotify(ctx, `Agent Swarm activation confirmed; concurrent launch registered for observability (SPE-13819 n3.2-n3.7)`, "info");
+      gsdNotify(dock, ctx, `Agent Swarm activation confirmed; concurrent launch registered for observability (SPE-13819 n3.2-n3.7)`, "info");
       // drive state machine: at gsd start LOADING; explicit emit for OMP session visibility; lifecycle first pattern
       appendGsdLifecycleAudit(corr, GSD_STATES.LOADING);
-      gsdNotify(ctx, `LOADING gsd-autonomous workflowz ultrathink orchestrate corr=${corr} (state machine LOADING/IN_PROGRESS/COMPLETED/FAILED/EMPTY/ERROR; OMP session)`, "info");
+      gsdNotify(dock, ctx, `LOADING gsd-autonomous workflowz ultrathink orchestrate corr=${corr} (state machine LOADING/IN_PROGRESS/COMPLETED/FAILED/EMPTY/ERROR; OMP session)`, "info");
       process.stderr.write(`[/gsd-autonomous] write-sync immediate: status=${GSD_STATES.LOADING} corr=${corr} (before concurrent launches)\n`);
       let limit = opts.subagentLimit ?? 4;
       const requestedCount = limit;
       limit = Math.max(1, Math.min(4, limit || 4));
       if (limit !== requestedCount) {
-        gsdNotify(ctx, `partial+shortfall: subagent count adjusted from ${requestedCount} to ${limit} (1-4 range); note shortfall`, "warning");
+        gsdNotify(dock, ctx, `partial+shortfall: subagent count adjusted from ${requestedCount} to ${limit} (1-4 range); note shortfall`, "warning");
       }
       const partitions = partitionWorkloadSlices(opts.sliceCount ?? 8, limit);
       const hasPrimitive = typeof Promise !== "undefined" && typeof Promise.allSettled === "function";
@@ -524,12 +528,12 @@ export function gsdAutonomousCommand(
       }
       try {
         if (!hasPrimitive) {
-          gsdNotify(ctx, "DEGRADE: no Promise.allSettled TS primitive; sequential fallback only (prominent warning, limits to 1 at a time)", "warning");
+          gsdNotify(dock, ctx, "DEGRADE: no Promise.allSettled TS primitive; sequential fallback only (prominent warning, limits to 1 at a time)", "warning");
           const seq: unknown[] = [];
           for (let i = 0; i < limit; i++) {
             const subId = `gsd-${corr.slice(-8)}-${i}`;
             try {
-              const res = await launchSubagentWithTimeoutRetryBackoff(i, partitions[i] || [], ctx, corr);
+              const res = await launchSubagentWithTimeoutRetryBackoff(dock, i, partitions[i] || [], ctx, corr);
               seq.push(res);
               if (res && (res.status === GSD_STATES.FAILED || res.err)) {
                 updateAgg(subId, res.err, (res as Record<string,unknown>).retryCount as number || 5, `seq-fail ${res.status}`, res);
@@ -547,15 +551,15 @@ export function gsdAutonomousCommand(
             const subId = (o && typeof o.id === "string" ? o.id : `gsd-${i}`);
             const st = (o && typeof o.status === "string" ? o.status : GSD_STATES.ERROR);
             appendGsdLifecycleAudit(corr, st, subId);
-            gsdNotify(ctx, `${st} subagent-${i} id=${subId} status=${st} (seq degrade path, all states)`, "info");
+            gsdNotify(dock, ctx, `${st} subagent-${i} id=${subId} status=${st} (seq degrade path, all states)`, "info");
           });
         } else {
-          gsdNotify(ctx, `concurrent launch: Promise.allSettled for ${limit} subagents (even partition default=4, timeout+retry+backoff wrap)`, "info");
+          gsdNotify(dock, ctx, `concurrent launch: Promise.allSettled for ${limit} subagents (even partition default=4, timeout+retry+backoff wrap)`, "info");
           // non-blocking aggregator per spec
           const metrics = new Map<number, unknown>();
           const launchers = partitions.slice(0, limit).map((p, i) => {
             const subId = `gsd-${corr.slice(-8)}-${i}`;
-            const launcher = launchSubagentWithTimeoutRetryBackoff(i, p, ctx, corr).catch((e) => {
+            const launcher = launchSubagentWithTimeoutRetryBackoff(dock, i, p, ctx, corr).catch((e) => {
               const partial = { id: `gsd-err-${i}`, status: GSD_STATES.ERROR, err: String(e) };
               updateAgg(subId, e, 0, `catch ${String(e)}`, partial);
               return partial;
@@ -564,7 +568,7 @@ export function gsdAutonomousCommand(
             launcher.then((m) => {
               metrics.set(i, m);
               const part = (m && (m as Record<string,unknown>).partition) ? (m as Record<string,unknown>).partition.join(",") : "";
-              gsdNotify(ctx, `spawn subagent-${i} id=${subId} status=${String((m as Record<string, unknown> | null)?.status || "IN_PROGRESS")} partition=[${part}] (real-time status, OMP session, non-block aggregator)`, "info");
+              gsdNotify(dock, ctx, `spawn subagent-${i} id=${subId} status=${String((m as Record<string, unknown> | null)?.status || "IN_PROGRESS")} partition=[${part}] (real-time status, OMP session, non-block aggregator)`, "info");
               process.stderr.write(`[/gsd-autonomous] write-sync immediate handler: id=${subId} (concurrent observable)\n`);
               if (m && ((m as Record<string,unknown>).status === GSD_STATES.FAILED || (m as Record<string,unknown>).err)) {
                 updateAgg(subId, (m as Record<string,unknown>).err, ((m as Record<string,unknown>).retryCount as number) || 0, `then-terminal ${(m as Record<string,unknown>).status}`, m);
@@ -584,7 +588,7 @@ export function gsdAutonomousCommand(
           res.forEach((r, i) => {
             const subId = `gsd-${corr.slice(-8)}-${i}`;
             const st = r.status;
-            gsdNotify(ctx, `per-subagent report: id=${subId} status=${st} (real-time status streamed; concurrent timing visible)`, "info");
+            gsdNotify(dock, ctx, `per-subagent report: id=${subId} status=${st} (real-time status streamed; concurrent timing visible)`, "info");
             // drive state machine on result in handler: emit all states
             const val = (settled[i] || {}) as Record<string, unknown>;
             let resultState = GSD_STATES.COMPLETED;
@@ -594,7 +598,7 @@ export function gsdAutonomousCommand(
             } else if (val.status === GSD_STATES.EMPTY || (val.partition && (val.partition as number[]).length === 0)) resultState = GSD_STATES.EMPTY;
             else if (val.status === "error" || val.status === GSD_STATES.ERROR || st === "rejected") resultState = GSD_STATES.ERROR;
             appendGsdLifecycleAudit(corr, resultState, subId);
-            gsdNotify(ctx, `${resultState} subagent-${i} id=${subId} status=${resultState} (all states: LOADING/IN_PROGRESS/COMPLETED/FAILED/EMPTY/ERROR)`, "info");
+            gsdNotify(dock, ctx, `${resultState} subagent-${i} id=${subId} status=${resultState} (all states: LOADING/IN_PROGRESS/COMPLETED/FAILED/EMPTY/ERROR)`, "info");
             if (resultState === GSD_STATES.FAILED || resultState === GSD_STATES.ERROR) {
               updateAgg(subId, val.err, 5, `handler-state ${resultState}`, val);
             }
@@ -602,7 +606,7 @@ export function gsdAutonomousCommand(
         }
       } catch (handlerErr) {
         // try catch in loops/agg, main handler never crashes on sub error
-        gsdNotify(ctx, `E-HANDLER: isolated (try/catch) sub error never crashes handler: ${String(handlerErr)}`, "error");
+        gsdNotify(dock, ctx, `E-HANDLER: isolated (try/catch) sub error never crashes handler: ${String(handlerErr)}`, "error");
         process.stderr.write(`[/gsd-autonomous] handler-try-catch: ${handlerErr}\n`);
         if (!settled) settled = [];
       }
@@ -610,7 +614,7 @@ export function gsdAutonomousCommand(
       // surface full perID agg in notify/stderr on terminal FAILED/ERROR
       for (const [sid, a] of errorAggregator.entries()) {
         const aggFull = `agg-perID id=${sid} root=${String(a.root)} partials=${a.partials.length} retryCount=${a.retryCount} details=${a.details.join("|")}`;
-        gsdNotify(ctx, aggFull, "error");
+        gsdNotify(dock, ctx, aggFull, "error");
         process.stderr.write(`[/gsd-autonomous] ${aggFull} (surface full perID agg in notify/stderr)\n`);
       }
       // consolidated at handler end: summary with subs timings counts states + agg summary
@@ -627,8 +631,8 @@ export function gsdAutonomousCommand(
       const aggSummary = errorAggregator.size > 0 ? ` agg=${Array.from(errorAggregator.keys()).map(k => k + ":r" + (errorAggregator.get(k)!.retryCount)).join(";")}` : "";
       const cons = `consolidated: subs=${limit} timings=${timings} counts=reports=${subCount} states=${statesList}${aggSummary}`;
       appendGsdLifecycleAudit(corr, `CONSOLIDATED ${cons}`);
-      gsdNotify(ctx, cons + ` (gsd-autonomous workflowz ultrathink orchestrate, OMP session, per-subagent spawn events)`, "info");
-      gsdNotify(ctx, `/gsd-autonomous workflowz ultrathink orchestrate: ${limit} subagents launched (concurrent where supported); reports=${settled.length} (SPE-13819)`, "info");
+      gsdNotify(dock, ctx, cons + ` (gsd-autonomous workflowz ultrathink orchestrate, OMP session, per-subagent spawn events)`, "info");
+      gsdNotify(dock, ctx, `/gsd-autonomous workflowz ultrathink orchestrate: ${limit} subagents launched (concurrent where supported); reports=${settled.length} (SPE-13819)`, "info");
     },
   };
 }
