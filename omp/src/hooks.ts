@@ -136,7 +136,7 @@ export function swarmContext(
   } catch {
     text = event.prompt;
   }
-  if (text.toLowerCase().includes("gsd-autonomous")) {
+  if (/^\s*\/gsd-autonomous(?:\s|$)/i.test(text)) {
     if (prior.includes(GSD_HANDOFF)) return undefined;
     return { systemPrompt: [...prior, GSD_HANDOFF] };
   }

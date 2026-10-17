@@ -81,6 +81,13 @@ test("gsd-autonomous handoff text does not name the retired policy token", () =>
   expect(GSD_HANDOFF).not.toContain(["E", "POLICY"].join(""));
 });
 
+test("gsd-autonomous handoff fires only for a leading /gsd-autonomous command", () => {
+  const question = hook()({ prompt: "What is gsd-autonomous?", systemPrompt: PRIOR }, top());
+  expect(parts(question)).not.toContain(GSD_HANDOFF);
+  const command = hook()({ prompt: "/gsd-autonomous", systemPrompt: PRIOR }, top());
+  expect(parts(command).at(-1)).toBe(GSD_HANDOFF);
+});
+
 // ── WR-01: an Ultrathink/Prompt-Uplift XML is classified by the user's <ORIGINAL> ─────────
 
 /** The plugin escapes the user's words into <ORIGINAL> (plugin src/uplift/xml.ts escapeXml). */
