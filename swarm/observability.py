@@ -112,7 +112,7 @@ def update_from_events(corr: str | None = None, *, root: str | Path | None = Non
     if subagent_id or slice_id:
         emit_gsd_omp("updated", subagent_id=subagent_id, task_id=None, corr=corr, root=root, task_slice=slice_id, state=data.get("swarm_state"))
     return data
-def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, error_agg: dict | None = None, **kw: Any) -> dict:
+def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, error_agg: dict | None = None, dry_run: bool = False, **kw: Any) -> dict:
     """Integrate emit for OMP gsd-autonomous. Per-subagent status streaming for OMP session visibility in concurrent launches.
     Enhanced for real-time per-sub, spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR etc).
     Add support emit for error agg, perID partial on FAILED/ERROR. Isolate with try. Wire to gsd states.
@@ -139,8 +139,8 @@ def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, ta
         store.append_gsd_audit("emit_gsd_omp", subagent_id=subagent_id, task_slice=task_slice, state=effective_state, identity=subagent_id or corr, root=root)
     except Exception:
         pass
-    return emit("gsd.autonomous.omp", payload, source=f"{CONTROLLER_AGENT}@omp_gsd", correlation_id=corr, task_id=task_id, root=root)
-def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None = None, phase: str = "exec", corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, consolidated: dict | None = None, error_agg: dict | None = None, **kw: Any) -> dict:
+    return emit("gsd.autonomous.omp", payload, source=f"{CONTROLLER_AGENT}@omp_gsd", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
+def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None = None, phase: str = "exec", corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, consolidated: dict | None = None, error_agg: dict | None = None, dry_run: bool = False, **kw: Any) -> dict:
     """Stream per-subagent identifier + real-time status directly to OMP session.
     Enhanced for immediate spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR).
     Add support emit for error agg, perID partial on FAILED/ERROR. Isolate errors with try.
@@ -174,7 +174,7 @@ def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None
         store.append_gsd_audit("stream_subagent_status", subagent_id=subagent_id, task_slice=task_slice, state=effective_state, identity=subagent_id, root=root)
     except Exception:
         pass
-    return emit("subagent.status.stream", payload, source=f"{CONTROLLER_AGENT}@subagent_lifecycle", correlation_id=corr, task_id=task_id, root=root)
+    return emit("subagent.status.stream", payload, source=f"{CONTROLLER_AGENT}@subagent_lifecycle", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
 def even_partition(workload: list, n: int = 4) -> list[list]:
     """Even partition hook for workload slices at OMP gsd-autonomous launch time.
     Partitions evenly by count (round-robin) for default 4 concurrent subagents.
@@ -188,7 +188,7 @@ def even_partition(workload: list, n: int = 4) -> list[list]:
     for i, item in enumerate(workload):
         parts[i % n].append(item)
     return parts
-def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, state: str = "ERROR", **kw: Any) -> dict:
+def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, corr: str | None = None, root: str | Path | None = None, state: str = "ERROR", dry_run: bool = False, **kw: Any) -> dict:
     """Dedicated support emit for error agg from CentralErrorAggregator.
     Per sub ID details/partials/retry surfaced. Called on FAILED/ERROR.
     Wire to gsd states, isolate with try.
@@ -207,10 +207,10 @@ def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, c
         store.append_gsd_audit("emit_error_agg", subagent_id=subagent_id, state=state, identity=corr, root=root)
         # also stream via status
         try:
-            stream_subagent_status(subagent_id, "error", task_id=task_id, state=state, error_agg=agg, root=root)
+            stream_subagent_status(subagent_id, "error", task_id=task_id, state=state, error_agg=agg, root=root, dry_run=dry_run)
         except Exception:
             pass
-        return emit("error.agg", payload, source=f"{CONTROLLER_AGENT}@error_aggregator", correlation_id=corr, task_id=task_id, root=root)
+        return emit("error.agg", payload, source=f"{CONTROLLER_AGENT}@error_aggregator", correlation_id=corr, task_id=task_id, root=root, tee=not dry_run)
     except Exception:
         # isolate
         return {"subagent_id": subagent_id, "error_agg": agg, "state": state}

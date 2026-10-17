@@ -894,6 +894,18 @@ def test_observability_progress_events_are_attributed_and_forwarded(tmp_path):
         assert body is not None and body["surface"] == tee_mod.AGENT_SURFACES["A01"]
         assert body["payload"]["swarm_type"] == rec["type"]
 
+def test_dry_run_gsd_progress_is_not_forwarded_but_real_progress_is(tmp_path, on, fake):
+    from swarm import observability
+    fake.bindings[CORR] = GID_A
+    sid = "subagent-T1-abc123-1"
+    simulated = observability.emit_gsd_omp("spawn", subagent_id=sid, task_id="T1", corr=CORR, root=tmp_path, dry_run=True)
+    assert tee_mod.build_event(simulated, GID_A) is not None  # attributable on its own: only tee=False keeps it local
+    assert fake.events == [] and fake.at("/events") == []
+    real = observability.emit_gsd_omp("spawn", subagent_id=sid, task_id="T1", corr=CORR, root=tmp_path)
+    (body,) = fake.events
+    assert body["surface"] == tee_mod.AGENT_SURFACES["A01"] and body["payload"]["msg_id"] == real["msg_id"]
+    assert body["payload"]["swarm_type"] == "gsd.autonomous.omp"
+
 
 def test_tee_event_fields(tmp_path, on, fake, monkeypatch):
     monkeypatch.setenv("SWARM_REPLICA", "r7")

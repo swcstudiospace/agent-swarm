@@ -1314,17 +1314,17 @@ def run(args, ctx) -> dict:
     lp = logging_paths(repo)
     log_phase("init", {"swarm_dir": str(sdir), "logging_paths": lp, "runtime": getattr(args, 'runtime', None)}, source="A01@swarm_run", correlation_id=corr, root=repo)
     from swarm.subagent_lifecycle import get_manager
-    mgr = get_manager(getattr(args, 'max_parallel', 4), root=ctx.root, overdue_after_s=args.task_timeout)  # lifecycle mgr init (emits subagent.* via runlog); OMP gsd-autonomous default 4 concurrent
+    mgr = get_manager(getattr(args, 'max_parallel', 4), root=ctx.root, overdue_after_s=args.task_timeout, dry_run=args.dry_run)  # lifecycle mgr init (emits subagent.* via runlog); OMP gsd-autonomous default 4 concurrent
     # OMP gsd-autonomous workflowz ultrathink: emit integrate + stream for session visibility
     # immediate emit calls for real-time status
-    emit_gsd_omp("init.immediate", corr=corr, wave1="gsd-autonomous")
-    stream_subagent_status("runner-init", "ready", phase="init", wave="wave1")
+    emit_gsd_omp("init.immediate", corr=corr, wave1="gsd-autonomous", dry_run=args.dry_run)
+    stream_subagent_status("runner-init", "ready", phase="init", wave="wave1", dry_run=args.dry_run)
     # wire wave1 gsd-autonomous: use even partition for task slices (partition)
     workload = [f"slice-{i}" for i in range(5)]  # example for gsd-autonomous wave1
     slices = mgr.even_partition(workload, 4)
-    emit_gsd_omp("wave1.partition", slices=len(slices), wave1="gsd-autonomous")
-    stream_subagent_status("wave1", "partitioned", phase="wave1", slices=len(slices))
-    emit_gsd_omp("consolidated", audit="run.init", wave="wave1")
+    emit_gsd_omp("wave1.partition", slices=len(slices), wave1="gsd-autonomous", dry_run=args.dry_run)
+    stream_subagent_status("wave1", "partitioned", phase="wave1", slices=len(slices), dry_run=args.dry_run)
+    emit_gsd_omp("consolidated", audit="run.init", wave="wave1", dry_run=args.dry_run)
     args.runtime = resolve_runtime(args.runtime)  # once per run: auto cannot flip mid-run
     validate_runtime_approval(args.runtime, args)
     if not args.dry_run:
@@ -1356,14 +1356,14 @@ def run(args, ctx) -> dict:
             recovered = recover_stranded(store, corr, emit=ctx.emit)
             if recovered:
                 log.append(f"recovered stranded: {recovered}")
-        mgr = get_manager(getattr(args, "max_parallel", 4), root=ctx.root, overdue_after_s=args.task_timeout)
+        mgr = get_manager(getattr(args, "max_parallel", 4), root=ctx.root, overdue_after_s=args.task_timeout, dry_run=args.dry_run)
         log.append(f"lifecycle_mgr: cap={mgr.max_concurrent}")
         # OMP gsd-autonomous: register for visibility, stream status, use even partition support
         # wire wave1 gsd-autonomous
         mgr.register_omp(corr)
-        emit_gsd_omp("dispatch.start.immediate", corr=corr, max=mgr.max_concurrent, wave1="gsd-autonomous")
-        stream_subagent_status("dispatch", "started", phase="wave1")
-        emit_gsd_omp("consolidated", audit="dispatch.start", wave="wave1")
+        emit_gsd_omp("dispatch.start.immediate", corr=corr, max=mgr.max_concurrent, wave1="gsd-autonomous", dry_run=args.dry_run)
+        stream_subagent_status("dispatch", "started", phase="wave1", dry_run=args.dry_run)
+        emit_gsd_omp("consolidated", audit="dispatch.start", wave="wave1", dry_run=args.dry_run)
         error_handler = ErrorHandler()
         log.append("error_handler_unit: " + error_handler.spec()["version"])
         while True:
@@ -1392,16 +1392,16 @@ def run(args, ctx) -> dict:
             # wire wave1: partition task slices for concurrent subagent spawn
             task_slices = [t.get("task_id", f"t{i}") for i, (t, _) in enumerate(batch)]
             slices = mgr.even_partition(task_slices, eff_parallel)
-            emit_gsd_omp("wave1.slice", slices=len(slices), wave1="gsd-autonomous")
+            emit_gsd_omp("wave1.slice", slices=len(slices), wave1="gsd-autonomous", dry_run=args.dry_run)
             with ThreadPoolExecutor(max_workers=eff_parallel) as pool:
                 try:
                     futs = {}  # future -> the subagent id it was submitted under
                     for t, a in batch:
                         sid = mgr.new_subagent_id(t.get("task_id", "t"), root=ctx.root)
                         # immediate emit calls for spawn events, subagent IDs, task slices, real-time status to OMP
-                        stream_subagent_status(sid, "dispatching.immediate", task_id=t.get("task_id"), phase="concurrent", wave="wave1")
-                        emit_gsd_omp("launch.immediate", subagent_id=sid, task_id=t.get("task_id"), wave1="gsd-autonomous")
-                        emit_gsd_omp("consolidated", subagent_id=sid, audit="spawn", wave="wave1")
+                        stream_subagent_status(sid, "dispatching.immediate", task_id=t.get("task_id"), phase="concurrent", wave="wave1", dry_run=args.dry_run)
+                        emit_gsd_omp("launch.immediate", subagent_id=sid, task_id=t.get("task_id"), wave1="gsd-autonomous", dry_run=args.dry_run)
+                        emit_gsd_omp("consolidated", subagent_id=sid, audit="spawn", wave="wave1", dry_run=args.dry_run)
                         def _w(tt=t, aa=a, ss=sid):
                             mgr.acquire(ss)
                             try:
@@ -1415,9 +1415,9 @@ def run(args, ctx) -> dict:
                         log.append(f"round {rounds}: {tid} [{aid}] sid={sid} → {outcome}")
                         print(log[-1], file=sys.stderr, flush=True)
                         # post dispatch immediate stream status real-time
-                        stream_subagent_status(sid, outcome.lower(), task_id=tid, phase="result", wave="wave1")
-                        emit_gsd_omp("result.immediate", subagent_id=sid, task_id=tid, outcome=outcome, wave1="gsd-autonomous")
-                        emit_gsd_omp("consolidated", subagent_id=sid, audit="result", outcome=outcome)
+                        stream_subagent_status(sid, outcome.lower(), task_id=tid, phase="result", wave="wave1", dry_run=args.dry_run)
+                        emit_gsd_omp("result.immediate", subagent_id=sid, task_id=tid, outcome=outcome, wave1="gsd-autonomous", dry_run=args.dry_run)
+                        emit_gsd_omp("consolidated", subagent_id=sid, audit="result", outcome=outcome, dry_run=args.dry_run)
                         if outcome == "FAILED":
                             if error_handler.force_degrade("FAILED during parallel"):
                                 log.append("error_handler_unit: degraded to sequential on error")
