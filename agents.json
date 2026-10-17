@@ -738,10 +738,8 @@
             "additionalProperties": false,
             "required": ["state"],
             "properties": {
-              "state": { "type": "string", "const": "SUCCESS" },
-              "correlation_id": { "type": "string" },
-              "dispatched": { "type": "integer" },
-              "summary": { "type": "string" }
+              "state": { "type": "string", "enum": ["DEPENDENCY_UNAVAILABLE"] },
+              "message": { "type": "string" }
             }
           },
           "errors": ["INVALID_INPUT", "UNAUTHORIZED", "DEPENDENCY_UNAVAILABLE", "TIMEOUT", "PARTIAL_SUCCESS"],
@@ -815,13 +813,10 @@
           "output_schema": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["state", "task_id", "agent_id"],
+            "required": ["state"],
             "properties": {
-              "state": { "type": "string", "const": "SUCCESS" },
-              "task_id": { "type": "string" },
-              "agent_id": { "type": "string" },
-              "assigned": { "type": "boolean" },
-              "summary": { "type": "string" }
+              "state": { "type": "string", "enum": ["DEPENDENCY_UNAVAILABLE"] },
+              "message": { "type": "string" }
             }
           },
           "errors": ["INVALID_INPUT", "UNAUTHORIZED", "DEPENDENCY_UNAVAILABLE", "TIMEOUT", "PARTIAL_SUCCESS"],

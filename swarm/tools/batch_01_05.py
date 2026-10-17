@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from swarm.errors import SwarmError
-from swarm.tools.support import respond, script
+from swarm.paths import latest_correlation
+from swarm.runlog import emit as log_emit
+from swarm.tools.support import respond, script, target_root
 from swarm.taskstore import TaskStore, GATES_BY_RISK  # prior unit for orchestrate DAG/gates
 from swarm.results import reconcile as do_reconcile  # prior unit: reassign on failure + aggregate
-from swarm.manifest import by_capability  # prior unit for assign
 
 
 def dag_order(payload: dict) -> dict:
@@ -121,15 +122,11 @@ def plan(payload: dict) -> dict:
 
 def run(payload: dict) -> dict:
     def work() -> dict:
-        corr = payload.get("correlation_id") or "demo"
-        max_parallel = payload.get("max_parallel", 3)
-        # assign + monitor simulation exercising store shape (prior)
+        # Dispatch is scripts/swarm_run.py: it spawns runtimes, signs, and holds leases. This handler does not drive
+        # it, so it reports the dependency as unavailable instead of claiming that any task was dispatched.
         return {
-            "state": "SUCCESS",
-            "correlation_id": corr,
-            "dispatched": max_parallel,
-            "ready": [],
-            "summary": "assigned and monitored ready tasks",
+            "state": "DEPENDENCY_UNAVAILABLE",
+            "message": "orch_run does not dispatch; run scripts/swarm_run.py to dispatch ready tasks",
         }
 
     return respond(payload, work)
@@ -137,17 +134,27 @@ def run(payload: dict) -> dict:
 
 def reconcile(payload: dict) -> dict:
     def work() -> dict:
-        corr = payload.get("correlation_id") or "demo"
-        # reassign on failure + aggregate: call prior reconcile shape
-        # (full call needs store+emit; here contract shape + prior import exercised)
-        notes = []
+        root = target_root()
+        corr = payload.get("correlation_id") or latest_correlation(root)
+        if not corr:
+            return {"state": "INVALID_INPUT", "field": "correlation_id",
+                    "message": "correlation_id required: this workspace has no latest correlation"}
+
+        def emit(event_type: str, event: dict):
+            return log_emit(event_type, event, source="A01@orch_reconcile", correlation_id=corr,
+                            task_id=event.get("task_id"), root=root)
+
+        store = TaskStore(root=root)
+        try:
+            notes = do_reconcile(store, corr, emit)
+        finally:
+            store.conn.close()
         return {
             "state": "SUCCESS",
             "correlation_id": corr,
-            "reassigned": 0,
-            "aggregated": ["DONE", "ESCALATED"],
-            "notes_log": notes,
-            "summary": "reconciled gates, reassign on fail, aggregate results",
+            "reassigned": sum("→ rework #" in note for note in notes),
+            "aggregated": notes,
+            "summary": f"reconciled {corr}: {len(notes)} outcome(s)",
         }
 
     return respond(payload, work)
@@ -158,15 +165,11 @@ def assign(payload: dict) -> dict:
         tid = payload.get("task_id")
         if not isinstance(tid, str):
             return {"state": "INVALID_INPUT", "field": "task_id", "message": "task_id required"}
-        agent = payload.get("agent_id", "a02-requirements")
-        # exercise by_capability prior unit for assign (requires capability str)
-        caps = by_capability("plan.decompose")
+        # scripts/orch_assign.py only returns a signed, verified assignment for an existing leased task;
+        # it writes no assignment state. No store write exists on this path, so report the dependency.
         return {
-            "state": "SUCCESS",
-            "task_id": tid,
-            "agent_id": agent,
-            "assigned": True,
-            "summary": "task assigned to agent",
+            "state": "DEPENDENCY_UNAVAILABLE",
+            "message": "orch_assign does not record assignments; use scripts/orch_assign.py for a verified assignment of an IN_PROGRESS leased task",
         }
 
     return respond(payload, work)

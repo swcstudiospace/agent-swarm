@@ -221,3 +221,20 @@ def test_incomplete_contract_names_the_missing_field(tmp_path):
     path.write_text(json.dumps(document), encoding="utf-8")
     errors = validate_registry(path)
     assert any("missing timeout_s" in error for error in errors)
+
+
+def test_orch_run_reports_dependency_instead_of_claiming_dispatch():
+    result = call_tool("orch_run", "A01", {"correlation_id": "Tdemo"})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+    assert "scripts/swarm_run.py" in result["message"]
+    assert "dispatched" not in result
+
+
+def test_orch_reconcile_success_fields_match_output_schema(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SWARM_DIR", raising=False)
+    result = call_tool("orch_reconcile", "A01", {"correlation_id": "Tdemo"})
+    assert result["state"] == "SUCCESS"
+    assert set(result) <= {"state", "correlation_id", "reassigned", "aggregated", "summary"}
+    assert result["reassigned"] == 0
+    assert result["aggregated"] == []

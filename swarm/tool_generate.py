@@ -65,6 +65,22 @@ def render_docs(data: dict) -> dict[str, str]:
     return pages
 
 
+def _allowed_states(tool: dict) -> list[str]:
+    """States a tool's success example may return, taken from its output_schema.state."""
+    state = ((tool.get("output_schema") or {}).get("properties") or {}).get("state") or {}
+    if "const" in state:
+        return [state["const"]]
+    if "enum" in state:
+        return sorted(set(state["enum"]))
+    return ["SUCCESS"]
+
+
+def _state_assertion(states: list[str]) -> str:
+    if states == ["SUCCESS"]:
+        return '    assert result["state"] == "SUCCESS"'
+    return f'    assert result["state"] in {tuple(states)!r}'
+
+
 def render_contract_tests(data: dict) -> str:
     tools = [tool for _container, tool in iter_entries(data) if isinstance(tool, dict) and tool.get("name")]
     tools.sort(key=lambda tool: tool["name"])
@@ -82,9 +98,10 @@ def render_contract_tests(data: dict) -> str:
         name = tool["name"]
         caller = tool["permitted_callers"][0]
         examples = tool["examples"]
+        states = _allowed_states(tool)
         lines.extend(["", "", f"def test_{name}_success():",
                       f"    result = call_tool({name!r}, {caller!r}, {examples['success']!r})",
-                      '    assert result["state"] == "SUCCESS"',
+                      _state_assertion(states),
                       "", "", f"def test_{name}_invalid_input():",
                       f"    result = call_tool({name!r}, {caller!r}, {examples['invalid_input']!r})",
                       '    assert result["state"] == "INVALID_INPUT"',
