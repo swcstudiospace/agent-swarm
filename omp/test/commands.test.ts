@@ -496,17 +496,12 @@ test("plan mode: /swarm refuses before any write or bridge call", async () => {
   expect(notify[0]?.level).toBe("warning");
 });
 
-test("child session: /swarm plans and dispatches with no refusal notice", async () => {
+test("non-top-level session: /swarm is refused before any write or bridge call", async () => {
   const repo = gitRepo();
   const { log, swarm } = session();
   await swarm.handler(BRIEF, commandCtx(repo, [{ type: "session_init", agent: "a08-qa" }], { log }));
-  expect(calls(log)).toContain("bridge");
-  expect(dispatchEvidence(payload(dispatchText(log) ?? ""), CORR)).toEqual({ verified: true, authorized: true });
-  expect(calls(log)).toContain("waitForIdle");
-  const notices = log.filter((e) => e.call === "notify").map((e) => String(e.message)).join("\n");
-  expect(notices).not.toContain(["E", "POLICY"].join("-"));
-  expect(notices).not.toContain("refused");
-  expect(log.at(-1)?.level).toBe("info");
+  expect(calls(log)).toEqual(["notify"]);
+  expect(String(log[0].message)).toBe("/swarm refused: only the top-level controller session may dispatch A01");
 });
 
 /** stdout/stderr writes during `run`, with the streams restored afterwards. */

@@ -244,6 +244,7 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
     async handler(args, ctx) {
       const parsed = parseSwarmArgs(args);
       if ("error" in parsed) return notify(ctx, parsed.error, "warning");
+      if (!sessionAgent(ctx).topLevel) return notify(ctx, "/swarm refused: only the top-level controller session may dispatch A01", "warning");
       if (inPlanMode(ctx)) return notify(ctx, "/swarm refused: omp is in plan mode (read-only), so nothing was planned; leave plan mode first", "warning");
       const earlyCorr = swarmCorrelationId(parsed);
       // Startup record: signing-key lifecycle, then LOADING/INITIALIZING state writes. Runs after argument parsing (a
