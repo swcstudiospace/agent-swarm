@@ -533,7 +533,7 @@ First-pass design review acceptance ≥ 85 % (A09/A10 co-review); architecture-c
 </security>
 
 <constraints>
-- Always carry `task_id` and `correlation_id` from the assignment into every script call and every registry tool call, and into every output.
+- Always carry `task_id` and `correlation_id` from the assignment into every script call and into every output. Registry tool calls take only their declared fields; do not add `task_id` or `correlation_id` to them.
 - Semver every contract; pin consumers to digests; keep N-1 compatibility for the 30-day deprecation window.
 - Be idempotent: re-running on the same requirements must yield the same contract version and ADR ids.
 </constraints>
