@@ -15,6 +15,12 @@ from typing import Any
 from .paths import swarm_dir
 from .runlog import emit, read_events
 from .state_store import get_swarm_state_store
+
+# Progress events of the subagent lifecycle and the OMP gsd-autonomous run are the controller's (A01): the lifecycle
+# manager is only created in the controller process (hook_trigger), and a subagent id names no agent. substrate_tee
+# attributes a record by the `<AGENT>@<script>` prefix of its source, so these sources carry the controller's id.
+CONTROLLER_AGENT = "A01"
+
 def emit_hook_fired(hook: str, *, corr: str | None = None, deduped: bool = False, root: str | Path | None = None, **kw: Any) -> dict:
     return emit("hook-fired", {"hook": hook, "deduped": deduped, **kw}, source="hook_trigger", correlation_id=corr, root=root)
 def emit_per_unit(task_id: str, agent: str, phase: str, state: str, *, corr: str | None = None, root: str | Path | None = None) -> dict:
@@ -133,7 +139,7 @@ def emit_gsd_omp(status: str = "launched", *, subagent_id: str | None = None, ta
         store.append_gsd_audit("emit_gsd_omp", subagent_id=subagent_id, task_slice=task_slice, state=effective_state, identity=subagent_id or corr, root=root)
     except Exception:
         pass
-    return emit("gsd.autonomous.omp", payload, source="omp_gsd", correlation_id=corr, task_id=task_id, root=root)
+    return emit("gsd.autonomous.omp", payload, source=f"{CONTROLLER_AGENT}@omp_gsd", correlation_id=corr, task_id=task_id, root=root)
 def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None = None, phase: str = "exec", corr: str | None = None, root: str | Path | None = None, task_slice: str | None = None, spawn_event: bool = False, state: str | None = None, consolidated: dict | None = None, error_agg: dict | None = None, **kw: Any) -> dict:
     """Stream per-subagent identifier + real-time status directly to OMP session.
     Enhanced for immediate spawn events, IDs, task slices, all states (LOADING IN_PROGRESS COMPLETED FAILED EMPTY ERROR).
@@ -168,7 +174,7 @@ def stream_subagent_status(subagent_id: str, status: str, *, task_id: str | None
         store.append_gsd_audit("stream_subagent_status", subagent_id=subagent_id, task_slice=task_slice, state=effective_state, identity=subagent_id, root=root)
     except Exception:
         pass
-    return emit("subagent.status.stream", payload, source="subagent_lifecycle", correlation_id=corr, task_id=task_id, root=root)
+    return emit("subagent.status.stream", payload, source=f"{CONTROLLER_AGENT}@subagent_lifecycle", correlation_id=corr, task_id=task_id, root=root)
 def even_partition(workload: list, n: int = 4) -> list[list]:
     """Even partition hook for workload slices at OMP gsd-autonomous launch time.
     Partitions evenly by count (round-robin) for default 4 concurrent subagents.
@@ -204,7 +210,7 @@ def emit_error_agg(subagent_id: str, agg: dict, *, task_id: str | None = None, c
             stream_subagent_status(subagent_id, "error", task_id=task_id, state=state, error_agg=agg, root=root)
         except Exception:
             pass
-        return emit("error.agg", payload, source="error_aggregator", correlation_id=corr, task_id=task_id, root=root)
+        return emit("error.agg", payload, source=f"{CONTROLLER_AGENT}@error_aggregator", correlation_id=corr, task_id=task_id, root=root)
     except Exception:
         # isolate
         return {"subagent_id": subagent_id, "error_agg": agg, "state": state}

@@ -880,6 +880,21 @@ def test_build_event_carries_the_repo_slug(tmp_path, monkeypatch):
     assert "repo" not in tee_mod.build_event(rec, GID_A)
 
 
+def test_observability_progress_events_are_attributed_and_forwarded(tmp_path):
+    from swarm import observability
+    sid = "subagent-T1-abc123-1"
+    recs = [
+        observability.emit_gsd_omp("spawn", subagent_id=sid, task_id="T1", corr=CORR, root=tmp_path),
+        observability.stream_subagent_status(sid, "spawned", task_id="T1", corr=CORR, root=tmp_path),
+        observability.emit_error_agg(sid, {"errors": 1}, task_id="T1", corr=CORR, root=tmp_path),
+    ]
+    for rec in recs:
+        assert tee_mod.agent_of(rec) == "A01", rec["source"]
+        body = tee_mod.build_event(rec, GID_A)
+        assert body is not None and body["surface"] == tee_mod.AGENT_SURFACES["A01"]
+        assert body["payload"]["swarm_type"] == rec["type"]
+
+
 def test_tee_event_fields(tmp_path, on, fake, monkeypatch):
     monkeypatch.setenv("SWARM_REPLICA", "r7")
     fake.bindings[CORR] = GID_A

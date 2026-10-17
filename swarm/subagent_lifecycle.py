@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .runlog import emit
-from .observability import stream_subagent_status, emit_gsd_omp, even_partition
+from .observability import stream_subagent_status, emit_gsd_omp, even_partition, CONTROLLER_AGENT
 import random
 
 
@@ -111,7 +111,7 @@ def _drive_gsd_state(state: str, *, root: str | Path | None = None, **extra) -> 
         ss.update(state, extra=extra or None)
     except Exception:
         # fallback immediate emit
-        emit("gsd.state", {"state": state, **extra}, source="subagent_lifecycle", root=root)
+        emit("gsd.state", {"state": state, **extra}, source=f"{CONTROLLER_AGENT}@subagent_lifecycle", root=root)
     # immediate real-time status emit to OMP
     try:
         emit_gsd_omp("state", state=state, root=root, **extra)
@@ -184,14 +184,14 @@ class SubagentLifecycleManager:
                         "max_concurrent": self.max_concurrent,
                         "wave": "wave1",
                     },
-                    source="subagent_lifecycle",
+                    source=f"{CONTROLLER_AGENT}@subagent_lifecycle",
                     task_id=task_id,
                     root=task_root,
                 )
                 emit(
                     "spawn.event",
                     {"subagent_id": sid, "task_id": task_id, "slice": task_id},
-                    source="subagent_lifecycle",
+                    source=f"{CONTROLLER_AGENT}@subagent_lifecycle",
                     root=task_root,
                 )
                 stream_subagent_status(sid, "spawned", task_id=task_id, phase="launch", wave="wave1", root=task_root)
@@ -294,7 +294,7 @@ class SubagentLifecycleManager:
                         "wave": "wave1",
                         "slice": task_id,
                     },
-                    source="subagent_lifecycle",
+                    source=f"{CONTROLLER_AGENT}@subagent_lifecycle",
                     task_id=task_id,
                     root=root,
                 )
