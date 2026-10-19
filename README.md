@@ -15,6 +15,7 @@ A complete design specification for a distributed swarm of 15 specialized AI age
 | 7 | [07-scalability.md](07-scalability.md) | Manifest schema, new-agent onboarding (shadow→probation→full), traffic shaping, contract evolution, multi-swarm |
 | 8 | [CLAUDE.md](CLAUDE.md) · [prompts/](prompts/) · [scripts/](scripts/) · [swarm/](swarm/) | Runnable implementation: subagent prompts, per-agent Python tools, orchestration runtime |
 | 9 | [docs/substrate-integration.md](docs/substrate-integration.md) | Platform pointer: how the spec's substrates map onto [Agent Substrate](https://github.com/swcstudiospace/agent-substrate) |
+| 10 | [docs/swarm-command-center.md](docs/swarm-command-center.md) · [docs/swarm-bar.md](docs/swarm-bar.md) · [docs/operations-runbook.md](docs/operations-runbook.md) | v2.2 runtime: continuous scheduler, telemetry, handover, tools and skills per agent, the omp bar; how-to guides, configuration, troubleshooting, known limits |
 
 ## Platform
 
@@ -68,13 +69,16 @@ lifecycle state machine, fail-closed gates, manifest registry). [agents.json](ag
 
 ```bash
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature   # brief → task DAG in <repo>/.swarm
-python3 scripts/swarm_run.py --repo /path/to/codebase --runtime omp  # normal OMP approvals; --runtime claude also supported
+python3 scripts/swarm_run.py --repo /path/to/codebase --runtime omp  # normal OMP approvals; --runtime claude also supported; --max-parallel N (default 4), --swarm-timeout S
 python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime omp   # simulate the DAG offline; not acceptance
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
 python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, .cursor/agents, omp/agents, omp/skills (--check)
 python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # list the Cursor files a target repo would gain; writes nothing
 python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, the omp package and substrate-mcp (see below)
 python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
+python3 scripts/swarm_live.py --repo /path/to/codebase            # live run table: state, elapsed time, last activity
+python3 scripts/swarm_tool.py catalog --caller A05                # tools and skills an agent may use (call: --name N --input JSON)
+python3 -m swarm.tool_registry check && python3 -m swarm.skill_registry check   # registry and skill validation
 python3 scripts/receipt_export.py --repo /path/to/codebase --json  # desk verification receipt; swarm verdicts stay advisory
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
@@ -96,6 +100,10 @@ the old stdin transport. Start a fresh OMP process after updating the extension.
 
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
 `a02-requirements` … `a15-docs` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
+
+### Swarm Command Center (v2.2)
+
+`swarm_run.py` runs a continuous scheduler: a slot is refilled the moment a session ends, bounded by `--max-parallel` (`SWARM_MAX_PARALLEL`, default 4, ceiling 32) and each agent's own limit, with a lifecycle state machine, cancellation, timeouts, backoff and rate-limit backpressure. One telemetry channel (`.swarm/events.jsonl` and `.swarm/live.json`) feeds the logs, `scripts/swarm_live.py` and a third omp bar that shows every subagent's state and elapsed time. Agents hand work over with a versioned, validated `swarm.handover.v1` document. Every agent has a shared baseline of tools and skills plus 10 to 15 of its own, found with `swarm_catalog` and called with `swarm_tool_call`. Start at [docs/swarm-command-center.md](docs/swarm-command-center.md) (architecture, how to add an agent, tool or skill, configuration, troubleshooting, security model, known limits) and [docs/swarm-bar.md](docs/swarm-bar.md) (reading the bar).
 
 ## Install into a workspace
 

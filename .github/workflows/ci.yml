@@ -31,6 +31,12 @@ jobs:
         run: python3 -m swarm.tool_registry docs --check
       - name: tool contract tests drift
         run: python3 -m swarm.tool_registry gen-tests --check
+      - name: skill registry
+        run: python3 -m swarm.skill_registry check
+      - name: skill docs drift
+        run: python3 -m swarm.skill_registry docs --check
+      - name: registry intake dry check
+        run: python3 scripts/_registry_intake.py --check
       - name: root TS suite
         run: bun test tests/ts
       - name: omp package suite

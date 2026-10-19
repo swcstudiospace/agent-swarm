@@ -19,3 +19,21 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: swarm-skill-registry
+        name: Swarm skill registry
+        entry: python3 -m swarm.skill_registry check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: swarm-skill-docs
+        name: Swarm skill documentation drift
+        entry: python3 -m swarm.skill_registry docs --check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: swarm-registry-intake
+        name: Swarm registry intake dry check
+        entry: python3 scripts/_registry_intake.py --check
+        language: system
+        pass_filenames: false
+        always_run: true
