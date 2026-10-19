@@ -29,6 +29,8 @@ Don't use for: Do not patch product code.
 
 - `python3 scripts/qa_gate.py --task-id $TASK --correlation-id $CORR --json`
 - `bun scripts/ts/qa_gate.ts --task-id $TASK --correlation-id $CORR --json`
+- `python3 scripts/req_lint.py --task-id $TASK --correlation-id $CORR --json`
+- `bun scripts/ts/req_lint.ts --task-id $TASK --correlation-id $CORR --json`
 
 ## Procedure
 

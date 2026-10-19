@@ -219,9 +219,9 @@ Expected state: SUCCESS with criteria_count 3, covered_count 2, coverage_pct 66.
 <OUTPUTS>
 - `state` (string): `SUCCESS` on a successful call.
 - `scored_mutants` (integer): killed plus timeout plus survived.
-- `score_pct` (number): (killed plus timeout) divided by scored_mutants, as a percentage rounded to 2 places.
+- `score_pct` (number): (killed plus timeout) divided by scored_mutants, as a percentage truncated (floored, never rounded up) to 2 places.
 - `threshold_pct` (number): threshold applied.
-- `meets_threshold` (boolean): true when score_pct is at or above threshold_pct.
+- `meets_threshold` (boolean): true when the reported (truncated) score_pct is at or above threshold_pct.
 </OUTPUTS>
 <SIDE_EFFECT_TIER>READ — evidence: handler `swarm.tools.a08_tools:mutation_gate` performs arithmetic on the supplied counts and returns the score; it runs no mutants and writes nothing.</SIDE_EFFECT_TIER>
 <IDEMPOTENT>idempotent</IDEMPOTENT>
@@ -533,7 +533,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/qa_gate.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/qa_gate.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: qa_runner_detect, qa_flaky_classify, qa_criteria_coverage, qa_mutation_gate, qa_runtime_p95, qa_skip_ratio, qa_defect_escape_rate, qa_retry_budget, qa_name_convention, shared_verdict (see TOOL_INVENTORY).
+Registry tools for this agent: qa_runner_detect, qa_flaky_classify, qa_criteria_coverage, qa_mutation_gate, qa_runtime_p95, qa_skip_ratio, qa_defect_escape_rate, qa_retry_budget, qa_name_convention, shared_verdict (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -543,7 +543,7 @@ Registry tools for this agent: qa_runner_detect, qa_flaky_classify, qa_criteria_
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

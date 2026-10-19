@@ -437,7 +437,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/data_migration_check.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/data_migration_check.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: data_down_present, data_destructive_ddl_scan, data_not_null_default_check, data_index_name_check, data_fk_cycle_check, data_pii_tag_coverage, data_contract_field_compat, data_row_count_reconcile, data_migration_version_order, data_reversible_pair_check (see TOOL_INVENTORY).
+Registry tools for this agent: data_down_present, data_destructive_ddl_scan, data_not_null_default_check, data_index_name_check, data_fk_cycle_check, data_pii_tag_coverage, data_contract_field_compat, data_row_count_reconcile, data_migration_version_order, data_reversible_pair_check (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -447,7 +447,7 @@ Registry tools for this agent: data_down_present, data_destructive_ddl_scan, dat
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

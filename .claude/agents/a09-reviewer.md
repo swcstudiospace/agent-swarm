@@ -77,9 +77,9 @@ Run the script first for stats and mechanical findings; read the diff yourself f
 <WHEN_TO_USE>After reading the diff stats from rev_gate.py, to test the total changed-line count against max_lines (default guidance 400 lines for a split request, 800 for the gate script ceiling).</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Do not use it to judge the quality of the change, to decide pass or fail, or to replace rev_gate.py. It only compares a sum with a limit.</WHEN_NOT_TO_USE>
 <INPUTS>
-- `added` (integer, required): lines added in the diff.
-- `deleted` (integer, required): lines deleted in the diff.
-- `max_lines` (integer, required): the split budget to compare against.
+- `added` (integer, minimum 0, required): lines added in the diff.
+- `deleted` (integer, minimum 0, required): lines deleted in the diff.
+- `max_lines` (integer, minimum 0, required): the split budget to compare against.
 - `probe` (string, optional, enum dependency | partial | sleep): contract-test probe only. Never set it in production work.
 </INPUTS>
 <OUTPUTS>
@@ -527,7 +527,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/rev_gate.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/rev_gate.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: rev_diff_size, rev_sensitive_paths, rev_auto_approve_check, rev_review_latency_p95, rev_severity_histogram, rev_false_approve_rate, rev_comment_density, rev_test_pairing, rev_unresolved_threads, shared_verdict (see TOOL_INVENTORY).
+Registry tools for this agent: rev_diff_size, rev_sensitive_paths, rev_auto_approve_check, rev_review_latency_p95, rev_severity_histogram, rev_false_approve_rate, rev_comment_density, rev_test_pairing, rev_unresolved_threads, shared_verdict (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -537,7 +537,7 @@ Registry tools for this agent: rev_diff_size, rev_sensitive_paths, rev_auto_appr
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

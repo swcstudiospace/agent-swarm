@@ -506,7 +506,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
     - bun scripts/ts/code_checks.ts --task-id $TASK --correlation-id $CORR --json
     - python3 scripts/fe_a11y_check.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/fe_a11y_check.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: fe_a11y_scan, fe_heading_sequence_check, fe_alt_text_check, fe_form_label_check, fe_tab_order_check, fe_bundle_budget_check, fe_prop_type_coverage, fe_target_size_check, shared_toolchain, shared_check_plan (see TOOL_INVENTORY).
+Registry tools for this agent: fe_a11y_scan, fe_heading_sequence_check, fe_alt_text_check, fe_form_label_check, fe_tab_order_check, fe_bundle_budget_check, fe_prop_type_coverage, fe_target_size_check, shared_toolchain, shared_check_plan (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -516,7 +516,7 @@ Registry tools for this agent: fe_a11y_scan, fe_heading_sequence_check, fe_alt_t
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

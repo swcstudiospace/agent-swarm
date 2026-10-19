@@ -553,7 +553,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
     - bun scripts/ts/arch_adr.ts --task-id $TASK --correlation-id $CORR --json
     - python3 scripts/arch_contract_check.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/arch_contract_check.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: arch_adr_slug, arch_contract_ops, arch_semver_bump, arch_field_breaks, arch_layer_violations, arch_cycle_check, arch_c4_fanout, arch_adr_transition, arch_nfr_budget, shared_verdict (see TOOL_INVENTORY).
+Registry tools for this agent: arch_adr_slug, arch_contract_ops, arch_semver_bump, arch_field_breaks, arch_layer_violations, arch_cycle_check, arch_c4_fanout, arch_adr_transition, arch_nfr_budget, shared_verdict (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -563,7 +563,7 @@ Registry tools for this agent: arch_adr_slug, arch_contract_ops, arch_semver_bum
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

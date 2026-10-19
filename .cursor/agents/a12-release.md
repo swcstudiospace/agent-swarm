@@ -594,7 +594,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/rel_plan.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/rel_plan.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: rel_canary_steps, rel_canary_verdict, rel_rollback_trigger, rel_release_record_check, rel_change_failure_rate, rel_deploy_frequency, rel_lead_time_p95, rel_gate_order_check, shared_verdict, shared_git_head (see TOOL_INVENTORY).
+Registry tools for this agent: rel_canary_steps, rel_canary_verdict, rel_rollback_trigger, rel_release_record_check, rel_change_failure_rate, rel_deploy_frequency, rel_lead_time_p95, rel_gate_order_check, shared_verdict, shared_git_head (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -604,7 +604,7 @@ Registry tools for this agent: rel_canary_steps, rel_canary_verdict, rel_rollbac
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

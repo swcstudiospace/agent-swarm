@@ -207,7 +207,9 @@
         "ci/hooks/**",
         "ci/tests/**",
         "scripts/qa_gate.py",
-        "scripts/ts/qa_gate.ts"
+        "scripts/req_lint.py",
+        "scripts/ts/qa_gate.ts",
+        "scripts/ts/req_lint.ts"
       ],
       "seat": "bot-06-quality-security",
       "slug": "a08-qa",
@@ -231,7 +233,9 @@
         ".pre-commit-config.yaml",
         "ownership.yaml",
         "scripts/rev_gate.py",
-        "scripts/ts/rev_gate.ts"
+        "scripts/rev_greptile_ingest.py",
+        "scripts/ts/rev_gate.ts",
+        "scripts/ts/rev_greptile_ingest.ts"
       ],
       "seat": "bot-06-quality-security",
       "slug": "a09-reviewer",

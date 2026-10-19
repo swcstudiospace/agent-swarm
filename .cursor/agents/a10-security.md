@@ -83,7 +83,7 @@ Run the script first; reason over its JSON (finding ids are stable hashes, evide
 <WHEN_TO_USE>When a candidate line flagged by sec_gate is ambiguous and you need the entropy figure as evidence for triage. Pass only text that contains no credential value (see GUARDRAILS).</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Do not use it to decide a verdict on its own, to replace the sec_gate scan, or on any text that contains a live credential, token or private key. Do not pass repository secrets to it.</WHEN_NOT_TO_USE>
 <INPUTS>
-- `text` (string, required, minLength 1): the candidate text, with credential values redacted before the call.
+- `text` (string, required, minLength 1, maxLength 100000): the candidate text, with credential values redacted before the call.
 - `probe` (string, optional, enum dependency | partial | sleep): contract-test probe only. Never set it in production work.
 </INPUTS>
 <OUTPUTS>
@@ -220,7 +220,7 @@ Expected state: SUCCESS with severity critical and gate_blocking true
   </FAILURE_HANDLING>
   <EXAMPLE><![CDATA[
 Input: {"released": "2024-01-01", "as_of": "2026-10-15", "max_age_days": 365}
-Expected state: SUCCESS with age_days 1019 and stale true
+Expected state: SUCCESS with age_days 1018 and stale true
 ]]></EXAMPLE>
 </TOOL>
 <TOOL name="sec_license_risk" owner="A10">
@@ -482,7 +482,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/sec_gate.py --task-id $TASK --correlation-id $CORR --json
     - The bun security twin does not write an advisory envelope. Use the python3 command above.
-Registry tools for this agent: sec_line_entropy, sec_credential_scan, sec_cvss_band, sec_dependency_age, sec_license_risk, sec_tls_min_version, sec_header_presence, sec_kev_match_count, sec_sbom_summary, shared_verdict (see TOOL_INVENTORY).
+Registry tools for this agent: sec_line_entropy, sec_credential_scan, sec_cvss_band, sec_dependency_age, sec_license_risk, sec_tls_min_version, sec_header_presence, sec_kev_match_count, sec_sbom_summary, shared_verdict (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -492,7 +492,7 @@ Registry tools for this agent: sec_line_entropy, sec_credential_scan, sec_cvss_b
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow><![CDATA[

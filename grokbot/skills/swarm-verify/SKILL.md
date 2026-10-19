@@ -32,7 +32,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 - Role: Senior Test Engineer (A08 QA, slug a08-qa) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A08-qa.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for test.suite, test.results, quality gate.verdict.
 - Home: `bot-06-quality-security`. Seat: `bot-06-quality-security`.
 - Autonomy ceiling: block_merge=L2, run_suites=L2, waive=L3.
-- Scripts: `$SWARM_ROOT/scripts/qa_gate.py`.
+- Scripts: `$SWARM_ROOT/scripts/qa_gate.py`, `$SWARM_ROOT/scripts/req_lint.py`.
 
 ### A09 REV (a09-reviewer)
 
@@ -40,7 +40,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 - Role: Senior Code Reviewer (A09 REV, slug a09-reviewer) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A09-reviewer.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for review.verdict / review gate.verdict (read-only on product code).
 - Home: `bot-06-quality-security`. Seat: `bot-06-quality-security`.
 - Autonomy ceiling: verdict=L2, waive=L3.
-- Scripts: `$SWARM_ROOT/scripts/rev_gate.py`.
+- Scripts: `$SWARM_ROOT/scripts/rev_gate.py`, `$SWARM_ROOT/scripts/rev_greptile_ingest.py`.
 
 ### A10 SEC (a10-security)
 

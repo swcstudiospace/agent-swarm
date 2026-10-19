@@ -86,7 +86,7 @@ Run the token validator before publishing any `design.system.tokens`; a `fail` r
 </INPUTS>
 <OUTPUTS>
 - `state` (string): `SUCCESS` on a successful call.
-- `ratio` (number): WCAG contrast ratio of the pair. Compare against 4.5 for normal text (WCAG 2.2 AA).
+- `ratio` (number): WCAG contrast ratio of the pair, truncated (never rounded up) to two decimals. Compare against 4.5 for normal text (WCAG 2.2 AA).
 </OUTPUTS>
 <SIDE_EFFECT_TIER>READ — evidence: handler `swarm.tools.batch_01_05:contrast` calls `contrast` in scripts/ux_tokens.py on the two hex strings and returns the number; it writes nothing.</SIDE_EFFECT_TIER>
 <IDEMPOTENT>idempotent</IDEMPOTENT>
@@ -94,7 +94,7 @@ Run the token validator before publishing any `design.system.tokens`; a `fail` r
 <FAILURE_HANDLING>
 - SUCCESS: use `ratio`. A ratio below 4.5 for normal text is a major finding; record the pair, the ratio and the token path that holds it.
 - PARTIAL_SUCCESS: record `completed_fraction` and the gap; treat the pair as unchecked and do not mark it compliant.
-- INVALID_INPUT: the handler names a `field` but always reports `fg` for a hex parse error, even when `bg` is the malformed value. Re-read both values from the source token, correct the malformed one once, and retry. If it still fails, return BLOCKED with needs=input.
+- INVALID_INPUT: the handler names the malformed `field` (`fg` or `bg`). Re-read that value from the source token, correct it once, and retry. If it still fails, return BLOCKED with needs=input.
 - UNAUTHORIZED: stop, do not retry, report. Permitted caller is A04 only.
 - DEPENDENCY_UNAVAILABLE: retry the same input at most twice, then report the pair as skipped:tool-missing; if the pair is required for an a11y target, FAILED under error_handling.
 - TIMEOUT: retry at most once, then E-TIMEOUT.
@@ -450,7 +450,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/ux_tokens.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/ux_tokens.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: ux_contrast, ux_token_name_check, ux_target_size_check, ux_scale_monotonic_check, ux_spacing_scale_check, ux_state_coverage_check, ux_focus_contrast_check, ux_motion_duration_check, ux_breakpoint_order_check, shared_verdict (see TOOL_INVENTORY).
+Registry tools for this agent: ux_contrast, ux_token_name_check, ux_target_size_check, ux_scale_monotonic_check, ux_spacing_scale_check, ux_state_coverage_check, ux_focus_contrast_check, ux_motion_duration_check, ux_breakpoint_order_check, shared_verdict (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -460,7 +460,7 @@ Registry tools for this agent: ux_contrast, ux_token_name_check, ux_target_size_
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>
