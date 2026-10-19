@@ -31,3 +31,23 @@ def test_orchestrate_skill():
     for skill in (ROOT / "skills").rglob("*"):
         if skill.is_file():
             assert "/root/" not in skill.read_text(), skill
+
+
+def test_source_skills_are_generated_hidden_and_footed():
+    """Each prompts/skills source renders to a hidden omp skill carrying its generated-from footer."""
+    from swarm.skill_registry import load_skills
+
+    for s in load_skills(ROOT):
+        text = (ROOT / "omp" / "skills" / s.name / "SKILL.md").read_text(encoding="utf-8")
+        head = text.split("---", 2)[1]
+        assert f'name: "{s.name}"' in head and "disable-model-invocation: true" in head, s.name
+        assert text.rstrip().endswith(f"<!-- generated from {s.path}; edit the source and run scripts/build_agents.py -->"), s.name
+        assert "/root/" not in text, s.name
+
+
+def test_index_skills_stay_visible():
+    """The per-agent routing skills keep their frontmatter: no hide flag, so omp still lists them."""
+    agents = json.loads((ROOT / "agents.json").read_text())["agents"]
+    for a in agents:
+        head = (ROOT / "omp" / "skills" / a["slug"] / "SKILL.md").read_text(encoding="utf-8").split("---", 2)[1]
+        assert "disable-model-invocation" not in head and f'name: "{a["slug"]}"' in head, a["slug"]

@@ -29,6 +29,8 @@ Don't use for: Do not edit product code.
 
 - `python3 scripts/rev_gate.py --task-id $TASK --correlation-id $CORR --json`
 - `bun scripts/ts/rev_gate.ts --task-id $TASK --correlation-id $CORR --json`
+- `python3 scripts/rev_greptile_ingest.py --task-id $TASK --correlation-id $CORR --json`
+- `bun scripts/ts/rev_greptile_ingest.ts --task-id $TASK --correlation-id $CORR --json`
 
 ## Procedure
 

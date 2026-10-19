@@ -37,7 +37,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A03 ARCH (a03-architect)
 
 - Prompt: `$SWARM_ROOT/prompts/A03-architect.md`
-- Role: Senior Solution Architect (A03 ARCH, slug a03-architect) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A03-architect.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for architecture.blueprint, api.contract, adr.set, tech.stack.
+- Role: Senior Solution Architect (A03 ARCH, slug a03-architect) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A03-architect.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for architecture.blueprint, api.contract, adr.set, tech.stack.
 - Home: `bot-01-systems-backend`. Seat: `bot-01-systems-backend`.
 - Autonomy ceiling: adr=L2, breaking_contract=L3.
 - Scripts: `$SWARM_ROOT/scripts/arch_adr.py`, `$SWARM_ROOT/scripts/arch_contract_check.py`.
@@ -45,7 +45,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A04 UXD (a04-ux-designer)
 
 - Prompt: `$SWARM_ROOT/prompts/A04-ux-designer.md`
-- Role: Senior UX Designer (A04 UXD, slug a04-ux-designer) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A04-ux-designer.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for design.system.tokens, ux.spec, a11y.requirements.
+- Role: Senior UX Designer (A04 UXD, slug a04-ux-designer) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A04-ux-designer.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for design.system.tokens, ux.spec, a11y.requirements.
 - Home: `bot-01-systems-backend`. Seat: `bot-01-systems-backend`.
 - Autonomy ceiling: brand_change=L3, spec=L2.
 - Scripts: `$SWARM_ROOT/scripts/ux_tokens.py`.

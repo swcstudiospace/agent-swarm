@@ -12,6 +12,7 @@ contains "background"/"bg"). Ratio < --min-ratio (4.5, WCAG AA) is a major findi
 """
 from __future__ import annotations
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -20,16 +21,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, iter_files  # noqa: E402
 from swarm.gates import make_finding, derive_verdict  # noqa: E402
 
-HEX_RE = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})")  # always used with fullmatch
 ALIAS_RE = re.compile(r"^\{([^}]+)\}$")
 BG_HINTS = ("background", "bg", "surface", "canvas")
 
 
+_HEX_DIGITS_RE = re.compile(r"(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
+
+
 def hex_to_rgb(h: str) -> tuple[float, float, float]:
-    h = h.lstrip("#")
+    h = h[1:] if h.startswith("#") else h
+    if not _HEX_DIGITS_RE.fullmatch(h):
+        raise ValueError(f"invalid hex colour {h!r}: expected 3, 4, 6 or 8 hex digits")
     if len(h) in (3, 4):
         h = "".join(c * 2 for c in h[:3])
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
+
+
+def _is_hex(value: str) -> bool:
+    """A `#`-prefixed colour that hex_to_rgb accepts: the same rule for validation and for contrast, so no value can
+    pass the check and then raise in contrast()."""
+    if not HEX_RE.fullmatch(value):
+        return False
+    try:
+        hex_to_rgb(value)
+    except ValueError:
+        return False
+    return True
 
 
 def luminance(h: str) -> float:
@@ -41,7 +59,11 @@ def luminance(h: str) -> float:
 
 def contrast(fg: str, bg: str) -> float:
     l1, l2 = sorted((luminance(fg), luminance(bg)), reverse=True)
-    return round((l1 + 0.05) / (l2 + 0.05), 2)
+    # Floor, never round: 2.9953 must not be reported as 3.0 and pass a >= 3 / 4.5 / 7 threshold check. The epsilon
+    # only absorbs float noise (about 1e-13 after the x100). The closest true ratio below a threshold over all 2^24
+    # sRGB colours is 3.5e-11 under it (1e-12 at x100 is 1e-14 in ratio units), so no ratio below 3, 4.5 or 7 can be
+    # reported as that threshold.
+    return math.floor((l1 + 0.05) / (l2 + 0.05) * 100 + 1e-12) / 100
 
 
 def walk(node, path: list[str], inherited: str | None, out: dict):
@@ -84,7 +106,7 @@ def check_file(path: Path, args, findings: list, fid) -> dict:
             findings.append(make_finding(fid(), "major", "alias", f"{name}: alias {t['value']} does not resolve", location=loc))
             continue
         if t["type"] == "color":
-            if isinstance(val, str) and HEX_RE.match(val):
+            if isinstance(val, str) and _is_hex(val):
                 colours[name] = val
             else:
                 findings.append(make_finding(fid(), "major", "color", f"{name}: invalid colour value {val!r}", location=loc))
@@ -97,7 +119,11 @@ def check_file(path: Path, args, findings: list, fid) -> dict:
         for name, val in colours.items():
             if name == bg_name or any(h in name.lower() for h in BG_HINTS):
                 continue
-            ratio = contrast(val, bg)
+            try:
+                ratio = contrast(val, bg)
+            except ValueError as exc:  # unreachable while _is_hex gates colours; a finding, never a crash for the whole file
+                findings.append(make_finding(fid(), "major", "color", f"{name}: {exc}", location=loc))
+                continue
             pairs.append({"fg": name, "bg": bg_name, "ratio": ratio, "aa": ratio >= args.min_ratio})
             if ratio < args.min_ratio:
                 findings.append(make_finding(fid(), "major", "contrast",
@@ -121,7 +147,7 @@ def run(args, ctx) -> dict:
         return f"UF-{counter[0]:03d}"
     findings, reports = [], []
     if args.fg or args.bg:
-        if not (args.fg and args.bg and HEX_RE.match(args.fg) and HEX_RE.match(args.bg)):
+        if not (args.fg and args.bg and _is_hex(args.fg) and _is_hex(args.bg)):
             return {"status": "fail", "summary": "E-INPUT: --fg and --bg must both be valid hex colours",
                     "findings": [make_finding("UF-000", "major", "input", "bad --fg/--bg", owner_suggestion="A04")]}
         ratio = contrast(args.fg, args.bg)

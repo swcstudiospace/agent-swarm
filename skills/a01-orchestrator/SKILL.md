@@ -1,7 +1,7 @@
 ---
 name: a01-orchestrator
 description: >
-  A01 ORCH Swarm Orchestrator — Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC.
+  A01 ORCH Swarm Orchestrator — Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 14 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC. Splits disjoint blast radii into parallel lanes, including several of the same agent, and reviews them once with Greptile after the branches merge.
   Use when the user runs /a01-orchestrator, asks for ORCH, or the swarm assigns capability plan.decompose, plan.schedule, plan.arbitrate.
 disable-model-invocation: false
 ---

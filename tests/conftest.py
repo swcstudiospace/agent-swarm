@@ -17,16 +17,39 @@ from install_helpers import _ENV_KEYS, _yaml  # noqa: E402  (after ROOT is on sy
 
 
 @pytest.fixture(autouse=True)
-def ephemeral_signing_key(monkeypatch):
-    """Each test gets a throwaway HMAC key. The dev-key opt-in stays off unless that test sets it.
+def ephemeral_signing_key(monkeypatch, tmp_path_factory):
+    """Each test gets a throwaway HMAC key and isolated private-key discovery directories.
 
     The value is generated here and is not printed, logged, or written down. A test that needs
-    another configuration sets or clears the variables itself.
+    another configuration sets or clears the variables itself. HOME/XDG remain test-owned even
+    after a keyless test clears the raw credentials; the separate home fixture can still override HOME.
+    Discovery directories live outside each test's tmp_path so installer filesystem assertions
+    and rollback checks are not affected by this autouse fixture.
     """
     monkeypatch.delenv("SWARM_ALLOW_INSECURE_DEV_KEY", raising=False)
     monkeypatch.delenv("SWARM_ED25519_KEY", raising=False)
+    monkeypatch.delenv("SWARM_ED25519_KEY_FILE", raising=False)
     monkeypatch.delenv("SWARM_REQUIRE_KEY", raising=False)
     monkeypatch.setenv("SWARM_SIGNING_KEY", secrets.token_hex(32))
+    signing_home = tmp_path_factory.mktemp("signing-home")
+    signing_config = tmp_path_factory.mktemp("signing-config")
+    monkeypatch.setenv("HOME", str(signing_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(signing_config))
+
+
+@pytest.fixture(autouse=True)
+def _repo_swarm_state_is_untouched(monkeypatch, tmp_path_factory):
+    """Keep tests off the checkout's own .swarm run state.
+
+    call_tool appends a local-only audit row whenever a .swarm directory exists (or the tool writes),
+    so a test that calls registry tools without SWARM_DIR would pollute <repo>/.swarm/events.jsonl,
+    which is the live run log when a swarm runs in this checkout. When the process has no SWARM_DIR,
+    point it at a fresh per-test directory (created lazily by the code under test, not here). Tests
+    that set SWARM_DIR keep control; tests of the default resolution call monkeypatch.delenv, which
+    runs after this fixture and wins.
+    """
+    if not os.environ.get("SWARM_DIR"):
+        monkeypatch.setenv("SWARM_DIR", str(tmp_path_factory.mktemp("swarm") / ".swarm"))
 
 
 @pytest.fixture()
@@ -91,10 +114,10 @@ def tree(tmp_path):
 # other host contamination — is scrubbed. Callers pass what the child needs
 # explicitly via `env`, which is applied on top untouched. Host signing keys
 # still cannot leak: the autouse ephemeral_signing_key fixture overwrites
-# SWARM_SIGNING_KEY for every test, and fail-closed tests clear the key vars,
-# so an allowlisted key is always test-controlled, never ambient.
+# SWARM_SIGNING_KEY, clears private-file references, and isolates HOME/XDG_CONFIG_HOME for every test.
+# Fail-closed tests can clear the raw key vars without discovering the real host fallback.
 _BASE_ENV_ALLOW = frozenset({
-    "PATH", "HOME",
+    "PATH", "HOME", "XDG_CONFIG_HOME",
     "TMPDIR", "TEMP", "TMP",
     "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS",
     "LANG", "LANGUAGE", "LC_ALL",
@@ -102,7 +125,7 @@ _BASE_ENV_ALLOW = frozenset({
     "LC_COLLATE", "LC_MONETARY",
     "PYTHONIOENCODING", "PYTHONUTF8", "TZ",
     "SWARM_DIR",
-    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_REQUIRE_KEY",
+    "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
     "SWARM_ALLOW_INSECURE_DEV_KEY",
 })
 

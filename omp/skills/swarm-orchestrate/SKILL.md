@@ -13,15 +13,16 @@ disable-model-invocation: false
 Never use from a specialist session.
 
 ## Prerequisites
-- Tools: swarm_plan, swarm_status, swarm_transition, swarm_ingest, task (plus read tools). You do **not** have `swarm_gate`: the gate agents (a08-qa, a09-reviewer, a10-security, a12-release) run it themselves.
+- Tools: swarm_plan, swarm_status, swarm_transition, swarm_assignment, swarm_ingest, task (plus read tools). You do **not** have `swarm_gate`: the gate agents (a08-qa, a09-reviewer, a10-security, a12-release) run it themselves.
 - A correlation from swarm_plan or /swarm.
 
 ## Procedure
 
 1. `swarm_status` for the correlation → the ready tasks, each with its `agent` and gate notes (`gate`, `gate_for`).
 2. Lease every task of the ready wave with `swarm_transition`: PLANNED → CLAIMED, then CLAIMED → IN_PROGRESS. Lease gate tasks before their gate agent runs: `swarm_gate` refuses a gate task that is not IN_PROGRESS.
+   Obtain each leased task's canonical prompt with `swarm_assignment({task_id, correlation_id})`; require `assignment_verified: true`. Do not construct signatures or use generic code-execution devices.
 3. Make **one** `task` call for the wave:
-   - `tasks[]` holds one item per task, each with `agent: <slug>` and a task.assign payload: `task_id`, `correlation_id`, `capability`, `inputs`, `acceptance`, `risk_class`.
+   - `tasks[]` holds one item per task, each with `agent: <slug>` from the verified assignment and its exact canonical signed prompt unchanged.
    - Add `schemaMode: "strict"` to every item for a08-qa, a09-reviewer, a10-security and a12-release.
    - Gate agents run `swarm_gate` themselves. Never pass them findings or a verdict.
 4. `swarm_ingest` every child's task.result before the next wave. Ingest applies the result and runs reconcile itself; there is no separate reconcile call. Reconcile:

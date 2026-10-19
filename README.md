@@ -15,6 +15,7 @@ A complete design specification for a distributed swarm of 15 specialized AI age
 | 7 | [07-scalability.md](07-scalability.md) | Manifest schema, new-agent onboarding (shadow→probation→full), traffic shaping, contract evolution, multi-swarm |
 | 8 | [CLAUDE.md](CLAUDE.md) · [prompts/](prompts/) · [scripts/](scripts/) · [swarm/](swarm/) | Runnable implementation: subagent prompts, per-agent Python tools, orchestration runtime |
 | 9 | [docs/substrate-integration.md](docs/substrate-integration.md) | Platform pointer: how the spec's substrates map onto [Agent Substrate](https://github.com/swcstudiospace/agent-substrate) |
+| 10 | [docs/swarm-command-center.md](docs/swarm-command-center.md) · [docs/swarm-bar.md](docs/swarm-bar.md) · [docs/operations-runbook.md](docs/operations-runbook.md) | v2.2 runtime: continuous scheduler, telemetry, handover, tools and skills per agent, the omp bar; how-to guides, configuration, troubleshooting, known limits |
 
 ## Platform
 
@@ -68,21 +69,41 @@ lifecycle state machine, fail-closed gates, manifest registry). [agents.json](ag
 
 ```bash
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature   # brief → task DAG in <repo>/.swarm
-python3 scripts/swarm_run.py --repo /path/to/codebase --runtime auto  # claude or grok -p --agent <slug>; --runtime omp [--omp-bin omp] for headless omp -p
-python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime grok   # simulate the whole DAG offline
+python3 scripts/swarm_run.py --repo /path/to/codebase --runtime omp  # normal OMP approvals; --runtime claude also supported; --max-parallel N (default 4), --swarm-timeout S
+python3 scripts/swarm_run.py --repo /path/to/codebase --dry-run --runtime omp   # simulate the DAG offline; not acceptance
 bun scripts/ts/req_lint.ts --json                                     # TypeScript twin of any scripts/*.py
 python3 scripts/build_agents.py                                      # regenerate .claude/agents, .grok/agents, .cursor/agents, omp/agents, omp/skills (--check)
 python3 scripts/_install_cursor.py --target /path/to/repo --dry-run  # list the Cursor files a target repo would gain; writes nothing
 python3 scripts/build_agents.py --install-workspace /path/to/workspace  # Claude + Grok agents, skills, hook, the omp package and substrate-mcp (see below)
 python3 scripts/orch_status.py --repo /path/to/codebase           # status, gates, escalations (same --repo as the plan)
+python3 scripts/swarm_live.py --repo /path/to/codebase            # live run table: state, elapsed time, last activity
+python3 scripts/swarm_tool.py catalog --caller A05                # tools and skills an agent may use (call: --name N --input JSON)
+python3 -m swarm.tool_registry check && python3 -m swarm.skill_registry check   # registry and skill validation
 python3 scripts/receipt_export.py --repo /path/to/codebase --json  # desk verification receipt; swarm verdicts stay advisory
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
 
 `scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
 
+Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE` (which must be an absolute path),
+or from `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when neither raw signing
+variable is set. References must resolve to an owner-only regular file without symlink components;
+the conventional directory must also be private. Key contents never belong in prompts, argv,
+logs, or tracked files. See [private signer bootstrap](docs/operations-runbook.md#private-signer-bootstrap).
+
+Live/reused `orch_plan` responses include a cryptographically verified `execution_assignment`
+when a real signer is available. `/swarm` refuses missing, unsigned, or mismatched kickoff
+assignments instead of dispatching an unauthenticated A01 turn. Specialist sessions cannot
+auto-load private references. OMP uses normal `write` approvals (or `--approval-mode always-ask`);
+Grok headless dispatch currently fails closed because its installed interface does not support
+the old stdin transport. Start a fresh OMP process after updating the extension.
+
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
 `a02-requirements` … `a15-docs` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
+
+### Swarm Command Center (v2.2)
+
+`swarm_run.py` runs a continuous scheduler: a slot is refilled the moment a session ends, bounded by `--max-parallel` (`SWARM_MAX_PARALLEL`, default 4, ceiling 32) and each agent's own limit, with a lifecycle state machine, cancellation, timeouts, backoff and rate-limit backpressure. One telemetry channel (`.swarm/events.jsonl` and `.swarm/live.json`) feeds the logs, `scripts/swarm_live.py` and the swarm bar of omp (always there, two full-width rows above the editor) that shows every subagent's state and elapsed time and the session's token savings. Agents hand work over with a versioned, validated `swarm.handover.v1` document. Every agent has a shared baseline of tools and skills plus 10 to 15 of its own, found with `swarm_catalog` and called with `swarm_tool_call`. Start at [docs/swarm-command-center.md](docs/swarm-command-center.md) (architecture, how to add an agent, tool or skill, configuration, troubleshooting, security model, known limits) and [docs/swarm-bar.md](docs/swarm-bar.md) (reading the bar).
 
 ## Install into a workspace
 
@@ -189,25 +210,3 @@ Desk Lead installs this onto the box and onto programming-desk only after Ming a
 ## Suggested reading order
 
 Operators: 01 → 04 → 05 → 06 · Agent developers: 02 → your agent spec in 03/ → 07 · Auditors/security: agent §7 sections + 06 §S · Integration work: 02 → 04.
-
-## Trae SOLO Agents
-
-The [Trae registration kit](.trae/README.md) contains all 15
-[XML-tagged prompts](.trae/agents/), each below 10,000 characters, a
-[registration checklist](.trae/registration.json), and the
-[/swarm command](.trae/commands/swarm.md).
-
-A01 coordinates the task flow; the built-in SOLO agent invokes the registered
-specialists and returns their results to A01 for gating and the next batch.
-The files do not automatically register agents: enable them in Trae's custom-agent
-UI and SOLO's callable-agent settings using the setup guide.
-
-```bash
-python3 scripts/build_trae_agents.py          # regenerate the Trae kit only
-python3 scripts/build_trae_agents.py --check  # read-only drift and size check
-python3 -m pytest tests/test_trae_agents.py -q
-```
-
-This native-session adapter does not invoke Claude/Grok hooks, the headless runner,
-or the signed Task Store protocol. It preserves approval gates and single-writer
-ownership without claiming that XML alone enforces runtime permissions.

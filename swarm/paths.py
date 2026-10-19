@@ -45,3 +45,20 @@ def swarm_dir(root: str | Path | None = None, *, create: bool = False) -> Path:
 def latest_correlation(root: str | Path | None = None) -> str | None:
     f = swarm_dir(root) / "latest_correlation"
     return f.read_text().strip() if f.exists() else None
+
+
+def logging_paths(root: str | Path | None = None) -> dict[str, str]:
+    """Spec for all logging paths used by the logger unit.
+    Emits at phases go to events.jsonl; end-of-run summaries and autonomous to their logs;
+    state for lifecycle projections.
+    """
+    d = swarm_dir(root, create=False)
+    return {
+        "dir": str(d),
+        "events": str(d / "events.jsonl"),
+        "autonomous_log": str(d / "autonomous.log"),
+        "swarm_state": str(d / "swarm-state.json"),
+        "latest_correlation": str(d / "latest_correlation"),
+        "tasks_db": str(d / "tasks.db"),
+        "results": str(d / "results"),
+    }

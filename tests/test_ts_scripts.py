@@ -27,6 +27,11 @@ def test_ts_dry_run_json(tmp_path, monkeypatch):
         if ts.stem in skip or ts.name.startswith("_"):
             continue
         r = subprocess.run([BUN, str(ts), "--dry-run", "--json"], cwd=ROOT, capture_output=True, text=True, env=env)
+        if ts.stem == "orch_assign":
+            data = json.loads(r.stdout)
+            assert r.returncode == 2 and data["error"]["code"] == "E-POLICY"
+            assert "assignment" not in data and "prompt" not in data
+            continue
         assert r.returncode in (0, 1), f"{ts.name} rc={r.returncode}\n{r.stderr[-800:]}\n{r.stdout[-400:]}"
         data = json.loads(r.stdout)
         assert data["status"] in ("ok", "fail"), ts.name

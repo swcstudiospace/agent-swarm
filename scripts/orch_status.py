@@ -19,6 +19,7 @@ from swarm.runlog import read_events  # noqa: E402
 from swarm.paths import latest_correlation  # noqa: E402
 from swarm.errors import SwarmError, ErrorCode  # noqa: E402
 from swarm.results import parse_result, validate_result, apply_result, reconcile, reject, check_manual_transition  # noqa: E402
+from swarm.observability import emit_inline_transition  # noqa: E402
 from swarm import substrate_lease  # noqa: E402
 
 
@@ -48,6 +49,7 @@ def ingest(store: TaskStore, path: Path, ctx, *, approve: bool = True) -> dict:
         raise
     log = reconcile(store, task["correlation_id"], ctx.emit, approve=approve)
     t = store.get(tid)
+    emit_inline_transition(store, t, task["state"], t["state"], reason=f"ingest {path.name}", root=ctx.root)
     return {"status": "ok", "task": t, "reconcile": log, "summary": f"ingested task.result for {tid} → {state} (now {t['state']})"}
 
 
@@ -65,6 +67,7 @@ def run(args, ctx) -> dict:
         if ctx.dry_run:
             return {"status": "ok", "summary": f"dry-run: would transition {tid} → {state}"}
         check_manual_transition(store, tid, state)  # T-05-31: a gate task reaches IN_REVIEW only through an ingest
+        before = store.get(tid)["state"]
         store.transition(tid, state, actor="A01", reason=args.reason or "manual")
         # a lease the runner mirrored in notes.lease is released (CANCELLED, FAILED, …) or completed (DONE) now, by its
         # lease_id and with the agent's token for this workspace (--root, the runner's --repo), rather than left to
@@ -73,6 +76,8 @@ def run(args, ctx) -> dict:
         # The task printed below carries the mirrored lease_id; runlog.emit drops it from the event (no lease_id in the log).
         substrate_lease.settle_mirrored(store, tid, emit=ctx.emit, workspace=ctx.root)
         t = store.get(tid)
+        # TaskStore's observer refreshed live.json; the run events are the in-session counterpart of Telemetry's
+        emit_inline_transition(store, t, before, t["state"], reason=args.reason or "manual", root=ctx.root)
         ctx.emit("task.transition", {"task_id": tid, "state": t["state"], "reason": args.reason})
         return {"status": "ok", "task": t, "summary": f"{tid} → {t['state']}"}
 
