@@ -269,8 +269,8 @@ Expected state: SUCCESS with drift_count 1, drifted_keys "replicas", action "aut
 <WHEN_TO_USE>During cost hygiene review, after reading the modeled budget and the actual cost for one environment from billing data, to decide whether that environment is flagged for auto-downscale.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Do not use it to fetch billing data; it compares two numbers you supply. Do not treat `action` as an executed downscale; the tool only returns the recommendation. Do not use it with a zero or negative budget.</WHEN_NOT_TO_USE>
 <INPUTS>
-- `modeled_cost` (number, required, greater than 0): modeled budget.
-- `actual_cost` (number, required, 0 or greater): actual cost for the same period.
+- `modeled_cost` (number, required, greater than 0, at most 1e15): modeled budget.
+- `actual_cost` (number, required, 0 to 1e15): actual cost for the same period.
 - `probe` (string, optional, enum dependency, partial, sleep): contract-test probe only. Never set it in production work.
 </INPUTS>
 <OUTPUTS>
@@ -285,7 +285,7 @@ Expected state: SUCCESS with drift_count 1, drifted_keys "replicas", action "aut
 <FAILURE_HANDLING>
 - SUCCESS: `overrun` true makes `auto-downscale` the recommended action; record the ratio in the cost report. `overrun` false means `none`.
 - PARTIAL_SUCCESS: record `completed_fraction` and the gap; do not report the overrun status as final.
-- INVALID_INPUT: the handler returns it when `modeled_cost` is zero or less. Confirm the budget from the cost model and retry once; if it still fails, return BLOCKED with needs=input.
+- INVALID_INPUT: the handler returns it when `modeled_cost` is zero or less, or when actual/modeled is not a finite number. Confirm the budget from the cost model and retry once; if it still fails, return BLOCKED with needs=input.
 - UNAUTHORIZED: stop, do not retry, report. Permitted caller is A11 only.
 - DEPENDENCY_UNAVAILABLE: retry the same input at most twice, then report the overrun status as skipped:tool-missing or FAILED.
 - TIMEOUT: retry at most once, then E-TIMEOUT.
@@ -424,7 +424,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
     - bun scripts/ts/devops_ci_check.ts --task-id $TASK --correlation-id $CORR --json
     - python3 scripts/devops_build_record.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/devops_build_record.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: devops_ci_kind, devops_build_systems, devops_env_tier, devops_change_gate, devops_drift_count, devops_cost_overrun, devops_image_tag_check, devops_freeze_window, shared_verdict, shared_git_head (see TOOL_INVENTORY).
+Registry tools for this agent: devops_ci_kind, devops_build_systems, devops_env_tier, devops_change_gate, devops_drift_count, devops_cost_overrun, devops_image_tag_check, devops_freeze_window, shared_verdict, shared_git_head (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -434,7 +434,7 @@ Registry tools for this agent: devops_ci_kind, devops_build_systems, devops_env_
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

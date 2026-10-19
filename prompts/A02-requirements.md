@@ -462,7 +462,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/req_lint.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/req_lint.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: req_gwt_check, req_invest_score, req_ambiguity_scan, req_story_duplicates, req_wsjf_rank, req_criteria_testability, req_traceability_coverage, req_change_impact, req_nfr_coverage, shared_verdict (see TOOL_INVENTORY).
+Registry tools for this agent: req_gwt_check, req_invest_score, req_ambiguity_scan, req_story_duplicates, req_wsjf_rank, req_criteria_testability, req_traceability_coverage, req_change_impact, req_nfr_coverage, shared_verdict (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -472,7 +472,7 @@ Registry tools for this agent: req_gwt_check, req_invest_score, req_ambiguity_sc
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

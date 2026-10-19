@@ -15,6 +15,7 @@ import posixpath
 import re
 from collections import Counter
 from datetime import date
+from urllib.parse import unquote
 
 from swarm.tools.support import respond
 
@@ -52,14 +53,30 @@ def _parse_date(value) -> date | None:
         return None
 
 
+_UNRESOLVABLE = "\0"  # never a listed file: a target whose encoded form hides a path separator
+
+
 def _link_path(source: str, target: str) -> str | None:
-    """Repo-relative path a link targets, or None when the link leaves the repo."""
+    """Repo-relative path a link targets, None when the link leaves the repo, _UNRESOLVABLE when it cannot name a file.
+
+    The query and fragment are dropped first, then every segment is percent-decoded (`my%20doc.md` is `my doc.md`).
+    A segment that decodes to something containing `/`, `\\` or NUL (`..%2F..%2Fetc`) is data, not a separator, and
+    never resolves, so encoding cannot be used to climb out of the tree. A literal or `%2e%2e` `..` is normalized as
+    before and stays broken when it climbs above the root.
+    """
     target = target.strip()
     if target.startswith("//") or _SCHEME.match(target):
         return None
     path = target.split("#", 1)[0].split("?", 1)[0]
     if not path:
         return source
+    segments = []
+    for segment in path.split("/"):
+        decoded = unquote(segment)
+        if "/" in decoded or "\\" in decoded or "\0" in decoded:
+            return _UNRESOLVABLE
+        segments.append(decoded)
+    path = "/".join(segments)
     if path.startswith("/"):
         return posixpath.normpath(path.lstrip("/"))
     return posixpath.normpath(posixpath.join(posixpath.dirname(source), path))
@@ -353,6 +370,245 @@ def docs_adr_render_coverage(payload: dict) -> dict:
             "missing": [adr_id for adr_id in in_scope if adr_id not in rendered_set],
             "orphan_rendered": [adr_id for adr_id in rendered if adr_id not in known],
             "excluded": len(ids) - len(in_scope),
+        }
+
+    return respond(payload, work)
+
+
+# --- v2.2 additions: runbook schema, digest staleness, terminology drift -----------------------------
+
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_FENCE_OPEN = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE = re.compile(r"^\s*(`{3,}|~{3,})\s*$")
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+_QUOTE_PREFIX = re.compile(r"(?: {0,3}>[ \t]?)+")  # blockquote markers: `>`, `> `, `> >`, ...
+
+
+def _blank(value) -> bool:
+    return not isinstance(value, str) or not value.strip()
+
+
+def docs_runbook_schema_check(payload: dict) -> dict:
+    """Validate runbook fragments against the executable schema A13 consumes (03-agents/A15-docs.md section 3)."""
+
+    def work() -> dict:
+        known = payload.get("known_actions")
+        known_set = set(known) if known is not None else None
+        seen_ids: set = set()
+        invalid: list[dict] = []
+        flagged: list[dict] = []
+        bad_ids: set = set()
+
+        def problem(runbook_id: str, field: str, reason: str) -> None:
+            invalid.append({"runbook_id": runbook_id, "field": field, "reason": reason})
+            bad_ids.add(runbook_id)
+
+        for index, rb in enumerate(payload["runbooks"]):
+            rid = rb["runbook_id"]
+            if not rid.strip():
+                return _invalid(f"runbooks[{index}].runbook_id", "runbook_id must not be blank")
+            if rid in seen_ids:
+                problem(rid, "runbook_id", f"duplicate runbook_id {rid}")
+                continue
+            seen_ids.add(rid)
+            if _blank(rb.get("title")):
+                problem(rid, "title", "title is missing")
+            if _blank(rb.get("trigger")):
+                problem(rid, "trigger", "trigger is missing")
+            steps = rb.get("steps") or []
+            if not steps:
+                problem(rid, "steps", "runbook has no step")
+            actions: dict[str, bool] = {}
+            for number, step in enumerate(steps):
+                action = step.get("action")
+                if _blank(action):
+                    problem(rid, f"steps[{number}].action", "step action is missing")
+                    continue
+                if known_set is not None and action not in known_set:
+                    problem(rid, f"steps[{number}].action", f"unknown action {action}")
+                actions[action] = actions.get(action, True) and step.get("reversible") is True
+            for action in _unique(rb.get("whitelisted_for_automation") or []):
+                if action not in actions:
+                    problem(rid, "whitelisted_for_automation", f"action {action} is not a step of this runbook")
+                elif not actions[action]:
+                    flagged.append({"runbook_id": rid, "action": action})
+            verified = rb.get("last_verified")
+            if _blank(verified):
+                problem(rid, "last_verified", "last_verified is missing")
+            elif _parse_date(verified) is None:
+                problem(rid, "last_verified", "last_verified must be a YYYY-MM-DD date")
+
+        bad_ids.update(item["runbook_id"] for item in flagged)
+        valid_count = len(seen_ids) - len(bad_ids)
+        return {
+            "state": "SUCCESS",
+            "checked": len(seen_ids),
+            "valid_count": valid_count,
+            "valid": not invalid and not flagged,
+            "invalid": invalid,
+            "non_reversible_whitelisted": flagged,
+        }
+
+    return respond(payload, work)
+
+
+def docs_digest_staleness(payload: dict) -> dict:
+    """Staleness law (03-agents/A15-docs.md section 4.2): a doc is stale when its bound artifact digest differs from the current one."""
+
+    def work() -> dict:
+        current: dict[str, str] = {}
+        for index, entry in enumerate(payload["current"]):
+            artifact, digest = entry["artifact"], entry["digest"]
+            if not artifact.strip():
+                return _invalid(f"current[{index}].artifact", "artifact must not be blank")
+            if not _DIGEST.fullmatch(digest):
+                return _invalid(f"current[{index}].digest", "digest must be sha256: followed by 64 lowercase hex characters")
+            if current.setdefault(artifact, digest) != digest:
+                return _invalid("current", f"artifact {artifact} is listed with two different digests")
+        paths = [doc["path"] for doc in payload["docs"]]
+        duplicate = _duplicates(paths)
+        if duplicate:
+            return _invalid("docs", f"duplicate path {duplicate[0]}")
+        stale: list[dict] = []
+        unbound: list[str] = []
+        scopes: set = set()
+        for doc in payload["docs"]:
+            artifact, bound = doc.get("bound_artifact"), doc.get("bound_digest")
+            if _blank(artifact):
+                unbound.append(doc["path"])
+                continue
+            if artifact not in current:
+                reason = f"bound artifact {artifact} is not in the current set"
+            elif _blank(bound):
+                reason = "no bound_digest recorded"
+            elif not _DIGEST.fullmatch(bound):
+                reason = "bound_digest is malformed"
+            elif bound != current[artifact]:
+                reason = f"digest of {artifact} changed"
+            else:
+                continue
+            stale.append({"path": doc["path"], "reason": reason})
+            scopes.add(artifact)
+        return {
+            "state": "SUCCESS",
+            "total": len(paths),
+            "fresh_count": len(paths) - len(stale) - len(unbound),
+            "stale": stale,
+            "unbound": unbound,
+            "stale_scopes": sorted(scopes),
+        }
+
+    return respond(payload, work)
+
+
+def _prose_lines(text: str) -> list[tuple[int, str]]:
+    """(1-based line number, line) outside fenced code blocks, with inline code spans blanked to keep columns.
+
+    A fence closes only on a line of the same character and at least the opening length with no info string
+    (CommonMark), so a four-backtick block may contain a three-backtick example. A fence inside a blockquote
+    (`> ```md` ... `> ```) is a fence: the `>` markers are removed before matching, the closing fence must sit at
+    the same quote depth, and the block ends where the quote ends. Limit: blockquotes are the only container
+    tracked; a fence inside a list item is matched by its indentation alone.
+    """
+    lines: list[tuple[int, str]] = []
+    marker = ""
+    marker_depth = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        quote = _QUOTE_PREFIX.match(line)
+        depth, inner = (quote.group(0).count(">"), line[quote.end():]) if quote else (0, line)
+        if marker and depth < marker_depth:
+            marker = ""  # the blockquote holding the fence ended, and the fence with it
+        if marker:
+            closing = _FENCE_CLOSE.match(inner)
+            if depth == marker_depth and closing and closing.group(1)[0] == marker[0] and len(closing.group(1)) >= len(marker):
+                marker = ""
+            continue
+        opening = _FENCE_OPEN.match(inner)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            marker, marker_depth = opening.group(1), depth
+            continue
+        lines.append((number, _INLINE_CODE.sub(lambda m: " " * len(m.group(0)), line)))
+    return lines
+
+
+MAX_REPORTED_VIOLATIONS = 500  # the list is a sample; violation_count and by_term stay exact (the registry also bounds output bytes)
+
+
+def docs_terminology_drift(payload: dict) -> dict:
+    """Glossary lint (03-agents/A15-docs.md sections 5 and 6): deprecated or variant terms per file and line."""
+
+    def work() -> dict:
+        owner: dict[str, str] = {}
+        preferred_seen: set = set()
+        for index, entry in enumerate(payload["glossary"]):
+            preferred = entry["preferred"].strip()
+            if not preferred:
+                return _invalid(f"glossary[{index}].preferred", "preferred must not be blank")
+            if preferred.lower() in preferred_seen:
+                return _invalid(f"glossary[{index}].preferred", f"duplicate preferred term {preferred}")
+            preferred_seen.add(preferred.lower())
+            for term in entry["deprecated"]:
+                key = " ".join(term.lower().split())
+                if not key:
+                    return _invalid(f"glossary[{index}].deprecated", "deprecated term must not be blank")
+                if key == preferred.lower():
+                    return _invalid(f"glossary[{index}].deprecated", f"{term} equals its preferred term")
+                if owner.setdefault(key, preferred) != preferred:
+                    return _invalid(f"glossary[{index}].deprecated", f"{term} is deprecated for two preferred terms")
+        paths = [item["path"] for item in payload["files"]]
+        if _duplicates(paths):
+            return _invalid("files", f"duplicate path {_duplicates(paths)[0]}")
+        # One alternation, longest key first, so each line is scanned once whatever the glossary size. Capturing groups
+        # per key would make the engine ~60x slower here (it loses the literal-prefix table), so the matched text is
+        # resolved afterwards. Unicode case folding makes `ſ` match `s` and `İ` match `I`, which `.lower()` of the
+        # match does not reproduce: that text is resolved by the first key (alternation order) that fully matches it.
+        keys = sorted(owner, key=len, reverse=True)
+
+        def key_regex(key: str) -> str:
+            return r"\s+".join(map(re.escape, key.split()))
+
+        pattern = (
+            re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(key_regex(key) for key in keys) + r")(?![A-Za-z0-9_])", re.IGNORECASE)
+            if keys
+            else None
+        )
+        # ASCII keys cannot fold onto each other, so a match whose lowered text is a key belongs to that key.
+        ascii_keys = all(key.isascii() for key in keys)
+        resolved: dict[str, str] = {}
+
+        def preferred_for(found: str) -> str:
+            cached = resolved.get(found)
+            if cached is None:
+                key = " ".join(found.lower().split())
+                if ascii_keys and key in owner:
+                    cached = owner[key]
+                else:
+                    cached = owner[next(k for k in keys if re.fullmatch(key_regex(k), found, re.IGNORECASE))]
+                resolved[found] = cached
+            return cached
+
+        violations: list[dict] = []
+        count = 0
+        by_term: dict[str, int] = {}
+        clean = 0
+        for item in payload["files"]:
+            before = count
+            for number, line in _prose_lines(item["text"]):
+                for m in pattern.finditer(line) if pattern is not None else ():
+                    pref = preferred_for(m.group(0))
+                    count += 1
+                    if len(violations) < MAX_REPORTED_VIOLATIONS:
+                        violations.append({"path": item["path"], "line": number, "found": m.group(0), "preferred": pref})
+                    by_term[pref] = by_term.get(pref, 0) + 1
+            clean += count == before
+        return {
+            "state": "SUCCESS",
+            "files_checked": len(paths),
+            "violation_count": count,
+            "violations": violations,
+            "violations_truncated": count > len(violations),
+            "by_term": by_term,
+            "pass_pct": round(clean * 100 / len(paths), 2),
         }
 
     return respond(payload, work)

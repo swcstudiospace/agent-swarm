@@ -2,7 +2,8 @@
 """A14 — dependency freshness, pin hygiene, tech-debt register and CVE-driven patch tasks.
 
 Parses requirements*.txt / pyproject.toml / package.json / go.mod / Cargo.toml for
-declared dependencies, flags unpinned or wildcard versions, runs `pip list --outdated`
+declared dependencies, flags unpinned or wildcard versions (a pin is one exact version; a compound spec such as
+`==1.2.3,<2` is a range), runs `pip list --outdated`
 and `npm outdated` when those tools exist (else `skipped:tool-missing`), scans source
 for TODO/FIXME/HACK/XXX/deprecated markers into .swarm/debt_register.json (with git
 age per file), and cross-matches an optional --cve-file against declared deps to open
@@ -23,17 +24,34 @@ from swarm.paths import swarm_dir  # noqa: E402
 
 SRC_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".sh", ".yaml", ".yml")
 DEBT_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b|\bdeprecated\b", re.I)
-EXACT_SEMVER = re.compile(r"^=?=?v?\d+(\.\d+){1,3}[\w.+-]*$")
+# One exact version, bare or v-prefixed, two to four numeric components; a compound spec (`1.2.3,<2`, `1.2.3 || ^2`) has
+# a comma or space after the version, so it never matches and is a range.
+EXACT_SEMVER = re.compile(r"v?\d+(?:\.\d+){1,3}[\w.+-]*")
+# After `==` / `===` (PEP 440 allows whitespace after the operator): `==1` and `==1!2.0` are exact too.
+PIN_BODY = re.compile(r"v?\d+(?:\.\d+)*[\w.+!-]*")
+OPERATOR = re.compile(r"(={1,3})\s*(.*)", re.S)
+# a wildcard component (x, X, *) in the dotted numeric core, e.g. 1.2.x or == 1.2.*: a floating range, never an exact pin.
+# Build/prerelease tails (1.2.3-rc.1, 1.2.3+build.x) come after the core and do not match.
+X_RANGE = re.compile(r"(?:===?|=)?\s*v?(?:\d+\.)+[xX*](?![A-Za-z0-9])")
 WILDCARDS = {"", "*", "latest", "x", ">=0", "any"}
 
 
 def _pin_state(spec: str) -> str:
-    s = spec.strip().strip('"').strip("'")
-    if s.lower() in WILDCARDS or s.startswith("*") or "latest" in s.lower():
+    """pinned = one exact version (`1.2.3`, `v1.2.3`, `=1.2.3`, `== 1.2.3`, `===1.2.3`, `==1`); wildcard = no real
+    constraint (`*`, `latest`, `x`, `any`, `>=0`, empty, also behind `==`: `==*`, bare `==`); range = everything else,
+    including a wildcard component (`1.x`, `== 1.2.*`) and every compound spec (`==1.2.3,<2`, `==1.2.3 || ^2`)."""
+    s = spec.strip().strip('"').strip("'").strip()
+    op = OPERATOR.fullmatch(s)
+    body = op.group(2).strip() if op else s
+    if s.lower() in WILDCARDS or body.lower() in WILDCARDS or s.startswith("*") or "latest" in s.lower():
         return "wildcard"
-    if EXACT_SEMVER.match(s) or s.startswith("==") or s.startswith("==="):
-        return "pinned"
-    return "range"  # ^, ~, >=, <, ~=, etc.
+    if X_RANGE.match(s):
+        return "range"
+    if op is None:
+        return "pinned" if EXACT_SEMVER.fullmatch(s) else "range"
+    if op.group(1) == "=":  # npm `=1.2.3`; a single `=1` is the range 1.x there
+        return "pinned" if EXACT_SEMVER.fullmatch(body) else "range"
+    return "pinned" if PIN_BODY.fullmatch(body) else "range"  # ^, ~, >=, <, ~=, etc. are ranges too
 
 
 def _dep(eco, name, spec, path) -> dict:

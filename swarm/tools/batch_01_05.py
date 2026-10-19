@@ -1,6 +1,8 @@
 """Lane tools for A01–A05. File-disjoint from the other Phase 3 batches."""
 from __future__ import annotations
 
+import re
+
 from swarm.errors import SwarmError
 from swarm.paths import latest_correlation
 from swarm.runlog import emit as log_emit
@@ -50,7 +52,7 @@ def gwt_check(payload: dict) -> dict:
         missing = 0
         for block in blocks:
             lowered = block["text"].lower()
-            if not all(word in lowered for word in ("given", "when", "then")):
+            if not all(re.search(rf"\b{word}\b", lowered) for word in ("given", "when", "then")):
                 missing += 1
         return {"state": "SUCCESS", "criteria": len(blocks), "missing_gwt": missing}
 
@@ -76,11 +78,13 @@ def contract_ops(payload: dict) -> dict:
 
 def contrast(payload: dict) -> dict:
     def work() -> dict:
-        try:
-            ratio = script("ux_tokens").contrast(payload["fg"], payload["bg"])
-        except ValueError as exc:
-            return {"state": "INVALID_INPUT", "field": "fg", "message": str(exc)}
-        return {"state": "SUCCESS", "ratio": ratio}
+        tokens = script("ux_tokens")
+        for field in ("fg", "bg"):
+            try:
+                tokens.hex_to_rgb(payload[field])
+            except ValueError as exc:
+                return {"state": "INVALID_INPUT", "field": field, "message": str(exc)}
+        return {"state": "SUCCESS", "ratio": tokens.contrast(payload["fg"], payload["bg"])}
 
     return respond(payload, work)
 
@@ -109,7 +113,7 @@ def plan(payload: dict) -> dict:
             "pattern": pattern,
             "tasks": 13 if pattern == "feature" else 8,
             "risk": risk,
-            "gates": gates,
+            "gates": list(gates),
         }
         return {
             "state": "SUCCESS",

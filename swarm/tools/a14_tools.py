@@ -12,23 +12,33 @@ Tools (all pure; dates, versions, and thresholds come from the payload):
   maint_debt_priority    impact x recurrence x effort tech-debt score and iteration
   maint_license_change   SPDX identifier diff, allowlist check, copyleft introduction
   maint_changelog_check  Keep a Changelog release entry validation
+  maint_hotfix_decision  hotfix / rollback / defer rule for a sev 1-2 incident (sev 1 = worst)
+  maint_version_affected is a version inside an advisory range (`<`, `<=`, `>=`, `>`, comma AND)
 
-Specifier rules for maint_unpinned_count: an empty spec or a bare version counts as
-unpinned, a wildcard (`*`, `latest`, `1.x`) counts as wildcard, and only `==`, `===`,
-or `=` followed by one exact version counts as pinned.
+maint_unpinned_count classifies each specifier with scripts/maint_deps.py `_pin_state` (the
+reference, also behind maint_spec_pin): one exact version, bare or `v`-prefixed or `==`/`===`/`=`
+prefixed (whitespace after the operator allowed: `== 1.2.3`), counts as pinned; `*`, `latest`, an
+empty spec, `x`, `any`, `>=0` and a bare or wildcard-only operator (`==`, `==*`) count as wildcard;
+everything else (`1.x`, `1.2.x`, `^1.2`, `>=1,<2`) is a range and counts as unpinned; a wildcard
+component (`x`, `X`, `*`) in the numeric core is a range even behind `==` (`== 1.2.*`), a compound
+spec is a range even when it starts with an exact pin (`==1.2.3,<2`, `==1.2.3 || ^2`), while build and
+prerelease tails (`1.2.3-rc.1`, `1.2.3+build5`) stay pinned.
 """
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 
-from swarm.tools.support import respond
+from swarm.tools.support import respond, script
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _UTC_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
-_SEMVER = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?")
-_PIN_BODY = re.compile(r"[0-9A-Za-z.+-]+")
-_WILDCARD_X = re.compile(r"(?:^|\.)[xX](?:\.|$)")
+_PRE_IDENT = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"  # semver 2.0.0 section 9: non-empty, no leading zero when numeric
+_BUILD_IDENT = r"[0-9A-Za-z-]+"  # section 10: non-empty
+_SEMVER = re.compile(
+    rf"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-({_PRE_IDENT}(?:\.{_PRE_IDENT})*))?(?:\+{_BUILD_IDENT}(?:\.{_BUILD_IDENT})*)?"
+)
 _LICENSE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]*")
 _COPYLEFT_PREFIXES = ("GPL", "AGPL", "LGPL", "MPL", "EPL", "CDDL", "EUPL")
 _CHANGELOG_HEAD = re.compile(r"## \[([^\]]+)\](?: - (\S+))?")
@@ -196,15 +206,8 @@ def eol_distance(payload: dict) -> dict:
 
 
 def _spec_class(spec: str) -> str:
-    text = spec.strip()
-    if not text:
-        return "unconstrained"
-    if "*" in text or text.lower() == "latest" or _WILDCARD_X.search(text):
-        return "wildcard"
-    for op in ("===", "==", "="):
-        if text.startswith(op):
-            return "pinned" if _PIN_BODY.fullmatch(text[len(op):].strip()) else "range"
-    return "range"
+    """Pin state of one specifier, taken from the maint_deps script so the two cannot drift."""
+    return script("maint_deps")._pin_state(spec)
 
 
 def unpinned_count(payload: dict) -> dict:
@@ -379,5 +382,100 @@ def changelog_check(payload: dict) -> dict:
             "problem_count": len(problems),
             "first_problem": problems[0] if problems else "",
         }
+
+    return respond(payload, work)
+
+
+_HOTFIX_MAX_SEVERITY = 2
+_HOTFIX_MAX_FIX_H = 4
+_RANGE_OPERATORS = ("<=", ">=", "<", ">")
+_RANGE_CLAUSE = re.compile(r"(<=|>=|<|>)\s*(\S+)")
+_MAX_RANGE_CLAUSES = 8
+
+
+def hotfix_decision(payload: dict) -> dict:
+    """Hotfix-vs-rollback rule: sev 1 or 2 (1 = worst, as in A13's incident.alert) primes the hotfix
+    path; a low-risk rollback is preferred; a hotfix is chosen only when the root-cause fix is
+    estimated under 4 h."""
+
+    def work() -> dict:
+        severity = payload["severity"]
+        if isinstance(severity, bool) or not isinstance(severity, int) or not 1 <= severity <= 5:
+            return _bad("severity", "severity must be an integer from 1 to 5")
+        fix_est_h = payload["fix_est_h"]
+        if isinstance(fix_est_h, bool) or not isinstance(fix_est_h, (int, float)) or not math.isfinite(fix_est_h) or fix_est_h < 0:
+            return _bad("fix_est_h", "fix_est_h must be a finite number of hours, 0 or more")
+        rollback_available = payload["rollback_available"]
+        if not isinstance(rollback_available, bool):
+            return _bad("rollback_available", "rollback_available must be a boolean")
+        rollback_risk = payload["rollback_risk"]
+        if rollback_risk not in ("low", "high"):
+            return _bad("rollback_risk", "rollback_risk must be low or high")
+        primes = severity <= _HOTFIX_MAX_SEVERITY
+        fast_fix = fix_est_h < _HOTFIX_MAX_FIX_H
+        if not primes:
+            path, reason = "defer", "severity 3 or above (sev 1 is the worst) does not prime the hotfix path; use the normal patch.task flow"
+        elif rollback_available and rollback_risk == "low":
+            path, reason = "rollback", "a low-risk rollback is preferred over a hotfix"
+        elif fast_fix:
+            path = "hotfix"
+            reason = (
+                "the rollback is high risk and the root-cause fix is under 4 h"
+                if rollback_available
+                else "no rollback is available and the root-cause fix is under 4 h"
+            )
+        elif rollback_available:
+            path, reason = "rollback", "the root-cause fix needs 4 h or more, so only the high-risk rollback remains; escalate for approval"
+        else:
+            path, reason = "defer", "no rollback is available and the root-cause fix needs 4 h or more; escalate to the incident owner"
+        return {"state": "SUCCESS", "path": path, "primes_hotfix": primes, "reason": reason}
+
+    return respond(payload, work)
+
+
+def _range_clauses(text: str) -> list[tuple[str, str, tuple]] | None:
+    """Parse a comma-separated AND range into (operator, version text, sort key); None when malformed."""
+    parts = [part.strip() for part in text.split(",")]
+    if not parts or len(parts) > _MAX_RANGE_CLAUSES:
+        return None
+    clauses = []
+    for part in parts:
+        match = _RANGE_CLAUSE.fullmatch(part)
+        if match is None:
+            return None
+        parsed = _parse_semver(match[2])
+        if parsed is None:
+            return None
+        core, pre = parsed
+        clauses.append((match[1], match[2], (core, _pre_key(pre))))
+    return clauses
+
+
+def version_affected(payload: dict) -> dict:
+    """True when the version satisfies every clause of an advisory range such as ``>=1.0.0,<1.4.5``.
+
+    matched_clause is the normalised range (clauses joined by a comma) when affected, else empty."""
+
+    def work() -> dict:
+        parsed = _parse_semver(payload["version"].strip())
+        if parsed is None:
+            return _bad("version", "version must be a semver version such as 1.2.3 or 1.2.3-rc.1")
+        key = (parsed[0], _pre_key(parsed[1]))
+        clauses = _range_clauses(payload["affected"])
+        if clauses is None:
+            return _bad(
+                "affected",
+                f"affected must be 1 to {_MAX_RANGE_CLAUSES} comma-separated clauses of "
+                f"{', '.join(_RANGE_OPERATORS)} followed by a semver version",
+            )
+        tests = {
+            "<": lambda a, b: a < b,
+            "<=": lambda a, b: a <= b,
+            ">": lambda a, b: a > b,
+            ">=": lambda a, b: a >= b,
+        }
+        affected = all(tests[op](key, bound) for op, _text, bound in clauses)
+        matched = ",".join(f"{op}{text}" for op, text, _bound in clauses) if affected else ""
+        return {"state": "SUCCESS", "affected": affected, "matched_clause": matched}
 
     return respond(payload, work)

@@ -9,6 +9,9 @@ Tools:
 - arch_c4_fanout: count C4 containers and relations and flag containers over a fan-out budget.
 - arch_adr_transition: check an ADR status change against the lifecycle used by scripts/arch_adr.py.
 - arch_nfr_budget: compare measured NFR values with their budgets; an unmeasured budget fails closed.
+- arch_nfr_allocation: check every NFR is bound to a clause or component budget that can be measured.
+- arch_breaking_readiness: autonomy level and outstanding acks, migration plan and approval for a change.
+- arch_adr_supersession: validate the supersession links and statuses of an ADR set.
 """
 from __future__ import annotations
 
@@ -340,3 +343,184 @@ def nfr_budget(payload: dict) -> dict:
         }
 
     return respond(payload, work)
+
+
+def nfr_allocation(payload: dict) -> dict:
+    """Whether every NFR is bound to a contract clause or component budget that can be measured.
+
+    A quantitative NFR counts as allocated only when at least one of its bindings carries a numeric
+    limit. A qualitative NFR (for example an auth scheme) needs one binding of any kind. An NFR with no
+    binding is unallocated; a quantitative NFR bound only without a limit is unmeasurable. Bindings for
+    ids that are not in `nfrs` are listed as unknown and keep fully_allocated false (fail closed).
+    """
+
+    def work() -> dict:
+        nfrs = payload["nfrs"]
+        ids = [item["id"] for item in nfrs]
+        if any(not item.strip() for item in ids):
+            return _invalid("nfrs", "NFR ids must not be blank")
+        if len(set(ids)) != len(ids):
+            return _invalid("nfrs", "NFR ids must be unique")
+        kind_of = {item["id"]: item["kind"] for item in nfrs}
+        bound: dict[str, list[dict]] = {}
+        unknown: set[str] = set()
+        seen: set[tuple[str, str, str]] = set()
+        for binding in payload["bindings"]:
+            if not binding["target_ref"].strip():
+                return _invalid("bindings", "target_ref must not be blank")
+            key = (binding["nfr_id"], binding["target_kind"], binding["target_ref"])
+            if key in seen:
+                return _invalid("bindings", f"binding {binding['nfr_id']} -> {binding['target_ref']} is listed twice")
+            seen.add(key)
+            if binding["nfr_id"] in kind_of:
+                bound.setdefault(binding["nfr_id"], []).append(binding)
+            else:
+                unknown.add(binding["nfr_id"])
+        allocated: list[str] = []
+        unallocated: list[str] = []
+        unmeasurable: list[str] = []
+        for nfr_id in ids:
+            bindings = bound.get(nfr_id)
+            if not bindings:
+                unallocated.append(nfr_id)
+            elif kind_of[nfr_id] == "quantitative" and not any("limit" in b for b in bindings):
+                unmeasurable.append(nfr_id)
+            else:
+                allocated.append(nfr_id)
+        return {
+            "state": "SUCCESS",
+            "nfr_count": len(ids),
+            "allocated": allocated,
+            "unallocated": unallocated,
+            "unmeasurable": unmeasurable,
+            "unknown_nfr_ids": sorted(unknown),
+            "coverage_pct": round(100 * len(allocated) / len(ids), 1),
+            "fully_allocated": len(allocated) == len(ids) and not unknown,
+        }
+
+    return respond(payload, work)
+
+
+def breaking_readiness(payload: dict) -> dict:
+    """Autonomy level and outstanding requirements before a contract change may be published.
+
+    Breaking or external-facing changes are L3 and always need human approval (breaking_contract). A
+    breaking change also needs a migration plan and, from every consumer, an acknowledgement of the exact
+    head version; an acknowledgement of any other version does not count. Other changes are L2. `ready`
+    is true only when nothing is outstanding and no human approval is required.
+    """
+
+    def work() -> dict:
+        head = payload["head_version"]
+        if _core(head) is None:
+            return _invalid("head_version", "head_version must be MAJOR.MINOR.PATCH")
+        consumers = payload["consumers"]
+        if any(not name.strip() for name in consumers):
+            return _invalid("consumers", "consumer names must not be blank")
+        if len(set(consumers)) != len(consumers):
+            return _invalid("consumers", "consumer names must be unique")
+        breaking = payload["breaking_change"]
+        level = "L3" if breaking or payload["external_facing"] else "L2"
+        acked = {ack["consumer"] for ack in payload["acks"] if ack["version"] == head}
+        missing_acks = [name for name in consumers if name not in acked] if breaking else []
+        missing: list[str] = []
+        needs: list[str] = []
+        if breaking and not payload["migration_plan_present"]:
+            missing.append("migration_plan")
+            needs.append("migration plan")
+        if missing_acks:
+            missing.append("consumer_acks")
+            needs.extend(f"consumer ack of {head}: {name}" for name in missing_acks)
+        if level == "L3":
+            needs.append("human-approval: breaking_contract")
+        return {
+            "state": "SUCCESS",
+            "autonomy_level": level,
+            "missing_acks": missing_acks,
+            "missing": missing,
+            "ready": not needs,
+            "needs": needs,
+        }
+
+    return respond(payload, work)
+
+
+def adr_supersession(payload: dict) -> dict:
+    """Integrity of an ADR set's supersession links (each ADR names at most one it supersedes).
+
+    dangling: X -> Y where Y is not in the set. cycles: ADRs that supersede each other through a loop
+    (a self-link is a cycle of one). forks: an ADR superseded by two or more ADRs. status_mismatches: an
+    ADR whose status disagrees with its links: superseded without a successor, still live although an
+    accepted successor exists, superseded by a successor that is only proposed, or superseded by a
+    rejected ADR. heads: ADRs nothing supersedes; chains: each head with two or more links, newest first.
+    """
+
+    def work() -> dict:
+        adrs = payload["adrs"]
+        ids = [item["adr_id"] for item in adrs]
+        if any(not item.strip() for item in ids):
+            return _invalid("adrs", "adr_id must not be blank")
+        if len(set(ids)) != len(ids):
+            return _invalid("adrs", "adr_id values must be unique")
+        status = {item["adr_id"]: item["status"] for item in adrs}
+        link = {item["adr_id"]: item["supersedes"] for item in adrs if item.get("supersedes")}
+        successors: dict[str, list[str]] = {}
+        dangling: list[str] = []
+        for src in ids:
+            dst = link.get(src)
+            if dst is None:
+                continue
+            if dst in status:
+                successors.setdefault(dst, []).append(src)
+            else:
+                dangling.append(f"{src} -> {dst}")
+        mismatches: list[str] = []
+        for dst in ids:
+            by = successors.get(dst, [])
+            if status[dst] == "superseded" and not by:
+                mismatches.append(f"{dst} is superseded but no ADR supersedes it")
+            for src in by:
+                if status[src] == "rejected":
+                    mismatches.append(f"{dst} is superseded by {src}, which is rejected")
+                elif status[src] == "proposed" and status[dst] == "superseded":
+                    mismatches.append(f"{dst} is superseded by {src}, which is only proposed")
+                elif status[src] != "proposed" and status[dst] != "superseded":
+                    mismatches.append(f"{dst} is {status[dst]} although {src} ({status[src]}) supersedes it")
+        forks = sorted(f"{dst} <- {', '.join(sorted(by))}" for dst, by in successors.items() if len(by) > 1)
+        cycles = _supersession_cycles(ids, link)
+        heads = sorted(adr for adr in ids if adr not in successors)
+        chains: list[str] = []
+        for head in heads:
+            walk, seen = [head], {head}
+            while walk[-1] in link and link[walk[-1]] in status and link[walk[-1]] not in seen:
+                walk.append(link[walk[-1]])
+                seen.add(walk[-1])
+            if len(walk) > 1:
+                chains.append(" -> ".join(walk))
+        return {
+            "state": "SUCCESS",
+            "dangling": dangling,
+            "status_mismatches": mismatches,
+            "forks": forks,
+            "chains": chains,
+            "cycles": cycles,
+            "heads": heads,
+            "valid": not (dangling or mismatches or forks or cycles),
+        }
+
+    return respond(payload, work)
+
+
+def _supersession_cycles(ids: list[str], link: dict[str, str]) -> list[str]:
+    """Each loop of single-successor links once, members sorted and joined by ', '."""
+    cycles: dict[str, str] = {}
+    for start in ids:
+        path: list[str] = []
+        node: str | None = start
+        while node is not None and node not in path:
+            path.append(node)
+            node = link.get(node)
+        if node is not None:
+            loop = sorted(path[path.index(node):])
+            cycles[loop[0]] = ", ".join(loop)
+    return [cycles[key] for key in sorted(cycles)]

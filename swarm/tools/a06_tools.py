@@ -9,8 +9,14 @@ Tools:
   fe_bundle_budget_check     bundle bytes against a budget and against a baseline regression
   fe_prop_type_coverage      share of component props with a concrete declared type
   fe_target_size_check       interactive targets below the minimum CSS-pixel size
+  fe_token_literal_scan      raw colour and spacing literals that are not design-token references
+  fe_state_parity_check      implemented states against ux.spec states, exact per screen
+  fe_cwv_budget_check        Core Web Vitals and Lighthouse scores against thresholds
+  fe_client_security_scan    XSS sinks, inline scripts, assets without SRI, PII keys in web storage
 """
 from __future__ import annotations
+
+import re
 
 from swarm.tools.support import respond
 
@@ -233,6 +239,283 @@ def fe_target_size_check(payload: dict) -> dict:
             "undersized_count": len(small),
             "undersized_ids": small,
             "size_ok": not small,
+        }
+
+    return respond(payload, work)
+
+
+# ---------------------------------------------------------------- fe_token_literal_scan
+
+DEFAULT_TOKEN_REFS = ("var(", "theme(", "token(", "$")
+COLOR_FUNCTIONS = ("rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color")
+NAMED_COLORS = frozenset(
+    "black white red green blue yellow orange purple pink gray grey silver maroon navy teal olive lime "
+    "aqua fuchsia brown cyan magenta".split()
+)
+COLOR_PROPERTY_HINTS = ("color", "background", "border", "outline", "fill", "stroke", "shadow", "caret", "accent")
+_HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})(?![0-9a-zA-Z_-])")
+_COLOR_FN_RE = re.compile(r"(?<![\w-])(?:" + "|".join(COLOR_FUNCTIONS) + r")\(", re.IGNORECASE)
+_LENGTH_RE = re.compile(r"(?<![\w.#-])(-?\d*\.?\d+)(px|rem|em|pt|vw|vh|ch)(?![\w-])", re.IGNORECASE)
+_WORD_RE = re.compile(r"(?<![\w$#-])([a-zA-Z]+)(?![\w(-])")
+_QUOTED_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
+
+
+def _strip_function_calls(value: str, prefix: str) -> str:
+    """Remove every balanced ``prefix ... )`` group (an unbalanced group runs to the end of the value)."""
+    lowered = value.lower()
+    needle = prefix.lower()
+    out: list[str] = []
+    i = 0
+    while i < len(value):
+        at = lowered.find(needle, i)
+        if at == -1:
+            out.append(value[i:])
+            break
+        if at > 0 and (value[at - 1].isalnum() or value[at - 1] in "_-"):
+            out.append(value[i : at + len(needle)])
+            i = at + len(needle)
+            continue
+        out.append(value[i:at])
+        depth = 1
+        j = at + len(needle)
+        while j < len(value) and depth:
+            depth += (value[j] == "(") - (value[j] == ")")
+            j += 1
+        out.append(" ")
+        i = j
+    return "".join(out)
+
+
+def _strip_token_refs(value: str, patterns) -> str:
+    value = _QUOTED_RE.sub(" ", _strip_function_calls(value, "url("))
+    for pattern in patterns:
+        if pattern.endswith("("):
+            value = _strip_function_calls(value, pattern)
+        else:
+            value = re.sub(re.escape(pattern) + r"[A-Za-z_][\w.-]*", " ", value)
+    return value
+
+
+def _literals(prop: str, value: str) -> tuple[int, int]:
+    """(colour literal count, spacing literal count) of a value that has had its token references removed."""
+    colors = len(_HEX_RE.findall(value)) + len(_COLOR_FN_RE.findall(value))
+    if any(hint in prop for hint in COLOR_PROPERTY_HINTS):
+        colors += sum(1 for word in _WORD_RE.findall(value) if word.lower() in NAMED_COLORS)
+    spacing = sum(1 for number, _unit in _LENGTH_RE.findall(value) if float(number) != 0.0)
+    return colors, spacing
+
+
+def fe_token_literal_scan(payload: dict) -> dict:
+    """Colour and spacing values must be design-token references; hex, rgb(), hsl(), and non-zero px/rem/em are literals."""
+
+    def work() -> dict:
+        declarations = payload["declarations"]
+        dup = _duplicate(item["id"] for item in declarations)
+        if dup is not None:
+            return _invalid("declarations", f"duplicate declaration id {dup!r}")
+        patterns = payload.get("token_ref_patterns", DEFAULT_TOKEN_REFS)
+        blank = next((p for p in patterns if not p.strip()), None)
+        if blank is not None:
+            return _invalid("token_ref_patterns", "a token reference pattern must not be blank")
+        flagged: list[str] = []
+        color_total = spacing_total = 0
+        for item in declarations:
+            if not item["property"].strip() or not item["value"].strip():
+                return _invalid("declarations", f"declaration {item['id']!r} needs a property and a value")
+            bare = _strip_token_refs(item["value"], patterns)
+            colors, spacing = _literals(item["property"].strip().lower(), bare)
+            if colors or spacing:
+                flagged.append(item["id"])
+            color_total += colors
+            spacing_total += spacing
+        return {
+            "state": "SUCCESS",
+            "declaration_count": len(declarations),
+            "literal_count": color_total + spacing_total,
+            "literal_ids": flagged,
+            "by_kind": {"color": color_total, "spacing": spacing_total},
+            "tokens_ok": not flagged,
+        }
+
+    return respond(payload, work)
+
+
+# ---------------------------------------------------------------- fe_state_parity_check
+
+
+def fe_state_parity_check(payload: dict) -> dict:
+    """Implemented states must equal ux.spec states exactly; dotted sub-states such as form.error are distinct states."""
+
+    def work() -> dict:
+        screens = payload["screens"]
+        dup = _duplicate(screen["id"] for screen in screens)
+        if dup is not None:
+            return _invalid("screens", f"duplicate screen id {dup!r}")
+        missing: dict[str, list[str]] = {}
+        extra: dict[str, list[str]] = {}
+        for screen in screens:
+            for key in ("spec_states", "implemented_states"):
+                if any(not state.strip() for state in screen[key]):
+                    return _invalid("screens", f"{screen['id']} has a blank state in {key}")
+                repeated = _duplicate(screen[key])
+                if repeated is not None:
+                    return _invalid("screens", f"{screen['id']} repeats state {repeated!r} in {key}")
+            spec = set(screen["spec_states"])
+            built = set(screen["implemented_states"])
+            if spec - built:
+                missing[screen["id"]] = sorted(spec - built)
+            if built - spec:
+                extra[screen["id"]] = sorted(built - spec)
+        return {
+            "state": "SUCCESS",
+            "screen_count": len(screens),
+            "missing": dict(sorted(missing.items())),
+            "extra": dict(sorted(extra.items())),
+            "parity_ok": not missing and not extra,
+        }
+
+    return respond(payload, work)
+
+
+# ---------------------------------------------------------------- fe_cwv_budget_check
+
+CWV_LIMITS = {"lcp_s": 2.5, "inp_ms": 200, "cls": 0.1}
+LIGHTHOUSE_MINIMUMS = {"perf": 90, "a11y": 100}
+
+
+def fe_cwv_budget_check(payload: dict) -> dict:
+    """Core Web Vitals must be at or under their limits and Lighthouse scores at or over their minimums (limit-equal passes)."""
+
+    def work() -> dict:
+        cwv = payload["cwv"]
+        lighthouse = payload["lighthouse"]
+        overrides = payload.get("thresholds", {})
+        limits = {**CWV_LIMITS, **{k: overrides[k] for k in CWV_LIMITS if k in overrides}}
+        minimums = dict(LIGHTHOUSE_MINIMUMS)
+        for key in ("perf", "a11y", "bp", "seo"):
+            if f"{key}_min" in overrides:
+                minimums[key] = overrides[f"{key}_min"]
+        for key in ("bp", "seo"):
+            if key in minimums and key not in lighthouse:
+                return _invalid("lighthouse", f"thresholds.{key}_min needs a lighthouse.{key} score")
+        breaches: list[dict] = []
+        cwv_breaches = 0
+        for metric in ("lcp_s", "inp_ms", "cls"):
+            if cwv[metric] > limits[metric]:
+                breaches.append({"metric": metric, "value": cwv[metric], "limit": limits[metric]})
+                cwv_breaches += 1
+        for metric in ("perf", "a11y", "bp", "seo"):
+            if metric in minimums and lighthouse[metric] < minimums[metric]:
+                breaches.append({"metric": metric, "value": lighthouse[metric], "limit": minimums[metric]})
+        return {
+            "state": "SUCCESS",
+            "breaches": breaches,
+            "breach_count": len(breaches),
+            "cwv_ok": cwv_breaches == 0,
+            "lighthouse_ok": len(breaches) == cwv_breaches,
+            "perf_ok": not breaches,
+        }
+
+    return respond(payload, work)
+
+
+# ---------------------------------------------------------------- fe_client_security_scan
+
+MAX_SECURITY_FINDINGS = 500
+_COMMENT_STARTS = ("//", "/*", "*", "<!--")
+_LINE_RULES = (
+    ("dangerous_html", re.compile(r"dangerouslySetInnerHTML|(?<![\w-])v-html(?![\w-])"), True),
+    ("inner_html", re.compile(r"\.(?:inner|outer)HTML\s*(?:\+)?=(?!=)|\.insertAdjacentHTML\s*\("), True),
+    ("eval", re.compile(r"(?<![\w.$])eval\s*\(|(?<![\w$])new\s+Function\s*\("), False),
+    ("document_write", re.compile(r"\bdocument\s*\.\s*write(?:ln)?\s*\("), False),
+)
+_INLINE_HANDLER_RE = re.compile(r"""\son[a-z]{3,}\s*=\s*["']""")
+_OPEN_TAG_RE = re.compile(r"<[A-Za-z][^<>]*>")
+_TAG_RE = re.compile(r"<(script|link)\b[^>]*>", re.IGNORECASE)
+_ATTR_RE = re.compile(r"""([a-zA-Z:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""")
+_EXECUTABLE_TYPES = ("", "module", "text/javascript", "application/javascript")
+_STORAGE_SETITEM_RE = re.compile(r"""\b(?:localStorage|sessionStorage)\s*\.\s*setItem\s*\(\s*(["'`])([^"'`]+)\1""")
+_STORAGE_INDEX_RE = re.compile(r"""\b(?:localStorage|sessionStorage)\s*\[\s*(["'`])([^"'`]+)\1\s*\]\s*=(?!=)""")
+_STORAGE_PROP_RE = re.compile(r"\b(?:localStorage|sessionStorage)\s*\.\s*([A-Za-z_$][\w$]*)\s*=(?!=)")
+_KEY_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+PII_WORDS = frozenset("email phone ssn dob birth address passport password passwd jwt iban".split())
+PII_PAIRS = frozenset("creditcard cardnumber accesstoken refreshtoken idtoken authtoken".split())
+
+
+def _pii_key(key: str) -> bool:
+    words = [w.lower() for w in _KEY_WORD_RE.findall(key)]
+    pairs = {a + b for a, b in zip(words, words[1:])}
+    return bool(PII_WORDS & set(words) or PII_PAIRS & pairs)
+
+
+def _attributes(tag: str) -> dict[str, str]:
+    return {m.group(1).lower(): next(g for g in m.groups()[1:] if g is not None) for m in _ATTR_RE.finditer(tag)}
+
+
+def _scan_text(text: str, sanitizers: tuple[str, ...]) -> set[tuple[int, str]]:
+    lines = text.splitlines()
+    hits: set[tuple[int, str]] = set()
+    for number, line in enumerate(lines, 1):
+        if line.lstrip().startswith(_COMMENT_STARTS):
+            continue
+        window = " ".join(lines[number - 1 : number + 2])
+        for kind, rule, sanitizable in _LINE_RULES:
+            if rule.search(line) and not (sanitizable and any(name in window for name in sanitizers)):
+                hits.add((number, kind))
+        keys = [m.group(2) for m in _STORAGE_SETITEM_RE.finditer(line)]
+        keys += [m.group(2) for m in _STORAGE_INDEX_RE.finditer(line)]
+        keys += [m.group(1) for m in _STORAGE_PROP_RE.finditer(line)]
+        if any(_pii_key(key) for key in keys):
+            hits.add((number, "pii_storage"))
+    for tag in _OPEN_TAG_RE.finditer(text):
+        handler = _INLINE_HANDLER_RE.search(tag.group(0))
+        if handler:
+            number = text.count("\n", 0, tag.start() + handler.start()) + 1
+            if not lines[number - 1].lstrip().startswith(_COMMENT_STARTS):
+                hits.add((number, "inline_handler"))
+    for match in _TAG_RE.finditer(text):
+        attrs = _attributes(match.group(0))
+        number = text.count("\n", 0, match.start()) + 1
+        if match.group(1).lower() == "script":
+            source = attrs.get("src")
+            if source is None:
+                if attrs.get("type", "").strip().lower() in _EXECUTABLE_TYPES:
+                    hits.add((number, "inline_script"))
+                continue
+        else:
+            source = attrs.get("href")
+            if "stylesheet" not in attrs.get("rel", "").lower().split():
+                continue
+        external = source is not None and source.strip().lower().startswith(("http://", "https://", "//"))
+        if external and not attrs.get("integrity", "").strip():
+            hits.add((number, "external_no_sri"))
+    return hits
+
+
+def fe_client_security_scan(payload: dict) -> dict:
+    """Flag XSS sinks, inline scripts and handlers, external assets without integrity, and PII keys in web storage."""
+
+    def work() -> dict:
+        files = payload["files"]
+        dup = _duplicate(item["id"] for item in files)
+        if dup is not None:
+            return _invalid("files", f"duplicate file id {dup!r}")
+        names = tuple(payload.get("sanitizer_names", ()))
+        if any(not name.strip() for name in names):
+            return _invalid("sanitizer_names", "a sanitizer name must not be blank")
+        findings: list[dict] = []
+        by_kind: dict[str, int] = {}
+        for item in files:
+            for number, kind in sorted(_scan_text(item["text"], names)):
+                by_kind[kind] = by_kind.get(kind, 0) + 1
+                findings.append({"id": item["id"], "kind": kind, "line": number})
+        return {
+            "state": "SUCCESS",
+            "file_count": len(files),
+            "findings": findings[:MAX_SECURITY_FINDINGS],
+            "findings_truncated": len(findings) > MAX_SECURITY_FINDINGS,
+            "by_kind": dict(sorted(by_kind.items())),
+            "secure_ok": not findings,
         }
 
     return respond(payload, work)

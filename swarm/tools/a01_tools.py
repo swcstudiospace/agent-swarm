@@ -10,6 +10,8 @@ Tools:
 """
 from __future__ import annotations
 
+import math
+
 from swarm.tools.support import respond
 
 DISPATCHABLE = frozenset({"PLANNED", "RETRY"})
@@ -117,6 +119,128 @@ def rework_bound(payload: dict) -> dict:
             "decision": decision,
             "rework_loops": after,
             "loops_remaining": max(0, cap - after),
+        }
+
+    return respond(payload, work)
+
+
+# --- v2.2 additions: round dispatch under concurrency ceilings and budget breach decisions ---
+
+WARN_AT_DEFAULT = 0.8  # share of a budget at which A01 starts watching a run
+EPSILON = 1e-9  # float slack so 0.8 x 300000 compares equal to 240000
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_num(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _shown_ratio(ratio: float, breached: bool) -> float:
+    """Four decimals, but never 1.0 for a dimension that did not breach (299999.99 of 300000 tokens shows 0.9999)."""
+    shown = round(ratio, 4)
+    return shown if breached or shown < 1.0 else 0.9999
+
+
+def dispatch_batch(payload: dict) -> dict:
+    """Pick which ready tasks start this round: per-agent ceiling first, then the global cap.
+
+    Order is priority (higher first, default 0), then the order supplied. The per-agent test is
+    swarm.blast_radius.take_agent_slot, the same function the runner uses.
+    """
+
+    def work() -> dict:
+        from swarm.blast_radius import take_agent_slot
+
+        ready, running, ceilings = payload["ready"], payload["running"], payload["ceilings"]
+        for field, mapping in (("running", running), ("ceilings", ceilings)):
+            if not isinstance(mapping, dict):
+                return {"state": "INVALID_INPUT", "field": field, "message": f"{field} must be an object of agent id to integer"}
+        for agent, count in running.items():
+            if not _is_int(count) or count < 0:
+                return {"state": "INVALID_INPUT", "field": "running", "message": f"running[{agent!r}] must be an integer >= 0"}
+        for agent, ceiling in ceilings.items():
+            if not _is_int(ceiling) or ceiling < 1:
+                return {"state": "INVALID_INPUT", "field": "ceilings", "message": f"ceilings[{agent!r}] must be an integer >= 1"}
+        seen: set[str] = set()
+        for index, task in enumerate(ready):
+            if task["id"] in seen:
+                return {"state": "INVALID_INPUT", "field": "ready", "message": f"duplicate task id {task['id']!r}"}
+            seen.add(task["id"])
+            if task["agent_id"] not in ceilings:
+                return {
+                    "state": "INVALID_INPUT",
+                    "field": "ceilings",
+                    "message": f"no ceiling for agent {task['agent_id']!r} (task {task['id']!r}); pass its max_parallel",
+                }
+        free = max(0, payload["global_cap"] - sum(running.values()))
+        counts = dict(running)
+        ordered = sorted(enumerate(ready), key=lambda row: (-row[1].get("priority", 0), row[0]))
+        start: list[str] = []
+        deferred: list[dict] = []
+        for _index, task in ordered:
+            agent, ceiling = task["agent_id"], ceilings[task["agent_id"]]
+            if not take_agent_slot(dict(counts), agent, ceiling):
+                deferred.append({"id": task["id"], "reason": "agent_ceiling"})
+            elif len(start) >= free:
+                deferred.append({"id": task["id"], "reason": "global_cap"})
+            else:
+                take_agent_slot(counts, agent, ceiling)
+                start.append(task["id"])
+        return {
+            "state": "SUCCESS",
+            "start": start,
+            "deferred": deferred,
+            "slots": {agent: max(0, ceiling - counts.get(agent, 0)) for agent, ceiling in sorted(ceilings.items())},
+            "global_free": free - len(start),
+        }
+
+    return respond(payload, work)
+
+
+def budget_guard(payload: dict) -> dict:
+    """Decide OK, WARN, HARD_STOP, or ESCALATED from usage against budget and earlier breaches.
+
+    A dimension breaches at 100 % of its budget. The first breach hard-stops (checkpoint, requeue once with an
+    annotated budget); a breach after a prior one escalates (03-agents/A01 section 3, rule 5).
+    """
+
+    def work() -> dict:
+        budget, usage = payload["budget"], payload["usage"]
+        warn_at = payload.get("warn_at", WARN_AT_DEFAULT)
+        if not _is_num(warn_at) or not 0 < warn_at < 1:
+            return {"state": "INVALID_INPUT", "field": "warn_at", "message": "warn_at must be a number above 0 and below 1"}
+        raw: dict[str, float] = {}
+        for dim in ("tokens", "wall_s", "cost_usd"):
+            limit = budget["max_" + dim]
+            used = usage[dim]
+            if not _is_num(limit) or limit <= 0:
+                return {"state": "INVALID_INPUT", "field": "budget", "message": f"max_{dim} must be a number above 0"}
+            if not _is_num(used) or used < 0:
+                return {"state": "INVALID_INPUT", "field": "usage", "message": f"{dim} must be a number >= 0"}
+            ratio = used / limit
+            if not math.isfinite(ratio):
+                return {"state": "INVALID_INPUT", "field": "usage", "message": f"{dim} is too large relative to max_{dim} to compare"}
+            raw[dim] = ratio
+        breached = [dim for dim, ratio in raw.items() if ratio >= 1 - EPSILON]
+        prior = payload["prior_breaches"]
+        if breached and prior >= 1:
+            decision, action = "ESCALATED", "escalate"
+        elif breached:
+            decision, action = "HARD_STOP", "requeue_once_annotated"
+        elif max(raw.values()) >= warn_at - EPSILON:
+            decision, action = "WARN", "note_usage"
+        else:
+            decision, action = "OK", "continue"
+        return {
+            "state": "SUCCESS",
+            "decision": decision,
+            "ratios": {dim: _shown_ratio(ratio, dim in breached) for dim, ratio in raw.items()},
+            "breached": breached,
+            "next_action": action,
+            "breaches_after": prior + 1 if breached else prior,
         }
 
     return respond(payload, work)

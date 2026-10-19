@@ -4,7 +4,8 @@
 --define writes an `slo.manifest` (service, sli availability|latency, objective, window) to
 .swarm/slo/<service>.json. --evaluate computes the SLI from --good/--total counts or an --events
 JSONL file ({ts, ok, latency_ms}), the error-budget remaining, burn rates for 1h/6h/3d windows and
-compares them to the standard multi-window thresholds (14.4x page, 6x page, 1x ticket). When a
+compares them to the standard multi-window thresholds (14.4x page, 6x page, 1x ticket) exactly (fractions
+of the numbers as written, so a burn of exactly 14.4x alerts, as in obs_multiwindow_alert). When a
 threshold is exceeded it emits an `incident.alert` payload with severity. With neither flag it lists
 the manifests present. Stdlib only
 missing manifests degrade to sensible defaults, never crash.
@@ -13,6 +14,8 @@ from __future__ import annotations
 import json
 import sys
 import time
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -80,12 +83,34 @@ def read_events(path: Path, latency_ms: float | None) -> list[tuple[float, bool]
     return out
 
 
+def count_problem(good: int, total: int) -> tuple[str, str] | None:
+    """(field, message) when the counts cannot describe a window; total <= 0 is the no-data case, not a problem."""
+    if total > 0 and not 0 <= good <= total:
+        return "good", "good must be between 0 and total"
+    return None
+
+
+def _exact(value) -> Fraction:
+    """The number as written (shortest repr, as a Decimal), exactly: 0.999 is 999/1000, not its binary neighbour. The
+    same reading obs_multiwindow_alert (swarm/tools/a13_tools.py) applies to its inputs."""
+    return Fraction(Decimal(repr(value)))
+
+
 def burn(good: int, total: int, objective: float) -> tuple[float | None, float | None]:
-    """returns (sli, burn_rate). burn = observed error ratio / allowed error ratio."""
+    """returns (sli, burn_rate). burn = observed error ratio / allowed error ratio, computed exactly and rounded once
+    to a float, so 144 errors in 10000 at objective 0.999 is 14.4 and not 14.399999999999956."""
     if total <= 0:
         return None, None
-    sli = good / total
-    return sli, (1 - sli) / (1 - objective)
+    problem = count_problem(good, total)
+    if problem:
+        raise SwarmError(ErrorCode.E_INPUT, f"{problem[0]}: {problem[1]} (good={good}, total={total})", field=problem[0])
+    return good / total, float(Fraction(total - good, total) / (1 - _exact(objective)))
+
+
+def burn_at_least(good: int, total: int, objective: float, threshold: float) -> bool:
+    """Exact `error ratio >= threshold x error budget` (cross-multiplied, no division): the comparison
+    obs_multiwindow_alert makes for the same windows, so both agree at 14.4x, 6x and 1x. False for no data."""
+    return total > 0 and Fraction(total - good, total) >= _exact(threshold) * (1 - _exact(objective))
 
 
 def evaluate(args, ctx) -> dict:
@@ -110,7 +135,7 @@ def evaluate(args, ctx) -> dict:
     sli, br_all = burn(good, total, objective)
     budget_remaining = None if br_all is None else round(1 - br_all, 4)
     breaches = [(w, thr, sev, act, per_window[w]["burn_rate"]) for w, thr, sev, act in THRESHOLDS
-                if per_window[w]["burn_rate"] is not None and per_window[w]["burn_rate"] >= thr]
+                if burn_at_least(per_window[w]["good"], per_window[w]["total"], objective, thr)]
     findings, alert = [], None
     if breaches:
         w, thr, sev, act, rate = min(breaches, key=lambda b: b[2])

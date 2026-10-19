@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
+from decimal import Decimal
 
 from swarm.tools.support import respond
 
-PAGE_BURN_1H = 14.4
-PAGE_BURN_6H = 6.0
-TICKET_BURN_3D = 1.0
+# Thresholds are decimal so that the documented boundaries (14.4x, 6x, 1x) are exact, not float-division accidents.
+PAGE_BURN_1H = Decimal("14.4")
+PAGE_BURN_6H = Decimal("6")
+TICKET_BURN_3D = Decimal("1")
+MAX_EVENT_COUNT = 10**15
+
+
+def _dec(value) -> Decimal:
+    """Exact decimal of the number as written (shortest repr), so 0.0144 is 0.0144 and not its binary neighbour."""
+    return Decimal(repr(value))
 
 
 def _ts(value: str) -> datetime:
@@ -30,12 +38,12 @@ def multiwindow_alert(payload: dict) -> dict:
     """Multi-window burn rate: page when 1h >= 14.4x and 6h >= 6x; ticket when 3d >= 1x."""
 
     def work() -> dict:
-        budget = 1.0 - payload["slo_target"]
-        burn_1h = payload["error_ratio_1h"] / budget
-        burn_6h = payload["error_ratio_6h"] / budget
-        burn_3d = payload["error_ratio_3d"] / budget
-        page = burn_1h >= PAGE_BURN_1H and burn_6h >= PAGE_BURN_6H
-        ticket = burn_3d >= TICKET_BURN_3D
+        budget = Decimal(1) - _dec(payload["slo_target"])
+        ratio_1h, ratio_6h, ratio_3d = (_dec(payload[key]) for key in ("error_ratio_1h", "error_ratio_6h", "error_ratio_3d"))
+        burn_1h, burn_6h, burn_3d = float(ratio_1h / budget), float(ratio_6h / budget), float(ratio_3d / budget)
+        # cross-multiplied: error_ratio >= factor * budget, exact in decimal arithmetic
+        page = ratio_1h >= PAGE_BURN_1H * budget and ratio_6h >= PAGE_BURN_6H * budget
+        ticket = ratio_3d >= TICKET_BURN_3D * budget
         severity = "page" if page else "ticket" if ticket else "none"
         return {
             "state": "SUCCESS",
@@ -55,17 +63,19 @@ def budget_remaining(payload: dict) -> dict:
 
     def work() -> dict:
         good, total = payload["good"], payload["total"]
+        if total > MAX_EVENT_COUNT:
+            return {"state": "INVALID_INPUT", "field": "total", "message": f"total must be at most {MAX_EVENT_COUNT}"}
         if good > total:
             return {"state": "INVALID_INPUT", "field": "good", "message": "good events exceed total events"}
-        allowed = total * (1.0 - payload["slo_target"])
+        allowed = total * (Decimal(1) - _dec(payload["slo_target"]))
         bad = total - good
         remaining = allowed - bad
         return {
             "state": "SUCCESS",
-            "allowed_bad_events": round(allowed, 2),
+            "allowed_bad_events": round(float(allowed), 2),
             "bad_events": bad,
-            "remaining_events": round(remaining, 2),
-            "remaining_fraction": round(remaining / allowed, 4),
+            "remaining_events": round(float(remaining), 2),
+            "remaining_fraction": round(float(remaining / allowed), 4),
             "exhausted": remaining <= 0,
         }
 
@@ -227,6 +237,76 @@ def probe_availability(payload: dict) -> dict:
             "availability": round(availability, 4),
             "longest_failure_run": longest,
             "meets_target": availability >= payload["min_availability"],
+        }
+
+    return respond(payload, work)
+
+
+MAX_AUTO_MITIGATIONS = 3
+ESCALATION_MINUTES = 10.0
+# obs_slo numbers severities so that 1 is the worst: sev 1 (1h page) and sev 2 (6h page) are the incident levels.
+INCIDENT_SEV_MAX = 2
+
+
+def mitigation_gate(payload: dict) -> dict:
+    """Allow an automatic mitigation only for a whitelisted playbook, below the per-incident cap, and not on full prod without A12."""
+
+    def work() -> dict:
+        max_auto = payload.get("max_auto", MAX_AUTO_MITIGATIONS)
+        remaining = max(0, max_auto - payload["auto_count"])
+        if payload["playbook"] not in payload["whitelist"]:
+            reason = "not-whitelisted"
+        elif payload["environment"] == "prod" and not payload.get("full_prod_with_a12", False):
+            reason = "prod-needs-approval"
+        elif remaining == 0:
+            reason = "cap-reached"
+        else:
+            reason = "ok"
+        return {"state": "SUCCESS", "allowed": reason == "ok", "reason": reason, "remaining_auto": remaining}
+
+    return respond(payload, work)
+
+
+def escalation_due(payload: dict) -> dict:
+    """An incident at sev 1 or 2 escalates to humans once it has gone max_minutes (default 10) without stabilizing."""
+
+    def work() -> dict:
+        try:
+            declared = _ts(payload["declared_at"])
+        except ValueError as exc:
+            return {"state": "INVALID_INPUT", "field": "declared_at", "message": str(exc)}
+        try:
+            now = _ts(payload["now"])
+        except ValueError as exc:
+            return {"state": "INVALID_INPUT", "field": "now", "message": str(exc)}
+        if now < declared:
+            return {"state": "INVALID_INPUT", "field": "now", "message": "now precedes declared_at"}
+        stabilized = None
+        if payload.get("stabilized_at") is not None:
+            try:
+                stabilized = _ts(payload["stabilized_at"])
+            except ValueError as exc:
+                return {"state": "INVALID_INPUT", "field": "stabilized_at", "message": str(exc)}
+            if stabilized < declared:
+                return {"state": "INVALID_INPUT", "field": "stabilized_at", "message": "stabilized_at precedes declared_at"}
+            if stabilized > now:
+                return {"state": "INVALID_INPUT", "field": "stabilized_at", "message": "stabilized_at is after now"}
+        limit_s = payload.get("max_minutes", ESCALATION_MINUTES) * 60
+        elapsed = ((stabilized or now) - declared).total_seconds()
+        if payload["sev"] > INCIDENT_SEV_MAX:
+            reason, due, remaining = "sev-below-threshold", False, 0.0
+        elif stabilized is not None:
+            reason, due, remaining = "stabilized", False, 0.0
+        elif elapsed >= limit_s:
+            reason, due, remaining = "escalate", True, 0.0
+        else:
+            reason, due, remaining = "waiting", False, limit_s - elapsed
+        return {
+            "state": "SUCCESS",
+            "elapsed_s": round(elapsed, 3),
+            "due": due,
+            "remaining_s": round(remaining, 3),
+            "reason": reason,
         }
 
     return respond(payload, work)

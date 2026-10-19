@@ -8,6 +8,7 @@ qa_skip_ratio, qa_defect_escape_rate, qa_retry_budget, qa_name_convention.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 from swarm.tools.support import respond
@@ -114,13 +115,15 @@ def mutation_gate(payload: dict) -> dict:
             return _invalid("killed", "no scored mutants")
         threshold = payload.get("threshold_pct", MUTATION_THRESHOLD_PCT)
         # Timeouts count as detected (Stryker convention); uncovered mutants are reported as survived.
-        raw = 100.0 * (killed + timeout) / scored
+        # Floor (never round up) to 2 places in integer arithmetic, then compare that same reported value:
+        # a gate must fail closed, so 69.996 % reports 69.99 and does not meet a 70 % threshold.
+        score_pct = (10000 * (killed + timeout) // scored) / 100
         return {
             "state": "SUCCESS",
             "scored_mutants": scored,
-            "score_pct": round(raw, 2),
+            "score_pct": score_pct,
             "threshold_pct": float(threshold),
-            "meets_threshold": raw >= threshold,
+            "meets_threshold": score_pct >= threshold,
         }
 
     return respond(payload, work)
@@ -231,6 +234,149 @@ def name_convention(payload: dict) -> dict:
             "checked": len(payload["names"]),
             "violations": violations,
             "conforming": not violations,
+        }
+
+    return respond(payload, work)
+
+
+# ---- v2.2 additions: tier plan, finding shape, defect dedupe -------------------------------------
+
+TIER_ORDER = ("unit", "integration", "e2e", "perf")
+# Mirrors scripts/qa_gate.py TIERS_BY_RISK (low unit; medium + integration; high + e2e, perf).
+REQUIRED_TIERS = {
+    "low": ("unit",),
+    "medium": ("unit", "integration"),
+    "high": ("unit", "integration", "e2e", "perf"),
+}
+SMOKE_TIERS = ("unit",)
+FINDING_KINDS = ("functional", "perf", "flake", "coverage")
+FINDING_SEVERITIES = ("minor", "major", "critical")
+BLOCKING_SEVERITIES = ("major", "critical")
+_FINDING_ID = re.compile(r"QF-[0-9]+")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_DERIVED_KEY_HEX = 16
+
+
+def _run_status(runs: dict, tier: str) -> str:
+    return runs.get(tier) or "skipped:not-selected"
+
+
+def tier_plan(payload: dict) -> dict:
+    def work() -> dict:
+        risk = payload["risk_class"]
+        required_by_risk = REQUIRED_TIERS.get(risk)
+        if required_by_risk is None:
+            return _invalid("risk_class", f"unknown risk class {risk}")
+        runs = payload["runs"]
+        unknown = [tier for tier in runs if tier not in TIER_ORDER]
+        if unknown:
+            return _invalid("runs", f"unknown tier {unknown[0]}")
+        degraded = bool(payload.get("degraded", False))
+        required = list(SMOKE_TIERS if degraded else required_by_risk)
+        status = {tier: _run_status(runs, tier) for tier in TIER_ORDER}
+        failed = [tier for tier in TIER_ORDER if status[tier] == "fail"]
+        missing = [tier for tier in required if status[tier].startswith("skipped")]
+        optional = [tier for tier in TIER_ORDER if tier not in required and status[tier].startswith("skipped")]
+        return {
+            "state": "SUCCESS",
+            "mode": "smoke" if degraded else "full",
+            "required": required,
+            "missing_required": missing,
+            "failed": failed,
+            "skipped_optional": optional,
+            "verdict": "fail" if failed or missing else "pass",
+        }
+
+    return respond(payload, work)
+
+
+def _text(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def finding_shape_check(payload: dict) -> dict:
+    def work() -> dict:
+        findings = payload["findings"]
+        violations: list[dict] = []
+        seen: set[str] = set()
+
+        def flag(index: int, fid: str, field: str, message: str) -> None:
+            violations.append({"index": index, "id": fid, "field": field, "message": message})
+
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict):
+                flag(index, "", "finding", "finding must be an object")
+                continue
+            fid = _text(finding.get("id"))
+            if not _FINDING_ID.fullmatch(fid):
+                flag(index, fid, "id", "id must look like QF-<number>")
+            elif fid in seen:
+                flag(index, fid, "id", f"duplicate id {fid}")
+            else:
+                seen.add(fid)
+            severity = finding.get("severity")
+            if severity not in FINDING_SEVERITIES:
+                flag(index, fid, "severity", "severity must be one of " + ", ".join(FINDING_SEVERITIES))
+            kind = finding.get("kind")
+            if kind not in FINDING_KINDS:
+                flag(index, fid, "kind", "kind must be one of " + ", ".join(FINDING_KINDS))
+            if kind == "functional" and not _text(finding.get("ac_ref")):
+                flag(index, fid, "ac_ref", "a functional finding needs an ac_ref")
+            if severity in BLOCKING_SEVERITIES and not _text(finding.get("evidence")):
+                flag(index, fid, "evidence", f"a {severity} finding needs evidence")
+        return {
+            "state": "SUCCESS",
+            "checked": len(findings),
+            "violations": violations,
+            "conforming": not violations,
+        }
+
+    return respond(payload, work)
+
+
+def _normalize_title(title: str) -> str:
+    return _NON_ALNUM.sub(" ", title.lower()).strip()
+
+
+def _derived_key(component: str, ac_ref: str, title: str) -> str:
+    material = "\n".join((component.strip().lower(), ac_ref.strip().upper(), _normalize_title(title)))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:_DERIVED_KEY_HEX]
+
+
+def defect_dedupe(payload: dict) -> dict:
+    def work() -> dict:
+        defects = payload["defects"]
+        duplicate = _first_duplicate(defect["defect_id"] for defect in defects)
+        if duplicate is not None:
+            return _invalid("defects", f"duplicate defect_id {duplicate}")
+        groups: dict[str, list[dict]] = {}
+        for index, defect in enumerate(defects):
+            if not _normalize_title(defect["title"]):
+                return _invalid("defects", f"defect {index} has no title text")
+            given = defect.get("dedupe_key")
+            if given is not None and not given.strip():
+                return _invalid("defects", f"defect {index} has a blank dedupe_key")
+            key = given.strip() if given is not None else _derived_key(
+                defect["suspected_component"], defect["ac_ref"], defect["title"]
+            )
+            groups.setdefault(key, []).append(defect)
+        rank = {name: position for position, name in enumerate(FINDING_SEVERITIES)}
+        out_groups = []
+        duplicate_ids: list[str] = []
+        for key, members in groups.items():
+            canonical = max(members, key=lambda item: rank[item["severity"]])  # ties keep the first reported
+            duplicate_ids.extend(item["defect_id"] for item in members if item is not canonical)
+            out_groups.append({
+                "key": key,
+                "canonical": canonical["defect_id"],
+                "members": [item["defect_id"] for item in members],
+                "max_severity": canonical["severity"],
+            })
+        return {
+            "state": "SUCCESS",
+            "groups": out_groups,
+            "duplicate_ids": duplicate_ids,
+            "unique_count": len(out_groups),
         }
 
     return respond(payload, work)

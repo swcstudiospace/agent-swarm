@@ -11,6 +11,9 @@ open threads) for the signed review verdict. Tools:
   rev_comment_density      comment-line ratio of added source lines
   rev_test_pairing         test-to-source ratio and source files without a test
   rev_unresolved_threads   open review threads, including open blocking threads
+  rev_risk_tier            risk_tier low/medium/high from categories, diff size, blocking count and top severity
+  rev_verdict_shape        validate the final review json block and normalize its verdict to pass or fail
+  rev_rule_dispute_flag    rules one producer disputed on at least `threshold` pull requests
 """
 from __future__ import annotations
 
@@ -43,6 +46,10 @@ _CODE_EXTENSIONS = frozenset({".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".mjs"
                               ".hpp", ".ex", ".exs"})
 _TEST_DIRS = frozenset({"test", "tests", "__tests__", "spec", "specs"})
 _TEST_SUFFIXES = ("_test", ".test", "_spec", ".spec")
+# CamelCase xUnit/JVM/.NET names (FooTest, FooTests, FooSpec, TestFoo); matched on the original-case stem so
+# lookalikes such as latest/contest/Attestation stay sources.
+_CAMEL_TEST_SUFFIX = re.compile(r"^(?P<base>.*[a-z0-9])(?:Tests?|Spec)$")
+_CAMEL_TEST_PREFIX = re.compile(r"^Tests?(?P<base>[A-Z].*)$")
 
 _COMMENT_PREFIXES = ("#", "//", "/*", "*/", "* ", "--", "<!--")
 _DIRECTIVES = ("#include", "#define", "#if", "#elif", "#else", "#endif", "#pragma", "#undef", "#error",
@@ -182,20 +189,28 @@ def comment_density(payload: dict) -> dict:
 
 
 def _split(path: str) -> tuple[list[str], str, str]:
-    *dirs, base = path.replace("\\", "/").lower().split("/")
+    *dirs, base = path.replace("\\", "/").split("/")
     stem, ext = os.path.splitext(base)
-    return dirs, stem, ext
+    return [part.lower() for part in dirs], stem, ext.lower()
 
 
 def _test_base(dirs: list[str], stem: str) -> str | None:
-    """Source stem a test file covers, or None when the file is not a test."""
+    """Lowercased source stem a test file covers, or None when the file is not a test.
+
+    `stem` keeps its original case so CamelCase test names can be recognised.
+    """
+    lowered = stem.lower()
     for suffix in _TEST_SUFFIXES:
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    if stem.startswith("test_"):
-        return stem[len("test_"):]
+        if lowered.endswith(suffix):
+            return lowered[: -len(suffix)]
+    if lowered.startswith("test_"):
+        return lowered[len("test_"):]
+    for pattern in (_CAMEL_TEST_SUFFIX, _CAMEL_TEST_PREFIX):
+        match = pattern.match(stem)
+        if match:
+            return match["base"].lower()
     if any(part in _TEST_DIRS for part in dirs):
-        return stem
+        return lowered
     return None
 
 
@@ -210,7 +225,7 @@ def test_pairing(payload: dict) -> dict:
                 continue
             base = _test_base(dirs, stem)
             if base is None:
-                sources.append((path, stem))
+                sources.append((path, stem.lower()))
             else:
                 test_count += 1
                 covered.add(base)
@@ -243,6 +258,182 @@ def unresolved_threads(payload: dict) -> dict:
             "unresolved_blocking_count": len(open_blocking),
             "unresolved_ids": [thread["id"] for thread in open_threads],
             "blocking_clear": not open_blocking,
+        }
+
+    return respond(payload, work)
+
+
+# ---- v2.2 additions: risk tier, verdict block shape, producer rule disputes --------------------------------------
+_RISK_SEVERITIES = ("none", *_SEVERITIES)
+_RISK_TIERS = ("low", "medium", "high")
+_MEDIUM_DIFF_LINES = 100  # same diff-size threshold as auto_approve_check (decision_logic: diff < 100 lines)
+_MODES = ("rules+semantic", "rules-only")
+_MAX_EXPIRES_S = 172800  # 48 h verdict expiry (output_format expires_s)
+_VERDICT_ALIASES = {
+    "pass": "pass", "approve": "pass",
+    "fail": "fail", "request_changes": "fail", "block": "fail",
+}
+_MAX_BLOCK_ITEMS = 2000
+_DEFAULT_DISPUTE_THRESHOLD = 2
+
+
+def risk_tier(payload: dict) -> dict:
+    """Map restricted categories, diff size and top severity to risk_tier low/medium/high.
+
+    high   co_sign_required, or max_severity critical or blocker
+    medium any restricted category, diff_lines >= 100 (the auto_approve_check size threshold), or blocking_count > 0
+    low    none of the above
+    """
+
+    def work() -> dict:
+        categories = list(dict.fromkeys(payload["categories"]))
+        unknown = [name for name in categories if name not in _CATEGORY_WORDS]
+        if unknown:
+            return _bad("categories", f"unknown category {unknown[0]!r}; expected one of {sorted(_CATEGORY_WORDS)}")
+        severity = payload["max_severity"]
+        blocking_count = payload["blocking_count"]
+        blocking_severity = _RISK_SEVERITIES.index(severity) >= _RISK_SEVERITIES.index("major")
+        if blocking_severity and blocking_count == 0:
+            return _bad("blocking_count", f"max_severity {severity} is blocking, so blocking_count must be at least 1")
+        if not blocking_severity and blocking_count > 0:
+            return _bad("max_severity", f"blocking_count {blocking_count} needs max_severity major or higher")
+        needs_cosign = sorted(set(categories) & _CO_SIGN_CATEGORIES)
+        if needs_cosign and not payload["co_sign_required"]:
+            return _bad("co_sign_required", f"category {needs_cosign[0]} requires co_sign_required true")
+
+        high: list[str] = []
+        if payload["co_sign_required"]:
+            high.append("co_sign_required")
+        if severity in ("critical", "blocker"):
+            high.append(f"max_severity:{severity}")
+        medium = [f"category:{name}" for name in categories]
+        if payload["diff_lines"] >= _MEDIUM_DIFF_LINES:
+            medium.append(f"diff_lines:{payload['diff_lines']}>={_MEDIUM_DIFF_LINES}")
+        if blocking_count > 0:
+            medium.append(f"blocking_count:{blocking_count}>0")
+        tier = "high" if high else "medium" if medium else "low"
+        return {"state": "SUCCESS", "risk_tier": tier, "reasons": [*high, *medium] or ["no_risk_trigger"]}
+
+    return respond(payload, work)
+
+
+def _nonblank(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _line_ok(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _verdict_block_errors(block: dict) -> tuple[list[dict], str]:
+    """(errors, normalized verdict or "none") for the final review json block (prompt output_format)."""
+    errors: list[dict] = []
+
+    def err(field: str, reason: str) -> None:
+        errors.append({"field": field, "reason": reason})
+
+    def need(field: str, ok: bool, expected: str) -> None:
+        if field not in block:
+            err(field, "missing")
+        elif not ok:
+            err(field, f"expected {expected}")
+
+    need("gate", block.get("gate") == "review", "'review'")
+    need("task_id", _nonblank(block.get("task_id")), "a non-empty string")
+    need("correlation_id", _nonblank(block.get("correlation_id")), "a non-empty string")
+    if "pr" in block and not _nonblank(block["pr"]):
+        err("pr", "expected a non-empty string")
+
+    verdict = block.get("verdict")
+    normalized = _VERDICT_ALIASES.get(verdict, "none") if isinstance(verdict, str) else "none"
+    need("verdict", normalized != "none", f"one of {', '.join(_VERDICT_ALIASES)}")
+
+    blocking = block.get("blocking")
+    need("blocking", isinstance(blocking, list), "a list")
+    if isinstance(blocking, list):
+        for index, item in enumerate(blocking):
+            where = f"blocking[{index}]"
+            if not isinstance(item, dict):
+                err(where, "expected an object")
+                continue
+            for key in ("file", "rule", "md"):
+                if key not in item:
+                    err(f"{where}.{key}", "missing")
+                elif not _nonblank(item[key]):
+                    err(f"{where}.{key}", "expected a non-empty string")
+            if "line" not in item:
+                err(f"{where}.line", "missing")
+            elif not _line_ok(item["line"]):
+                err(f"{where}.line", "expected an integer of at least 1")
+    non_blocking = block.get("non_blocking")
+    need("non_blocking", isinstance(non_blocking, list), "a list")
+    if isinstance(non_blocking, list):
+        for index, item in enumerate(non_blocking):
+            where = f"non_blocking[{index}]"
+            if not isinstance(item, dict):
+                err(where, "expected an object")
+                continue
+            for key in ("rule", "suggestion_md"):
+                if key not in item:
+                    err(f"{where}.{key}", "missing")
+                elif not _nonblank(item[key]):
+                    err(f"{where}.{key}", "expected a non-empty string")
+
+    need("risk_tier", block.get("risk_tier") in _RISK_TIERS, f"one of {', '.join(_RISK_TIERS)}")
+    need("mode", block.get("mode") in _MODES, f"one of {', '.join(_MODES)}")
+    need("co_sign_required", isinstance(block.get("co_sign_required"), bool), "a boolean")
+    expires = block.get("expires_s")
+    need("expires_s", isinstance(expires, int) and not isinstance(expires, bool) and 1 <= expires <= _MAX_EXPIRES_S,
+         f"an integer from 1 to {_MAX_EXPIRES_S}")
+
+    # verdict ladder: pass means no blocking finding; a fail carries the finding that explains it (fail closed)
+    if isinstance(blocking, list) and normalized == "pass" and blocking:
+        err("verdict", "pass cannot carry blocking items")
+    if isinstance(blocking, list) and normalized == "fail" and not blocking:
+        err("blocking", "a fail verdict needs at least one blocking item")
+    return errors, normalized
+
+
+def verdict_shape(payload: dict) -> dict:
+    def work() -> dict:
+        block = payload["block"]
+        for key in ("blocking", "non_blocking"):
+            if isinstance(block.get(key), list) and len(block[key]) > _MAX_BLOCK_ITEMS:
+                return _bad(f"block.{key}", f"more than {_MAX_BLOCK_ITEMS} items")
+        errors, normalized = _verdict_block_errors(block)
+        return {"state": "SUCCESS", "valid": not errors, "errors": errors, "normalized_verdict": normalized}
+
+    return respond(payload, work)
+
+
+def rule_dispute_flag(payload: dict) -> dict:
+    """Flag rules that one producer disputed on at least `threshold` distinct pull requests (default 2).
+
+    Counts are per (rule, producer): a rule disputed once each by two producers is not merged into one count, and a
+    repeated (rule, pr, producer) dispute is counted once.
+    """
+
+    def work() -> dict:
+        threshold = payload.get("threshold", _DEFAULT_DISPUTE_THRESHOLD)
+        seen: set[tuple[str, str, str]] = set()
+        for index, item in enumerate(payload["disputes"]):
+            for key in ("rule", "pr", "producer"):
+                if not item[key].strip():
+                    return _bad("disputes", f"disputes[{index}].{key} must not be blank")
+            seen.add((item["rule"], item["pr"], item["producer"]))
+        per_pair: dict[tuple[str, str], list[str]] = {}
+        for rule, pr, producer in sorted(seen):
+            per_pair.setdefault((rule, producer), []).append(pr)
+        flagged = [
+            {"rule": rule, "producer": producer, "dispute_count": len(prs), "prs": prs}
+            for (rule, producer), prs in sorted(per_pair.items())
+            if len(prs) >= threshold
+        ]
+        return {
+            "state": "SUCCESS",
+            "flagged_rules": flagged,
+            "flagged_count": len(flagged),
+            "max_disputes": max((len(prs) for prs in per_pair.values()), default=0),
         }
 
     return respond(payload, work)

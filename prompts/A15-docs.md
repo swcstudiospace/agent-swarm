@@ -450,7 +450,7 @@ Only the artifacts listed in &lt;outputs&gt; for this task.assign. Echo task_id 
 Scripts for this agent (Python and TypeScript twins, identical flags):
     - python3 scripts/docs_bundle.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/docs_bundle.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: docs_heading_order, docs_link_targets, docs_anchor_check, docs_changelog_section_order, docs_conventional_groups, docs_api_endpoint_coverage, docs_flesch_grade, docs_stale_doc_age, docs_runbook_verified_ratio, docs_adr_render_coverage (see TOOL_INVENTORY).
+Registry tools for this agent: docs_heading_order, docs_link_targets, docs_anchor_check, docs_changelog_section_order, docs_conventional_groups, docs_api_endpoint_coverage, docs_flesch_grade, docs_stale_doc_age, docs_runbook_verified_ratio, docs_adr_render_coverage (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -460,7 +460,7 @@ Registry tools for this agent: docs_heading_order, docs_link_targets, docs_ancho
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

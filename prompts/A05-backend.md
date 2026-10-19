@@ -313,9 +313,9 @@ Expected state: SUCCESS, checked_count 2, violation_count 1, violations ["tiny (
 </INPUTS>
 <OUTPUTS>
 - `state` (string): `SUCCESS` on a successful call.
-- `delta` (number): after minus before, rounded to two decimals.
+- `delta` (number): after minus before, at full precision (only float noise below 1e-12 is removed).
 - `direction` (string): up, down or flat.
-- `regressed` (boolean): true when `after` is less than `before`.
+- `regressed` (boolean): true when `after` is less than `before`, i.e. exactly when `direction` is `down`; any drop, however small, counts.
 - Values outside 0 to 100 return `state` `INVALID_INPUT` with `field` set to `before` or `after`.
 </OUTPUTS>
 <SIDE_EFFECT_TIER>READ — evidence: handler `swarm.tools.a05_tools:coverage_delta` computes from its two inputs and writes nothing.</SIDE_EFFECT_TIER>
@@ -433,7 +433,7 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
     - bun scripts/ts/code_checks.ts --task-id $TASK --correlation-id $CORR --json
     - python3 scripts/be_contract_conformance.py --task-id $TASK --correlation-id $CORR --json
     - bun scripts/ts/be_contract_conformance.ts --task-id $TASK --correlation-id $CORR --json
-Registry tools for this agent: be_route_norm, be_openapi_path_params, be_route_collision, be_method_status_check, be_semver_range_class, be_license_allowlist_check, be_coverage_delta, be_acceptance_coverage, shared_toolchain, shared_check_plan (see TOOL_INVENTORY).
+Registry tools for this agent: be_route_norm, be_openapi_path_params, be_route_collision, be_method_status_check, be_semver_range_class, be_license_allowlist_check, be_coverage_delta, be_acceptance_coverage, shared_toolchain, shared_check_plan (see TOOL_INVENTORY; swarm_catalog lists any further registry tools and skills you may use, including the shared handover tools).
 </scope>
 
 <out_of_scope>
@@ -443,7 +443,7 @@ Registry tools for this agent: be_route_norm, be_openapi_path_params, be_route_c
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
 - Fabricating script output when a binary is missing.
-- Calling any registry tool not listed in TOOL_INVENTORY.
+- Calling a registry tool that is neither in TOOL_INVENTORY nor returned for you by swarm_catalog.
 </out_of_scope>
 
 <workflow>

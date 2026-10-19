@@ -9,6 +9,9 @@
 - ux_focus_contrast_check: WCAG 2.2 SC 1.4.11 focus indicator contrast against each adjacent surface.
 - ux_motion_duration_check: animation duration bound and reduced-motion variant presence.
 - ux_breakpoint_order_check: responsive breakpoint names unique and minimum widths strictly ascending.
+- ux_token_semver_impact: diff two flat token maps; the semver bump, next version and deprecation aliases still owed.
+- ux_spec_completeness_check: one ux.spec against the output_format shape, required states, focus order and contrast floor.
+- ux_ac_trace_check: two-way trace of acceptance-criterion ids to per-screen ux.spec acceptance_refs.
 """
 from __future__ import annotations
 
@@ -245,6 +248,223 @@ def breakpoint_order_check(payload: dict) -> dict:
             "out_of_order": out_of_order,
             "duplicate_names": duplicates,
             "sorted_names": [b["name"] for b in ordered],
+        }
+
+    return respond(payload, work)
+
+
+_SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+_MAX_TOKENS = 5000
+_FIDELITY = ("hifi", "lofi")
+_A11Y_TARGETS = ("WCAG-2.2-AA", "WCAG-2.2-AAA")
+
+
+def _invalid(field: str, message: str) -> dict:
+    return {"state": "INVALID_INPUT", "field": field, "message": message}
+
+
+def _flat_map_problem(field: str, tokens: dict) -> dict | None:
+    """INVALID_INPUT for a token map that is too large, has blank names or non-scalar values; else None."""
+    if len(tokens) > _MAX_TOKENS:
+        return _invalid(field, f"more than {_MAX_TOKENS} tokens")
+    for name, value in tokens.items():
+        if not name.strip():
+            return _invalid(field, "token names must not be blank")
+        if value is None or not isinstance(value, (str, int, float, bool)):
+            return _invalid(field, f"{name}: value must be a string, number or boolean (flatten composite tokens to dotted paths)")
+    return None
+
+
+def _token_differs(before: object, after: object) -> bool:
+    return before != after or isinstance(before, bool) != isinstance(after, bool)
+
+
+def token_semver_impact(payload: dict) -> dict:
+    def work() -> dict:
+        old, new, aliases = payload["old"], payload["new"], payload.get("aliases") or {}
+        for field, tokens in (("old", old), ("new", new)):
+            problem = _flat_map_problem(field, tokens)
+            if problem:
+                return problem
+        if len(aliases) > _MAX_TOKENS:
+            return _invalid("aliases", f"more than {_MAX_TOKENS} aliases")
+        for old_name, target in aliases.items():
+            if not isinstance(target, str) or not target.strip():
+                return _invalid("aliases", f"{old_name}: alias target must be a non-blank token name")
+        match = _SEMVER.match(payload["current_version"])
+        if not match:
+            return _invalid("current_version", "must be MAJOR.MINOR.PATCH with numeric parts and no leading zeros")
+        major, minor, patch = (int(part) for part in match.groups())
+        added = sorted(name for name in new if name not in old)
+        removed = sorted(name for name in old if name not in new)
+        changed = sorted(name for name in old if name in new and _token_differs(old[name], new[name]))
+        breaking = sorted(set(removed) | set(changed))
+        unaliased = [name for name in removed if aliases.get(name) not in new]
+        if breaking:
+            bump, next_version = "major", f"{major + 1}.0.0"
+        elif added:
+            bump, next_version = "minor", f"{major}.{minor + 1}.0"
+        else:
+            bump, next_version = "patch", f"{major}.{minor}.{patch + 1}"
+        return {
+            "state": "SUCCESS",
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "breaking": breaking,
+            "unaliased_removals": unaliased,
+            "required_bump": bump,
+            "next_version": next_version,
+            "l3_required": bool(breaking),
+            "diff_empty": not (added or removed or changed),
+        }
+
+    return respond(payload, work)
+
+
+def _nonblank(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _spec_findings(spec: dict) -> tuple[list[str], list[str], bool]:
+    """(missing_fields, bad_enums, empty_acceptance_refs) for the output_format shape of one ux.spec."""
+    missing: list[str] = []
+    bad: list[str] = []
+    if not _nonblank(spec.get("screen_id")):
+        missing.append("screen_id")
+    for key in ("flows", "states"):
+        value = spec.get(key)
+        if not (isinstance(value, list) and value and all(_nonblank(v) for v in value)):
+            missing.append(key)
+    components = spec.get("components")
+    if not (isinstance(components, list) and components):
+        missing.append("components")
+    else:
+        for index, item in enumerate(components):
+            if not (isinstance(item, dict) and _nonblank(item.get("ref"))):
+                missing.append(f"components[{index}].ref")
+            elif "props" in item and not isinstance(item["props"], dict):
+                missing.append(f"components[{index}].props")
+    a11y = spec.get("a11y")
+    if not isinstance(a11y, dict):
+        missing.append("a11y")
+    else:
+        target = a11y.get("target")
+        if not _nonblank(target):
+            missing.append("a11y.target")
+        elif target not in _A11Y_TARGETS:
+            bad.append(f"a11y.target: expected one of {', '.join(_A11Y_TARGETS)}, got {target!r}")
+        order = a11y.get("focus_order")
+        if not (isinstance(order, list) and all(_nonblank(v) for v in order)):
+            missing.append("a11y.focus_order")
+        if not _is_number(a11y.get("min_contrast")):
+            missing.append("a11y.min_contrast")
+    version = spec.get("tokens_version")
+    if not _nonblank(version):
+        missing.append("tokens_version")
+    elif not _SEMVER.match(version):
+        bad.append(f"tokens_version: expected MAJOR.MINOR.PATCH, got {version!r}")
+    fidelity = spec.get("fidelity")
+    if not _nonblank(fidelity):
+        missing.append("fidelity")
+    elif fidelity not in _FIDELITY:
+        bad.append(f"fidelity: expected one of {', '.join(_FIDELITY)}, got {fidelity!r}")
+    if not isinstance(spec.get("provisional"), bool):
+        missing.append("provisional")
+    refs = spec.get("acceptance_refs")
+    empty_refs = False
+    if not isinstance(refs, list) or not all(_nonblank(r) for r in refs):
+        missing.append("acceptance_refs")
+    else:
+        empty_refs = not refs
+    return missing, bad, empty_refs
+
+
+def spec_completeness_check(payload: dict) -> dict:
+    def work() -> dict:
+        spec = payload["spec"]
+        required = list(dict.fromkeys(_norm_state(s) for s in payload["required_states"]))
+        if "" in required:
+            return _invalid("required_states", "required states must not be blank")
+        interactive = payload.get("interactive_ids")
+        if interactive is not None:
+            if any(not i.strip() for i in interactive):
+                return _invalid("interactive_ids", "interactive ids must not be blank")
+            repeated = sorted(i for i, count in Counter(interactive).items() if count > 1)
+            if repeated:
+                return _invalid("interactive_ids", f"duplicate ids: {', '.join(repeated)}")
+        floor = payload.get("min_contrast_floor", 4.5)
+        missing, bad, empty_refs = _spec_findings(spec)
+        states = spec.get("states")
+        declared = [_norm_state(s) for s in states if isinstance(s, str)] if isinstance(states, list) else []
+        missing_states = [family for family in required if not any(_covers(s, family) for s in declared)]
+        a11y = spec.get("a11y") if isinstance(spec.get("a11y"), dict) else {}
+        contrast = a11y.get("min_contrast")
+        below_floor = _is_number(contrast) and contrast < floor
+        order = a11y.get("focus_order")
+        order = [i for i in order if isinstance(i, str)] if isinstance(order, list) else []
+        unknown: list[str] = []
+        absent: list[str] = []
+        if interactive is not None:
+            unknown = [i for i in dict.fromkeys(order) if i not in set(interactive)]
+            absent = [i for i in interactive if i not in set(order)]
+        return {
+            "state": "SUCCESS",
+            "missing_fields": missing,
+            "bad_enums": bad,
+            "missing_states": missing_states,
+            "focus_order_unknown": unknown,
+            "focus_order_missing": absent,
+            "empty_acceptance_refs": empty_refs,
+            "below_floor": below_floor,
+            "complete": not (missing or bad or missing_states or unknown or absent or empty_refs or below_floor),
+        }
+
+    return respond(payload, work)
+
+
+def ac_trace_check(payload: dict) -> dict:
+    def work() -> dict:
+        ids = [i.strip() for i in payload["acceptance_ids"]]
+        if "" in ids:
+            return _invalid("acceptance_ids", "acceptance ids must not be blank")
+        repeated = sorted(i for i, count in Counter(ids).items() if count > 1)
+        if repeated:
+            return _invalid("acceptance_ids", f"duplicate ids: {', '.join(repeated)}")
+        screens = payload["screens"]
+        screen_ids = [s["screen_id"].strip() for s in screens]
+        if "" in screen_ids:
+            return _invalid("screens", "screen ids must not be blank")
+        repeated = sorted(i for i, count in Counter(screen_ids).items() if count > 1)
+        if repeated:
+            return _invalid("screens", f"duplicate ids: {', '.join(repeated)}")
+        known = set(ids)
+        cited: set[str] = set()
+        unknown: list[str] = []
+        without: list[str] = []
+        for screen_id, screen in zip(screen_ids, screens):
+            refs = [r.strip() for r in screen["acceptance_refs"]]
+            if "" in refs:
+                return _invalid("screens", f"{screen_id}: acceptance refs must not be blank")
+            if not refs:
+                without.append(screen_id)
+            for ref in dict.fromkeys(refs):
+                if ref in known:
+                    cited.add(ref)
+                else:
+                    unknown.append(f"{screen_id}: {ref}")
+        uncovered = [i for i in ids if i not in cited]
+        return {
+            "state": "SUCCESS",
+            "uncovered_acs": uncovered,
+            "unknown_refs": unknown,
+            "screens_without_refs": without,
+            "coverage_pct": round(100 * (len(ids) - len(uncovered)) / len(ids), 2),
+            "traced": not (uncovered or unknown or without),
         }
 
     return respond(payload, work)
