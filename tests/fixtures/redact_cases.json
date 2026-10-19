@@ -243,7 +243,28 @@
     {"name": "Q8: a comment's double quote before a multi-line double-quoted secret", "input": "# \"\nPASSWORD=\"a\n{{tok:urlsafe:508:20}}\"\n", "must_not_contain": [["{{tok:urlsafe:508:20}}"]], "must_contain": ["# \""], "expected": "# \"\nPASSWORD=[REDACTED]\n"},
     {"name": "Q9: a comment after a closed value hides nothing before it", "input": "PASSWORD=\"{{tok:urlsafe:509:20}}\" # it's\nTOKEN='{{tok:urlsafe:510:20}}' # '\n", "must_not_contain": [["{{tok:urlsafe:509:20}}"], ["{{tok:urlsafe:510:20}}"]], "must_contain": [], "expected": "PASSWORD=[REDACTED] # it's\nTOKEN=[REDACTED] # '\n"},
     {"name": "Q10: a hash inside a word is not a comment: its apostrophe opens a quote", "input": "x#'y\nPASSWORD=\"a\n{{tok:urlsafe:511:20}}\"\n", "must_not_contain": [["{{tok:urlsafe:511:20}}"]], "must_contain": [], "expected": "x#'y\nPASSWORD=[REDACTED]\n"},
-    {"name": "GL9: restart: the same carrier followed by every kind of stray quote line", "input": "mysql -p'alpha beta' db\n# sshpass -p'\nredis-cli -a \"gamma delta\" ping\n'", "must_not_contain": ["alpha", "gamma"], "must_contain": [], "expected": "mysql -p[REDACTED] db\n# sshpass -p[REDACTED]"}
+    {"name": "R1 (review P2): joined quoted segments in a comment are one value, and the tail after them is masked too", "input": "# PASSWORD=\"{{tok:urlsafe:601:12}}\"' secret tail'\n", "must_not_contain": [["{{tok:urlsafe:601:12}}"], "secret tail"], "must_contain": [], "expected": "# PASSWORD=[REDACTED]\n"},
+    {"name": "R2: three joined quoted segments in a comment are one value", "input": "# PASSWORD=\"{{tok:urlsafe:602:12}}\"'{{tok:urlsafe:603:12}}'\"{{tok:urlsafe:604:12}}\"\n", "must_not_contain": [["{{tok:urlsafe:602:12}}"], ["{{tok:urlsafe:603:12}}"], ["{{tok:urlsafe:604:12}}"]], "must_contain": [], "expected": "# PASSWORD=[REDACTED]\n"},
+    {"name": "R3: four joined quoted segments in a comment end at the blank after them", "input": "# TOKEN='{{tok:urlsafe:605:12}}'\"{{tok:urlsafe:606:12}}\"'{{tok:urlsafe:607:12}}'\"{{tok:urlsafe:608:12}}\" done\n", "must_not_contain": [["{{tok:urlsafe:605:12}}"], ["{{tok:urlsafe:606:12}}"], ["{{tok:urlsafe:607:12}}"], ["{{tok:urlsafe:608:12}}"]], "must_contain": ["done"], "expected": "# TOKEN=[REDACTED] done\n"},
+    {"name": "R4: a comment value, then a prose apostrophe on the next line, opens no quote", "input": "# PASSWORD=\"{{tok:urlsafe:609:12}}\"\n# it's the user's note\necho 'ok'\n", "must_not_contain": [["{{tok:urlsafe:609:12}}"]], "must_contain": ["# it's the user's note", "echo 'ok'"], "expected": "# PASSWORD=[REDACTED]\n# it's the user's note\necho 'ok'\n"},
+    {"name": "R5: a multi-line value joined to two quoted segments outside a comment (unchanged)", "input": "PASSWORD=\"{{tok:urlsafe:610:12}}\n{{tok:urlsafe:611:12}}\"'{{tok:urlsafe:612:12}}'\necho done\n", "must_not_contain": [["{{tok:urlsafe:610:12}}"], ["{{tok:urlsafe:611:12}}"], ["{{tok:urlsafe:612:12}}"]], "must_contain": ["echo done"], "expected": "PASSWORD=[REDACTED]\necho done\n"},
+    {"name": "R6 (review P2, earlier): a comment's apostrophe before a multi-line double-quoted secret", "input": "# '\nPASSWORD=\"{{tok:urlsafe:613:12}}\n{{tok:urlsafe:614:12}}\"\n", "must_not_contain": [["{{tok:urlsafe:613:12}}"], ["{{tok:urlsafe:614:12}}"]], "must_contain": ["# '"], "expected": "# '\nPASSWORD=[REDACTED]\n"},
+    {"name": "R7: a comment value that runs onto the next line and joins a quoted segment there", "input": "# PASSWORD=\"{{tok:urlsafe:615:12}}\n{{tok:urlsafe:616:12}}\"' tail'\necho ok\n", "must_not_contain": [["{{tok:urlsafe:615:12}}"], ["{{tok:urlsafe:616:12}}"], "tail'"], "must_contain": ["echo ok"], "expected": "# PASSWORD=[REDACTED]\necho ok\n"},
+    {"name": "R8: an unclosed double quote in a comment value runs to the end of its line only", "input": "# PASSWORD=\"{{tok:urlsafe:617:12}}\nnext line\n", "must_not_contain": [["{{tok:urlsafe:617:12}}"]], "must_contain": ["next line"], "expected": "# PASSWORD=[REDACTED]\nnext line\n"},
+    {"name": "R9: a#b is a word, so its assignment is no comment and its joined segments are one value", "input": "echo a#PASSWORD=\"{{tok:urlsafe:618:12}}\"'x' ok\n", "must_not_contain": [["{{tok:urlsafe:618:12}}"], "'x'"], "must_contain": ["echo a#PASSWORD=", " ok"], "expected": "echo a#PASSWORD=[REDACTED] ok\n"},
+    {"name": "R10: a prose apostrophe after a closed comment value stays prose", "input": "# PASSWORD=\"{{tok:urlsafe:619:12}}\" it's\n", "must_not_contain": [["{{tok:urlsafe:619:12}}"]], "must_contain": ["it's"], "expected": "# PASSWORD=[REDACTED] it's\n"},
+    {"name": "R11: a sensitive flag's joined value in a comment is masked whole", "input": "# mysql --password \"{{tok:urlsafe:620:12}}\"'{{tok:urlsafe:621:12}}' x\n", "must_not_contain": [["{{tok:urlsafe:620:12}}"], ["{{tok:urlsafe:621:12}}"]], "must_contain": ["# mysql --password ", " x"], "expected": "# mysql --password [REDACTED] x\n"},
+    {"name": "R12: a quoted JSON pair in a comment masks its value", "input": "# {\"password\": \"{{tok:urlsafe:622:12}}\"}\n", "must_not_contain": [["{{tok:urlsafe:622:12}}"]], "must_contain": ["# {\"password\": \""], "expected": "# {\"password\": \"[REDACTED]\"}\n"},
+    {"name": "R13: a flag value that starts with `:;` is one shell word (a flag reads through `;`), in a comment as outside one", "input": "# --password :;\"{{tok:urlsafe:717:12}}\" x\n", "must_not_contain": [["{{tok:urlsafe:717:12}}"]], "must_contain": ["# --password ", " x"], "expected": "# --password [REDACTED] x\n"},
+    {"name": "GL9: restart: the same carrier followed by every kind of stray quote line", "input": "mysql -p'alpha beta' db\n# sshpass -p'\nredis-cli -a \"gamma delta\" ping\n'", "must_not_contain": ["alpha", "gamma"], "must_contain": [], "expected": "mysql -p[REDACTED] db\n# sshpass -p[REDACTED]"},
+    {"name": "J1: a bare run then a quoted segment with a blank inside it is one word (single quotes)", "input": "PASSWORD=x'a b'", "must_not_contain": ["a b"], "must_contain": [], "expected": "PASSWORD=[REDACTED]"},
+    {"name": "J2: a bare run then a double-quoted segment with a blank inside it; the word after the blank stays visible", "input": "PASSWORD=x\"a b\" tail", "must_not_contain": ["a b"], "must_contain": ["tail"], "expected": "PASSWORD=[REDACTED] tail"},
+    {"name": "J3: a quoted segment with a blank inside it between bare runs, then a bare word", "input": "PASSWORD=ab'c d'ef next", "must_not_contain": ["c d", "ef"], "must_contain": ["next"], "expected": "PASSWORD=[REDACTED] next"},
+    {"name": "J4: a quoted value keeps its blank and ends at its closing quote", "input": "export PASSWORD='p w'", "must_not_contain": ["p w"], "must_contain": ["export PASSWORD="], "expected": "export PASSWORD=[REDACTED]"},
+    {"name": "J5: two joined segments with blanks, then a bare run; the word after the blank stays visible", "input": "TOKEN=ab'c d'\"e f\"gh visible word\n", "must_not_contain": ["c d", "e f", "gh"], "must_contain": ["visible word"], "expected": "TOKEN=[REDACTED] visible word\n"},
+    {"name": "J6: a quoted value with a blank inside a comment ends at its closing quote", "input": "# PASSWORD='a b' next\n", "must_not_contain": ["a b"], "must_contain": ["next"], "expected": "# PASSWORD=[REDACTED] next\n"},
+    {"name": "J7: a joined value with a blank inside a comment, then a bare word", "input": "# PASSWORD=ab'c d'ef next\n", "must_not_contain": ["c d", "ef"], "must_contain": ["next"], "expected": "# PASSWORD=[REDACTED] next\n"},
+    {"name": "J8: a joined value in a comment with a blank in each segment, then a bare word and the next line", "input": "# PASSWORD=x\"a b\"'c d' tail\necho ok", "must_not_contain": ["a b", "c d"], "must_contain": ["tail", "echo ok"], "expected": "# PASSWORD=[REDACTED] tail\necho ok"}
   ],
   "property": {
     "_doc": "Seeded shell-like snippets for swarm/redact.py and omp/src/swarm_bar.ts. Each case is `count` lines chosen with xorshift32 (the seed, as in the `tokens` algorithm of redact_generated.json): 2 to 4 templates drawn from `templates`, then one drawn from templates[secret_from:]. Every `{S}` in the chosen text (left to right) becomes a fresh planted secret `{{tok:urlsafe:INDEX:20}}` with INDEX = 100000 + the running count of secrets. Each draw is rng.next(len) on the table. Both suites: no planted secret survives the redaction, and the SHA-256 of the outputs joined with NUL is `sha256` (Python == TypeScript for every case).",
@@ -277,5 +298,53 @@
       "# \"\nPASSWORD=\"a\n{S}\""
     ],
     "sha256": "a0beab09a8d43c43eab2917fa84464ec1a4deece935bf8eceddc9e912e6ba182"
+  },
+  "property_comments": {
+    "_doc": "Seeded shell-like snippets with comments that carry sensitive values, joined quoted segments inside and outside comments, multi-line values, prose apostrophes and a#b words, for swarm/redact.py and omp/src/swarm_bar.ts (the comment value spans of the quote lexer). Drawn exactly as `property` is (xorshift32 from `seed`; 2 to 4 templates, then one of templates[secret_from:]; every `{S}`, left to right, is a fresh planted secret `{{tok:urlsafe:INDEX:20}}`, INDEX = 100000 + the running count). Every planted secret sits in a value position (after a sensitive name or inside its value span). Both suites: no 6-byte window of a planted secret survives the redaction, and the SHA-256 of the outputs joined with NUL is `sha256` (Python == TypeScript for every case).",
+    "seed": 20262,
+    "count": 800,
+    "secret_from": 0,
+    "templates": [
+      "# PASSWORD=\"{S}\"' secret tail'",
+      "# PASSWORD=\"{S}\"'{S}'\"{S}\"",
+      "# TOKEN='{S}'\"{S}\"'{S}'\"{S}\"",
+      "# DB_PASSWORD=\"{S}\"'{S}' # it's ok",
+      "# PASSWORD=\"{S}\n{S}\"'{S}'",
+      "# '\nPASSWORD=\"{S}\n{S}\"",
+      "# it's the user's note\nPASSWORD=\"{S}\"'{S}'",
+      "# PASSWORD=\"{S}\"\n# it's ok\necho 'done'",
+      "echo a#PASSWORD=\"{S}\"'x' ok",
+      "# mysql --password \"{S}\"'{S}' x",
+      "# {\"password\": \"{S}\"}",
+      "# API_KEY: '{S}'\"{S}\"",
+      "# TOKEN=\"{S}\" it's",
+      "# PASSWORD={S}'{S}' # don't",
+      "PASSWORD=\"{S}\"'{S}' secret tail'",
+      "TOKEN='{S}' # '",
+      "echo \"it's\"; mysql -p'{S}' db",
+      "# note: x'y\nDB_PASSWORD=\"{S}\"'{S}'",
+      "x && # it's\nPASSWORD='{S}'",
+      "# PASSWORD=\"it's {S}\"",
+      "# PASSWORD=\"{S}\" # '",
+      "# PASSWORD='{S}'\"{S}\" it's"
+    ],
+    "sha256": "c5b02898f8250dd895917720f2dc3b0c724f9a2f2119851720e9d32a27e1acf4"
+  },
+  "property_joined": {
+    "_doc": "Seeded shell-like snippets whose joined words carry blanks inside quoted segments (`ab'c d'SECRET`, `x\"a b\"'SECRET'`, `ab'c {SECRET} d'ef`), for swarm/redact.py and omp/src/swarm_bar.ts. Every template is ONE balanced line (each quote it opens it closes, prose apostrophes aside), so no unclosed quote precedes an assignment: a stray quote's closer ends a value by design (an enclosing close), which would put a glued planted secret outside the value. Drawn exactly as `property` is (xorshift32 from `seed`; 2 to 4 templates, then one of templates[secret_from:]; every `{S}`, left to right, is a fresh planted secret `{{tok:urlsafe:INDEX:20}}`, INDEX = 100000 + the running count). Both suites: no planted secret survives the redaction, and the SHA-256 of the outputs joined with NUL is `sha256` (Python == TypeScript for every case).",
+    "seed": 20263,
+    "count": 600,
+    "secret_from": 0,
+    "templates": [
+      "PASSWORD=ab'c d'x{S} tail",
+      "export TOKEN=x\"a b\"'c'x{S} next",
+      "API_KEY=p'q r's\"ab\"x{S} done",
+      "# PASSWORD=ab'c d'x{S} tail",
+      "echo x; TOKEN=x'a b'\"ab\"x{S} ok # it's",
+      "# DB_PASSWORD=ab'c d'x{S} e'f end",
+      "PASSWORD=ab'c {S} d'ef next",
+      "TOKEN=\"a b\"x{S} visible"
+    ],
+    "sha256": "c260ceb01996bda95dd750497a1cbbcaabe96676621a7c31efbe96ecd7999f60"
   }
 }

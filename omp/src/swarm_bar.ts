@@ -211,10 +211,16 @@ function bareEnd(s: string, i: number, kind: number): number {
 //     quote: a plain `'` or `"` right after a letter or digit that is not the `-p` of a flag word (`it's`, `don't`, `users'`, `5"`) never
 //     opens a quote and is plain content. (`-p'x'`, `-u'a:b'` and `--pass"x"`: the letters belong to a flag word, the quote opens.)
 //   * outside quotes, a `#` that STARTS a word (the start of the text, or right after a blank, a newline, `;`, `&`, `|` or `(`, unless that
-//     character is backslash-escaped) begins a COMMENT that runs to the end of its line. A quote inside a comment is a CONTENT mark: it opens and
-//     closes nothing, so a stray apostrophe there (`# '`, `# don't`) changes no later quote; a value that starts at such a quote is read to its
-//     next plain quote of its kind (or the line end), so a comment hides no secret. `a#b`, `$#`, `\#` and a `#` inside an open quote are not
-//     comments. "Outside quotes" is the lexer's own view: no quote is open on its stack at that point (an unclosed quote still counts as open).
+//     character is backslash-escaped) begins a COMMENT that runs to the end of its line. A comment is text, but the VALUE of a sensitive name is
+//     a value wherever it sits. A quote in comment PROSE is a CONTENT mark: it opens and closes nothing, so a stray apostrophe such as `# '` or
+//     `# don't` changes no later quote. The VALUE SPAN of a sensitive name in a comment is read as it is outside one: it starts where `NAME=`,
+//     `NAME:` (strict names), `"NAME": ` or `--NAME ` (strict) names a sensitive name (the detectors' own test; a `//` after `NAME:` is a URL
+//     scheme), and it is a shell WORD: its marks are read by the rules above, so joined segments (`"a"'b'"c"`) and multi-line quotes are one
+//     value, until a blank outside quotes ends the word (a blank that a backslash escapes does not), or a `;` or `&` outside quotes when the
+//     value is a `NAME=`, `NAME:` or pair value (a flag value reads through them, as `_FLAG_BARE_RE` does), or the line ends. Two readings
+//     of one word (`--password :;` is a flag and also `password :`) make one value, the longer. A quote that nothing closes runs to the end
+//     of its line. `a#b`, `$#`, `\#` and a `#` inside an open quote are not comments. "Outside quotes" is the lexer's own view: no quote is
+//     open on its stack at that point (an unclosed quote still counts as open).
 //   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
 //     detectors mask from the value start to the end of that line, never a part of it.
 //   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
@@ -246,6 +252,57 @@ function commentAt(s: string, p: number): boolean {
   let r = p - 1; // an escaped blank or joiner (`\ #`, `\;#`) does not start a word
   while (r > 0 && s.charCodeAt(r - 1) === 92) r--;
   return (p - 1 - r) % 2 === 0;
+}
+
+/**
+ * (offset, ends at `;`/`&` too) for every value of a SENSITIVE name in `line` (one comment, from its `#`), ascending (twin of `_value_starts`).
+ * The offset is the end of `NAME<sep>` (`=` is tested loosely, `:` strictly, as in `_scan`; a `//` after `NAME:` is a URL scheme, not a
+ * value), of a `"NAME": ` / `\"NAME\": ` pair (as in `_pair_spans`), or of `--flag<blank>` (strict). A NAME or pair value stops at `;` and `&`
+ * too (`_NAME_BARE_RE`); a flag value does not (`_FLAG_BARE_RE`).
+ */
+function valueStarts(line: string): Array<[number, boolean]> {
+  const out: Array<[number, boolean]> = [];
+  NAME_SEP.lastIndex = 0;
+  for (const m of line.matchAll(NAME_SEP)) {
+    const end = m.index! + m[0].length;
+    const eq = m[2]!.includes("=");
+    if (!eq && line.startsWith("//", end)) continue;
+    if (isNameHit(m[1]!, eq)) out.push([end, true]);
+  }
+  FLAG_SEP.lastIndex = 0;
+  for (const m of line.matchAll(FLAG_SEP)) if (isNameHit(m[1]!, false)) out.push([m.index! + m[0].length, false]);
+  PAIR.lastIndex = 0;
+  for (const m of line.matchAll(PAIR)) if (isSensitiveKey(m.groups!.name!)) out.push([m.index! + m[0].length, true]);
+  ESC_PAIR.lastIndex = 0;
+  for (const m of line.matchAll(ESC_PAIR)) {
+    if (m.groups!.bs!.length % 2 === 1 && isSensitiveKey(m.groups!.name!)) out.push([m.index! + m[0].length, true]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+
+/**
+ * Whether s[a:b], outside quotes, ends a value word: a blank that no backslash escapes, or (`joiners`) a `;` or `&` (twin of `_word_break`).
+ */
+function wordBreak(s: string, a: number, b: number, joiners: boolean): boolean {
+  for (let k = a; k < b; k++) {
+    const c = s.charCodeAt(k);
+    if (joiners && (c === 59 || c === 38)) return true;
+    if ((c === 32 || c === 9) && !(k > 0 && s.charCodeAt(k - 1) === 92)) return true;
+  }
+  return false;
+}
+
+/** The next PLAIN quote of s[p]'s kind before `stop` (the end of its comment line), or -1 (twin of `_mate`). */
+function proseMate(s: string, p: number, stop: number): number {
+  const ch = s.charAt(p);
+  let q = s.indexOf(ch, p + 1);
+  while (q >= 0 && q < stop) {
+    let r = q;
+    while (r > 0 && s.charCodeAt(r - 1) === 92) r--;
+    if ((q - r) % 2 === 0) return q;
+    q = s.indexOf(ch, q + 1);
+  }
+  return -1;
 }
 
 /** First index `i` of the ascending `a[0, n)` with `a[i] >= x` (`n` when there is none). */
@@ -301,6 +358,12 @@ class Lexer {
     const lost: number[] = [];
     let i = 0;
     let skipTo = 0; // the offset up to which the text is a comment: no marks there
+    let starts: Array<[number, boolean]> = []; // the value spans of the comment in progress: where each starts and whether it also ends at `;`/`&`, ascending
+    let si = 0;
+    let vact = false; // a value word of that comment is open ...
+    let vgap = 0; // ... and the text from here to the next quote is not yet checked for its end
+    let vjoin = true; // whether that word ends at a `;` or `&` as well as at a blank
+    let vseg = -1; // the mate of a prose quote that opened a quoted segment of that word: the blanks up to it are inside the quotes
     for (let p = 0; p < len; p++) {
       const c = s.charCodeAt(p);
       if (c === 35) {
@@ -308,6 +371,9 @@ class Lexer {
           let e = p;
           while (e < len && s.charCodeAt(e) !== 10 && s.charCodeAt(e) !== 13) e++;
           skipTo = e;
+          starts = valueStarts(s.slice(p, e)).map(([k, joins]): [number, boolean] => [p + k, joins]);
+          si = 0;
+          vact = false;
         }
         continue;
       }
@@ -321,11 +387,37 @@ class Lexer {
       pos[i] = p;
       lvl[i] = level;
       keys[i] = key;
-      if (p < skipTo) {
-        // a quote inside a comment is a CONTENT mark: it opens and closes nothing, and a value that starts there still finds its end
-        top[i] = sp > 0 ? stack[sp - 1]! : -1;
-        i++;
-        continue;
+      const inComment = p < skipTo;
+      if (inComment) {
+        // a quote in a comment is prose unless it lies in the value span of a sensitive name (the rules above)
+        while (si < starts.length && starts[si]![0] <= p) {
+          const [st, joins] = starts[si]!;
+          if (sp === 0) {
+            if (vact && wordBreak(s, vgap, st, vjoin)) vact = false;
+            if (vact) {
+              // a second reading of the same word (`--password :;` is also `password :`): the detectors take the union, the longer word
+              vjoin = vjoin && joins;
+            } else {
+              vact = true;
+              vgap = st;
+              vjoin = joins;
+            }
+          }
+          si++;
+        }
+        if (vact && sp === 0 && wordBreak(s, vgap, p, vjoin)) vact = false;
+        if (!vact) {
+          // comment prose: a CONTENT mark, it opens and closes nothing
+          top[i] = sp > 0 ? stack[sp - 1]! : -1;
+          i++;
+          continue;
+        }
+        if (sp === 0 && level === 0 && p > vseg && proseQuote(s, p)) {
+          // `ab'c d'ef` in a comment: the prose quote opens a quoted segment that its mate on the line closes; the blanks in between are
+          // inside the quotes, so the word goes on past them (the reader's rule for the same word outside a comment)
+          const mate = proseMate(s, p, skipTo);
+          if (mate >= 0) vseg = vgap = mate;
+        }
       }
       if (level === 0) {
         // a plain quote ends the escaped quotes of its kind on top of the stack
@@ -365,6 +457,7 @@ class Lexer {
         cnt.set(key, (cnt.get(key) ?? 0) + 1);
       }
       top[i] = sp > 0 ? stack[sp - 1]! : -1;
+      if (inComment) vgap = Math.max(vgap, p + 1);
       i++;
     }
     for (let k = 0; k < sp; k++) lost.push(stack[k]!);
@@ -570,13 +663,13 @@ class Reader {
             nxt = -1;
           }
         } else {
-          // a quote that is prose (`it's`): part of the word
-          this.closeLen = 0;
-          end = qpos + 1;
+          // a quote that is prose (`it's`): part of the word, unless its mate on the line closes a quoted segment (`x'a b'`)
+          end = this.run === 0 ? this.proseEnd(qpos) : qpos + 1;
+          if (this.run !== 0) this.closeLen = 0;
           nxt = -1;
         }
         quoted = true;
-      } else if (quoted && !CLI_CLOSERS.includes(s.charAt(end)) && !"/?&|".includes(s.charAt(end))) {
+      } else if (quoted && !GLUE_STOPS.includes(s.charAt(end))) {
         const e2 = bareEnd(s, end, kind);
         if (e2 === end) break;
         end = e2;
@@ -587,6 +680,22 @@ class Reader {
       }
     }
     return end;
+  }
+
+  /**
+   * `end` of a PLAIN quote the lexer takes for prose (`x'a b'`, `ab'c d'ef`) read as the opener of a quoted segment when its mate, the next plain
+   * quote of its kind, lies on the same line (twin of `_Reader.prose_end`); else `qpos + 1`, the quote is part of the word. Sets `closeLen`.
+   */
+  proseEnd(qpos: number): number {
+    const lex = this.lex;
+    const m = lex.index(qpos);
+    const t = m >= 0 ? lex.nextMarks()[0][m]! : -1;
+    if (t >= 0 && lex.pos[t]! < this.lineEnd(qpos)) {
+      this.closeLen = 1;
+      return lex.pos[t]! + 1;
+    }
+    this.closeLen = 0;
+    return qpos + 1;
   }
 
   /**
@@ -755,6 +864,7 @@ const isAlnumDash = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && 
 const isNameChar = (c: number): boolean => isAlnumDash(c) || c === 95 || c === 46;
 /** A character of a command name: no `_` (no command name has one; `__mysql` is emphasis). */
 const isCommandChar = (c: number): boolean => isAlnumDash(c) || c === 46;
+const GLUE_STOPS = "`\"')]}>*,;/?&|"; // a value glued to a quoted segment ends here; `_`, `.`, `:` continue it (shell word characters)
 const CLI_CLOSERS = "`\"')]}>*_.,;:"; // Markdown/prose closers: a word `-p` followed by only these is a flag in prose, not `-pPASSWORD`
 const CLI_MYSQL = 1;
 const CLI_LOGIN = 2;

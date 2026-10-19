@@ -97,12 +97,75 @@ def test_shared_property_snippets_leak_no_planted_secret_and_match_typescript():
     assert hashlib.sha256("\u0000".join(outs).encode("utf-8")).hexdigest() == spec["sha256"]
 
 
+def test_joined_property_snippets_with_blanks_inside_quoted_segments_leak_nothing_and_match_typescript():
+    """Balanced one-line snippets whose joined words hold blanks inside quoted segments (`ab'c d'SECRET`, `x"a b"'SECRET'`): no planted secret
+    survives, and the digest of all outputs is the one omp/test/swarm_bar.test.ts pins too (Python == TypeScript for every case)."""
+    spec = _SHARED_DOC["property_joined"]
+    snippets = _property_snippets(spec)
+    assert len(snippets) == spec["count"] == 600
+    outs = []
+    for text in snippets:
+        out = redact_text(expand_tokens(text))
+        for placeholder in _PLANTED.findall(text):
+            assert expand_tokens(placeholder) not in out, (text, out)
+        outs.append(out)
+    assert hashlib.sha256("\u0000".join(outs).encode("utf-8")).hexdigest() == spec["sha256"]
+
+
 def test_lexer_roles_for_comments_and_words():
     """`#` starts a comment only at a word start and with no quote open: `a#b 'x'` keeps its quotes, while the apostrophe in the comment `# 'z` is
     a CONTENT mark, so the next line's quote is an opener of its own (the same roles omp/src/swarm_bar.ts gives)."""
     from swarm.redact import _CLOSE, _CONTENT, _OPEN, _Lexer
     assert list(_Lexer("echo a#b 'x' y\n# 'z\n'w'").role) == [_OPEN, _CLOSE, _CONTENT, _OPEN, _CLOSE]
     assert list(_Lexer("x#'y").role) == [_OPEN]
+    # a sensitive name's value in a comment is a shell word read by the outside quote rules; a quote in comment prose stays content
+    assert list(_Lexer('# PASSWORD="a"\'b\'"c"').role) == [_OPEN, _CLOSE, _OPEN, _CLOSE, _OPEN, _CLOSE]
+    assert list(_Lexer("# it's 'x' PASSWORD=\"a\"").role) == [_CONTENT, _CONTENT, _CONTENT, _OPEN, _CLOSE]
+    assert list(_Lexer("# PASSWORD=ab'c d' x'").role) == [_CONTENT, _CONTENT, _CONTENT]
+
+
+def test_the_review_case_a_comment_value_of_joined_segments_is_masked_whole():
+    """`# PASSWORD="first"' secret tail'` left `secret tail'` readable: the value of a sensitive name is one shell word in a comment too."""
+    assert redact_text("# PASSWORD=\"first\"' secret tail'") == "# PASSWORD=" + REDACTED
+    assert redact_text("# PASSWORD=\"first\"' secret tail'\necho ok") == "# PASSWORD=" + REDACTED + "\necho ok"
+
+
+@pytest.mark.parametrize("line", [
+    'PASSWORD="{{tok:urlsafe:701:12}}"\'{{tok:urlsafe:702:12}}\'"{{tok:urlsafe:703:12}}"',
+    "TOKEN='{{tok:urlsafe:704:12}}'\"{{tok:urlsafe:705:12}}\" done",
+    "--password \"{{tok:urlsafe:706:12}}\"'{{tok:urlsafe:707:12}}' x",
+    "PASSWORD={{tok:urlsafe:708:12}}'{{tok:urlsafe:709:12}}' tail",
+    "API_KEY: \"{{tok:urlsafe:710:12}}\"'{{tok:urlsafe:711:12}}'",
+    '{"password": "{{tok:urlsafe:712:12}}"}',
+    "PASSWORD=\"it's {{tok:urlsafe:713:12}}\"",
+    "PASSWORD=\"{{tok:urlsafe:714:12}}\n{{tok:urlsafe:715:12}}\"'{{tok:urlsafe:716:12}}' end",
+])
+def test_a_comment_value_is_masked_exactly_as_the_same_assignment_outside_a_comment(line):
+    """The value span of a sensitive name reads the same in a comment as outside one: `# ` + line masks what line masks, and no secret survives."""
+    text = expand_tokens(line)
+    out = redact_text("# " + text)
+    assert out == "# " + redact_text(text)
+    for placeholder in _PLANTED.findall(line):
+        assert expand_tokens(placeholder) not in out
+
+
+def test_comment_property_snippets_leak_no_planted_secret_and_match_typescript():
+    """Snippets with comments that carry sensitive values, joined quoted segments inside and outside comments, multi-line values, prose apostrophes
+    and `a#b` words (the shared `property_comments` spec, drawn as `property` is): no 6-byte window of a planted secret survives, and the digest
+    of all outputs is the one omp/test/swarm_bar.test.ts pins too (Python == TypeScript for every case)."""
+    spec = _SHARED_DOC["property_comments"]
+    snippets = _property_snippets(spec)
+    assert len(snippets) == spec["count"] == 800
+    outs = []
+    for text in snippets:
+        out = redact_text(expand_tokens(text))
+        for placeholder in _PLANTED.findall(text):
+            secret = expand_tokens(placeholder)
+            assert not any(secret[k:k + 6] in out for k in range(len(secret) - 5)), (text, out)
+        outs.append(out)
+    assert hashlib.sha256("\u0000".join(outs).encode("utf-8")).hexdigest() == spec["sha256"]
+
+
 
 
 def test_megabyte_inputs_are_scanned_in_linear_time():

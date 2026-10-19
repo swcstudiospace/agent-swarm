@@ -190,10 +190,16 @@ _EOL_RE = re.compile(r"[\r\n]")
 #     quote: a plain `'` or `"` right after a letter or digit that is not the `-p` of a flag word (`it's`, `don't`, `users'`, `5"`) never
 #     opens a quote and is plain content. (`-p'x'`, `-u'a:b'` and `--pass"x"`: the letters belong to a flag word, the quote opens.)
 #   * outside quotes, a `#` that STARTS a word (the start of the text, or right after a blank, a newline, `;`, `&`, `|` or `(`, unless that
-#     character is backslash-escaped) begins a COMMENT that runs to the end of its line. A quote inside a comment is a CONTENT mark: it opens and
-#     closes nothing, so a stray apostrophe there (`# '`, `# don't`) changes no later quote; a value that starts at such a quote is read to its
-#     next plain quote of its kind (or the line end), so a comment hides no secret. `a#b`, `$#`, `\#` and a `#` inside an open quote are not
-#     comments. "Outside quotes" is the lexer's own view: no quote is open on its stack at that point (an unclosed quote still counts as open).
+#     character is backslash-escaped) begins a COMMENT that runs to the end of its line. A comment is text, but the VALUE of a sensitive name is
+#     a value wherever it sits. A quote in comment PROSE is a CONTENT mark: it opens and closes nothing, so a stray apostrophe such as `# '` or
+#     `# don't` changes no later quote. The VALUE SPAN of a sensitive name in a comment is read as it is outside one: it starts where `NAME=`,
+#     `NAME:` (strict names), `"NAME": ` or `--NAME ` (strict) names a sensitive name (the detectors' own test; a `//` after `NAME:` is a URL
+#     scheme), and it is a shell WORD: its marks are read by the rules above, so joined segments (`"a"'b'"c"`) and multi-line quotes are one
+#     value, until a blank outside quotes ends the word (a blank that a backslash escapes does not), or a `;` or `&` outside quotes when the
+#     value is a `NAME=`, `NAME:` or pair value (a flag value reads through them, as `_FLAG_BARE_RE` does), or the line ends. Two readings
+#     of one word (`--password :;` is a flag and also `password :`) make one value, the longer. A quote that nothing closes runs to the end
+#     of its line. `a#b`, `$#`, `\#` and a `#` inside an open quote are not comments. "Outside quotes" is the lexer's own view: no quote is
+#     open on its stack at that point (an unclosed quote still counts as open).
 #   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
 #     detectors mask from the value start to the end of that line, never a part of it.
 #   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
@@ -216,6 +222,20 @@ def _prose_quote(s: str, p: int) -> bool:
     return not (i > 0 and s[i - 1] == _PROSE_FLAG)
 
 
+def _mate(s: str, p: int, stop: int) -> int:
+    """The next PLAIN quote of s[p]'s kind before `stop` (the end of its comment line), or -1: the mate that closes a prose quote's segment."""
+    c = s[p]
+    q = s.find(c, p + 1, stop)
+    while q >= 0:
+        r = q
+        while r > 0 and s[r - 1] == "\\":
+            r -= 1
+        if (q - r) % 2 == 0:
+            return q
+        q = s.find(c, q + 1, stop)
+    return -1
+
+
 def _comment_at(s: str, p: int) -> bool:
     """Whether the `#` at s[p] starts a word, so that it begins a shell comment (`echo x #note`, `#` at the start of a line); not for `a#b`."""
     if p == 0:
@@ -226,6 +246,47 @@ def _comment_at(s: str, p: int) -> bool:
     while r > 0 and s[r - 1] == "\\":
         r -= 1
     return (p - 1 - r) % 2 == 0
+
+
+_WORD_BREAK_RE = re.compile(r"[ \t;&]")
+_BLANK_RE = re.compile(r"[ \t]")
+
+
+def _value_starts(line: str) -> list[tuple[int, bool]]:
+    """(offset, ends at `;`/`&` too) for every value of a SENSITIVE name in `line` (one comment, from its `#`), ascending. The offset is the end
+    of `NAME<sep>` (`=` is tested loosely, `:` strictly, as in `_scan`; a `//` after `NAME:` is a URL scheme, not a value), of a
+    `"NAME": ` / `\\"NAME\\": ` pair (as in `_pair_spans`), or of `--flag<blank>` (strict). A NAME or pair value stops at `;` and `&` too
+    (`_NAME_BARE_RE`); a flag value does not (`_FLAG_BARE_RE`)."""
+    out: list[tuple[int, bool]] = []
+    for m in _NAME_SEP_RE.finditer(line):
+        eq = "=" in m.group(2)
+        if not eq and line.startswith("//", m.end()):
+            continue
+        if _name_hit(m.group(1), eq):
+            out.append((m.end(), True))
+    for m in _FLAG_SEP_RE.finditer(line):
+        if _name_hit(m.group(1), False):
+            out.append((m.end(), False))
+    for m in _PAIR_RE.finditer(line):
+        if is_sensitive_key(m.group("name")):
+            out.append((m.end(), True))
+    for m in _ESC_PAIR_RE.finditer(line):
+        if len(m.group("bs")) % 2 == 1 and is_sensitive_key(m.group("name")):
+            out.append((m.end(), True))
+    out.sort()
+    return out
+
+
+def _word_break(s: str, a: int, b: int, joiners: bool) -> bool:
+    """Whether s[a:b], outside quotes, ends a value word: a blank that no backslash escapes, or (`joiners`) a `;` or `&`."""
+    pat = _WORD_BREAK_RE if joiners else _BLANK_RE
+    k = a
+    while (m := pat.search(s, k, b)) is not None:
+        k = m.start()
+        if s[k] in ";&" or k == 0 or s[k - 1] != "\\":
+            return True
+        k += 1
+    return False
 
 
 class _Lexer:
@@ -245,12 +306,20 @@ class _Lexer:
         cnt: dict[int, int] = {}
         i = 0
         skip_to = -1
+        starts: list[tuple[int, bool]] = []  # the value spans of the comment in progress: where each starts and whether it also ends at `;`/`&`, ascending
+        si = 0
+        vact = False  # a value word of that comment is open ...
+        vgap = 0  # ... and the text from here to the next quote is not yet checked for its end
+        vjoin = True  # whether that word ends at a `;` or `&` as well as at a blank
+        vseg = -1  # the mate of a prose quote that opened a quoted segment of that word: the blanks up to it are inside the quotes
         for mm in _LEX_RE.finditer(s):
             p = mm.start()
             if s[p] == "#":  # a `#` inside a comment, or inside a quote, is plain text
                 if p >= skip_to and not stack and _comment_at(s, p):
                     eol = _EOL_RE.search(s, p)
                     skip_to = eol.start() if eol else len(s)
+                    starts = [(p + k, j) for k, j in _value_starts(s[p:skip_to])]
+                    si, vact = 0, False
                 continue
             r = p
             while r and s[r - 1] == "\\":
@@ -263,9 +332,29 @@ class _Lexer:
             role_add(_CONTENT)
             link_add(-1)
             how_add(_UNCLOSED)
-            if p < skip_to:  # a quote in a comment: a CONTENT mark, it opens and closes nothing (a value there still finds its end)
-                i += 1
-                continue
+            in_comment = p < skip_to
+            if in_comment:  # a quote in a comment is prose unless it lies in the value span of a sensitive name (the rules above)
+                while si < len(starts) and starts[si][0] <= p:
+                    st, joins = starts[si]
+                    if not stack:
+                        if vact and _word_break(s, vgap, st, vjoin):
+                            vact = False
+                        if vact:  # a second reading of the same word (`--password :;` is also `password :`): the detectors take the union, the longer word
+                            vjoin = vjoin and joins
+                        else:
+                            vact, vgap, vjoin = True, st, joins
+                    si += 1
+                if vact and not stack and _word_break(s, vgap, p, vjoin):
+                    vact = False
+                if not vact:  # comment prose: a CONTENT mark, it opens and closes nothing
+                    i += 1
+                    continue
+                if not stack and level == 0 and p > vseg and _prose_quote(s, p):
+                    # `ab'c d'ef` in a comment: the prose quote opens a quoted segment that its mate on the line closes; the blanks in between are
+                    # inside the quotes, so the word goes on past them (the reader's rule for the same word outside a comment)
+                    mate = _mate(s, p, skip_to)
+                    if mate >= 0:
+                        vseg = vgap = mate
             if level == 0:  # a plain quote ends the escaped quotes of its kind on top of the stack
                 while kstack:
                     k = kstack[-1]
@@ -294,6 +383,8 @@ class _Lexer:
                 stack.append(i)
                 kstack.append(key)
                 cnt[key] = cnt.get(key, 0) + 1
+            if in_comment:
+                vgap = max(vgap, p + 1)
             i += 1
         self.pos, self.lvl, self.role, self.link, self.how = pos, lvl, role, link, how
         self._top = self._par = self._lost = self.nx0 = self.nxl = None
@@ -493,14 +584,26 @@ class _Reader:
                     else:
                         end, close = self.quoted(end, *op)
                         nxt = -1
-                else:  # a quote that is prose (`it's`): part of the word
-                    end, close, nxt = qpos + 1, 0, -1
+                else:  # a quote that is prose (`it's`): part of the word, unless its mate on the line closes a quoted segment (`x'a b'`)
+                    end, close = self.prose_end(qpos) if op[2] == 0 else (qpos + 1, 0)
+                    nxt = -1
                 quoted = True
             elif quoted and c not in _GLUE_STOPS and (m := bare_re.match(s, end)):
                 end, quoted, nxt = m.end(), False, -1
             else:
                 break
         return end, close
+
+    def prose_end(self, qpos: int) -> tuple[int, int]:
+        """`(end, closing quote length)` of a PLAIN quote the lexer takes for prose (`x'a b'`, `ab'c d'ef`): it opens a quoted segment when its mate,
+        the next plain quote of its kind, lies on the same line, and the blanks between them are inside the quotes; else it is part of the word,
+        `(qpos + 1, 0)`. Outside a comment this and `_mate` (the same rule in a comment's value) read a word the same way."""
+        lex = self.lex
+        m = lex.index(qpos)
+        t = lex.next_marks(self.s)[0][m] if m >= 0 else -1
+        if t >= 0 and lex.pos[t] < self.line_end(qpos):
+            return lex.pos[t] + 1, 1
+        return qpos + 1, 0
 
     def closes(self, i: int, oplen: int, run: int) -> bool:
         """Whether the quote of the opener at s[i] CLOSES a quote that opened earlier on the same line (`"mysql -p" ok`: a prose quote, not the
@@ -637,7 +740,9 @@ _CLI_TWO_WORD = {**dict.fromkeys(("docker", "podman", "buildah", "skopeo", "cran
 _CLI_FLAG_KINDS = {"p": _CLI_MYSQL | _CLI_LOGIN, "a": _CLI_REDIS, "P": _CLI_SQLCMD, "N": _CLI_KEYGEN}
 # after a quoted segment a bare character continues the word unless it is a closer of prose or Markdown or one of the joiners (`/`, `?`, `&`, `|`)
 # that end a value in URLs, option lists and pipelines (`password='x'?id=1`)
-_GLUE_STOPS = _CLI_CLOSERS | frozenset("/?&|")
+# A value glued to a quoted segment ends at a separator or a closing mark. `_`, `.` and `:` are word characters to the shell
+# (`"a"_SECRET` is one word), so they continue the value; `,` and `;` separate options.
+_GLUE_STOPS = frozenset("`\"')]}>*,;/?&|")
 _CLI_COMMAND_HINTS = ("mysql", "mariadb", "sshpass", "login", "mongo", "redis-cli", "sqlcmd", "bcp", "ssh-keygen")
 
 
