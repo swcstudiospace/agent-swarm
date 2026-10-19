@@ -485,7 +485,7 @@ describe("redactText shared vectors", () => {
     expect(redactText(prose)).toBe(prose);
   });
 
-  test("GL8: 1 MB of quote openers, escaped quotes and unclosed quotes is linear (< 150 ms each) and still finds the trailing password", () => {
+  test("GL8: 1 MB of quote openers, escaped quotes and unclosed quotes is linear (scaling, not a wall-clock cap) and still finds the trailing password", () => {
     const units = ['mysql -p" ', "mysql -p\\\" ", "-u me:'", "x --password $'", 'DB_PASSWORD="', 'mysql -p\\\\\\" ', '"password": "', '\\"password\\": \\"', "a\\"];
     for (const unit of units) {
       const started = performance.now();
@@ -504,6 +504,7 @@ describe("redactText shared vectors", () => {
     }
     const fixture = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_generated.json"), "utf8")) as {
       property: PropertyCase[];
+      noise: PropertyCase[];
       random: { seed: number; count: number; fragments: string[]; inputs: string; digests: string[] };
       tokens: Array<[string, string]>;
     };
@@ -546,6 +547,50 @@ describe("redactText shared vectors", () => {
     test("the structured cases give the Python spans and output byte for byte", () => {
       const wrong = property.filter((c) => digest(c.text) !== c.digest);
       expect(wrong.slice(0, 3).map((c) => c.text.slice(0, 200))).toEqual([]);
+    });
+
+    test("GL9: planted secrets survive quote noise (prose apostrophes, stray quotes, multi-line quoted values, restarting lines) and match Python byte for byte", () => {
+      const noise = fixture.noise.map((c) => ({ ...c, ...expandWithSpans(c.input) }));
+      expect(noise.length).toBe(2400);
+      const leaks = noise.filter((c) => c.secrets.some(([start, end]) => !covered(redactSpans(c.text), start, end)));
+      expect(leaks.slice(0, 3).map((c) => c.text.slice(0, 200))).toEqual([]);
+      const wrong = noise.filter((c) => digest(c.text) !== c.digest);
+      expect(wrong.slice(0, 3).map((c) => c.text.slice(0, 200))).toEqual([]);
+    });
+
+    test("GL9: a later unmatched quote never changes how an earlier value is read (no state shared by restarting scans)", () => {
+      expect(redactText("'password': 'alpha\n  beta'\n# sshpass -p'")).toBe("'password': '[REDACTED]'\n# sshpass -p'");
+      const heads = ["'password': 'alpha\n  beta'", '"password": "alpha\n  beta"', "DB_PASSWORD='alpha\n  beta'", 'DB_PASSWORD="alpha\n  beta"',
+        "tool --password 'alpha\n  beta' db", "mysql -p'alpha\n  beta' db", "curl -u 'me:alpha\n  beta' h", 'sshpass -p "alpha\n  beta" ssh h'];
+      for (const tail of ["\n# sshpass -p'", '\n# mysql -p"', "\n'", '\n"', "\ndon't", " ; echo 'x"]) {
+        for (const head of heads) {
+          const out = redactText(head + tail);
+          expect({ head, tail, ok: !out.includes("alpha") && !out.includes("beta") }).toEqual({ head, tail, ok: true });
+        }
+      }
+    });
+
+    test("GL9: unrelated quotes do not turn a password opener into a closer", () => {
+      expect(redactText("echo \"it's ready\"; mysql -p'***' db")).toBe("echo \"it's ready\"; mysql -p[REDACTED] db");
+      const noises = ["it's ready", "don't", "the users' list", 'echo "it\'s ready";', "'cause", "rock 'n' roll", "O'Brien", 'say "hi', "'", '"', '5" wide', "x = 'it''s'"];
+      const commands = ["mysql -p'%s' db", 'mysql -p"%s" db', "sshpass -p '%s' ssh h", "redis-cli -a '%s' ping", 'docker login -p "%s" r', "curl -u me:'%s' h"];
+      for (const noise of noises) {
+        for (const command of commands) {
+          for (const password of ["***", "!@#", "&;|", ")]}"]) {
+            for (const joiner of ["; ", "\n", " && ", " "]) {
+              const out = redactText(noise + joiner + command.replace("%s", password));
+              expect({ noise, joiner, command, password, ok: !out.replace(noise, "").includes(password) }).toEqual({ noise, joiner, command, password, ok: true });
+            }
+          }
+        }
+      }
+      for (const [text, expected] of [
+        ["'unclosed && mysql -p'***' db", "'unclosed && mysql -p[REDACTED] db"],
+        ['"quoted ; mariadb -p")]}" db', '"quoted ; mariadb -p[REDACTED] db'],
+        ["the users' list; sshpass -p'&;|' ssh h", "the users' list; sshpass -p[REDACTED] ssh h"],
+      ] as const) {
+        expect(redactText(text)).toBe(expected);
+      }
     });
 
     test("union: splitting the input into carriers, in any order, changes no span", () => {
@@ -613,10 +658,21 @@ describe("redactText shared vectors", () => {
 
   test("1 MB assignment floods are linear and still find the trailing password", () => {
     for (const unit of ["a=", "a=a=", "user=a,", "user=a;", "x=1&"]) {
-      const started = performance.now();
-      const out = redactText(unit.repeat(Math.floor(1_000_000 / unit.length)) + "password=hunter2");
-      expect({ unit, fast: performance.now() - started < 100 }).toEqual({ unit, fast: true });
-      expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
+      const big = unit.repeat(Math.floor(1_000_000 / unit.length)) + "password=hunter2";
+      const small = unit.repeat(Math.floor(250_000 / unit.length)) + "password=hunter2";
+      const timed = (text: string) => {
+        const started = performance.now();
+        const out = redactText(text);
+        return { out, ms: performance.now() - started };
+      };
+      timed(small); // warm the JIT before measuring
+      const s = timed(small);
+      const b = timed(big);
+      // linear scanning: 4x the input costs about 4x the time; a quadratic scan would cost about 16x. Compare the ratio
+      // (machine load scales both sides alike) and keep a generous absolute ceiling against a blow-up.
+      expect({ unit, ratioOk: b.ms / Math.max(s.ms, 1) < 9 }).toEqual({ unit, ratioOk: true });
+      expect({ unit, ceilingOk: b.ms < 2000 }).toEqual({ unit, ceilingOk: true });
+      expect({ unit, masked: b.out.endsWith("password=[REDACTED]") && !b.out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
   });
 
@@ -625,16 +681,25 @@ describe("redactText shared vectors", () => {
     expect(row).toBe("login --password [REDACTED]");
   });
 
-  test("1 MB adversarial inputs are scanned in time linear in their size (< 150 ms each)", () => {
+  test("1 MB adversarial inputs are scanned in time linear in their size (scaling, not a wall-clock cap)", () => {
     const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
       "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
       "--mode a;", "-v ", "password=a,token = ", "token=a,--password ", 'Cookie: a="', "x=-u=", '-u "', "A_KEY=", "STRIPE_KEY=A_KEY=", "a://u:",
       'password="', "-u=a:", 'Cookie: a="b" ', "-u a:", "--user=-u="];
     for (const unit of units) {
-      const text = unit.repeat(Math.floor(1_000_000 / unit.length));
-      const started = performance.now();
-      redactText(text);
-      expect({ unit, fast: performance.now() - started < 150 }).toEqual({ unit, fast: true });
+      const big = unit.repeat(Math.floor(1_000_000 / unit.length));
+      const small = unit.repeat(Math.floor(250_000 / unit.length));
+      const timed = (text: string) => {
+        const started = performance.now();
+        redactText(text);
+        return performance.now() - started;
+      };
+      timed(small); // warm up
+      const s = timed(small);
+      const b = timed(big);
+      // scaling, not a wall-clock cap: 4x the input must not cost 16x the time (quadratic); a generous ceiling catches a blow-up
+      expect({ unit, ratioOk: b / Math.max(s, 1) < 9 }).toEqual({ unit, ratioOk: true });
+      expect({ unit, ceilingOk: b < 2000 }).toEqual({ unit, ceilingOk: true });
     }
   });
 

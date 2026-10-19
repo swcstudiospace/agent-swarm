@@ -34,14 +34,19 @@ block scalars (`password: |`). Identifier fields are never free text and are not
 Every option form (`NAME=`, `NAME:`, `--flag value`, `-pVALUE`, `-p VALUE`, `-u user:pass`, `"name": "value"` ...) reads its value through ONE
 quote-aware reader (`_Reader`): bare (a backslash keeps a blank), `'..'`, `".."`, ANSI-C `$'..'`, locale `$".."`, the escaped form a double quote
 takes inside saved JSON evidence (`\\".."`, and `\\\\\\"..` when it was serialised twice), with blanks, tabs, newlines, `;&|`, unicode and escaped
-quotes of its own kind inside; a quote that never closes runs to the end of its line. A quoted value is always a value, even when it holds only
-blanks or punctuation. The one quote that is NOT a value is a lone quote that closes an earlier quote of the same kind on its line
-(`"mysql -p" ok`: a flag in a sentence), so `ssh h 'mysql -p' secret'` (a same-kind wrapper) is read as prose and left alone.
+quotes of its own kind inside. The quote context is computed once per string by ONE left-to-right lexer (`_Lexer`: a stack of open quotes,
+backslash escapes, nested quotes of the other kind, prose apostrophes such as `it's` never open a quote; rules in the comment above it) and every
+detector queries it; nothing is counted locally and no cache is shared between scans, so a later unmatched quote never changes how an earlier
+value is read. A quoted value may span lines; a quote that never closes runs to the end of its line. A quoted value is always a value, even
+when it holds only blanks or punctuation. The one quote that is NOT a value is a lone quote that the lexer pairs with an earlier quote of
+the same kind on its line (`"mysql -p" ok`: a flag in a sentence).
 """
 from __future__ import annotations
 
 import functools
 import re
+from array import array
+from bisect import bisect_left, bisect_right
 
 REDACTED = "[REDACTED]"
 
@@ -146,12 +151,10 @@ _BASIC_RE = re.compile(r"(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=]
                        re.IGNORECASE | re.ASCII)
 # Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header (`Authorization: Token x`, `Cookie: sid=x; theme=dark`): the rest of
 # the line is the credential (Bearer/Basic keep their scheme visible, see above). The regex matches the lead only; `_header_end`
-# scans the value to its TRUE end (line end, or an enclosing quote that does not open a quoted cookie value): never a length cap,
+# asks the lexer for the TRUE end of the value (line end, or the quote that encloses the header): never a length cap,
 # a cap would leave the tail of a long session token readable.
 _HEADER_RE = re.compile(r"(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]*:(?![ \t]*(?:Bearer|Basic)\b)[ \t]*)(?=[^\s\"'])",
                         re.IGNORECASE | re.ASCII)
-_HEADER_STOP_RE = re.compile(r"[\r\n\"']")
-_HEADER_CLOSE_RES = {'"': re.compile(r"[\r\n\"]"), "'": re.compile(r"[\r\n']")}
 # scheme://user:password@host: the user cannot contain ':' (so the split is unambiguous), the password runs to the LAST
 # '@' before the first '/' or whitespace (`postgres://u:p@ss@host/db`). Neither part is length-capped: a scan stops at the next
 # '/' (every `://` ends the previous scan), so the scans of different schemes never overlap.
@@ -171,27 +174,187 @@ _FLAG_BARE_RE = re.compile(r"""(?:[^\s"'\\]|\\[ \t]|\\(?!"))+""", re.ASCII)
 # like NAME=value: the regex matches `--flag<ws>` only, a benign flag never hides a later one (`--mode a;--password x`).
 _FLAG_SEP_RE = re.compile(r"(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9_-]{0,63})([ \t]{1,8})(?![-\s])", re.ASCII)
 _EOL_RE = re.compile(r"[\r\n]")
-_QUOTE_CHAR_RE = re.compile(r"""["'\r\n]""")
+
+
+# ---- the quote lexer ---------------------------------------------------------------------------------------------------------
+# The quote/escape context of a string is computed ONCE, by ONE left-to-right lexer (`_Lexer`, twin of `Lexer` in omp/src/swarm_bar.ts), and
+# every detector QUERIES it: whether a quote OPENS, CLOSES or is plain CONTENT, and where a quoted value ends, is never re-derived locally
+# (no counting of same-kind quotes on a line, no cache shared by scans that restart at earlier positions): every answer is a pure function of
+# (text, position). Rules, identical in both implementations:
+#   * a MARK is a `"` or `'` with the backslashes before it: an odd run of `k` backslashes makes an ESCAPED mark of level `k` (the form a quote
+#     takes inside saved JSON: `\"` level 1, `\\\"` level 3), any other run (none, or an even one) a PLAIN mark (level 0).
+#   * the lexer keeps a stack of open quotes. A mark of the same kind and level as an open quote CLOSES it (and ends every quote that was opened
+#     after it and never closed: a quote nested in a quote ends before the close of the quote that holds it). A PLAIN mark also ends the
+#     escaped quotes of its own kind that are open on top of the stack (`\"x"`: the plain quote is the one that closes the JSON string).
+#   * any other mark OPENS a quote, nested in the open ones (`"mysql -p'x' db"`, `'a "b c"'`, `"{\"k\": 1}"`), except a PROSE apostrophe or
+#     quote: a plain `'` or `"` right after a letter or digit that is not the `-p` of a flag word (`it's`, `don't`, `users'`, `5"`) never
+#     opens a quote and is plain content. (`-p'x'`, `-u'a:b'` and `--pass"x"`: the letters belong to a flag word, the quote opens.)
+#   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
+#     detectors mask from the value start to the end of that line, never a part of it.
+#   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
+#     for a CLOSE or for prose is read like an opener of its own kind that nothing in the lexer's view contradicts (the next quote of its
+#     kind, else the end of the line): over-redacting, never leaving a suffix of the value readable.
+_MARK_RE = re.compile("[\"']")
+_PROSE_FLAG = "-"
+_CONTENT, _OPEN, _CLOSE = 0, 1, 2
+_UNCLOSED, _CLOSED, _CUT = 0, 1, 2
+
+
+def _prose_quote(s: str, p: int) -> bool:
+    """Whether the plain quote at s[p] sits right after a letter or digit that is not part of a flag word (`it's`, `users'`, not `-p'x'`)."""
+    if p == 0 or s[p - 1] not in _ALNUM:
+        return False
+    i = p - 1
+    while i > 0 and s[i - 1] in _ALNUM:
+        i -= 1
+    return not (i > 0 and s[i - 1] == _PROSE_FLAG)
+
+
+class _Lexer:
+    """Every quote mark of one string with its role: parallel arrays indexed by the mark's number (ascending position). `role` is content,
+    open or close; an OPEN mark has `how` (unclosed, closed, or ended by an enclosing close) and `link` (the mark that ended it; an unclosed
+    quote that an escaped-quote rule dropped from the stack keeps `how` unclosed but names the mark that dropped it); a CLOSE mark's `link` is
+    the mark it closes. `top[m]` (the innermost quote open after mark m, -1 for none), `par[m]` (the quote an OPEN mark is nested in) and
+    `lost` (the ascending numbers of the quotes that nothing closes) are derived from those on first use."""
+    __slots__ = ("pos", "lvl", "role", "link", "how", "_top", "_par", "_lost", "nx0", "nxl")
+
+    def __init__(self, s: str) -> None:
+        pos, lvl, link = array("i"), array("i"), array("i")
+        role, how = bytearray(), bytearray()
+        pos_add, lvl_add, link_add, role_add, how_add = pos.append, lvl.append, link.append, role.append, how.append
+        stack: list[int] = []  # the marks of the open quotes ...
+        kstack: list[int] = []  # ... and their keys (`level << 1 | is_apostrophe`)
+        cnt: dict[int, int] = {}
+        i = 0
+        for mm in _MARK_RE.finditer(s):
+            p = mm.start()
+            r = p
+            while r and s[r - 1] == "\\":
+                r -= 1
+            q1 = s[p] == "'"
+            level = (p - r) if (p - r) & 1 else 0
+            key = (level << 1) | q1
+            pos_add(p)
+            lvl_add(level)
+            role_add(_CONTENT)
+            link_add(-1)
+            how_add(_UNCLOSED)
+            if level == 0:  # a plain quote ends the escaped quotes of its kind on top of the stack
+                while kstack:
+                    k = kstack[-1]
+                    if k < 2 or (k & 1) != q1:
+                        break
+                    kstack.pop()
+                    o = stack.pop()
+                    cnt[k] -= 1
+                    link[o] = i
+                    if cnt.get(key):  # the plain quote closes a quote that holds the escaped one (`"mysql -p\\"x"`); with none it ends nothing
+                        how[o] = _CUT
+            if cnt.get(key):
+                while True:
+                    k = kstack.pop()
+                    o = stack.pop()
+                    cnt[k] -= 1
+                    link[o] = i
+                    if k == key:
+                        how[o] = _CLOSED
+                        role[i] = _CLOSE
+                        link[i] = o
+                        break
+                    how[o] = _CUT
+            elif level or not _prose_quote(s, p):
+                role[i] = _OPEN
+                stack.append(i)
+                kstack.append(key)
+                cnt[key] = cnt.get(key, 0) + 1
+            i += 1
+        self.pos, self.lvl, self.role, self.link, self.how = pos, lvl, role, link, how
+        self._top = self._par = self._lost = self.nx0 = self.nxl = None
+
+    def _derive(self) -> None:
+        """`top` and `par` for every mark (one pass over the roles and links)."""
+        n = len(self.pos)
+        top, par = array("i", [-1]) * n, array("i", [-1]) * n
+        role, link = self.role, self.link
+        stack: list[int] = []
+        for i in range(n):
+            while stack and link[stack[-1]] == i:  # the quotes that end at mark i
+                stack.pop()
+            if role[i] == _OPEN:
+                if stack:
+                    par[i] = stack[-1]
+                stack.append(i)
+            top[i] = stack[-1] if stack else -1
+        self._top, self._par = top, par
+
+    @property
+    def top(self) -> array:
+        if self._top is None:
+            self._derive()
+        return self._top
+
+    @property
+    def par(self) -> array:
+        if self._par is None:
+            self._derive()
+        return self._par
+
+    @property
+    def lost(self) -> list[int]:
+        if self._lost is None:
+            role, how = self.role, self.how
+            self._lost = [i for i in range(len(role)) if role[i] == _OPEN and how[i] == _UNCLOSED]
+        return self._lost
+
+    def index(self, p: int) -> int:
+        """The number of the mark at s[p], or -1."""
+        i = bisect_left(self.pos, p)
+        return i if i < len(self.pos) and self.pos[i] == p else -1
+
+    def next_marks(self, s: str) -> tuple[array, array]:
+        """For every mark the next PLAIN mark of its kind, and the next mark of its kind and level (built on first use)."""
+        if self.nx0 is None:
+            n = len(self.pos)
+            nx0, nxl = array("i", [-1]) * n, array("i", [-1]) * n
+            last0 = [-1, -1]
+            lastk: dict[int, int] = {}
+            pos, lvl = self.pos, self.lvl
+            for i in range(n - 1, -1, -1):
+                k = (lvl[i] << 1) | (1 if s[pos[i]] == "'" else 0)
+                nx0[i] = last0[k & 1]
+                nxl[i] = lastk.get(k, -1)
+                if k < 2:
+                    last0[k & 1] = i
+                else:
+                    lastk[k] = i
+            self.nx0, self.nxl = nx0, nxl
+        return self.nx0, self.nxl
 
 
 class _Reader:
     """The ONE reader of a value that follows a secret-taking name or option. It starts where the value starts and understands every way a
     shell, a JSON string or a log line quotes it: bare (a backslash keeps a blank, `pa\\ ss`), `'..'`, `".."`, ANSI-C `$'..'`, locale `$".."`,
     and the ESCAPED form a quote takes inside saved JSON evidence (`\\".."`, `\\\\\\"..\\\\\\"` when the JSON was serialised twice). A quoted value
-    runs through its closing quote honouring backslash escapes (a quote preceded by an odd run of backslashes is content, as is a blank, a tab,
-    a newline, `;&|`, `#`, unicode ...); an escaped-form value closes at a quote preceded by exactly the opening run and ends before a quote
-    that is not preceded by an odd run (the closing quote of the JSON string that holds it). A quote that never closes runs to the end of its
-    line (a truncated log line). A quoted value always is a value, even when it holds only blanks or punctuation.
-    One instance reads one string; scans only move forward: a quote that has no close fails for every later quote of its kind (remembered in
-    `failed`), the end of a line is remembered, and the quote counts of `odd` are advanced, never recounted."""
-    __slots__ = ("s", "failed", "eol_from", "eol_to", "seen", "counts")
+    is whatever the lexer (above) says it is: it runs through its closing quote honouring backslash escapes (a quote preceded by an odd run
+    of backslashes is content, as is a blank, a tab, a newline, `;&|`, `#`, unicode ...), across lines; an escaped-form value closes at a
+    quote preceded by exactly the opening run and ends before a plain quote (the closing quote of the JSON string that holds it); a quote
+    nested in another ends before the quote that closes the outer one; a quote that never closes runs to the end of its line. A quoted value
+    always is a value, even when it holds only blanks or punctuation. One instance reads one string and keeps no state that depends on the
+    order of the questions: the lexer is immutable once built (lazily, on the first question), the end of a line is a pure memo."""
+    __slots__ = ("s", "_lex", "eol_from", "eol_to", "_eols")
 
     def __init__(self, s: str) -> None:
         self.s = s
-        self.failed: set[tuple[str, int]] = set()
+        self._lex: _Lexer | None = None
         self.eol_from, self.eol_to = 1, 0
-        self.seen = 0
-        self.counts: dict[tuple[str, int], int] = {}
+        self._eols: list[int] | None = None
+
+    @property
+    def lex(self) -> _Lexer:
+        lex = self._lex
+        if lex is None:
+            lex = self._lex = _Lexer(self.s)
+        return lex
 
     def opener(self, i: int) -> tuple[str, int, int] | None:
         """`(quote, length of the opener, backslashes before the quote)` when a quote opens at s[i] (`"`, `'`, `$'`, `$"`, `\\"`, `$\\"` ...), else None."""
@@ -224,57 +387,125 @@ class _Reader:
 
     def quoted(self, i: int, q: str, oplen: int, run: int) -> tuple[int, int]:
         """`(end, length of the closing quote)` of the quoted value that opens at s[i]; the closing length is 0 for a value that ends at the end of
-        its line or before the quote of an enclosing string."""
-        s = self.s
-        key = (q, run)
-        if key not in self.failed:
-            k = i + oplen
-            find = s.find
-            while (j := find(q, k)) >= 0:
-                r = j
-                while r > k and s[r - 1] == "\\":
-                    r -= 1
-                n = j - r
-                if run:
-                    if n == run:
-                        return j + 1, run + 1
-                    if n % 2 == 0:
-                        return j, 0
-                elif n % 2 == 0:
-                    return j + 1, 1
-                k = j + 1
-            self.failed.add(key)
+        its line or before the quote that closes an enclosing one."""
+        lex = self.lex
+        m = lex.index(i + oplen - 1)
+        if m < 0:
+            return self.line_end(i), 0
+        if lex.role[m] == _OPEN and lex.lvl[m] == run:
+            how = lex.how[m]
+            if how == _UNCLOSED:
+                return self.line_end(i), 0
+            t = lex.link[m]
+            if how == _CLOSED:
+                return lex.pos[t] + 1, run + 1 if run else 1
+            end = lex.pos[t] - lex.lvl[t]
+            # an escaped quote ends before the plain quote that closes the JSON string holding it (`"mysql -p\\"x"`); any other quote that was
+            # cut by an enclosing one is ambiguous (`OPTS='sshpass -p "x'y' z'`): its value runs at least to the end of its line
+            return (end if run and self.s[lex.pos[t]] == q else max(end, self.line_end(i))), 0
+        # the lexer takes this quote for a closer or for prose: read it as an opener of its own kind (the next quote that ends it)
+        nx0, nxl = lex.next_marks(self.s)
+        t0 = nx0[m]
+        t1 = nxl[m] if run and lex.lvl[m] == run else -1
+        if t1 >= 0 and (t0 < 0 or t1 < t0):
+            return lex.pos[t1] + 1, run + 1
+        if t0 >= 0:
+            return (lex.pos[t0] + 1, 1) if not run else (lex.pos[t0], 0)
         return self.line_end(i), 0
 
     def read(self, i: int, bare_re: re.Pattern[str]) -> tuple[int, int]:
-        """`(end, closing quote length)` of the value at s[i]; `end == i` when there is none (no bare character, or a quote with nothing after it)."""
+        """`(end, closing quote length)` of the value at s[i]; `end == i` when there is none (no bare character, or a quote with nothing after it).
+        The value is a shell WORD: segments that touch the one just read belong to it (`-p'a b'c`, `-p"x"'y'`, `x=ab'c'`): a quote the lexer opens
+        (or one it takes for prose) continues it, a quote it closes ends it (the closing quote of an enclosing string), and after a quoted
+        segment a bare character continues it unless it is a closer of prose or Markdown or a joiner (`/`, `?`, `&`, `|`)."""
+        s = self.s
         op = self.opener(i)
         if op is not None:
             end, close = self.quoted(i, *op)
-            return (end, close) if close or end > i + op[1] else (i, 0)
-        m = bare_re.match(self.s, i)
-        return (m.end(), 0) if m else (i, 0)
-
-    def odd(self, q: str, run: int, upto: int) -> bool:
-        """Whether an odd number of quotes `(q, run)` (the quote with `run` backslashes before it) stand in the current line before s[upto]: such a
-        quote CLOSES what an earlier quote opened (`"mysql -p" ok`: a prose quote, not the opener of a password). `upto` only grows."""
-        counts = self.counts
-        if upto > self.seen:
-            s, seen = self.s, self.seen
-            for m in _QUOTE_CHAR_RE.finditer(s, seen, upto):
-                j = m.start()
-                c = s[j]
-                if c == "\n" or c == "\r":
-                    counts.clear()
+            if not (close or end > i + op[1]):
+                return i, 0
+        else:
+            m = bare_re.match(s, i)
+            if not m:
+                return i, 0
+            end, close = m.end(), 0
+        quoted = close > 0
+        n = len(s)
+        lex = None
+        nxt = -1  # the number of the mark that follows the last segment, when that segment was a closed quote
+        while end < n:
+            if nxt >= 0:  # the next quote starts exactly here and the lexer closes it: one step, no re-reading (`\\"a\\"\\"b\\"...`)
+                lex = self.lex
+                if nxt < len(lex.pos) and lex.pos[nxt] - lex.lvl[nxt] == end and lex.role[nxt] == _OPEN and lex.how[nxt] == _CLOSED:
+                    t = lex.link[nxt]
+                    end, close, nxt = lex.pos[t] + 1, (lex.lvl[nxt] + 1 if lex.lvl[nxt] else 1), t + 1
                     continue
-                r = j
-                while r > seen and s[r - 1] == "\\":
-                    r -= 1
-                key = (c, j - r)
-                counts[key] = counts.get(key, 0) + 1
-            self.seen = upto
-        return counts.get((q, run), 0) % 2 == 1
+            c = s[end]
+            if c == '"' or c == "'" or c == "\\" or c == "$":
+                op = self.opener(end)
+                if op is None:
+                    m = bare_re.match(s, end)
+                    if not m:
+                        break
+                    end, quoted, nxt = m.end(), False, -1
+                    continue
+                if lex is None:
+                    lex = self.lex
+                qpos = end + op[1] - 1
+                k = nxt if 0 <= nxt < len(lex.pos) and lex.pos[nxt] == qpos else lex.index(qpos)
+                role = lex.role[k] if k >= 0 else _CONTENT
+                if role == _CLOSE:
+                    break
+                if role == _OPEN and lex.lvl[k] == op[2]:
+                    if lex.how[k] == _CLOSED:
+                        t = lex.link[k]
+                        end, close, nxt = lex.pos[t] + 1, op[2] + 1 if op[2] else 1, t + 1
+                    else:
+                        end, close = self.quoted(end, *op)
+                        nxt = -1
+                else:  # a quote that is prose (`it's`): part of the word
+                    end, close, nxt = qpos + 1, 0, -1
+                quoted = True
+            elif quoted and c not in _GLUE_STOPS and (m := bare_re.match(s, end)):
+                end, quoted, nxt = m.end(), False, -1
+            else:
+                break
+        return end, close
 
+    def closes(self, i: int, oplen: int, run: int) -> bool:
+        """Whether the quote of the opener at s[i] CLOSES a quote that opened earlier on the same line (`"mysql -p" ok`: a prose quote, not the
+        opener of a password). Two things make that reading unsafe, and the quote is then taken for an opener (over-redacting): the lexer pairs
+        it with a quote on an earlier line, or a quote that nothing closes follows it on its line (`'x && mysql -p'***' db`: the quoting of the
+        line is unbalanced, so the pairing may be an accident of a stray quote)."""
+        lex = self.lex
+        m = lex.index(i + oplen - 1)
+        if m < 0 or lex.role[m] != _CLOSE or lex.lvl[m] != run:
+            return False
+        eols = self._eols
+        if eols is None:
+            eols = self._eols = [x.start() for x in _EOL_RE.finditer(self.s)]
+        at = lex.pos[m]
+        if bisect_left(eols, lex.pos[lex.link[m]]) != bisect_left(eols, at):
+            return False
+        j = bisect_right(lex.lost, m)
+        return not (j < len(lex.lost) and lex.pos[lex.lost[j]] < self.line_end(at))
+
+    def enclosing_end(self, p: int) -> int:
+        """Where the quote that encloses s[p] ends (before its closing quote), or -1 when none does or it never closes. A closing quote right
+        after `=` is not taken for the close of the enclosing quote (`Cookie: a=1; session="x"`: it opens a cookie value): the next enclosing
+        quote out is tried (at most 4 levels, then -1: the caller reads to the end of the line)."""
+        lex, s = self.lex, self.s
+        m = bisect_left(lex.pos, p) - 1
+        o = lex.top[m] if m >= 0 else -1
+        for _ in range(4):
+            if o < 0 or lex.how[o] == _UNCLOSED:
+                return -1
+            t = lex.link[o]
+            end = lex.pos[t] - lex.lvl[t]
+            if end == 0 or s[end - 1] != "=":
+                return end
+            o = lex.par[o]
+        return -1
 
 
 # "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS).
@@ -374,12 +605,15 @@ _CLI_COMMANDS = {
     "redis-cli": _CLI_REDIS, "sqlcmd": _CLI_SQLCMD, "bcp": _CLI_SQLCMD, "ssh-keygen": _CLI_KEYGEN}
 _CLI_TWO_WORD = {**dict.fromkeys(("docker", "podman", "buildah", "skopeo", "crane", "oras", "nerdctl", "az"), 1), "helm": 2}  # 1: `login`; 2: `registry login`
 _CLI_FLAG_KINDS = {"p": _CLI_MYSQL | _CLI_LOGIN, "a": _CLI_REDIS, "P": _CLI_SQLCMD, "N": _CLI_KEYGEN}
+# after a quoted segment a bare character continues the word unless it is a closer of prose or Markdown or one of the joiners (`/`, `?`, `&`, `|`)
+# that end a value in URLs, option lists and pipelines (`password='x'?id=1`)
+_GLUE_STOPS = _CLI_CLOSERS | frozenset("/?&|")
 _CLI_COMMAND_HINTS = ("mysql", "mariadb", "sshpass", "login", "mongo", "redis-cli", "sqlcmd", "bcp", "ssh-keygen")
 
 
 def _cli_attached(rd: _Reader, at: int, end: int) -> bool:
     """Whether the flag at s[at:at + 2] (`-p`) of the word that ends at `end` carries its value attached: `-pVALUE`, `-p'VALUE'`, `-p$'VALUE'`, `-p\\"VALUE\\"`.
-    A quote that opens the value (one that does not CLOSE an earlier quote of the line: `"mysql -p" ok` and `"-p"` are prose) makes everything
+    A quote that opens the value (one that the lexer does not take for the CLOSE of an earlier quote of the line: `"mysql -p" ok` and `"-p"` are prose) makes everything
     after it the value, even when it is only punctuation or blanks (`-p" x"`, `-p\\" x\\"`); an unquoted value is one unless it is made
     only of closers (`-p`, `(-p)`, `**-p**`) that end the word."""
     v = at + 2
@@ -387,7 +621,7 @@ def _cli_attached(rd: _Reader, at: int, end: int) -> bool:
         return False
     op = rd.opener(v)
     if op is not None:
-        if not rd.odd(op[0], op[2], at):
+        if not rd.closes(v, op[1], op[2]):
             return True
         v += op[1]  # the quote CLOSES an earlier one: only what follows it can be a value (`"mysql -p" ok`, `\\"mysql -p\\" ok`)
     return any(ch not in _CLI_CLOSERS for ch in rd.s[v:end])
@@ -532,7 +766,7 @@ def _yaml_value_end(s: str, start: int, indent: int) -> int:
     return end
 
 
-def _yaml_spans(s: str, add) -> None:
+def _yaml_spans(s: str, add, rd: _Reader) -> None:
     if "\n" not in s or ":" not in s:
         return
     for rx, indent_group in ((_YAML_NAME_RE, 3), (_YAML_BLOCK_KEY_RE, 1)):
@@ -542,6 +776,8 @@ def _yaml_spans(s: str, add) -> None:
                 continue
             start = m.end()
             end = _yaml_value_end(s, start, len(m.group(indent_group)))
+            if s[start] in "\"'":
+                end = max(end, rd.quoted(start, s[start], 1, 0)[0])  # a quoted scalar runs to its closing quote, across lines
             if end > start:
                 add((start, end))
                 last = end
@@ -654,27 +890,19 @@ def _pair_spans(s: str, add, rd: _Reader) -> None:
             pos = end
 
 
-def _header_end(s: str, value_start: int) -> int:
-    """End of the header value that begins at `value_start` (the first non-blank, non-quote character): the end of the line, or an
-    enclosing quote. A quote right after `=` opens a quoted cookie value (`session="..."`) and is skipped to its closing quote; a
-    quote that never closes on the line ends the value. Each character is read once."""
-    i = value_start + 1
-    while (m := _HEADER_STOP_RE.search(s, i)) is not None:
-        j = m.start()
-        c = s[j]
-        if c == "\r" or c == "\n" or s[j - 1] != "=":
-            return j
-        close = _HEADER_CLOSE_RES[c].search(s, j + 1)
-        if close is None or s[close.start()] != c:
-            return j
-        i = close.end()
-    return len(s)
+def _header_end(rd: _Reader, value_start: int) -> int:
+    """End of the header value that begins at `value_start` (the first non-blank, non-quote character): the end of its line, or the quote
+    that closes the quote it sits in (`-H "Cookie: a=b"`), whichever comes first. A quote inside the value (`a="b c"; d=e`, a stray
+    apostrophe) is part of it: the lexer, not a local scan for the next quote, says which quote encloses the header."""
+    end = rd.line_end(value_start)
+    close = rd.enclosing_end(value_start)
+    return close if value_start < close < end else end  # a header that starts at the closing quote of an enclosing one is ambiguous: its line
 
 
-def _header_spans(s: str, add) -> None:
+def _header_spans(s: str, add, rd: _Reader) -> None:
     pos = 0
     while (m := _HEADER_RE.search(s, pos)) is not None:
-        pos = _header_end(s, m.end())
+        pos = _header_end(rd, m.end())
         add((m.end(), pos))
 
 
@@ -691,10 +919,10 @@ def _spans(s: str) -> list[tuple[int, int]]:
             add((m.end(1), m.end()))
     for m in _USERINFO_RE.finditer(s):
         add((m.end(1), m.end() - 1))  # the '@' stays
-    _header_spans(s, add)
     rd = _Reader(s)
+    _header_spans(s, add, rd)
     _cli_spans(s, add, rd)
-    _yaml_spans(s, add)
+    _yaml_spans(s, add, rd)
     _scan(s, _NAME_SEP_RE, _NAME_BARE_RE, True, add, rd)
     _scan(s, _FLAG_SEP_RE, _FLAG_BARE_RE, False, add, rd)
     for rx in (_JWT_RE, *_TOKEN_RES):
@@ -709,7 +937,7 @@ def redact_spans(s: str) -> list[tuple[int, int]]:
     overlapping or touching spans become one range."""
     if not isinstance(s, str) or len(s) < 6:
         return []
-    spans = _spans(s)
+    spans = [sp for sp in _spans(s) if sp[0] < sp[1]]  # an empty span hides nothing (the TypeScript union drops it too)
     if not spans:
         return []
     spans.sort()

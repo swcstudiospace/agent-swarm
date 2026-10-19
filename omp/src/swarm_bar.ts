@@ -150,12 +150,10 @@ const BEARER = /(?<![A-Za-z0-9])([Bb]earer[ \t\r\n\f\v]{1,16})[A-Za-z0-9._~+/=-]
 const BASIC = /(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}["']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}/gi;
 /**
  * Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header: the rest of the line is the credential (Bearer/Basic keep their scheme).
- * The regex matches the lead only; `headerEnd` scans the value to its TRUE end (line end, or an enclosing quote that does not open a quoted
- * cookie value): never a length cap, a cap would leave the tail of a long session token readable.
+ * The regex matches the lead only; `headerEnd` asks the lexer for the TRUE end of the value (line end, or the quote that encloses the header):
+ * never a length cap, a cap would leave the tail of a long session token readable.
  */
 const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]*:(?![ \t]*(?:Bearer|Basic)\b)[ \t]*)(?=[^ \t\r\n\f\v"'])/gi;
-const HEADER_STOP = /[\r\n"']/g;
-const HEADER_CLOSE: Record<string, RegExp> = { '"': /[\r\n"]/g, "'": /[\r\n']/g };
 /**
  * scheme://user:password@host: the password runs to the LAST '@' before the first '/' or whitespace. Neither part is length-capped: a scan
  * stops at the next '/' (every `://` ends the previous scan), so the scans of different schemes never overlap.
@@ -200,15 +198,196 @@ function bareEnd(s: string, i: number, kind: number): number {
   return i;
 }
 
+// ---- the quote lexer (twin of `_Lexer` in swarm/redact.py; the rules are the same, word for word) -------------------------------------
+// The quote/escape context of a string is computed ONCE, by ONE left-to-right lexer, and every detector QUERIES it: whether a quote OPENS,
+// CLOSES or is plain CONTENT, and where a quoted value ends, is never re-derived locally (no counting of same-kind quotes on a line, no cache
+// shared by scans that restart at earlier positions): every answer is a pure function of (text, position). Rules:
+//   * a MARK is a `"` or `'` with the backslashes before it: an odd run of `k` backslashes makes an ESCAPED mark of level `k` (the form a quote
+//     takes inside saved JSON: `\"` level 1, `\\\"` level 3), any other run (none, or an even one) a PLAIN mark (level 0).
+//   * the lexer keeps a stack of open quotes. A mark of the same kind and level as an open quote CLOSES it (and ends every quote that was opened
+//     after it and never closed: a quote nested in a quote ends before the close of the quote that holds it). A PLAIN mark also ends the
+//     escaped quotes of its own kind that are open on top of the stack (`\"x"`: the plain quote is the one that closes the JSON string).
+//   * any other mark OPENS a quote, nested in the open ones (`"mysql -p'x' db"`, `'a "b c"'`, `"{\"k\": 1}"`), except a PROSE apostrophe or
+//     quote: a plain `'` or `"` right after a letter or digit that is not the `-p` of a flag word (`it's`, `don't`, `users'`, `5"`) never
+//     opens a quote and is plain content. (`-p'x'`, `-u'a:b'` and `--pass"x"`: the letters belong to a flag word, the quote opens.)
+//   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
+//     detectors mask from the value start to the end of that line, never a part of it.
+//   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
+//     for a CLOSE or for prose is read like an opener of its own kind that nothing in the lexer's view contradicts (the next quote of its
+//     kind, else the end of the line): over-redacting, never leaving a suffix of the value readable.
+const ROLE_CONTENT = 0;
+const ROLE_OPEN = 1;
+const ROLE_CLOSE = 2;
+const HOW_UNCLOSED = 0;
+const HOW_CLOSED = 1;
+const HOW_CUT = 2;
+
+const isAsciiAlnum = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+
+/** Whether the plain quote at s[p] sits right after a letter or digit that is not part of a flag word (`it's`, `users'`, not `-p'x'`). */
+function proseQuote(s: string, p: number): boolean {
+  if (p === 0 || !isAsciiAlnum(s.charCodeAt(p - 1))) return false;
+  let i = p - 1;
+  while (i > 0 && isAsciiAlnum(s.charCodeAt(i - 1))) i--;
+  return !(i > 0 && s.charCodeAt(i - 1) === 45);
+}
+
+/** First index `i` of the ascending `a[0, n)` with `a[i] >= x` (`n` when there is none). */
+function lowerBound(a: Int32Array | number[], n: number, x: number): number {
+  let lo = 0;
+  let hi = n;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (a[mid]! < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Every quote mark of one string with its role: parallel arrays indexed by the mark's number (ascending position). `role` is content, open or
+ * close; an OPEN mark has `how` (unclosed, closed, or ended by an enclosing close) and `link` (the mark that ended it); a CLOSE mark's `link`
+ * is the mark it closes; `top[m]` is the innermost quote open after mark m (-1 for none) and `par[m]` the quote an OPEN mark is nested in.
+ */
+class Lexer {
+  readonly count: number;
+  readonly pos: Int32Array;
+  readonly lvl: Int32Array;
+  readonly role: Uint8Array;
+  readonly link: Int32Array;
+  readonly how: Uint8Array;
+  readonly top: Int32Array;
+  readonly par: Int32Array;
+  /** the ascending numbers of the quotes that nothing closes */
+  readonly lost: number[];
+  private readonly keys: Int32Array;
+  private nx0: Int32Array | null = null;
+  private nxl: Int32Array | null = null;
+
+  constructor(s: string) {
+    const len = s.length;
+    let marks = 0;
+    for (let i = 0; i < len; i++) {
+      const c = s.charCodeAt(i);
+      if (c === 34 || c === 39) marks++;
+    }
+    const pos = new Int32Array(marks);
+    const lvl = new Int32Array(marks);
+    const link = new Int32Array(marks).fill(-1);
+    const top = new Int32Array(marks);
+    const par = new Int32Array(marks).fill(-1);
+    const keys = new Int32Array(marks);
+    const role = new Uint8Array(marks);
+    const how = new Uint8Array(marks);
+    const stack = new Int32Array(marks);
+    let sp = 0;
+    const cnt = new Map<number, number>();
+    const lost: number[] = [];
+    let i = 0;
+    for (let p = 0; p < len; p++) {
+      const c = s.charCodeAt(p);
+      if (c !== 34 && c !== 39) continue;
+      let r = p;
+      while (r > 0 && s.charCodeAt(r - 1) === 92) r--;
+      const run = p - r;
+      const q1 = c === 39 ? 1 : 0;
+      const level = run % 2 === 1 ? run : 0;
+      const key = level * 2 + q1;
+      pos[i] = p;
+      lvl[i] = level;
+      keys[i] = key;
+      if (level === 0) {
+        // a plain quote ends the escaped quotes of its kind on top of the stack
+        while (sp > 0) {
+          const o = stack[sp - 1]!;
+          const k = keys[o]!;
+          if (k < 2 || (k & 1) !== q1) break;
+          sp--;
+          cnt.set(k, cnt.get(k)! - 1);
+          if ((cnt.get(key) ?? 0) > 0) {
+            // the plain quote closes a quote that holds the escaped one (`"mysql -p\"x"`); with none it ends nothing
+            how[o] = HOW_CUT;
+            link[o] = i;
+          } else {
+            lost.push(o);
+          }
+        }
+      }
+      if ((cnt.get(key) ?? 0) > 0) {
+        for (;;) {
+          const o = stack[--sp]!;
+          const k = keys[o]!;
+          cnt.set(k, cnt.get(k)! - 1);
+          link[o] = i;
+          if (k === key) {
+            how[o] = HOW_CLOSED;
+            role[i] = ROLE_CLOSE;
+            link[i] = o;
+            break;
+          }
+          how[o] = HOW_CUT;
+        }
+      } else if (level !== 0 || !proseQuote(s, p)) {
+        role[i] = ROLE_OPEN;
+        par[i] = sp > 0 ? stack[sp - 1]! : -1;
+        stack[sp++] = i;
+        cnt.set(key, (cnt.get(key) ?? 0) + 1);
+      }
+      top[i] = sp > 0 ? stack[sp - 1]! : -1;
+      i++;
+    }
+    for (let k = 0; k < sp; k++) lost.push(stack[k]!);
+    lost.sort((a, b) => a - b);
+    this.lost = lost;
+    this.count = marks;
+    this.pos = pos;
+    this.lvl = lvl;
+    this.role = role;
+    this.link = link;
+    this.how = how;
+    this.top = top;
+    this.par = par;
+    this.keys = keys;
+  }
+
+  /** The number of the mark at s[p], or -1. */
+  index(p: number): number {
+    const i = lowerBound(this.pos, this.count, p);
+    return i < this.count && this.pos[i] === p ? i : -1;
+  }
+
+  /** For every mark the next PLAIN mark of its kind (`nx0`), and the next mark of its kind and level (`nxl`); built on first use. */
+  nextMarks(): [Int32Array, Int32Array] {
+    if (this.nx0 === null || this.nxl === null) {
+      const n = this.count;
+      const nx0 = new Int32Array(n).fill(-1);
+      const nxl = new Int32Array(n).fill(-1);
+      const last0 = [-1, -1];
+      const lastK = new Map<number, number>();
+      for (let i = n - 1; i >= 0; i--) {
+        const k = this.keys[i]!;
+        nx0[i] = last0[k & 1]!;
+        nxl[i] = lastK.get(k) ?? -1;
+        if (k < 2) last0[k & 1] = i;
+        else lastK.set(k, i);
+      }
+      this.nx0 = nx0;
+      this.nxl = nxl;
+    }
+    return [this.nx0, this.nxl];
+  }
+}
+
 /**
  * The ONE reader of a value that follows a secret-taking name or option (twin of `_Reader`). It starts where the value starts and understands
  * every way a shell, a JSON string or a log line quotes it: bare (a backslash keeps a blank), `'..'`, `".."`, ANSI-C `$'..'`, locale `$".."`, and
- * the ESCAPED form a quote takes inside saved JSON evidence (`\".."`, `\\\".."` when the JSON was serialised twice). A quoted value runs
- * through its closing quote honouring backslash escapes (a quote preceded by an odd run of backslashes is content, as is a blank, a tab, a
- * newline, `;&|`, `#`, unicode ...); an escaped-form value closes at a quote preceded by exactly the opening run and ends before a quote that
- * is not preceded by an odd run (the closing quote of the JSON string that holds it). A quote that never closes runs to the end of its line.
- * A quoted value always is a value, even when it holds only blanks or punctuation. One instance reads one string; scans only move forward: a
- * quote without a close fails for every later quote of its kind (`failed`), the end of a line is remembered, quote counts are advanced.
+ * the ESCAPED form a quote takes inside saved JSON evidence (`\".."`, `\\\".."` when the JSON was serialised twice). A quoted value is whatever
+ * the lexer (above) says it is: it runs through its closing quote honouring backslash escapes (a quote preceded by an odd run of backslashes is
+ * content, as is a blank, a tab, a newline, `;&|`, `#`, unicode ...), across lines; an escaped-form value closes at a quote preceded by exactly
+ * the opening run and ends before a plain quote (the closing quote of the JSON string that holds it); a quote nested in another ends before the
+ * quote that closes the outer one; a quote that never closes runs to the end of its line. A quoted value always is a value, even when it holds
+ * only blanks or punctuation. One instance reads one string and keeps no state that depends on the order of the questions: the lexer is
+ * immutable once built (lazily, on the first question), the end of a line is a pure memo.
  */
 class Reader {
   readonly s: string;
@@ -216,16 +395,19 @@ class Reader {
   q = "";
   oplen = 0;
   run = 0;
-  /** set by `quoted` / `read`: the length of the closing quote (0 when the value ends at a line end or before an enclosing quote) */
+  /** set by `quoted` / `read`: the length of the closing quote (0 when the value ends at a line end or before the quote of an enclosing one) */
   closeLen = 0;
-  private readonly failed = new Set<string>();
+  private lexer: Lexer | null = null;
   private eolFrom = 1;
   private eolTo = 0;
-  private seen = 0;
-  private readonly counts = new Map<string, number>();
+  private eols: number[] | null = null;
 
   constructor(s: string) {
     this.s = s;
+  }
+
+  get lex(): Lexer {
+    return (this.lexer ??= new Lexer(this.s));
   }
 
   /** Whether a quote opens at s[i] (`"`, `'`, `$'`, `$"`, `\"`, `$\"` ...); then `q`, `oplen` and `run` describe it. */
@@ -256,7 +438,7 @@ class Reader {
     return false;
   }
 
-  private lineEnd(i: number): number {
+  lineEnd(i: number): number {
     if (this.eolFrom <= i && i <= this.eolTo) return this.eolTo;
     const s = this.s;
     let e = i;
@@ -268,64 +450,152 @@ class Reader {
 
   /** End of the quoted value that opens at s[i]; `closeLen` is the length of its closing quote. */
   quoted(i: number, q: string, oplen: number, run: number): number {
-    const s = this.s;
-    const key = q + run;
-    if (!this.failed.has(key)) {
-      let k = i + oplen;
-      for (let j = s.indexOf(q, k); j >= 0; j = s.indexOf(q, k)) {
-        let r = j;
-        while (r > k && s.charCodeAt(r - 1) === 92) r--;
-        const n = j - r;
-        if (run !== 0) {
-          if (n === run) {
-            this.closeLen = run + 1;
-            return j + 1;
-          }
-          if (n % 2 === 0) {
-            this.closeLen = 0;
-            return j;
-          }
-        } else if (n % 2 === 0) {
-          this.closeLen = 1;
-          return j + 1;
-        }
-        k = j + 1;
-      }
-      this.failed.add(key);
-    }
+    const lex = this.lex;
+    const m = lex.index(i + oplen - 1);
     this.closeLen = 0;
+    if (m < 0) return this.lineEnd(i);
+    if (lex.role[m] === ROLE_OPEN && lex.lvl[m] === run) {
+      const how = lex.how[m]!;
+      if (how === HOW_UNCLOSED) return this.lineEnd(i);
+      const t = lex.link[m]!;
+      if (how === HOW_CLOSED) {
+        this.closeLen = run !== 0 ? run + 1 : 1;
+        return lex.pos[t]! + 1;
+      }
+      // an escaped quote ends before the plain quote that closes the JSON string holding it (`"mysql -p\"x"`); any other quote that was cut by
+      // an enclosing one is ambiguous (`OPTS='sshpass -p "x'y' z'`): its value runs at least to the end of its line
+      const end = lex.pos[t]! - lex.lvl[t]!;
+      return run !== 0 && this.s.charAt(lex.pos[t]!) === q ? end : Math.max(end, this.lineEnd(i));
+    }
+    // the lexer takes this quote for a closer or for prose: read it as an opener of its own kind (the next quote that ends it)
+    const [nx0, nxl] = lex.nextMarks();
+    const t0 = nx0[m]!;
+    const t1 = run !== 0 && lex.lvl[m] === run ? nxl[m]! : -1;
+    if (t1 >= 0 && (t0 < 0 || t1 < t0)) {
+      this.closeLen = run + 1;
+      return lex.pos[t1]! + 1;
+    }
+    if (t0 >= 0) {
+      if (run === 0) {
+        this.closeLen = 1;
+        return lex.pos[t0]! + 1;
+      }
+      return lex.pos[t0]!;
+    }
     return this.lineEnd(i);
   }
 
-  /** End of the value at s[i] (`i` when there is none: no bare character, or a quote with nothing after it); `closeLen` as in `quoted`. */
+  /**
+   * End of the value at s[i] (`i` when there is none: no bare character, or a quote with nothing after it); `closeLen` as in `quoted`. The value
+   * is a shell WORD: segments that touch the one just read belong to it (`-p'a b'c`, `-p"x"'y'`, `x=ab'c'`): a quote the lexer opens (or one it
+   * takes for prose) continues it, a quote it closes ends it (the closing quote of an enclosing string), and after a quoted segment a bare
+   * character continues it unless it is a closer of prose or Markdown.
+   */
   read(i: number, kind: number): number {
+    const s = this.s;
+    let end: number;
+    let quoted: boolean;
     if (this.opener(i)) {
-      const end = this.quoted(i, this.q, this.oplen, this.run);
-      return this.closeLen !== 0 || end > i + this.oplen ? end : i;
+      end = this.quoted(i, this.q, this.oplen, this.run);
+      if (!(this.closeLen !== 0 || end > i + this.oplen)) return i;
+      quoted = this.closeLen > 0;
+    } else {
+      end = bareEnd(s, i, kind);
+      this.closeLen = 0;
+      if (end === i) return i;
+      quoted = false;
     }
-    this.closeLen = 0;
-    return bareEnd(this.s, i, kind);
+    const n = s.length;
+    let lex: Lexer | null = null;
+    let nxt = -1; // the number of the mark that follows the last segment, when that segment was a closed quote
+    while (end < n) {
+      const c = s.charCodeAt(end);
+      if (c === 34 || c === 39 || c === 92 || c === 36) {
+        if (!this.opener(end)) {
+          const e2 = bareEnd(s, end, kind);
+          if (e2 === end) break;
+          end = e2;
+          quoted = false;
+          nxt = -1;
+          continue;
+        }
+        lex ??= this.lex;
+        const qpos = end + this.oplen - 1;
+        const k = nxt >= 0 && nxt < lex.count && lex.pos[nxt] === qpos ? nxt : lex.index(qpos);
+        const role = k >= 0 ? lex.role[k]! : ROLE_CONTENT;
+        if (role === ROLE_CLOSE) break;
+        if (role === ROLE_OPEN && lex.lvl[k] === this.run) {
+          if (lex.how[k] === HOW_CLOSED) {
+            const t = lex.link[k]!;
+            this.closeLen = this.run !== 0 ? this.run + 1 : 1;
+            end = lex.pos[t]! + 1;
+            nxt = t + 1;
+          } else {
+            end = this.quoted(end, this.q, this.oplen, this.run);
+            nxt = -1;
+          }
+        } else {
+          // a quote that is prose (`it's`): part of the word
+          this.closeLen = 0;
+          end = qpos + 1;
+          nxt = -1;
+        }
+        quoted = true;
+      } else if (quoted && !CLI_CLOSERS.includes(s.charAt(end)) && !"/?&|".includes(s.charAt(end))) {
+        const e2 = bareEnd(s, end, kind);
+        if (e2 === end) break;
+        end = e2;
+        quoted = false;
+        nxt = -1;
+      } else {
+        break;
+      }
+    }
+    return end;
   }
 
-  /** Whether an odd number of quotes (`q` with `run` backslashes before it) stand in the current line before s[upto]: such a quote CLOSES what an earlier quote opened. `upto` only grows. */
-  odd(q: string, run: number, upto: number): boolean {
-    const s = this.s;
-    if (upto > this.seen) {
-      const seen = this.seen;
-      for (let j = seen; j < upto; j++) {
-        const c = s.charCodeAt(j);
-        if (c === 10 || c === 13) {
-          this.counts.clear();
-        } else if (c === 34 || c === 39) {
-          let r = j;
-          while (r > seen && s.charCodeAt(r - 1) === 92) r--;
-          const key = s.charAt(j) + (j - r);
-          this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
-        }
+  /**
+   * Whether the quote of the opener at s[i] CLOSES a quote that opened earlier on the same line (`"mysql -p" ok`: a prose quote, not the opener
+   * of a password). Two things make that reading unsafe, and the quote is then taken for an opener (over-redacting): the lexer pairs it with a
+   * quote on an earlier line, or a quote that nothing closes follows it on its line (`'x && mysql -p'***' db`: the quoting of the line is
+   * unbalanced, so the pairing may be an accident of a stray quote).
+   */
+  closes(i: number, oplen: number, run: number): boolean {
+    const lex = this.lex;
+    const m = lex.index(i + oplen - 1);
+    if (m < 0 || lex.role[m] !== ROLE_CLOSE || lex.lvl[m] !== run) return false;
+    let eols = this.eols;
+    if (eols === null) {
+      eols = this.eols = [];
+      const s = this.s;
+      for (let k = 0; k < s.length; k++) {
+        const c = s.charCodeAt(k);
+        if (c === 10 || c === 13) eols.push(k);
       }
-      this.seen = upto;
     }
-    return (this.counts.get(q + run) ?? 0) % 2 === 1;
+    const at = lex.pos[m]!;
+    if (lowerBound(eols, eols.length, lex.pos[lex.link[m]!]!) !== lowerBound(eols, eols.length, at)) return false;
+    const j = lowerBound(lex.lost, lex.lost.length, m + 1); // the first quote that nothing closes after mark m
+    return !(j < lex.lost.length && lex.pos[lex.lost[j]!]! < this.lineEnd(at));
+  }
+
+  /**
+   * Where the quote that encloses s[p] ends (before its closing quote), or -1 when none does or it never closes. A closing quote right after `=`
+   * is not taken for the close of the enclosing quote (`Cookie: a=1; session="x"`: it opens a cookie value): the next enclosing quote out is
+   * tried (at most 4 levels, then -1: the caller reads to the end of the line).
+   */
+  enclosingEnd(p: number): number {
+    const lex = this.lex;
+    const m = lowerBound(lex.pos, lex.count, p) - 1;
+    let o = m >= 0 ? lex.top[m]! : -1;
+    for (let hop = 0; hop < 4; hop++) {
+      if (o < 0 || lex.how[o] === HOW_UNCLOSED) return -1;
+      const t = lex.link[o]!;
+      const end = lex.pos[t]! - lex.lvl[t]!;
+      if (end === 0 || this.s.charCodeAt(end - 1) !== 61) return end;
+      o = lex.par[o]!;
+    }
+    return -1;
   }
 }
 
@@ -508,15 +778,15 @@ function hasChar(s: string, ch: string, from: number, to: number): boolean {
 }
 /**
  * Whether the flag at s[at, at + 2) (`-p`) of the word that ends at `end` carries its value attached: `-pVALUE`, `-p'VALUE'`, `-p$'VALUE'`, `-p\"VALUE\"`.
- * A quote that opens the value (one that does not CLOSE an earlier quote of the line: `"mysql -p" ok` and `"-p"` are prose) makes everything
- * after it the value, even when it is only punctuation or blanks (`-p" x"`, `-p\" x\"`); an unquoted value is one unless it is made only of
- * closers (`-p`, `(-p)`, `**-p**`) that end the word.
+ * A quote that opens the value (one that the lexer does not take for the CLOSE of an earlier quote of the line: `"mysql -p" ok` and `"-p"` are
+ * prose) makes everything after it the value, even when it is only punctuation or blanks (`-p" x"`, `-p\" x\"`); an unquoted value is one
+ * unless it is made only of closers (`-p`, `(-p)`, `**-p**`) that end the word.
  */
 function cliAttached(rd: Reader, at: number, end: number): boolean {
   let v = at + 2;
   if (v >= end) return false;
   if (rd.opener(v)) {
-    if (!rd.odd(rd.q, rd.run, at)) return true;
+    if (!rd.closes(v, rd.oplen, rd.run)) return true;
     v += rd.oplen; // the quote CLOSES an earlier one: only what follows it can be a value (`"mysql -p" ok`, `\"mysql -p\" ok`)
   }
   return hasNonCloser(rd.s, v, end);
@@ -713,7 +983,7 @@ function yamlValueEnd(s: string, start: number, indent: number): number {
   }
   return end;
 }
-function yamlSpans(s: string, spans: number[]): void {
+function yamlSpans(s: string, spans: number[], rd: Reader): void {
   if (!s.includes("\n") || !s.includes(":")) return;
   for (const [rx, indentGroup] of [[YAML_NAME, 3], [YAML_BLOCK_KEY, 1]] as const) {
     let last = 0;
@@ -721,7 +991,8 @@ function yamlSpans(s: string, spans: number[]): void {
       const at = m.index as number;
       if (at < last || !isSensitiveKey(m[2]!)) continue;
       const start = at + m[0].length;
-      const end = yamlValueEnd(s, start, m[indentGroup]!.length);
+      let end = yamlValueEnd(s, start, m[indentGroup]!.length);
+      if (s.charAt(start) === '"' || s.charAt(start) === "'") end = Math.max(end, rd.quoted(start, s.charAt(start), 1, 0)); // a quoted scalar runs to its closing quote, across lines
       if (end > start) {
         spans.push(start, end);
         last = end;
@@ -773,32 +1044,21 @@ function scan(s: string, sep: RegExp, kind: number, eqSep: boolean, spans: numbe
   }
 }
 
-/** End of the header value that begins at `valueStart`: the end of the line, or an enclosing quote. A quote right after `=` opens a quoted cookie value and is skipped to its closing quote; a quote that never closes on the line ends the value. */
-function headerEnd(s: string, valueStart: number): number {
-  let i = valueStart + 1;
-  for (;;) {
-    HEADER_STOP.lastIndex = i;
-    const m = HEADER_STOP.exec(s);
-    if (m === null) return s.length;
-    const j = m.index;
-    const c = m[0];
-    if (c === "\r" || c === "\n" || s.charAt(j - 1) !== "=") return j;
-    const close = HEADER_CLOSE[c]!;
-    close.lastIndex = j + 1;
-    const k = close.exec(s);
-    if (k === null || k[0] !== c) return j;
-    i = k.index + 1;
-  }
+/** End of the header value that begins at `valueStart`: the end of its line, or the quote that closes the quote it sits in (`-H "Cookie: a=b"`), whichever comes first. A quote inside the value (`a="b c"; d=e`, a stray apostrophe) is part of it: the lexer, not a local scan for the next quote, says which quote encloses the header. */
+function headerEnd(rd: Reader, valueStart: number): number {
+  const end = rd.lineEnd(valueStart);
+  const close = rd.enclosingEnd(valueStart);
+  return close > valueStart && close < end ? close : end; // a header that starts at the closing quote of an enclosing one is ambiguous: its line
 }
 
-function headerSpans(s: string, spans: number[]): void {
+function headerSpans(s: string, spans: number[], rd: Reader): void {
   let pos = 0;
   for (;;) {
     HEADER.lastIndex = pos;
     const m = HEADER.exec(s);
     if (m === null) return;
     const start = m.index + m[0].length;
-    pos = headerEnd(s, start);
+    pos = headerEnd(rd, start);
     spans.push(start, pos);
   }
 }
@@ -852,10 +1112,10 @@ function collectSpans(s: string): number[] {
     for (const m of s.matchAll(rx)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length);
   }
   for (const m of s.matchAll(USERINFO)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length - 1); // the '@' stays
-  headerSpans(s, spans);
   const rd = new Reader(s);
+  headerSpans(s, spans, rd);
   cliSpans(s, spans, rd);
-  yamlSpans(s, spans);
+  yamlSpans(s, spans, rd);
   scan(s, NAME_SEP, BARE_NAME, true, spans, rd);
   scan(s, FLAG_SEP, BARE_FLAG, false, spans, rd);
   for (const rx of [JWT, ...TOKENS]) {

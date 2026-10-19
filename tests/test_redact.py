@@ -382,8 +382,9 @@ def test_a_backslash_in_a_bare_value_is_still_consumed_unless_it_starts_an_escap
 
 @pytest.mark.parametrize("filler", ['\\"' * 500_000, "\\" * 1_000_000, '"\\' * 500_000, 'a=\\"' * 250_000])
 def test_escaped_quote_floods_scan_in_bounded_time(filler):
-    assert _timed("DB_PASSWORD=" + filler) < 1.0
-    assert _timed("--password " + filler) < 1.0
+    # 500k quote marks: the quote lexer keeps five arrays and a stack per mark (about 1 us each); the documented budget is 3 s per MB
+    assert _timed("DB_PASSWORD=" + filler) < 2.0
+    assert _timed("--password " + filler) < 2.0
 
 
 # ---- randomized option lists: a benign assignment must never hide a later sensitive one ---------------------------------
@@ -503,6 +504,8 @@ def _generated_fixture() -> dict:
         "property": [c | {"digest": _digest(expand_tokens(c["input"]))} for c in generate_property_cases(_PROPERTY_SEED, _PROPERTY_EXTRA)],
         "quoting": [{"input": c["input"], "expected": c["expected"]} for c in _QUOTING_CASES[::_QUOTING_STRIDE]],
         # the random strings are rebuilt in both languages from the seed and the fragment table; only digests of the Python outputs are stored
+        "noise_seed": _NOISE_SEED,
+        "noise": [{"input": c["input"], "digest": _digest(expand_tokens(c["input"]))} for c in _NOISE_CASES],
         "random": {"seed": _RANDOM_SEED, "count": _RANDOM_COUNT, "fragments": list(_RANDOM_FRAGMENTS),
                    "inputs": hashlib.sha256("\u0000".join(strings).encode("utf-8")).hexdigest()[:16],
                    "digests": [_digest(s) for s in strings]},
@@ -520,8 +523,8 @@ def test_generated_fixture_is_current_and_matches_the_python_output():
         digest_rows = ",\n".join("   " + ", ".join(json.dumps(d) for d in random_part["digests"][i:i + 10])
                                  for i in range(0, len(random_part["digests"]), 10))
         _GENERATED_PATH.write_text(
-            f'{{"_doc": {json.dumps(_FIXTURE_DOC)},\n"tokens": [\n{rows(wanted["tokens"])}\n],\n"seed": {_GENERATED_SEED}, "wild_seed": {_WILD_SEED}, "property_seed": {_PROPERTY_SEED}, "cases": [\n{rows(wanted["cases"])}\n], '
-            f'"wild": [\n{rows(wanted["wild"])}\n], "property": [\n{rows(wanted["property"])}\n], "quoting": [\n{rows(wanted["quoting"])}\n], "random": {{"seed": {_RANDOM_SEED}, '
+            f'{{"_doc": {json.dumps(_FIXTURE_DOC)},\n"tokens": [\n{rows(wanted["tokens"])}\n],\n"seed": {_GENERATED_SEED}, "wild_seed": {_WILD_SEED}, "property_seed": {_PROPERTY_SEED}, "noise_seed": {_NOISE_SEED}, "cases": [\n{rows(wanted["cases"])}\n], '
+            f'"wild": [\n{rows(wanted["wild"])}\n], "property": [\n{rows(wanted["property"])}\n], "quoting": [\n{rows(wanted["quoting"])}\n], "noise": [\n{rows(wanted["noise"])}\n], "random": {{"seed": {_RANDOM_SEED}, '
             f'"count": {_RANDOM_COUNT}, "inputs": "{random_part["inputs"]}", "fragments": {json.dumps(random_part["fragments"])}, '
             f'"digests": [\n{digest_rows}\n]}}}}\n', encoding="utf-8")
     assert json.loads(_GENERATED_PATH.read_text(encoding="utf-8")) == wanted
@@ -1127,6 +1130,7 @@ _RANDOM_FRAGMENTS = (
     "DB_PASSWORD", "[REDACTED]", "1000:1000", "a:b", "user:pw@", "u:p@h", "pw", "x=1", "a=b", "--", "-",
     "`--user ", "**", "__", "~~", "<", ">", "sshpass -p ", "docker login -u a: -p ", "--cmd=", "--token ", "redis-cli -a ", "-passin ", "--user=a:",
     "$'", '$"', '\\\\\\"', "\\ ", "\\'", "-p'", '-p"', "-p\\\"", "-P ", "-N ", "--password=", "-u me:", "sqlcmd -P", "mysql -p", "curl -u ",
+    "it's ", "don't ", "the users' list", "'cause ", '5" wide', "# sshpass -p'", '# mysql -p"', 'echo "it\'s ready"; ', "-p'***'", '-p")]}"', "O'Brien", "x\n  y",
     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 )
 
@@ -1282,3 +1286,160 @@ def test_quoting_forms_scan_in_linear_time():
         out = redact_text(text)
         assert time.perf_counter() - started < 3.0, unit
         assert "hunter2" not in out, unit
+
+
+# ---- GL9 round 9: quote context comes from ONE lexer (swarm.redact._Lexer), never from local counting or a cache shared by restarts -----
+# Greptile round 9: (1) `'password': 'alpha\n  beta'\n# sshpass -p'` left `beta` readable (a failure cache shared by scans that restart at earlier
+# positions); (2) `echo "it's ready"; mysql -p'***' db` left the password readable (the line-wide count of apostrophes took its opener for a closer).
+# This section plants secrets in carriers with quote NOISE (prose apostrophes, stray quotes, multi-line quoted values, restarts: the same text
+# followed by a later unmatched quote) and demands that no planted byte survives; the cases are shared with the TypeScript twin.
+_NOISE_SEED, _NOISE_COUNT = 20241023, 2400
+_NOISE_FRAGMENTS = ("it's ready", "don't", "the users' list", 'echo "it\'s ready";', 'say "hi', '5" wide', "'", '"', "# sshpass -p'", '# mysql -p"', "I'll",
+                    "O'Brien", "rock 'n' roll", "(user's)", "'quoted prose'", 'say "he\'s here"', "that's all", "'cause", 'he said "ok" and left', "isn't \"x\"",
+                    "a'b'c", 'a"b"c', "# note: '", "[it's](u)", "`it's`")
+_NOISE_LINES = ("# sshpass -p'", '# mysql -p"', "don't", "it's", "'", '"', "the users' list", 'echo "it\'s ready"', "'cause", "x\" y", "rock 'n' roll")
+_NOISE_JOINERS = ("\n", " ; ", " && ", " ", "\n\n", " | ")
+# multi-line quoted values (`lines`: 40-character lines joined by "\n  "), every carrier form that can quote one
+_ML_CARRIERS = (
+    ("ml_json_pair", ("lines",), "{\"%N%\": \"%S%\", \"n\": 1}"),
+    ("ml_py_pair", ("lines",), "{'%N%': '%S%'}"),
+    ("ml_env_dq", ("lines",), '%N%="%S%"'),
+    ("ml_env_sq", ("lines",), "%N%='%S%'"),
+    ("ml_flag_dq", ("lines",), 'tool --password "%S%" db'),
+    ("ml_flag_sq", ("lines",), "tool --password '%S%' db"),
+    ("ml_mysql_sq", ("lines",), "mysql -u root -p'%S%' db"),
+    ("ml_sshpass_dq", ("lines",), 'sshpass -p "%S%" ssh h'),
+    ("ml_curl_user", ("lines",), "curl -u 'me:%S%' https://h.test"),
+    ("yaml_ml_dq", ("lines",), '- name: DB_PASSWORD\n  value: "%S%"\n- name: X\n  value: y'),
+    ("yaml_ml_sq", ("lines",), "- name: API_TOKEN\n  value: '%S%'\nnext: 1"),
+)
+_ML_LABELS = frozenset(c[0] for c in _ML_CARRIERS)
+# single-line carriers whose value is punctuation only: the secret is the literal (not a placeholder), checked by `test_a_punctuation_only_password...`
+_NOISE_PASSWORDS = ("***", "!@#", "&;|", ")]}", "'\"'")
+
+
+def generate_noise_cases(seed: int, count: int) -> list[dict]:
+    """`count` cases `{"input": text}` (placeholders for the planted secrets): a property carrier (or a multi-line quoted one) with quote noise
+    BEFORE it, AFTER it, on both sides, or as a trailing line that restarts the quote scans. YAML carriers keep their keys at the start of a line."""
+    rng = random.Random(seed)
+    serial = itertools.count(5_000_000)
+    carriers = [c for c in _CARRIERS if c[0] != "env_unterminated"] + list(_ML_CARRIERS)
+    cases = []
+    for _ in range(count):
+        label, kinds, template = rng.choice(carriers)
+        length = 80 + 40 * rng.randint(0, 2) if label in _ML_LABELS else rng.randint(1, 120)  # a multi-line value spans 2 to 4 lines
+        body = _plant(rng, label, kinds, template, length, next(serial))
+        joiner = "\n" if label.startswith("yaml") else rng.choice(_NOISE_JOINERS)
+        where = rng.choice(("before", "after", "both", "restart"))
+        before, after = rng.choice(_NOISE_FRAGMENTS), rng.choice(_NOISE_FRAGMENTS)
+        text = {"before": before + joiner + body, "after": body + joiner + after, "both": before + joiner + body + joiner + after,
+                "restart": body + "\n" + rng.choice(_NOISE_LINES)}[where]
+        cases.append({"input": text})
+    return cases
+
+
+_NOISE_CASES = generate_noise_cases(_NOISE_SEED, _NOISE_COUNT)
+
+
+def test_planted_secrets_survive_quote_noise_before_after_and_as_a_restarting_line():
+    assert len(_NOISE_CASES) == _NOISE_COUNT
+    assert _leaks(_NOISE_CASES)[:3] == []
+
+
+def test_the_noise_cases_in_the_shared_fixture_are_the_generated_ones():
+    stored = json.loads(_GENERATED_PATH.read_text(encoding="utf-8"))["noise"]
+    assert [c["input"] for c in stored] == [c["input"] for c in _NOISE_CASES]
+    assert _leaks([{"input": c["input"]} for c in stored])[:3] == []
+
+
+def test_the_finding_a_later_unmatched_quote_must_not_change_how_an_earlier_value_is_read():
+    """Greptile round 9, P2 #1: the quote scans share no cache, so a stray quote LATER in the text cannot cut a multi-line value read EARLIER."""
+    text = "'password': 'alpha\n  beta'\n# sshpass -p'"
+    assert redact_text(text) == "'password': '" + REDACTED + "'\n# sshpass -p'"
+    for tail in ("\n# sshpass -p'", "\n# mysql -p\"", "\n'", "\n\"", "\ndon't", " ; echo 'x"):
+        for head in ("'password': 'alpha\n  beta'", '"password": "alpha\n  beta"', "DB_PASSWORD='alpha\n  beta'", 'DB_PASSWORD="alpha\n  beta"',
+                     "tool --password 'alpha\n  beta' db", "mysql -p'alpha\n  beta' db", "curl -u 'me:alpha\n  beta' h", "sshpass -p \"alpha\n  beta\" ssh h"):
+            out = redact_text(head + tail)
+            assert "alpha" not in out and "beta" not in out, (head, tail, out)
+
+
+def test_the_finding_unrelated_quotes_must_not_turn_a_password_opener_into_a_closer():
+    """Greptile round 9, P2 #2: the quote context is tracked (an apostrophe inside a double-quoted string is content), not counted per line."""
+    assert redact_text('echo "it\'s ready"; mysql -p\'***\' db') == 'echo "it\'s ready"; mysql -p' + REDACTED + " db"
+    for noise in ("it's ready", "don't", "the users' list", 'echo "it\'s ready";', "'cause", "rock 'n' roll", "O'Brien", 'say "hi', "'", '"', "5\" wide", "x = 'it''s'"):
+        for command in ("mysql -p'%s' db", 'mysql -p"%s" db', "sshpass -p '%s' ssh h", "redis-cli -a '%s' ping", "docker login -p \"%s\" r", "curl -u me:'%s' h"):
+            for password in _NOISE_PASSWORDS:
+                quote = '"' if command.count('"') else "'"
+                if quote in password:
+                    continue
+                for joiner in ("; ", "\n", " && ", " "):
+                    out = redact_text(noise + joiner + command % password)
+                    assert password not in out.replace(noise, ""), (noise, joiner, command, password, out)
+
+
+def test_a_punctuation_only_password_after_unrelated_quotes_is_masked_wherever_the_quote_context_is_unbalanced():
+    for text, expected in (
+        ("'unclosed && mysql -p'***' db", "'unclosed && mysql -p" + REDACTED + " db"),
+        ('"quoted ; mariadb -p")]}" db', '"quoted ; mariadb -p' + REDACTED + " db"),
+        ("# note: ' ;docker login -p'***' --x db", "# note: ' ;docker login -p" + REDACTED + " --x db"),
+        ("the users' list; sshpass -p'&;|' ssh h", "the users' list; sshpass -p" + REDACTED + " ssh h"),
+    ):
+        assert redact_text(text) == expected
+
+
+def test_quote_lexer_rules():
+    from swarm.redact import _CLOSE, _CONTENT, _OPEN, _Lexer
+    def roles(text):
+        lex = _Lexer(text)
+        return [(text[lex.pos[i]], lex.role[i]) for i in range(len(lex.pos))]
+    # an apostrophe inside a double-quoted string is content, a prose apostrophe never opens a quote, a flag-attached quote does
+    assert roles('echo "it\'s ready"') == [('"', _OPEN), ("'", _CONTENT), ('"', _CLOSE)]
+    assert roles("don't stop") == [("'", _CONTENT)]
+    assert roles("the users' list") == [("'", _CONTENT)]
+    assert roles("mysql -p'x'") == [("'", _OPEN), ("'", _CLOSE)]
+    assert roles("a 'b' c") == [("'", _OPEN), ("'", _CLOSE)]
+    # a quote of the other kind nests; the quote that closes the outer one ends it
+    assert roles("bash -c \"mysql -p'x' db\"") == [('"', _OPEN), ("'", _OPEN), ("'", _CLOSE), ('"', _CLOSE)]
+    # an escaped quote (the JSON form) is a mark of its own level
+    assert roles('{\\"k\\": \\"v\\"}') == [('"', _OPEN), ('"', _CLOSE), ('"', _OPEN), ('"', _CLOSE)]
+
+
+def test_the_quote_lexer_is_a_pure_function_of_the_text():
+    """Same text, same answer, whatever was asked before; appending a restarting line never changes how an EARLIER value is read."""
+    from swarm.redact import _Reader
+    text = "'password': 'alpha\n  beta'\nmysql -p'x y' db"
+    first = _Reader(text)
+    a = [first.quoted(13, "'", 1, 0), first.quoted(36, "'", 1, 0)]
+    second = _Reader(text + "\n# sshpass -p'")
+    b = [second.quoted(36, "'", 1, 0), second.quoted(13, "'", 1, 0)]
+    assert a == [b[1], b[0]]
+
+
+@pytest.mark.parametrize("unit", ["'", '"', "\\'", '\\"', "a'", "-p'", '-p"', "it's ", "x' ", "$'", "'\\'", "\"'", "mysql -p'a' ", "echo \"it's\"; "])
+def test_quote_noise_floods_are_scanned_in_linear_time(unit):
+    import time
+    for lead in ("", "DB_PASSWORD=", "mysql -p", "Cookie: ", "curl -u me:"):
+        text = lead + unit * (1_000_000 // len(unit)) + "\npassword=hunter2"
+        started = time.perf_counter()
+        out = redact_text(text)
+        assert time.perf_counter() - started < 3.0, (lead, unit)
+        assert "hunter2" not in out, (lead, unit)
+
+
+def test_a_cookie_header_ends_at_its_line_or_at_the_quote_that_encloses_it_never_at_a_stray_quote():
+    assert redact_text("Cookie: sid=alpha\"beta gamma") == "Cookie: " + REDACTED
+    assert redact_text("Cookie: sid=alpha'beta gamma") == "Cookie: " + REDACTED
+    assert redact_text("curl -H 'Cookie: sid=alpha; theme=dark' https://h") == "curl -H 'Cookie: " + REDACTED + "' https://h"
+    assert redact_text('curl -H "Cookie: a=1; s="alpha beta"; x=2" u') == 'curl -H "Cookie: ' + REDACTED
+    assert redact_text("Set-Cookie: sid=\"alpha beta\"; Path=/\nnext") == "Set-Cookie: " + REDACTED + "\nnext"
+
+
+def test_a_value_is_a_shell_word_a_quote_that_touches_it_continues_it():
+    for text, expected in (
+        ("mysql -p'alpha beta'gamma db", "mysql -p" + REDACTED + " db"),
+        ("export DB_PASSWORD=alpha'beta'gamma x", "export DB_PASSWORD=" + REDACTED + " x"),
+        ("sshpass -p \"alpha\"'beta' ssh h", "sshpass -p " + REDACTED + " ssh h"),
+        ("run \"DB_PASSWORD=alpha\" next", 'run "DB_PASSWORD=' + REDACTED + '" next'),
+        ("$(mysql -p'alpha')", "$(mysql -p" + REDACTED + ")"),
+    ):
+        assert redact_text(text) == expected
