@@ -269,7 +269,8 @@ def test_read_reports_each_status_without_failing(env, monkeypatch):
     (env.sdir / "handovers" / "corr-1" / "T-be.1.json").write_text("{", encoding="utf-8")
     bad = env.call("shared_handover_read", "A08", {"task_id": "T-be"})
     assert bad["state"] == "SUCCESS" and bad["found"] is False and bad["status"] == "malformed"
-    assert env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 4})["status"] == "missing"
+    refused = env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 4})  # a seq the task lacks is refused, never answered
+    assert refused["state"] == "INVALID_INPUT" and refused["field"] == "seq"
     assert env.call("shared_handover_read", "A08", {"task_id": "../x"})["field"] == "task_id"
 
 
@@ -784,3 +785,113 @@ def test_artifact_check_refuses_more_outputs_than_it_checks(env):
     assert refused["state"] == "INVALID_INPUT" and refused["field"] == "outputs" and "101" in refused["message"]
     full = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "agent": "A05", "outputs": [good] * 100})
     assert full["state"] == "SUCCESS" and full["checked"] == 100 and full["verified"] is True
+
+
+# ---- greploop round 2: PR #37 findings --------------------------------------------------------------------------
+def _resumed_task(env):
+    """A01 left a checkpoint addressed to A05 under T-be; A05 resumed the task and hands its own work to A08."""
+    make_world(env)
+    incoming = env.call("shared_handover_write", "A01", handover_payload(to_agent="A05", goal="Resume the export endpoint"))
+    outgoing = env.call("shared_handover_write", "A05", handover_payload(to_agent="A08", goal="Test the export endpoint"))
+    assert incoming["state"] == outgoing["state"] == "SUCCESS" and outgoing["seq"] == incoming["seq"] + 1
+    return incoming, outgoing
+
+
+def test_the_producers_read_back_is_pinned_to_the_seq_it_wrote(env):
+    """Greptile P1: a producer on a resumed task read back the checkpoint addressed to itself, not the handover just written."""
+    incoming, outgoing = _resumed_task(env)
+    unpinned = env.call("shared_handover_read", "A05", {"task_id": "T-be"})
+    assert unpinned["handover"]["handover_id"] == incoming["handover_id"]  # the receiver view: what is addressed to A05
+    back = env.call("shared_handover_read", "A05", {"task_id": "T-be", "seq": outgoing["seq"]})
+    assert back["status"] == "ok" and back["handover"]["handover_id"] == outgoing["handover_id"]
+    assert back["handover"]["digest"] == outgoing["digest"] and back["handover"]["to_agent"] == "A08"
+    assert back["context_only"] is True  # addressed to the next agent, not to the producer: no receipt for the producer
+    verify = env.call("shared_handover_verify", "A05", {"task_id": "T-be", "seq": outgoing["seq"]})
+    assert verify["handover_id"] == outgoing["handover_id"]
+    bundle = env.call("shared_handover_bundle", "A05", {"task_id": "T-be", "seq": outgoing["seq"]})
+    assert bundle["handover"]["digest"] == outgoing["digest"] and bundle["goal"] == "Test the export endpoint"
+    older = env.call("shared_handover_bundle", "A05", {"task_id": "T-be", "seq": incoming["seq"]})
+    assert older["handover"]["digest"] == incoming["digest"] and "context_only" not in older["handover"]
+
+
+def test_a_seq_the_task_does_not_have_is_invalid_input_for_every_handover_reader(env):
+    _resumed_task(env)
+    for tool in ("shared_handover_read", "shared_handover_verify", "shared_handover_bundle", "shared_artifact_check"):
+        refused = env.call(tool, "A05", {"task_id": "T-be", "seq": 99})
+        assert refused["state"] == "INVALID_INPUT" and refused["field"] == "seq" and "99" in refused["message"], (tool, refused)
+        assert env.call(tool, "A05", {"task_id": "T-be", "seq": 0})["state"] == "INVALID_INPUT", tool
+
+
+def _digest_of(env, name, text):
+    (env.root / "src").mkdir(exist_ok=True)
+    (env.root / "src" / name).write_text(text, encoding="utf-8")
+    return env.call("shared_artifact_digest", "A05", {"path": f"src/{name}"})["digest"]
+
+
+def test_a_result_without_a_digest_keeps_the_digest_the_handover_supplied(env):
+    """Greptile P2: the emit skill writes the handover before the final task.result, whose outputs may omit `digest`; the
+    newer digest-less row replaced the handover's digest (`no_digest`) and later edits went unnoticed."""
+    store = make_world(env)
+    digest = _digest_of(env, "out.py", "v1\n")
+    env.call("shared_handover_write", "A05", handover_payload(artifacts=[
+        {"kind": "file", "uri": "src/out.py", "digest": digest, "producer": "A05"}]))
+    time.sleep(0.02)
+    store.add_artifact("T-be", kind="file", uri="src/out.py", digest="", producer="A05")  # task.result output without a digest
+    out = env.call("shared_artifact_check", "A08", {"task_id": "T-be"})
+    (row,) = [r for r in out["results"] if r["uri"] == "src/out.py"]
+    assert row["status"] == "ok" and row["digest_match"] == "yes" and row["actual_digest"] == digest
+    assert row["inherited"] == {"digest": digest, "source": "handover T-be.1"}
+    assert not [r for r in out["results"] if r["uri"] == "src/out.py" and r["status"] == "no_digest"]
+    (env.root / "src" / "out.py").write_text("v1 edited after the handover\n", encoding="utf-8")
+    changed = env.call("shared_artifact_check", "A08", {"task_id": "T-be"})
+    (row,) = [r for r in changed["results"] if r["uri"] == "src/out.py"]
+    assert row["status"] == "digest_mismatch" and digest in row["reason"] and changed["ok"] is False
+
+
+def test_a_digestless_row_keeps_the_newest_known_digest_and_lists_the_older_one_as_superseded(env):
+    store = make_world(env)
+    old = _digest_of(env, "out.py", "v1\n")
+    env.call("shared_handover_write", "A05", handover_payload(artifacts=[
+        {"kind": "file", "uri": "src/out.py", "digest": old, "producer": "A05"}]))
+    time.sleep(0.02)
+    new = _digest_of(env, "out.py", "v2 after rework\n")
+    store.add_artifact("T-be", kind="file", uri="src/out.py", digest=new, producer="A05")
+    time.sleep(0.02)
+    store.add_artifact("T-be", kind="file", uri="src/out.py", digest="", producer="A05")
+    out = env.call("shared_artifact_check", "A08", {"task_id": "T-be"})
+    (row,) = [r for r in out["results"] if r["uri"] == "src/out.py"]
+    assert row["status"] == "ok" and row["inherited"] == {"digest": new, "source": "stored result row"}
+    assert any("superseded" in n and old in n and new not in n for n in out["notes"]), out["notes"]
+    (env.root / "src" / "out.py").write_text("v1\n", encoding="utf-8")  # back to a superseded digest: the newest one wins
+    reverted = env.call("shared_artifact_check", "A08", {"task_id": "T-be"})
+    (row,) = [r for r in reverted["results"] if r["uri"] == "src/out.py"]
+    assert row["status"] == "digest_mismatch"
+
+
+def test_artifact_check_with_a_seq_reads_the_artifacts_of_that_handover(env):
+    _incoming, outgoing = _resumed_task(env)  # both handovers declare src/export.py with the b* digest
+    first_digest = _digest_of(env, "first.py", "first\n")
+    env.call("shared_handover_write", "A01", handover_payload(to_agent="A05", goal="Resume again", artifacts=[
+        {"kind": "file", "uri": "src/first.py", "digest": first_digest, "producer": "A01"}]))
+    pinned = env.call("shared_artifact_check", "A05", {"task_id": "T-be", "seq": outgoing["seq"]})
+    assert "src/first.py" not in [r["uri"] for r in pinned["results"]]
+    default = env.call("shared_artifact_check", "A05", {"task_id": "T-be"})  # A05's newest incoming one
+    assert "src/first.py" in [r["uri"] for r in default["results"]]
+
+
+def test_the_bundle_lists_one_entry_for_a_file_the_result_repeats_without_a_digest(env):
+    store = make_world(env)
+    digest = _digest_of(env, "out.py", "v1\n")
+    env.call("shared_handover_write", "A05", handover_payload(artifacts=[
+        {"kind": "file", "uri": "src/out.py", "digest": digest, "producer": "A05"}]))
+    store.add_artifact("T-be", kind="file", uri="src/out.py", digest="", producer="A05")
+    bundle = env.call("shared_handover_bundle", "A08", {"task_id": "T-be"})
+    assert [a["digest"] for a in bundle["artifacts"] if a["uri"] == "src/out.py"] == [digest]
+
+
+def test_open_questions_of_a_task_with_two_receivers_are_those_of_the_handover_addressed_to_the_caller(env):
+    make_world(env)
+    env.call("shared_handover_write", "A05", handover_payload(to_agent="A15", open_questions=["Docs question?"]))
+    env.call("shared_handover_write", "A05", handover_payload(to_agent="A14", goal="Record the debt", open_questions=["Debt question?"]))
+    mine = [q["question"] for q in env.call("shared_open_questions", "A15", {"task_id": "T-be"})["questions"] if q["origin"] == "handover"]
+    assert mine == ["Docs question?"]

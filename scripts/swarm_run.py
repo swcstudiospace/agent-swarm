@@ -210,11 +210,14 @@ def handover_section(task: dict, repo: Path) -> str:
     if status_of is None or latest is None:
         return ""
     blocks: list[str] = []
+    receiver = task.get("agent_id")
     for dep in task["depends_on"]:
         try:
             if (status_of(dep, root=repo) or {}).get("status") not in ("ok", "partial"):
                 continue
-            doc = latest(dep, root=repo)
+            # a task can hand over to several receivers (A15 and A14 of one release): this agent's own handover first, the
+            # newest one as context when none is addressed to it
+            doc = (latest(dep, root=repo, to_agent=receiver) if receiver else None) or latest(dep, root=repo)
         except (SwarmError, OSError, ValueError):
             continue
         if isinstance(doc, dict):

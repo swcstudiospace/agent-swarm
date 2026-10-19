@@ -996,6 +996,10 @@
             "type": "string",
             "minLength": 1
           },
+          "seq": {
+            "type": "integer",
+            "minimum": 1
+          },
           "probe": {
             "type": "string",
             "enum": [
@@ -1194,6 +1198,10 @@
           "task_id": {
             "type": "string",
             "minLength": 1
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 1
           },
           "probe": {
             "type": "string",
@@ -1565,6 +1573,10 @@
           "task_id": {
             "type": "string",
             "minLength": 1
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 1
           },
           "outputs": {
             "type": "array",

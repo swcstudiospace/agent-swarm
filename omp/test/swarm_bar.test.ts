@@ -146,7 +146,8 @@ describe("redactText shared vectors", () => {
   });
 
   test("1 MB adversarial inputs are scanned in time linear in their size (< 100 ms each)", () => {
-    const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-"];
+    const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
+      "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x"];
     for (const unit of units) {
       const text = unit.repeat(Math.floor(1_000_000 / unit.length));
       const started = performance.now();
@@ -160,6 +161,21 @@ describe("redactText shared vectors", () => {
       const out = redactText(`${lead}${"q".repeat(1_000_000)}${lead.startsWith("{") ? "\"}" : ""}`);
       expect({ lead, leaked: out.includes("qqqqqqqq") }).toEqual({ lead, leaked: false });
     }
+  });
+
+  test("a megabyte-long comma-separated secret value is redacted whole and fast", () => {
+    const started = performance.now();
+    const out = redactText(`API_TOKEN=${"q,".repeat(500_000)} done`);
+    expect(performance.now() - started).toBeLessThan(200);
+    expect(out.includes("q,q")).toBe(false);
+    expect(out.endsWith("[REDACTED] done")).toBe(true);
+  });
+
+  test("a signing seed assignment never reaches the activity row", () => {
+    const seed = "0123456789abcdef".repeat(4);
+    expect(sanitizeText(`SWARM_ED25519_KEY=${seed} bun run`)).toBe("SWARM_ED25519_KEY=[REDACTED] bun run");
+    expect(sanitizeText(`export SWARM_SIGNING_KEY=${seed}`)).toBe("export SWARM_SIGNING_KEY=[REDACTED]");
+    expect(sanitizeText("SWARM_ED25519_KEY_FILE=/home/u/signing-key.hex")).toBe("SWARM_ED25519_KEY_FILE=/home/u/signing-key.hex");
   });
 });
 

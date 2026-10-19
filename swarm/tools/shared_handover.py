@@ -229,12 +229,33 @@ def handover_write(payload: dict) -> dict:
     return respond(payload, lambda: _guarded(work))
 
 
+# ---- handover selection ----------------------------------------------------------------------------------------
+def _seq(payload: dict) -> int | None:
+    """The optional `seq` input: the exact handover of the task to act on (None: the caller's own, else the newest)."""
+    value = payload.get("seq")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ho.HandoverInvalid([f"/seq: {value!r} is not a handover sequence number (an integer of at least 1)"])
+    return value
+
+
+def _inspect(payload: dict, task_id: str, **kw) -> tuple[dict, dict | None]:
+    """`ho.inspect_handover` for the caller with the shared selection order: the explicit `seq`, else the newest handover
+    addressed to the caller, else the newest as context (`context_only`). A `seq` the task does not have is refused (never
+    answered with a different handover)."""
+    seq = _seq(payload)
+    status, doc = ho.inspect_handover(task_id, seq=seq, to_agent=current_caller() or None, **kw)
+    if seq is not None and status["status"] == "missing":
+        raise ho.HandoverInvalid([f"/seq: task {task_id} has no handover with seq {seq}"])
+    return status, doc
+
+
 # ---- handover_read ---------------------------------------------------------------------------------------------
 def handover_read(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
-        status, doc = ho.inspect_handover(task_id, correlation_id=payload.get("correlation_id"), seq=payload.get("seq"),
-                                          to_agent=current_caller() or None)
+        status, doc = _inspect(payload, task_id, correlation_id=payload.get("correlation_id"))
         row = ho.read_task(task_id)
         out = {"state": "SUCCESS", "found": doc is not None, "status": status["status"], "reasons": status["reasons"],
                "handover": doc or {}}
@@ -262,12 +283,15 @@ def handover_validate(payload: dict) -> dict:
 
 # ---- bundle / verify -------------------------------------------------------------------------------------------
 def _merge_artifacts(*sources: tuple[str, list[dict]]) -> list[dict]:
+    """Distinct (uri, digest) artifacts across the sources. An entry without a digest is dropped when another entry names
+    the same uri WITH one (the final result's output next to the handover's artifact is one file, not two)."""
+    digested = {str(i.get("uri") or "") for _t, items in sources for i in items if i.get("digest")}
     seen: set[tuple[str, str]] = set()
     merged: list[dict] = []
     for task_id, items in sources:
         for item in items:
             key = (str(item.get("uri") or ""), str(item.get("digest") or ""))
-            if key in seen or not key[0]:
+            if key in seen or not key[0] or (not key[1] and key[0] in digested):
                 continue
             seen.add(key)
             merged.append({"task_id": task_id, "kind": _clip(item.get("kind") or "artifact", 60), "uri": _clip(key[0], 300),
@@ -314,7 +338,7 @@ def handover_bundle(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
         clock = SYSTEM_CLOCK
-        status, doc = ho.inspect_handover(task_id, clock=clock, to_agent=current_caller() or None)
+        status, doc = _inspect(payload, task_id, clock=clock)
         with ho.StoreReader() as store:
             row = store.task(task_id)
             upstream_rows = [r for d in (row or {}).get("depends_on") or [] if isinstance(d, str) and (r := store.task(d))]
@@ -400,7 +424,7 @@ def _settle_bytes(out: dict) -> None:
 def handover_verify(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
-        status, doc = ho.inspect_handover(task_id, to_agent=current_caller() or None)
+        status, doc = _inspect(payload, task_id)
         with ho.StoreReader() as store:
             row = store.task(task_id)
             upstream = [{"task_id": d, "state": (r or {}).get("state") or "unknown", "satisfied": bool(r and r.get("state") in SATISFIED_STATES)}
@@ -486,12 +510,14 @@ def artifact_digest(payload: dict) -> dict:
     return respond(payload, lambda: _guarded(work))
 
 
-def _check_output(item: dict, expected: str) -> dict:
+def _check_output(item: dict, expected: str, inherited: dict | None = None) -> dict:
     uri = item.get("uri") if isinstance(item.get("uri"), str) else ""
     declared = item.get("digest") if isinstance(item.get("digest"), str) else ""
     producer = item.get("producer") if isinstance(item.get("producer"), str) else ""
     out = {"kind": _clip(item.get("kind") or "", 60), "uri": _clip(uri, 300), "status": "unchecked", "exists": "unchecked",
            "digest_match": "unchecked", "producer_ok": "unchecked", "actual_digest": "", "reason": ""}
+    if inherited:
+        out["inherited"] = inherited
     if expected:
         out["producer_ok"] = "yes" if producer == expected else "no"
     path, why = _local_path(uri) if uri else (None, "no uri")
@@ -521,29 +547,39 @@ def _check_output(item: dict, expected: str) -> dict:
     return out
 
 
-def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[dict], list[str]]:
-    """One row per output (a workspace file or uri): the newest of the handover's artifacts and the stored rows.
+def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[tuple[dict, dict | None]], list[str]]:
+    """`(item, inherited)` per output (a workspace file or uri) from the handover's artifacts and the stored rows.
 
     `apply_result` appends a row per version of an output, so after a rework the old digest sits next to the new one. The
-    old rows are history, not outputs to check; they are named in the returned notes. A document counts as written at
-    its `created_wall`, a stored row at its `ts`; on a tie the stored row wins."""
-    dated = [(float(doc.get("created_wall") or 0), 0, a) for a in (doc or {}).get("artifacts") or [] if isinstance(a, dict)]
-    dated += [(float(r.get("ts") or 0), 1, r) for r in stored if isinstance(r, dict)]
-    latest: dict[str, tuple[tuple[float, int, int], dict]] = {}
-    seen: dict[str, set[str]] = {}
-    for index, (ts, source, item) in enumerate(sorted(dated, key=lambda d: d[:2])):
+    reference of an output is its newest row WITH a digest; a newer row without one (the final `task.result` after a
+    handover that carried the digest) never discards it: the item is the newest row with the reference digest and
+    `inherited` names where the digest came from. Older rows with other digests are history, named in the returned notes
+    as superseded. A document counts as written at its `created_wall`, a stored row at its `ts`; on a tie the stored row
+    wins."""
+    origin = f"handover {(doc or {}).get('handover_id') or ''}".strip()
+    dated = [(float(doc.get("created_wall") or 0), 0, a, origin) for a in (doc or {}).get("artifacts") or [] if isinstance(a, dict)]
+    dated += [(float(r.get("ts") or 0), 1, r, "stored result row") for r in stored if isinstance(r, dict)]
+    groups: dict[str, list[tuple[tuple[float, int, int], dict, str]]] = {}
+    for index, (ts, source, item, where) in enumerate(sorted(dated, key=lambda d: d[:2])):
         uri = item.get("uri") if isinstance(item.get("uri"), str) else ""
         path, _why = _local_path(uri) if uri else (None, "")
-        key = str(path) if path is not None else uri or f"#{index}"
-        seen.setdefault(key, set()).add(str(item.get("digest") or ""))
-        latest[key] = ((ts, source, index), item)
+        groups.setdefault(str(path) if path is not None else uri or f"#{index}", []).append(((ts, source, index), item, where))
+    ranked: list[tuple[tuple[float, int, int], dict, dict | None]] = []
     notes = []
-    for key, (_rank, item) in latest.items():
-        old = sorted(d for d in seen[key] if d != str(item.get("digest") or ""))
-        if old:
-            notes.append(_clip(f"{item.get('uri') or key}: {len(old)} older digest(s) superseded and not checked: "
-                               f"{', '.join(old)}", 400))
-    return [item for _rank, item in sorted(latest.values(), key=lambda v: v[0])], notes
+    for key, rows in groups.items():
+        rank, item, _where = rows[-1]
+        reference = next(((r, i, w) for r, i, w in reversed(rows) if isinstance(i.get("digest"), str) and i["digest"]), None)
+        inherited = None
+        if reference is not None:
+            digest = reference[1]["digest"]
+            if not (isinstance(item.get("digest"), str) and item["digest"]):
+                item, inherited = {**item, "digest": digest}, {"digest": digest, "source": reference[2]}
+            old = sorted({i["digest"] for _r, i, _w in rows if isinstance(i.get("digest"), str) and i["digest"] and i["digest"] != digest})
+            if old:
+                notes.append(_clip(f"{item.get('uri') or key}: {len(old)} older digest(s) superseded and not checked: "
+                                   f"{', '.join(old)}", 400))
+        ranked.append((rank, item, inherited))
+    return [(item, inherited) for _rank, item, inherited in sorted(ranked, key=lambda v: v[0])], notes
 
 
 def artifact_check(payload: dict) -> dict:
@@ -560,19 +596,17 @@ def artifact_check(payload: dict) -> dict:
         expected = ho.agent_id_of(payload.get("agent")) or _agent_of_row(row)
         complete = True
         if outputs is None:
-            doc = None
-            try:
-                caller = current_caller()
-                doc = (ho.latest_handover(task_id, to_agent=caller) if caller else None) or ho.latest_handover(task_id)
-            except ho.HandoverInvalid as exc:
-                notes.append(f"handover unreadable: {exc.problems[0][:200]}")
-            outputs, superseded = _current_outputs(doc, stored)
+            status, doc = _inspect(payload, task_id)  # the explicit seq, else the caller's own handover, else the newest
+            if doc is None and status["status"] != "missing":
+                notes.append(f"handover unreadable: {(status['reasons'] or [status['status']])[0][:200]}")
+            entries, superseded = _current_outputs(doc, stored)
             notes += superseded
-            if len(outputs) > MAX_OUTPUTS:
+            if len(entries) > MAX_OUTPUTS:
                 complete = False
-                notes.append(f"only the first {MAX_OUTPUTS} of {len(outputs)} outputs were checked; verified is false")
-        items = [o for o in outputs if isinstance(o, dict)][:MAX_OUTPUTS]
-        results = [_check_output(item, expected) for item in items]
+                notes.append(f"only the first {MAX_OUTPUTS} of {len(entries)} outputs were checked; verified is false")
+        else:
+            entries = [(o, None) for o in outputs if isinstance(o, dict)]
+        results = [_check_output(item, expected, inherited) for item, inherited in entries[:MAX_OUTPUTS]]
         failed = sum(1 for r in results if r["status"] in ("missing", "digest_mismatch", "producer_mismatch"))
         unchecked = sum(1 for r in results if r["status"] in ("unchecked", "no_digest"))
         good = sum(1 for r in results if r["status"] == "ok")
@@ -784,10 +818,7 @@ def open_questions(payload: dict) -> dict:
             upstream = [r for d in (row or {}).get("depends_on") or [] if isinstance(d, str) and (r := store.task(d))]
         questions = [{"task_id": up["task_id"], "origin": "upstream", "task_state": up.get("state") or "", "question": q}
                      for up in upstream if _unresolved(up) for q in _upstream_questions(up)]
-        try:
-            doc = ho.latest_handover(task_id)
-        except ho.HandoverInvalid:
-            doc = None  # a malformed handover is reported by handover_verify, not guessed at here
+        doc = _inspect({}, task_id)[1]  # the handover addressed to the caller, else the newest; a malformed one is left to handover_verify
         if doc:
             questions += [{"task_id": task_id, "origin": "handover", "task_state": (row or {}).get("state") or "",
                            "question": _clip(q)} for q in doc["open_questions"]]

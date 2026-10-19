@@ -55,11 +55,32 @@ def test_shared_vectors(case):
 
 def test_megabyte_inputs_are_scanned_in_linear_time():
     import time
-    for unit in ("a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-"):
+    for unit in ("a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
+                 "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x"):
         text = unit * (1_000_000 // len(unit))
         started = time.perf_counter()
         redact_text(text)
         assert time.perf_counter() - started < 3.0, unit  # a quadratic scan of 1 MB takes minutes
+
+
+def test_megabyte_comma_separated_secret_value_is_redacted_whole_and_fast():
+    import time
+    started = time.perf_counter()
+    out = redact_text("API_TOKEN=" + "q," * 500_000 + " done")
+    assert time.perf_counter() - started < 3.0
+    assert "qq" not in out and "q,q" not in out and out.endswith(f"{REDACTED} done")
+
+
+def test_signer_variables_are_sensitive_dict_keys_and_key_files_are_not():
+    from swarm.redact import is_sensitive_key, redact
+    for name in ("SWARM_ED25519_KEY", "SWARM_SIGNING_KEY", "SWARM_ED25519_SEED", "swarmEd25519Key", "ed25519-key", "SUBSTRATE_HANDOFF_KEY",
+                 "SUBSTRATE_OPERATOR_TOKENS", "bearer"):
+        assert is_sensitive_key(name), name
+    for name in ("SWARM_ED25519_KEY_FILE", "SWARM_ED25519_KEY_PATH", "KEYBOARD", "MONKEY", "keyframes", "sort_key", "random_seed", "seed",
+                 "cache_key_prefix", "SWARM_ED25519_PUBLIC_KEY", "SWARM_BAR_KEY", "max_tokens"):
+        assert not is_sensitive_key(name), name
+    out = redact({"SWARM_ED25519_KEY": "0123", "SWARM_ED25519_KEY_FILE": "/home/u/key.hex", "SWARM_SIGNING_KEY": "abcd"})
+    assert out == {"SWARM_ED25519_KEY": REDACTED, "SWARM_ED25519_KEY_FILE": "/home/u/key.hex", "SWARM_SIGNING_KEY": REDACTED}
 
 
 def test_pem_block_whole_and_truncated():

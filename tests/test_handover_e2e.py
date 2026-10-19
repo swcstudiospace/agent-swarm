@@ -116,7 +116,12 @@ def emit(world, *, to_agent="A08", frm="A05", task_id="T-be", check=True, **over
     validated = ok(call("shared_handover_validate", frm, {"document": {**body, "correlation_id": CORR, "from_agent": frm}, "draft": True}))
     if check:
         assert validated["valid"], validated
-    return call("shared_handover_write", frm, body)
+    written = call("shared_handover_write", frm, body)
+    if written["state"] == "SUCCESS":  # step 7: the read-back is pinned to the seq just written
+        back = ok(call("shared_handover_read", frm, {"task_id": task_id, "seq": written["seq"]}))
+        assert back["status"] == written["status"] and back["handover"]["handover_id"] == written["handover_id"], back
+        assert back["handover"]["digest"] == written["digest"] and back["handover"]["to_agent"] == to_agent
+    return written
 
 
 # ----------------------------------------------------------------------------------- receiver: the intake sequence
@@ -219,6 +224,21 @@ def test_the_runner_shows_the_same_handover_to_the_dependent_task(world):
     assert "Test the CSV export so every row streams" in section and "src/export.py" in section
     assert [c.path.name for c in ho.list_handovers("T-be")] == ["T-be.1.json"]
     assert ho.list_handovers("T-qa") == [], "nothing is ever filed under the receiver's task id"
+
+
+def test_the_runner_shows_each_dependent_the_handover_addressed_to_its_agent(world):
+    """Greptile: a task hands over to several receivers; the assignment of the A08 task must carry the handover addressed to A08
+    even when a later one went to another agent (the newest is only the fallback context)."""
+    finish_upstream(world)
+    ok(emit(world, to_agent="A08", goal="Test the CSV export so every row streams"))
+    ok(emit(world, to_agent="A15", goal="Document the CSV export endpoint for the release notes"))
+    mod = sc._runner()
+    section = mod.handover_section(world.store.get("T-qa"), world.root)  # T-qa belongs to A08
+    assert "Test the CSV export so every row streams" in section, section
+    assert "Document the CSV export endpoint" not in section
+    other = world.store.get("T-qa")
+    other["agent_id"] = "A02"  # an agent with no handover of its own gets the newest one as context
+    assert "Document the CSV export endpoint" in mod.handover_section(other, world.root)
 
 
 def test_the_receivers_own_task_id_finds_nothing_so_it_must_read_its_upstream_ids(world):
@@ -417,3 +437,29 @@ def test_two_receivers_of_one_task_each_acknowledge_their_own_handover(world):
         assert bundle["handover"]["digest"] == mine["digest"]
         receipt = ok(call("shared_handover_receipt", me, {"task_id": "T-be", "digest": bundle["handover"]["digest"]}))
         assert receipt["handover_id"] == mine["handover_id"]
+
+
+def test_a_resumed_producer_confirms_its_own_handover_not_the_checkpoint_addressed_to_it(world):
+    """Greptile P1: A01 left a checkpoint for A05 under T-be; A05 writes to A08 and reads back with the written seq."""
+    checkpoint = ok(emit(world, frm="A01", to_agent="A05", goal="Resume the CSV export and hand it to testing"))
+    outgoing = ok(emit(world))
+    assert outgoing["seq"] == checkpoint["seq"] + 1
+    unpinned = ok(call("shared_handover_read", "A05", {"task_id": "T-be"}))
+    assert unpinned["handover"]["handover_id"] == checkpoint["handover_id"], "unpinned: the incoming checkpoint"
+    pinned = ok(call("shared_handover_read", "A05", {"task_id": "T-be", "seq": outgoing["seq"]}))
+    assert pinned["handover"]["handover_id"] == outgoing["handover_id"] and pinned["handover"]["to_agent"] == "A08"
+
+
+def test_a_final_result_without_a_digest_does_not_discard_the_handovers_digest(world):
+    """Greptile P2: the handover is written before the final task.result, whose outputs may omit `digest`."""
+    finish_upstream(world)
+    ok(emit(world))
+    time.sleep(0.02)
+    world.store.add_artifact("T-be", kind="code", uri="src/export.py", digest="", producer="A05")
+    out = intake(world)
+    assert out["outcome"] == "continue"
+    assert out["working_set"]["sources"]["T-be"]["artifact_status"] == ["ok"]
+    checked = ok(call("shared_artifact_check", "A08", {"task_id": "T-be"}))
+    assert checked["results"][0]["inherited"]["source"] == "handover T-be.1" and checked["verified"] is True
+    (world.root / "src" / "export.py").write_text(EXPORT + "# edited after the result\n")
+    assert ok(call("shared_artifact_check", "A08", {"task_id": "T-be"}))["results"][0]["status"] == "digest_mismatch"

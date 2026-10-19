@@ -61,21 +61,29 @@ const REDACTED = "[REDACTED]";
 const words = (list: string): Record<string, true> => Object.fromEntries(list.split(" ").map((w) => [w, true]));
 const SENSITIVE_TOKENS = words(
   "token secret password passwd passphrase credential credentials signing private cookie cookies auth oauth authorization " +
-    "authorisation authentication apikey accesskey secretkey privatekey signingkey sshkey masterkey encryptionkey",
+    "authorisation authentication apikey accesskey secretkey privatekey signingkey sshkey masterkey encryptionkey bearer",
 );
-const KEY_PREFIX_LIST = "api access secret private signing ssh encryption master auth session license licence client";
+/** `<prefix>_key` / `<prefix>_seed` is a credential only after these prefixes (`SWARM_ED25519_KEY`, `signing_seed`); a bare `key`/`seed`, `sort_key`, `random_seed` stay readable. */
+const KEY_PREFIX_LIST =
+  "api access secret private signing ssh encryption master auth session license licence client ed25519 hmac jwt handoff signer";
 const KEY_PREFIXES = words(KEY_PREFIX_LIST);
+const KEY_WORDS = words("key seed");
+/** Plurals are counts/labels (`tokens: 1200`, `max_tokens`) unless right after one of these (`SUBSTRATE_OPERATOR_TOKENS`, `api_keys`). */
+const PLURAL_WORDS = words("tokens secrets passwords keys");
+const PLURAL_CONTEXT = words("operator api access bearer auth session");
+/** A name whose LAST token is one of these holds a path to the secret, not the secret (`SWARM_ED25519_KEY_FILE`). */
+const PATH_TOKENS = words("file path");
 const SENSITIVE_SUFFIXES: readonly string[] = [
   "password", "passwd", "passphrase", "token", "secret", "credential", "credentials", "apikey", "accesskey",
   "secretkey", "privatekey", "signingkey", "sshkey", "masterkey", "encryptionkey",
-  ...KEY_PREFIX_LIST.split(" ").map((p) => `${p}key`),
+  ...KEY_PREFIX_LIST.split(" ").flatMap((p) => [`${p}key`, `${p}seed`]),
 ];
 const PASS_TOKENS = words("pass pwd");
 const PASS_CONTEXT = words(
   "db database sql mysql pg postgres postgresql mongo mongodb redis smtp imap ftp sftp ssh ldap amqp rabbitmq user admin root login mail auth master",
 );
 /** Whole-word names too generic for the prose-prone `name: value` and `--flag value` forms; `=` and JSON pairs keep them. */
-const WEAK_TOKENS = words("auth oauth private signing cookie cookies authentication authorization authorisation");
+const WEAK_TOKENS = words("auth oauth private signing cookie cookies authentication authorization authorisation bearer");
 const NAME_CAP = 256;
 const CAMEL_SPLIT = /(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/;
 
@@ -88,6 +96,7 @@ function nameTokens(name: string): string[] {
 }
 
 function sensitiveTokens(toks: string[], strict: boolean): boolean {
+  if (toks.length > 1 && PATH_TOKENS[toks[toks.length - 1]!] === true) return false;
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i]!;
     if (SENSITIVE_TOKENS[t] === true) {
@@ -96,8 +105,9 @@ function sensitiveTokens(toks: string[], strict: boolean): boolean {
       return true;
     } else if (i > 0) {
       const prev = toks[i - 1]!;
-      if (t === "key" && KEY_PREFIXES[prev] === true) return true;
+      if (KEY_WORDS[t] === true && KEY_PREFIXES[prev] === true) return true;
       if (PASS_TOKENS[t] === true && PASS_CONTEXT[prev] === true) return true;
+      if (PLURAL_WORDS[t] === true && PLURAL_CONTEXT[prev] === true) return true;
     }
   }
   return false;
@@ -129,11 +139,13 @@ const TOKENS = [
 const BEARER = /(?<![A-Za-z0-9])([Bb]earer\s{1,16})[A-Za-z0-9._~+/=-]{16,}/g;
 /** `Authorization: Basic <base64>` (and Proxy-Authorization); a bare "basic <word>" in prose is not touched. */
 const BASIC = /(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}["']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}/gi;
+/** Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header: the rest of the line up to a quote is the credential (Bearer/Basic keep their scheme). */
+const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]{0,3}:(?![ \t]{0,3}(?:Bearer|Basic)\b)[ \t]{0,3})[^\s"'][^\r\n"']{0,511}/gi;
 /** scheme://user:password@host: the password runs to the LAST '@' before the first '/' or whitespace. */
 const USERINFO = /(\b[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/\s@:]{0,256}:[^/\s]{0,256}@/g;
 // The loops below are written unrolled (`[^x]*(?:\\(?!")[^x]*)*`, not `(?:[^x]|\\(?!"))*`): same language as the Python
 // patterns, but a megabyte-long value no longer exhausts the regex engine's backtrack stack (which skips the match, i.e. leaks).
-const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?=[^\s&;,"'\\]|\\(?!"))[^\s&;,"'\\]*(?:\\(?!")[^\s&;,"'\\]*)*)`;
+const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?=[^\s&;"'\\]|\\(?!"))[^\s&;"'\\]*(?:\\(?!")[^\s&;"'\\]*)*)`;
 /** NAME=value / NAME = value (any sensitive name) and NAME: value (strict names only; prose-safe). */
 const NAME_VALUE = new RegExp(
   String.raw`(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})` + VALUE,
@@ -158,6 +170,7 @@ export function redactText(text: string): string {
   s = s.replace(BEARER, (_m, lead: string) => lead + REDACTED);
   s = s.replace(BASIC, (_m, lead: string) => lead + REDACTED);
   s = s.replace(USERINFO, (_m, scheme: string) => `${scheme}${REDACTED}@`);
+  s = s.replace(HEADER, (_m, lead: string) => lead + REDACTED);
   s = s.replace(NAME_VALUE, (m, name: string, sep: string) => {
     const hit = sep.includes("=") ? isSensitiveKey(name) : isStrictKey(name);
     return hit ? `${name}${sep}${REDACTED}` : m;

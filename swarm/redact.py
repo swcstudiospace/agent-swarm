@@ -2,11 +2,12 @@
 
 `redact()` returns a redacted COPY; the caller's object is never mutated. Two independent layers:
   * sensitive keys (see `is_sensitive_key`: a name token that IS or ENDS WITH token, secret, password, credential,
-    apikey ... (`PGPASSWORD`, `accesstoken`), a whole-word signing/private/cookie/auth(orization), a
-    `api|access|secret|private|signing|ssh|encryption|master|auth|session|license|client` + `key` pair, or a
-    `<db|mysql|pg|...>_pass|pwd` pair): every string beneath such a dict key is replaced. Numbers, booleans and None
-    stay, so a counter such as `tokens: 1200` survives. A bare `key`, `sort_key`, `cache_key`, `author` or `authority`
-    is not a credential.
+    apikey ... (`PGPASSWORD`, `accesstoken`), a whole-word signing/private/cookie/auth(orization)/bearer, a
+    `api|access|secret|private|signing|ssh|encryption|master|auth|session|license|client|ed25519|hmac|jwt|handoff|signer`
+    + `key|seed` pair (`SWARM_ED25519_KEY`), or a `<db|mysql|pg|...>_pass|pwd` pair; a name ending in `file`/`path`
+    (`SWARM_ED25519_KEY_FILE`) names a location, not a secret): every string beneath such a dict key is replaced.
+    Numbers, booleans and None stay, so a counter such as `tokens: 1200` survives. A bare `key`, `seed`, `sort_key`,
+    `cache_key`, `author` or `authority` is not a credential.
   * text patterns inside any string: GitHub, `sk-`, AWS, Slack and Bearer tokens, `Authorization: Basic`, JWTs, PEM
     private-key blocks, `NAME=value`, `NAME: value`, `--flag value`, `"NAME": "value"` / `'NAME': 'value'` /
     `\\"NAME\\": \\"value\\"` pairs with a sensitive NAME, and URL userinfo (`scheme://user:pass@host`, the password may
@@ -24,20 +25,26 @@ REDACTED = "[REDACTED]"
 _SENSITIVE_TOKENS = frozenset({
     "token", "secret", "password", "passwd", "passphrase", "credential", "credentials",
     "signing", "private", "cookie", "cookies", "auth", "oauth", "authorization", "authorisation", "authentication",
-    "apikey", "accesskey", "secretkey", "privatekey", "signingkey", "sshkey", "masterkey", "encryptionkey",
+    "apikey", "accesskey", "secretkey", "privatekey", "signingkey", "sshkey", "masterkey", "encryptionkey", "bearer",
 })
 # Plural `tokens`/`secrets`/`passwords` are deliberately absent: they are counts and category labels in this codebase
-# (`tokens: 1200`, `max_tokens`, `ux_tokens`, `runs: {"secrets": "pass"}`); the singular names hold credentials.
-# `<prefix>_key` is a credential only for these prefixes; a bare `key`, `sort_key`, `cache_key`, `idempotency_key`,
-# `dedupe_key` ... is an identifier and stays readable.
+# (`tokens: 1200`, `max_tokens`, `ux_tokens`, `runs: {"secrets": "pass"}`); the singular names hold credentials. The one
+# exception is a plural right after one of `_PLURAL_CONTEXT` (`SUBSTRATE_OPERATOR_TOKENS`, `api_keys`: credential lists).
+# `<prefix>_key` / `<prefix>_seed` is a credential only for these prefixes (`SWARM_ED25519_KEY`, `signing_seed`); a bare
+# `key`/`seed`, `sort_key`, `cache_key`, `idempotency_key`, `random_seed` ... is an identifier and stays readable.
 _KEY_PREFIXES = frozenset({"api", "access", "secret", "private", "signing", "ssh", "encryption", "master", "auth",
-                           "session", "license", "licence", "client"})
+                           "session", "license", "licence", "client", "ed25519", "hmac", "jwt", "handoff", "signer"})
+_KEY_WORDS = frozenset({"key", "seed"})
+_PLURAL_WORDS = frozenset({"tokens", "secrets", "passwords", "keys"})
+_PLURAL_CONTEXT = frozenset({"operator", "api", "access", "bearer", "auth", "session"})
+# A name whose LAST token is one of these holds a path to the secret, not the secret (`SWARM_ED25519_KEY_FILE`).
+_PATH_TOKENS = frozenset({"file", "path"})
 # A name token that merely ENDS with one of these is a glued compound (`PGPASSWORD`, `accesstoken`, `clientsecret`,
 # `sessionkey`): sensitive too. Plural forms (`tokens`, `secrets`) do not end with them and stay readable.
 _SENSITIVE_SUFFIXES = tuple(sorted({
     "password", "passwd", "passphrase", "token", "secret", "credential", "credentials", "apikey", "accesskey",
     "secretkey", "privatekey", "signingkey", "sshkey", "masterkey", "encryptionkey",
-} | {p + "key" for p in _KEY_PREFIXES}))
+} | {p + w for p in _KEY_PREFIXES for w in _KEY_WORDS}))
 # `DB_PASS`, `MYSQL_PWD`: `pass`/`pwd` are credentials only right after a service/account word (a bare `PWD` is the cwd,
 # `gate_pass` is a verdict).
 _PASS_TOKENS = frozenset({"pass", "pwd"})
@@ -46,7 +53,7 @@ _PASS_CONTEXT = frozenset({"db", "database", "sql", "mysql", "pg", "postgres", "
                            "login", "mail", "auth", "master"})
 # Whole-word names too generic for the prose-prone `name: value` and `--flag value` forms; `=` and JSON pairs keep them.
 _WEAK_TOKENS = frozenset({"auth", "oauth", "private", "signing", "cookie", "cookies", "authentication", "authorization",
-                          "authorisation"})
+                          "authorisation", "bearer"})
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 _NAME_CAP = 256  # names longer than this are not credential names (and are never scanned in full)
@@ -58,6 +65,8 @@ def _name_tokens(name: str) -> list[str]:
 
 
 def _sensitive(toks: list[str], *, strict: bool) -> bool:
+    if len(toks) > 1 and toks[-1] in _PATH_TOKENS:
+        return False
     for i, t in enumerate(toks):
         if t in _SENSITIVE_TOKENS:
             if not (strict and t in _WEAK_TOKENS):
@@ -65,9 +74,11 @@ def _sensitive(toks: list[str], *, strict: bool) -> bool:
         elif t.endswith(_SENSITIVE_SUFFIXES):
             return True
         elif i > 0:
-            if t == "key" and toks[i - 1] in _KEY_PREFIXES:
+            if t in _KEY_WORDS and toks[i - 1] in _KEY_PREFIXES:
                 return True
             if t in _PASS_TOKENS and toks[i - 1] in _PASS_CONTEXT:
+                return True
+            if t in _PLURAL_WORDS and toks[i - 1] in _PLURAL_CONTEXT:
                 return True
     return False
 
@@ -102,10 +113,15 @@ _BEARER_RE = re.compile(r"(?<![A-Za-z0-9])([Bb]earer\s{1,16})[A-Za-z0-9._~+/=-]{
 # `Authorization: Basic <base64>` (and Proxy-Authorization); a bare "basic <word>" in prose is not touched.
 _BASIC_RE = re.compile(r"(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}[\"']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}",
                        re.IGNORECASE)
+# Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header (`Authorization: Token x`, `Cookie: sid=x; theme=dark`): the rest of
+# the line up to a quote is the credential. Bearer/Basic keep their scheme visible (handled above).
+_HEADER_RE = re.compile(r"(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]{0,3}:(?![ \t]{0,3}(?:Bearer|Basic)\b)[ \t]{0,3})[^\s\"'][^\r\n\"']{0,511}",
+                        re.IGNORECASE)
 # scheme://user:password@host: the user cannot contain ':' (so the split is unambiguous), the password runs to the LAST
 # '@' before the first '/' or whitespace (`postgres://u:p@ss@host/db`).
 _USERINFO_RE = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/\s@:]{0,256}:[^/\s]{0,256}@")
-_VALUE = r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?:[^\s&;,"'\\]|\\(?!"))+)"""
+# ',' is part of an unquoted value (`TOKENS=one,two`): a credential may contain it, and a list of credentials is comma-joined.
+_VALUE = r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?:[^\s&;"'\\]|\\(?!"))+)"""
 # The second lookbehind keeps a `a.b.c.d` / `a-b-c` run from re-starting a 128-char scan at every dot or dash.
 # NAME=value / NAME = value (any sensitive name) and NAME: value / NAME : value (strict names only; prose-safe).
 _NAME_VALUE_RE = re.compile(
@@ -154,6 +170,7 @@ def redact_text(s: str) -> str:
     s = _BEARER_RE.sub(lambda m: m.group(1) + REDACTED, s)
     s = _BASIC_RE.sub(lambda m: m.group(1) + REDACTED, s)
     s = _USERINFO_RE.sub(lambda m: f"{m.group(1)}{REDACTED}@", s)
+    s = _HEADER_RE.sub(lambda m: m.group(1) + REDACTED, s)
     s = _NAME_VALUE_RE.sub(_name_value, s)
     s = _FLAG_RE.sub(_flag, s)
     s = _PAIR_RE.sub(_pair, s)
