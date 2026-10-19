@@ -471,20 +471,18 @@ def handover_receipt(payload: dict) -> dict:
 
 
 # ---- artifacts -------------------------------------------------------------------------------------------------
-_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:")
-_HOST_SEGMENT_RE = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?\Z")
+_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_REFERENCE_KINDS = frozenset({"image", "container", "registry", "package", "url", "link"})
 
 
-def _is_reference(text: str, root: Path) -> bool:
-    """A relative `text` that names an image or package reference, not a file: it pins a digest (`app@sha256:...`), starts
-    with a registry host (`ghcr.io/org/app`, a dotted first segment) or tags its last segment (`org/app:1.2`). A workspace
-    file of that name wins: `./name` or an existing path is always a file."""
+def _is_reference(text: str, kind: str, root: Path) -> bool:
+    """A relative `text` that names an image or package reference, not a file. Only declared forms count: a digest pin
+    (`app@sha256:...`, `@sha512:`) or an output `kind` of image, container, registry, package, url or link. Everything
+    else is a local path, however dotted or colon-bearing (`v1.2/app.js`, `ghcr.io/x/y.md`), so an absent file is
+    `missing`, never `unchecked`. A workspace file of that name always wins; `./name` and absolute paths are files."""
     if text.startswith(("/", "./", "../")):
         return False
-    first, sep, _rest = text.partition("/")
-    last = text.rsplit("/", 1)[-1]
-    shaped = "@sha256:" in text or (bool(sep) and _HOST_SEGMENT_RE.match(first) is not None) or ":" in last
-    if not shaped:
+    if "@sha256:" not in text and "@sha512:" not in text and kind.strip().lower() not in _REFERENCE_KINDS:
         return False
     try:
         return not (root / text).exists()
@@ -492,8 +490,9 @@ def _is_reference(text: str, root: Path) -> bool:
         return True
 
 
-def _local_path(uri: str) -> tuple[Path | None, str]:
-    """The workspace file a uri names, else (None, why it is not checked). Only the workspace and the swarm dir are read."""
+def _local_path(uri: str, kind: str = "") -> tuple[Path | None, str]:
+    """The workspace file a uri names, else (None, why it is not checked). Only the workspace and the swarm dir are read.
+    `kind` is the output's declared kind: it marks a scheme-less uri as a registry or package reference."""
     text = uri.strip()
     root = target_root()
     if text.startswith("file://"):
@@ -503,7 +502,7 @@ def _local_path(uri: str) -> tuple[Path | None, str]:
         text = unquote(parsed.path)
     elif _SCHEME_RE.match(text):
         return None, f"not a local file ({text.split(':', 1)[0]})"
-    elif _is_reference(text, root):
+    elif _is_reference(text, kind, root):
         return None, "not a local file (registry or package reference)"
     path = Path(text)
     resolved = (path if path.is_absolute() else root / path).resolve()
@@ -552,7 +551,7 @@ def _check_output(item: dict, expected: str, inherited: dict | None = None) -> d
         out["inherited"] = inherited
     if expected:
         out["producer_ok"] = "yes" if producer == expected else "no"
-    path, why = _local_path(uri) if uri else (None, "no uri")
+    path, why = _local_path(uri, item["kind"] if isinstance(item.get("kind"), str) else "") if uri else (None, "no uri")
     unreadable = ""
     if path is not None:
         out["exists"] = "yes" if path.is_file() else "no"
@@ -601,7 +600,7 @@ def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[tuple[d
     groups: dict[str, list[tuple[tuple[float, int, int], dict, str]]] = {}
     for index, (ts, source, item, where) in enumerate(sorted(dated, key=lambda d: d[:2])):
         uri = item.get("uri") if isinstance(item.get("uri"), str) else ""
-        path, _why = _local_path(uri) if uri else (None, "")
+        path, _why = _local_path(uri, item["kind"] if isinstance(item.get("kind"), str) else "") if uri else (None, "")
         groups.setdefault(str(path) if path is not None else uri or f"#{index}", []).append(((ts, source, index), item, where))
     ranked: list[tuple[tuple[float, int, int], dict, dict | None]] = []
     notes = []

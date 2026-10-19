@@ -345,23 +345,26 @@ def test_clarification_request_is_a_blocked_task_result(env):
 
 # ---- concurrency ----------------------------------------------------------------------------------------------
 def test_concurrent_writers_get_distinct_sequence_numbers(env):
-    errors, seqs = [], []
+    errors, written = [], []
 
     def writer(i):
         try:
-            seqs.append(env.write(base(goal=f"writer {i}"))["seq"])
+            written.append(env.write(base(goal=f"writer {i}")))
         except Exception as exc:  # noqa: BLE001 - collected and asserted below
             errors.append(exc)
 
-    threads = [threading.Thread(target=writer, args=(i,)) for i in range(10)]
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     assert errors == []
-    assert sorted(seqs) == list(range(1, 11))
-    docs = [env.ho.read_handover(f"T1-be.{n}", root=env.root) for n in range(1, 11)]
-    assert len({d["goal"] for d in docs}) == 10 and {d["handover_id"] for d in docs} == {f"T1-be.{n}" for n in range(1, 11)}
+    assert sorted(w["seq"] for w in written) == list(range(1, 9))
+    for w in written:  # each returned receipt describes the content of ITS seq, not another writer's
+        on_disk = env.ho.read_handover(f"T1-be.{w['seq']}", root=env.root)
+        assert on_disk["digest"] == w["digest"] and on_disk["goal"] == w["document"]["goal"]
+    docs = [env.ho.read_handover(f"T1-be.{n}", root=env.root) for n in range(1, 9)]
+    assert len({d["goal"] for d in docs}) == 8 and {d["handover_id"] for d in docs} == {f"T1-be.{n}" for n in range(1, 9)}
     leftovers = [p.name for p in (env.sdir / "handovers" / "corr-1").iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []  # every temp file was replaced into place
 
@@ -672,28 +675,22 @@ def _husk(env, seq, age_s, task="T1-be", corr="corr-1"):
     return path
 
 
-def test_an_old_empty_reserved_file_is_reclaimed_and_its_seq_reused(env):
-    """RV-I P3-7: a writer killed between the O_EXCL create and `os.replace` left a 0-byte `T1-be.2.json` forever, and every
-    later write skipped to seq 3 (a gap a reader that scans seq upward stops at)."""
+@pytest.mark.parametrize("age_s", [1, 3600, 30 * 86400])
+def test_an_empty_reserved_file_is_left_alone_whatever_its_age(env, age_s):
+    """Age is not ownership: a writer that reserved seq 2 may still be about to publish, so nothing removes or reuses an
+    empty reserved file. A crashed writer leaves a harmless gap and the next write takes the next seq."""
     env.write()
-    husk = _husk(env, 2, age_s=env.ho.RESERVE_RECLAIM_S + 60)
-    second = env.write(base(goal="A changed goal"))
-    assert second["seq"] == 2 and second["handover_id"] == "T1-be.2" and husk.stat().st_size > 0
-    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == [1, 2]
-    assert env.ho.read_handover("T1-be.2", root=env.root)["goal"] == "A changed goal"
-
-
-def test_a_young_empty_reserved_file_belongs_to_a_writer_at_work(env):
-    env.write()
-    husk = _husk(env, 2, age_s=1)
+    husk = _husk(env, 2, age_s=age_s)
     third = env.write(base(goal="A changed goal"))
-    assert third["seq"] == 3 and husk.stat().st_size == 0
+    assert third["seq"] == 3 and third["handover_id"] == "T1-be.3" and husk.exists() and husk.stat().st_size == 0
+    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == [1, 3]
+    assert env.ho.read_handover("T1-be.3", root=env.root)["goal"] == "A changed goal"
 
 
-def test_an_old_empty_file_below_a_valid_one_is_removed(env):
+def test_an_old_empty_file_below_a_valid_one_is_left_alone(env):
     env.write()
     env.write(base(goal="second goal"))
     env.file(seq=1).unlink()
-    husk = _husk(env, 1, age_s=env.ho.RESERVE_RECLAIM_S + 60)  # a dead writer's husk under a valid seq 2
+    husk = _husk(env, 1, age_s=30 * 86400)
     third = env.write(base(goal="third goal"))
-    assert third["seq"] == 3 and not husk.exists()
+    assert third["seq"] == 3 and husk.exists()

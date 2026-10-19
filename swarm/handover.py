@@ -50,7 +50,6 @@ MANDATORY = ("goal", "remaining", "blockers", "open_questions", "constraints")
 STRING_LISTS = ("completed", "remaining", "blockers", "open_questions", "constraints")
 CLIP_ITEM = 120  # characters an entry of completed/decisions keeps once the document had to be shortened
 MAX_FILE_BYTES = 1 << 20  # a file larger than this is never parsed, whatever the cap says
-RESERVE_RECLAIM_S = 60.0  # an empty reserved handover file older than this was left by a writer that died before it wrote
 MAX_REASON = 400
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -429,29 +428,13 @@ def _reserve(folder: Path, task_id: str, start: int) -> tuple[int, Path]:
 
 
 def _next_seq(folder: Path, task_id: str) -> int:
-    """One above the highest seq of `task_id` in `folder`. An EMPTY file older than `RESERVE_RECLAIM_S` is the husk of a
-    writer that died between the reservation and its first write: it is removed (so its seq is reused when it was the
-    highest, and no reader meets a permanently empty file); a young empty file belongs to a writer at work and counts."""
+    """One above the highest seq of `task_id` in `folder`, empty reserved files included: a file of a writer that died
+    after its reservation leaves a harmless gap and is never reused or removed (age is not ownership)."""
     pattern = re.compile(re.escape(task_id) + r"\.(\d+)\.json\Z")
-    seqs: list[int] = []
     try:
-        names = os.listdir(folder)
+        seqs = [int(m.group(1)) for name in os.listdir(folder) if (m := pattern.match(name))]
     except OSError:
-        return 1
-    for name in names:
-        match = pattern.match(name)
-        if not match:
-            continue
-        try:
-            info = (folder / name).stat()
-            if info.st_size == 0 and time.time() - info.st_mtime > RESERVE_RECLAIM_S:
-                (folder / name).unlink()
-                continue
-        except FileNotFoundError:
-            continue
-        except OSError:
-            pass
-        seqs.append(int(match.group(1)))
+        seqs = []
     return max(seqs, default=0) + 1
 
 

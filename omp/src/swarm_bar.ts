@@ -417,8 +417,7 @@ const ESC_PAIR = /(?<lead>\\"(?<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\"
 /** TS port of `swarm/redact.py redact_text`: every secret-looking span becomes `[REDACTED]`. */
 export function redactText(text: string): string {
   if (text.length < 6) return text;
-  let s = text.replace(PEM, REDACTED).replace(JWT, REDACTED);
-  for (const rx of TOKENS) s = s.replace(rx, REDACTED);
+  let s = text.replace(PEM, REDACTED);
   s = s.replace(BEARER, (_m, lead: string) => lead + REDACTED);
   s = s.replace(BASIC, (_m, lead: string) => lead + REDACTED);
   s = s.replace(USERINFO, (_m, scheme: string) => `${scheme}${REDACTED}@`);
@@ -426,6 +425,9 @@ export function redactText(text: string): string {
   s = maskYaml(maskCli(s));
   s = scan(s, NAME_SEP, VALUE_AT, true);
   s = scan(s, FLAG_SEP, FLAG_VALUE_AT, false);
+  // Token shapes run AFTER the name passes: a sensitive NAME owns its whole value up to the original boundary (`SECRET=ghp_x,second`).
+  s = s.replace(JWT, REDACTED);
+  for (const rx of TOKENS) s = s.replace(rx, REDACTED);
   s = s.replace(PAIR, (...args) => {
     const g = args[args.length - 1] as { lead: string; name: string; v: string };
     return isCredentialPair(g.name, g.v.slice(1, -1)) ? `${g.lead}${g.v[0]}${REDACTED}${g.v[0]}` : (args[0] as string);

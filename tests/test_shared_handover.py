@@ -1087,6 +1087,43 @@ def test_registry_references_are_unchecked_never_missing(env):
     assert result["failed"] == 1 and result["unchecked"] == len(refs) + 1
 
 
+def _check_one(env, uri, kind):
+    out = {"kind": kind, "uri": uri, "digest": "sha256:" + "a" * 64, "producer": "A11"}
+    return env.call("shared_artifact_check", "A12", {"task_id": "T-build", "agent": "A11", "outputs": [out]})["results"][0]
+
+
+@pytest.mark.parametrize("uri", ["v1.2/app.js", "ghcr.io/x/y.md", "docker.io/org/app:1.2", "org/app:1.2", "app:1.2",
+                                 "localhost:5000/app", "docs.v2/a.md"])
+def test_an_absent_local_file_is_missing_not_unchecked(env, uri):
+    """A dotted first directory or a colon in the last segment is not a registry reference: without a URL scheme, a digest
+    pin or a reference kind the uri is a workspace path, and an absent file stops intake."""
+    one = _check_one(env, uri, "file")
+    assert (one["status"], one["exists"]) == ("missing", "no"), one
+    result = env.call("shared_artifact_check", "A12", {"task_id": "T-build", "agent": "A11", "outputs": [
+        {"kind": "file", "uri": uri, "digest": "sha256:" + "a" * 64, "producer": "A11"}]})
+    assert result["ok"] is False and result["failed"] == 1 and result["unchecked"] == 0
+
+
+@pytest.mark.parametrize("uri,kind", [
+    ("ghcr.io/org/app@sha256:" + "a" * 64, "file"), ("ghcr.io/org/app@sha512:" + "a" * 128, "file"),
+    ("docker.io/org/app:1.2", "image"), ("docker.io/org/app:1.2", "Container"), ("pkg/lib:1.0", "package"),
+    ("reg.io/x/y", "registry"), ("example.com/page", "url"), ("example.com/page", "link"),
+    ("https://example.com/a.js", "file"), ("oci://reg/app", "file")])
+def test_only_declared_reference_forms_are_unchecked(env, uri, kind):
+    one = _check_one(env, uri, kind)
+    assert (one["status"], one["exists"]) == ("unchecked", "unchecked") and "not a local file" in one["reason"], one
+
+
+def test_an_existing_local_file_wins_over_every_reference_form(env):
+    (env.root / "ghcr.io" / "x").mkdir(parents=True)
+    (env.root / "ghcr.io" / "x" / "y.md").write_text("doc\n", encoding="utf-8")
+    digest = "sha256:" + hashlib.sha256(b"doc\n").hexdigest()
+    for kind in ("file", "image", "url"):
+        out = {"kind": kind, "uri": "ghcr.io/x/y.md", "digest": digest, "producer": "A11"}
+        one = env.call("shared_artifact_check", "A12", {"task_id": "T-build", "agent": "A11", "outputs": [out]})["results"][0]
+        assert (one["status"], one["exists"]) == ("ok", "yes"), (kind, one)
+
+
 def test_one_unreadable_file_does_not_abort_the_check(env, monkeypatch):
     """RV-I P3-1: an OSError while digesting one output escaped as DEPENDENCY_UNAVAILABLE and lost every other result."""
     (env.root / "ok.py").write_text("print(1)\n", encoding="utf-8")

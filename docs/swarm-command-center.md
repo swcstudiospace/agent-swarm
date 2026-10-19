@@ -213,10 +213,10 @@ such as `A05`, never slugs), `created_wall`, `goal`, `completed[]`, `remaining[]
   `duplicate: true`; a changed document gets a new `seq`. The duplicate check reads the newest file before the seq is
   reserved, so two writers that submit the same document at the same instant both pass it and both are stored (two
   seqs, same content): the history is append-only and a repeated entry is harmless, so this is intended and not
-  guarded by a lock. An empty reserved file older than 60 seconds (`RESERVE_RECLAIM_S`: the writer died between the
-  reservation and its write) is removed by the next write of that task; when it was the highest `seq` the new
-  document takes that `seq`, so no gap is left. Ids are matched whole (a trailing newline is refused) and the size
-  cap is never above the 1 MiB read limit, whatever `SWARM_HANDOVER_MAX_BYTES` says.
+  guarded by a lock. An empty reserved file is never removed or reused, whatever its age (age is not ownership: its
+  writer may still be about to publish); a writer that died between the reservation and its write leaves a harmless
+  gap in the `seq` numbers and readers skip the empty file. Ids are matched whole (a trailing newline is refused) and
+  the size cap is never above the 1 MiB read limit, whatever `SWARM_HANDOVER_MAX_BYTES` says.
 - **Integrity:** `digest` is the sha256 of the canonical document without its own `digest`. Read recomputes it, so an
   edited file is rejected (`malformed`).
 - **Size:** at most `SWARM_HANDOVER_MAX_BYTES` (16384). A larger document is summarized deterministically, with no

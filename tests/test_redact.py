@@ -404,6 +404,8 @@ def generate_option_cases(seed: int, count: int) -> list[dict]:
             sensitive = rng.random() < 0.4
             name = rng.choice(_SECRET_NAMES if sensitive else _BENIGN_NAMES)
             value = f"S{i}x{j}" if sensitive else "v" + "".join(rng.choice("abcdef0123456789") for _ in range(rng.randrange(1, 6)))
+            if sensitive and rng.random() < 0.3:  # a token-shaped prefix inside the value: the name still owns the whole value
+                value = rng.choice((f"ghp_,{value}", f"sk-{'a' * 16}{value}", f"AKIAIOSFODNN7EXAMPLE,{value}", f"sk-{'a' * 16},{value},t"))
             pairs.append((rng.choice(_SEPARATORS) if j else "", name, value, sensitive))
         prefix, suffix = rng.choice(_PREFIXES), rng.choice(_SUFFIXES)
         text, expected, inside = prefix, prefix, False
@@ -456,6 +458,7 @@ def generate_wild_cases(seed: int, count: int) -> list[dict]:
             if sensitive:
                 secrets.append(sv)
             forms = [sv, f'"{sv}"', f"'{sv}'", f"{sv},{sv}", f"{sv}=x", f'"{sv} w"', f"{sv}\\x", f'"a b,{sv}"', f'\\"{sv}\\"']
+            forms += [f"ghp_,{sv}", f"sk-{'a' * 16},{sv}", f"AKIAIOSFODNN7EXAMPLE,{sv},z", f"sk-{'a' * 16}{sv}"]  # token shape, then a tail
             if "=" in sep or name.startswith("-"):
                 forms.append(f"//{sv}")  # `NAME: //x` is a URL scheme (`token://x`), deliberately not masked
             value = rng.choice(forms)

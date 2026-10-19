@@ -382,9 +382,6 @@ def redact_text(s: str) -> str:
     if not isinstance(s, str) or len(s) < 6:
         return s
     s = _PEM_RE.sub(REDACTED, s)
-    s = _JWT_RE.sub(REDACTED, s)
-    for rx in _TOKEN_RES:
-        s = rx.sub(REDACTED, s)
     s = _BEARER_RE.sub(lambda m: m.group(1) + REDACTED, s)
     s = _BASIC_RE.sub(lambda m: m.group(1) + REDACTED, s)
     s = _USERINFO_RE.sub(lambda m: f"{m.group(1)}{REDACTED}@", s)
@@ -392,6 +389,11 @@ def redact_text(s: str) -> str:
     s = _mask_yaml(_mask_cli(s))
     s = _scan(s, _NAME_SEP_RE, _VALUE_RE, True)
     s = _scan(s, _FLAG_SEP_RE, _FLAG_VALUE_RE, False)
+    # Token shapes run AFTER the name passes: a sensitive NAME owns its whole value up to the original boundary
+    # (`SECRET=ghp_x,second`), so a shape may not shrink that value to `[REDACTED]` before the name pass has measured it.
+    s = _JWT_RE.sub(REDACTED, s)
+    for rx in _TOKEN_RES:
+        s = rx.sub(REDACTED, s)
     s = _PAIR_RE.sub(_pair, s)
     return _ESC_PAIR_RE.sub(_esc_pair, s)
 
