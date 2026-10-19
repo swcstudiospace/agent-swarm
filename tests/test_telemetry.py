@@ -298,6 +298,26 @@ def test_live_json_is_valid_atomic_and_counts_states(env):
     assert [p.name for p in env.sdir.iterdir() if p.name.endswith(".tmp")] == []
 
 
+def test_a_swarm_with_cancelled_runs_and_no_failure_is_cancelled_not_completed(env):
+    """The audit repro: a cancelled swarm's final live.json said `completed` and the bar painted a green check."""
+    t, _ = env.new()
+    for run_id, agent in (("T1.a1", "a05-backend"), ("T2.a1", "a06-frontend"), ("T3.a1", "a08-qa")):
+        t.run_queued(run_id, agent)
+        t.run_started(run_id)
+    t.finish("T1.a1", "ok")
+    t.finish("T2.a1", "cancelled")
+    t.finish("T3.a1", "cancelled")
+    t.flush_live(force=True)
+    doc = json.loads((env.sdir / "live.json").read_text())
+    _assert_valid(env, doc)
+    assert doc["swarm"]["state"] == "cancelled" and (doc["swarm"]["completed"], doc["swarm"]["cancelled"]) == (1, 2)
+    t.run_queued("T4.a1", "a09-reviewer")
+    t.run_started("T4.a1")
+    t.finish("T4.a1", "error", error="boom")
+    t.flush_live(force=True)
+    assert json.loads((env.sdir / "live.json").read_text())["swarm"]["state"] == "failed"  # a failure outranks a cancel
+
+
 def test_live_json_runs_are_capped_at_64_with_problems_first(env):
     t, _ = env.new()
     for i in range(70):

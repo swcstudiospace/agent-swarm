@@ -141,9 +141,9 @@ def test_a_failing_log_never_changes_the_result_and_never_raises(state, monkeypa
     def broken(*_a, **_k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(runlog, "emit", broken)
-    assert tool_registry.call_tool("orch_registry_ping", "A01", {"token": "same"}) == expected
-    monkeypatch.undo()
+    with monkeypatch.context() as scoped:  # undo() would also revert the fixtures' SWARM_DIR isolation
+        scoped.setattr(runlog, "emit", broken)
+        assert tool_registry.call_tool("orch_registry_ping", "A01", {"token": "same"}) == expected
     (state / "events.jsonl").unlink()
     (state / "events.jsonl").mkdir()  # the log file can not be opened for append: IsADirectoryError
     assert tool_registry.call_tool("orch_registry_ping", "A01", {"token": "same"}) == expected

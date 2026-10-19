@@ -666,6 +666,35 @@ describe("render: overflow ordering and labels", () => {
     expect(plain(starting, 200, T0)[1]).toContain("● start");
   });
 
+  test("a finished swarm with cancelled rows and no failure is marked cancelled, not with a green check", () => {
+    const model = createModel();
+    ingestLive(
+      model,
+      live([
+        { run_id: "T1.a1", task_id: "T1", agent: "a-done", state: "completed", elapsed_s: 30 },
+        { run_id: "T2.a1", task_id: "T2", agent: "b-cancelled", state: "cancelled", elapsed_s: 3 },
+      ]),
+      T0,
+    );
+    const head = plain(model, 160, T0)[0];
+    expect(head.startsWith("⊘ swarm")).toBe(true);
+    expect(head).toContain("1 done");
+    expect(head).toContain("1 cancel");
+    const clean = createModel();
+    ingestLive(clean, live([{ run_id: "T1.a1", task_id: "T1", agent: "a-done", state: "completed", elapsed_s: 30 }]), T0);
+    expect(plain(clean, 160, T0)[0].startsWith("✓ swarm")).toBe(true);
+    const failing = createModel();
+    ingestLive(
+      failing,
+      live([
+        { run_id: "T1.a1", task_id: "T1", agent: "a-fail", state: "failed", elapsed_s: 5, error: "boom" },
+        { run_id: "T2.a1", task_id: "T2", agent: "b-cancelled", state: "cancelled", elapsed_s: 3 },
+      ]),
+      T0,
+    );
+    expect(plain(failing, 160, T0)[0].startsWith("✕ swarm")).toBe(true);  // a failure outranks a cancel
+  });
+
   test("when rows do not fit the worst states stay and the rest become +N more", () => {
     const lines = plain(mixed(), 60, T0);
     expect(lines[1]).toContain("f-failed");

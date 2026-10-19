@@ -22,7 +22,7 @@ The bar is at most two rows.
 
 | Segment | Meaning |
 |---------|---------|
-| mark | A spinner (one braille frame per second, taken from the theme) while anything is live; `✓` (green) when everything settled well; `✕` (red) when something failed or timed out. `●` replaces the spinner under reduced motion. |
+| mark | A spinner (one braille frame per second, taken from the theme) while anything is live; `✓` (green) when everything settled well; `⊘` (muted) when work was cancelled and nothing failed; `✕` (red) when something failed or timed out. `●` replaces the spinner under reduced motion. |
 | `swarm <elapsed>` | The longest elapsed of the rows shown; while something is live it is at least the swarm's own clock from `live.json` (`swarm.elapsed_s`). |
 | `N run` | Running, starting and handing-off agents. Accent colour when above 0. |
 | `N wait` | Agents waiting on another agent. Shown only when above 0. |

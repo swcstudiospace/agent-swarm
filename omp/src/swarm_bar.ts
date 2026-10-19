@@ -1095,11 +1095,14 @@ export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: 
   const spin = spinner(model, theme, nowMono);
   const live = rows.some((run) => !isTerminal(run.state));
   const failed = base === "failed";
+  const cancelled = !failed && rows.some((run) => run.state === "cancelled");  // cancelled work is not a clean finish
   const mark: Seg = live
     ? { plain: DEFAULT_SPINNER, painted: paint(theme, "accent", spin) }
     : failed
       ? seg(theme, "error", "✕")
-      : seg(theme, "success", "✓");
+      : cancelled
+        ? seg(theme, "muted", "⊘")
+        : seg(theme, "success", "✓");
   const head = summary(model, rows, theme, mark, nowMono);
   let line1: string | undefined;
   for (let keep = head.length; keep >= 2 && line1 === undefined; keep--) line1 = fitBand(theme, head.slice(0, keep), width);

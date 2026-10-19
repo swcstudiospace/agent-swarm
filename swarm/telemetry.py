@@ -333,6 +333,8 @@ def build_snapshot(rows: list[dict], *, correlation_id: str | None, seq: int, up
         state = "running"
     elif counts["failed"] or counts["timed_out"]:
         state = "failed"
+    elif counts["cancelled"]:
+        state = "cancelled"  # a cancelled swarm must not read as a clean finish (the bar would paint a green check)
     else:
         state = "completed"
     ordered = [r for _, r in sorted(((_sort_key(r, i), r) for i, r in enumerate(rows)), key=lambda p: p[0])]
