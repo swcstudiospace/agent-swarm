@@ -47,7 +47,8 @@ def _join(value):
     return expand_tokens(value if isinstance(value, str) else "".join(value))
 
 
-_SHARED = json.loads((Path(__file__).parent / "fixtures" / "redact_cases.json").read_text(encoding="utf-8"))["cases"]
+_SHARED_DOC = json.loads((Path(__file__).parent / "fixtures" / "redact_cases.json").read_text(encoding="utf-8"))
+_SHARED = _SHARED_DOC["cases"]
 
 
 @pytest.mark.parametrize("case", _SHARED, ids=[c["name"] for c in _SHARED])
@@ -61,6 +62,47 @@ def test_shared_vectors(case):
     if "expected" in case:
         assert out == case["expected"]
     assert redact_text(out) == out  # a masked output is a fixed point
+
+
+_PLANTED = re.compile(r"\{\{tok:[a-z0-9_]+:\d+(?::\d+)?\}\}")
+
+
+def _property_snippets(spec: dict) -> list[str]:
+    """The seeded shell-like snippets of the shared `property` spec, drawn exactly as omp/test/swarm_bar.test.ts draws them: xorshift32 from
+    `seed`; 2 + next(3) templates, then one template of templates[secret_from:]; every `{S}` (left to right) is a fresh planted secret."""
+    rng = _Xorshift(spec["seed"])
+    templates, first = spec["templates"], spec["secret_from"]
+    planted = itertools.count(1)
+    snippets = []
+    for _ in range(spec["count"]):
+        parts = [templates[rng.next(len(templates))] for _ in range(2 + rng.next(3))]
+        parts.append(templates[first + rng.next(len(templates) - first)])
+        text = "\n".join(parts) + "\n"
+        snippets.append(re.sub(r"\{S\}", lambda _m: "{{tok:urlsafe:%d:20}}" % (100000 + next(planted)), text))
+    return snippets
+
+
+def test_shared_property_snippets_leak_no_planted_secret_and_match_typescript():
+    """Shell-like snippets mixing comments with stray quotes, quoted, multi-line and unquoted secrets and prose apostrophes: no planted secret
+    survives, and the digest of all outputs is the one omp/test/swarm_bar.test.ts pins too (Python == TypeScript for every case)."""
+    spec = _SHARED_DOC["property"]
+    snippets = _property_snippets(spec)
+    assert len(snippets) == spec["count"] >= 500
+    outs = []
+    for text in snippets:
+        out = redact_text(expand_tokens(text))
+        for placeholder in _PLANTED.findall(text):
+            assert expand_tokens(placeholder) not in out, (text, out)
+        outs.append(out)
+    assert hashlib.sha256("\u0000".join(outs).encode("utf-8")).hexdigest() == spec["sha256"]
+
+
+def test_lexer_roles_for_comments_and_words():
+    """`#` starts a comment only at a word start and with no quote open: `a#b 'x'` keeps its quotes, while the apostrophe in the comment `# 'z` is
+    a CONTENT mark, so the next line's quote is an opener of its own (the same roles omp/src/swarm_bar.ts gives)."""
+    from swarm.redact import _CLOSE, _CONTENT, _OPEN, _Lexer
+    assert list(_Lexer("echo a#b 'x' y\n# 'z\n'w'").role) == [_OPEN, _CLOSE, _CONTENT, _OPEN, _CLOSE]
+    assert list(_Lexer("x#'y").role) == [_OPEN]
 
 
 def test_megabyte_inputs_are_scanned_in_linear_time():

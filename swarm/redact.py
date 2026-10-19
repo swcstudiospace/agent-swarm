@@ -189,12 +189,18 @@ _EOL_RE = re.compile(r"[\r\n]")
 #   * any other mark OPENS a quote, nested in the open ones (`"mysql -p'x' db"`, `'a "b c"'`, `"{\"k\": 1}"`), except a PROSE apostrophe or
 #     quote: a plain `'` or `"` right after a letter or digit that is not the `-p` of a flag word (`it's`, `don't`, `users'`, `5"`) never
 #     opens a quote and is plain content. (`-p'x'`, `-u'a:b'` and `--pass"x"`: the letters belong to a flag word, the quote opens.)
+#   * outside quotes, a `#` that STARTS a word (the start of the text, or right after a blank, a newline, `;`, `&`, `|` or `(`, unless that
+#     character is backslash-escaped) begins a COMMENT that runs to the end of its line. A quote inside a comment is a CONTENT mark: it opens and
+#     closes nothing, so a stray apostrophe there (`# '`, `# don't`) changes no later quote; a value that starts at such a quote is read to its
+#     next plain quote of its kind (or the line end), so a comment hides no secret. `a#b`, `$#`, `\#` and a `#` inside an open quote are not
+#     comments. "Outside quotes" is the lexer's own view: no quote is open on its stack at that point (an unclosed quote still counts as open).
 #   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
 #     detectors mask from the value start to the end of that line, never a part of it.
 #   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
 #     for a CLOSE or for prose is read like an opener of its own kind that nothing in the lexer's view contradicts (the next quote of its
 #     kind, else the end of the line): over-redacting, never leaving a suffix of the value readable.
-_MARK_RE = re.compile("[\"']")
+_LEX_RE = re.compile("[\"'#]")
+_COMMENT_LEAD = frozenset(" \t\r\n;&|(")
 _PROSE_FLAG = "-"
 _CONTENT, _OPEN, _CLOSE = 0, 1, 2
 _UNCLOSED, _CLOSED, _CUT = 0, 1, 2
@@ -208,6 +214,18 @@ def _prose_quote(s: str, p: int) -> bool:
     while i > 0 and s[i - 1] in _ALNUM:
         i -= 1
     return not (i > 0 and s[i - 1] == _PROSE_FLAG)
+
+
+def _comment_at(s: str, p: int) -> bool:
+    """Whether the `#` at s[p] starts a word, so that it begins a shell comment (`echo x #note`, `#` at the start of a line); not for `a#b`."""
+    if p == 0:
+        return True
+    if s[p - 1] not in _COMMENT_LEAD:
+        return False
+    r = p - 1  # an escaped blank or joiner (`\ #`, `\;#`) does not start a word
+    while r > 0 and s[r - 1] == "\\":
+        r -= 1
+    return (p - 1 - r) % 2 == 0
 
 
 class _Lexer:
@@ -226,8 +244,14 @@ class _Lexer:
         kstack: list[int] = []  # ... and their keys (`level << 1 | is_apostrophe`)
         cnt: dict[int, int] = {}
         i = 0
-        for mm in _MARK_RE.finditer(s):
+        skip_to = -1
+        for mm in _LEX_RE.finditer(s):
             p = mm.start()
+            if s[p] == "#":  # a `#` inside a comment, or inside a quote, is plain text
+                if p >= skip_to and not stack and _comment_at(s, p):
+                    eol = _EOL_RE.search(s, p)
+                    skip_to = eol.start() if eol else len(s)
+                continue
             r = p
             while r and s[r - 1] == "\\":
                 r -= 1
@@ -239,6 +263,9 @@ class _Lexer:
             role_add(_CONTENT)
             link_add(-1)
             how_add(_UNCLOSED)
+            if p < skip_to:  # a quote in a comment: a CONTENT mark, it opens and closes nothing (a value there still finds its end)
+                i += 1
+                continue
             if level == 0:  # a plain quote ends the escaped quotes of its kind on top of the stack
                 while kstack:
                     k = kstack[-1]
@@ -400,9 +427,12 @@ class _Reader:
             if how == _CLOSED:
                 return lex.pos[t] + 1, run + 1 if run else 1
             end = lex.pos[t] - lex.lvl[t]
-            # an escaped quote ends before the plain quote that closes the JSON string holding it (`"mysql -p\\"x"`); any other quote that was
-            # cut by an enclosing one is ambiguous (`OPTS='sshpass -p "x'y' z'`): its value runs at least to the end of its line
-            return (end if run and self.s[lex.pos[t]] == q else max(end, self.line_end(i))), 0
+            if run:
+                # an escaped quote ends before the plain quote that closes the JSON string holding it (`"mysql -p\\"x"`); any other escaped quote
+                # that was cut by an enclosing one is ambiguous (`OPTS='sshpass -p "x'y' z'`): its value runs at least to the end of its line
+                return (end if self.s[lex.pos[t]] == q else max(end, self.line_end(i))), 0
+            # a plain quote cut by an enclosing close (`echo a 'x` ... `P="x 'y` ... `s3cr3t"`: the stray `'` closes the earlier one) is a value
+            # that runs to its matching quote, the next plain quote of its kind, which the fallback below finds; a multi-line value stays whole
         # the lexer takes this quote for a closer or for prose: read it as an opener of its own kind (the next quote that ends it)
         nx0, nxl = lex.next_marks(self.s)
         t0 = nx0[m]

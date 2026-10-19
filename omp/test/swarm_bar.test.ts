@@ -410,6 +410,24 @@ function expectAppearOrder(label: string, render: (width: number) => string, tex
   });
 }
 
+/**
+ * Scaling check for the redactor (linear vs quadratic), not a wall-clock cap: the same unit at 250 KB and at 1 MB. 4x the
+ * input must not cost 16x the time; a generous ceiling catches a true blow-up. Returns the redacted 1 MB output.
+ */
+function expectLinear(redact: (text: string) => string, unit: string, tail: string, label: string): string {
+  const reps = (size: number) => Math.floor(size / unit.length);
+  const timed = (text: string) => {
+    const started = performance.now();
+    const out = redact(text);
+    return { out, ms: performance.now() - started };
+  };
+  const small = timed(unit.repeat(reps(250_000)) + tail);
+  const big = timed(unit.repeat(reps(1_000_000)) + tail);
+  expect({ label, ratioOk: big.ms / Math.max(small.ms, 1) < 9 }).toEqual({ label, ratioOk: true });
+  expect({ label, ceilingOk: big.ms < 2000 }).toEqual({ label, ceilingOk: true });
+  return big.out;
+}
+
 describe("formatElapsed", () => {
   const cases = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "elapsed_cases.json"), "utf8")) as Array<[number | string, string]>;
   test("is byte-identical to the Python twin for every fixture case", () => {
@@ -436,7 +454,15 @@ describe("redactText shared vectors", () => {
     expected?: string;
   }
   const flat = (value: Needle): string => expandTokens(typeof value === "string" ? value : value.join("")); // `{{tok:...}}` secrets expand at runtime
-  const { cases } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[] };
+  interface PropertySpec {
+    seed: number;
+    count: number;
+    secret_from: number;
+    templates: string[];
+    sha256: string;
+  }
+  const shared = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[]; property: PropertySpec };
+  const { cases } = shared;
 
   test("tests/fixtures/redact_cases.json: the same vectors tests/test_redact.py runs against swarm/redact.py", () => {
     expect(cases.length).toBeGreaterThan(30);
@@ -447,6 +473,26 @@ describe("redactText shared vectors", () => {
       if (vector.expected !== undefined) expect({ name: vector.name, out }).toEqual({ name: vector.name, out: vector.expected });
       expect({ name: vector.name, fixedPoint: redactText(out) === out }).toEqual({ name: vector.name, fixedPoint: true }); // a masked output is a fixed point
     }
+  });
+  test("tests/fixtures/redact_cases.json property: seeded shell snippets leak no planted secret and hash to the Python suite's digest", () => {
+    // the twin of `_property_snippets` in tests/test_redact.py: the same xorshift32 draws, the same templates, the same placeholders
+    const spec = shared.property;
+    const next = xorshift(spec.seed);
+    const first = spec.secret_from;
+    let planted = 0;
+    const outs: string[] = [];
+    for (let c = 0; c < spec.count; c++) {
+      const parts: string[] = [];
+      const k = 2 + next(3);
+      for (let j = 0; j < k; j++) parts.push(spec.templates[next(spec.templates.length)]!);
+      parts.push(spec.templates[first + next(spec.templates.length - first)]!);
+      const text = `${parts.join("\n")}\n`.replace(/\{S\}/g, () => `{{tok:urlsafe:${100000 + ++planted}:20}}`);
+      const out = redactText(expandTokens(text));
+      for (const m of text.matchAll(TOKEN_RE)) expect({ text, leaked: out.includes(expandTokens(m[0])) }).toEqual({ text, leaked: false });
+      outs.push(out);
+    }
+    expect(outs.length).toBe(spec.count);
+    expect(createHash("sha256").update(outs.join("\u0000"), "utf8").digest("hex")).toBe(spec.sha256);
   });
   test("tests/fixtures/redact_generated.json: 6000 seeded option lists give exactly the Python suite's output (reference model + wild shapes)", () => {
     type Generated = Array<{ input: string; expected: string }>;
@@ -488,9 +534,7 @@ describe("redactText shared vectors", () => {
   test("GL8: 1 MB of quote openers, escaped quotes and unclosed quotes is linear (scaling, not a wall-clock cap) and still finds the trailing password", () => {
     const units = ['mysql -p" ', "mysql -p\\\" ", "-u me:'", "x --password $'", 'DB_PASSWORD="', 'mysql -p\\\\\\" ', '"password": "', '\\"password\\": \\"', "a\\"];
     for (const unit of units) {
-      const started = performance.now();
-      const out = redactText(`${unit.repeat(Math.floor(1_000_000 / unit.length))}\npassword=hunter2`);
-      expect({ unit, fast: performance.now() - started < 150 }).toEqual({ unit, fast: true });
+      const out = expectLinear(redactText, unit, "\npassword=hunter2", unit);
       expect({ unit, masked: !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
   });
@@ -787,9 +831,7 @@ describe("sanitization", () => {
 
   test("1 MB floods of the command-line, YAML and vendor-key carriers stay linear and still find the trailing password", () => {
     for (const unit of ["mysql ", "docker login ", "sshpass -p ", "-u a:b ", "- name: PASSWORD\n  value: ", "password: |\n  ", "STRIPE_KEY=", "redis-cli ", "- name: ", "password:  "]) {
-      const started = performance.now();
-      const out = redactText(`${unit.repeat(Math.floor(1_000_000 / unit.length))}\npassword=hunter2`);
-      expect({ unit, fast: performance.now() - started < 300 }).toEqual({ unit, fast: true });
+      const out = expectLinear(redactText, unit, "\npassword=hunter2", unit);
       expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
     expect(redactText("- name: PASSWORD\n  value: x\nmysql -u a -pb db\n".repeat(250_000)).split("[REDACTED]").length - 1).toBe(500_000);
@@ -901,9 +943,7 @@ describe("sanitization", () => {
     const units = ["mysql -u a ", "docker login x ", "`--user a:", "docker login -p ", "redis-cli -a ", "-passin pass:", "--cmd=mysql ", "-u=-u=", "x -u ", "-u  ",
       "mysql -p'", 'sshpass -p "', "docker login -u a: -p ", "sqlcmd -P ", "ssh-keygen -N ", "__-u a:", "(-u a:"];
     for (const unit of units) {
-      const started = performance.now();
-      const out = redactText(`${unit.repeat(Math.floor(1_000_000 / unit.length))}\npassword=hunter2`);
-      expect({ unit, fast: performance.now() - started < 300 }).toEqual({ unit, fast: true });
+      const out = expectLinear(redactText, unit, "\npassword=hunter2", unit);
       expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
   });

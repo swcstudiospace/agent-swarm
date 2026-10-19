@@ -210,6 +210,11 @@ function bareEnd(s: string, i: number, kind: number): number {
 //   * any other mark OPENS a quote, nested in the open ones (`"mysql -p'x' db"`, `'a "b c"'`, `"{\"k\": 1}"`), except a PROSE apostrophe or
 //     quote: a plain `'` or `"` right after a letter or digit that is not the `-p` of a flag word (`it's`, `don't`, `users'`, `5"`) never
 //     opens a quote and is plain content. (`-p'x'`, `-u'a:b'` and `--pass"x"`: the letters belong to a flag word, the quote opens.)
+//   * outside quotes, a `#` that STARTS a word (the start of the text, or right after a blank, a newline, `;`, `&`, `|` or `(`, unless that
+//     character is backslash-escaped) begins a COMMENT that runs to the end of its line. A quote inside a comment is a CONTENT mark: it opens and
+//     closes nothing, so a stray apostrophe there (`# '`, `# don't`) changes no later quote; a value that starts at such a quote is read to its
+//     next plain quote of its kind (or the line end), so a comment hides no secret. `a#b`, `$#`, `\#` and a `#` inside an open quote are not
+//     comments. "Outside quotes" is the lexer's own view: no quote is open on its stack at that point (an unclosed quote still counts as open).
 //   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
 //     detectors mask from the value start to the end of that line, never a part of it.
 //   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
@@ -222,6 +227,8 @@ const HOW_UNCLOSED = 0;
 const HOW_CLOSED = 1;
 const HOW_CUT = 2;
 
+/** The characters that may precede a `#` which starts a word (a blank, a newline, `;`, `&`, `|`, `(`). */
+const COMMENT_LEAD = " \t\r\n;&|(";
 const isAsciiAlnum = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 
 /** Whether the plain quote at s[p] sits right after a letter or digit that is not part of a flag word (`it's`, `users'`, not `-p'x'`). */
@@ -230,6 +237,15 @@ function proseQuote(s: string, p: number): boolean {
   let i = p - 1;
   while (i > 0 && isAsciiAlnum(s.charCodeAt(i - 1))) i--;
   return !(i > 0 && s.charCodeAt(i - 1) === 45);
+}
+
+/** Whether the `#` at s[p] starts a word, so that it begins a shell comment (`echo x #note`, `#` at the start of a line); not for `a#b`. */
+function commentAt(s: string, p: number): boolean {
+  if (p === 0) return true;
+  if (!COMMENT_LEAD.includes(s.charAt(p - 1))) return false;
+  let r = p - 1; // an escaped blank or joiner (`\ #`, `\;#`) does not start a word
+  while (r > 0 && s.charCodeAt(r - 1) === 92) r--;
+  return (p - 1 - r) % 2 === 0;
 }
 
 /** First index `i` of the ascending `a[0, n)` with `a[i] >= x` (`n` when there is none). */
@@ -284,8 +300,17 @@ class Lexer {
     const cnt = new Map<number, number>();
     const lost: number[] = [];
     let i = 0;
+    let skipTo = 0; // the offset up to which the text is a comment: no marks there
     for (let p = 0; p < len; p++) {
       const c = s.charCodeAt(p);
+      if (c === 35) {
+        if (p >= skipTo && sp === 0 && commentAt(s, p)) {
+          let e = p;
+          while (e < len && s.charCodeAt(e) !== 10 && s.charCodeAt(e) !== 13) e++;
+          skipTo = e;
+        }
+        continue;
+      }
       if (c !== 34 && c !== 39) continue;
       let r = p;
       while (r > 0 && s.charCodeAt(r - 1) === 92) r--;
@@ -296,6 +321,12 @@ class Lexer {
       pos[i] = p;
       lvl[i] = level;
       keys[i] = key;
+      if (p < skipTo) {
+        // a quote inside a comment is a CONTENT mark: it opens and closes nothing, and a value that starts there still finds its end
+        top[i] = sp > 0 ? stack[sp - 1]! : -1;
+        i++;
+        continue;
+      }
       if (level === 0) {
         // a plain quote ends the escaped quotes of its kind on top of the stack
         while (sp > 0) {
@@ -339,7 +370,7 @@ class Lexer {
     for (let k = 0; k < sp; k++) lost.push(stack[k]!);
     lost.sort((a, b) => a - b);
     this.lost = lost;
-    this.count = marks;
+    this.count = i;
     this.pos = pos;
     this.lvl = lvl;
     this.role = role;
@@ -462,10 +493,14 @@ class Reader {
         this.closeLen = run !== 0 ? run + 1 : 1;
         return lex.pos[t]! + 1;
       }
-      // an escaped quote ends before the plain quote that closes the JSON string holding it (`"mysql -p\"x"`); any other quote that was cut by
-      // an enclosing one is ambiguous (`OPTS='sshpass -p "x'y' z'`): its value runs at least to the end of its line
       const end = lex.pos[t]! - lex.lvl[t]!;
-      return run !== 0 && this.s.charAt(lex.pos[t]!) === q ? end : Math.max(end, this.lineEnd(i));
+      if (run !== 0) {
+        // an escaped quote ends before the plain quote that closes the JSON string holding it (`"mysql -p\"x"`); any other escaped quote that was
+        // cut by an enclosing one is ambiguous (`OPTS='sshpass -p "x'y' z'`): its value runs at least to the end of its line
+        return this.s.charAt(lex.pos[t]!) === q ? end : Math.max(end, this.lineEnd(i));
+      }
+      // a plain quote cut by an enclosing close (`echo a 'x` ... `P="x 'y` ... `s3cr3t"`) is a value that runs to its matching quote, the next plain
+      // quote of its kind, which the fallback below finds; a multi-line value stays whole
     }
     // the lexer takes this quote for a closer or for prose: read it as an opener of its own kind (the next quote that ends it)
     const [nx0, nxl] = lex.nextMarks();
