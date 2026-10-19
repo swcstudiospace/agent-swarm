@@ -662,7 +662,8 @@ def test_surfaces_match_agents_json():
 EVENT_KINDS = {"session.start", "prompt", "claim", "tool.call", "file.edit", "shell", "commit", "pr", "handoff", "session.end",
                "note", "warning"}
 _SOURCES = [*sorted((ROOT / "swarm").glob("*.py")), *sorted((ROOT / "scripts").glob("*.py")), *sorted((ROOT / "hooks").glob("*.py"))]
-_PASS_THROUGH = "swarm/script_base.py"  # Ctx.emit forwards its own `event_type` argument to runlog.emit
+# Ctx.emit and Telemetry.emit forward their own `event_type` argument to runlog.emit; every Telemetry.emit CALL site is literal
+_PASS_THROUGH = frozenset({"swarm/script_base.py", "swarm/telemetry.py"})
 
 
 def _emit_type_arg(call: ast.Call) -> ast.expr | None:
@@ -701,7 +702,7 @@ def _emit_sites():
                 # placeholder is rendered as `x` so PREFIX_KINDS resolves it like any other member of that family
                 text = "".join(p.value if isinstance(p, ast.Constant) else "x" for p in arg.values)
                 literal.setdefault(text, []).append(path.name)
-            elif not (rel == _PASS_THROUGH and isinstance(arg, ast.Name) and arg.id == "event_type"):
+            elif not (rel in _PASS_THROUGH and isinstance(arg, ast.Name) and arg.id == "event_type"):
                 other.append((rel, node.lineno, ast.unparse(node)[:60]))
     return literal, other
 
@@ -1232,3 +1233,21 @@ def test_dry_run_with_a_bound_correlation_never_tees(tmp_path, on, fake, monkeyp
     assert _probe(tmp_path, *corr_args) == 0  # the same run for real tees its exit record
     assert [(e["surface"], e["payload"]["swarm_type"]) for e in fake.events] == [("swarm-a08-qa", "script.qa_probe")]
     capsys.readouterr()
+
+
+def test_registry_audit_rows_are_mapped_but_stay_local_only(tmp_path, on, fake, monkeypatch):
+    """`swarm.tool.call` (tool_registry.call_tool, SEC-03) has a kind, so the emit-site table is complete, yet it never
+    leaves the machine: source "registry" names no agent surface and the row is written with tee=False."""
+    from swarm import tool_registry
+
+    assert tee_mod.kind_for("swarm.tool.call") == "tool.call"
+    fake.bindings[CORR] = GID_A
+    tee_mod.remember_graph_id(CORR, GID_A, tmp_path)
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    (tmp_path / ".swarm").mkdir(exist_ok=True)  # a READ call audits only where the state dir already exists
+    monkeypatch.setenv("SWARM_CORRELATION_ID", CORR)
+    assert tool_registry.call_tool("orch_registry_ping", "A01", {"token": "x"})["state"] == "SUCCESS"
+    (rec,) = runlog.read_events(correlation_id=CORR, root=tmp_path, event_type="swarm.tool.call")
+    assert rec["source"] == "registry" and tee_mod.agent_of(rec) is None
+    assert tee_mod.build_event(rec, GID_A) is None and tee_mod.tee(rec, tmp_path) is False
+    assert fake.calls == [] and fake.events == []

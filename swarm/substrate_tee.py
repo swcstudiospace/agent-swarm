@@ -116,6 +116,22 @@ TYPE_KINDS: dict[str, str] = {
     "swarm.start": "session.start",
     # hook trigger could not wait on a follow-on subagent (hook_trigger.py): the follow-on did not run to a verdict -> warning
     "follow_on.wait_failed": "warning",
+    # runtime telemetry (telemetry.py, v2.2): run lifecycle -> note, a silent run or a degraded capability -> warning. Rows carry
+    # source="telemetry", which names no agent surface, so build_event/tee never forward them; swarm.run.activity and
+    # swarm.run.heartbeat are high-frequency and are additionally written with tee=False (local only).
+    "swarm.run.queued": "note",
+    "swarm.run.started": "note",
+    "swarm.run.state": "note",
+    "swarm.run.activity": "note",
+    "swarm.run.heartbeat": "note",
+    "swarm.run.stalled": "warning",
+    "swarm.run.finished": "note",
+    "swarm.run.handover": "note",              # the packet itself is written by the server as `handoff`; this is the run-side record
+    "swarm.scheduler.tick": "note",
+    "swarm.degraded": "warning",
+    # registry audit (tool_registry.call_tool, v2.2 SEC-03): one row per registry call, source="registry" (no agent surface, so
+    # build_event/tee never forward it) and written with tee=False: names, states and durations stay on this machine.
+    "swarm.tool.call": "tool.call",
 }
 # `script.<name>` and `script.<name>.error` are the exit record of one agent script run -> tool.call.
 # `phase.<name>` is a run-phase marker written by runlog.log_phase (init, reconcile, hook.main, ...) -> note.

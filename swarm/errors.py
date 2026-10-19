@@ -77,7 +77,8 @@ class ErrorHandler:
     - 5 retries (DEFAULT_MAX_ATTEMPTS) w/ 1s + jit backoff
     - timeout handling (maps to E-TIMEOUT, FAILED path)
     - parallelism detection (via batch/max_parallel)
-    - degrade to sequential (effective max=1) on error during parallel
+    - degrade to sequential (effective max=1) only when a caller latches it (should_degrade / force_degrade); the
+      scheduler no longer does for an ordinary FAILED: it isolates the failure and uses a consecutive-failure circuit
     - integrate with lifecycle (TaskStore transitions, dispatchable retry ladder)
     - output .spec() describing all error paths
     - CentralErrorAggregator per ID for details/partials/retry surfaced
@@ -199,9 +200,10 @@ class ErrorHandler:
             ],
             "parallel_detection": "detect_parallel(len(batch), max_p) sets _parallel_detected when >1 concurrent",
             "degrade_paths": [
-                "if parallel_detected and error code in {E_TIMEOUT, E_INTERNAL, E_CONTRACT, E_DEP} -> latch _degraded",
-                "effective_parallel() returns 1 while degraded (sticky for run, fresh run resets)",
-                "used in run() to choose ThreadPool max_workers and select_batch"
+                "if parallel_detected and error code in {E_TIMEOUT, E_INTERNAL, E_CONTRACT, E_DEP} -> latch _degraded (callers of should_degrade/handle_error)",
+                "effective_parallel() returns 1 while degraded (sticky for the handler's life)",
+                "scripts/swarm_run.py does NOT call force_degrade for an ordinary FAILED task: a failure is isolated (retry/escalation ladder only) and parallelism is unchanged",
+                "systemic trouble is a circuit in the runner: SWARM_FAIL_STREAK (default 3, 0 = off) consecutive failures of distinct tasks halve the AIMD limiter once per streak (swarm.degraded reason consecutive_failures); a success resets it"
             ],
             "lifecycle_integration": [
                 "TaskStore: LEGAL_TRANSITIONS allow CLAIMED/IN_PROGRESS -> FAILED/RETRY; FAILED -> RETRY/ESCALATED",

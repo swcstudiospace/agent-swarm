@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "swarm.live v1",
+  "description": "<swarm_dir>/live.json (DESIGN 4.5). elapsed_s values are producer-monotonic as of updated_wall; a consumer extrapolates with its OWN monotonic clock. runs is capped at 64 entries by the producer.",
+  "type": "object",
+  "required": [
+    "schema",
+    "correlation_id",
+    "seq",
+    "updated_wall",
+    "swarm",
+    "runs"
+  ],
+  "properties": {
+    "schema": {
+      "const": "swarm.live.v1"
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "updated_wall": {
+      "type": "number"
+    },
+    "producer": {
+      "description": "Who wrote this document: 'scheduler' (a Telemetry process; monotonic, activity-rich) or 'derived' (rebuilt from the Task Store). Optional, additive. A derived writer never replaces a 'scheduler' document that is fresh (producer_updated within 3 heartbeats) and whose pid is alive.",
+      "type": "string",
+      "minLength": 1
+    },
+    "pid": {
+      "description": "Process id of the writer (liveness check for the freshness rule).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "producer_updated": {
+      "description": "Wall-clock seconds of the scheduler's last write; only present when producer is 'scheduler'.",
+      "type": "number"
+    },
+    "swarm": {
+      "type": "object",
+      "required": [
+        "state",
+        "elapsed_s",
+        "max_parallel",
+        "effective_parallel",
+        "running",
+        "queued",
+        "waiting",
+        "completed",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "stalled",
+        "degraded"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "elapsed_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_parallel": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "effective_parallel": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "running": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queued": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "waiting": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cancelled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timed_out": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stalled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "degraded": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "run_id",
+          "task_id",
+          "agent",
+          "state",
+          "attempt",
+          "elapsed_s",
+          "state_elapsed_s",
+          "since_activity_s",
+          "stalled",
+          "activity",
+          "tool_calls",
+          "last_tool",
+          "parent",
+          "handover_in",
+          "handover_out",
+          "error"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "waiting",
+              "queued",
+              "starting",
+              "running",
+              "handing_off",
+              "completed",
+              "failed",
+              "cancelled",
+              "timed_out"
+            ]
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "elapsed_s": {
+            "type": "number",
+            "minimum": 0
+          },
+          "state_elapsed_s": {
+            "type": "number",
+            "minimum": 0
+          },
+          "since_activity_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "stalled": {
+            "type": "boolean"
+          },
+          "activity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_calls": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "last_tool": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handover_in": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handover_out": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 
 from .paths import swarm_dir
+from .redact import redact
 
 
 def _log_file(root: str | Path | None, *, create: bool) -> Path:
@@ -38,7 +39,8 @@ def redact_leases(value):
 def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | None = None,
          task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
     """Append one record to the run log; `tee=False` (dry runs) keeps it local and never sends it to substrate. Lease ids
-    are dropped from the payload (`redact_leases`); the caller's own payload object is left as it is."""
+    are dropped from the payload (`redact_leases`), then secrets are replaced (`redact.redact`); the caller's own payload
+    object is left as it is."""
     log_file = _log_file(root, create=True)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -46,7 +48,7 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
         "source": source,
         "correlation_id": correlation_id,
         "task_id": task_id,
-        "payload": redact_leases(payload),
+        "payload": redact(redact_leases(payload)),
         "msg_id": uuid.uuid4().hex,
     }
     with log_file.open("a", encoding="utf-8") as fh:
