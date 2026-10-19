@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import signal
 import subprocess
 import textwrap
@@ -76,6 +77,11 @@ class Run:
     def start(self, *extra, python_path: str | None = None) -> subprocess.Popen:
         rig = self.rig
         env = {**_scrubbed_base_env(), **rig.env}
+        # module-scoped fixtures start the runner BEFORE the function-scoped `ephemeral_signing_key` autouse fixture runs, so a
+        # host without a signing key (CI) would make the runner fail closed: give it its own throwaway key, never the host's
+        for host_key in ("SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY"):
+            env.pop(host_key, None)
+        env.setdefault("SWARM_SIGNING_KEY", secrets.token_hex(32))
         if python_path:
             env["PYTHONPATH"] = python_path
         self._out = open(rig.tmp / "runner.out", "w")
