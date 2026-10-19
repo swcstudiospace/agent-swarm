@@ -2,7 +2,7 @@
 
 # A03 ARCH — Solution Architect — skills
 
-Owner: `a03-architect`. 12 skill(s), 40016 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a03-architect`. 12 skill(s), 40261 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

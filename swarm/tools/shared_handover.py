@@ -242,13 +242,10 @@ def _seq(payload: dict) -> int | None:
 
 def _inspect(payload: dict, task_id: str, **kw) -> tuple[dict, dict | None]:
     """`ho.inspect_handover` for the caller with the shared selection order: the explicit `seq`, else the newest handover
-    addressed to the caller, else the newest as context (`context_only`). A `seq` the task does not have is refused (never
-    answered with a different handover)."""
-    seq = _seq(payload)
-    status, doc = ho.inspect_handover(task_id, seq=seq, to_agent=current_caller() or None, **kw)
-    if seq is not None and status["status"] == "missing":
-        raise ho.HandoverInvalid([f"/seq: task {task_id} has no handover with seq {seq}"])
-    return status, doc
+    addressed to the caller, else the newest as context (`context_only`). A `seq` the task does not have is `missing`
+    (`found` false for a read), exactly like a task without handovers: a reader that scans `seq` upward ends on it. It is
+    never answered with a different handover. Only a `seq` that is not a positive integer is INVALID_INPUT."""
+    return ho.inspect_handover(task_id, seq=_seq(payload), to_agent=current_caller() or None, **kw)
 
 
 # ---- handover_read ---------------------------------------------------------------------------------------------
@@ -599,6 +596,8 @@ def artifact_check(payload: dict) -> dict:
             status, doc = _inspect(payload, task_id)  # the explicit seq, else the caller's own handover, else the newest
             if doc is None and status["status"] != "missing":
                 notes.append(f"handover unreadable: {(status['reasons'] or [status['status']])[0][:200]}")
+            elif doc is None and payload.get("seq") is not None:
+                notes.append(f"no handover with seq {payload['seq']}: only the stored result rows were checked")
             entries, superseded = _current_outputs(doc, stored)
             notes += superseded
             if len(entries) > MAX_OUTPUTS:

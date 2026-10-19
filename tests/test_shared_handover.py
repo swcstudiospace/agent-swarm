@@ -269,8 +269,9 @@ def test_read_reports_each_status_without_failing(env, monkeypatch):
     (env.sdir / "handovers" / "corr-1" / "T-be.1.json").write_text("{", encoding="utf-8")
     bad = env.call("shared_handover_read", "A08", {"task_id": "T-be"})
     assert bad["state"] == "SUCCESS" and bad["found"] is False and bad["status"] == "malformed"
-    refused = env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 4})  # a seq the task lacks is refused, never answered
-    assert refused["state"] == "INVALID_INPUT" and refused["field"] == "seq"
+    absent = env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 4})  # a seq the task lacks is "no such handover", never another one
+    assert absent == {"state": "SUCCESS", "found": False, "status": "missing", "reasons": ["no handover 4 of task T-be recorded"], "handover": {}}
+    assert env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 0})["field"] == "seq"
     assert env.call("shared_handover_read", "A08", {"task_id": "../x"})["field"] == "task_id"
 
 
@@ -814,12 +815,23 @@ def test_the_producers_read_back_is_pinned_to_the_seq_it_wrote(env):
     assert older["handover"]["digest"] == incoming["digest"] and "context_only" not in older["handover"]
 
 
-def test_a_seq_the_task_does_not_have_is_invalid_input_for_every_handover_reader(env):
+def test_a_seq_the_task_does_not_have_is_missing_for_every_handover_reader(env):
     _resumed_task(env)
     for tool in ("shared_handover_read", "shared_handover_verify", "shared_handover_bundle", "shared_artifact_check"):
-        refused = env.call(tool, "A05", {"task_id": "T-be", "seq": 99})
-        assert refused["state"] == "INVALID_INPUT" and refused["field"] == "seq" and "99" in refused["message"], (tool, refused)
-        assert env.call(tool, "A05", {"task_id": "T-be", "seq": 0})["state"] == "INVALID_INPUT", tool
+        absent = env.call(tool, "A05", {"task_id": "T-be", "seq": 99})
+        assert absent["state"] == "SUCCESS", (tool, absent)
+        if tool == "shared_handover_read":
+            assert absent["found"] is False and absent["status"] == "missing" and absent["handover"] == {}
+        elif tool == "shared_handover_verify":
+            assert absent["status"] == "missing" and absent["ready"] is False and absent["handover_id"] == ""
+        elif tool == "shared_handover_bundle":
+            assert absent["handover"]["status"] == "missing" and absent["handover"]["document"] == {}
+        else:
+            assert any("no handover with seq 99" in n for n in absent["notes"]), absent  # only the stored rows, no other handover's artifacts
+            assert not [r for r in absent["results"] if "handover" in str(r.get("inherited"))], absent
+        for bad in (0, -1, "2", True, 1.5):
+            refused = env.call(tool, "A05", {"task_id": "T-be", "seq": bad})
+            assert refused["state"] == "INVALID_INPUT" and refused["field"] == "seq", (tool, bad, refused)
 
 
 def _digest_of(env, name, text):
@@ -895,3 +907,163 @@ def test_open_questions_of_a_task_with_two_receivers_are_those_of_the_handover_a
     env.call("shared_handover_write", "A05", handover_payload(to_agent="A14", goal="Record the debt", open_questions=["Debt question?"]))
     mine = [q["question"] for q in env.call("shared_open_questions", "A15", {"task_id": "T-be"})["questions"] if q["origin"] == "handover"]
     assert mine == ["Docs question?"]
+
+
+# ---- greploop round 3: PR #37 findings --------------------------------------------------------------------------
+CONSUMERS = ("A05", "A06")
+ACK = "ack contract-api 2.0.0"
+
+
+def _breaking_change_reply_scan(env, caller, task_id, consumers=CONSUMERS, ack=ACK):
+    """Step 8 of `a03-architect--breaking-change`, as the skill words it: read `seq` = 1, 2, 3, ... until `status` is
+    `missing`, skip an entry that is no document (`found` false), count a reply whose `from_agent` is a consumer and whose
+    `decisions` hold the ack. Returns (the acks, the last seq read)."""
+    acks, seq = {}, 1
+    while True:
+        read = env.call("shared_handover_read", caller, {"task_id": task_id, "seq": seq})
+        assert read["state"] == "SUCCESS", (seq, read)  # the end of the history is never an error
+        if read["status"] == "missing":
+            return acks, seq
+        assert seq < 50, "the scan did not end"
+        if read["found"]:
+            doc = read["handover"]
+            if doc["from_agent"] in consumers and any(ack in d["decision"] for d in doc["decisions"]):
+                acks[doc["from_agent"]] = "2.0.0"
+        seq += 1
+
+
+def _architect_asks(env):
+    make_world(env)
+    for consumer in CONSUMERS:  # step 7: one handover per consumer
+        env.call("shared_handover_write", "A03", handover_payload(to_agent=consumer, goal="Acknowledge the breaking change",
+                                                                    open_questions=[ACK], artifacts=[]))
+
+
+def _consumer_replies(env, consumer, **over):
+    body = handover_payload(to_agent="A03", goal=f"{consumer} acknowledges", artifacts=[], open_questions=[],
+                            decisions=[{"decision": ACK, "rationale": f"{consumer} migrated"}])
+    body.update(over)
+    return env.call("shared_handover_write", consumer, body)
+
+
+def test_the_breaking_change_reply_scan_ends_cleanly_when_every_consumer_replied(env):
+    _architect_asks(env)
+    for consumer in CONSUMERS:
+        assert _consumer_replies(env, consumer)["state"] == "SUCCESS"
+    acks, end = _breaking_change_reply_scan(env, "A03", "T-be")
+    assert acks == {"A05": "2.0.0", "A06": "2.0.0"} and end == 5  # seq 1-2 asks, 3-4 replies, 5 is the end
+
+
+def test_the_breaking_change_reply_scan_ends_cleanly_when_no_consumer_replied(env):
+    _architect_asks(env)
+    assert _breaking_change_reply_scan(env, "A03", "T-be") == ({}, 3)
+    assert _breaking_change_reply_scan(env, "A03", "T-none") == ({}, 1)  # a task that has no handover at all
+
+
+def test_the_breaking_change_reply_scan_goes_past_a_handover_that_is_no_document(env):
+    _architect_asks(env)
+    _consumer_replies(env, "A05")
+    (env.sdir / "handovers" / "corr-1" / "T-be.3.json").write_text("{", encoding="utf-8")  # a damaged reply in the middle
+    _consumer_replies(env, "A06")
+    assert env.call("shared_handover_read", "A03", {"task_id": "T-be", "seq": 3})["status"] == "malformed"
+    acks, end = _breaking_change_reply_scan(env, "A03", "T-be")
+    assert acks == {"A06": "2.0.0"} and end == 5
+
+
+def test_handover_readers_agree_with_a_reference_model_on_random_histories(env):
+    """Differential audit: random histories (valid handovers by random writers, damaged files, gaps) against a model of
+    the contract: `seq` n is `missing` iff no readable file is named `<task>.<n>.json`, else `malformed` or a document of
+    exactly that file; read, verify and bundle report the same status and handover id."""
+    import random
+
+    make_world(env)
+    folder = env.sdir / "handovers" / "corr-1"
+    for trial in range(25):
+        rng = random.Random(trial)
+        task = f"T-rand{trial}"
+        env.taskstore.TaskStore(root=env.root).create(task_id=task, correlation_id="corr-1", capability="be.code", agent_id="A05", title="r")
+        model: dict[int, tuple[str, str]] = {}
+        for _ in range(rng.randint(0, 6)):
+            writer, target = rng.sample(ALL_AGENTS, 2)
+            out = env.call("shared_handover_write", writer, handover_payload(task_id=task, to_agent=target, artifacts=[], goal=f"g{rng.random()}"))
+            assert out["state"] == "SUCCESS", out
+            model[out["seq"]] = (writer, out["handover_id"])
+        for seq in list(model):
+            if rng.random() < 0.25:
+                (folder / f"{task}.{seq}.json").write_text("{", encoding="utf-8")
+                model[seq] = ("", "")
+            elif rng.random() < 0.2:
+                (folder / f"{task}.{seq}.json").unlink()
+                del model[seq]
+        top = max(model, default=0)
+        for seq in range(1, top + 4):
+            read = env.call("shared_handover_read", "A01", {"task_id": task, "seq": seq})
+            verify = env.call("shared_handover_verify", "A01", {"task_id": task, "seq": seq})
+            bundle = env.call("shared_handover_bundle", "A01", {"task_id": task, "seq": seq})
+            assert read["state"] == verify["state"] == bundle["state"] == "SUCCESS", (trial, seq)
+            if seq not in model:
+                assert (read["status"], read["found"]) == ("missing", False), (trial, seq, read)
+                assert verify["status"] == bundle["handover"]["status"] == "missing" and verify["ready"] is False
+            elif model[seq][0] == "":
+                assert (read["status"], read["found"]) == ("malformed", False), (trial, seq, read)
+                assert verify["status"] == bundle["handover"]["status"] == "malformed"
+            else:
+                assert read["found"] is True and read["handover"]["handover_id"] == model[seq][1], (trial, seq, read)
+                assert read["handover"]["from_agent"] == model[seq][0]
+                assert verify["handover_id"] == bundle["handover"]["handover_id"] == model[seq][1]
+                assert verify["status"] == read["status"] == bundle["handover"]["status"]
+
+
+def test_unpinned_read_follows_the_addressing_rule_of_a_reference_model_on_random_histories(env):
+    """Differential audit of the selection order without `seq`: newest handover addressed to the caller, else the newest as
+    context; a damaged file met on the way (the newest, or newer than the addressed one) makes the read `malformed`."""
+    import random
+
+    make_world(env)
+    folder = env.sdir / "handovers" / "corr-1"
+    for trial in range(30):
+        rng = random.Random(1000 + trial)
+        task = f"T-sel{trial}"
+        env.taskstore.TaskStore(root=env.root).create(task_id=task, correlation_id="corr-1", capability="be.code", agent_id="A05", title="r")
+        docs: list[tuple[int, str, str, str]] = []  # seq, from, to, id ("" when damaged)
+        for _ in range(rng.randint(1, 6)):
+            writer, target = rng.sample(["A01", "A05", "A06", "A08"], 2)
+            out = env.call("shared_handover_write", writer, handover_payload(task_id=task, to_agent=target, artifacts=[], goal=f"g{rng.random()}"))
+            docs.append((out["seq"], writer, target, out["handover_id"]))
+        if rng.random() < 0.4:
+            victim = rng.randrange(len(docs))
+            (folder / f"{task}.{docs[victim][0]}.json").write_text("{", encoding="utf-8")
+            docs[victim] = (docs[victim][0], "", "", "")
+        for caller in ("A01", "A05", "A06", "A08", "A12"):
+            read = env.call("shared_handover_read", caller, {"task_id": task})
+            newest = docs[-1]
+            if not newest[3]:
+                expect, status, context = None, "malformed", False
+            elif newest[2] == caller:
+                expect, status, context = newest, "ok", False
+            else:
+                expect, status, context = newest, "ok", True
+                for cand in reversed(docs[:-1]):
+                    if not cand[3]:
+                        expect, status = None, "malformed"
+                        break
+                    if cand[2] == caller:
+                        expect, context = cand, False
+                        break
+            assert read["status"] == status, (trial, caller, read, docs)
+            if expect is None:
+                assert read["found"] is False
+            else:
+                assert read["handover"]["handover_id"] == expect[3], (trial, caller, docs)
+                assert read.get("context_only", False) is context, (trial, caller, docs)
+
+
+def test_a_pinned_seq_names_the_plans_handover_when_a_stale_correlation_reuses_the_number(env):
+    make_world(env)
+    old = env.sdir / "handovers" / "corr-old"
+    old.mkdir(parents=True)
+    env.call("shared_handover_write", "A05", handover_payload())  # corr-1 (the plan), seq 1
+    (old / "T-be.1.json").write_text((env.sdir / "handovers" / "corr-1" / "T-be.1.json").read_text().replace('"corr-1"', '"corr-old"'), encoding="utf-8")
+    pinned = env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 1})
+    assert pinned["status"] == "ok" and pinned["handover"]["correlation_id"] == "corr-1"
+    assert env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 2})["status"] == "missing"

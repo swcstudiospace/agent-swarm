@@ -12,12 +12,15 @@
     private-key blocks, `NAME=value`, `NAME: value`, `--flag value`, `"NAME": "value"` / `'NAME': 'value'` /
     `\\"NAME\\": \\"value\\"` pairs with a sensitive NAME, and URL userinfo (`scheme://user:pass@host`, the password may
     contain `@`).
+A benign name never hides a later assignment (`user=alice,password=x`, `--mode a;--password x`): the scan is one forward pass
+that steps past a benign separator, while a sensitive name masks its whole comma-bearing value.
 Identifiers (task ids, run ids, correlation ids, `sha256:<64 hex>` digests) and ordinary prose never match. Every
 quantifier that can be re-entered from many start positions is bounded, so adversarial input of hundreds of KB is
 scanned in time linear in its size.
 """
 from __future__ import annotations
 
+import functools
 import re
 
 REDACTED = "[REDACTED]"
@@ -121,15 +124,18 @@ _HEADER_RE = re.compile(r"(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authoriza
 # '@' before the first '/' or whitespace (`postgres://u:p@ss@host/db`).
 _USERINFO_RE = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/\s@:]{0,256}:[^/\s]{0,256}@")
 # ',' is part of an unquoted value (`TOKENS=one,two`): a credential may contain it, and a list of credentials is comma-joined.
-_VALUE = r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?:[^\s&;"'\\]|\\(?!"))+)"""
+_VALUE = r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?:[^\s&;"'\\]|\\(?!"))+)"""
 # The second lookbehind keeps a `a.b.c.d` / `a-b-c` run from re-starting a 128-char scan at every dot or dash.
-# NAME=value / NAME = value (any sensitive name) and NAME: value / NAME : value (strict names only; prose-safe).
-_NAME_VALUE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})" + _VALUE)
-# `--password hunter2`, `-db-password hunter2`: a sensitive flag followed by a separate value that is not another flag.
-_FLAG_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9-]{0,63})([ \t]{1,8})(?![-\s])"
-    r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?:[^\s"'\\]|\\(?!"))+)""")
+# NAME=value / NAME = value (any sensitive name) and NAME: value / NAME : value (strict names only; prose-safe). The regex
+# matches only `NAME<sep>`; `_scan_name_values` then consumes the value (`_VALUE_RE`) of a SENSITIVE name and merely steps
+# past the separator of a benign one, so a later assignment inside its "value" (`user=alice,password=x`) is still scanned.
+_NAME_SEP_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})")
+_VALUE_RE = re.compile(_VALUE)
+# `--password hunter2`, `-db-password hunter2`: a sensitive flag followed by a separate value that is not another flag. Scanned
+# like NAME=value: the regex matches `--flag<ws>` only, a benign flag never hides a later one (`--mode a;--password x`).
+_FLAG_SEP_RE = re.compile(r"(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9-]{0,63})([ \t]{1,8})(?![-\s])")
+_FLAG_VALUE_RE = re.compile(r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?:[^\s"'\\]|\\(?!"))+)""")
 # "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS).
 _PAIR_RE = re.compile(
     r"""((?P<q>["'])(?P<name>[^"'\\\n]{1,80})(?P=q)[ \t]{0,8}:[ \t]{0,8})(?P<v>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""")
@@ -138,14 +144,78 @@ _ESC_PAIR_RE = re.compile(
     r"""(\\"(?P<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")(?:[^"\\]|\\(?!"))*(\\")""")
 
 
-def _name_value(m: re.Match[str]) -> str:
-    name, sep = m.group(1), m.group(2)
-    hit = is_sensitive_key(name) if "=" in sep else _strict_key(name)
-    return f"{name}{sep}{REDACTED}" if hit else m.group(0)
+@functools.lru_cache(maxsize=4096)
+def _name_hit(name: str, eq: bool) -> bool:
+    return is_sensitive_key(name) if eq else _strict_key(name)
 
 
-def _flag(m: re.Match[str]) -> str:
-    return f"{m.group(1)}{m.group(2)}{REDACTED}" if _strict_key(m.group(1)) else m.group(0)
+# A masked value can swallow the NAME of a further sensitive assignment (`password=a,token: b`, `key=a,token = b`,
+# `key=a;--password b`) and stop right before that assignment's own value (a quote, or whitespace around the `:`/`=`/flag):
+# the value goes on. A quote right after any other value is not taken as a continuation: it is as likely the closing quote
+# of an enclosing string.
+_TAIL_NAME_RE = re.compile(r"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([=:]?)")
+_TAIL_FLAG_RE = re.compile(r"(?<![A-Za-z0-9_-])--?[A-Za-z][A-Za-z0-9-]{0,63}")
+_AFTER_NAME_RE = re.compile(r"[ \t]{0,3}([=:])[ \t]{0,3}")
+_AFTER_SEP_RE = re.compile(r"[ \t]{0,3}")
+_FLAG_GAP_RE = re.compile(r"[ \t]{1,8}(?![-\s])")
+_TAIL_WINDOW = 200
+_TAIL_DELIMS = (",", ";", "&", "/", "?")
+
+
+def _continuation(s: str, pos: int, end: int, value_re: re.Pattern[str]) -> int:
+    """End of the next value segment that still belongs to the secret whose value spans s[pos:end], or -1."""
+    c = s[end:end + 1]
+    if c != " " and c != "\t" and c != '"' and c != "'" and not s.startswith('\\"', end):
+        return -1
+    lo = max(pos, end - _TAIL_WINDOW)
+    cut = max(s.rfind(d, lo, end) for d in _TAIL_DELIMS)
+    if cut >= 0:
+        lo = cut + 1
+    elif end - pos > _TAIL_WINDOW:
+        return -1
+    colon = False  # `NAME://...` is a URL, not `NAME: value` (see _scan)
+    if (a := _TAIL_NAME_RE.fullmatch(s, lo, end)) is not None:
+        if a.group(2):
+            if not _name_hit(a.group(1), a.group(2) == "="):
+                return -1
+            gap, colon = _AFTER_SEP_RE.match(s, end), a.group(2) == ":"
+        else:
+            gap = _AFTER_NAME_RE.match(s, end)
+            if gap is None or not _name_hit(a.group(1), gap.group(1) == "="):
+                return -1
+            colon = gap.group(1) == ":"
+    elif _TAIL_FLAG_RE.fullmatch(s, lo, end) is not None and _name_hit(s[lo:end], False):
+        gap = _FLAG_GAP_RE.match(s, end)
+        if gap is None:
+            return -1
+    else:
+        return -1
+    if colon and s.startswith("//", gap.end()):
+        return -1
+    v = value_re.match(s, gap.end())
+    return -1 if v is None else v.end()
+
+
+def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bool) -> str:
+    """Mask the value that follows every sensitive `NAME<sep>` match of `sep_re`: one forward pass with a cursor (no
+    recursion, no rescans). A benign name only moves the cursor past its separator, so what looks like its value is scanned too."""
+    out: list[str] = []
+    pos = last = 0
+    while (m := sep_re.search(s, pos)) is not None:
+        pos = m.end()
+        if eq_sep and "=" not in m.group(2) and s.startswith("//", pos):
+            continue  # `auth://host`, `token://x`: a URL scheme, not `NAME: value` (`PASSWORD=//x` is still a secret)
+        if _name_hit(m.group(1), eq_sep and "=" in m.group(2)) and (v := value_re.match(s, pos)) is not None:
+            end = v.end()
+            while (more := _continuation(s, pos, end, value_re)) >= 0:
+                end = more
+            out.append(s[last:pos])
+            out.append(REDACTED)
+            last = pos = end
+    if not out:
+        return s
+    out.append(s[last:])
+    return "".join(out)
 
 
 def _pair(m: re.Match[str]) -> str:
@@ -171,8 +241,8 @@ def redact_text(s: str) -> str:
     s = _BASIC_RE.sub(lambda m: m.group(1) + REDACTED, s)
     s = _USERINFO_RE.sub(lambda m: f"{m.group(1)}{REDACTED}@", s)
     s = _HEADER_RE.sub(lambda m: m.group(1) + REDACTED, s)
-    s = _NAME_VALUE_RE.sub(_name_value, s)
-    s = _FLAG_RE.sub(_flag, s)
+    s = _scan(s, _NAME_SEP_RE, _VALUE_RE, True)
+    s = _scan(s, _FLAG_SEP_RE, _FLAG_VALUE_RE, False)
     s = _PAIR_RE.sub(_pair, s)
     return _ESC_PAIR_RE.sub(_esc_pair, s)
 

@@ -139,6 +139,28 @@ describe("redactText shared vectors", () => {
       for (const needle of vector.must_contain) expect({ name: vector.name, kept: out.includes(flat(needle)) }).toEqual({ name: vector.name, kept: true });
     }
   });
+  test("tests/fixtures/redact_generated.json: 6000 seeded option lists give exactly the Python suite's output (reference model + wild shapes)", () => {
+    type Generated = Array<{ input: string; expected: string }>;
+    const { cases: generated, wild } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_generated.json"), "utf8")) as {
+      cases: Generated;
+      wild: Generated;
+    };
+    expect([generated.length, wild.length]).toEqual([3000, 3000]);
+    // `cases`: the reference model of the spec; `wild`: Python's output over every separator/quote/flag shape (and no sensitive value survives there).
+    for (const group of [generated, wild]) {
+      const wrong = group.filter((c) => redactText(c.input) !== c.expected);
+      expect(wrong.slice(0, 3)).toEqual([]);
+    }
+  });
+
+  test("1 MB assignment floods are linear and still find the trailing password", () => {
+    for (const unit of ["a=", "a=a=", "user=a,", "user=a;", "x=1&"]) {
+      const started = performance.now();
+      const out = redactText(unit.repeat(Math.floor(1_000_000 / unit.length)) + "password=hunter2");
+      expect({ unit, fast: performance.now() - started < 100 }).toEqual({ unit, fast: true });
+      expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
+    }
+  });
 
   test("a space-separated password flag in currentToolArgs never reaches the activity row", () => {
     const row = sanitizeText("login --password hunter2");
@@ -147,7 +169,8 @@ describe("redactText shared vectors", () => {
 
   test("1 MB adversarial inputs are scanned in time linear in their size (< 100 ms each)", () => {
     const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
-      "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x"];
+      "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
+      "--mode a;", "-v ", "password=a,token = ", "token=a,--password "];
     for (const unit of units) {
       const text = unit.repeat(Math.floor(1_000_000 / unit.length));
       const started = performance.now();

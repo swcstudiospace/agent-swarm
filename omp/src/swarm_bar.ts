@@ -145,18 +145,102 @@ const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]
 const USERINFO = /(\b[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/\s@:]{0,256}:[^/\s]{0,256}@/g;
 // The loops below are written unrolled (`[^x]*(?:\\(?!")[^x]*)*`, not `(?:[^x]|\\(?!"))*`): same language as the Python
 // patterns, but a megabyte-long value no longer exhausts the regex engine's backtrack stack (which skips the match, i.e. leaks).
-const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?=[^\s&;"'\\]|\\(?!"))[^\s&;"'\\]*(?:\\(?!")[^\s&;"'\\]*)*)`;
-/** NAME=value / NAME = value (any sensitive name) and NAME: value (strict names only; prose-safe). */
-const NAME_VALUE = new RegExp(
-  String.raw`(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})` + VALUE,
-  "g",
+const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^\s&;"'\\]|\\(?!"))[^\s&;"'\\]*(?:\\(?!")[^\s&;"'\\]*)*)`;
+/**
+ * NAME=value / NAME = value (any sensitive name) and NAME: value (strict names only; prose-safe), and `--password hunter2` /
+ * `-db-password hunter2` (a sensitive flag followed by a separate value that is not another flag). The regexes match only
+ * `NAME<sep>`; `scan` consumes the value of a SENSITIVE name and merely steps past a benign name's separator, so a later
+ * assignment inside its "value" (`user=alice,password=x`, `--mode a;--password x`) is still scanned.
+ */
+const NAME_SEP = /(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})/g;
+const FLAG_SEP = /(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9-]{0,63})([ \t]{1,8})(?![-\s])/g;
+const VALUE_AT = new RegExp(VALUE, "y");
+const FLAG_VALUE_AT = new RegExp(
+  String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^\s"'\\]|\\(?!"))[^\s"'\\]*(?:\\(?!")[^\s"'\\]*)*)`,
+  "y",
 );
-/** `--password hunter2`, `-db-password hunter2`: a sensitive flag followed by a separate value that is not another flag. */
-const FLAG = new RegExp(
-  String.raw`(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9-]{0,63})([ \t]{1,8})(?![-\s])` +
-    String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^\s"'\\]|\\(?!"))[^\s"'\\]*(?:\\(?!")[^\s"'\\]*)*)`,
-  "g",
-);
+
+// A masked value can swallow the NAME of a further sensitive assignment (`password=a,token: b`, `key=a,token = b`,
+// `key=a;--password b`) and stop right before that assignment's own value (a quote, or whitespace around the `:`/`=`/flag):
+// the value goes on. A quote right after any other value is not taken as a continuation: it is as likely the closing quote
+// of an enclosing string.
+const TAIL_NAME = /(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([=:]?)/y;
+const TAIL_FLAG = /(?<![A-Za-z0-9_-])--?[A-Za-z][A-Za-z0-9-]{0,63}/y;
+const AFTER_NAME = /[ \t]{0,3}([=:])[ \t]{0,3}/y;
+const AFTER_SEP = /[ \t]{0,3}/y;
+const FLAG_GAP = /[ \t]{1,8}(?![-\s])/y;
+const TAIL_WINDOW = 200;
+const TAIL_DELIMS = [",", ";", "&", "/", "?"];
+
+/** `re` (sticky) matched at `at`, or null. */
+function stickyAt(re: RegExp, s: string, at: number): RegExpExecArray | null {
+  re.lastIndex = at;
+  return re.exec(s);
+}
+
+/** `re` (sticky) must match exactly s[lo, end). */
+function stickySpan(re: RegExp, s: string, lo: number, end: number): RegExpExecArray | null {
+  const m = stickyAt(re, s, lo);
+  return m !== null && lo + m[0].length === end ? m : null;
+}
+
+/** End of the next value segment that still belongs to the secret whose value spans s[pos, end), or -1. */
+function continuation(s: string, pos: number, end: number, valueAt: RegExp): number {
+  const c = s.charAt(end);
+  if (c !== " " && c !== "\t" && c !== '"' && c !== "'" && !s.startsWith('\\"', end)) return -1;
+  let lo = Math.max(pos, end - TAIL_WINDOW);
+  const win = s.slice(lo, end);
+  const cut = Math.max(...TAIL_DELIMS.map((d) => win.lastIndexOf(d)));
+  if (cut >= 0) lo += cut + 1;
+  else if (end - pos > TAIL_WINDOW) return -1;
+  let gap: RegExpExecArray | null;
+  let colon = false; // `NAME://...` is a URL, not `NAME: value` (see scan)
+  const a = stickySpan(TAIL_NAME, s, lo, end);
+  if (a !== null) {
+    if (a[2] !== "") {
+      if (!isNameHit(a[1]!, a[2] === "=")) return -1;
+      gap = stickyAt(AFTER_SEP, s, end);
+      colon = a[2] === ":";
+    } else {
+      gap = stickyAt(AFTER_NAME, s, end);
+      if (gap === null || !isNameHit(a[1]!, gap[1] === "=")) return -1;
+      colon = gap[1] === ":";
+    }
+  } else if (stickySpan(TAIL_FLAG, s, lo, end) !== null && isNameHit(s.slice(lo, end), false)) {
+    gap = stickyAt(FLAG_GAP, s, end);
+  } else {
+    return -1;
+  }
+  if (gap === null) return -1;
+  if (colon && s.startsWith("//", gap.index + gap[0].length)) return -1;
+  const v = stickyAt(valueAt, s, gap.index + gap[0].length);
+  return v === null ? -1 : v.index + v[0].length;
+}
+
+/** Loose verdict for `=` separators, strict (prose-safe) otherwise: the same rule as `_name_hit` in swarm/redact.py. */
+const isNameHit = (name: string, eq: boolean): boolean => (eq ? isSensitiveKey(name) : isStrictKey(name));
+
+/** Mask the value that follows every sensitive `NAME<sep>` match of `sep`: one forward pass with a cursor (no recursion, no rescans). */
+function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean): string {
+  const out: string[] = [];
+  let last = 0;
+  sep.lastIndex = 0;
+  for (let m = sep.exec(s); m !== null; m = sep.exec(s)) {
+    const pos = sep.lastIndex;
+    if (eqSep && !m[2]!.includes("=") && s.startsWith("//", pos)) continue; // `auth://host`, `token://x`: a URL scheme, not `NAME: value`
+    if (!isNameHit(m[1]!, eqSep && m[2]!.includes("="))) continue;
+    const v = stickyAt(valueAt, s, pos);
+    if (v === null) continue;
+    let end = pos + v[0].length;
+    for (let more = continuation(s, pos, end, valueAt); more >= 0; more = continuation(s, pos, end, valueAt)) end = more;
+    out.push(s.slice(last, pos), REDACTED);
+    last = sep.lastIndex = end;
+  }
+  if (out.length === 0) return s;
+  out.push(s.slice(last));
+  return out.join("");
+}
+
 /** "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS). */
 const PAIR = /(?<lead>(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,8})(?<v>"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')/g;
 /** JSON that was serialised again into a string: {\"password\": \"x\"} */
@@ -171,11 +255,8 @@ export function redactText(text: string): string {
   s = s.replace(BASIC, (_m, lead: string) => lead + REDACTED);
   s = s.replace(USERINFO, (_m, scheme: string) => `${scheme}${REDACTED}@`);
   s = s.replace(HEADER, (_m, lead: string) => lead + REDACTED);
-  s = s.replace(NAME_VALUE, (m, name: string, sep: string) => {
-    const hit = sep.includes("=") ? isSensitiveKey(name) : isStrictKey(name);
-    return hit ? `${name}${sep}${REDACTED}` : m;
-  });
-  s = s.replace(FLAG, (m, flag: string, sep: string) => (isStrictKey(flag) ? `${flag}${sep}${REDACTED}` : m));
+  s = scan(s, NAME_SEP, VALUE_AT, true);
+  s = scan(s, FLAG_SEP, FLAG_VALUE_AT, false);
   s = s.replace(PAIR, (...args) => {
     const g = args[args.length - 1] as { lead: string; name: string; v: string };
     return isSensitiveKey(g.name) ? `${g.lead}${g.v[0]}${REDACTED}${g.v[0]}` : (args[0] as string);

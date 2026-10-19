@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import random
 from pathlib import Path
 
 import pytest
@@ -56,7 +58,8 @@ def test_shared_vectors(case):
 def test_megabyte_inputs_are_scanned_in_linear_time():
     import time
     for unit in ("a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
-                 "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x"):
+                 "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
+                 "--mode a;", "-v ", "password=a,token = ", "token=a,--password "):
         text = unit * (1_000_000 // len(unit))
         started = time.perf_counter()
         redact_text(text)
@@ -372,3 +375,134 @@ def test_a_backslash_in_a_bare_value_is_still_consumed_unless_it_starts_an_escap
 def test_escaped_quote_floods_scan_in_bounded_time(filler):
     assert _timed("DB_PASSWORD=" + filler) < 1.0
     assert _timed("--password " + filler) < 1.0
+
+
+# ---- randomized option lists: a benign assignment must never hide a later sensitive one ---------------------------------
+_BENIGN_NAMES = ("user", "name", "id", "a", "b", "mode", "region", "count", "host", "retries", "x1", "role", "timeout")
+_SECRET_NAMES = ("password", "token", "API_KEY", "SECRET", "client_secret", "db_password", "access_token", "authToken")
+_SEPARATORS = (",", ";", "&", " ")
+_PREFIXES = ("", "run ", "https://h.test/p?", "cmd: ", "{", "set ")
+_SUFFIXES = ("", " done", "\nnext")
+_GENERATED_SEED, _GENERATED_COUNT = 20241019, 3000
+_GENERATED_PATH = Path(__file__).parent / "fixtures" / "redact_generated.json"
+
+
+def generate_option_cases(seed: int, count: int) -> list[dict]:
+    """`count` seeded option lists plus the output the spec demands (a simple reference model, independent of the regexes).
+
+    A sensitive name masks its whole value, and an unquoted value runs through `,` to the next `;`, `&` or space, so a pair
+    joined to a sensitive one by `,` is inside its value (and gone); every other pair is a benign assignment and survives.
+    """
+    rng = random.Random(seed)
+    cases = []
+    for i in range(count):
+        pairs = []  # (separator before it, name, value, sensitive)
+        for j in range(rng.randrange(1, 7)):
+            sensitive = rng.random() < 0.4
+            name = rng.choice(_SECRET_NAMES if sensitive else _BENIGN_NAMES)
+            value = f"S{i}x{j}" if sensitive else "v" + "".join(rng.choice("abcdef0123456789") for _ in range(rng.randrange(1, 6)))
+            pairs.append((rng.choice(_SEPARATORS) if j else "", name, value, sensitive))
+        prefix, suffix = rng.choice(_PREFIXES), rng.choice(_SUFFIXES)
+        text, expected, inside = prefix, prefix, False
+        for sep, name, value, sensitive in pairs:
+            text += f"{sep}{name}={value}"
+            if inside and sep == ",":
+                continue  # part of the preceding secret's value
+            inside = sensitive
+            expected += f"{sep}{name}={REDACTED if sensitive else value}"
+        cases.append({"input": text + suffix, "expected": expected + suffix,
+                      "secrets": [v for _, _, v, s in pairs if s]})
+    return cases
+
+
+def test_generated_option_lists_follow_the_reference_model():
+    cases = generate_option_cases(_GENERATED_SEED, _GENERATED_COUNT)
+    assert len(cases) == _GENERATED_COUNT
+    for case in cases:
+        out = redact_text(case["input"])
+        assert out == case["expected"], case["input"]
+        assert not any(secret in out for secret in case["secrets"]), case["input"]  # (a) no sensitive value survives
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_other_seeds_follow_the_reference_model(seed):
+    for case in generate_option_cases(seed, 500):
+        assert redact_text(case["input"]) == case["expected"], case["input"]
+
+
+_WILD_SEED, _WILD_COUNT = 20241020, 3000
+_WILD_SECRET_NAMES = ("password", "token", "API_KEY", "SECRET", "client_secret", "db_password", "access_token", "authToken",
+                      "--password", "--api-key")
+_WILD_BENIGN_NAMES = ("user", "name", "id", "a", "mode", "region", "note", "host", "--mode", "-v", "k.x", "a-b")
+_WILD_JOINERS = (",", " ", ";", "&", ", ", "\n", " ; ", ",\t", "?", "/", "&amp;")
+_WILD_SEPARATORS = ("=", " = ", ": ", ":", "= ", "  :   ")
+
+
+def generate_wild_cases(seed: int, count: int) -> list[dict]:
+    """Option lists in every shape that has fooled a scanner so far: benign and sensitive names (flags too), `=` / `:` with
+    spaces, bare / quoted / escaped-quoted / comma-bearing values, `, ; & ? /` joiners. Each secret is a unique `S<i>_<j>q`."""
+    rng = random.Random(seed)
+    cases = []
+    for i in range(count):
+        units, secrets = [], []
+        for j in range(rng.randrange(1, 6)):
+            sensitive = rng.random() < 0.5
+            name = rng.choice(_WILD_SECRET_NAMES if sensitive else _WILD_BENIGN_NAMES)
+            sep = " " if name.startswith("-") else rng.choice(_WILD_SEPARATORS)
+            sv = f"S{i}_{j}q"
+            if sensitive:
+                secrets.append(sv)
+            forms = [sv, f'"{sv}"', f"'{sv}'", f"{sv},{sv}", f"{sv}=x", f'"{sv} w"', f"{sv}\\x", f'"a b,{sv}"', f'\\"{sv}\\"']
+            if "=" in sep or name.startswith("-"):
+                forms.append(f"//{sv}")  # `NAME: //x` is a URL scheme (`token://x`), deliberately not masked
+            value = rng.choice(forms)
+            units.append(f"{name}{sep}{value}")
+        text = rng.choice(("", "run ", "{", "https://h.test/x?"))
+        for k, unit in enumerate(units):
+            text += unit + (rng.choice(_WILD_JOINERS) if k < len(units) - 1 else "")
+        cases.append({"input": text + rng.choice(("", "}", " done")), "secrets": secrets})
+    return cases
+
+
+def test_wild_option_lists_never_leak_a_sensitive_value():
+    """Invariant (no reference model: shapes are too varied): a sensitive value never survives, whatever precedes it."""
+    leaks = []
+    for case in generate_wild_cases(_WILD_SEED, _WILD_COUNT) + generate_wild_cases(11, 3000):
+        out = redact_text(case["input"])
+        leaks += [(case["input"], out) for secret in case["secrets"] if secret in out]
+    assert leaks[:3] == []
+
+
+def test_generated_fixture_is_current_and_matches_the_python_output():
+    """tests/fixtures/redact_generated.json is also run by omp/test/swarm_bar.test.ts, so Python and TypeScript give identical
+    output. Regenerate with REGENERATE_REDACT_FIXTURE=1 after an intended behavior change (and review the diff)."""
+    option_lists = generate_option_cases(_GENERATED_SEED, _GENERATED_COUNT)
+    wanted = {
+        "seed": _GENERATED_SEED,
+        "cases": [{"input": c["input"], "expected": c["expected"]} for c in option_lists],
+        "wild_seed": _WILD_SEED,
+        "wild": [{"input": c["input"], "expected": redact_text(c["input"])} for c in generate_wild_cases(_WILD_SEED, _WILD_COUNT)],
+    }
+    if os.environ.get("REGENERATE_REDACT_FIXTURE") == "1":
+        def rows(key):
+            return ",\n".join("  " + json.dumps(c, ensure_ascii=False) for c in wanted[key])
+        _GENERATED_PATH.write_text(
+            f'{{"seed": {_GENERATED_SEED}, "wild_seed": {_WILD_SEED}, "cases": [\n{rows("cases")}\n], "wild": [\n{rows("wild")}\n]}}\n',
+            encoding="utf-8")
+    assert json.loads(_GENERATED_PATH.read_text(encoding="utf-8")) == wanted
+
+
+def test_value_scanning_is_idempotent_on_generated_cases():
+    for case in generate_option_cases(7, 500):
+        once = redact_text(case["input"])
+        assert redact_text(once) == once
+
+
+def test_megabyte_assignment_floods_are_scanned_in_linear_time_and_still_find_the_password():
+    import time
+    for unit in ("a=", "a=a=", "user=a,", "user=a;", "x=1&"):
+        text = unit * (1_000_000 // len(unit)) + "password=hunter2"
+        started = time.perf_counter()
+        out = redact_text(text)
+        assert time.perf_counter() - started < 3.0, unit
+        assert out.endswith("password=" + REDACTED) and "hunter2" not in out, unit
