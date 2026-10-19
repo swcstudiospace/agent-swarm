@@ -952,3 +952,111 @@ def test_derive_snapshot_shows_no_handover_in_for_a_tampered_or_malformed_newest
     assert env.tel.derive_snapshot(env.root)["runs"][0]["handover_in"] is None
     path.write_text("{not json")
     assert env.tel.derive_snapshot(env.root)["runs"][0]["handover_in"] is None
+
+
+# ---- the producer folds out-of-band reports (Greptile #6) -------------------------------------------------------------------------------
+_SECRET = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+
+
+def _status(env, task="T1-be", *, wall, kind="progress", step="reading", percent=None, corr="corr-1"):
+    """What shared_status_report leaves behind: `<swarm_dir>/status/<task_id>.json`, replaced atomically (a new inode)."""
+    path = env.sdir / "status" / f"{task}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".tmp-{time.monotonic_ns()}")
+    tmp.write_text(json.dumps({"task_id": task, "correlation_id": corr, "agent": "A05", "kind": kind, "step": step,
+                               "percent": percent, "note": None, "updated_wall": wall, "seq": 1}))
+    tmp.replace(path)
+
+
+def test_producer_folds_a_status_report_into_the_run_activity_and_the_live_file(env):
+    """The derived refresh a report triggers never replaces a live scheduler's live.json, so the producer reads it."""
+    t, fake = _running(env)
+    fake.advance(30)
+    assert t.snapshot()["runs"][0]["activity"] is None
+    _status(env, wall=fake.wall(), step="reading the spec", percent=40)
+    row = t.snapshot()["runs"][0]
+    assert row["activity"] == "progress: reading the spec (40%)" and row["since_activity_s"] == 0.0
+    t.flush_live(force=True)
+    assert env.tel.read_live(env.root)["runs"][0]["activity"] == "progress: reading the spec (40%)"
+
+
+def test_the_newest_of_a_status_report_and_tool_activity_wins(env):
+    t, fake = _running(env)
+    fake.advance(5)
+    _status(env, wall=fake.wall(), step="plan")
+    assert t.snapshot()["runs"][0]["activity"] == "progress: plan"
+    fake.advance(2)
+    t.activity("T1-be.a1", tool="edit")  # newer than the report
+    assert t.snapshot()["runs"][0]["activity"] == "edit"  # the unchanged report file is not folded again over it
+    fake.advance(2)
+    _status(env, wall=fake.wall(), kind="blocked", step="waiting for the design")
+    assert t.snapshot()["runs"][0]["activity"] == "blocked: waiting for the design"
+    fake.advance(2)
+    _status(env, wall=fake.wall() - 10, step="older than the last tool call")  # written late, stamped early: loses
+    t.activity("T1-be.a1", tool="bash")
+    assert t.snapshot()["runs"][0]["activity"] == "bash"
+
+
+def test_a_status_report_ends_a_stall_episode(env):
+    t, fake = _running(env, stall_after_s=60)
+    fake.advance(120)
+    assert t.stalled_runs() == ["T1-be.a1"]
+    _status(env, wall=fake.wall(), step="still working")
+    assert t.stalled_runs() == [] and t.snapshot()["runs"][0]["stalled"] is False
+
+
+def test_a_report_of_an_earlier_attempt_or_another_task_or_swarm_is_not_shown(env):
+    t, fake = _running(env)
+    fake.advance(100)
+    _status(env, wall=fake.wall() - 90, step="left over from attempt 1")  # before this attempt started
+    _status(env, task="T9-other", wall=fake.wall(), step="not mine")
+    _status(env, wall=fake.wall(), step="another correlation", corr="corr-2")
+    assert t.snapshot()["runs"][0]["activity"] is None
+
+
+def test_the_status_file_is_parsed_only_when_it_changed(env, monkeypatch):
+    t, fake = _running(env)
+    _status(env, wall=fake.wall(), step="one")
+    reads = []
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (reads.append(self.name), real(self, *a, **k))[1])
+    for _ in range(3):
+        t.snapshot()
+    assert reads.count("T1-be.json") == 1
+    fake.advance(1)
+    _status(env, wall=fake.wall(), step="two")
+    assert t.snapshot()["runs"][0]["activity"] == "progress: two" and reads.count("T1-be.json") == 2
+
+
+def test_a_folded_report_is_redacted_and_bounded(env):
+    t, fake = _running(env)
+    _status(env, wall=fake.wall(), step=f"token {_SECRET} " + "x" * 400)
+    activity = t.snapshot()["runs"][0]["activity"]
+    assert _SECRET not in activity and len(activity) <= env.tel.CLIP and "[REDACTED]" in activity
+    _status(env, wall=fake.wall(), step="y" * (env.tel.STATUS_MAX_BYTES + 10))  # oversized file: ignored, never read
+    fake.advance(1)
+    assert t.snapshot()["runs"][0]["activity"] == activity
+
+
+def test_settled_runs_are_not_updated_by_a_late_report(env):
+    t, fake = _running(env)
+    t.finish("T1-be.a1", "ok")
+    _status(env, wall=fake.wall(), step="after the end")
+    assert t.snapshot()["runs"][0]["activity"] is None
+
+
+def test_producer_folds_handover_markers_from_the_handover_files(env):
+    from test_handover import base
+    ho = importlib.import_module("swarm.handover")
+    t, fake = _running(env)  # T1-be.a1 on a05-backend
+    t.run_queued("T9.a1", "a08-qa")
+    t.run_started("T9.a1")
+    rows = lambda: {r["task_id"]: r for r in t.snapshot()["runs"]}  # noqa: E731
+    assert rows()["T1-be"]["handover_out"] is None and rows()["T9"]["handover_in"] is None
+    ho.write_handover(base(correlation_id="corr-1", task_id="T1-be", from_agent="A05", to_agent="A08"), root=env.root, emit=False)
+    ho.write_handover(base(correlation_id="corr-1", task_id="T9", from_agent="A05", to_agent="A08"), root=env.root, emit=False)
+    snap = rows()
+    assert snap["T1-be"]["handover_out"] == "T1-be.1" and snap["T1-be"]["handover_in"] is None
+    assert snap["T9"]["handover_in"] == "T9.1" and snap["T9"]["handover_out"] is None
+    t.flush_live(force=True)
+    _assert_valid(env, env.tel.read_live(env.root))

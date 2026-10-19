@@ -111,7 +111,7 @@ Registered tools: 206. Shared tools: 25.
 | `orch_dispatch_batch` | A01 | lane | READ | Choose which ready tasks start this round under each agent's max_parallel and the global cap, with the deferred ones and their reason. | A01 | `tests/generated/test_tool_contracts.py` |
 | `orch_gate_coverage` | A01 | lane | READ | Check the latest verdict per gate against the gates a risk class requires, so A01 approves a task only when every required gate passed or was waived. | A01 | `tests/generated/test_tool_contracts.py` |
 | `orch_plan` | A01 | lane | READ | Orchestrator unit: decompose brief into typed task DAG (plan). | A01 | `tests/generated/test_tool_contracts.py` |
-| `orch_reconcile` | A01 | lane | READ | Orchestrator unit: reassign on failure, aggregate gate results (reconcile). | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_reconcile` | A01 | lane | WRITE | Orchestrator unit: reassign on failure, aggregate gate results (reconcile). | A01 | `tests/generated/test_tool_contracts.py` |
 | `orch_registry_ping` | A01 | lane | READ | Pilot A01 lane tool that echoes a short token so register, call, test, and document can be proven without writing the task store. | A01 | `tests/generated/test_tool_contracts.py` |
 | `orch_rework_bound` | A01 | lane | READ | Apply the rework-loop cap to a gate failure and return REWORK, ESCALATED, or PASS with the loops left, so A01 escalates after the second rework. | A01 | `tests/generated/test_tool_contracts.py` |
 | `orch_run` | A01 | lane | READ | Orchestrator unit: assign tasks, monitor DAG execution (run). | A01 | `tests/generated/test_tool_contracts.py` |

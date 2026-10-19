@@ -54,14 +54,71 @@ export function formatElapsed(seconds: number): string {
 }
 
 const REDACTED = "[REDACTED]";
-const SENSITIVE_WORDS = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "SIGNING", "PRIVATE", "AUTH", "COOKIE"];
 
-function isSensitiveKey(name: string): boolean {
-  const upper = name.toUpperCase().replace(/AUTHOR(?!I[SZ])/g, "");
-  return SENSITIVE_WORDS.some((word) => upper.includes(word));
+// Faithful TS port of `swarm/redact.py` (DESIGN 4.3). Both implementations run the shared vectors in
+// tests/fixtures/redact_cases.json; change a pattern here and there together, or those tests fail.
+/** Static word table: a `Record` keyed by the words (read it with `=== true`, so inherited names such as `constructor` never match). */
+const words = (list: string): Record<string, true> => Object.fromEntries(list.split(" ").map((w) => [w, true]));
+const SENSITIVE_TOKENS = words(
+  "token secret password passwd passphrase credential credentials signing private cookie cookies auth oauth authorization " +
+    "authorisation authentication apikey accesskey secretkey privatekey signingkey sshkey masterkey encryptionkey",
+);
+const KEY_PREFIX_LIST = "api access secret private signing ssh encryption master auth session license licence client";
+const KEY_PREFIXES = words(KEY_PREFIX_LIST);
+const SENSITIVE_SUFFIXES: readonly string[] = [
+  "password", "passwd", "passphrase", "token", "secret", "credential", "credentials", "apikey", "accesskey",
+  "secretkey", "privatekey", "signingkey", "sshkey", "masterkey", "encryptionkey",
+  ...KEY_PREFIX_LIST.split(" ").map((p) => `${p}key`),
+];
+const PASS_TOKENS = words("pass pwd");
+const PASS_CONTEXT = words(
+  "db database sql mysql pg postgres postgresql mongo mongodb redis smtp imap ftp sftp ssh ldap amqp rabbitmq user admin root login mail auth master",
+);
+/** Whole-word names too generic for the prose-prone `name: value` and `--flag value` forms; `=` and JSON pairs keep them. */
+const WEAK_TOKENS = words("auth oauth private signing cookie cookies authentication authorization authorisation");
+const NAME_CAP = 256;
+const CAMEL_SPLIT = /(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/;
+
+function nameTokens(name: string): string[] {
+  const out: string[] = [];
+  for (const part of name.slice(0, NAME_CAP).split(/[^A-Za-z0-9]+/)) {
+    for (const t of part.split(CAMEL_SPLIT)) if (t) out.push(t.toLowerCase());
+  }
+  return out;
 }
 
-const PEM = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g;
+function sensitiveTokens(toks: string[], strict: boolean): boolean {
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]!;
+    if (SENSITIVE_TOKENS[t] === true) {
+      if (!(strict && WEAK_TOKENS[t] === true)) return true;
+    } else if (SENSITIVE_SUFFIXES.some((suffix) => t.endsWith(suffix))) {
+      return true;
+    } else if (i > 0) {
+      const prev = toks[i - 1]!;
+      if (t === "key" && KEY_PREFIXES[prev] === true) return true;
+      if (PASS_TOKENS[t] === true && PASS_CONTEXT[prev] === true) return true;
+    }
+  }
+  return false;
+}
+
+/** Verdicts are memoized per name (a dense `a=b c=d ...` line repeats a few names thousands of times); the cache is bounded. */
+const VERDICTS = { loose: new Map<string, boolean>(), strict: new Map<string, boolean>() };
+const VERDICT_CAP = 1024;
+function keyVerdict(cache: Map<string, boolean>, name: string, strict: boolean): boolean {
+  let hit = cache.get(name);
+  if (hit === undefined) {
+    hit = sensitiveTokens(nameTokens(name), strict);
+    if (cache.size >= VERDICT_CAP) cache.clear();
+    cache.set(name, hit);
+  }
+  return hit;
+}
+const isSensitiveKey = (name: string): boolean => keyVerdict(VERDICTS.loose, name, false);
+const isStrictKey = (name: string): boolean => keyVerdict(VERDICTS.strict, name, true);
+
+const PEM = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g;
 const JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g;
 const TOKENS = [
   /(?<![A-Za-z0-9_])(?:gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g,
@@ -69,20 +126,51 @@ const TOKENS = [
   /(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])/g,
   /(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}/g,
 ];
-const BEARER = /(?<![A-Za-z0-9])([Bb]earer\s+)[A-Za-z0-9._~+/=-]{16,}/g;
-const USERINFO = /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/\s@]*:[^/\s@]*@/g;
-const NAME_VALUE = /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_.-]*)=("[^"]*"|'[^']*'|[^\s&;,"']+)/g;
-const JSON_PAIR = /("([^"\\\n]{1,80})"\s*:\s*)"(?:[^"\\]|\\.)*"/g;
+const BEARER = /(?<![A-Za-z0-9])([Bb]earer\s{1,16})[A-Za-z0-9._~+/=-]{16,}/g;
+/** `Authorization: Basic <base64>` (and Proxy-Authorization); a bare "basic <word>" in prose is not touched. */
+const BASIC = /(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}["']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}/gi;
+/** scheme://user:password@host: the password runs to the LAST '@' before the first '/' or whitespace. */
+const USERINFO = /(\b[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/\s@:]{0,256}:[^/\s]{0,256}@/g;
+// The loops below are written unrolled (`[^x]*(?:\\(?!")[^x]*)*`, not `(?:[^x]|\\(?!"))*`): same language as the Python
+// patterns, but a megabyte-long value no longer exhausts the regex engine's backtrack stack (which skips the match, i.e. leaks).
+const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?!//)(?=[^\s&;,"'\\]|\\(?!"))[^\s&;,"'\\]*(?:\\(?!")[^\s&;,"'\\]*)*)`;
+/** NAME=value / NAME = value (any sensitive name) and NAME: value (strict names only; prose-safe). */
+const NAME_VALUE = new RegExp(
+  String.raw`(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})` + VALUE,
+  "g",
+);
+/** `--password hunter2`, `-db-password hunter2`: a sensitive flag followed by a separate value that is not another flag. */
+const FLAG = new RegExp(
+  String.raw`(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9-]{0,63})([ \t]{1,8})(?![-\s])` +
+    String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^\s"'\\]|\\(?!"))[^\s"'\\]*(?:\\(?!")[^\s"'\\]*)*)`,
+  "g",
+);
+/** "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS). */
+const PAIR = /(?<lead>(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,8})(?<v>"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')/g;
+/** JSON that was serialised again into a string: {\"password\": \"x\"} */
+const ESC_PAIR = /(\\"(?<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")[^"\\]*(?:\\(?!")[^"\\]*)*(\\")/g;
 
-/** TS port of `swarm/redact.py redact_text` (same patterns, DESIGN 4.3): every secret-looking span becomes `[REDACTED]`. */
+/** TS port of `swarm/redact.py redact_text`: every secret-looking span becomes `[REDACTED]`. */
 export function redactText(text: string): string {
   if (text.length < 6) return text;
   let s = text.replace(PEM, REDACTED).replace(JWT, REDACTED);
   for (const rx of TOKENS) s = s.replace(rx, REDACTED);
   s = s.replace(BEARER, (_m, lead: string) => lead + REDACTED);
+  s = s.replace(BASIC, (_m, lead: string) => lead + REDACTED);
   s = s.replace(USERINFO, (_m, scheme: string) => `${scheme}${REDACTED}@`);
-  s = s.replace(NAME_VALUE, (m, name: string) => (isSensitiveKey(name) ? `${name}=${REDACTED}` : m));
-  return s.replace(JSON_PAIR, (m, lead: string, name: string) => (isSensitiveKey(name) ? `${lead}"${REDACTED}"` : m));
+  s = s.replace(NAME_VALUE, (m, name: string, sep: string) => {
+    const hit = sep.includes("=") ? isSensitiveKey(name) : isStrictKey(name);
+    return hit ? `${name}${sep}${REDACTED}` : m;
+  });
+  s = s.replace(FLAG, (m, flag: string, sep: string) => (isStrictKey(flag) ? `${flag}${sep}${REDACTED}` : m));
+  s = s.replace(PAIR, (...args) => {
+    const g = args[args.length - 1] as { lead: string; name: string; v: string };
+    return isSensitiveKey(g.name) ? `${g.lead}${g.v[0]}${REDACTED}${g.v[0]}` : (args[0] as string);
+  });
+  return s.replace(ESC_PAIR, (...args) => {
+    const g = args[args.length - 1] as { name: string };
+    return isSensitiveKey(g.name) ? `${args[1] as string}${REDACTED}${args[2] as string}` : (args[0] as string);
+  });
 }
 
 /** Controls, line separators and bidi overrides (display spoofing), replaced by a space or dropped. */
@@ -787,10 +875,39 @@ export function snapshotHasLive(doc: { runs: unknown[] }): boolean {
   });
 }
 
+/** `T.a2` -> [2, 0]; `T.a1.r2` (rework 2 of attempt 1) -> [1, 2]. Falls back to the row's own `attempt` field, then [0, 0]. */
+function attemptOrder(run: Record<string, unknown>, runId: string): [number, number] {
+  const m = /\.a(\d+)(?:\.r(\d+))?$/.exec(runId);
+  if (m) return [Number(m[1]), m[2] === undefined ? 0 : Number(m[2])];
+  return [num(run.attempt) ?? 0, 0];
+}
+
+/**
+ * The producer keeps every attempt of a task in live.json (`T.a1` completed, `T.a1.r1` rework running, `T.a2` ...) and sorts
+ * running rows before completed ones. One task is one row on the bar, so per task (`task_id`, else the run id) only the NEWEST
+ * attempt is merged: higher attempt, then higher rework index, then the earlier row (the producer's own order: active first).
+ * An older settled attempt must never overwrite, or settle, the row of the attempt that is running now.
+ */
+function newestAttemptRows(runs: unknown[]): Set<unknown> {
+  const best = new Map<string, { entry: unknown; order: [number, number] }>();
+  for (const entry of runs) {
+    const run = record(entry);
+    const runId = str(run?.run_id);
+    const state = str(run?.state);
+    if (!run || !runId || !state || !RUN_STATES.has(state)) continue;
+    const group = str(run.task_id) ?? runId;
+    const order = attemptOrder(run, runId);
+    const held = best.get(group);
+    if (!held || order[0] > held.order[0] || (order[0] === held.order[0] && order[1] > held.order[1])) best.set(group, { entry, order });
+  }
+  return new Set([...best.values()].map((held) => held.entry));
+}
+
 /**
  * Merge a `swarm.live.v1` snapshot read at consumer-monotonic `nowMono`. Producer elapsed values are as of the read, so they
  * are extrapolated from `nowMono`. `ageMs` is how old the file was at the first read: settled runs older than their linger
- * are never shown. A new `run_id` for a known `task_id` is a retry: a new run. Runs the snapshot no longer lists lose their live part.
+ * are never shown. A task listed with several attempts contributes its newest one only (`newestAttemptRows`); a new `run_id`
+ * for a known `task_id` is a retry: a new run. Runs the snapshot no longer lists lose their live part.
  */
 export function ingestLive(model: SwarmBarModel, doc: unknown, nowMono: number, ageMs = 0): boolean {
   if (!isLiveSnapshot(doc)) return false;
@@ -801,7 +918,9 @@ export function ingestLive(model: SwarmBarModel, doc: unknown, nowMono: number, 
   model.slotLimit = limit !== undefined && limit > 0 ? Math.floor(limit) : undefined;
   const swarmElapsed = num(swarm?.elapsed_s);
   model.swarmTimer = swarmElapsed === undefined ? undefined : { baseS: Math.max(0, swarmElapsed), atMono: nowMono };
+  const newest = newestAttemptRows(doc.runs);
   for (const entry of doc.runs) {
+    if (!newest.has(entry)) continue;
     const run = record(entry);
     const runId = str(run?.run_id);
     const state = str(run?.state);

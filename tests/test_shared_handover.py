@@ -689,3 +689,98 @@ def test_generated_contract_tests_run_in_an_isolated_swarm_dir(tmp_path):
     proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:randomly", str(tmp_path / "test_probe.py")],
                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ---- greploop: PR #37 findings ----------------------------------------------------------------------------------
+def _two_receivers(env):
+    make_world(env)
+    to_docs = env.call("shared_handover_write", "A05", handover_payload(to_agent="A15", goal="Bundle the release docs"))
+    to_release = env.call("shared_handover_write", "A05", handover_payload(to_agent="A14", goal="Record the release debt"))
+    assert to_docs["state"] == to_release["state"] == "SUCCESS" and to_docs["digest"] != to_release["digest"]
+    return to_docs, to_release
+
+
+def test_each_receiver_reads_the_handover_addressed_to_it_not_the_latest_written(env):
+    """Greptile #4: the release-record skill writes one handover to A15 and one to A14 under the same task id; after the
+    second write A15's read, verify and bundle returned A14's handover and A15 never saw its own."""
+    docs, release = _two_receivers(env)
+    for caller, mine in (("A15", docs), ("A14", release)):
+        read = env.call("shared_handover_read", caller, {"task_id": "T-be"})
+        assert read["handover"]["to_agent"] == caller and read["handover"]["digest"] == mine["digest"], caller
+        assert "context_only" not in read
+        verify = env.call("shared_handover_verify", caller, {"task_id": "T-be"})
+        assert verify["handover_id"] == mine["handover_id"] and "context_only" not in verify
+        bundle = env.call("shared_handover_bundle", caller, {"task_id": "T-be"})
+        assert bundle["handover"]["digest"] == mine["digest"] and bundle["goal"] == read["handover"]["goal"]
+        assert bundle["handover"]["document"]["to_agent"] == caller and "context_only" not in bundle["handover"]
+        receipt = env.call("shared_handover_receipt", caller, {"task_id": "T-be", "digest": bundle["handover"]["digest"]})
+        assert receipt["state"] == "SUCCESS" and receipt["handover_id"] == mine["handover_id"], receipt
+
+
+def test_a_caller_without_its_own_handover_gets_the_latest_as_context(env):
+    docs, release = _two_receivers(env)
+    read = env.call("shared_handover_read", "A08", {"task_id": "T-be"})
+    assert read["context_only"] is True and read["handover"]["digest"] == release["digest"]
+    assert env.call("shared_handover_verify", "A08", {"task_id": "T-be"})["context_only"] is True
+    assert env.call("shared_handover_bundle", "A08", {"task_id": "T-be"})["handover"]["context_only"] is True
+    refused = env.call("shared_handover_receipt", "A08", {"task_id": "T-be", "digest": release["digest"]})
+    assert refused["state"] == "INVALID_INPUT" and "addressed to A14, not to A08" in refused["message"]
+
+
+def test_artifact_check_judges_the_current_artifact_not_the_superseded_rows(env):
+    """Greptile #3: apply_result appends a row per version, so after a rework the old digest stayed next to the new one and
+    was reported as digest_mismatch although the file matched the latest row."""
+    store = make_world(env)
+    (env.root / "src").mkdir()
+    target = env.root / "src" / "export.py"
+    target.write_text("v1\n", encoding="utf-8")
+    old = env.call("shared_artifact_digest", "A05", {"path": "src/export.py"})["digest"]
+    store.add_artifact("T-be", kind="file", uri="src/export.py", digest=old, producer="A05")
+    target.write_text("v2 after rework\n", encoding="utf-8")
+    new = env.call("shared_artifact_digest", "A05", {"path": "src/export.py"})["digest"]
+    time.sleep(0.01)
+    store.add_artifact("T-be", kind="file", uri="src/export.py", digest=new, producer="A05")
+    env.call("shared_handover_write", "A05", handover_payload(artifacts=[
+        {"kind": "file", "uri": "src/export.py", "digest": new, "producer": "A05"}]))
+    out = env.call("shared_artifact_check", "A08", {"task_id": "T-be"})
+    stale_row = "sha256:" + "b" * 64  # make_world's own row, older than both
+    assert [(r["uri"], r["status"]) for r in out["results"]] == [("src/export.py", "ok")], out
+    assert out["ok"] is True and out["verified"] is True and out["failed"] == 0
+    assert any("superseded" in n and old in n and stale_row in n for n in out["notes"]), out["notes"]
+    # an explicit outputs list is checked as given: the caller asked about those exact digests
+    explicit = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "outputs": [
+        {"kind": "file", "uri": "src/export.py", "digest": old, "producer": "A05"}]})
+    assert explicit["results"][0]["status"] == "digest_mismatch"
+
+
+def test_a_file_that_changed_after_the_latest_row_still_fails(env):
+    store = make_world(env)
+    (env.root / "src").mkdir()
+    (env.root / "src" / "export.py").write_text("v1\n", encoding="utf-8")
+    digest = env.call("shared_artifact_digest", "A05", {"path": "src/export.py"})["digest"]
+    store.add_artifact("T-be", kind="file", uri="src/export.py", digest=digest, producer="A05")
+    (env.root / "src" / "export.py").write_text("edited later\n", encoding="utf-8")
+    out = env.call("shared_artifact_check", "A08", {"task_id": "T-be"})
+    assert out["results"][0]["status"] == "digest_mismatch" and out["ok"] is False and out["verified"] is False
+
+
+def test_dod_check_refuses_more_criteria_than_it_checks(env):
+    """Greptile #10: criteria past the 100th were dropped, then `total` and `all_met` were computed on the subset."""
+    result = {"summary_md": "The export endpoint returns CSV"}
+    criteria = ["The export endpoint returns CSV"] * 100 + ["Never judged criterion without any evidence"]
+    refused = env.call("shared_dod_check", "A08", {"criteria": criteria, "result": result})
+    assert refused["state"] == "INVALID_INPUT" and refused["field"] == "criteria" and "101" in refused["message"]
+    full = env.call("shared_dod_check", "A08", {"criteria": criteria[:100], "result": result})
+    assert full["state"] == "SUCCESS" and full["total"] == 100 and full["all_met"] is True
+
+
+def test_artifact_check_refuses_more_outputs_than_it_checks(env):
+    (env.root / "src").mkdir()
+    (env.root / "src" / "a.py").write_text("a\n", encoding="utf-8")
+    digest = env.call("shared_artifact_digest", "A05", {"path": "src/a.py"})["digest"]
+    good = {"kind": "file", "uri": "src/a.py", "digest": digest, "producer": "A05"}
+    bad = {"kind": "file", "uri": "src/missing.py", "digest": digest, "producer": "A05"}
+    refused = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "agent": "A05", "outputs": [good] * 100 + [bad]})
+    assert refused["state"] == "INVALID_INPUT" and refused["field"] == "outputs" and "101" in refused["message"]
+    full = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "agent": "A05", "outputs": [good] * 100})
+    assert full["state"] == "SUCCESS" and full["checked"] == 100 and full["verified"] is True

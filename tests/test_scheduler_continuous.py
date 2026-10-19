@@ -43,6 +43,12 @@ emit({"type": "session", "version": 3, "id": "fake-" + tid, "cwd": os.getcwd()})
 for tool in c.get("tools", []):
     emit({"type": "tool_execution_start", "toolName": tool["name"], "args": tool.get("args", {})})
     time.sleep(tool.get("sleep", 0.05))
+if c.get("report"):  # the agent's own process calls the real shared_status_report handler
+    sys.path.insert(0, @ROOT@)
+    from swarm.tools.shared_runtime import status_report
+    from swarm.tools.support import caller_scope
+    with caller_scope(c.get("agent", "A05")):
+        rec("reported", out=status_report({"task_id": tid, **c["report"]}))
 if c.get("child"):
     ch = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -95,7 +101,7 @@ class Rig:
         self.bin = tmp_path / "omp-bin" / "omp"
         self.bin.parent.mkdir()
         self.bin.write_text(_FAKE.replace("@PY@", sys.executable).replace("@CFG@", repr(str(cfg_file)))
-                            .replace("@LOG@", repr(str(self.log_file))))
+                            .replace("@LOG@", repr(str(self.log_file))).replace("@ROOT@", repr(str(ROOT))))
         self.bin.chmod(self.bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         spec = tmp_path / "plan.json"
         spec.write_text(json.dumps({"tasks": tasks}))
@@ -246,6 +252,43 @@ def test_max_rounds_bounds_the_dispatches(tmp_path, scheduler, dispatched):
     assert r.returncode == 1, r.stdout + r.stderr
     assert len([rec for rec in rig.fake_log() if rec["ev"] == "start"]) == dispatched
     assert sorted(rig.states().values()).count("DONE") == dispatched
+
+
+def test_one_pass_never_starts_more_than_the_remaining_budget(tmp_path):
+    """Greptile #9: a root finishes and unlocks four children while one dispatch is spent; with a budget of four
+    (--max-rounds 1 --max-parallel 4) that pass may start three of them, never four (five dispatches in total)."""
+    tasks = [_task("root")] + [_task(f"c{i}", deps=["root"]) for i in range(4)]
+    rig = Rig(tmp_path, tasks, {"*": {"sleep": 0.1}})
+    r = rig.run("--max-rounds", "1", "--max-parallel", "4")
+    assert r.returncode == 1, r.stdout + r.stderr
+    starts = [rec["tid"] for rec in rig.fake_log() if rec["ev"] == "start"]
+    assert len(starts) == 4 and starts[0] == "T-root", starts
+    assert sorted(rig.states().values()).count("DONE") == 4
+
+
+def test_an_agent_status_report_reaches_the_schedulers_live_snapshot(tmp_path):
+    """Greptile #6: shared_status_report runs in the agent's process; the derived refresh it triggers refuses to replace
+    the scheduler's fresh live.json, so the scheduler (the owning producer) has to read the report itself."""
+    cfg = {"*": {"sleep": 4.0, "report": {"kind": "progress", "step": "indexing the repo", "percent": 40}}}
+    rig = Rig(tmp_path, [_task("a")], cfg, SWARM_HEARTBEAT_S="1")
+    proc = rig.spawn("--max-parallel", "1")
+    try:
+        deadline, row, live = time.time() + 30, None, None
+        while time.time() < deadline and row is None and proc.poll() is None:
+            try:
+                live = json.loads((rig.swarm / "live.json").read_text())
+            except (OSError, ValueError):
+                live = None
+            row = next((r for r in (live or {}).get("runs", []) if r["task_id"] == "T-a"
+                        and "indexing the repo" in (r["activity"] or "")), None)
+            time.sleep(0.1)
+        assert row is not None, f"the report never reached live.json: {live}"
+        assert live["producer"] == "scheduler"  # the scheduler's own file, not a derived replacement
+        assert row["activity"] == "progress: indexing the repo (40%)" and row["state"] == "running"
+        assert [r for r in rig.fake_log() if r["ev"] == "reported"][0]["out"]["recorded"] is True
+    finally:
+        proc.communicate(timeout=60)
+    assert rig.states() == {"T-a": "DONE"}
 
 
 def test_an_unknown_scheduler_is_refused(tmp_path):

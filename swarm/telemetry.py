@@ -55,6 +55,8 @@ DEFAULT_STALL_AFTER_S = 180.0
 DEFAULT_HEARTBEAT_S = 10.0
 DEFAULT_MAX_PARALLEL = 4
 TAIL_BYTES = 256 * 1024  # events.jsonl tail read by the stateless path
+STATUS_DIR = "status"  # `<state dir>/status/<task_id>.json`, written by shared_status_report
+STATUS_MAX_BYTES = 64 * 1024
 
 EV_QUEUED = "swarm.run.queued"
 EV_STARTED = "swarm.run.started"
@@ -101,6 +103,12 @@ def _clip_text(raw: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def status_label(kind: str, step: str, percent=None) -> str:
+    """The one-line form of a `shared_status_report` for the bar: `progress: build (40%)`."""
+    pct = f" ({percent:g}%)" if isinstance(percent, (int, float)) and not isinstance(percent, bool) else ""
+    return f"{kind}: {step}{pct}"
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -144,12 +152,13 @@ def _state_dir(root, db_path) -> Path:
 _HANDOVER_FILE = re.compile(r"^(?P<task>.+)\.(?P<seq>\d+)\.json$")
 
 
-def _handovers_in(sdir: Path, corr: str | None, tasks: list[dict]) -> dict[str, str]:
-    """`{task_id: handover_id}` for each task whose newest handover is addressed to the agent the task runs on.
+def _handovers_in(sdir: Path, corr: str | None, tasks: list[dict], side: str = "to_agent") -> dict[str, str]:
+    """`{task_id: handover_id}` for each task whose newest handover is addressed to the agent the task runs on
+    (`side="to_agent"`, the in marker) or was written by that agent (`side="from_agent"`, the out marker).
 
     Read from `<state dir>/handovers/<correlation>/` (swarm.handover's layout; the digest is checked, the full schema
-    is not: this is a display projection). A malformed newest file means no handover_in, as `latest_handover` raises
-    rather than skip to an older one; a handover addressed to another agent is passed over. Never raises."""
+    is not: this is a display projection). A malformed newest file means no marker, as `latest_handover` raises
+    rather than skip to an older one; a handover of another agent is passed over. Never raises."""
     out: dict[str, str] = {}
     if not corr:
         return out
@@ -176,13 +185,13 @@ def _handovers_in(sdir: Path, corr: str | None, tasks: list[dict]) -> dict[str, 
                         break
                     doc = json.loads(path.read_text(encoding="utf-8"))
                     valid = (isinstance(doc, dict) and doc.get("task_id") == t["task_id"]
-                             and isinstance(doc.get("handover_id"), str) and isinstance(doc.get("to_agent"), str)
+                             and isinstance(doc.get("handover_id"), str) and isinstance(doc.get(side), str)
                              and doc.get("digest") == handover.compute_digest(doc))
                 except (OSError, ValueError):
                     break
                 if not valid:
                     break
-                if handover.agent_id_of(doc["to_agent"]) == agent:
+                if handover.agent_id_of(doc[side]) == agent:
                     out[t["task_id"]] = clip(doc["handover_id"], 64) or doc["handover_id"][:64]
                     break
     except Exception:  # noqa: BLE001 - a display projection: a handover module that misbehaves hides handover_in only
@@ -372,6 +381,8 @@ class _Run:
         self.stalled = False
         self.error: str | None = None
         self.handover_out: str | None = None
+        self.handover_in: str | None = None
+        self.status_sig: tuple[int, int, int] | None = None  # (inode, size, mtime_ns) of the last status file parsed
         self.parent: str | None = None
         self.finished_emitted = False
 
@@ -401,6 +412,8 @@ class Telemetry:
         self._last_flush: float | None = None
         self._tick: dict = {}
         self._degraded: dict | None = None
+        self._handover_key: tuple | None = None  # (folder listing, live runs) the handover marks below were scanned for
+        self._handover_marks: tuple[dict[str, str], dict[str, str]] = ({}, {})
         if live:
             _ACTIVE[str(self._live_target())] = weakref.ref(self)
 
@@ -564,6 +577,7 @@ class Telemetry:
         """Run ids that are `running` with no activity for more than `stall_after_s`. `swarm.run.stalled` is emitted
         once per stall episode; activity (or a state change) ends the episode."""
         with self._lock:
+            self._fold_external()
             now = self.clock.monotonic()
             out = []
             for run in self._runs.values():
@@ -577,6 +591,74 @@ class Telemetry:
                                    task_id=run.task_id)
             return out
 
+    def _fold_external(self) -> None:
+        """Fold what agents report out of band into the runs this producer owns (fail-open, display only).
+
+        `shared_status_report` runs in the agent's process and writes `<state dir>/status/<task_id>.json`; a derived
+        refresh may not replace this scheduler's live.json, so the producer reads those files itself. Only runs still
+        running are looked at, a file is parsed only when its (inode, size, mtime) changed, and the newest of the report
+        and the last tool activity wins `activity` (a report also ends a stall episode). `handover_in` / `handover_out`
+        come from the handover files of the correlation, re-scanned only when that folder's listing changed."""
+        live = [r for r in self._runs.values() if r.end_mono is None and r.state in (RunState.RUNNING, RunState.HANDING_OFF)]
+        if not live:
+            return
+        sdir = _state_dir(self.root, None)
+        now_mono, now_wall = self.clock.monotonic(), self.clock.wall()
+        for run in live:
+            try:
+                self._fold_status(run, sdir / STATUS_DIR / f"{run.task_id}.json", now_mono, now_wall)
+            except Exception:  # noqa: BLE001 - a display projection: a bad status file hides that report only
+                log.debug("status fold failed for %s", run.run_id, exc_info=True)
+        self._fold_handovers(live, sdir)
+
+    def _fold_status(self, run: _Run, path: Path, now_mono: float, now_wall: float) -> None:
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        sig = (st.st_ino, st.st_size, st.st_mtime_ns)
+        if sig == run.status_sig:
+            return
+        run.status_sig = sig
+        if not 0 < st.st_size <= STATUS_MAX_BYTES:
+            return
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            run.status_sig = None  # a torn or unreadable read: look again next time
+            return
+        updated = doc.get("updated_wall") if isinstance(doc, dict) else None
+        if (not isinstance(updated, (int, float)) or isinstance(updated, bool) or doc.get("task_id") != run.task_id
+                or (self.correlation_id and doc.get("correlation_id") not in (None, self.correlation_id))
+                or not isinstance(doc.get("kind"), str) or not isinstance(doc.get("step"), str)):
+            return
+        reported_mono = now_mono - max(0.0, now_wall - float(updated))
+        if reported_mono < run.anchor_mono - 1.0:
+            return  # a report of an earlier attempt of this task: the file is per task, not per attempt
+        if reported_mono >= run.activity_mono:  # newest wins against tool activity; a tie goes to the report
+            run.activity = clip(status_label(doc["kind"], doc["step"], doc.get("percent")))
+            run.activity_mono = min(reported_mono, now_mono)
+            run.stalled = False
+
+    def _fold_handovers(self, live: list[_Run], sdir: Path) -> None:
+        corr = self.correlation_id
+        if not corr:
+            return
+        folder = sdir / "handovers" / corr
+        try:
+            names = tuple(sorted(os.listdir(folder)))
+        except OSError:
+            return
+        key = (names, tuple(sorted((r.task_id, r.agent) for r in live)))
+        if key != self._handover_key:
+            self._handover_key = key
+            tasks = [{"task_id": r.task_id, "agent_id": r.agent} for r in live]
+            self._handover_marks = (_handovers_in(sdir, corr, tasks), _handovers_in(sdir, corr, tasks, "from_agent"))
+        marks_in, marks_out = self._handover_marks
+        for run in live:
+            run.handover_in = marks_in.get(run.task_id, run.handover_in)
+            run.handover_out = marks_out.get(run.task_id, run.handover_out)
+
     def _row(self, run: _Run, now: float) -> dict:
         end = run.end_mono if run.end_mono is not None else now
         active = run.end_mono is None
@@ -586,8 +668,8 @@ class Telemetry:
             "state_elapsed_s": round(max(0.0, end - run.state_mono), 3),
             "since_activity_s": round(max(0.0, now - run.activity_mono), 3) if active else None,
             "stalled": bool(run.stalled and run.state is RunState.RUNNING), "activity": run.activity,
-            "tool_calls": run.tool_calls, "last_tool": run.last_tool, "parent": run.parent, "handover_in": None,
-            "handover_out": run.handover_out, "error": run.error,
+            "tool_calls": run.tool_calls, "last_tool": run.last_tool, "parent": run.parent,
+            "handover_in": run.handover_in, "handover_out": run.handover_out, "error": run.error,
         }
 
     def heartbeat(self, run_id: str | None = None) -> list[dict]:

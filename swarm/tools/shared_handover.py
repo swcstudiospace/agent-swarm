@@ -30,6 +30,7 @@ BLOCKING = ("major", "critical", "blocker")
 _SEVERITY_ORDER = {"blocker": 0, "critical": 1, "major": 2, "minor": 3, "info": 4}
 MAX_FILE_DIGEST_BYTES = 256 << 20
 MAX_OUTPUTS = 100
+MAX_CRITERIA = 100
 MAX_FINDINGS = 100
 MAX_TRANSITIONS = 50
 MAX_QUESTIONS = 50
@@ -232,10 +233,13 @@ def handover_write(payload: dict) -> dict:
 def handover_read(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
-        status, doc = ho.inspect_handover(task_id, correlation_id=payload.get("correlation_id"), seq=payload.get("seq"))
+        status, doc = ho.inspect_handover(task_id, correlation_id=payload.get("correlation_id"), seq=payload.get("seq"),
+                                          to_agent=current_caller() or None)
         row = ho.read_task(task_id)
         out = {"state": "SUCCESS", "found": doc is not None, "status": status["status"], "reasons": status["reasons"],
                "handover": doc or {}}
+        if status.get("context_only"):
+            out["context_only"] = True
         return _scrub(out, _lease_ids(row))
 
     return respond(payload, lambda: _guarded(work))
@@ -310,7 +314,7 @@ def handover_bundle(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
         clock = SYSTEM_CLOCK
-        status, doc = ho.inspect_handover(task_id, clock=clock)
+        status, doc = ho.inspect_handover(task_id, clock=clock, to_agent=current_caller() or None)
         with ho.StoreReader() as store:
             row = store.task(task_id)
             upstream_rows = [r for d in (row or {}).get("depends_on") or [] if isinstance(d, str) and (r := store.task(d))]
@@ -336,7 +340,8 @@ def handover_bundle(payload: dict) -> dict:
             "goal": _clip((doc or {}).get("goal") or (row or {}).get("title") or "", 2000),
             "acceptance": _acceptance(row)[:25],
             "handover": {"status": status["status"], "reasons": status["reasons"], "document": doc or {},
-                         "handover_id": status.get("handover_id", ""), "digest": status.get("digest", "")},
+                         "handover_id": status.get("handover_id", ""), "digest": status.get("digest", ""),
+                         **({"context_only": True} if status.get("context_only") else {})},
             "upstream": upstream[:10], "artifacts": _merge_artifacts(*sources)[:25], "verdicts": verdicts[:8],
             "lease": _lease_view(row, clock), "attempts": attempts, "open_questions": questions[:MAX_QUESTIONS],
             "truncated": False, "over_cap": False, "bytes": 0,
@@ -395,7 +400,7 @@ def _settle_bytes(out: dict) -> None:
 def handover_verify(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
-        status, doc = ho.inspect_handover(task_id)
+        status, doc = ho.inspect_handover(task_id, to_agent=current_caller() or None)
         with ho.StoreReader() as store:
             row = store.task(task_id)
             upstream = [{"task_id": d, "state": (r or {}).get("state") or "unknown", "satisfied": bool(r and r.get("state") in SATISFIED_STATES)}
@@ -405,9 +410,12 @@ def handover_verify(payload: dict) -> dict:
             if not up["satisfied"]:
                 reasons.append(f"upstream {up['task_id']} is {up['state']}, not yet reviewed or approved")
         ready = status["status"] == "ok" and not [r for r in reasons if r not in status["reasons"]]
-        return {"state": "SUCCESS", "task_known": row is not None, "status": status["status"], "reasons": reasons,
-                "handover_id": status.get("handover_id", ""), "upstream": upstream, "ready": ready,
-                "substrate": "not used: Task Store and handover files only"}
+        out = {"state": "SUCCESS", "task_known": row is not None, "status": status["status"], "reasons": reasons,
+               "handover_id": status.get("handover_id", ""), "upstream": upstream, "ready": ready,
+               "substrate": "not used: Task Store and handover files only"}
+        if status.get("context_only"):
+            out["context_only"] = True
+        return out
 
     return respond(payload, lambda: _guarded(work))
 
@@ -513,32 +521,64 @@ def _check_output(item: dict, expected: str) -> dict:
     return out
 
 
+def _current_outputs(doc: dict | None, stored: list[dict]) -> tuple[list[dict], list[str]]:
+    """One row per output (a workspace file or uri): the newest of the handover's artifacts and the stored rows.
+
+    `apply_result` appends a row per version of an output, so after a rework the old digest sits next to the new one. The
+    old rows are history, not outputs to check; they are named in the returned notes. A document counts as written at
+    its `created_wall`, a stored row at its `ts`; on a tie the stored row wins."""
+    dated = [(float(doc.get("created_wall") or 0), 0, a) for a in (doc or {}).get("artifacts") or [] if isinstance(a, dict)]
+    dated += [(float(r.get("ts") or 0), 1, r) for r in stored if isinstance(r, dict)]
+    latest: dict[str, tuple[tuple[float, int, int], dict]] = {}
+    seen: dict[str, set[str]] = {}
+    for index, (ts, source, item) in enumerate(sorted(dated, key=lambda d: d[:2])):
+        uri = item.get("uri") if isinstance(item.get("uri"), str) else ""
+        path, _why = _local_path(uri) if uri else (None, "")
+        key = str(path) if path is not None else uri or f"#{index}"
+        seen.setdefault(key, set()).add(str(item.get("digest") or ""))
+        latest[key] = ((ts, source, index), item)
+    notes = []
+    for key, (_rank, item) in latest.items():
+        old = sorted(d for d in seen[key] if d != str(item.get("digest") or ""))
+        if old:
+            notes.append(_clip(f"{item.get('uri') or key}: {len(old)} older digest(s) superseded and not checked: "
+                               f"{', '.join(old)}", 400))
+    return [item for _rank, item in sorted(latest.values(), key=lambda v: v[0])], notes
+
+
 def artifact_check(payload: dict) -> dict:
     def work() -> dict:
         task_id = _task_id(payload)
         notes: list[str] = []
         outputs = payload.get("outputs")
+        if isinstance(outputs, list) and len(outputs) > MAX_OUTPUTS:
+            return _invalid("outputs", f"at most {MAX_OUTPUTS} outputs per call, got {len(outputs)}; split them across calls "
+                                       "(a partial check never reports verified)")
         with ho.StoreReader() as store:
             row = store.task(task_id)
             stored = store.artifacts(task_id) if row else []
         expected = ho.agent_id_of(payload.get("agent")) or _agent_of_row(row)
+        complete = True
         if outputs is None:
             doc = None
             try:
-                doc = ho.latest_handover(task_id)
+                caller = current_caller()
+                doc = (ho.latest_handover(task_id, to_agent=caller) if caller else None) or ho.latest_handover(task_id)
             except ho.HandoverInvalid as exc:
                 notes.append(f"handover unreadable: {exc.problems[0][:200]}")
-            outputs = [*((doc or {}).get("artifacts") or []), *stored]
+            outputs, superseded = _current_outputs(doc, stored)
+            notes += superseded
+            if len(outputs) > MAX_OUTPUTS:
+                complete = False
+                notes.append(f"only the first {MAX_OUTPUTS} of {len(outputs)} outputs were checked; verified is false")
         items = [o for o in outputs if isinstance(o, dict)][:MAX_OUTPUTS]
-        if len(outputs) > MAX_OUTPUTS:
-            notes.append(f"only the first {MAX_OUTPUTS} outputs were checked")
         results = [_check_output(item, expected) for item in items]
         failed = sum(1 for r in results if r["status"] in ("missing", "digest_mismatch", "producer_mismatch"))
         unchecked = sum(1 for r in results if r["status"] in ("unchecked", "no_digest"))
         good = sum(1 for r in results if r["status"] == "ok")
         return {"state": "SUCCESS", "task_known": row is not None, "expected_producer": expected or "", "results": results,
                 "checked": len(results), "ok_count": good, "failed": failed, "unchecked": unchecked,
-                "ok": failed == 0, "verified": bool(results) and good == len(results), "notes": notes}
+                "ok": failed == 0 and complete, "verified": complete and bool(results) and good == len(results), "notes": notes}
 
     return respond(payload, lambda: _guarded(work))
 
@@ -665,7 +705,10 @@ def dod_check(payload: dict) -> dict:
         if not isinstance(criteria, list) or not criteria or not all(isinstance(c, str) and c.strip() for c in criteria):
             return _invalid("criteria", "pass criteria (non-empty strings) or a task_id whose Task Store row has acceptance criteria")
         evidence = _evidence(payload["result"])
-        results = [_judge(c, evidence) for c in criteria[:100]]
+        if len(criteria) > MAX_CRITERIA:
+            return _invalid("criteria", f"at most {MAX_CRITERIA} criteria per call, got {len(criteria)}; split them across "
+                                        "calls (a partial check never reports all_met)")
+        results = [_judge(c, evidence) for c in criteria]
         met = sum(1 for r in results if r["status"] == "met")
         return {"state": "SUCCESS", "results": results, "total": len(results), "met": met, "unknown": len(results) - met,
                 "all_met": met == len(results)}

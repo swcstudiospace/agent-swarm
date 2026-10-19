@@ -23,7 +23,8 @@ EXPECTED_SHARED_WRITE = frozenset({
     "shared_escalate",
     "shared_log_emit",
 })
-EXPECTED_LANE_WRITE: frozenset[str] = frozenset()
+# orch_reconcile mutates the Task Store (reopens tasks, creates gate reruns, moves tasks to DONE) and appends run-log events.
+EXPECTED_LANE_WRITE: frozenset[str] = frozenset({"orch_reconcile"})
 REQUIRED_AUTOLOAD = ("swarm-handover-intake", "swarm-handover-emit")
 REQUIRED_OMP_TOOLS = ("swarm_catalog", "swarm_tool_call")
 

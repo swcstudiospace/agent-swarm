@@ -141,7 +141,8 @@ slow task never holds back newly ready work.
 - **Caps:** the global cap is `--max-parallel`, else `SWARM_MAX_PARALLEL`, else 4, never above
   `SWARM_MAX_PARALLEL_CEILING` (32). Each agent's `max_parallel` in `agents.json` applies on top; a class at its
   ceiling does not block another class from taking a free slot. The old fixed cap of 4 (`HARD_MAX`) is gone.
-- **Budget:** `--max-rounds` (default 50) bounds dispatches to `max-rounds x max-parallel`.
+- **Budget:** `--max-rounds` (default 50) bounds dispatches to `max-rounds x max-parallel`, as a total: one pass starts at
+  most what is left of it, so freed slots never carry a run past the budget.
 - **File claims:** a task whose `notes.claims` overlap a claim held by a running task waits
   (`claim-conflict:<holder>` in the tick's `skipped`). Items are a pattern string (exclusive) or
   `{"pattern": "docs/*.md", "mode": "shared"}`. Patterns are repo-relative globs; absolute paths and `..` are
@@ -252,7 +253,10 @@ must be a shared tool all 15 agents may call, each listed skill must have a sour
 
 - **Handover tools (13):** the list in section 5.
 - **Runtime tools (8):** `shared_status_report` (latest progress of the caller's own task; emits
-  `swarm.run.activity`), `shared_scratchpad_put` / `_get` (bounded per-correlation key/value store with
+  `swarm.run.activity` and writes `status/<task_id>.json`, which the scheduler's `Telemetry` reads for its running
+  runs, re-parsing only when the file changed: the newest of the report and the last tool call becomes the run's
+  `activity` in `live.json` and a report ends a stall episode; a derived refresh may not replace a live scheduler's
+  file, so the file is the channel), `shared_scratchpad_put` / `_get` (bounded per-correlation key/value store with
   compare-and-swap, under `scratch/<correlation_id>/`), `shared_escalate` (records `escalation.request` and returns a
   BLOCKED `task.result` patch), `shared_cancel_check` (the cancel flag and deadline arithmetic),
   `shared_log_emit` (one `agent.log` event), `shared_route_check` (does ACP allow this message type between two
@@ -380,7 +384,8 @@ config edit. Checklist (grep for `range(1, 16)`, `== 15` and `A15` to find any p
 5. Tests: your own `tests/test_tools_aNN.py`, plus `python3 -m pytest tests/generated/test_tool_contracts.py
    tests/test_capability_acceptance.py`. The count rule is `capability_policy.tools` (10 to 15 lane tools per agent;
    `enforce: false` drops only the minimum). `test_capability_acceptance.py` also pins the exact set of WRITE tools
-   (`EXPECTED_SHARED_WRITE`, `EXPECTED_LANE_WRITE` is empty): a new WRITE tool changes that set on purpose.
+   (`EXPECTED_SHARED_WRITE`; `EXPECTED_LANE_WRITE` is `orch_reconcile` alone, because its handler reopens tasks, creates
+   gate reruns and moves tasks to DONE): a new WRITE tool changes that set on purpose.
 
 I ran this flow in a scratch copy with a throwaway `be_demo_echo` tool: `--check` and `--apply` passed, the
 registry check passed, and the generated contract tests and `test_capability_acceptance.py` passed.
@@ -502,7 +507,8 @@ failure). A write error names the field (`/artifacts/0/digest: ...`). See the ru
 - **Tiers.** `side_effect_tier` is `READ` (default) or `WRITE`. `DESTRUCTIVE` and `EXTERNAL` are rejected by the
   registry validator in v2.2. A WRITE tool may write only under the swarm state dir. The set of WRITE tools is pinned by
   `tests/test_capability_acceptance.py`: `shared_handover_write`, `shared_handover_receipt`, `shared_status_report`,
-  `shared_scratchpad_put`, `shared_escalate`, `shared_log_emit`; lane tools are all READ. This is review and test
+  `shared_scratchpad_put`, `shared_escalate`, `shared_log_emit`, and the lane tool `orch_reconcile` (it reopens tasks,
+  creates gate reruns and moves tasks to DONE in the Task Store); every other lane tool is READ. This is review and test
   enforced, not an OS sandbox.
 - **Plan mode.** `swarm_tool_call` refuses WRITE tools in omp plan mode.
 - **Redaction.** `runlog.emit` redacts every payload (tokens, keys, `NAME=value` with a sensitive name, URL userinfo,

@@ -212,7 +212,10 @@ def _emit_activity(task: dict, caller: str, text: str) -> None:
     telemetry.emit("swarm.run.activity", {"run_id": run_id, "agent": caller, "tool": "shared_status_report", "text": text,
                                           "tool_calls": calls, "turns": 0, "tokens": 0},
                    task_id=task["task_id"], local_only=True)
-    refresh_live(clock=CLOCK)  # fail-open: the bar reads live.json, and a display projection must never fail the call
+    # Fail-open. With no scheduler this derives live.json from the event above. During `swarm_run` the refresh refuses to
+    # replace the scheduler's fresh file; that producer reads the status file written by `status_report` itself
+    # (`Telemetry._fold_external`), so the report still reaches the bar.
+    refresh_live(clock=CLOCK)
 
 
 def status_report(payload: dict) -> dict:
@@ -250,7 +253,9 @@ def status_report(payload: dict) -> dict:
         throttled = (since is not None and 0 <= since < STATUS_EMIT_INTERVAL_S
                      and previous.get("kind") == kind and kind == "progress")
         if not throttled:
-            label = f"{kind}: {record['step']}" + (f" ({percent:g}%)" if percent is not None else "")
+            from swarm.telemetry import status_label
+
+            label = status_label(kind, record["step"], percent)
             _emit_activity(task, caller, _text(label))
         return {**base, "recorded": True, "emitted": not throttled, "seq": seq}
 

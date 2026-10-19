@@ -186,6 +186,19 @@ def test_plan_mode_refuses_non_read_tools_before_the_handler_and_catalog_shows_t
     assert [t["tier"] for t in listing["tools"]] == ["WRITE"]
 
 
+def test_plan_mode_refuses_orch_reconcile_which_mutates_the_task_store(capsys, monkeypatch):
+    """Greptile #1: orch_reconcile reopens tasks, creates gate reruns and moves tasks to DONE, so it is WRITE, not the READ default."""
+    imported = []
+    real = tool_registry._import_handler
+    monkeypatch.setattr(tool_registry, "_import_handler", lambda handler: imported.append(handler) or real(handler))
+    code, out = _run(capsys, monkeypatch, "call", "--caller", "A01", "--name", "orch_reconcile",
+                     "--input", '{"correlation_id": "C1"}', "--plan-mode")
+    assert code == 2 and out["error"]["code"] == "E-POLICY" and "WRITE" in out["error"]["message"]
+    assert imported == []
+    _code, listing = _run(capsys, monkeypatch, "catalog", "--caller", "A01", "--kind", "tools", "--query", "orch_reconcile")
+    assert [(t["name"], t["tier"]) for t in listing["tools"]] == [("orch_reconcile", "WRITE")]
+
+
 def test_call_runs_in_the_workspace_root_not_the_install(capsys, monkeypatch, tmp_path):
     work = tmp_path / "work"
     work.mkdir()

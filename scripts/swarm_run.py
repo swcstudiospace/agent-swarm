@@ -1953,8 +1953,8 @@ class Scheduler:
                 self.book.seen(t, waiting=True, queue_depth=len(ready))
         eff = self.effective_parallel()
         free = max(0, eff - len(self.inflight))
-        if not self.barrier and self.dispatched >= self.budget:
-            free = 0
+        if not self.barrier:  # `--max-rounds` is a total: never start more than what is left of it in one pass
+            free = min(free, max(0, self.budget - self.dispatched))
         per_class = Counter(i.agent["id"] for i in self.inflight.values())
         batch, waiting = select_batch(store, eligible, free, self.leases, running=per_class, claims=self.claims,
                                       skipped=skipped)

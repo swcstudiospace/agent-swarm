@@ -139,6 +139,32 @@ def test_status_report_keeps_the_tool_call_counter_the_live_snapshot_shows(store
     assert sr._carried_calls("T-be.a1") == 12 and sr._carried_calls("T-other.a1") == 0
 
 
+def test_status_report_reaches_the_live_snapshot_a_scheduler_producer_owns(store, clock):
+    """Greptile #6: the report only reached the event log; the producer's own snapshot never showed the step."""
+    from swarm.telemetry import Telemetry, read_live
+
+    producer = Telemetry(correlation_id="C1", clock=clock, tee=False)
+    producer.run_queued("T-be.a1", "a05-backend")
+    producer.run_started("T-be.a1", sid="s1", runtime="omp")
+    clock.advance(2)  # past the one-write-per-second flush window
+    assert report(store, percent=40)["emitted"] is True
+    [row] = read_live()["runs"]
+    assert read_live()["producer"] == "scheduler"
+    assert row["run_id"] == "T-be.a1" and row["activity"] == "progress: reading (40%)"
+    clock.advance(2)
+    report(store, kind="blocked", step="waiting for the design")
+    assert read_live()["runs"][0]["activity"] == "blocked: waiting for the design"
+
+
+def test_status_report_reaches_the_derived_snapshot_when_no_scheduler_runs(store):
+    from swarm.telemetry import read_live
+
+    assert report(store, step="indexing")["emitted"] is True
+    doc = read_live()
+    assert doc["producer"] == "derived"
+    assert [r["activity"] for r in doc["runs"] if r["task_id"] == "T-be"] == ["progress: indexing"]
+
+
 # ---- shared_scratchpad_put / get ---------------------------------------------------------------------------------
 def put(caller="A05", key="plan", value=None, corr="C1", **kw):
     return call(sr.scratchpad_put, caller, {"correlation_id": corr, "key": key, "value": {"n": 1} if value is None else value, **kw})

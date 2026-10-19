@@ -383,3 +383,37 @@ def test_a_changed_handover_gets_a_new_seq_and_the_receiver_acknowledges_the_new
     assert again["duplicate"] is True and again["handover_id"] == second["handover_id"]
     out = intake(world)
     assert out["receipts"][0]["digest"] == second["digest"] and out["receipts"][0]["handover_id"] == "T-be.2"
+
+
+def test_a_fresh_task_has_no_handover_of_its_own_and_the_skill_says_that_is_fine(world):
+    """Greptile #2: the intake skill put the receiver's own task id into `sources` but excused a missing handover only for
+    an upstream task or when EVERY source was missing, so in the normal A05 -> A08 handoff (upstream written, own task
+    never) step 2 told A08 to stop with BLOCKED. The own id has nothing on a fresh task; only a resumed task has one."""
+    finish_upstream(world)
+    ok(emit(world))
+    own = ok(call("shared_handover_verify", "A08", {"task_id": "T-qa"}))
+    assert (own["status"], own["ready"], [u["satisfied"] for u in own["upstream"]]) == ("missing", False, [True])
+    out = intake(world)
+    assert out["outcome"] == "continue" and out["receipts"][0]["state"] == "SUCCESS"
+
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "prompts" / "skills" / "shared" / "handover-intake.md").read_text(encoding="utf-8")
+    assert "FRESH task" in text and "`status: missing` and `ready: false` are expected" in text
+    assert "NOT a reason to stop" in text and "resumed" in text
+    assert "every source is `missing`" not in text  # the rule that counted the own id as a source to be present
+
+
+def test_two_receivers_of_one_task_each_acknowledge_their_own_handover(world):
+    """Greptile #4 end to end: A05 hands T-be to A15 and to A14; A15's intake acknowledges A15's handover (not the later one)."""
+    finish_upstream(world)
+    to_docs = ok(emit(world, to_agent="A15", goal="Bundle the release docs for the CSV export"))
+    to_release = ok(emit(world, to_agent="A14", goal="Record the release debt of the CSV export"))
+    assert to_docs["digest"] != to_release["digest"]
+    for me, mine in (("A15", to_docs), ("A14", to_release)):
+        verify = ok(call("shared_handover_verify", me, {"task_id": "T-be"}))
+        assert verify["handover_id"] == mine["handover_id"] and verify["ready"] is True
+        bundle = ok(call("shared_handover_bundle", me, {"task_id": "T-be"}))
+        assert bundle["handover"]["digest"] == mine["digest"]
+        receipt = ok(call("shared_handover_receipt", me, {"task_id": "T-be", "digest": bundle["handover"]["digest"]}))
+        assert receipt["handover_id"] == mine["handover_id"]

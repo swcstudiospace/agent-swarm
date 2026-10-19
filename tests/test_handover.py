@@ -585,3 +585,51 @@ def test_verdicts_of_the_reader_keep_pre_rework_rows_flagged_stale(env):
     with env.ho.StoreReader(env.root) as reader:
         rows = reader.verdicts("T-v")
     assert [(r["verdict"], r["stale"]) for r in rows] == [("pass", False)]
+
+
+# ---- greploop: PR #37 findings ----------------------------------------------------------------------------------
+def test_a_task_with_handovers_to_two_receivers_serves_each_its_own(env):
+    """Greptile #4: `inspect_handover` always judged the last handover of the task, whoever it was addressed to."""
+    env.write(base(to_agent="A15", goal="Bundle the release docs"))
+    env.write(base(to_agent="A14", goal="Record the release debt"))
+
+    def judge(**kw):
+        return env.ho.inspect_handover("T1-be", root=env.root, clock=env.clock, **kw)
+
+    status, doc = judge(to_agent="A15")
+    assert (doc["to_agent"], doc["goal"], status["seq"], status["status"]) == ("A15", "Bundle the release docs", 1, "ok")
+    assert "context_only" not in status
+    status, doc = judge(to_agent="A14")
+    assert (doc["to_agent"], status["seq"]) == ("A14", 2) and "context_only" not in status
+    status, doc = judge(to_agent="A08")  # nobody wrote to A08: the newest one, as context
+    assert (doc["to_agent"], status["seq"], status["context_only"]) == ("A14", 2, True)
+    status, doc = judge()  # no caller: the newest handover, as before
+    assert doc["to_agent"] == "A14" and "context_only" not in status
+    status, doc = judge(to_agent="A14", seq=1)  # an explicit seq is judged as asked, flagged when it is not for the caller
+    assert (doc["to_agent"], status["context_only"]) == ("A15", True)
+
+
+def test_a_malformed_newer_handover_is_not_skipped_to_find_the_addressee(env):
+    env.write(base(to_agent="A15"))
+    env.write(base(to_agent="A14", goal="Another goal"))
+    path = env.file(seq=2)
+    path.write_bytes(path.read_bytes().replace(b"Another goal", b"Tampered goal"))
+    status, doc = env.ho.inspect_handover("T1-be", root=env.root, clock=env.clock, to_agent="A15")
+    assert status["status"] == "malformed" and doc is None and status["seq"] == 2
+
+
+def test_a_document_near_the_cap_is_summarized_for_the_real_id_of_a_long_task_id(env):
+    """Greptile #5: sizing used `pending.999999` (14 characters) while the stored id is `<task id up to 128>.<seq>`, so a
+    document that fit with the short id passed the cap check and then overflowed with E_INTERNAL."""
+    task_id = "T" + "a" * 127
+    completed = [f"step {i}: " + "x" * 300 for i in range(3)]
+    first = env.write(base(task_id=task_id, completed=completed, correlation_id="corr-size"), max_bytes=1 << 15)
+    assert first["summarized"] is False
+    cap = first["bytes"] - 1  # the whole document fits with a short id, but not with its real 130-character id
+    other = base(task_id=task_id, completed=completed, correlation_id="corr-size-2")
+    short_id = env.ho.stored_size({**env.ho._prepare(other, env.clock), "handover_id": "pending.999999"})
+    assert short_id <= cap < first["bytes"] + 1
+    written = env.write(other, max_bytes=cap)
+    assert written["summarized"] is True and written["bytes"] <= cap
+    stored = env.sdir / "handovers" / "corr-size-2" / f"{task_id}.1.json"
+    assert len(stored.read_bytes()) == written["bytes"] and env.ho.read_handover(stored, root=env.root)["summarized"] is True

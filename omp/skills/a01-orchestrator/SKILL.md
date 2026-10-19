@@ -27,7 +27,7 @@ Discover with `swarm_catalog`, call with `swarm_tool_call` (the caller is your o
 - `orch_budget_class` (READ): Return the token, wall, and cost budget orch_plan assigns to a risk class.
 - `orch_plan` (READ): Orchestrator unit: decompose brief into typed task DAG (plan).
 - `orch_run` (READ): Orchestrator unit: assign tasks, monitor DAG execution (run).
-- `orch_reconcile` (READ): Orchestrator unit: reassign on failure, aggregate gate results (reconcile).
+- `orch_reconcile` (WRITE): Orchestrator unit: reassign on failure, aggregate gate results (reconcile).
 - `orch_assign` (READ): Orchestrator unit: assign task to agent (part of monitor/assign).
 - `orch_dag_blocked` (READ): Classify a plan's dispatchable tasks as ready, waiting, or blocked, and report dependency cycles, so A01 disp…
 - `orch_gate_coverage` (READ): Check the latest verdict per gate against the gates a risk class requires, so A01 approves a task only when e…

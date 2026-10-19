@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,32 @@ def test_token_positives(secret, label):
 def test_bearer_keeps_scheme_and_hides_token():
     assert redact_text("Authorization: Bearer abcdefghij0123456789xyz") == f"Authorization: Bearer {REDACTED}"
     assert redact_text("bearer abcdefghij0123456789xyz") == f"bearer {REDACTED}"
+
+
+def _join(value):
+    return value if isinstance(value, str) else "".join(value)
+
+
+_SHARED = json.loads((Path(__file__).parent / "fixtures" / "redact_cases.json").read_text(encoding="utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("case", _SHARED, ids=[c["name"] for c in _SHARED])
+def test_shared_vectors(case):
+    """The same vectors run in omp/test/swarm_bar.test.ts against redactText: the two implementations cannot drift."""
+    out = redact_text(_join(case["input"]))
+    for needle in case["must_not_contain"]:
+        assert _join(needle) not in out
+    for needle in case["must_contain"]:
+        assert _join(needle) in out
+
+
+def test_megabyte_inputs_are_scanned_in_linear_time():
+    import time
+    for unit in ("a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-"):
+        text = unit * (1_000_000 // len(unit))
+        started = time.perf_counter()
+        redact_text(text)
+        assert time.perf_counter() - started < 3.0, unit  # a quadratic scan of 1 MB takes minutes
 
 
 def test_pem_block_whole_and_truncated():

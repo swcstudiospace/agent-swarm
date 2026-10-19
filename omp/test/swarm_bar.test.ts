@@ -120,6 +120,49 @@ describe("formatElapsed", () => {
   });
 });
 
+describe("redactText shared vectors", () => {
+  type Needle = string | string[];
+  interface Vector {
+    name: string;
+    input: Needle;
+    must_not_contain: Needle[];
+    must_contain: Needle[];
+  }
+  const flat = (value: Needle): string => (typeof value === "string" ? value : value.join(""));
+  const { cases } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[] };
+
+  test("tests/fixtures/redact_cases.json: the same vectors tests/test_redact.py runs against swarm/redact.py", () => {
+    expect(cases.length).toBeGreaterThan(30);
+    for (const vector of cases) {
+      const out = redactText(flat(vector.input));
+      for (const needle of vector.must_not_contain) expect({ name: vector.name, leaked: out.includes(flat(needle)) }).toEqual({ name: vector.name, leaked: false });
+      for (const needle of vector.must_contain) expect({ name: vector.name, kept: out.includes(flat(needle)) }).toEqual({ name: vector.name, kept: true });
+    }
+  });
+
+  test("a space-separated password flag in currentToolArgs never reaches the activity row", () => {
+    const row = sanitizeText("login --password hunter2");
+    expect(row).toBe("login --password [REDACTED]");
+  });
+
+  test("1 MB adversarial inputs are scanned in time linear in their size (< 100 ms each)", () => {
+    const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-"];
+    for (const unit of units) {
+      const text = unit.repeat(Math.floor(1_000_000 / unit.length));
+      const started = performance.now();
+      redactText(text);
+      expect({ unit, fast: performance.now() - started < 100 }).toEqual({ unit, fast: true });
+    }
+  });
+
+  test("a megabyte-long unbroken secret value is still redacted (the regex engine must not give up and leak it)", () => {
+    for (const lead of ["AUTH=", "--password ", "{\"password\": \""]) {
+      const out = redactText(`${lead}${"q".repeat(1_000_000)}${lead.startsWith("{") ? "\"}" : ""}`);
+      expect({ lead, leaked: out.includes("qqqqqqqq") }).toEqual({ lead, leaked: false });
+    }
+  });
+});
+
 describe("sanitization", () => {
   test("strips ANSI sequences and control characters, collapses whitespace", () => {
     expect(sanitizeText("\x1b[31mred\x1b[0m\x07 bell\r\n\tnext\u0000line\x1b]0;title\x07")).toBe("red bell next line");
@@ -382,6 +425,67 @@ describe("reducer: sources", () => {
     expect(rows[0].state).toBe("queued");
     ingestLive(model, live([]), T0 + 2 * SEC);
     expect(visibleRuns(model, T0 + 2 * SEC)).toHaveLength(0);
+  });
+
+  describe("several attempts of one task in one snapshot: the newest attempt wins", () => {
+    const reworkDoc = (): Record<string, unknown> & { runs: Array<Record<string, unknown>> } =>
+      JSON.parse(readFileSync(join(REPO_ROOT, "omp", "test", "fixtures", "live_rework_sample.json"), "utf8"));
+    const byAgent = (model: SwarmBarModel, now: number) => Object.fromEntries(visibleRuns(model, now).map((run) => [run.agent, run.state]));
+
+    test("real scheduler shape (retained earlier attempts, running rows before completed ones), both orders of appearance, counted once", () => {
+      const forward = reworkDoc();
+      const reversed = { ...reworkDoc(), runs: [...reworkDoc().runs].reverse() };
+      for (const [order, doc] of [["producer order", forward], ["reversed", reversed]] as const) {
+        const model = createModel();
+        expect(ingestLive(model, doc, T0)).toBe(true);
+        const rows = visibleRuns(model, T0);
+        expect({ order, rows: rows.length }).toEqual({ order, rows: 3 });
+        expect({ order, states: byAgent(model, T0) }).toEqual({ order, states: { "a05-backend": "running", "a06-frontend": "running", "a15-docs": "completed" } });
+        expect(rows.find((run) => run.agent === "a06-frontend")?.parts.live?.runId).toBe("T-fe.a1.r1");
+        expect(rows.find((run) => run.agent === "a05-backend")?.parts.live?.runId).toBe("T-be.a2");
+        const [summary] = plain(model, 200, T0);
+        expect(summary).toContain("2 run");
+        expect(summary).toContain("1 done");
+        expect(summary).toContain("0 fail");
+        expect(statusText(model, T0)).toBe("swarm: 2 run");
+      }
+    });
+
+    test("an older completed attempt never settles the row of its running rework, snapshot after snapshot", () => {
+      const model = createModel();
+      ingestLive(model, live([{ run_id: "T.a1", task_id: "T", agent: "a06", state: "running", elapsed_s: 5 }]), T0);
+      // the rework starts: the file now lists the running rework FIRST and the completed original after it
+      const doc = live([
+        { run_id: "T.a1.r1", task_id: "T", agent: "a06", state: "running", elapsed_s: 6 },
+        { run_id: "T.a1", task_id: "T", agent: "a06", state: "completed", elapsed_s: 5 },
+      ]);
+      for (const runs of [doc.runs, [...doc.runs].reverse()]) {
+        ingestLive(model, { ...doc, runs }, T0 + SEC);
+        expect(byAgent(model, T0 + SEC)).toEqual({ a06: "running" });
+        expect(visibleRuns(model, T0 + SEC)).toHaveLength(1);
+      }
+      ingestLive(model, live([{ run_id: "T.a1.r1", task_id: "T", agent: "a06", state: "completed", elapsed_s: 9 }, { run_id: "T.a1", task_id: "T", agent: "a06", state: "completed", elapsed_s: 5 }]), T0 + 2 * SEC);
+      expect(byAgent(model, T0 + 2 * SEC)).toEqual({ a06: "completed" });
+    });
+
+    test("attempt number outranks the rework index, the rework index outranks none, ties keep the earlier row", () => {
+      const pick = (ids: string[]): string | undefined => {
+        const model = createModel();
+        ingestLive(model, live(ids.map((id) => ({ run_id: id, task_id: "T", agent: "a", state: "running" }))), T0);
+        return visibleRuns(model, T0)[0]?.parts.live?.runId;
+      };
+      expect(pick(["T.a1.r3", "T.a2"])).toBe("T.a2");
+      expect(pick(["T.a2", "T.a1.r3"])).toBe("T.a2");
+      expect(pick(["T.a1", "T.a1.r2", "T.a1.r10"])).toBe("T.a1.r10");
+      expect(pick(["T.a2.r1", "T.a2"])).toBe("T.a2.r1");
+      expect(pick(["T.a1", "T.a1"])).toBe("T.a1");
+    });
+
+    test("distinct tasks never collapse, and rows without a task id stay per run id", () => {
+      const model = createModel();
+      ingestLive(model, live([{ run_id: "A.a1", task_id: "A", agent: "x", state: "running" }, { run_id: "B.a1", task_id: "B", agent: "y", state: "running" }, { run_id: "lone", agent: "z", state: "running" }]), T0);
+      expect(byAgent(model, T0)).toEqual({ x: "running", y: "running", z: "running" });
+    });
   });
 
   test("the same agent seen on the bus and in live.json is one row, with the live clock and stall flag", () => {

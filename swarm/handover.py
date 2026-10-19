@@ -600,9 +600,15 @@ def latest_handover(task_id: str, *, root: str | Path | None = None, to_agent: s
 
 # ---- status ----------------------------------------------------------------------------------------------------
 def inspect_handover(task_id: str, *, root: str | Path | None = None, clock: Clock = SYSTEM_CLOCK,
-                     correlation_id: str | None = None, seq: int | None = None) -> tuple[dict, dict | None]:
+                     correlation_id: str | None = None, seq: int | None = None,
+                     to_agent: str | None = None) -> tuple[dict, dict | None]:
     """`(status, document)`: `handover_status` plus the document when it is readable (ok, partial or stale). Without
-    `seq` the newest handover is judged, with it that sequence number."""
+    `seq` the newest handover is judged, with it that sequence number.
+
+    A task can carry several handovers to different receivers (`A05` hands to `A15` and to `A14`). With `to_agent` (and
+    no `seq`) the newest handover ADDRESSED to that agent is judged; when none is addressed to it, the newest handover
+    is judged as context and the status carries `context_only: true` (a receiver writes no receipt for it). An
+    unreadable handover met on the way is never skipped: its addressee is unknown, so the status is `malformed`."""
     cands = list_handovers(task_id, root=root, correlation_id=correlation_id)
     if seq is not None:
         cands = [c for c in cands if c.seq == seq]
@@ -622,8 +628,19 @@ def inspect_handover(task_id: str, *, root: str | Path | None = None, clock: Clo
     info = {"seq": latest.seq, "correlation_id": latest.correlation_id}
     try:
         doc = read_handover(latest.path, root=root)
+        if to_agent is not None and seq is None and doc["to_agent"] != to_agent:
+            for cand in reversed(scoped[:-1]):
+                info = {"seq": cand.seq, "correlation_id": cand.correlation_id}  # a malformed file is reported under its own seq
+                older = read_handover(cand.path, root=root)
+                if older["to_agent"] == to_agent:
+                    doc = older
+                    break
+            else:
+                info = {"seq": latest.seq, "correlation_id": latest.correlation_id}
     except HandoverInvalid as exc:
         return {"status": "malformed", "reasons": [p[:MAX_REASON] for p in exc.problems], **info}, None
+    if to_agent is not None and doc["to_agent"] != to_agent:
+        info["context_only"] = True
     age = max(0.0, clock.wall() - float(doc["created_wall"]))
     info.update(handover_id=doc["handover_id"], digest=doc["digest"], from_agent=doc["from_agent"],
                 to_agent=doc["to_agent"], age_s=round(age, 3))
@@ -742,6 +759,9 @@ def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = 
     problems = validate_handover(prepared)
     if problems:
         raise HandoverInvalid(problems)
+    # Size and summarize with the id shape the stored file will have (`<task_id>.<seq>`, a task id up to 128 characters):
+    # a shorter provisional id would let a document near the cap pass this check and overflow once the real id is set.
+    prepared["handover_id"] = f"{prepared['task_id']}.{_PENDING_ID}"
     clean = _restore_identity(redact(prepared), prepared)
     redacted = clean != prepared
     sized = _sized(clean)
