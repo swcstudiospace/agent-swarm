@@ -67,6 +67,16 @@ def test_every_render_embeds_the_shared_block_once(render, slug):
 
 
 @pytest.mark.parametrize("render,slug", CASES, ids=IDS)
+def test_registry_bridge_guidance_is_omp_only(render, slug):
+    """Only omp agents hold swarm_catalog and swarm_tool_call, so only their preamble explains them."""
+    text = _text(render, slug)
+    assert ("- Registry tools and skills:" in text) == (render == "omp")
+    assert ("swarm_tool_call" in text) == (render == "omp")
+    if render == "omp":
+        assert text.count("swarm_tool_call") >= 1 and "your own identity, never a parameter" in text
+
+
+@pytest.mark.parametrize("render,slug", CASES, ids=IDS)
 def test_no_pre_change_grant_survives(render, slug):
     text = _text(render, slug)
     for grant in GRANTS:

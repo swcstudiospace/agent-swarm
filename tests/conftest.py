@@ -37,6 +37,21 @@ def ephemeral_signing_key(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(signing_config))
 
 
+@pytest.fixture(autouse=True)
+def _repo_swarm_state_is_untouched(monkeypatch, tmp_path_factory):
+    """Keep tests off the checkout's own .swarm run state.
+
+    call_tool appends a local-only audit row whenever a .swarm directory exists (or the tool writes),
+    so a test that calls registry tools without SWARM_DIR would pollute <repo>/.swarm/events.jsonl,
+    which is the live run log when a swarm runs in this checkout. When the process has no SWARM_DIR,
+    point it at a fresh per-test directory (created lazily by the code under test, not here). Tests
+    that set SWARM_DIR keep control; tests of the default resolution call monkeypatch.delenv, which
+    runs after this fixture and wins.
+    """
+    if not os.environ.get("SWARM_DIR"):
+        monkeypatch.setenv("SWARM_DIR", str(tmp_path_factory.mktemp("swarm") / ".swarm"))
+
+
 @pytest.fixture()
 def swarm_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))

@@ -1,0 +1,43 @@
+---
+name: swarm-handover-intake
+description: Use when a task starts from upstream work or a handover; verify it first, stop with BLOCKED on any doubt, then read the bundle and record a receipt.
+owner: shared
+tools: [shared_handover_verify, shared_handover_bundle, shared_handover_read, shared_artifact_check, shared_open_findings, shared_lease_state, shared_handover_receipt, shared_escalate, shared_log_emit]
+---
+
+# Handover intake
+
+## When to Use
+
+- Every task assignment, before any work: the assignment names a `task_id` and may depend on upstream tasks.
+- A rework or escalation arrives: run this first, then `swarm-rework-intake` or `swarm-escalation-takeover`.
+
+## Procedure
+
+A handover is filed under the task id of the task that PRODUCED it (the sender writes it with its own `task_id` and `to_agent` set to the next agent id). It is never filed under your task id. So you read it under each upstream task id, and under your own id only when the same task is resumed (pause, cancel, escalation, rework).
+
+1. Call `shared_handover_verify` with `{task_id: <your own task id>}`. Its `upstream[]` (`task_id`, `state`, `satisfied`) lists the dependency tasks: they, plus your own task id, are your `sources`. `status` here judges only a handover filed under your own id.
+2. For every source `S` call `shared_handover_verify` with `{task_id: S}` and read `status` (ok, missing, partial, stale, malformed), `reasons`, `ready`. `missing` for an upstream `S` that is `satisfied` means that agent wrote no handover: note it with `shared_log_emit` (level info) and go on. If every source is `missing` and every upstream is `satisfied`, nothing was handed over (a root task): continue from the assignment and skip the receipt. In every other case where a source is not `ok`, or `ready` is false, or an upstream is not `satisfied`, STOP: do not continue on guesses. Call `shared_escalate` with `{task_id: <your own task id>, reason_code, summary, needs}`: `stale-handover` for stale or malformed, `ambiguous-input` for partial, `blocked` when an upstream task is not yet satisfied; `summary` quotes `reasons`; `needs` lists what the sender must supply.
+3. Build the BLOCKED result from the returned `result_patch`, replacing its `needs` with `{"kind": "handover_clarification", "reason": <reasons>, "missing": [<needs>]}` (the shape of `swarm.handover.clarification_request`). Emit it as the final `task.result` and do no further work.
+4. For every source `S` with status `ok` call `shared_handover_read` with `{task_id: S}` and check `handover.to_agent` is your agent id. A handover addressed to another agent is context only: read it, write no receipt. Then call `shared_handover_bundle` with `{task_id: S}` and read `goal`, `handover.document` (completed, remaining, decisions, constraints, blockers), `upstream[].summary` and `needs`, `open_questions`, and `truncated` (if true, the full document is in `shared_handover_read`). Your own acceptance criteria come from your assignment, not from the bundle of `S`.
+5. Call `shared_artifact_check` with `{task_id: S}`. Read each `results[].status`: every artifact must be `ok`. `missing`, `digest_mismatch` or `producer_mismatch` means stop as in step 2 (`reason_code: conflict`). `unchecked` or `no_digest` means unverified: carry it as a question, never as fact.
+6. Call `shared_open_findings` with `{task_id: S}`. Any finding with `blocking: true` is mandatory scope: see `swarm-rework-intake`.
+7. Call `shared_lease_state` with `{task_id: <your own task id>}` and apply `swarm-lease-discipline`.
+8. For every handover addressed to you call `shared_handover_receipt` with `{task_id: S, digest: <bundle handover.digest>, understood: [<goal, constraints, remaining>], questions: [<open items>], accepted: true}`. `handover.digest` of the bundle names the stored file even when `handover.document` was shortened (a shortened document carries no digest of its own). Only the addressed receiver may write it; a rejection means the handover is not yours, so go to step 2.
+
+## Outputs
+
+- A receipt (`receipt`, `duplicate` flag) per handover addressed to you, tied to its digest.
+- A working set: goal, remaining work, constraints, artifacts with digests, open questions, plus your own acceptance criteria.
+- Or a BLOCKED `task.result` with a `handover_clarification` need.
+
+## Failure Handling
+
+- `INVALID_INPUT`: correct the named field once, then BLOCKED.
+- `DEPENDENCY_UNAVAILABLE`, `TIMEOUT` or `PARTIAL_SUCCESS`: retry the same call at most twice, then report BLOCKED with the tool name.
+- `UNAUTHORIZED` or an unknown task from `shared_escalate`: the task is not assigned to you or not in the Task Store; write the BLOCKED result by hand (`state`, `task_id` = your own, `needs` as in step 3) and stop.
+- Never invent a missing handover, digest or artifact to unblock yourself.
+
+## Handover
+
+- The receipt is the acknowledgement. Carry unresolved `questions` forward in your own handover (`swarm-handover-emit`), filed under your own task id.

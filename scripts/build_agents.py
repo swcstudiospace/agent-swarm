@@ -35,7 +35,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from swarm.manifest import load_manifest  # noqa: E402
-from _write_skills import omp_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
+from _write_skills import omp_skill, source_skill, swarm_orchestrate_skill, yaml_str  # noqa: E402
+from swarm.skill_registry import SHARED_OWNER, load_skills, validate_skills  # noqa: E402
 import _install_cursor  # noqa: E402
 import _install_omp  # noqa: E402
 import _install_substrate  # noqa: E402
@@ -52,22 +53,28 @@ SCHEMA = ROOT / "swarm" / "schemas" / "task.result.v1.json"
 TOOL_MAP = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "bash", "Write": "write", "Edit": "edit", "Agent": "task"}
 BLOCKING = {"A01", "A08", "A09", "A10", "A12"}
 # D-01: the omp package's hidden swarm_* tools reach only the agents granted here (omp frontmatter only).
-SWARM_TOOLS = {
+# Every agent gets the registry bridge (v2.2 DESIGN 5.3); the caller is the session's own identity, never a parameter.
+REGISTRY_BRIDGE_TOOLS = ["swarm_catalog", "swarm_tool_call"]
+_ROLE_SWARM_TOOLS = {
     "A01": ["swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"],
     "A08": ["swarm_gate"],
     "A09": ["swarm_gate"],
     "A10": ["swarm_gate"],
     "A12": ["swarm_gate"],
 }
-# Fail-closed ceiling: only A01 leases and requests canonical assignments; only gate agents record verdicts.
+SWARM_TOOLS = {f"A{n:02d}": _ROLE_SWARM_TOOLS.get(f"A{n:02d}", []) + REGISTRY_BRIDGE_TOOLS for n in range(1, 16)}
+# Fail-closed ceiling: only A01 leases and requests canonical assignments; only gate agents record verdicts. The
+# registry bridge is the one grant every agent may hold.
 ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"}
+# Skills every omp agent autoloads when their sources exist (D6); absent sources are skipped so a tree without them is unchanged.
+SHARED_AUTOLOAD = ("swarm-handover-intake", "swarm-handover-emit")
 # gate agent → (swarm_gate gate name, gate script stem); mirrors GATE_AGENTS in omp/src/context.ts
 GATES = {"A08": ("quality", "qa_gate"), "A09": ("review", "rev_gate"), "A10": ("security", "sec_gate"), "A12": ("release", "rel_plan")}
 GATE_AGENTS = set(GATES)
 
 # One rule block for every render. Claude, Grok, omp (all three preambles) and Cursor embed it verbatim, so the merge,
 # branch, keyless-advisory and no-bypass rules cannot drift apart (tests/test_render_rules.py pins it). It must stay
-# short: omp/agents/a01-orchestrator.md is the largest agent and is capped at 24 KB (tests/test_omp_agents.py).
+# short: omp/agents/a01-orchestrator.md is the largest agent and is capped at OMP_AGENT_MAX_BYTES, 64 KiB (tests/test_omp_agents.py).
 # It must not contain the literal pre-change branch text: tests/test_cursor_agents.py forbids it in Cursor output.
 SHARED_RULES = """- Never merge a pull request, enable auto-merge, push to a protected branch, or delete a branch. Work ends at a draft PR and a report; a human merges. Where the body below grants merge or auto-merge rights, open a draft PR and report instead.
 - Branches are `<seat-prefix>/<task_id>`. In a Programming Desk repo `<seat-prefix>` is the ownership.yaml owner of the files you change, so the branch is bot-0N-<seat>/<task_id> (gates.yml rejects any prefix not matching ^bot-0[0-6]-[a-z0-9-]+$); with more than one owner, stop BLOCKED with needs naming the seats. In any other repo `<seat-prefix>` is swarm.
@@ -297,6 +304,7 @@ _OMP_COMMON = """You are running as an omp task agent inside the AgentSwarm (see
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Finish by calling the `yield` tool with your `task.result` (or gate verdict) payload as defined in <output_format> as `data`; under omp this replaces any fenced-json finish instruction in the body below. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
+- Registry tools and skills: find them with `swarm_catalog` (optional `kind` tools or skills, optional `query`); call a registry tool with `swarm_tool_call` (`name`, `input`). The caller is always your own identity, never a parameter. Read a skill by opening its `skill://<name>` link. A call returns the registry result object unchanged: `state` SUCCESS or an error state.
 """ + SHARED_RULES
 
 OMP_PREAMBLE = "<swarm_runtime>\n" + _OMP_COMMON + "</swarm_runtime>\n"
@@ -330,6 +338,18 @@ OMP_ORCH_PREAMBLE = """<swarm_runtime>
 """
 
 
+def omp_autoload(agent: dict) -> list[str]:
+    """Skills an omp agent autoloads: its index skill (A01 also the driver skill), then the shared handover skills that exist."""
+    names = ["a01-orchestrator", "swarm-orchestrate"] if agent["id"] == "A01" else [agent["slug"]]
+    shared = {s.name for s in load_skills(ROOT) if s.owner_dir == SHARED_OWNER}
+    return names + [n for n in SHARED_AUTOLOAD if n in shared]
+
+
+def generated_skill_names(agents: list[dict]) -> set[str]:
+    """Every omp skill the generator writes: the agent index skills, the driver skill and each source skill."""
+    return {a["slug"] for a in agents} | {"swarm-orchestrate"} | {s.name for s in load_skills(ROOT) if s.name}
+
+
 def render_omp(agent: dict, agents: list[dict]) -> str:
     output = json.dumps(json.loads(SCHEMA.read_text(encoding="utf-8")), separators=(",", ":"))
     is_orch = agent["id"] == "A01"
@@ -342,7 +362,7 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
     if not is_orch and "task" in mapped:
         raise ValueError(f"{agent['id']}: specialists must not get the omp task tool")
     grants = SWARM_TOOLS.get(agent["id"], [])
-    allowed = ORCH_SWARM_TOOLS if is_orch else {"swarm_gate"} if agent["id"] in GATE_AGENTS else set()
+    allowed = set(REGISTRY_BRIDGE_TOOLS) | (ORCH_SWARM_TOOLS if is_orch else {"swarm_gate"} if agent["id"] in GATE_AGENTS else set())
     denied = [t for t in grants if t not in allowed]
     if denied:
         raise ValueError(f"{agent['id']}: swarm tool(s) not allowed for this agent: {', '.join(denied)}")
@@ -357,10 +377,12 @@ def render_omp(agent: dict, agents: list[dict]) -> str:
     ]
     if agent["id"] in BLOCKING:
         fm.append("blocking: true")
-    if is_orch:
-        fm += ["autoloadSkills: a01-orchestrator,swarm-orchestrate", f"output: {output}", "---"]
-    else:
-        fm += [f"autoloadSkills: {agent['slug']}", f"output: {output}", "---"]
+    autoload = omp_autoload(agent)
+    generated = generated_skill_names(agents)
+    unknown = [n for n in autoload if n not in generated]
+    if unknown:
+        raise ValueError(f"{agent['id']}: autoload skill(s) with no generated skill (omp drops unknown names silently): {', '.join(unknown)}")
+    fm += [f"autoloadSkills: {','.join(autoload)}", f"output: {output}", "---"]
     if is_orch:
         preamble = OMP_ORCH_PREAMBLE
     elif agent["id"] in GATES:
@@ -844,7 +866,7 @@ def _omp_orphans(slugs: set[str]) -> tuple[list[Path], list[Path]]:
     for p in OMP_AGENTS_DIR.glob("*.md"):
         if p.stem not in slugs:
             (removable if _contained(p, OMP_AGENTS_DIR) else unsafe).append(p)
-    known_skills = slugs | {"swarm-orchestrate"}
+    known_skills = slugs | {"swarm-orchestrate"} | {s.name for s in load_skills(ROOT) if s.name}
     for d in (OMP_SKILLS_DIR.iterdir() if OMP_SKILLS_DIR.is_dir() else []):
         if d.name in known_skills:
             continue
@@ -1173,6 +1195,11 @@ def main() -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    sources = load_skills(ROOT)
+    skill_errors = validate_skills(sources, {**manifest_raw, "agents": agents}, counts=False)
+    if skill_errors:
+        print("error: invalid skill sources:\n  " + "\n  ".join(skill_errors), file=sys.stderr)
+        return 1
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
     GROK_DIR.mkdir(parents=True, exist_ok=True)
     changed, written, blocked = [], [], []
@@ -1186,6 +1213,11 @@ def main() -> int:
         _write_or_check(OMP_SKILLS_DIR / agent["slug"] / "SKILL.md", omp_skill(agent), args.check, changed, written, blocked)
         if agent["id"] == "A01":
             _write_or_check(OMP_SKILLS_DIR / "swarm-orchestrate" / "SKILL.md", swarm_orchestrate_skill(), args.check, changed, written, blocked)
+    slug_selected = {a["slug"] for a in agents if _agent_selected(a, only)}
+    for skill in sources:
+        if only and skill.owner_dir != SHARED_OWNER and skill.owner_dir not in slug_selected:
+            continue
+        _write_or_check(OMP_SKILLS_DIR / skill.name / "SKILL.md", source_skill(skill), args.check, changed, written, blocked)
     for rel in sorted(grok_files):
         if not _grok_rel_selected(rel, agents, only):
             continue

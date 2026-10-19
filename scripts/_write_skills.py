@@ -2,9 +2,12 @@
 """Generate per-agent SKILL.md files and the orchestration skill."""
 from __future__ import annotations
 import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from swarm.skill_registry import Skill, load_skills, skills_for_owner, validate_skills  # noqa: E402
 AGENTS = json.loads((ROOT / "agents.json").read_text())["agents"]
 
 DONT = {
@@ -209,7 +212,38 @@ def yaml_str(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
 
 
-def omp_skill(a: dict) -> str:
+def _one_line(text: str, limit: int = 110) -> str:
+    """First sentence or line of `text`, single-spaced and clipped to `limit` characters."""
+    flat = " ".join(text.split())
+    cut = flat.find(". ")
+    if 0 < cut < limit:
+        flat = flat[: cut + 1]
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _index_sections(a: dict, skills: list[Skill]) -> str:
+    """`## Registered tools` and `## Skills` for an agent's index skill; a section with no entries is omitted."""
+    out = ""
+    tools = [t for t in a.get("registered_tools") or [] if isinstance(t, dict) and t.get("name")]
+    if tools:
+        lines = "\n".join(
+            f"- `{t['name']}` ({t.get('side_effect_tier', 'READ')}): {_one_line(str(t.get('purpose', '')))}" for t in tools
+        )
+        out += (
+            "\n## Registered tools\n\n"
+            "Discover with `swarm_catalog`, call with `swarm_tool_call` (the caller is your own identity).\n\n"
+            f"{lines}\n"
+        )
+    if skills:
+        lines = "\n".join(f"- `skill://{s.name}`: {_one_line(s.description, 130)}" for s in skills)
+        out += f"\n## Skills\n\nRead the one that fits with its link; they are hidden from the skill listing.\n\n{lines}\n"
+    return out
+
+
+def omp_skill(a: dict, skills: list[Skill] | None = None) -> str:
+    """The visible per-agent index skill. `skills` defaults to this agent's sources under prompts/skills/<slug>."""
+    if skills is None:
+        skills = skills_for_owner(load_skills(ROOT), a["slug"])
     desc = yaml_str(
         f"{a['id']} {a['code']} {a['name']} — {a['description']} "
         f"Use when the swarm assigns capability {', '.join(a['capabilities'][:3])}."
@@ -233,11 +267,35 @@ Don't use for: {DONT[a['id']]}
 1. Dispatch via the omp `task` tool with `agent: {a['slug']}` (definition: `omp/agents/{a['slug']}.md`), passing the signed `task.assign` payload.
 2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.
 3. Don't use it for: {DONT[a['id']]}
-"""
+{_index_sections(a, skills)}"""
 
 
+def source_skill(s: Skill) -> str:
+    """A hidden skill rendered from its source file: omp lists it only by `skill://` link, never in the prompt."""
+    return (
+        "---\n"
+        f"name: {yaml_str(s.name)}\n"
+        f"description: {yaml_str(s.description)}\n"
+        "disable-model-invocation: true\n"
+        "---\n\n"
+        f"{s.body.strip()}\n\n"
+        f"<!-- generated from {s.path}; edit the source and run scripts/build_agents.py -->\n"
+    )
 
-def main() -> None:
+
+def source_skill_names(skills: list[Skill] | None = None) -> list[str]:
+    return [s.name for s in (load_skills(ROOT) if skills is None else skills) if s.name]
+
+
+def main() -> int:
+    # validate before the first write: a source skill that fails (empty name, reserved name, bad path) must not
+    # produce stray files or overwrite a generated skill
+    sources = load_skills(ROOT)
+    document = json.loads((ROOT / "agents.json").read_text())
+    errors = validate_skills(sources, document, counts=False)
+    if errors:
+        print("error: invalid skill sources, nothing written:\n  " + "\n  ".join(errors), file=sys.stderr)
+        return 1
     for a in AGENTS:
         d = ROOT / "skills" / a["slug"]
         d.mkdir(parents=True, exist_ok=True)
@@ -258,8 +316,16 @@ def main() -> None:
     for a in AGENTS:
         d = ROOT / "omp" / "skills" / a["slug"]
         d.mkdir(parents=True, exist_ok=True)
-        (d / "SKILL.md").write_text(omp_skill(a), encoding="utf-8")
+        (d / "SKILL.md").write_text(omp_skill(a, skills_for_owner(sources, a["slug"])), encoding="utf-8")
         print("wrote", d / "SKILL.md")
 
+    for s in sources:
+        d = ROOT / "omp" / "skills" / s.name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(source_skill(s), encoding="utf-8")
+        print("wrote", d / "SKILL.md")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

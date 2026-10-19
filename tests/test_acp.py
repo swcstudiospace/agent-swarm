@@ -183,12 +183,14 @@ def test_retries_keep_the_original_envelope():
 
 
 def test_busy_handler_is_not_retried(monkeypatch):
-    from swarm.tools.support import Busy
+    Busy = Bus.request.__globals__["Busy"]  # the class this Bus catches, whichever module graph it was imported in
 
     def boom(_fn, _arg, _timeout):
         raise Busy("call")
 
-    monkeypatch.setattr("swarm.acp.invoke_bounded", boom)
+    # patch the globals of the Bus under test: conftest's swarm_dir fixture evicts swarm* modules, so a dotted-name
+    # setattr could patch a fresh `swarm.acp` that this Bus never uses
+    monkeypatch.setitem(Bus.request.__globals__, "invoke_bounded", boom)
     bus = Bus(sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("retried")))
     bus.register("A03", lambda envelope: {"correlation_id": envelope["correlation_id"]})
     result = bus.request(HAPPY)
