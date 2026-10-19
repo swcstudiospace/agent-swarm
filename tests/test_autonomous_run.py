@@ -272,3 +272,27 @@ time.sleep(30)
     log = json.loads((tmp_path / ".swarm" / "autonomous.log").read_text())
     assert log["run_rc"] == -signal.SIGKILL
     assert r.returncode in (-signal.SIGKILL, 256 - signal.SIGKILL)
+
+
+def test_run_exports_its_grace_as_the_runners_shutdown_budget(tmp_path):
+    """RV-A P1: the runner sized its own shutdown (10 s wait + 5 s kill) without knowing the supervisor's 15 s grace,
+    so its sessions were SIGKILLed alongside it. The hook now tells the runner its grace."""
+    seen = tmp_path / "budget"
+    root = _stub_root(tmp_path, f"""import json, os
+open({str(seen)!r}, "w").write(os.environ.get("SWARM_SHUTDOWN_BUDGET_S", "unset"))
+print(json.dumps({{"status": "ok"}}))
+""")
+    briefs = iter(["implement a billing feature", "implement a billing report", "implement a billing export"])
+
+    def kick(**extra):  # a different brief per kick: the same one is debounced for 120 s
+        env = {**os.environ, "SWARM_DIR": str(tmp_path / ".swarm"), **extra}
+        for name in ("SWARM_AUTONOMOUS_RUN_GRACE_S", "SWARM_SHUTDOWN_BUDGET_S"):
+            if name not in extra:
+                env.pop(name, None)
+        subprocess.run([sys.executable, str(RUNNER), "--cwd", str(tmp_path), "--brief", next(briefs),
+                        "--swarm-root", str(root)], capture_output=True, text=True, env=env, timeout=30)
+        return seen.read_text()
+
+    assert kick() == "15"
+    assert kick(SWARM_AUTONOMOUS_RUN_GRACE_S="7.5") == "7.5"
+    assert kick(SWARM_AUTONOMOUS_RUN_GRACE_S="nope", SWARM_SHUTDOWN_BUDGET_S="99") == "15"  # the supervisor's grace wins

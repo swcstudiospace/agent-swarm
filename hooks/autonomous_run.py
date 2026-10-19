@@ -178,11 +178,14 @@ def main() -> int:
             return 0
         run += ["--correlation-id", plan_json["correlation_id"]]
         # SWARM_AUTONOMOUS_RUN_CAP_S bounds the run (default 3600). The grace is how long the runner has to end
-        # its sessions after SIGTERM before this process SIGKILLs it (T-06-26).
+        # its sessions after SIGTERM before this process SIGKILLs it (T-06-26). The runner fits its whole shutdown
+        # (cooperative wait, session kill, final records) inside it: SWARM_SHUTDOWN_BUDGET_S.
+        grace = _env_seconds("SWARM_AUTONOMOUS_RUN_GRACE_S", 15)
+        env["SWARM_SHUTDOWN_BUDGET_S"] = f"{grace:g}"
         p2 = run_capped(
             run, cwd=str(root), env=env,
             timeout=_env_seconds("SWARM_AUTONOMOUS_RUN_CAP_S", 3600),
-            grace=_env_seconds("SWARM_AUTONOMOUS_RUN_GRACE_S", 15),
+            grace=grace,
         )
         log.write_text(
             json.dumps({
