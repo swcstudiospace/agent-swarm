@@ -161,9 +161,9 @@ const HEADER_CLOSE: Record<string, RegExp> = { '"': /[\r\n"]/g, "'": /[\r\n']/g 
  * stops at the next '/' (every `://` ends the previous scan), so the scans of different schemes never overlap.
  */
 const USERINFO = /((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/ \t\r\n\f\v@:]*:[^/ \t\r\n\f\v]*@/g;
-// The loops below are written unrolled (`[^x]*(?:\\(?!")[^x]*)*`, not `(?:[^x]|\\(?!"))*`): same language as the Python
-// patterns, but a megabyte-long value no longer exhausts the regex engine's backtrack stack (which skips the match, i.e. leaks).
-const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^ \t\r\n\f\v&;"'\\]|\\(?!"))[^ \t\r\n\f\v&;"'\\]*(?:\\(?!")[^ \t\r\n\f\v&;"'\\]*)*)`;
+// A VALUE is read by ONE quote-aware `Reader` (twin of `_Reader` in swarm/redact.py) for every option form (NAME=, NAME:, --flag value, -pVALUE,
+// -u user:pass ...): only its BARE word differs per carrier (`BARE_*` below). A backslash keeps the next blank in a bare word (`pa\ ss`) but never
+// starts an escaped quote (`\"`). Written as loops, not regexes: a megabyte-long value never exhausts the regex engine's backtrack stack.
 /**
  * NAME=value / NAME = value (any sensitive name) and NAME: value (strict names only; prose-safe), and `--password hunter2` /
  * `-db-password hunter2` (a sensitive flag followed by a separate value that is not another flag). The regexes match only
@@ -172,11 +172,162 @@ const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]
  */
 const NAME_SEP = /(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,32}[=:][ \t]{0,32})/g;
 const FLAG_SEP = /(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9_-]{0,63})([ \t]{1,8})(?![- \t\r\n\f\v])/g;
-const VALUE_AT = new RegExp(VALUE, "y");
-const FLAG_VALUE_AT = new RegExp(
-  String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^ \t\r\n\f\v"'\\]|\\(?!"))[^ \t\r\n\f\v"'\\]*(?:\\(?!")[^ \t\r\n\f\v"'\\]*)*)`,
-  "y",
-);
+/** Bare-word flavours: a NAME=value stops at a blank, `;`, `&` or a quote; a `--flag value` at a blank or a quote; a command-line word at a blank, `;&|` or a quote. */
+const BARE_NAME = 0;
+const BARE_FLAG = 1;
+const BARE_CLI = 2;
+
+/** End of the bare word that starts at s[i] (`i` when it is empty); explicit ASCII blanks: JS and Python `\s` differ. */
+function bareEnd(s: string, i: number, kind: number): number {
+  const n = s.length;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 92) {
+      const d = s.charCodeAt(i + 1);
+      if (d === 32 || d === 9) {
+        i += 2;
+        continue;
+      }
+      if (d === 34) break;
+      i++;
+      continue;
+    }
+    if (c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || c === 11 || c === 34 || c === 39) break;
+    if (kind !== BARE_FLAG && (c === 59 || c === 38)) break;
+    if (kind === BARE_CLI && c === 124) break;
+    i++;
+  }
+  return i;
+}
+
+/**
+ * The ONE reader of a value that follows a secret-taking name or option (twin of `_Reader`). It starts where the value starts and understands
+ * every way a shell, a JSON string or a log line quotes it: bare (a backslash keeps a blank), `'..'`, `".."`, ANSI-C `$'..'`, locale `$".."`, and
+ * the ESCAPED form a quote takes inside saved JSON evidence (`\".."`, `\\\".."` when the JSON was serialised twice). A quoted value runs
+ * through its closing quote honouring backslash escapes (a quote preceded by an odd run of backslashes is content, as is a blank, a tab, a
+ * newline, `;&|`, `#`, unicode ...); an escaped-form value closes at a quote preceded by exactly the opening run and ends before a quote that
+ * is not preceded by an odd run (the closing quote of the JSON string that holds it). A quote that never closes runs to the end of its line.
+ * A quoted value always is a value, even when it holds only blanks or punctuation. One instance reads one string; scans only move forward: a
+ * quote without a close fails for every later quote of its kind (`failed`), the end of a line is remembered, quote counts are advanced.
+ */
+class Reader {
+  readonly s: string;
+  /** set by `opener`: the quote, the length of the opener, the backslashes before the quote */
+  q = "";
+  oplen = 0;
+  run = 0;
+  /** set by `quoted` / `read`: the length of the closing quote (0 when the value ends at a line end or before an enclosing quote) */
+  closeLen = 0;
+  private readonly failed = new Set<string>();
+  private eolFrom = 1;
+  private eolTo = 0;
+  private seen = 0;
+  private readonly counts = new Map<string, number>();
+
+  constructor(s: string) {
+    this.s = s;
+  }
+
+  /** Whether a quote opens at s[i] (`"`, `'`, `$'`, `$"`, `\"`, `$\"` ...); then `q`, `oplen` and `run` describe it. */
+  opener(i: number): boolean {
+    const s = this.s;
+    let j = i;
+    let c = s.charAt(j);
+    if (c === "$") {
+      j++;
+      c = s.charAt(j);
+    }
+    if (c === '"' || c === "'") {
+      this.q = c;
+      this.oplen = j + 1 - i;
+      this.run = 0;
+      return true;
+    }
+    if (c !== "\\") return false;
+    let r = j;
+    while (s.charCodeAt(r) === 92) r++;
+    const q = s.charAt(r);
+    if ((r - j) % 2 === 1 && (q === '"' || q === "'")) {
+      this.q = q;
+      this.oplen = r + 1 - i;
+      this.run = r - j;
+      return true;
+    }
+    return false;
+  }
+
+  private lineEnd(i: number): number {
+    if (this.eolFrom <= i && i <= this.eolTo) return this.eolTo;
+    const s = this.s;
+    let e = i;
+    while (e < s.length && s.charCodeAt(e) !== 10 && s.charCodeAt(e) !== 13) e++;
+    this.eolFrom = i;
+    this.eolTo = e;
+    return e;
+  }
+
+  /** End of the quoted value that opens at s[i]; `closeLen` is the length of its closing quote. */
+  quoted(i: number, q: string, oplen: number, run: number): number {
+    const s = this.s;
+    const key = q + run;
+    if (!this.failed.has(key)) {
+      let k = i + oplen;
+      for (let j = s.indexOf(q, k); j >= 0; j = s.indexOf(q, k)) {
+        let r = j;
+        while (r > k && s.charCodeAt(r - 1) === 92) r--;
+        const n = j - r;
+        if (run !== 0) {
+          if (n === run) {
+            this.closeLen = run + 1;
+            return j + 1;
+          }
+          if (n % 2 === 0) {
+            this.closeLen = 0;
+            return j;
+          }
+        } else if (n % 2 === 0) {
+          this.closeLen = 1;
+          return j + 1;
+        }
+        k = j + 1;
+      }
+      this.failed.add(key);
+    }
+    this.closeLen = 0;
+    return this.lineEnd(i);
+  }
+
+  /** End of the value at s[i] (`i` when there is none: no bare character, or a quote with nothing after it); `closeLen` as in `quoted`. */
+  read(i: number, kind: number): number {
+    if (this.opener(i)) {
+      const end = this.quoted(i, this.q, this.oplen, this.run);
+      return this.closeLen !== 0 || end > i + this.oplen ? end : i;
+    }
+    this.closeLen = 0;
+    return bareEnd(this.s, i, kind);
+  }
+
+  /** Whether an odd number of quotes (`q` with `run` backslashes before it) stand in the current line before s[upto]: such a quote CLOSES what an earlier quote opened. `upto` only grows. */
+  odd(q: string, run: number, upto: number): boolean {
+    const s = this.s;
+    if (upto > this.seen) {
+      const seen = this.seen;
+      for (let j = seen; j < upto; j++) {
+        const c = s.charCodeAt(j);
+        if (c === 10 || c === 13) {
+          this.counts.clear();
+        } else if (c === 34 || c === 39) {
+          let r = j;
+          while (r > seen && s.charCodeAt(r - 1) === 92) r--;
+          const key = s.charAt(j) + (j - r);
+          this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
+        }
+      }
+      this.seen = upto;
+    }
+    return (this.counts.get(q + run) ?? 0) % 2 === 1;
+  }
+}
 
 // A masked value can swallow the NAME of a further sensitive assignment (`password=a,token: b`, `key=a,token = b`,
 // `key=a;--password b`) and stop right before that assignment's own value (a quote, or whitespace around the `:`/`=`/flag):
@@ -203,7 +354,7 @@ function stickySpan(re: RegExp, s: string, lo: number, end: number): RegExpExecA
 }
 
 /** End of the next value segment that still belongs to the secret whose value spans s[pos, end), or -1. */
-function continuation(s: string, pos: number, end: number, valueAt: RegExp): number {
+function continuation(s: string, pos: number, end: number, kind: number, rd: Reader): number {
   const c = s.charAt(end);
   if (c !== " " && c !== "\t" && c !== '"' && c !== "'" && !s.startsWith('\\"', end)) return -1;
   let lo = Math.max(pos, end - TAIL_WINDOW);
@@ -231,8 +382,9 @@ function continuation(s: string, pos: number, end: number, valueAt: RegExp): num
   }
   if (gap === null) return -1;
   if (colon && s.startsWith("//", gap.index + gap[0].length)) return -1;
-  const v = stickyAt(valueAt, s, gap.index + gap[0].length);
-  return v === null ? -1 : v.index + v[0].length;
+  const gapEnd = gap.index + gap[0].length;
+  const valueEnd = rd.read(gapEnd, kind);
+  return valueEnd === gapEnd ? -1 : valueEnd;
 }
 
 /** Loose verdict for `=` separators, strict (prose-safe) otherwise: the same rule as `_name_hit` in swarm/redact.py. */
@@ -290,16 +442,8 @@ function keyValueEnd(s: string, pos: number): [number, number] {
 const CLI_BREAKS = "\r\n\f\v;&|";
 const CLI_STOPS = ` \t${CLI_BREAKS}`;
 const CLI_WORD = /[^ \t\r\n\f\v;&|]+/g;
-const CLI_UNQUOTED = /[^ \t\r\n\f\v;&|"']+/y;
-const CLI_LINE = /[^\r\n]*/y;
 /** A lookup table without a prototype: a command word such as `constructor` or `__proto__` finds nothing. */
 const table = <V>(entries: Record<string, V>): Record<string, V> => Object.assign(Object.create(null) as Record<string, V>, entries);
-const CLI_QUOTED = table<RegExp>({
-  '"': /"[^"\n]*"/y,
-  "'": /'[^'\n]*'/y,
-  '\\"': /\\"[^\n]*?\\"/y,
-  "\\'": /\\'[^\n]*?\\'/y,
-});
 const CLI_UID_GID = /^[0-9]{1,10}:[0-9]{1,10}$/;
 const CLI_CORE = /[A-Za-z0-9_./-]+/;
 const isAlnumDash = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45;
@@ -363,66 +507,33 @@ function hasChar(s: string, ch: string, from: number, to: number): boolean {
   return false;
 }
 /**
- * Whether the flag at s[at, at + 2) (`-p`) of the word s[start, end) carries its value attached: `-pVALUE`, `-p'VALUE'`. A quote that opens
- * the value (one the word's own prefix did not open: `"-p"` is a closer) makes everything after it the value, even when it is only
- * punctuation; an unquoted value is one unless it is made only of closers (`-p`, `(-p)`, `**-p**`) that end the word.
+ * Whether the flag at s[at, at + 2) (`-p`) of the word that ends at `end` carries its value attached: `-pVALUE`, `-p'VALUE'`, `-p$'VALUE'`, `-p\"VALUE\"`.
+ * A quote that opens the value (one that does not CLOSE an earlier quote of the line: `"mysql -p" ok` and `"-p"` are prose) makes everything
+ * after it the value, even when it is only punctuation or blanks (`-p" x"`, `-p\" x\"`); an unquoted value is one unless it is made only of
+ * closers (`-p`, `(-p)`, `**-p**`) that end the word.
  */
-function cliAttached(s: string, start: number, at: number, end: number): boolean {
-  const v = at + 2;
+function cliAttached(rd: Reader, at: number, end: number): boolean {
+  let v = at + 2;
   if (v >= end) return false;
-  const c = s.charAt(v);
-  let quote = 0; // the length of the quote that opens the value
-  if (c === '"' || c === "'") quote = 1;
-  else if (c === "\\" && (s.charAt(v + 1) === '"' || s.charAt(v + 1) === "'")) quote = 2;
-  if (quote !== 0 && !hasChar(s, s.charAt(v + quote - 1), start, at)) {
-    // a lone quote opens a value only where `;&|` ended the word (`-p"&x"`): `"mysql -p" ok` is prose
-    const next = s.charCodeAt(end);
-    return end - v > quote || next === 59 || next === 38 || next === 124;
+  if (rd.opener(v)) {
+    if (!rd.odd(rd.q, rd.run, at)) return true;
+    v += rd.oplen; // the quote CLOSES an earlier one: only what follows it can be a value (`"mysql -p" ok`, `\"mysql -p\" ok`)
   }
-  return hasNonCloser(s, v, end);
-}
-
-/** End of the run of characters from `start` that holds no blank, `;&|` or quote (`CLI_UNQUOTED`, as a loop: no match object). */
-function unquotedEnd(s: string, start: number): number {
-  let i = start;
-  for (; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c === 32 || c === 9 || c === 13 || c === 10 || c === 12 || c === 11 || c === 59 || c === 38 || c === 124 || c === 34 || c === 39) break;
-  }
-  return i;
-}
-
-/**
- * End of the value that starts at s[start] (not a blank, not `;&|`): a quoted value runs to its closing quote, or to the end of the line
- * when it never closes (a truncated log line); any other value to the next blank, `;&|` or quote. `start` when it is empty.
- */
-function cliValueEnd(s: string, start: number): number {
-  let c = s.charAt(start);
-  if (c === "\\") {
-    const d = s.charAt(start + 1);
-    if (d === '"' || d === "'") c += d;
-  }
-  const rx = CLI_QUOTED[c];
-  if (rx !== undefined) {
-    const m = stickyAt(rx, s, start);
-    return start + (m !== null ? m[0].length : (stickyAt(CLI_LINE, s, start) as RegExpExecArray)[0].length);
-  }
-  const m = stickyAt(CLI_UNQUOTED, s, start);
-  return m === null ? start : start + m[0].length;
+  return hasNonCloser(rd.s, v, end);
 }
 
 /**
  * The values of `-u user:pass` (and `--user`, `--proxy-user`, also `=user:pass`) and of `-passin pass:X` (`-pass`, `-passout`): the option may
  * follow ANY character that is not a letter, digit or `-` (a backtick, a quote, a bracket, `=`, the `_` of Markdown emphasis ...).
  */
-function cliOptionSpans(s: string, spans: number[]): void {
+function cliOptionSpans(s: string, spans: number[], rd: Reader): void {
   if (!s.includes("-u") && !s.includes("-pass")) return;
   const n = s.length;
   let runFrom = -1; // [runFrom, runTo) holds no blank, `;&|` or quote: the unquoted run every start inside it ends at
   let runTo = -1;
   let colonFrom = 0; // no ':' in [colonFrom, colonAt), a ':' at colonAt (n when there is none)
   let colonAt = -1;
-  let pushedEnd = -1; // end of the last unquoted value reported: a later start (starts only grow) inside that run is covered
+  let pushedEnd = -1; // end of the last value reported: a later start (starts only grow) inside that run is covered
   for (let at = s.indexOf("-"); at >= 0; at = s.indexOf("-", at + 1)) {
     if (at > 0 && isAlnumDash(s.charCodeAt(at - 1))) continue; // the option does not continue a word
     // the option (`CLI_OPTION` in swarm/redact.py, spelled out: a regex match object per candidate costs more than the scan)
@@ -446,39 +557,48 @@ function cliOptionSpans(s: string, spans: number[]): void {
       start++;
     }
     if (start < pushedEnd || start >= n || CLI_STOPS.includes(s.charAt(start))) continue; // (a start inside a reported run is covered)
-    const c = s.charAt(start);
+    const open = rd.opener(start);
     if (openssl) {
-      // openssl: `-passin pass:SECRET`, `-passin "pass:SECRET"`
-      const q = c === '"' || c === "'" ? start + 1 : start;
-      if (s.startsWith("pass:", q)) {
-        const value = stickyAt(CLI_UNQUOTED, s, q + 5);
-        if (value !== null) spans.push(q + 5, q + 5 + value[0].length);
+      // openssl: `-passin pass:SECRET`, `-passin "pass:SECRET"`, `-passin pass:"a b"`
+      if (open) {
+        const inner = start + rd.oplen;
+        const ve = rd.quoted(start, rd.q, rd.oplen, rd.run);
+        if (s.startsWith("pass:", inner) && ve - rd.closeLen > inner + 5) spans.push(inner + 5, ve - rd.closeLen);
+      } else if (s.startsWith("pass:", start)) {
+        const ve = rd.read(start + 5, BARE_CLI);
+        if (ve > start + 5) spans.push(start + 5, ve);
       }
       continue;
     }
-    const d = s.charAt(start + 1);
-    if (c === '"' || c === "'" || (c === "\\" && (d === '"' || d === "'"))) {
-      const end = cliValueEnd(s, start);
-      if (hasChar(s, ":", start + 1, end)) spans.push(start, end);
+    if (open) {
+      // the whole `user:pass` is quoted
+      const oplen = rd.oplen;
+      const ve = rd.quoted(start, rd.q, oplen, rd.run);
+      if (hasChar(s, ":", start + oplen, ve)) {
+        spans.push(start, ve);
+        pushedEnd = ve;
+      }
       continue;
     }
     if (!(runFrom <= start && start < runTo)) {
       runFrom = start;
-      runTo = unquotedEnd(s, start);
+      runTo = bareEnd(s, start, BARE_CLI);
     }
     if (!(colonFrom <= start && start <= colonAt)) {
       colonFrom = start;
       colonAt = s.indexOf(":", start);
       if (colonAt < 0) colonAt = n;
     }
-    // a user, `:`, a password (both non-empty); a docker uid:gid pair is not a credential
-    if (
-      start < colonAt &&
-      colonAt + 1 < runTo &&
-      !(colonAt - start <= 10 && runTo - colonAt <= 11 && CLI_UID_GID.test(s.slice(start, runTo)))
-    ) {
-      spans.push(start, runTo);
-      pushedEnd = runTo;
+    if (start >= colonAt || colonAt >= runTo) continue; // no user, or no `:` inside the word
+    // a user, `:`, a password (both non-empty): bare, or quoted in any form (`curl -u me:'a b'`); a docker uid:gid pair is not a credential
+    const p = colonAt + 1;
+    let ve: number;
+    if (rd.opener(p)) ve = rd.read(p, BARE_CLI);
+    else if (p < runTo && !(colonAt - start <= 10 && runTo - colonAt <= 11 && CLI_UID_GID.test(s.slice(start, runTo)))) ve = runTo;
+    else continue;
+    if (ve > p) {
+      spans.push(start, ve);
+      pushedEnd = ve;
     }
   }
 }
@@ -487,7 +607,7 @@ function cliOptionSpans(s: string, spans: number[]): void {
  * The password flag of `mysql -pSECRET`, `docker login -p SECRET`, `sshpass -p`, `redis-cli -a`, `sqlcmd -P`, `ssh-keygen -N`: once a command is
  * seen in a segment its flag is checked in EVERY later word of that segment, however long or numerous the arguments.
  */
-function cliCommandSpans(s: string, spans: number[]): void {
+function cliCommandSpans(s: string, spans: number[], rd: Reader): void {
   if (!CLI_COMMAND_HINTS.some((h) => s.includes(h))) return;
   let active = 0; // command kinds seen in this segment
   let pending = 0; // a two-word command's next word
@@ -504,7 +624,7 @@ function cliCommandSpans(s: string, spans: number[]): void {
       // the value is taken whole, and its words are still read: a value can hold the next command (`redis-cli -a $(sshpass -p x)`)
       want = 0;
       if (s.charAt(start) !== "-") {
-        const valueEnd = cliValueEnd(s, start);
+        const valueEnd = rd.read(start, BARE_CLI);
         if (valueEnd > start) spans.push(start, valueEnd);
       }
     }
@@ -514,9 +634,10 @@ function cliCommandSpans(s: string, spans: number[]): void {
       pending = 0;
       const kinds = active !== 0 ? active & (CLI_FLAG_KINDS[s.charAt(at + 1)] ?? 0) : 0;
       if (kinds !== 0) {
-        if (cliAttached(s, start, at, end)) {
+        if (cliAttached(rd, at, end)) {
           // `-pSECRET`: the value touches the flag
-          spans.push(at + 2, cliValueEnd(s, at + 2));
+          const valueEnd = rd.read(at + 2, BARE_CLI);
+          if (valueEnd > at + 2) spans.push(at + 2, valueEnd);
           continue;
         }
         if (kinds !== CLI_MYSQL) want = 1; // a bare `-p` is a prompt for mysql, not for the others: the value is the next word
@@ -547,9 +668,9 @@ function cliCommandSpans(s: string, spans: number[]): void {
   }
 }
 
-function cliSpans(s: string, spans: number[]): void {
-  cliOptionSpans(s, spans);
-  cliCommandSpans(s, spans);
+function cliSpans(s: string, spans: number[], rd: Reader): void {
+  cliOptionSpans(s, spans, rd);
+  cliCommandSpans(s, spans, rd);
 }
 
 // ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ----
@@ -609,13 +730,6 @@ function yamlSpans(s: string, spans: number[]): void {
   }
 }
 
-/** `valueAt` at the bare value after an opening quote that never closes on its line (`password="abc def`, a truncated log line): the quote is noise. */
-function openQuoteValue(s: string, pos: number, valueAt: RegExp): [number, number] | null {
-  const skip = s.startsWith('\\"', pos) ? 2 : s.charAt(pos) === '"' || s.charAt(pos) === "'" ? 1 : 0;
-  if (skip === 0) return null;
-  const v = stickyAt(valueAt, s, pos + skip);
-  return v === null ? null : [pos + skip, pos + skip + v[0].length];
-}
 
 /** Where the name (and its `=`/`:`) that a value may have swallowed at its end starts: at most 130 characters back, never before `floor` (twin of `_tail_name_start`). */
 function tailNameStart(s: string, floor: number, end: number): number {
@@ -627,7 +741,7 @@ function tailNameStart(s: string, floor: number, end: number): number {
 }
 
 /** Report the value that follows every sensitive `NAME<sep>` match of `sep`: one forward pass with a cursor (no recursion, no rescans). */
-function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: number[]): void {
+function scan(s: string, sep: RegExp, kind: number, eqSep: boolean, spans: number[], rd: Reader): void {
   let keyFail = 0;
   sep.lastIndex = 0;
   for (let m = sep.exec(s); m !== null; m = sep.exec(s)) {
@@ -636,19 +750,11 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: nu
     const name = m[1]!;
     const hit = isNameHit(name, eqSep && m[2]!.includes("="));
     if (!hit && !isKeyName(name)) continue;
-    let start = pos;
+    const start = pos;
     let end: number;
-    let reopen = false;
     if (hit) {
-      const v = stickyAt(valueAt, s, pos);
-      if (v !== null) {
-        end = pos + v[0].length;
-      } else {
-        const open = openQuoteValue(s, pos, valueAt);
-        if (open === null) continue;
-        [start, end] = open;
-        reopen = true;
-      }
+      end = rd.read(pos, kind);
+      if (end === pos) continue;
       // an already-masked value (`[REDACTED],x`) ends where the mask does, like a closing quote
       if (s.startsWith(REDACTED, start) && end > start + REDACTED.length && !/[A-Za-z0-9]/.test(s.charAt(start + REDACTED.length))) end = start + REDACTED.length;
     } else {
@@ -660,10 +766,10 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: nu
       }
       end = keyEnd;
     }
-    for (let more = continuation(s, pos, end, valueAt); more >= 0; more = continuation(s, pos, end, valueAt)) end = more;
+    for (let more = continuation(s, pos, end, kind, rd); more >= 0; more = continuation(s, pos, end, kind, rd)) end = more;
     spans.push(start, end);
-    // the value of a quote that never closes is a guess (`--token "--password x`): scanning goes on INSIDE it. A value can also end with the NAME of the next assignment (`--api-key = {--password=\"x\"`): scanning resumes where that name starts
-    sep.lastIndex = reopen ? start : tailNameStart(s, pos, end);
+    // a value can end with the NAME of the next assignment (`--api-key = {--password=\"x\"`): scanning resumes where that name starts
+    sep.lastIndex = tailNameStart(s, pos, end);
   }
 }
 
@@ -697,25 +803,40 @@ function headerSpans(s: string, spans: number[]): void {
   }
 }
 
-/** "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS). */
-const PAIR = /(?<lead>(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,8})(?<v>"[^"\\]*(?:\\[^\n][^"\\]*)*"|'[^'\\]*(?:\\[^\n][^'\\]*)*')/g;
-/** JSON that was serialised again into a string: {\"password\": \"x\"} */
-const ESC_PAIR = /(?<lead>\\"(?<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")[^"\\]*(?:\\(?!")[^"\\]*)*(?<close>\\")/g;
+/** "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS): the head up to the opening quote of the value. */
+const PAIR = /(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,8}(?=["'])/g;
+/** JSON that was serialised again into a string: {\"password\": \"x\"}, and again: {\\\"password\\\": \\\"x\\\"} (the quotes carry an odd run of backslashes). */
+const ESC_PAIR = /(?<!\\)(?<bs>\\{1,31})"(?<name>[^"'\\\n]{1,80})\k<bs>"[ \t]{0,8}:[ \t]{0,8}(?=\k<bs>")/g;
 
-/** "name": "value" pairs with a sensitive name (and `*_key` names with a credential-shaped value): the string between the quotes. */
-function pairSpans(s: string, spans: number[]): void {
-  for (const m of s.matchAll(PAIR)) {
-    const g = m.groups as { lead: string; name: string; v: string };
-    if (g.v.length > 2 && isCredentialPair(g.name, g.v.slice(1, -1))) {
-      const at = (m.index as number) + g.lead.length;
-      spans.push(at + 1, at + g.v.length - 1);
+/**
+ * "name": "value" pairs with a sensitive name (and `*_key` names with a credential-shaped value): the string between the quotes. The value is
+ * read to its closing quote (to the end of the line when it never closes); a benign pair does not hide a pair INSIDE its value
+ * (`{"message": "login 'password': 'x'"}`): the scan goes on inside it.
+ */
+function pairSpans(s: string, spans: number[], rd: Reader): void {
+  PAIR.lastIndex = 0;
+  for (let m = PAIR.exec(s); m !== null; m = PAIR.exec(s)) {
+    const p = PAIR.lastIndex;
+    const end = rd.quoted(p, s.charAt(p), 1, 0);
+    const close = rd.closeLen;
+    if (end - close > p + 1 && isCredentialPair(m.groups!.name!, s.slice(p + 1, end - close))) {
+      spans.push(p + 1, end - close);
+      PAIR.lastIndex = end;
+    } else {
+      PAIR.lastIndex = p + 1;
     }
   }
-  for (const m of s.matchAll(ESC_PAIR)) {
-    const g = m.groups as { lead: string; name: string; close: string };
-    const start = (m.index as number) + g.lead.length;
-    const end = (m.index as number) + m[0].length - g.close.length;
-    if (start < end && isSensitiveKey(g.name)) spans.push(start, end);
+  ESC_PAIR.lastIndex = 0;
+  for (let m = ESC_PAIR.exec(s); m !== null; m = ESC_PAIR.exec(s)) {
+    const p = ESC_PAIR.lastIndex;
+    const run = m.groups!.bs!.length;
+    ESC_PAIR.lastIndex = p + run + 1;
+    if (run % 2 === 0 || !isSensitiveKey(m.groups!.name!)) continue;
+    const end = rd.quoted(p, '"', run + 1, run);
+    if (end - rd.closeLen > p + run + 1) {
+      spans.push(p + run + 1, end - rd.closeLen);
+      ESC_PAIR.lastIndex = end;
+    }
   }
 }
 
@@ -732,14 +853,15 @@ function collectSpans(s: string): number[] {
   }
   for (const m of s.matchAll(USERINFO)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length - 1); // the '@' stays
   headerSpans(s, spans);
-  cliSpans(s, spans);
+  const rd = new Reader(s);
+  cliSpans(s, spans, rd);
   yamlSpans(s, spans);
-  scan(s, NAME_SEP, VALUE_AT, true, spans);
-  scan(s, FLAG_SEP, FLAG_VALUE_AT, false, spans);
+  scan(s, NAME_SEP, BARE_NAME, true, spans, rd);
+  scan(s, FLAG_SEP, BARE_FLAG, false, spans, rd);
   for (const rx of [JWT, ...TOKENS]) {
     for (const m of s.matchAll(rx)) spans.push(m.index as number, (m.index as number) + m[0].length);
   }
-  pairSpans(s, spans);
+  pairSpans(s, spans, rd);
   return spans;
 }
 

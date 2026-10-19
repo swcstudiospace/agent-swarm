@@ -501,6 +501,7 @@ def _generated_fixture() -> dict:
         "wild": [{"input": c["input"], "expected": redact_text(c["input"])} for c in generate_wild_cases(_WILD_SEED, _WILD_COUNT)],
         "property_seed": _PROPERTY_SEED,
         "property": [c | {"digest": _digest(expand_tokens(c["input"]))} for c in generate_property_cases(_PROPERTY_SEED, _PROPERTY_EXTRA)],
+        "quoting": [{"input": c["input"], "expected": c["expected"]} for c in _QUOTING_CASES[::_QUOTING_STRIDE]],
         # the random strings are rebuilt in both languages from the seed and the fragment table; only digests of the Python outputs are stored
         "random": {"seed": _RANDOM_SEED, "count": _RANDOM_COUNT, "fragments": list(_RANDOM_FRAGMENTS),
                    "inputs": hashlib.sha256("\u0000".join(strings).encode("utf-8")).hexdigest()[:16],
@@ -520,7 +521,7 @@ def test_generated_fixture_is_current_and_matches_the_python_output():
                                  for i in range(0, len(random_part["digests"]), 10))
         _GENERATED_PATH.write_text(
             f'{{"_doc": {json.dumps(_FIXTURE_DOC)},\n"tokens": [\n{rows(wanted["tokens"])}\n],\n"seed": {_GENERATED_SEED}, "wild_seed": {_WILD_SEED}, "property_seed": {_PROPERTY_SEED}, "cases": [\n{rows(wanted["cases"])}\n], '
-            f'"wild": [\n{rows(wanted["wild"])}\n], "property": [\n{rows(wanted["property"])}\n], "random": {{"seed": {_RANDOM_SEED}, '
+            f'"wild": [\n{rows(wanted["wild"])}\n], "property": [\n{rows(wanted["property"])}\n], "quoting": [\n{rows(wanted["quoting"])}\n], "random": {{"seed": {_RANDOM_SEED}, '
             f'"count": {_RANDOM_COUNT}, "inputs": "{random_part["inputs"]}", "fragments": {json.dumps(random_part["fragments"])}, '
             f'"digests": [\n{digest_rows}\n]}}}}\n', encoding="utf-8")
     assert json.loads(_GENERATED_PATH.read_text(encoding="utf-8")) == wanted
@@ -695,7 +696,7 @@ def test_a_flag_word_in_prose_is_not_a_password_but_its_glued_punctuation_is():
 
 
 def test_a_credential_value_that_swallowed_the_next_sensitive_name_still_masks_that_names_value():
-    assert redact_text('run --token \\"--password hunter2') == f'run --token \\"{REDACTED} {REDACTED}'
+    assert redact_text('run --token \\"--password hunter2') == f"run --token {REDACTED}"  # an unclosed quote runs to the end of the line
     assert redact_text('--api-key = {--password=\\"user:hunter2\\"') == f"--api-key {REDACTED} {REDACTED}"
 
 
@@ -897,9 +898,9 @@ _KINDS = {"plain": ("plain", 1), "comma": ("comma", 3), "jwt": ("jwt", 15), "ven
 # ---- class-level properties (GL5-B): every detector reads the ORIGINAL text and reports spans; one union replaces them -------------
 # 1. soundness: a secret of ANY length (1..5000) planted in ANY carrier is covered, byte for byte, by the reported spans;
 # 2. union: spans(a + "\n" + b) == spans(a) + shifted spans(b), in every order (a detector never reads another's rewrite);
-# 3. parity: omp/test/swarm_bar.test.ts replays the same cases (and 50k random strings) and gets identical spans and output.
+# 3. parity: omp/test/swarm_bar.test.ts replays the same cases (and 80k random strings, and the quoting model) and gets identical spans and output.
 _PROPERTY_SEED, _PROPERTY_EXTRA = 20241021, 1200
-_RANDOM_SEED, _RANDOM_COUNT = 20241022, 50_000
+_RANDOM_SEED, _RANDOM_COUNT = 20241022, 80_000
 _SENSITIVE_NAMES = ("password", "API_KEY", "github_token", "client_secret", "db_password", "ANTHROPIC_API_KEY", "SECRET", "access_token",
                     "authToken", "PGPASSWORD", "refreshtoken")
 _STRICT_NAMES = ("password", "token", "API_KEY", "client_secret", "db_password", "access_token", "authToken")  # prose-safe `NAME: value`
@@ -1124,7 +1125,9 @@ _RANDOM_FRAGMENTS = (
     "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----", "MIIEowIBAAKCAQEA", "mysql ", "docker login ", "sshpass ", "curl ", "redis-cli ",
     "sqlcmd ", "openssl ", "pass:", "STRIPE_KEY", "{{tok:mixed:5:33}}", "- name: ", "name: ", "value: ", "|\n  ", "  value: ",
     "DB_PASSWORD", "[REDACTED]", "1000:1000", "a:b", "user:pw@", "u:p@h", "pw", "x=1", "a=b", "--", "-",
-    "`--user ", "**", "__", "~~", "<", ">", "sshpass -p ", "docker login -u a: -p ", "--cmd=", "--token ", "redis-cli -a ", "-passin ", "--user=a:", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "`--user ", "**", "__", "~~", "<", ">", "sshpass -p ", "docker login -u a: -p ", "--cmd=", "--token ", "redis-cli -a ", "-passin ", "--user=a:",
+    "$'", '$"', '\\\\\\"', "\\ ", "\\'", "-p'", '-p"', "-p\\\"", "-P ", "-N ", "--password=", "-u me:", "sqlcmd -P", "mysql -p", "curl -u ",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 )
 
 
@@ -1141,3 +1144,141 @@ def _digest(text: str) -> str:
     """8 hex digits over the redacted output and the reported spans (UTF-16 offsets: the corpus is BMP-only, so they equal Python's)."""
     spans = ";".join(f"{a},{b}" for a, b in redact_spans(text))
     return hashlib.sha256((redact_text(text) + "\u0000" + spans).encode("utf-8", "surrogatepass")).hexdigest()[:8]
+
+
+# ---- GL8 round 8: EVERY quoting form of a secret value, in EVERY option form (shared with the TypeScript twin) ----------------------
+# The value after a secret-taking option may be bare (a backslash keeps a blank: `pa\ ss`), '..', "..", ANSI-C $'..', locale $"..", the form a
+# double quote takes inside saved JSON evidence (\"..\"), or that form serialised again (\\\"..\\\"); it may hold blanks, tabs, newlines, `;&|`,
+# unicode and an escaped quote of its own kind; a quote that never closes runs to the end of its line. ONE reader (`_Reader`) serves every
+# option form: this model plants a placeholder secret in each combination and demands the output the spec gives (the value replaced).
+_Q_CONTENTS = {"plain": "Zq1", "lead": " Zq1", "trail": "Zq1 ", "two": "Zq1 Zq2", "tab": "Zq1\tZq2", "ws": " Zq1  Zq2 ", "punct": "Zq1;Zq2&Zq3|Zq4",
+               "uni": "Zq1é日本Zq2", "nl": "Zq1\nZq2", "dollar": "$HOME Zq1 #Zq2", "bs": "Zq1\\Zq2", "esc": "Zq1+Zq2"}
+_Q_ESC_INNER = {"dq": 'Zq1\\"Zq2', "ansi": "Zq1\\'Zq2", "loc": 'Zq1\\"Zq2', "jdq": 'Zq1\\\\\\"Zq2', "jdq3": "Zq1" + "\\" * 7 + '"Zq2', "jloc": 'Zq1\\\\\\"Zq2'}
+_Q_CLOSED = ("dq", "sq", "jdq", "jdq3", "ansi", "loc", "jloc")
+_Q_UNCLOSED = ("udq", "usq", "ujdq", "uansi")
+_Q_BARE = {"plain": "Zq1", "uni": "Zq1é日本Zq2", "bs": "Zq1\\Zq2", "sp": "Zq1\\ Zq2", "lsp": "\\ Zq1"}
+_Q_FORMS = ("bare", *_Q_CLOSED, *_Q_UNCLOSED)
+# placement -> (text before the value, text after it, what stays of `before` in the output when the value drags it along: `curl -u me:'a b'` masks `me:` too)
+_Q_PLACEMENTS = {
+    "mysql -p": ("mysql -u root -p", " db", None), "mysql --password=": ("mysql --user=root --password=", " db", None),
+    "mysql --password ": ("mysql --user root --password ", " db", None), "mysqldump -p": ("mysqldump -h h -p", " db > o.sql", None),
+    "docker login -p": ("docker login -u me -p ", " reg.io", None), "docker login --password": ("docker login --username me --password ", " reg.io", None),
+    "podman login -p": ("podman login -p ", " reg.io", None), "helm registry login -p": ("helm registry login reg.io -u me -p ", " --insecure", None),
+    "az login -p": ("az login -u me -p ", " --tenant t", None), "sshpass -p ": ("sshpass -p ", " ssh host", None), "sshpass -p": ("sshpass -p", " ssh host", None),
+    "redis-cli -a ": ("redis-cli -h h -a ", " ping", None), "redis-cli -a": ("redis-cli -a", " ping", None), "sqlcmd -P ": ("sqlcmd -S h -U sa -P ", " -Q x", None),
+    "sqlcmd -P": ("sqlcmd -S h -U sa -P", " -Q x", None), "ssh-keygen -N": ("ssh-keygen -t ed25519 -N ", " -f k", None),
+    "mongosh -p": ("mongosh --host h -u me -p ", " --quiet", None),
+    "curl -u": ("curl -u me:", " https://h/x", "curl -u "), "curl --user ": ("curl --user me:", " https://h/x", "curl --user "),
+    "curl --user=": ("curl --user=me:", " https://h/x", "curl --user="), "curl --proxy-user": ("curl --proxy-user me:", " https://h/x", "curl --proxy-user "),
+    "openssl -passin pass:": ("openssl rsa -passin pass:", " -in k", None),
+    "DB_PASSWORD=": ("DB_PASSWORD=", " run", None), "DB_PASSWORD = ": ("DB_PASSWORD = ", " run", None), "password: ": ("password: ", " done", None),
+    "--token ": ("deploy --token ", " --env prod", None), "--api-key=": ("deploy --api-key=", " --env prod", None),
+}
+# `curl -u '<user>:<password>'`: the quote holds the user too
+_Q_QUOTED_USER = ("curl -u ", " https://h/x")
+
+
+def _q_render(form: str, content: str) -> str:
+    inner = _Q_ESC_INNER[form] if content == "Zq1+Zq2" and form in _Q_ESC_INNER else content
+    return {"bare": inner, "dq": f'"{inner}"', "sq": f"'{inner}'", "jdq": f'\\"{inner}\\"', "jdq3": "\\\\\\" + f'"{inner}' + "\\\\\\" + '"',
+            "ansi": f"$'{inner}'", "loc": f'$"{inner}"', "jloc": f'$\\"{inner}\\"', "udq": f'"{inner}', "usq": f"'{inner}", "ujdq": f'\\"{inner}',
+            "uansi": f"$'{inner}"}[form]
+
+
+def _q_contents(form: str) -> list[str]:
+    if form == "bare":
+        return list(_Q_BARE.values())
+    names = ["plain", "lead", "trail", "two", "tab", "ws", "punct", "uni", "dollar", "bs"]
+    if form in _Q_CLOSED:
+        names += ["nl"] + (["esc"] if form in _Q_ESC_INNER else [])
+    elif form in ("ujdq",):
+        names = [n for n in names if n != "bs"]
+    return [_Q_CONTENTS[n] for n in names]
+
+
+def generate_quoting_cases() -> list[dict]:
+    """Every placement x quoting form x content x carrier the model covers, each with the output the spec demands."""
+    cases = []
+    wrappers = (("`", "`"), ("**", "**"), ("(", ")"), ("<code>", "</code>"), ("$(", ")"))
+    for name, (before, after, before_out) in _Q_PLACEMENTS.items():
+        for form in _Q_FORMS:
+            unclosed = form in _Q_UNCLOSED
+            for content in _q_contents(form):
+                value = _q_render(form, content)
+                text_in = before + value + ("" if unclosed else after)
+                text_out = (before if before_out is None else before_out) + REDACTED + ("" if unclosed else after)
+                row = {"form": f"{name}|{form}", "secrets": ["Zq"]}
+                cases.append(row | {"input": text_in, "expected": text_out})
+                cases.append(row | {"input": f"line one\nrun {text_in}\nlast line", "expected": f"line one\nrun {text_out}\nlast line"})
+                if not unclosed and after:
+                    for opener, closer in wrappers:
+                        cases.append(row | {"input": f"Run {opener}{text_in}{closer} now", "expected": f"Run {opener}{text_out}{closer} now"})
+                # a JSON string doubles every backslash: `\'` (the escaped quote inside $'..') then reads as a backslash and a closing quote, and an
+                # unclosed ' quote runs to the end of the line, past the closing quote of the JSON string: those combinations are not json carriers
+                if form not in ("usq", "uansi") and content not in (_Q_BARE["bs"], _Q_CONTENTS["bs"]) and not (form == "ansi" and content == _Q_CONTENTS["esc"]):
+                    cases.append(row | {"input": json.dumps({"cmd": text_in}), "expected": json.dumps({"cmd": text_out})})
+    # `curl -u '<user>:<password>'`: the quote holds the user too
+    before, after = _Q_QUOTED_USER
+    for form in _Q_FORMS:
+        if form == "bare":
+            continue
+        for content in _q_contents(form):
+            value = _q_render(form, "me:" + content)
+            unclosed = form in _Q_UNCLOSED
+            cases.append({"form": f"curl -u quoted|{form}", "secrets": ["Zq"], "input": before + value + ("" if unclosed else after),
+                          "expected": before + REDACTED + ("" if unclosed else after)})
+    # `"password": "<value>"` / `'password': '<value>'` / `\"password\": \"<value>\"` (once and twice serialised): the quotes stay, the content goes
+    for head, quote, escaped_inner, tail in (('"password": ', '"', 'Zq1\\"Zq2', ""), ("'password': ", "'", "Zq1\\'Zq2", ""), ('\\"api_token\\": ', '\\"', 'Zq1\\\\\\"Zq2', ""),
+                                             ('\\\\\\"password\\\\\\": ', '\\\\\\"', "Zq1" + "\\" * 7 + '"Zq2', "")):
+        for key, content in _Q_CONTENTS.items():
+            inner = escaped_inner if key == "esc" else content
+            if quote == "'" and key == "esc":
+                continue
+            text_in = f"{head}{quote}{inner}{quote}{tail}, \"ok\": true"
+            text_out = f"{head}{quote}{REDACTED}{quote}{tail}, \"ok\": true"
+            cases.append({"form": f"pair {head}", "secrets": ["Zq"], "input": f"cfg = {{{text_in}}}", "expected": f"cfg = {{{text_out}}}"})
+    return cases
+
+
+_QUOTING_CASES = generate_quoting_cases()
+_QUOTING_STRIDE = 7  # every 7th model case is stored in tests/fixtures/redact_generated.json and re-run by omp/test/swarm_bar.test.ts
+
+
+def test_quoting_model_is_large_and_covers_every_form():
+    assert len(_QUOTING_CASES) > 8000
+    forms = {c["form"].split("|")[-1] for c in _QUOTING_CASES if "|" in c["form"]}
+    assert forms == set(_Q_FORMS)
+
+
+def test_every_quoting_form_of_a_secret_value_is_masked_in_every_option_form():
+    wrong = []
+    for case in _QUOTING_CASES:
+        out = redact_text(case["input"])
+        if out != case["expected"] or "Zq" in out or redact_text(out) != out:
+            wrong.append((case["form"], case["input"], out))
+    assert wrong[:5] == [] and len(wrong) == 0
+
+
+def test_the_finding_a_password_that_starts_with_a_blank_inside_escaped_quotes_is_masked():
+    """Greptile round 8: `mysql -p\" leading-space\" db` (the form a quoted password takes in saved JSON evidence) left the value readable."""
+    assert redact_text('mysql -p\\" leading-space\\" db') == "mysql -p" + REDACTED + " db"
+    assert redact_text('{"cmd": "mysql -p\\" leading-space\\" db"}') == '{"cmd": "mysql -p' + REDACTED + ' db"}'
+    for quoted in ('" "', "' '", '\\" \\"', '$" "', "$' '", '"..."', '\\"!!\\"'):  # blank-only and punctuation-only values are values
+        assert redact_text(f"mysql -p{quoted} db") == f"mysql -p{REDACTED} db", quoted
+        assert redact_text(f"redis-cli -a {quoted} ping") == f"redis-cli -a {REDACTED} ping", quoted
+        assert redact_text(f"curl -u me:{quoted} h") == f"curl -u {REDACTED} h", quoted
+
+
+def test_a_prose_quote_around_a_flag_is_still_not_a_password():
+    prose = 'run "mysql -p" ok; use \\"mysql -p\\" ok; mysql "-p" and \\"-p\\" ok; \'mysql -p\' ok'
+    assert redact_text(prose) == prose
+
+
+def test_quoting_forms_scan_in_linear_time():
+    import time
+    for unit in ('mysql -p" ', "mysql -p\\\" ", "-u me:'", "x --password $'", 'DB_PASSWORD="', "mysql -p\\\\\\\" ", '"password": "', '\\"password\\": \\"', "a\\"):
+        text = unit * (1_000_000 // len(unit)) + "\npassword=hunter2"
+        started = time.perf_counter()
+        out = redact_text(text)
+        assert time.perf_counter() - started < 3.0, unit
+        assert "hunter2" not in out, unit

@@ -461,6 +461,39 @@ describe("redactText shared vectors", () => {
       expect(wrong.slice(0, 3)).toEqual([]);
     }
   });
+  test("tests/fixtures/redact_generated.json: the quoting model (every quoting form of a secret value in every option form) gives exactly Python's output and leaves no planted secret", () => {
+    const { quoting } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_generated.json"), "utf8")) as {
+      quoting: Array<{ input: string; expected: string }>;
+    };
+    expect(quoting.length).toBeGreaterThan(2500);
+    const wrong = quoting.filter((c) => {
+      const out = redactText(c.input);
+      return out !== c.expected || out.includes("Zq") || redactText(out) !== out;
+    });
+    expect(wrong.slice(0, 3)).toEqual([]);
+  });
+
+  test("GL8: a password that starts with a blank inside escaped quotes is masked, whatever the quoting form", () => {
+    expect(redactText('mysql -p\\" leading-space\\" db')).toBe("mysql -p[REDACTED] db");
+    expect(redactText('{"cmd": "mysql -p\\" leading-space\\" db"}')).toBe('{"cmd": "mysql -p[REDACTED] db"}');
+    for (const quoted of ['" "', "' '", '\\" \\"', '$" "', "$' '", '"..."', '\\"!!\\"']) {
+      expect({ quoted, out: redactText(`mysql -p${quoted} db`) }).toEqual({ quoted, out: "mysql -p[REDACTED] db" });
+      expect({ quoted, out: redactText(`redis-cli -a ${quoted} ping`) }).toEqual({ quoted, out: "redis-cli -a [REDACTED] ping" });
+      expect({ quoted, out: redactText(`curl -u me:${quoted} h`) }).toEqual({ quoted, out: "curl -u [REDACTED] h" });
+    }
+    const prose = 'run "mysql -p" ok; use \\"mysql -p\\" ok; mysql "-p" and \\"-p\\" ok; \'mysql -p\' ok';
+    expect(redactText(prose)).toBe(prose);
+  });
+
+  test("GL8: 1 MB of quote openers, escaped quotes and unclosed quotes is linear (< 150 ms each) and still finds the trailing password", () => {
+    const units = ['mysql -p" ', "mysql -p\\\" ", "-u me:'", "x --password $'", 'DB_PASSWORD="', 'mysql -p\\\\\\" ', '"password": "', '\\"password\\": \\"', "a\\"];
+    for (const unit of units) {
+      const started = performance.now();
+      const out = redactText(`${unit.repeat(Math.floor(1_000_000 / unit.length))}\npassword=hunter2`);
+      expect({ unit, fast: performance.now() - started < 150 }).toEqual({ unit, fast: true });
+      expect({ unit, masked: !out.includes("hunter2") }).toEqual({ unit, masked: true });
+    }
+  });
 
   /** The class-level properties (GL5-B): detectors report spans on the ORIGINAL text, one union replaces them. */
   describe("span properties (shared tests/fixtures/redact_generated.json)", () => {
@@ -536,10 +569,10 @@ describe("redactText shared vectors", () => {
       }
     });
 
-    test("50k seeded random strings: TypeScript and Python agree on every output and span", () => {
+    test("80k seeded random strings: TypeScript and Python agree on every output and span", () => {
       const { seed, count, inputs, digests } = fixture.random;
       const fragments = fixture.random.fragments.map(expandTokens); // the table holds placeholders, never a secret-shaped literal
-      expect(count).toBe(50_000);
+      expect(count).toBe(80_000);
       let state = seed >>> 0 || 1; // xorshift32, the twin of `_Xorshift` in tests/test_redact.py
       const next = (bound: number): number => {
         state = (state ^ (state << 13)) >>> 0;
@@ -795,7 +828,7 @@ describe("sanitization", () => {
     expect(redactText("sshpass -p 'abc def")).toBe("sshpass -p [REDACTED]");
     expect(redactText('docker login -p \\"abc def\\" reg')).toBe("docker login -p [REDACTED] reg");
     expect(redactText('curl -u "admin:my pass" https://h')).toBe("curl -u [REDACTED] https://h");
-    expect(redactText('run --token \\"--password hunter2')).toBe('run --token \\"[REDACTED] [REDACTED]');
+    expect(redactText('run --token \\"--password hunter2')).toBe("run --token [REDACTED]"); // an unclosed quote runs to the end of the line
     expect(redactText('--api-key = {--password=\\"user:hunter2\\"')).toBe("--api-key [REDACTED] [REDACTED]");
   });
 

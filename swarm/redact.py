@@ -31,6 +31,12 @@ Best effort, not a guarantee: it covers the carriers above plus the command-line
 `sshpass -p`, `docker login -p`, `redis-cli -a`, `sqlcmd -P`, `-pass pass:X`; vendor tokens (GitHub, Stripe, Google, SendGrid, Slack, npm,
 GitLab, DigitalOcean, AWS key ids, ...); `<vendor>_KEY=<long mixed-case value>`; and YAML `- name: X_PASSWORD` / `value:` pairs and
 block scalars (`password: |`). Identifier fields are never free text and are not passed through it (see `swarm.runlog.emit`).
+Every option form (`NAME=`, `NAME:`, `--flag value`, `-pVALUE`, `-p VALUE`, `-u user:pass`, `"name": "value"` ...) reads its value through ONE
+quote-aware reader (`_Reader`): bare (a backslash keeps a blank), `'..'`, `".."`, ANSI-C `$'..'`, locale `$".."`, the escaped form a double quote
+takes inside saved JSON evidence (`\\".."`, and `\\\\\\"..` when it was serialised twice), with blanks, tabs, newlines, `;&|`, unicode and escaped
+quotes of its own kind inside; a quote that never closes runs to the end of its line. A quoted value is always a value, even when it holds only
+blanks or punctuation. The one quote that is NOT a value is a lone quote that closes an earlier quote of the same kind on its line
+(`"mysql -p" ok`: a flag in a sentence), so `ssh h 'mysql -p' secret'` (a same-kind wrapper) is read as prose and left alone.
 """
 from __future__ import annotations
 
@@ -151,24 +157,130 @@ _HEADER_CLOSE_RES = {'"': re.compile(r"[\r\n\"]"), "'": re.compile(r"[\r\n']")}
 # '/' (every `://` ends the previous scan), so the scans of different schemes never overlap.
 _USERINFO_RE = re.compile(r"((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/\s@:]*:[^/\s]*@", re.ASCII)
 # ',' is part of an unquoted value (`TOKENS=one,two`): a credential may contain it, and a list of credentials is comma-joined.
-_VALUE = r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?:[^\s&;"'\\]|\\(?!"))+)"""
+# A VALUE is read by ONE quote-aware reader (`_Reader.read`, below) for every option form (NAME=, NAME:, --flag value, -pVALUE, -u user:pass ...);
+# these patterns are only its BARE word: a backslash keeps the next blank in the word (`pa\ ss`), but never starts an escaped quote (`\"`).
+_NAME_BARE_RE = re.compile(r"""(?:[^\s&;"'\\]|\\[ \t]|\\(?!"))+""", re.ASCII)
 # The second lookbehind keeps a `a.b.c.d` / `a-b-c` run from re-starting a 128-char scan at every dot or dash.
 # NAME=value / NAME = value (any sensitive name) and NAME: value / NAME : value (strict names only; prose-safe). The regex
 # matches only `NAME<sep>`; `_scan_name_values` then consumes the value (`_VALUE_RE`) of a SENSITIVE name and merely steps
 # past the separator of a benign one, so a later assignment inside its "value" (`user=alice,password=x`) is still scanned.
 _NAME_SEP_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,32}[=:][ \t]{0,32})")
-_VALUE_RE = re.compile(_VALUE, re.ASCII)
+_FLAG_BARE_RE = re.compile(r"""(?:[^\s"'\\]|\\[ \t]|\\(?!"))+""", re.ASCII)
 # `--password hunter2`, `-db-password hunter2`: a sensitive flag followed by a separate value that is not another flag. Scanned
 # like NAME=value: the regex matches `--flag<ws>` only, a benign flag never hides a later one (`--mode a;--password x`).
 _FLAG_SEP_RE = re.compile(r"(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9_-]{0,63})([ \t]{1,8})(?![-\s])", re.ASCII)
-_FLAG_VALUE_RE = re.compile(r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?:[^\s"'\\]|\\(?!"))+)""", re.ASCII)
+_EOL_RE = re.compile(r"[\r\n]")
+_QUOTE_CHAR_RE = re.compile(r"""["'\r\n]""")
+
+
+class _Reader:
+    """The ONE reader of a value that follows a secret-taking name or option. It starts where the value starts and understands every way a
+    shell, a JSON string or a log line quotes it: bare (a backslash keeps a blank, `pa\\ ss`), `'..'`, `".."`, ANSI-C `$'..'`, locale `$".."`,
+    and the ESCAPED form a quote takes inside saved JSON evidence (`\\".."`, `\\\\\\"..\\\\\\"` when the JSON was serialised twice). A quoted value
+    runs through its closing quote honouring backslash escapes (a quote preceded by an odd run of backslashes is content, as is a blank, a tab,
+    a newline, `;&|`, `#`, unicode ...); an escaped-form value closes at a quote preceded by exactly the opening run and ends before a quote
+    that is not preceded by an odd run (the closing quote of the JSON string that holds it). A quote that never closes runs to the end of its
+    line (a truncated log line). A quoted value always is a value, even when it holds only blanks or punctuation.
+    One instance reads one string; scans only move forward: a quote that has no close fails for every later quote of its kind (remembered in
+    `failed`), the end of a line is remembered, and the quote counts of `odd` are advanced, never recounted."""
+    __slots__ = ("s", "failed", "eol_from", "eol_to", "seen", "counts")
+
+    def __init__(self, s: str) -> None:
+        self.s = s
+        self.failed: set[tuple[str, int]] = set()
+        self.eol_from, self.eol_to = 1, 0
+        self.seen = 0
+        self.counts: dict[tuple[str, int], int] = {}
+
+    def opener(self, i: int) -> tuple[str, int, int] | None:
+        """`(quote, length of the opener, backslashes before the quote)` when a quote opens at s[i] (`"`, `'`, `$'`, `$"`, `\\"`, `$\\"` ...), else None."""
+        s = self.s
+        c = s[i:i + 1]
+        j = i
+        if c == "$":
+            j += 1
+            c = s[j:j + 1]
+        if c == '"' or c == "'":
+            return c, j + 1 - i, 0
+        if c != "\\":
+            return None
+        r = j
+        while s[r:r + 1] == "\\":
+            r += 1
+        run = r - j
+        q = s[r:r + 1]
+        if run % 2 == 1 and (q == '"' or q == "'"):
+            return q, r + 1 - i, run
+        return None
+
+    def line_end(self, i: int) -> int:
+        if self.eol_from <= i <= self.eol_to:
+            return self.eol_to
+        m = _EOL_RE.search(self.s, i)
+        end = m.start() if m else len(self.s)
+        self.eol_from, self.eol_to = i, end
+        return end
+
+    def quoted(self, i: int, q: str, oplen: int, run: int) -> tuple[int, int]:
+        """`(end, length of the closing quote)` of the quoted value that opens at s[i]; the closing length is 0 for a value that ends at the end of
+        its line or before the quote of an enclosing string."""
+        s = self.s
+        key = (q, run)
+        if key not in self.failed:
+            k = i + oplen
+            find = s.find
+            while (j := find(q, k)) >= 0:
+                r = j
+                while r > k and s[r - 1] == "\\":
+                    r -= 1
+                n = j - r
+                if run:
+                    if n == run:
+                        return j + 1, run + 1
+                    if n % 2 == 0:
+                        return j, 0
+                elif n % 2 == 0:
+                    return j + 1, 1
+                k = j + 1
+            self.failed.add(key)
+        return self.line_end(i), 0
+
+    def read(self, i: int, bare_re: re.Pattern[str]) -> tuple[int, int]:
+        """`(end, closing quote length)` of the value at s[i]; `end == i` when there is none (no bare character, or a quote with nothing after it)."""
+        op = self.opener(i)
+        if op is not None:
+            end, close = self.quoted(i, *op)
+            return (end, close) if close or end > i + op[1] else (i, 0)
+        m = bare_re.match(self.s, i)
+        return (m.end(), 0) if m else (i, 0)
+
+    def odd(self, q: str, run: int, upto: int) -> bool:
+        """Whether an odd number of quotes `(q, run)` (the quote with `run` backslashes before it) stand in the current line before s[upto]: such a
+        quote CLOSES what an earlier quote opened (`"mysql -p" ok`: a prose quote, not the opener of a password). `upto` only grows."""
+        counts = self.counts
+        if upto > self.seen:
+            s, seen = self.s, self.seen
+            for m in _QUOTE_CHAR_RE.finditer(s, seen, upto):
+                j = m.start()
+                c = s[j]
+                if c == "\n" or c == "\r":
+                    counts.clear()
+                    continue
+                r = j
+                while r > seen and s[r - 1] == "\\":
+                    r -= 1
+                key = (c, j - r)
+                counts[key] = counts.get(key, 0) + 1
+            self.seen = upto
+        return counts.get((q, run), 0) % 2 == 1
+
+
+
 # "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS).
-_PAIR_RE = re.compile(
-    r"""((?P<q>["'])(?P<name>[^"'\\\n]{1,80})(?P=q)[ \t]{0,8}:[ \t]{0,8})(?P<v>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""")
-# JSON that was serialised again into a string: {\"password\": \"x\"}
-_ESC_PAIR_RE = re.compile(
-    r"""(\\"(?P<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")(?:[^"\\]|\\(?!"))*(\\")""")
+_PAIR_RE = re.compile(r"""((?P<q>["'])(?P<name>[^"'\\\n]{1,80})(?P=q)[ \t]{0,8}:[ \t]{0,8})(?=["'])""")
+# JSON that was serialised again into a string: {\"password\": \"x\"}, and again: {\\\"password\\\": \\\"x\\\"} (the quotes carry an odd run of backslashes)
+_ESC_PAIR_RE = re.compile(r"""(?<!\\)(?P<bs>\\{1,31})"(?P<name>[^"'\\\n]{1,80})(?P=bs)"[ \t]{0,8}:[ \t]{0,8}(?=(?P=bs)")""")
 
 
 @functools.lru_cache(maxsize=4096)
@@ -244,10 +356,7 @@ _CLI_BREAKS = "\r\n\f\v;&|"
 _CLI_STOPS = " \t" + _CLI_BREAKS
 _CLI_WORD_RE = re.compile(r"[^ \t\r\n\f\v;&|]+")
 _CLI_BLANKS_RE = re.compile(r"[ \t]*")
-_CLI_UNQUOTED_RE = re.compile(r"""[^ \t\r\n\f\v;&|"']+""")
-_CLI_LINE_RE = re.compile(r"[^\r\n]*")
-_CLI_QUOTED_RES = {'"': re.compile(r'"[^"\n]*"'), "'": re.compile(r"'[^'\n]*'"),
-                   '\\"': re.compile(r'\\"[^\n]*?\\"'), "\\'": re.compile(r"\\'[^\n]*?\\'")}
+_CLI_UNQUOTED_RE = re.compile(r"""(?:[^ \t\r\n\f\v;&|"'\\]|\\[ \t]|\\(?!"))+""")
 _CLI_UID_GID_RE = re.compile(r"[0-9]{1,10}:[0-9]{1,10}")
 # `-u`/`--user`/`--proxy-user` value, and the openssl `-pass`/`-passin`/`-passout` pass:X form; the option may follow ANY non-name character
 # (a backtick, a quote, a bracket, `=`, `_` of Markdown emphasis ...), not a letter, digit or `-`.
@@ -268,58 +377,51 @@ _CLI_FLAG_KINDS = {"p": _CLI_MYSQL | _CLI_LOGIN, "a": _CLI_REDIS, "P": _CLI_SQLC
 _CLI_COMMAND_HINTS = ("mysql", "mariadb", "sshpass", "login", "mongo", "redis-cli", "sqlcmd", "bcp", "ssh-keygen")
 
 
-def _cli_attached(s: str, start: int, at: int, end: int) -> bool:
-    """Whether the flag at s[at:at + 2] (`-p`) of the word s[start:end] carries its value attached: `-pVALUE`, `-p'VALUE'`.
-    A quote that opens the value (one the word's own prefix did not open: `"-p"` is a closer) makes everything after it the value, even when it is
-    only punctuation; an unquoted value is one unless it is made only of closers (`-p`, `(-p)`, `**-p**`) that end the word."""
+def _cli_attached(rd: _Reader, at: int, end: int) -> bool:
+    """Whether the flag at s[at:at + 2] (`-p`) of the word that ends at `end` carries its value attached: `-pVALUE`, `-p'VALUE'`, `-p$'VALUE'`, `-p\\"VALUE\\"`.
+    A quote that opens the value (one that does not CLOSE an earlier quote of the line: `"mysql -p" ok` and `"-p"` are prose) makes everything
+    after it the value, even when it is only punctuation or blanks (`-p" x"`, `-p\\" x\\"`); an unquoted value is one unless it is made
+    only of closers (`-p`, `(-p)`, `**-p**`) that end the word."""
     v = at + 2
     if v >= end:
         return False
-    c = s[v]
-    quote = c if c in ('"', "'") else s[v:v + 2] if c == "\\" and s[v + 1:v + 2] in ('"', "'") else ""
-    if quote and quote[-1] not in s[start:at]:
-        return end - v > len(quote) or s[end:end + 1] in (";", "&", "|")  # a lone quote opens a value only where `;&|` ended the word (`-p"&x"`): `"mysql -p" ok`
-    return any(ch not in _CLI_CLOSERS for ch in s[v:end])
+    op = rd.opener(v)
+    if op is not None:
+        if not rd.odd(op[0], op[2], at):
+            return True
+        v += op[1]  # the quote CLOSES an earlier one: only what follows it can be a value (`"mysql -p" ok`, `\\"mysql -p\\" ok`)
+    return any(ch not in _CLI_CLOSERS for ch in rd.s[v:end])
 
 
-def _cli_value_end(s: str, start: int) -> int:
-    """End of the value that starts at s[start] (not a blank, not `;&|`): a quoted value runs to its closing quote, or to the end of the
-    line when it never closes (a truncated log line); any other value to the next blank, `;&|` or quote. `start` when it is empty."""
-    c = s[start]
-    if c == "\\" and s[start + 1:start + 2] in ('"', "'"):
-        c = s[start:start + 2]
-    rx = _CLI_QUOTED_RES.get(c)
-    if rx is not None:
-        m = rx.match(s, start)
-        return m.end() if m else _CLI_LINE_RE.match(s, start).end()
-    m = _CLI_UNQUOTED_RE.match(s, start)
-    return m.end() if m else start
-
-
-def _cli_option_spans(s: str, add) -> None:
+def _cli_option_spans(s: str, add, rd: _Reader) -> None:
     """The values of `-u user:pass` (and `--user`, `--proxy-user`, also `=user:pass`) and of `-passin pass:X`."""
     if "-u" not in s and "-pass" not in s:
         return
     n = len(s)
     run_from = run_to = -1  # [run_from, run_to) holds no blank, `;&|` or quote: the unquoted run every start inside it ends at
     colon_from, colon_at = 0, -1  # no ':' in [colon_from, colon_at), a ':' at colon_at (n when there is none)
-    pushed_end = -1  # end of the last unquoted value reported: a later start (starts only grow) inside that run is covered
+    pushed_end = -1  # end of the last value reported: a later start (starts only grow) inside that run is covered
     for m in _CLI_OPTION_RE.finditer(s):
         start = m.end() if m.group(1) == "=" else _CLI_BLANKS_RE.match(s, m.end()).end()
         if start < pushed_end or start >= n or s[start] in _CLI_STOPS:
             continue  # (a start inside a reported run is covered)
-        if m.group(2) is not None:  # openssl: `-passin pass:SECRET`, `-passin "pass:SECRET"`
-            q = start + 1 if s[start] in "\"'" else start
-            if s.startswith("pass:", q):
-                value = _CLI_UNQUOTED_RE.match(s, q + 5)
-                if value:
-                    add((q + 5, value.end()))
+        op = rd.opener(start)
+        if m.group(2) is not None:  # openssl: `-passin pass:SECRET`, `-passin "pass:SECRET"`, `-passin pass:"a b"`
+            if op is not None:
+                end, close = rd.quoted(start, *op)
+                inner = start + op[1]
+                if s.startswith("pass:", inner) and end - close > inner + 5:
+                    add((inner + 5, end - close))
+            elif s.startswith("pass:", start):
+                end = rd.read(start + 5, _CLI_UNQUOTED_RE)[0]
+                if end > start + 5:
+                    add((start + 5, end))
             continue
-        c = s[start]
-        if c in "\"'" or (c == "\\" and s[start + 1:start + 2] in ('"', "'")):
-            end = _cli_value_end(s, start)
-            if s.find(":", start + 1, end) >= 0:
+        if op is not None:  # the whole `user:pass` is quoted
+            end = rd.quoted(start, *op)[0]
+            if s.find(":", start + op[1], end) >= 0:
                 add((start, end))
+                pushed_end = end
             continue
         if not run_from <= start < run_to:
             run_from, run_to = start, _CLI_UNQUOTED_RE.match(s, start).end()
@@ -328,14 +430,22 @@ def _cli_option_spans(s: str, add) -> None:
             colon_at = s.find(":", start)
             if colon_at < 0:
                 colon_at = n
-        # a user, `:`, a password (both non-empty); a docker uid:gid pair is not a credential
-        if start < colon_at and colon_at + 1 < run_to and not (colon_at - start <= 10 and run_to - colon_at <= 11
-                                                               and _CLI_UID_GID_RE.fullmatch(s, start, run_to)):
-            add((start, run_to))
-            pushed_end = run_to
+        if start >= colon_at or colon_at >= run_to:
+            continue  # no user, or no `:` inside the word
+        # a user, `:`, a password (both non-empty): bare, or quoted in any form (`curl -u me:'a b'`); a docker uid:gid pair is not a credential
+        p = colon_at + 1
+        if rd.opener(p) is not None:
+            end = rd.read(p, _CLI_UNQUOTED_RE)[0]
+        elif p < run_to and not (colon_at - start <= 10 and run_to - colon_at <= 11 and _CLI_UID_GID_RE.fullmatch(s, start, run_to)):
+            end = run_to
+        else:
+            continue
+        if end > p:
+            add((start, end))
+            pushed_end = end
 
 
-def _cli_command_spans(s: str, add) -> None:
+def _cli_command_spans(s: str, add, rd: _Reader) -> None:
     """The password flag of `mysql -pSECRET`, `docker login -p SECRET`, `sshpass -p`, `redis-cli -a`, `sqlcmd -P`, `ssh-keygen -N`: once
     a command is seen in a segment its flag is checked in EVERY later word of that segment, however long or numerous the arguments."""
     if not any(h in s for h in _CLI_COMMAND_HINTS):
@@ -349,7 +459,7 @@ def _cli_command_spans(s: str, add) -> None:
         if want:  # the value is taken whole, and its words are still read: a value can hold the next command (`redis-cli -a $(sshpass -p x)`)
             want = 0
             if s[start] != "-":
-                value_end = _cli_value_end(s, start)
+                value_end = rd.read(start, _CLI_UNQUOTED_RE)[0]
                 if value_end > start:
                     add((start, value_end))
         at = start
@@ -359,8 +469,10 @@ def _cli_command_spans(s: str, add) -> None:
             pending = 0
             kinds = active & _CLI_FLAG_KINDS.get(s[at + 1:at + 2], 0) if active else 0
             if kinds:
-                if _cli_attached(s, start, at, end):  # `-pSECRET`: the value touches the flag
-                    add((at + 2, _cli_value_end(s, at + 2)))
+                if _cli_attached(rd, at, end):  # `-pSECRET`: the value touches the flag
+                    value_end = rd.read(at + 2, _CLI_UNQUOTED_RE)[0]
+                    if value_end > at + 2:
+                        add((at + 2, value_end))
                     continue
                 if kinds != _CLI_MYSQL:  # a bare `-p` is a prompt for mysql, not for the others: the value is the next word
                     want = 1
@@ -385,9 +497,9 @@ def _cli_command_spans(s: str, add) -> None:
                 pending = _CLI_TWO_WORD[base]
 
 
-def _cli_spans(s: str, add) -> None:
-    _cli_option_spans(s, add)
-    _cli_command_spans(s, add)
+def _cli_spans(s: str, add, rd: _Reader) -> None:
+    _cli_option_spans(s, add, rd)
+    _cli_command_spans(s, add, rd)
 
 
 # ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ------------------------
@@ -435,7 +547,7 @@ def _yaml_spans(s: str, add) -> None:
                 last = end
 
 
-def _continuation(s: str, pos: int, end: int, value_re: re.Pattern[str]) -> int:
+def _continuation(s: str, pos: int, end: int, bare_re: re.Pattern[str], rd: _Reader) -> int:
     """End of the next value segment that still belongs to the secret whose value spans s[pos:end], or -1."""
     c = s[end:end + 1]
     if c != " " and c != "\t" and c != '"' and c != "'" and not s.startswith('\\"', end):
@@ -465,8 +577,8 @@ def _continuation(s: str, pos: int, end: int, value_re: re.Pattern[str]) -> int:
         return -1
     if colon and s.startswith("//", gap.end()):
         return -1
-    v = value_re.match(s, gap.end())
-    return -1 if v is None else v.end()
+    value_end = rd.read(gap.end(), bare_re)[0]
+    return -1 if value_end == gap.end() else value_end
 
 
 _NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
@@ -483,14 +595,7 @@ def _tail_name_start(s: str, floor: int, end: int) -> int:
     return i
 
 
-def _open_quote_value(s: str, pos: int, value_re: re.Pattern[str]) -> re.Match[str] | None:
-    """The value of a name whose opening quote never closes on its line (`password="abc def`, a truncated log line): the quote is
-    noise and the bare value after it is the secret. None when `s[pos]` is no quote."""
-    skip = 2 if s.startswith('\\"', pos) else 1 if s[pos:pos + 1] in ('"', "'") else 0
-    return value_re.match(s, pos + skip) if skip else None
-
-
-def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bool, add) -> None:
+def _scan(s: str, sep_re: re.Pattern[str], bare_re: re.Pattern[str], eq_sep: bool, add, rd: _Reader) -> None:
     """Report the value that follows every sensitive `NAME<sep>` match of `sep_re`: one forward pass with a cursor (no
     recursion, no rescans). A benign name only moves the cursor past its separator, so what looks like its value is scanned too."""
     pos = key_fail = 0
@@ -503,13 +608,10 @@ def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bo
         if not hit and not _key_name(name):
             continue
         start = pos
-        reopen = False
         if hit:
-            if (v := value_re.match(s, pos)) is None:
-                if (v := _open_quote_value(s, pos, value_re)) is None:
-                    continue
-                reopen = True
-            start, end = v.start(), v.end()
+            end = rd.read(pos, bare_re)[0]
+            if end == pos:
+                continue
             if s.startswith(REDACTED, start) and end > start + len(REDACTED) and s[start + len(REDACTED)] not in _ALNUM:
                 end = start + len(REDACTED)  # an already-masked value (`[REDACTED],x`) ends where the mask does, like a closing quote
         else:
@@ -519,22 +621,37 @@ def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bo
             if end < 0:
                 key_fail = max(key_fail, run_end)
                 continue
-        while (more := _continuation(s, pos, end, value_re)) >= 0:
+        while (more := _continuation(s, pos, end, bare_re, rd)) >= 0:
             end = more
         add((start, end))
-        # the value of a quote that never closes is a guess (`--token "--password x`): scanning goes on INSIDE it. A value can also end
-        # with the NAME of the next assignment (`--api-key = {--password=\"x\"`): scanning resumes where that name starts
-        pos = start if reopen else _tail_name_start(s, pos, end)
+        # a value can end with the NAME of the next assignment (`--api-key = {--password=\"x\"`): scanning resumes where that name starts
+        pos = _tail_name_start(s, pos, end)
 
 
-def _pair_spans(s: str, add) -> None:
-    for m in _PAIR_RE.finditer(s):
-        v = m.group("v")
-        if len(v) > 2 and _credential_pair(m.group("name"), v[1:-1]):
-            add((m.start("v") + 1, m.end("v") - 1))
-    for m in _ESC_PAIR_RE.finditer(s):
-        if m.end(1) < m.start(3) and is_sensitive_key(m.group("name")):
-            add((m.end(1), m.start(3)))
+def _pair_spans(s: str, add, rd: _Reader) -> None:
+    """`"name": "value"` / `'name': 'value'` and the twice-serialised `\\"name\\": \\"value\\"` (any odd number of backslashes before the quotes). The
+    value of a credential name is read to its closing quote (to the end of the line when it never closes); a benign pair does not hide a
+    pair INSIDE its value (`{"message": "login 'password': 'x'"}`): the scan goes on inside it."""
+    pos = 0
+    while (m := _PAIR_RE.search(s, pos)) is not None:
+        p = m.end()
+        end, close = rd.quoted(p, s[p], 1, 0)
+        if end - close > p + 1 and _credential_pair(m.group("name"), s[p + 1:end - close]):
+            add((p + 1, end - close))
+            pos = end
+        else:
+            pos = p + 1
+    pos = 0
+    while (m := _ESC_PAIR_RE.search(s, pos)) is not None:
+        p = m.end()
+        run = len(m.group("bs"))
+        pos = p + run + 1
+        if run % 2 == 0 or not is_sensitive_key(m.group("name")):
+            continue
+        end, close = rd.quoted(p, '"', run + 1, run)
+        if end - close > p + run + 1:
+            add((p + run + 1, end - close))
+            pos = end
 
 
 def _header_end(s: str, value_start: int) -> int:
@@ -575,14 +692,15 @@ def _spans(s: str) -> list[tuple[int, int]]:
     for m in _USERINFO_RE.finditer(s):
         add((m.end(1), m.end() - 1))  # the '@' stays
     _header_spans(s, add)
-    _cli_spans(s, add)
+    rd = _Reader(s)
+    _cli_spans(s, add, rd)
     _yaml_spans(s, add)
-    _scan(s, _NAME_SEP_RE, _VALUE_RE, True, add)
-    _scan(s, _FLAG_SEP_RE, _FLAG_VALUE_RE, False, add)
+    _scan(s, _NAME_SEP_RE, _NAME_BARE_RE, True, add, rd)
+    _scan(s, _FLAG_SEP_RE, _FLAG_BARE_RE, False, add, rd)
     for rx in (_JWT_RE, *_TOKEN_RES):
         for m in rx.finditer(s):
             add((m.start(), m.end()))
-    _pair_spans(s, add)
+    _pair_spans(s, add, rd)
     return spans
 
 
