@@ -312,7 +312,7 @@ class _Lexer:
         starts: list[tuple[int, bool]] = []  # the value spans of the comment in progress: where each starts and whether it also ends at `;`/`&`, ascending
         si = 0
         vact = False  # a value word of that comment is open ...
-        vgap = 0  # ... and the text from here to the next quote is not yet checked for its end
+        vscan = 0  # ... and the text before here is checked for the word's end (no break in it); the text from here on is not yet
         vjoin = True  # whether that word ends at a `;` or `&` as well as at a blank
         vseg = -1  # the mate of a prose quote that opened a quoted segment of that word: the blanks up to it are inside the quotes
         comment_open = False  # a comment began and no mark has come after its line yet: the first mark after that line closes the quotes it opened
@@ -349,15 +349,17 @@ class _Lexer:
                 while si < len(starts) and starts[si][0] <= p:
                     st, joins = starts[si]
                     if not stack:
-                        if vact and _word_break(s, vgap, st, vjoin):
-                            vact = False
+                        if vact and st > vscan:  # only the text past the cursor is scanned: every character of the comment is scanned once
+                            vact = not _word_break(s, vscan, st, vjoin)
+                            vscan = st
                         if vact:  # a second reading of the same word (`--password :;` is also `password :`): the detectors take the union, the longer word
                             vjoin = vjoin and joins
                         else:
-                            vact, vgap, vjoin = True, st, joins
+                            vact, vscan, vjoin = True, st, joins
                     si += 1
-                if vact and not stack and _word_break(s, vgap, p, vjoin):
-                    vact = False
+                if vact and not stack and p > vscan:
+                    vact = not _word_break(s, vscan, p, vjoin)
+                    vscan = p
                 if not vact:  # comment prose: a CONTENT mark, it opens and closes nothing
                     i += 1
                     continue
@@ -366,7 +368,7 @@ class _Lexer:
                     # inside the quotes, so the word goes on past them (the reader's rule for the same word outside a comment)
                     mate = _mate(s, p, skip_to)
                     if mate >= 0:
-                        vseg = vgap = mate
+                        vseg = vscan = mate
             if level == 0:  # a plain quote ends the escaped quotes of its kind on top of the stack
                 while kstack:
                     k = kstack[-1]
@@ -396,7 +398,7 @@ class _Lexer:
                 kstack.append(key)
                 cnt[key] = cnt.get(key, 0) + 1
             if in_comment:
-                vgap = max(vgap, p + 1)
+                vscan = max(vscan, p + 1)
             i += 1
         self.pos, self.lvl, self.role, self.link, self.how = pos, lvl, role, link, how
         self._top = self._par = self._lost = self.nx0 = self.nxl = None

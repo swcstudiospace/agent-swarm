@@ -796,6 +796,32 @@ describe("redactText shared vectors", () => {
     }
   });
 
+  // The comment scan keeps one cursor through the comment line (`vscan` in `Lexer`): every character is scanned a bounded number of
+  // times. The outputs pinned here are the pre-fix outputs (the quadratic scan returned the same text; only its speed changed).
+  test("a comment of repeated assignments keeps its pre-fix output", () => {
+    expect(redactText("# " + "PASSWORD=".repeat(4) + '"x"')).toBe("# PASSWORD=[REDACTED]");
+    expect(redactText("# " + "x=y ".repeat(4))).toBe("# x=y x=y x=y x=y ");
+    expect(redactText("# " + 'PASSWORD="ab cd" '.repeat(3) + "tail")).toBe("# " + "PASSWORD=[REDACTED] ".repeat(3) + "tail");
+    expect(redactText("# " + "PASSWORD=a'b c'\"d\" ".repeat(2) + "end")).toBe("# " + "PASSWORD=[REDACTED] ".repeat(2) + "end");
+  });
+
+  test("1 MB comments of repeated assignments are scanned in linear time", () => {
+    for (const unit of ["PASSWORD=", "x=y ", 'PASSWORD="ab cd" ']) {
+      const comment = (size: number) => "# " + unit.repeat(Math.floor(size / unit.length)) + '"x"';
+      const timed = (text: string) => {
+        const started = performance.now();
+        redactText(text);
+        return performance.now() - started;
+      };
+      timed(comment(250_000)); // warm the JIT before measuring
+      const small = Math.min(timed(comment(250_000)), timed(comment(250_000)), timed(comment(250_000)));
+      const big = Math.min(timed(comment(1_000_000)), timed(comment(1_000_000)));
+      // 4x the input must not cost 16x the time (a quadratic scan does); the absolute ceiling is only against a blow-up
+      expect({ unit, ratioOk: big / Math.max(small, 1) < 9 }).toEqual({ unit, ratioOk: true });
+      expect({ unit, ceilingOk: big < 3000 }).toEqual({ unit, ceilingOk: true });
+    }
+  });
+
   test("a space-separated password flag in currentToolArgs never reaches the activity row", () => {
     const row = sanitizeText("login --password hunter2");
     expect(row).toBe("login --password [REDACTED]");

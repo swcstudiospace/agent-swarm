@@ -364,7 +364,7 @@ class Lexer {
     let starts: Array<[number, boolean]> = []; // the value spans of the comment in progress: where each starts and whether it also ends at `;`/`&`, ascending
     let si = 0;
     let vact = false; // a value word of that comment is open ...
-    let vgap = 0; // ... and the text from here to the next quote is not yet checked for its end
+    let vscan = 0; // ... and the text before here is checked for the word's end (no break in it); the text from here on is not yet
     let vjoin = true; // whether that word ends at a `;` or `&` as well as at a blank
     let vseg = -1; // the mate of a prose quote that opened a quoted segment of that word: the blanks up to it are inside the quotes
     let commentOpen = false; // a comment began and no mark has come after its line yet: the first mark after that line closes the quotes it opened
@@ -409,19 +409,26 @@ class Lexer {
         while (si < starts.length && starts[si]![0] <= p) {
           const [st, joins] = starts[si]!;
           if (sp === 0) {
-            if (vact && wordBreak(s, vgap, st, vjoin)) vact = false;
+            if (vact && st > vscan) {
+              // only the text past the cursor is scanned: every character of the comment is scanned once
+              if (wordBreak(s, vscan, st, vjoin)) vact = false;
+              vscan = st;
+            }
             if (vact) {
               // a second reading of the same word (`--password :;` is also `password :`): the detectors take the union, the longer word
               vjoin = vjoin && joins;
             } else {
               vact = true;
-              vgap = st;
+              vscan = st;
               vjoin = joins;
             }
           }
           si++;
         }
-        if (vact && sp === 0 && wordBreak(s, vgap, p, vjoin)) vact = false;
+        if (vact && sp === 0 && p > vscan) {
+          if (wordBreak(s, vscan, p, vjoin)) vact = false;
+          vscan = p;
+        }
         if (!vact) {
           // comment prose: a CONTENT mark, it opens and closes nothing
           top[i] = sp > 0 ? stack[sp - 1]! : -1;
@@ -432,7 +439,7 @@ class Lexer {
           // `ab'c d'ef` in a comment: the prose quote opens a quoted segment that its mate on the line closes; the blanks in between are
           // inside the quotes, so the word goes on past them (the reader's rule for the same word outside a comment)
           const mate = proseMate(s, p, skipTo);
-          if (mate >= 0) vseg = vgap = mate;
+          if (mate >= 0) vseg = vscan = mate;
         }
       }
       if (level === 0) {
@@ -473,7 +480,7 @@ class Lexer {
         cnt.set(key, (cnt.get(key) ?? 0) + 1);
       }
       top[i] = sp > 0 ? stack[sp - 1]! : -1;
-      if (inComment) vgap = Math.max(vgap, p + 1);
+      if (inComment) vscan = Math.max(vscan, p + 1);
       i++;
     }
     for (let k = 0; k < sp; k++) lost.push(stack[k]!);

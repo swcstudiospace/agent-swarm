@@ -1596,3 +1596,41 @@ def test_a_value_is_a_shell_word_a_quote_that_touches_it_continues_it():
         ("$(mysql -p'alpha')", "$(mysql -p" + REDACTED + ")"),
     ):
         assert redact_text(text) == expected
+
+
+# The comment scan keeps one cursor through the comment line (`vscan` in `_Lexer`): every character is scanned a bounded number of
+# times. A value word of repeated assignments used to rescan its whole prefix at every value start (quadratic: 17 s for 360 KB).
+# The outputs below are the pre-fix outputs (the quadratic scan returned the same text; only its speed changed).
+_COMMENT_PARITY = [
+    ("# " + "PASSWORD=" * 4 + '"x"', "# PASSWORD=" + REDACTED),
+    ("# " + "x=y " * 4, "# x=y x=y x=y x=y "),
+    ("# " + 'PASSWORD="ab cd" ' * 3 + "tail", "# " + ("PASSWORD=" + REDACTED + " ") * 3 + "tail"),
+    ("# " + "PASSWORD=a'b c'\"d\" " * 2 + "end", "# " + ("PASSWORD=" + REDACTED + " ") * 2 + "end"),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _COMMENT_PARITY)
+def test_the_comment_scan_output_is_unchanged_by_its_linear_cursor(text, expected):
+    assert redact_text(text) == expected
+
+
+def _best_seconds(text: str, runs: int) -> float:
+    import time
+    best = float("inf")
+    for _ in range(runs):
+        started = time.perf_counter()
+        redact_text(text)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+@pytest.mark.parametrize("unit", ["PASSWORD=", "x=y ", 'PASSWORD="ab cd" '])
+def test_a_comment_of_repeated_assignments_scans_in_linear_time(unit):
+    """Scaling check, not a wall-clock cap: the same comment unit at 250 KB and at 1 MB. 4x the input must not cost 16x the time."""
+    def comment(size: int) -> str:
+        return "# " + unit * (size // len(unit)) + '"x"'
+    _best_seconds(comment(250_000), 1)  # warm up before measuring
+    small = _best_seconds(comment(250_000), 3)
+    big = _best_seconds(comment(1_000_000), 2)
+    assert big / max(small, 1e-3) < 9, (unit, small, big)
+    assert big < 3.0, (unit, big)  # generous absolute ceiling against a blow-up
