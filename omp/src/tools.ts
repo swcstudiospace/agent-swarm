@@ -59,6 +59,13 @@ const FINDING = {
   additionalProperties: false,
 } as const;
 
+/** swarm_tool.py --kind choices. */
+const CATALOG_KINDS = ["tools", "skills", "all"] as const;
+/** Registry tool names (swarm/tool_registry.py `_conventional_name`): lowercase, digits, underscore. */
+const TOOL_NAME_PATTERN = "^[a-z][a-z0-9_]{0,63}$";
+/** One argv value is capped by the kernel at 128 KiB; swarm_tool.py enforces the same 100 000 byte ceiling. */
+const MAX_TOOL_INPUT_BYTES = 100_000;
+
 type Details = Record<string, unknown>;
 
 /** A registered swarm tool as omp sees it (params are the model's JSON, shaped by `parameters`). */
@@ -89,6 +96,8 @@ export type GateParams = {
   per_target_findings?: Record<string, Finding[]>;
   dry_run?: boolean;
 };
+export type CatalogParams = { kind?: (typeof CATALOG_KINDS)[number]; query?: string };
+export type ToolCallParams = { name: string; input: Record<string, unknown> };
 export type TransitionParams = { task_id: string; state: (typeof STATES)[number]; reason: string; dry_run?: boolean };
 
 interface ToolSpec<P> {
@@ -419,5 +428,83 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
   });
 
-  return [status, plan, assignment, ingest, transition, gate];
+  /** The session's own agent slug; a tool call is authorized for it and for nobody the model names (DESIGN 5.3). */
+  function sessionCaller(tool: string, ctx: ExtensionContext): string {
+    const agent = callingAgent(ctx);
+    if (agent === undefined || !SWARM_SLUGS.includes(agent)) {
+      throw new SwarmToolError(
+        "E-POLICY",
+        `${tool} refused: the session has no swarm agent identity, so there is no caller to authorize`,
+      );
+    }
+    return agent;
+  }
+
+  const catalog = define<CatalogParams>({
+    name: "swarm_catalog",
+    label: "Swarm catalog",
+    description:
+      "List the registry tools you may call with swarm_tool_call (name, purpose, side-effect tier, timeout) and the " +
+      "skills available to you (your own plus shared), optionally filtered by kind and by words matched against " +
+      "name and purpose. The list is computed for the calling agent only. Read-only; works in plan mode.",
+    parameters: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: CATALOG_KINDS, description: "tools, skills or all (default all)" },
+        query: { type: "string", minLength: 1, maxLength: 200, description: "Words that must all appear in the name or purpose" },
+      },
+      additionalProperties: false,
+    },
+    mutating: false,
+    async run(_toolCallId, params, signal, ctx) {
+      const caller = sessionCaller("swarm_catalog", ctx);
+      // argv from whitelisted fields only; the caller is the session identity, never a model field
+      const args = [rootArg(ctx), "catalog", `--caller=${caller}`];
+      if (params.kind !== undefined) args.push(`--kind=${params.kind}`);
+      if (params.query !== undefined) args.push(`--query=${params.query}`);
+      const res = await bridge({ script: "swarm_tool", args, cwd: ctx.cwd, signal });
+      const { tools, skills, skills_unavailable: unavailable } = res.json;
+      const listing = JSON.stringify({ tools, skills, ...(unavailable === undefined ? {} : { skills_unavailable: unavailable }) });
+      return { content: [{ type: "text", text: `${String(res.json.summary)}\n${listing}` }], details: res.json };
+    },
+  });
+
+  const toolCall = define<ToolCallParams>({
+    name: "swarm_tool_call",
+    label: "Swarm tool call",
+    description:
+      "Call one registry tool you are permitted to use (see swarm_catalog) with a JSON input object. Returns the " +
+      "registry result object unchanged: state SUCCESS, INVALID_INPUT, UNAUTHORIZED, DEPENDENCY_UNAVAILABLE, TIMEOUT " +
+      "or PARTIAL_SUCCESS plus the tool's fields; read `state` before using any field. READ tools work in plan " +
+      "mode; a WRITE tool is refused there. The caller is your own agent identity and cannot be changed.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", pattern: TOOL_NAME_PATTERN, description: "Registered tool name, for example be_route_norm" },
+        input: { type: "object", description: "The tool's input object; python validates it against the tool's input schema" },
+      },
+      required: ["name", "input"],
+      additionalProperties: false,
+    },
+    mutating: false,
+    async run(_toolCallId, params, signal, ctx) {
+      const caller = sessionCaller("swarm_tool_call", ctx);
+      if (!isObject(params) || typeof params.name !== "string" || !new RegExp(TOOL_NAME_PATTERN).test(params.name) ||
+          !isObject(params.input)) {
+        throw new SwarmToolError("E-INPUT", "swarm_tool_call requires a tool name and an input object");
+      }
+      const input = JSON.stringify(params.input);
+      if (Buffer.byteLength(input, "utf8") > MAX_TOOL_INPUT_BYTES) {
+        throw new SwarmToolError("E-INPUT", `swarm_tool_call input exceeds ${MAX_TOOL_INPUT_BYTES} bytes`);
+      }
+      const args = [rootArg(ctx), "call", `--caller=${caller}`, `--name=${params.name}`, `--input=${input}`];
+      // python knows each tool's tier: in plan mode it refuses anything above READ before importing the handler
+      if (inPlanMode(ctx)) args.push("--plan-mode");
+      const res = await bridge({ script: "swarm_tool", args, cwd: ctx.cwd, signal });
+      const result = isObject(res.json.result) ? res.json.result : res.json;
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    },
+  });
+
+  return [status, plan, assignment, ingest, transition, gate, catalog, toolCall];
 }

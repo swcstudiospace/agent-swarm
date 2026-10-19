@@ -8,7 +8,6 @@ import { HOLD_ENV, holdTimeoutMs, parseSwarmArgs, swarmCommand, type SwarmComman
 import { DISPATCH_MARKER } from "../src/hooks.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import type { SessionEntry } from "../src/omp-api.ts";
-import { createDockState } from "../src/swarm_dock.ts";
 import {
   type CallLog,
   callTool,
@@ -155,7 +154,7 @@ const DISPATCH_ENTRY: SessionEntry = {
 };
 
 /** A session whose fake sendUserMessage starts a scripted turn; `opts` reach swarmCommand's DI options directly. */
-function turnSession(script: ScriptedTurn, opts?: Omit<SwarmCommandOptions, "dock">) {
+function turnSession(script: ScriptedTurn, opts?: SwarmCommandOptions) {
   const log: CallLog = [];
   const entries: SessionEntry[] = [];
   const turn = fakeTurn(script, entries, log);
@@ -170,7 +169,7 @@ function turnSession(script: ScriptedTurn, opts?: Omit<SwarmCommandOptions, "doc
     },
   });
   pi.load(createSwarmExtension({ bridge }));
-  const swarm = opts ? swarmCommand(pi.api, bridge, { ...opts, dock: createDockState() }) : pi.command("swarm");
+  const swarm = opts ? swarmCommand(pi.api, bridge, opts) : pi.command("swarm");
   const ctx = commandCtx(gitRepo(), entries, { log, isIdle: turn.isIdle });
   return { log, turn, swarm, ctx };
 }

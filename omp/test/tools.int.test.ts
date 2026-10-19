@@ -1,7 +1,7 @@
 /** Integration: tools → real bridge → real python scripts → tmp Task Store (never the repo's .swarm/). */
 import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Bridge, type BridgeRequest, runPy, SwarmToolError } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
@@ -11,7 +11,7 @@ import { SWARM_SLUGS } from "../src/guard.ts";
 
 isolateEnv(
   "SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_AGENT_SESSION", "SWARM_AGENT",
-  "SWARM_SIGNING_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY",
+  "SWARM_SIGNING_KEY", "SWARM_ALLOW_INSECURE_DEV_KEY", "SWARM_AGENTS_FILE",
 );
 beforeEach(() => {
   process.env.SWARM_SIGNING_KEY = ephemeralSigningKey();
@@ -568,4 +568,53 @@ test("status env wins", async () => {
   expect(details.db).toBe(`${other}/tasks.db`);
   expect(details.tasks).toEqual([]);
   expect(res.content[0].text).toContain(`db: ${other}/tasks.db`);
+});
+
+/** A copy of the live registry in which `be_route_norm` is a WRITE tool, so plan mode has something to refuse. */
+function registryWithWriteTool(): string {
+  const registry = JSON.parse(readFileSync(join(import.meta.dir, "..", "..", "agents.json"), "utf8"));
+  for (const agent of registry.agents) {
+    for (const tool of agent.registered_tools) if (tool.name === "be_route_norm") tool.side_effect_tier = "WRITE";
+  }
+  const file = join(tmpDir("swarm-omp-registry-"), "agents.json");
+  writeFileSync(file, JSON.stringify(registry));
+  return file;
+}
+
+test("swarm_catalog lists the session agent's tools with tier and timeout; swarm_tool_call returns the registry object", async () => {
+  const { repo } = tmpStore();
+  const { calls, tool } = swarm();
+  const ctx = agentCtx(repo, "a05-backend");
+
+  const listed = await callTool(tool("swarm_catalog"), { kind: "tools", query: "route" }, ctx);
+  const rows = (listed.details as { tools: Array<{ name: string; tier: string; timeout_s: number }> }).tools;
+  expect(rows.map((r) => r.name)).toContain("be_route_norm");
+  expect(rows.every((r) => r.tier === "READ" && r.timeout_s > 0)).toBe(true);
+  expect((listed.details as { caller: string }).caller).toBe("A05");
+
+  const ok = await callTool(tool("swarm_tool_call"), { name: "be_route_norm", input: { path: "/users/:id/" } }, ctx);
+  expect(ok.details).toEqual({ state: "SUCCESS", normalized: "/users/{}" });
+
+  // a tool of another lane: the registry answers UNAUTHORIZED (exit 1 is data, not a thrown error)
+  const denied = await callTool(tool("swarm_tool_call"), { name: "req_gwt_check", input: { text: "x" } }, ctx);
+  expect(denied.details).toMatchObject({ state: "UNAUTHORIZED", caller: "A05", target: "req_gwt_check" });
+  const bad = await callTool(tool("swarm_tool_call"), { name: "be_route_norm", input: {} }, ctx);
+  expect(bad.details).toMatchObject({ state: "INVALID_INPUT", field: "path" });
+  expect(calls).toHaveLength(4);
+});
+
+test("plan mode: swarm_tool_call refuses a WRITE tool before it runs, a READ tool and swarm_catalog still work", async () => {
+  const { repo } = tmpStore();
+  process.env.SWARM_AGENTS_FILE = registryWithWriteTool();
+  const { tool } = swarm();
+  const planned = agentCtx(repo, "a05-backend", PLAN_MODE);
+  const err = await rejection(callTool(tool("swarm_tool_call"), { name: "be_route_norm", input: { path: "/a/" } }, planned));
+  expect(err.code).toBe("E-POLICY");
+  const read = await callTool(tool("swarm_tool_call"), { name: "be_route_collision", input: { routes: [{ method: "GET", path: "/a" }] } }, planned);
+  expect((read.details as { state: string }).state).toBe("SUCCESS");
+  const listed = await callTool(tool("swarm_catalog"), { query: "route_norm" }, planned);
+  expect((listed.details as { tools: Array<{ tier: string }> }).tools[0].tier).toBe("WRITE");
+  // outside plan mode the same WRITE tool runs
+  const run = await callTool(tool("swarm_tool_call"), { name: "be_route_norm", input: { path: "/a/" } }, agentCtx(repo, "a05-backend"));
+  expect((run.details as { state: string }).state).toBe("SUCCESS");
 });

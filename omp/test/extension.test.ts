@@ -38,6 +38,21 @@ afterAll(() => {
   spawnSync.mockRestore();
 });
 
+/** The extension registers exactly these event handlers; the swarm bar adds the session/agent/turn/tool-execution ones. */
+const EXPECTED_HANDLERS = [
+  "agent_end",
+  "agent_start",
+  "before_agent_start",
+  "session_shutdown",
+  "session_start",
+  "session_switch",
+  "tool_call",
+  "tool_execution_end",
+  "tool_execution_start",
+  "tool_result",
+  "turn_end",
+  "turn_start",
+];
 
 type Entry = typeof EntryModule;
 let entry: Promise<Entry> | undefined;
@@ -71,7 +86,7 @@ test("registers hidden essential swarm operations without fs, spawn or spawnSync
   expect(spawn).toHaveBeenCalledTimes(0);
   expect(spawnSync).toHaveBeenCalledTimes(0);
   // registration order is not part of the contract
-  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call", "tool_result"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(EXPECTED_HANDLERS);
   expect([...pi.commands.keys()]).toEqual(["swarm"]);
   for (const tool of pi.tools) {
     expect(tool.hidden).toBe(true);
@@ -86,7 +101,7 @@ test("no action at load: the factory never calls a runtime pi action", async () 
   const pi = fakePi();
   factory(pi.api);
   expect(pi.actionCalls).toEqual([]);
-  expect([...pi.handlers.keys()].sort()).toEqual(["before_agent_start", "session_shutdown", "tool_call", "tool_result"]);
+  expect([...pi.handlers.keys()].sort()).toEqual(EXPECTED_HANDLERS);
   expect([...pi.commands.keys()]).toEqual(["swarm"]);
 });
 
@@ -225,6 +240,75 @@ test("bridge once per tool: one recorded bridge call each with the expected scri
     expect(res.content[0].text).toBe(`${script} ok`);
   }
   expect(spawn).toHaveBeenCalledTimes(0);
+});
+
+test("swarm_catalog and swarm_tool_call: registered, one bridge call, caller from the session identity only", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const repo = gitRepo();
+  const calls: BridgeRequest[] = [];
+  const registryResult = { state: "SUCCESS", normalized: "/u/{}" };
+  const pi = fakePi();
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    calls.push(req);
+    const json = req.args.includes("catalog")
+      ? { status: "ok", summary: "A05 (a05-backend): 1 tools, 0 skills", tools: [{ name: "be_route_norm", tier: "READ" }], skills: [] }
+      : { status: "ok", result: registryResult };
+    return { exitCode: 0, json, swarmDir: "" };
+  } }));
+  const catalog = pi.tool("swarm_catalog");
+  const call = pi.tool("swarm_tool_call");
+  expect(Object.keys(catalog.parameters.properties ?? {}).sort()).toEqual(["kind", "query"]);
+  expect(Object.keys(call.parameters.properties ?? {}).sort()).toEqual(["input", "name"]);
+  expect(call.parameters.required).toEqual(["name", "input"]);
+  for (const tool of [catalog, call]) expect(tool.parameters.additionalProperties).toBe(false);
+
+  const ctx = agentCtx(repo, "a05-backend");
+  const listed = await callTool(catalog, { kind: "tools", query: "route" }, ctx);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].script).toBe("swarm_tool");
+  expect(calls[0].args).toEqual([`--root=${repo}`, "catalog", "--caller=a05-backend", "--kind=tools", "--query=route"]);
+  expect(listed.content[0].text).toContain("be_route_norm");
+
+  calls.length = 0;
+  // a forged caller (or any other extra key) from the model never reaches argv
+  const forged = { name: "be_route_norm", input: { path: "/u/:id/" }, caller: "a01-orchestrator", root: "/etc" };
+  const result = await callTool(call, forged, ctx);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].script).toBe("swarm_tool");
+  expect(calls[0].args).toEqual([
+    `--root=${repo}`, "call", "--caller=a05-backend", "--name=be_route_norm", `--input=${JSON.stringify({ path: "/u/:id/" })}`,
+  ]);
+  expect(result.details).toEqual(registryResult);
+  expect(JSON.parse(result.content[0].text)).toEqual(registryResult);
+
+  calls.length = 0;
+  // no agent identity: nobody to authorize, nothing runs
+  await expect(callTool(call, { name: "be_route_norm", input: {} }, fakeCtx(repo))).rejects.toMatchObject({ code: "E-POLICY" });
+  await expect(callTool(catalog, {}, fakeCtx(repo))).rejects.toMatchObject({ code: "E-POLICY" });
+  // malformed name, non-object input and oversized input are refused before the bridge
+  await expect(callTool(call, { name: "--evil", input: {} }, ctx)).rejects.toMatchObject({ code: "E-INPUT" });
+  await expect(callTool(call, { name: "be_route_norm", input: [] }, ctx)).rejects.toMatchObject({ code: "E-INPUT" });
+  await expect(callTool(call, { name: "be_route_norm", input: { blob: "x".repeat(100_001) } }, ctx))
+    .rejects.toMatchObject({ code: "E-INPUT" });
+  expect(calls).toEqual([]);
+});
+
+test("swarm_tool_call passes --plan-mode only in plan mode; both tools stay usable there", async () => {
+  const { createSwarmExtension } = await loadEntry();
+  const repo = gitRepo();
+  const calls: BridgeRequest[] = [];
+  const pi = fakePi();
+  pi.load(createSwarmExtension({ bridge: async (req) => {
+    calls.push(req);
+    return { exitCode: 0, json: { status: "ok", result: { state: "SUCCESS" }, tools: [], skills: [], summary: "s" }, swarmDir: "" };
+  } }));
+  const plan = agentCtx(repo, "a05-backend", [{ type: "mode_change", mode: "plan" }]);
+  await callTool(pi.tool("swarm_catalog"), {}, plan);
+  await callTool(pi.tool("swarm_tool_call"), { name: "be_route_norm", input: {} }, plan);
+  expect(calls[0].args).not.toContain("--plan-mode");
+  expect(calls[1].args).toContain("--plan-mode");
+  await callTool(pi.tool("swarm_tool_call"), { name: "be_route_norm", input: {} }, agentCtx(repo, "a05-backend"));
+  expect(calls[2].args).not.toContain("--plan-mode");
 });
 
 test("registered assignment transport returns the canonical prompt and envelope only for A01", async () => {

@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { swarmDir } from "./paths.ts";
 
-export type Script = "orch_plan" | "orch_status" | "orch_assign" | "qa_gate" | "rev_gate" | "sec_gate" | "rel_plan";
+export type Script = "orch_plan" | "orch_status" | "orch_assign" | "qa_gate" | "rev_gate" | "sec_gate" | "rel_plan" | "swarm_tool";
 export type ErrorCode = "E-INPUT" | "E-TIMEOUT" | "E-DEP" | "E-CAPACITY" | "E-CONTRACT" | "E-POLICY" | "E-INTERNAL";
 
 const ERROR_CODES: Record<ErrorCode, true> = {

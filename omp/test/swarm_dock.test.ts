@@ -1,162 +1,134 @@
 import { describe, expect, test } from "bun:test";
-import { createSwarmExtension } from "../src/index.ts";
-import type { SwarmDockComponent, SwarmDockTheme } from "../src/swarm_dock.ts";
-import { clearToolActivity, createDockState, noteToolActivity, publishTaskSpawn, renderSwarmDock, settleTaskResult, swarmDockWidget } from "../src/swarm_dock.ts";
-import { fakeCtx, fakePi } from "./helpers.ts";
+import { band, clipToWidth, displayWidth, stripAnsi, type BarTheme } from "../src/swarm_dock.ts";
 
-function cardUi() {
-  const factories: Array<(tui: unknown, theme: SwarmDockTheme) => SwarmDockComponent> = [];
-  const ui = {
-    setWidget(_key: string, content: ((tui: unknown, theme: SwarmDockTheme) => SwarmDockComponent) | undefined) {
-      if (content) factories.push(content);
-    },
-  };
-  return {
-    ui,
-    paint(index = factories.length - 1): string {
-      const factory = factories[index];
-      if (!factory) return "";
-      return factory(undefined, undefined).render(80).join("\n");
-    },
-    paints: () => factories.length,
-  };
-}
+/** The host measures with `Bun.stringWidth(text, { ambiguousIsNarrow: true })` (pi-tui utils.ts visibleWidth). */
+const HOST = { countAnsiEscapeCodes: false, ambiguousIsNarrow: true } as const;
+const hostWidth = (text: string): number => Bun.stringWidth(text, HOST);
 
-/** Agent mentions on the status bar. One line can carry several agents. */
-function agentMentions(painted: string): number {
-  return painted.split("a05-backend").length - 1;
-}
-
-const SPAWN = { tasks: [{ name: "be", agent: "a05-backend" }] };
-
-describe("swarm dock launch lifecycle", () => {
-  test("an accepted task spawn does not stay on launching", () => {
-    const dock = createDockState();
-    const card = cardUi();
-    publishTaskSpawn(dock, card.ui, SPAWN, "call-1");
-    const first = card.paint(0);
-    expect(first).toContain("a05-backend");
-    expect(first).toContain("running");
-    expect(first).not.toContain("launching");
-
-    const retained = card.paint(0);
-    settleTaskResult(dock, card.ui, { toolName: "task", toolCallId: "call-1", isError: false });
-    // The host may keep the first component and only call render() again.
-    expect(retained).toContain("running");
-    expect(card.paint(0)).toContain("completed");
-    expect(card.paint(0)).not.toContain("running");
-    expect(card.paint()).toContain("completed");
+describe("display width", () => {
+  test("matches the host's width for every code point of the scripts the bar can show", () => {
+    const ranges: Array<[number, number]> = [
+      [0x20, 0x7e], [0xa0, 0x24f], [0x370, 0x52f], [0x2190, 0x21ff], [0x2500, 0x25ff], [0x2600, 0x27bf],
+      [0x2e80, 0x2e99], [0x3000, 0x30ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff], [0xac00, 0xd7a3], [0xff00, 0xffef],
+      [0x1f300, 0x1f64f], [0x1f680, 0x1f6ff], [0x1f900, 0x1f9ff], [0x20000, 0x2001f],
+    ];
+    const mismatches: string[] = [];
+    for (const [lo, hi] of ranges) {
+      for (let cp = lo; cp <= hi; cp++) {
+        const ch = String.fromCodePoint(cp);
+        if (/^\p{Cn}$/u.test(ch)) continue; // unassigned: no script defines a width
+        if (displayWidth(ch) !== hostWidth(ch)) mismatches.push(`U+${cp.toString(16)}`);
+      }
+    }
+    expect(mismatches).toEqual([]);
   });
 
-  test("a failed task result marks the row failed", () => {
-    const dock = createDockState();
-    const card = cardUi();
-    publishTaskSpawn(dock, card.ui, SPAWN, "call-2");
-    settleTaskResult(dock, card.ui, { toolName: "task", toolCallId: "call-2", isError: true });
-    expect(card.paint()).toContain("failed");
-    expect(card.paint()).not.toContain("launching");
+  test("clusters measure as the host measures them: combining marks, ZWJ, skin tones, flags, keycaps, VS16", () => {
+    for (const sample of ["e\u0301", "👨‍👩‍👧", "👍🏽", "🇯🇵", "🇯", "1\ufe0f\u20e3", "⏱\ufe0f", "⏱", "A\ufe0f", "❤️", "✔️", "한", "ᄀ\u1161\u11a8", "日本語", "ｱｲｳ", "Ａ", "a👍b", "✓ ✕ ⊘ ⇄ ○ ◌ ● ⏱"]) {
+      expect({ sample, width: displayWidth(sample) }).toEqual({ sample, width: hostWidth(sample) });
+    }
   });
 
-  test("the extension settles the dock when the task tool returns", () => {
-    const pi = fakePi({ activeTools: ["task"] });
-    pi.load(createSwarmExtension({ bridge: async () => { throw new Error("bridge must not run"); } }));
-    const card = cardUi();
-    const ctx = { ...fakeCtx("/tmp/swarm-dock"), ui: card.ui };
-    pi.handler("tool_call")(
-      { toolName: "task", toolCallId: "call-3", input: SPAWN },
-      ctx,
-    );
-    expect(card.paint()).toContain("running");
-    expect(card.paint()).not.toContain("launching");
-    pi.handler("tool_result")(
-      { toolName: "task", toolCallId: "call-3", isError: false },
-      ctx,
-    );
-    expect(card.paint(0)).toContain("completed");
+  test("Indic conjuncts, Thai and Lao sara am and jamo clusters add up as the host adds them (they used to measure too narrow)", () => {
+    // host width of a cluster is the sum of its code points: क्ष is 2, กำ is 2, ᄀ각 is 4, not the widest member
+    const samples = ["क्ष", "क्षि", "ক্ষ", "க்ஷ", "ക്ഷ", "ಕ್ಷ", "กำ", "ก้ำ", "ຄຳ", "ᄀ각", "ᄀᄀ각", "ᄀ\u1161\u11a8각", "ꥠ각", "ဍ္ဍ", "ក្ក"];
+    for (const sample of samples) expect({ sample, width: displayWidth(sample) }).toEqual({ sample, width: hostWidth(sample) });
+    expect(displayWidth("क्ष")).toBe(2);
+    expect(displayWidth("กำ")).toBe(2);
+    expect(displayWidth("ᄀ각")).toBe(4);
+  });
+
+  test("every code point and every adjacent pair of the Indic, Thai, Lao, Myanmar, Khmer and jamo blocks measures as the host does", () => {
+    const ranges: Array<[number, number]> = [[0x900, 0xdff], [0xe00, 0xeff], [0x1000, 0x109f], [0x1100, 0x11ff], [0x1780, 0x17ff], [0xa960, 0xa97f], [0xd7b0, 0xd7ff]];
+    const mismatches: string[] = [];
+    for (const [lo, hi] of ranges) {
+      const chars: string[] = [];
+      for (let cp = lo; cp <= hi; cp++) {
+        const ch = String.fromCodePoint(cp);
+        if (!/^\p{Cn}$/u.test(ch)) chars.push(ch);
+      }
+      for (const [i, ch] of chars.entries()) {
+        const pair = ch + chars[(i * 7 + 3) % chars.length];
+        for (const text of [ch, pair, `a${pair}b`]) if (displayWidth(text) !== hostWidth(text)) mismatches.push(`U+${[...text].map((c) => c.codePointAt(0)?.toString(16)).join("+")}`);
+      }
+    }
+    expect(mismatches).toEqual([]);
+  });
+
+  test("ANSI sequences cost nothing and are stripped", () => {
+    const colored = "\x1b[38;5;196mred\x1b[39m \x1b]8;;http://x\x07link\x1b]8;;\x07";
+    expect(stripAnsi(colored)).toBe("red link");
+    expect(displayWidth(colored)).toBe(8);
   });
 });
 
-describe("swarm dock card identity", () => {
-  test("two tasks in one session keep distinct cards", () => {
-    const dock = createDockState();
-    const card = cardUi();
-    // Two overlapping calls reuse the same task name; settling one must not touch the other's card.
-    publishTaskSpawn(dock, card.ui, SPAWN, "call-a");
-    publishTaskSpawn(dock, card.ui, SPAWN, "call-b");
-    expect(agentMentions(card.paint())).toBe(2);
-    settleTaskResult(dock, card.ui, { toolName: "task", toolCallId: "call-a", isError: true });
-    const painted = card.paint();
-    expect(agentMentions(painted)).toBe(2);
-    expect(painted).toContain("failed");
-    expect(painted).toContain("running");
-    expect(painted).toContain("1 running");
-    expect(painted).not.toContain("╭");
+describe("clipToWidth", () => {
+  test("never exceeds the width, whatever the characters", () => {
+    for (const text of ["abcdefghij", "日本語のテキスト", "👨‍👩‍👧👍🏽🇯🇵 emoji", "e\u0301e\u0301e\u0301e\u0301", "𠀀𠀁𠀂𠀃"]) {
+      for (let width = 0; width <= displayWidth(text) + 2; width++) {
+        const out = clipToWidth(text, width);
+        expect({ text, width, fits: displayWidth(out) <= width }).toEqual({ text, width, fits: true });
+      }
+    }
   });
 
-  test("two sessions keep separate card sets", () => {
-    const first = createDockState();
-    const second = createDockState();
-    const firstCard = cardUi();
-    const secondCard = cardUi();
-    publishTaskSpawn(first, firstCard.ui, SPAWN, "call-1");
-    // The other session reuses the same tool call id; its settle must not reach the first session's card.
-    publishTaskSpawn(second, secondCard.ui, SPAWN, "call-1");
-    settleTaskResult(second, secondCard.ui, { toolName: "task", toolCallId: "call-1", isError: false });
-    expect(secondCard.paint()).toContain("completed");
-    expect(firstCard.paint()).toContain("running");
-    expect(firstCard.paint()).not.toContain("completed");
+  test("a wide character is never split: it either fits whole or the clip stops before it", () => {
+    expect(clipToWidth("日本語", 5)).toBe("日本…");
+    expect(clipToWidth("日本語", 4)).toBe("日…");
+    expect(clipToWidth("日本語", 6)).toBe("日本語");
+  });
+
+  test("a surrogate pair is never cut in half", () => {
+    const out = clipToWidth("a𠀀𠀁b", 4);
+    expect(out).toBe("a𠀀…");
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(out)).toBe(false);
+  });
+
+  test("width 1 is the ellipsis, width 0 is empty, short text is unchanged", () => {
+    expect(clipToWidth("abc", 1)).toBe("…");
+    expect(clipToWidth("abc", 0)).toBe("");
+    expect(clipToWidth("abc", 3)).toBe("abc");
+  });
+
+  test("an escape sequence in the input is stripped, so a cut cannot land inside one", () => {
+    const out = clipToWidth("\x1b[38;5;196mred text here\x1b[39m", 6);
+    expect(out).toBe("red t…");
+    expect(out.includes("\x1b")).toBe(false);
+  });
+
+  test("the host's own width never exceeds the clip for conjuncts, sara am and jamo clusters (rows used to overflow and lose '+N more')", () => {
+    for (const unit of ["क्ष", "กำ", "ຄຳ", "ᄀ각", "ক্ষ"]) {
+      const text = unit.repeat(40);
+      for (const width of [1, 2, 3, 7, 30, 59, 60, 200]) {
+        const out = clipToWidth(text, width);
+        expect({ unit, width, host: hostWidth(out) <= width }).toEqual({ unit, width, host: true });
+      }
+    }
+    expect(hostWidth(clipToWidth("क्ष".repeat(40), 30))).toBeLessThanOrEqual(30);
   });
 });
 
-describe("swarm status bar", () => {
-  test("an in-flight tool is painted before it completes", () => {
-    const pi = fakePi({ activeTools: ["bash"] });
-    pi.load(createSwarmExtension({ bridge: async () => { throw new Error("bridge must not run"); } }));
-    const card = cardUi();
-    const ctx = { ...fakeCtx("/tmp/swarm-dock"), ui: card.ui };
-    pi.handler("tool_call")({ toolName: "bash", toolCallId: "call-bash", input: { command: "pytest" } }, ctx);
-    const live = card.paint();
-    expect(live).toContain("bash");
-    expect(live).toContain("agent swarm");
-    expect(live.split("\n")).toHaveLength(1);
-    pi.handler("tool_result")({ toolName: "bash", toolCallId: "call-bash", isError: false }, ctx);
-    expect(card.paint()).not.toContain("bash");
+describe("band", () => {
+  const powerline: BarTheme = {
+    getBgAnsi: () => "\x1b[48;5;236m",
+    getFgAnsi: (color: string) => (color === "text" ? "\x1b[38;5;252m" : "\x1b[38;5;240m"),
+    sep: { powerlineThinLeft: "\ue0b3", powerlineCapLeft: "\ue0b6", powerlineLeft: "\ue0b0" },
+  };
+
+  test("joins parts with the thin powerline separator when the theme supplies every piece", () => {
+    const line = band(powerline, ["one", "two"]);
+    expect(stripAnsi(line)).toBe("\ue0b6 one \ue0b3 two \ue0b0");
+    expect(displayWidth(line)).toBe(displayWidth("\ue0b6 one \ue0b3 two \ue0b0"));
   });
 
-  test("a host that keeps the first component is asked to repaint while work is live", () => {
-    const dock = createDockState();
-    let renders = 0;
-    const tui = { requestRender: () => { renders += 1; } };
-    swarmDockWidget(dock)(tui, undefined);
-    noteToolActivity(dock, undefined, "bash");
-    expect(renders).toBeGreaterThan(0);
-    dock.ticker?.stop();
-  });
-
-  test("a narrow pane clips plain text and does not cut a color sequence", () => {
-    const theme: SwarmDockTheme = {
-      fg: (_color, text) => `\x1b[31m${text}\x1b[0m`,
-      bold: (text) => `\x1b[1m${text}\x1b[0m`,
+  test("falls back to a plain separator for a missing, partial or throwing theme", () => {
+    expect(band(undefined, ["one", "two"])).toBe("one │ two");
+    expect(band({ getBgAnsi: () => "\x1b[48;5;236m" }, ["one", "two"])).toBe("one │ two");
+    const throwing: BarTheme = {
+      getBgAnsi: () => {
+        throw new Error("no such color");
+      },
     };
-    const line = renderSwarmDock(
-      { title: "Agent Swarm", rows: [{ id: "1", agent: "a05-backend", status: "running" }], startedAt: 1 },
-      4,
-      theme,
-    )[0] ?? "";
-    expect(line).not.toContain("\x1b");
-    expect(line.length).toBeLessThanOrEqual(4);
-  });
-
-  test("a finished task wave does not lend its clock to the next wave", () => {
-    const dock = createDockState();
-    dock.startedAt = 1;
-    publishTaskSpawn(dock, undefined, SPAWN, "call-1");
-    expect(dock.startedAt).toBe(1);
-    settleTaskResult(dock, undefined, { toolName: "task", toolCallId: "call-1", isError: false });
-    clearToolActivity(dock, undefined);
-    expect(dock.startedAt).toBeUndefined();
-    const before = Date.now();
-    publishTaskSpawn(dock, undefined, SPAWN, "call-2");
-    expect(dock.startedAt).toBeGreaterThanOrEqual(before);
+    expect(band(throwing, ["one"])).toBe("one");
   });
 });
