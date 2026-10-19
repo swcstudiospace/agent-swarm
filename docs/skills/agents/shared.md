@@ -2,7 +2,7 @@
 
 # Shared baseline — skills
 
-Owner: `shared`. 12 skill(s), 39072 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `shared`. 12 skill(s), 39157 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 
@@ -11,7 +11,7 @@ Owner: `shared`. 12 skill(s), 39072 bytes of source. Overview: [catalog](../cata
 | `swarm-cooperative-cancel` | Use when a run may be cancelled or hit its deadline; poll shared_cancel_check at step boundaries, stop cleanly, hand over what is done and report state. | `shared_cancel_check`, `shared_artifact_digest`, `shared_handover_write`, `shared_status_report`, `shared_escalate` |
 | `swarm-dod-evidence` | Use when you must prove acceptance criteria are met; attach evidence to each criterion, run the deterministic check and report unknown as unmet. | `shared_handover_bundle`, `shared_dod_check`, `shared_artifact_digest`, `shared_artifact_check`, `shared_open_findings` |
 | `swarm-escalation-takeover` | Use when a task was escalated to you after retries or rework failed; read what was tried, decide re-plan, human review or cancel, and record it. | `shared_escalation_owner`, `shared_attempt_history`, `shared_handover_bundle`, `shared_open_findings`, `shared_lease_state`, `shared_open_questions`, `shared_handover_write` |
-| `swarm-handover-emit` | Use when your work ends or pauses and another agent continues it; write a validated HandoverV1 with digests and cite its id in the task result. | `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write`, `shared_dod_check`, `shared_open_questions`, `shared_handover_read` |
+| `swarm-handover-emit` | Use when your work ends or pauses and another agent continues it; write a validated HandoverV1 with digests and cite its id in the task result. | `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write`, `shared_dod_check`, `shared_open_questions`, `shared_handover_read`, `shared_handover_bundle` |
 | `swarm-handover-intake` | Use when a task starts from upstream work or a handover; verify it first, stop with BLOCKED on any doubt, then read the bundle and record a receipt. | `shared_handover_verify`, `shared_handover_bundle`, `shared_handover_read`, `shared_artifact_check`, `shared_open_findings`, `shared_lease_state`, `shared_handover_receipt`, `shared_escalate`, `shared_log_emit` |
 | `swarm-lease-discipline` | Use when you edit files or artifacts a task owns; check the lease mirror before long writes, stop when it is lost, and never touch lease ids or force. | `shared_lease_state`, `shared_escalate`, `shared_log_emit`, `shared_cancel_check` |
 | `swarm-open-questions` | Use when requirements, inputs or upstream answers are unclear; list open questions, resolve what the record answers, escalate the rest instead of guessing. | `shared_open_questions`, `shared_handover_bundle`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_escalate` |

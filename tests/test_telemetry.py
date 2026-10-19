@@ -504,6 +504,26 @@ def test_derive_scopes_to_latest_correlation(env):
     assert [r["task_id"] for r in env.tel.derive_snapshot(env.root, correlation_id="c-new")["runs"]] == ["T-new"]
 
 
+@pytest.mark.parametrize("task_id", ["sk-onboarding-flow-v2", "github_pat_" + "ABCDEFGHIJKLMNOPQRSTUV", "T-plain-0001"])
+def test_derive_keeps_activity_handover_and_timeout_for_token_shaped_task_ids(env, task_id):
+    """RV-J P2-1: events.jsonl is redacted, but run ids are join keys: a task id shaped like a token must not lose its state."""
+    store = _store(env)
+    _task(store, task_id, ["VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS", "FAILED"])
+    t, _ = env.new(correlation_id="c1")
+    run_id = f"{task_id}.a1"
+    t.run_queued(run_id, "a05-backend", task_id=task_id)
+    t.run_started(run_id, sid="s1", runtime="omp")
+    t.activity(run_id, tool="bash", text="compiling module")
+    t.handover(run_id, to_agent="a09-reviewer", handover_id=f"H-{task_id}", digest=None, nbytes=10)
+    env.runlog.emit("swarm.run.finished", {"run_id": run_id, "state": "timed_out", "outcome": "timed_out"},
+                    source="telemetry", correlation_id="c1", task_id=task_id, root=env.root, tee=False)
+    row = env.tel.derive_snapshot(env.root)["runs"][0]
+    assert (row["run_id"], row["state"]) == (run_id, "timed_out")
+    assert (row["activity"], row["last_tool"], row["tool_calls"]) == ("compiling module", "bash", 1)
+    assert row["handover_out"] == f"H-{task_id}"[:64]
+    assert {e["payload"]["run_id"] for e in env.events("swarm.run.activity")} == {run_id}
+
+
 def test_refresh_live_writes_valid_json_with_increasing_seq(env):
     store = _store(env)
     _task(store, "T-run", ["VALIDATED", "PLANNED", "CLAIMED", "IN_PROGRESS"])  # every transition already refreshed

@@ -1,20 +1,28 @@
 # The swarm bar
 
-The swarm bar is the third widget above the omp editor (key `agent-swarm`). It shows, live, what every subagent of a swarm run is doing and for how long. It is display-only: it never changes a tool decision, never writes a file and never calls a model. It sits in the stack after the other two bars (Ultrathink's) and is drawn only while there is something to show.
+The swarm bar is the topmost of the bars above the omp editor (widget key `agent-swarm`). It shows, live, what every subagent of a swarm run is doing and for how long, and the measured token savings of the session. It is display-only: it never changes a tool decision, never writes a file and never calls a model. It is always there: from the first event of an interactive session until the session ends it is exactly two rows, always the full width of the terminal, and when there is nothing to show it says so (state `idle`) instead of going away. Stack, top to bottom: the swarm bar, Ultrathink's bar, omp's own bar.
 
-- Source: `omp/src/swarm_bar.ts` (state reducer, renderer, controller) with the text helpers of `omp/src/swarm_dock.ts`.
+- Source: `omp/src/swarm_bar.ts` (state reducer, renderer, controller), the row composer of `omp/src/swarm_dock.ts` (`composeBar`), the token chips of `omp/src/token_savings.ts` and the stack protocol of `omp/src/bar_stack.ts`.
 - Contract: `.planning/research/v2.2-DESIGN.md` section 6 and section 7.
-- Every capture below was produced by the real renderer (`renderSwarmBar`) with the real omp theme `dark-lavender` (truecolor, Nerd Font symbols). `omp/test/render_states.test.ts` fails when a capture here differs from what the renderer produces today, so this page cannot drift from the code. The colour-preserved originals are in `omp/test/fixtures/bar_states.ansi` (`cat` it in a truecolor terminal).
+- Every capture below was produced by the real renderer (`renderSwarmBar`) with the real omp theme `dark-lavender` (truecolor, Nerd Font symbols), at the width its name says: every row is exactly that many columns wide. `omp/test/render_states.test.ts` fails when a capture here differs from what the renderer produces today, so this page cannot drift from the code. The colour-preserved originals are in `omp/test/fixtures/bar_states.ansi` (`cat` it in a truecolor terminal).
 - The powerline glyphs of the Nerd Font preset (U+E0B6, U+E0B0, U+E0B1) are shown as `◖`, `◗` and `│` so the captures read in any font. Widths are identical (one column each).
 
 ## 1. Reading the bar
 
-The bar is at most two rows.
+The bar is exactly two rows, in every state, and each row is exactly as wide as the terminal: omp hands a widget the full terminal width, and the bar fills it with its own background, so its left and right caps sit in the same columns whatever the swarm is doing.
 
 ```
-◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail │ slots 3/4 ◗      row 1: the summary
-◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ○ queued a08-qa   0s ◗  row 2: the agents
+row 1  ◖ ● swarm 5m00s │ 3 run │ 1 queued │ slots 3/4        …gap…        cache 87% │ saved 48.2k ◗   summary left, token chips right
+row 2  ◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ○ queued a08-qa   0s            …gap…       ◗   the agents
 ```
+
+### Its place in the stack
+
+From the top: the swarm bar (2 rows), Ultrathink's bar (1 row), omp's own bar. omp stacks `aboveEditor` widgets in insertion order and re-setting a widget key moves that widget to the bottom, so a bar that remounts would drop below the bars that were meant to be under it. The bars keep their order with the `bars:restack` protocol on omp's event bus (`pi.events`, whose handlers run synchronously inside `emit`):
+
+- Every time a bar (re)sets its widget (first mount, the remount one tick after events that move other bars, a restack-triggered remount) it emits `bars:restack` with `{ v: 1, after: <its rank> }`. Ranks: swarm bar 10, Ultrathink bar 20.
+- A mounted bar whose rank is greater than `after` re-sets its own widget, which puts it below the announcer, and announces itself in turn. Payloads with another version, a bad shape or `after` greater than or equal to the bar's own rank are ignored. Ranks only increase along the chain, so it ends after at most one step per bar.
+- It does not matter which extension loads first, and it works when one of them is absent: with no Ultrathink bar the swarm bar's announcement has no listener and the swarm bar sits alone above omp's own bar; with no swarm bar Ultrathink's bar is unchanged. Third-party widgets that set themselves after these bars end up below them until the next remount.
 
 ### Row 1: the summary
 
@@ -35,7 +43,90 @@ The bar is at most two rows.
 | `slots R/L` | Running over the slot limit (`effective_parallel`, else `max_parallel`, from `live.json`). Shown only when `live.json` supplies a limit. |
 | `telemetry unavailable` | The live source is unreadable, malformed or stale (see section 2, state `error`). |
 
-When the row does not fit, segments are dropped from the right (the mark, `swarm` and elapsed always stay), and as a last resort the row is clipped with `…`. Compare the three widths of any capture below.
+When the row does not fit, segments are dropped by priority, never by position: the segment with the largest priority number goes first (on a tie the later one on screen), the others keep their order and place. Row 1 priorities: mark, `swarm` and elapsed 0 (the last to go), `N run` 1, `N fail`, `N timeout`, `N stall` and `telemetry unavailable` 2, `N queued` 3, `N wait` and `N done` 4, `N cancel` 5, `slots R/L` 6; the token chips (below) are in the same pool with priorities 0 to 11. Row 2: the agent rows in display order (the first is the last to go), `+N more` first. A lone segment still too wide is clipped with `…`. Between the left and the right group there are at least two columns. Under 12 columns, or when the theme lacks a powerline piece or throws, the row is plain: segments joined by ` │ `, no caps, still exactly as wide as the terminal; a theme with a transparent bar background draws no caps. Compare the widths of any capture below.
+
+### Row 1, right: token savings
+
+The right-hand end of row 1 shows the measured token savings of this session, as chips. The producer is the `omp-token-opt` plugin of claude-ultrathink: it emits `token-opt:savings` (a v1 snapshot) on omp's event bus and writes the same document to `$HOME/.omp/agent/token-opt/live.json` (`HOME` first, else the user's home directory). The swarm bar subscribes at the first event of an interactive session and restores the last snapshot from that `live.json` once (at most 1 MiB; a missing, unreadable or malformed file restores nothing). A snapshot has to pass the v1 checks (`v` is 1, a session id of 1 to 128 characters without `/`, count fields are non-negative safe integers, `savedTokens` equals `baselineTokens - currentTokens`, at most 200 `points`, each with `saved = baseline - current`, optional measurements absent or integers in range, `cacheHitPct` at most 100, flags 0 or 1); any invalid optional field rejects the whole snapshot.
+
+- **Session filtering.** The bar reads its own session id on every event, and the id is read before the `live.json` restore. Once it is known a snapshot of another session is ignored: the bar keeps showing this session's last snapshot, so another session's snapshots neither replace it nor blank the chips. A restored `live.json` of another session is not adopted. When the id changes (a switched or resumed session) the stored snapshot of the old session is dropped. Before the id is known any valid snapshot is shown.
+- **No snapshot, no chips.** Nothing is invented: without a snapshot row 1 has no right-hand side, and an optional chip appears only when its measurement exists. `before <n> · now <n>` and `saved <n>` are the only chips every snapshot carries.
+- **Fresh snapshots.** A new valid snapshot is drawn at once, or by one trailing render when the last render was less than 250 ms ago.
+- Provider cache tokens and billed totals are never folded into `saved`; the provider's hit rate is `cache`.
+
+Chips, left to right on screen (least important at the left, `saved` always right-most); counts print as `999`, `1.2k`, `1.2M`:
+
+| Chip | Shown when the snapshot has | Drop priority |
+|------|-----------------------------|---------------|
+| `graph ready` (dim) | `graphReady` 1 | 11 |
+| `bill <n> · out <n>` (dim) | `providerInput` and/or `providerOutput` (each half only when present) | 10 |
+| `idle <n>ms` | `lastIdleMs` | 9 |
+| `payload <n>c` | `lastPayloadChars` | 8 |
+| `query <n>ms` | `lastQueryMs` | 7 |
+| `rtk +<n>` | `rtkSavedTokens` | 6 |
+| `cost <n>c` | `costCents` | 5 |
+| `turn <n>ms` | `lastTurnMs` | 4 |
+| `before <n> · now <n>` (dim) | always (`baselineTokens`, `currentTokens`) | 3 |
+| `prefix moved` / `tools moved` (warning, one chip each) | `prefixChanged` 1 / `toolsChanged` 1 | 2 |
+| `ttft <n>ms` | `ttftMs` | 2 |
+| `cache <n>%` | `cacheHitPct` | 1 |
+| `saved <n>` (green when above 0, else dim) | always (`savedTokens`) | 0 |
+
+The chips compete with the summary segments for the same columns: a narrow row loses `graph ready`, the bill, `idle`, `payload` and the other low-priority chips first, and `saved` is the last chip to go; the chips with priority 0 to 2 even outlast `N queued`, `N done` and `slots R/L` (see the 80-column capture, where only `N run` and `N fail` remain next to them). Captures of session `demo-session` with a full snapshot (every optional measurement present): one active swarm at 80 and 120 columns, then an idle swarm, which keeps the chips because the session's savings do not depend on the swarm, at 120 and at 200 columns, where the whole list fits.
+
+Active, width 80:
+
+<!-- capture:tokens-active@80 -->
+```text
+◖ ● swarm 5m00s │ 3 run │ 0 fail          ttft 640ms │ cache 87% │ saved 48.2k ◗
+◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ +1 more   ◗
+```
+<!-- /capture -->
+
+Active, width 120:
+
+<!-- capture:tokens-active@120 -->
+```text
+◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail   before 61.4k · now 13.2k │ ttft 640ms │ cache 87% │ saved 48.2k ◗
+◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ ○ queued a08-qa     0s                            ◗
+```
+<!-- /capture -->
+
+Idle, width 120:
+
+<!-- capture:tokens-idle@120 -->
+```text
+◖ ○ swarm idle    rtk +4.1k │ cost 12c │ turn 3200ms │ before 61.4k · now 13.2k │ ttft 640ms │ cache 87% │ saved 48.2k ◗
+◖ no subagents running                                                                                                 ◗
+```
+<!-- /capture -->
+
+Idle, width 200:
+
+<!-- capture:tokens-idle@200 -->
+```text
+◖ ○ swarm idle  graph ready │ bill 9.4k · out 2.1k │ idle 1200ms │ payload 156523c │ query 85ms │ rtk +4.1k │ cost 12c │ turn 3200ms │ before 61.4k · now 13.2k │ ttft 640ms │ cache 87% │ saved 48.2k ◗
+◖ no subagents running                                                                                                                                                                                 ◗
+```
+<!-- /capture -->
+
+A snapshot with only the required counts shows only those chips, no zeros for what was never measured:
+
+<!-- capture:tokens-minimal@80 -->
+```text
+◖ ○ swarm idle                          before 61.4k · now 13.2k │ saved 48.2k ◗
+◖ no subagents running                                                         ◗
+```
+<!-- /capture -->
+
+A snapshot of another session (here `another-session`, while this one is `demo-session`) is not shown:
+
+<!-- capture:tokens-foreign@80 -->
+```text
+◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail │ slots 3/4               ◗
+◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ +1 more   ◗
+```
+<!-- /capture -->
 
 ### Row 2: the agents
 
@@ -59,6 +150,7 @@ State is never colour alone: every state has a distinct glyph, and every state t
 - `agent` is clipped to 18 columns, `elapsed` is right-aligned in 6 columns.
 - `~` after the elapsed (`1m07s~`) marks a **detached** specialist: A01 started it as a background job and its `task` call has returned, so no frame and no `live.json` row vouches for it any more. It is still running (the glyph, the state and the ticking elapsed are those of a running row); the `~` says "last known running, not confirmed". It goes when a `live.json` row for the same task lists the specialist, and the row ends by one of the three rules in section 9.
 - `activity` is the current tool or intent (`edit swarm/handover.py`), the error of a failed run, `retry 2/3` while the model retries, or `blocked: …` when retries ran out. It is redacted by a port of `swarm/redact.py` (tokens, keys, `Authorization:` and `Cookie:` headers, URL credentials, `NAME=value` and `--password hunter2` style flags, quoted `"password": "x"` / `'password': 'x'` fields and PEM blocks become `[REDACTED]`; both implementations run the shared vectors in `tests/fixtures/redact_cases.json`). A benign assignment or flag never hides a later one (`user=alice,password=x`, `--mode a;--password x`: the scan steps past the benign separator and keeps looking), while a credential name masks its whole value, commas included (`SECRET=a,b,c`), and a credential name swallowed inside that value keeps its own value masked too (`password=a,token: b`); `tests/fixtures/redact_generated.json` pins 6000 seeded option lists for both implementations. A name is a credential by its tokens (split on `_ - .` and camelCase): `token`, `secret`, `password`, `credential`, ..., and `key` or `seed` after `api`, `access`, `secret`, `private`, `signing`, `ssh`, `encryption`, `master`, `auth`, `session`, `license`, `client`, `ed25519`, `hmac`, `jwt`, `handoff` or `signer` (so `SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY` and `SUBSTRATE_HANDOFF_KEY` are masked, while `KEYBOARD`, `--key-length`, `sort_key`, `random_seed` and `SWARM_ED25519_PUBLIC_KEY` are not); a name ending in `file` or `path` (`SWARM_ED25519_KEY_FILE`) is a location and stays visible. An unquoted value runs to whitespace, `&` or `;`, so a comma-joined credential list is masked whole. The text is then stripped of control and ANSI characters and clipped. Its budget is 40 columns for up to 2 rows, 24 for up to 4 and 16 beyond that; if the row would not fit it drops to 12 and then to none before a whole row is dropped.
+- Redaction is best effort, not a guarantee. Beyond the carriers above, both implementations mask vendor tokens (GitHub, Stripe, Google, SendGrid, Slack, npm, GitLab, DigitalOcean, Hugging Face, AWS key ids), `<vendor>_KEY=` values that look like credentials (`STRIPE_KEY=`, Azure `AccountKey=`), `NAME    = value` aligned with up to 32 blanks, command-line credentials (`curl -u user:pass`, `mysql -pSECRET`, `sshpass -p`, `docker login -p`, `redis-cli -a`, `sqlcmd -P`, `-passin pass:`; `docker run -u 1000:1000` and `-p 8080:80` are left alone), re-serialised JSON pairs (`{\"password\":\"x\"}`), Kubernetes `- name: DB_PASSWORD` / `value:` pairs and YAML block scalars (`password: |`). `sanitizeText` removes bidi marks, zero-width characters and controls before redacting, so a secret split by them cannot re-join after the strip. On the Python side `runlog.emit` keeps `run_id`, `handover_id`, `task_id`, `parent_id` and `correlation_id` as written (identifiers are not free text), so a task id such as `sk-onboarding-flow-v2` keeps its activity and timeout state. Not covered: JSON `{"name": "DB_PASSWORD", "value": "x"}` pairs, a quote inside a quoted value, and any secret without a recognisable name or shape.
 - Order: failed, timed out, stalled, running (starting, handoff), waiting, queued, cancelled, done; ties by longest elapsed, then by creation order. At most 12 rows compete for the line.
 - Overflow: as many rows as fit are drawn, then `+N more` counts the rest. The count is exact (`N` is rows left out, never an estimate); the `overflow` captures show it.
 
@@ -68,17 +160,18 @@ State is never colour alone: every state has a distinct glyph, and every state t
 
 ## 2. The states
 
-The bar is one of seven states (`BarState`). Each is shown below at widths 40, 80 and 120. The captures use reduced motion (`●`) so they are stable; section 4 shows the animated spinner.
+The bar is one of seven states (`BarState`). Each is shown below at widths 40, 80 and 120: always two rows, each exactly as wide as the width. The captures use reduced motion (`●`) so they are stable; section 4 shows the animated spinner. Row 1's right-hand side is empty in them because no token snapshot exists; the token captures are in section 1.
 
 ### State `idle`
 
-Nothing is live, nothing lingers and there is no telemetry error: nothing is drawn, the widget is unmounted (no spacer row above the editor) and the status text is cleared.
+Nothing is live, nothing lingers and there is no telemetry error. The bar stays mounted and says so: row 1 is the dim `○ swarm idle` (with the token chips on its right when a snapshot exists), row 2 the dim `no subagents running`. The status text is cleared.
 
 Width 40:
 
 <!-- capture:idle@40 -->
 ```text
-(nothing is drawn)
+◖ ○ swarm idle                         ◗
+◖ no subagents running                 ◗
 ```
 <!-- /capture -->
 
@@ -86,7 +179,8 @@ Width 80:
 
 <!-- capture:idle@80 -->
 ```text
-(nothing is drawn)
+◖ ○ swarm idle                                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -94,7 +188,8 @@ Width 120:
 
 <!-- capture:idle@120 -->
 ```text
-(nothing is drawn)
+◖ ○ swarm idle                                                                                                         ◗
+◖ no subagents running                                                                                                 ◗
 ```
 <!-- /capture -->
 
@@ -106,7 +201,7 @@ Width 40:
 
 <!-- capture:loading@40 -->
 ```text
-◖ ● swarm 2s │ 3 run │ 0 queued ◗
+◖ ● swarm 2s │ 3 run │ 0 fail          ◗
 ◖ ● start a05-backend     2s │ +2 more ◗
 ```
 <!-- /capture -->
@@ -115,8 +210,8 @@ Width 80:
 
 <!-- capture:loading@80 -->
 ```text
-◖ ● swarm 2s │ 3 run │ 0 queued │ 0 done │ 0 fail ◗
-◖ ● start a05-backend     2s │ ● start a06-frontend     2s │ +1 more ◗
+◖ ● swarm 2s │ 3 run │ 0 queued │ 0 done │ 0 fail                              ◗
+◖ ● start a05-backend     2s │ ● start a06-frontend     2s │ +1 more           ◗
 ```
 <!-- /capture -->
 
@@ -124,8 +219,8 @@ Width 120:
 
 <!-- capture:loading@120 -->
 ```text
-◖ ● swarm 2s │ 3 run │ 0 queued │ 0 done │ 0 fail ◗
-◖ ● start a05-backend     2s │ ● start a06-frontend     2s │ ● start a07-data     2s ◗
+◖ ● swarm 2s │ 3 run │ 0 queued │ 0 done │ 0 fail                                                                      ◗
+◖ ● start a05-backend     2s │ ● start a06-frontend     2s │ ● start a07-data     2s                                   ◗
 ```
 <!-- /capture -->
 
@@ -137,8 +232,8 @@ Width 40:
 
 <!-- capture:active@40 -->
 ```text
-◖ ● swarm 5m00s │ 3 run │ 1 queued ◗
-◖ ● a05-backend  4m12s │ +3 more ◗
+◖ ● swarm 5m00s │ 3 run │ 0 fail       ◗
+◖ ● a05-backend  4m12s │ +3 more       ◗
 ```
 <!-- /capture -->
 
@@ -146,8 +241,8 @@ Width 80:
 
 <!-- capture:active@80 -->
 ```text
-◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail │ slots 3/4 ◗
-◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ +1 more ◗
+◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail │ slots 3/4               ◗
+◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ +1 more   ◗
 ```
 <!-- /capture -->
 
@@ -155,8 +250,8 @@ Width 120:
 
 <!-- capture:active@120 -->
 ```text
-◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail │ slots 3/4 ◗
-◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ ○ queued a08-qa     0s ◗
+◖ ● swarm 5m00s │ 3 run │ 1 queued │ 0 done │ 0 fail │ slots 3/4                                                       ◗
+◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ● a07-data    14s │ ○ queued a08-qa     0s                            ◗
 ```
 <!-- /capture -->
 
@@ -168,8 +263,8 @@ Width 40:
 
 <!-- capture:every-state@40 -->
 ```text
-◖ ● swarm 10m00s │ 3 run │ 1 wait ◗
-◖ ✕ FAIL a05-backend  1m11s │ +8 more ◗
+◖ ● swarm 10m00s │ 3 run │ 1 fail      ◗
+◖ ✕ FAIL a05-backend  1m11s │ +8 more  ◗
 ```
 <!-- /capture -->
 
@@ -177,8 +272,8 @@ Width 80:
 
 <!-- capture:every-state@80 -->
 ```text
-◖ ● swarm 10m00s │ 3 run │ 1 wait │ 1 queued │ 1 done │ 1 fail │ 1 timeout ◗
-◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ +7 more ◗
+◖ ● swarm 10m00s │ 3 run │ 1 wait │ 1 queued │ 1 fail │ 1 timeout │ 1 stall    ◗
+◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ +7 more          ◗
 ```
 <!-- /capture -->
 
@@ -186,8 +281,8 @@ Width 120:
 
 <!-- capture:every-state@120 -->
 ```text
-◖ ● swarm 10m00s │ 3 run │ 1 wait │ 1 queued │ 1 done │ 1 fail │ 1 timeout │ 1 stall │ 1 cancel │ slots 3/4 ◗
-◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ ! STALL a07-data  3m10s │ ● a08-qa  1m06s │ +5 more ◗
+◖ ● swarm 10m00s │ 3 run │ 1 wait │ 1 queued │ 1 done │ 1 fail │ 1 timeout │ 1 stall │ 1 cancel │ slots 3/4            ◗
+◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ ! STALL a07-data  3m10s │ ● a08-qa  1m06s │ +5 more      ◗
 ```
 <!-- /capture -->
 
@@ -199,8 +294,8 @@ Width 40:
 
 <!-- capture:in-session@40 -->
 ```text
-◖ ● swarm 5m05s │ 3 run │ 1 wait ◗
-◖ ● a01-orchestrator  2m35s │ +4 more ◗
+◖ ● swarm 5m05s │ 3 run │ 0 fail       ◗
+◖ ● a01-orchestrator  2m35s │ +4 more  ◗
 ```
 <!-- /capture -->
 
@@ -208,7 +303,7 @@ Width 80:
 
 <!-- capture:in-session@80 -->
 ```text
-◖ ● swarm 5m05s │ 3 run │ 1 wait │ 0 queued │ 1 done │ 0 fail │ slots 3/4 ◗
+◖ ● swarm 5m05s │ 3 run │ 1 wait │ 0 queued │ 1 done │ 0 fail │ slots 3/4      ◗
 ◖ ● a01-orchestrator  2m35s task │ ● a05-backend  1m07s edit swarm/… │ +3 more ◗
 ```
 <!-- /capture -->
@@ -217,8 +312,8 @@ Width 120:
 
 <!-- capture:in-session@120 -->
 ```text
-◖ ● swarm 5m05s │ 3 run │ 1 wait │ 0 queued │ 1 done │ 0 fail │ slots 3/4 ◗
-◖ ● a01-orchestrator  2m35s │ ● a05-backend  1m07s │ ● a06-frontend    53s │ ◌ wait a08-qa    10s │ ✓ a15-docs    33s ◗
+◖ ● swarm 5m05s │ 3 run │ 1 wait │ 0 queued │ 1 done │ 0 fail │ slots 3/4                                              ◗
+◖ ● a01-orchestrator  2m35s │ ● a05-backend  1m07s │ ● a06-frontend    53s │ ◌ wait a08-qa    10s │ ✓ a15-docs    33s  ◗
 ```
 <!-- /capture -->
 
@@ -230,8 +325,8 @@ Width 40:
 
 <!-- capture:detached@40 -->
 ```text
-◖ ● swarm 2m35s │ 3 run │ 0 queued ◗
-◖ ● a01-orchestrator  2m35s │ +2 more ◗
+◖ ● swarm 2m35s │ 3 run │ 0 fail       ◗
+◖ ● a01-orchestrator  2m35s │ +2 more  ◗
 ```
 <!-- /capture -->
 
@@ -239,8 +334,8 @@ Width 80:
 
 <!-- capture:detached@80 -->
 ```text
-◖ ● swarm 2m35s │ 3 run │ 0 queued │ 0 done │ 0 fail ◗
-◖ ● a01-orchestrator  2m35s │ ● a05-backend 1m07s~ │ ● a06-frontend   53s~ ◗
+◖ ● swarm 2m35s │ 3 run │ 0 queued │ 0 done │ 0 fail                           ◗
+◖ ● a01-orchestrator  2m35s │ ● a05-backend 1m07s~ │ ● a06-frontend   53s~     ◗
 ```
 <!-- /capture -->
 
@@ -248,8 +343,8 @@ Width 120:
 
 <!-- capture:detached@120 -->
 ```text
-◖ ● swarm 2m35s │ 3 run │ 0 queued │ 0 done │ 0 fail ◗
-◖ ● a01-orchestrator  2m35s bash python… │ ● a05-backend 1m07s~ edit swarm/… │ ● a06-frontend   53s~ Reading the… ◗
+◖ ● swarm 2m35s │ 3 run │ 0 queued │ 0 done │ 0 fail                                                                   ◗
+◖ ● a01-orchestrator  2m35s bash python… │ ● a05-backend 1m07s~ edit swarm/… │ ● a06-frontend   53s~ Reading the…      ◗
 ```
 <!-- /capture -->
 
@@ -261,8 +356,8 @@ Width 40:
 
 <!-- capture:overflow@40 -->
 ```text
-◖ ● swarm 5m00s │ 6 run │ 2 queued ◗
-◖ ✕ FAIL a05-backend  1m11s │ +8 more ◗
+◖ ● swarm 5m00s │ 6 run │ 1 fail       ◗
+◖ ✕ FAIL a05-backend  1m11s │ +8 more  ◗
 ```
 <!-- /capture -->
 
@@ -270,8 +365,8 @@ Width 80:
 
 <!-- capture:overflow@80 -->
 ```text
-◖ ● swarm 5m00s │ 6 run │ 2 queued │ 0 done │ 1 fail │ slots 6/8 ◗
-◖ ✕ FAIL a05-backend  1m11s │ ● a06-frontend  5m00s │ +7 more ◗
+◖ ● swarm 5m00s │ 6 run │ 2 queued │ 0 done │ 1 fail │ slots 6/8               ◗
+◖ ✕ FAIL a05-backend  1m11s │ ● a06-frontend  5m00s │ +7 more                  ◗
 ```
 <!-- /capture -->
 
@@ -279,8 +374,8 @@ Width 120:
 
 <!-- capture:overflow@120 -->
 ```text
-◖ ● swarm 5m00s │ 6 run │ 2 queued │ 0 done │ 1 fail │ slots 6/8 ◗
-◖ ✕ FAIL a05-backend  1m11s │ ● a06-frontend  5m00s │ ● a07-data  4m20s │ ● a08-qa  3m40s │ +5 more ◗
+◖ ● swarm 5m00s │ 6 run │ 2 queued │ 0 done │ 1 fail │ slots 6/8                                                       ◗
+◖ ✕ FAIL a05-backend  1m11s │ ● a06-frontend  5m00s │ ● a07-data  4m20s │ ● a08-qa  3m40s │ +5 more                    ◗
 ```
 <!-- /capture -->
 
@@ -292,8 +387,8 @@ Width 40:
 
 <!-- capture:completed@40 -->
 ```text
-◖ ✓ swarm 3m23s │ 0 run │ 0 queued ◗
-◖ ✓ a07-data  3m23s │ +2 more ◗
+◖ ✓ swarm 3m23s │ 0 run │ 0 fail       ◗
+◖ ✓ a07-data  3m23s │ +2 more          ◗
 ```
 <!-- /capture -->
 
@@ -301,8 +396,8 @@ Width 80:
 
 <!-- capture:completed@80 -->
 ```text
-◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4 ◗
-◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s ◗
+◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4               ◗
+◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s             ◗
 ```
 <!-- /capture -->
 
@@ -310,8 +405,8 @@ Width 120:
 
 <!-- capture:completed@120 -->
 ```text
-◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4 ◗
-◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s ◗
+◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4                                                       ◗
+◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s                                                     ◗
 ```
 <!-- /capture -->
 
@@ -323,8 +418,8 @@ Width 40:
 
 <!-- capture:failed@40 -->
 ```text
-◖ ✕ swarm 10m00s │ 0 run │ 0 queued ◗
-◖ ✕ FAIL a05-backend  1m11s │ +3 more ◗
+◖ ✕ swarm 10m00s │ 0 run │ 1 fail      ◗
+◖ ✕ FAIL a05-backend  1m11s │ +3 more  ◗
 ```
 <!-- /capture -->
 
@@ -332,8 +427,8 @@ Width 80:
 
 <!-- capture:failed@80 -->
 ```text
-◖ ✕ swarm 10m00s │ 0 run │ 0 queued │ 2 done │ 1 fail │ 1 timeout │ slots 0/4 ◗
-◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ +2 more ◗
+◖ ✕ swarm 10m00s │ 0 run │ 0 queued │ 2 done │ 1 fail │ 1 timeout │ slots 0/4  ◗
+◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ +2 more          ◗
 ```
 <!-- /capture -->
 
@@ -341,20 +436,21 @@ Width 120:
 
 <!-- capture:failed@120 -->
 ```text
-◖ ✕ swarm 10m00s │ 0 run │ 0 queued │ 2 done │ 1 fail │ 1 timeout │ slots 0/4 ◗
-◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ ✓ a07-data  3m23s │ ✓ a08-qa  1m28s ◗
+◖ ✕ swarm 10m00s │ 0 run │ 0 queued │ 2 done │ 1 fail │ 1 timeout │ slots 0/4                                          ◗
+◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s │ ✓ a07-data  3m23s │ ✓ a08-qa  1m28s                      ◗
 ```
 <!-- /capture -->
 
 ### State `error`
 
-`live.json` is stale, malformed or unreadable and there are no rows to show: the bar says so instead of lying with old rows.
+`live.json` is stale, malformed or unreadable and there are no rows to show: the bar says so instead of lying with old rows. Row 1 is `swarm: telemetry unavailable` in the warning colour (with the token chips when a snapshot exists), row 2 the same placeholder as idle.
 
 Width 40:
 
 <!-- capture:error@40 -->
 ```text
-◖ swarm: telemetry unavailable ◗
+◖ swarm: telemetry unavailable         ◗
+◖ no subagents running                 ◗
 ```
 <!-- /capture -->
 
@@ -362,7 +458,8 @@ Width 80:
 
 <!-- capture:error@80 -->
 ```text
-◖ swarm: telemetry unavailable ◗
+◖ swarm: telemetry unavailable                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -370,7 +467,8 @@ Width 120:
 
 <!-- capture:error@120 -->
 ```text
-◖ swarm: telemetry unavailable ◗
+◖ swarm: telemetry unavailable                                                                                         ◗
+◖ no subagents running                                                                                                 ◗
 ```
 <!-- /capture -->
 
@@ -382,8 +480,8 @@ Width 40:
 
 <!-- capture:error-rows@40 -->
 ```text
-◖ ● swarm 5s │ 1 run │ 0 queued ◗
-◖ ● start a05-backend     5s ◗
+◖ ● swarm 5s │ 1 run │ 0 fail          ◗
+◖ ● start a05-backend     5s           ◗
 ```
 <!-- /capture -->
 
@@ -391,8 +489,8 @@ Width 80:
 
 <!-- capture:error-rows@80 -->
 ```text
-◖ ● swarm 5s │ 1 run │ 0 queued │ 0 done │ 0 fail │ telemetry unavailable ◗
-◖ ● start a05-backend     5s ◗
+◖ ● swarm 5s │ 1 run │ 0 queued │ 0 done │ 0 fail │ telemetry unavailable      ◗
+◖ ● start a05-backend     5s                                                   ◗
 ```
 <!-- /capture -->
 
@@ -400,44 +498,46 @@ Width 120:
 
 <!-- capture:error-rows@120 -->
 ```text
-◖ ● swarm 5s │ 1 run │ 0 queued │ 0 done │ 0 fail │ telemetry unavailable ◗
-◖ ● start a05-backend     5s ◗
+◖ ● swarm 5s │ 1 run │ 0 queued │ 0 done │ 0 fail │ telemetry unavailable                                              ◗
+◖ ● start a05-backend     5s                                                                                           ◗
 ```
 <!-- /capture -->
 
 
 ## 3. Settled rows linger
 
-A settled row stays visible for `SWARM_BAR_LINGER_S` (default 20 s) after it settled; failed and timed-out rows stay for `SWARM_BAR_FAIL_LINGER_S` (default 600 s) so a failure is not missed. When the last row goes, the widget is removed (no empty spacer row above the editor) and the status text is cleared. A new wave (a live run appears while nothing else is live) drops the previous wave's settled rows, failed ones included.
+A settled row stays visible for `SWARM_BAR_LINGER_S` (default 20 s) after it settled; failed and timed-out rows stay for `SWARM_BAR_FAIL_LINGER_S` (default 600 s) so a failure is not missed. When the last row goes, the bar returns to its idle rows (it is not unmounted) and the status text is cleared. A new wave (a live run appears while nothing else is live) drops the previous wave's settled rows, failed ones included.
 
-Edges of both windows, drawn at width 80. The 19 s capture still shows the done rows; at 20 s nothing is drawn. Likewise the failed rows at 599 s and 600 s.
+Edges of both windows, drawn at width 80. The 19 s capture still shows the done rows; at 20 s the bar is idle. Likewise the failed rows at 599 s and 600 s.
 
 <!-- capture:linger:done+0s@80 -->
 ```text
-◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4 ◗
-◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s ◗
+◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4               ◗
+◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s             ◗
 ```
 <!-- /capture -->
 <!-- capture:linger:done+19s@80 -->
 ```text
-◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4 ◗
-◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s ◗
+◖ ✓ swarm 3m23s │ 0 run │ 0 queued │ 3 done │ 0 fail │ slots 0/4               ◗
+◖ ✓ a07-data  3m23s │ ✓ a06-frontend  2m22s │ ✓ a05-backend  1m01s             ◗
 ```
 <!-- /capture -->
 <!-- capture:linger:done+20s@80 -->
 ```text
-(nothing is drawn)
+◖ ○ swarm idle                                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 <!-- capture:linger:failed+599s@80 -->
 ```text
-◖ ✕ swarm 10m00s │ 0 run │ 0 queued │ 0 done │ 1 fail │ 1 timeout │ slots 0/4 ◗
-◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s ◗
+◖ ✕ swarm 10m00s │ 0 run │ 0 queued │ 0 done │ 1 fail │ 1 timeout │ slots 0/4  ◗
+◖ ✕ FAIL a05-backend  1m11s │ ⏱ TIMEOUT a06-frontend 10m00s                    ◗
 ```
 <!-- /capture -->
 <!-- capture:linger:failed+600s@80 -->
 ```text
-(nothing is drawn)
+◖ ○ swarm idle                                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -453,22 +553,22 @@ Animated (default): one agent, four consecutive seconds.
 
 <!-- capture:spinner:animated+0s@80 -->
 ```text
-◖ ⠋ a05-backend  4m12s edit swarm/handover.py ◗
+◖ ⠋ a05-backend  4m12s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 <!-- capture:spinner:animated+1s@80 -->
 ```text
-◖ ⠙ a05-backend  4m13s edit swarm/handover.py ◗
+◖ ⠙ a05-backend  4m13s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 <!-- capture:spinner:animated+2s@80 -->
 ```text
-◖ ⠹ a05-backend  4m14s edit swarm/handover.py ◗
+◖ ⠹ a05-backend  4m14s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 <!-- capture:spinner:animated+3s@80 -->
 ```text
-◖ ⠸ a05-backend  4m15s edit swarm/handover.py ◗
+◖ ⠸ a05-backend  4m15s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 
@@ -476,22 +576,22 @@ Reduced motion:
 
 <!-- capture:spinner:reduced+0s@80 -->
 ```text
-◖ ● a05-backend  4m12s edit swarm/handover.py ◗
+◖ ● a05-backend  4m12s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 <!-- capture:spinner:reduced+1s@80 -->
 ```text
-◖ ● a05-backend  4m13s edit swarm/handover.py ◗
+◖ ● a05-backend  4m13s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 <!-- capture:spinner:reduced+2s@80 -->
 ```text
-◖ ● a05-backend  4m14s edit swarm/handover.py ◗
+◖ ● a05-backend  4m14s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 <!-- capture:spinner:reduced+3s@80 -->
 ```text
-◖ ● a05-backend  4m15s edit swarm/handover.py ◗
+◖ ● a05-backend  4m15s edit swarm/handover.py                                  ◗
 ```
 <!-- /capture -->
 
@@ -550,13 +650,13 @@ Three sources, merged per run (a terminal state from any source beats everything
 - A nested row never settles as `cancelled` just because A01's `task` call returned, was replaced, or its details went away: omp runs most specialists as background jobs (one update with `details.async`, then the call returns), so the row is **detached** (still running, `~` after the elapsed) and settles only on evidence: a `live.json` part with a final state; its parent's end (A01 failed, was cancelled or timed out: `cancelled`; A01 completed: the row is dropped, no state is invented); or the evidence timeout (`SWARM_BAR_DETACHED_S`). A settled row never goes back to running, even if `live.json` later loses it. Settled specialists leave with A01's row (the usual 20 s and 600 s lingers).
 - Bounds: at most 64 entries per frame (`progress[]` first), every string sanitized like any other agent text, a malformed payload (not an object, `progress` not an array, entries without an id or status) is ignored, never thrown. Headless sessions print one stderr line per specialist spawn and settle, like any row.
 
-The bar renders only in the top-level interactive session (`ctx.hasUI`, `ctx.mode === "tui"`, no subagent identity); subagents themselves never draw it.
+The bar renders only in the top-level interactive session (`ctx.hasUI`, `ctx.mode === "tui"`, no subagent identity); subagents themselves never draw it. The token chips are fed separately from the rows (section 1, "Row 1, right: token savings").
 
 ## 8. Switches
 
 | Name | Default | Effect |
 |------|---------|--------|
-| `SWARM_BAR=off` | on | The bar, the status segment and the headless lines are all off (read once, at the first event of the session). |
+| `SWARM_BAR=off` | on | The bar (no widget at all), its token chips (no `token-opt:savings` subscription, no `live.json` restore), the status segment and the headless lines are all off (read once, at the first event of the session). |
 | `SWARM_BAR_LINGER_S` | 20 | Seconds a done or cancelled row stays. |
 | `SWARM_BAR_FAIL_LINGER_S` | 600 | Seconds a failed or timed-out row stays. |
 | `SWARM_BAR_REDUCED_MOTION=1` | unset | Freezes the spinner on `●`. |
@@ -589,7 +689,7 @@ An isolated profile was used so nothing from the user's own configuration (crede
 
 **Loads cleanly.** The TUI came up with the bar mounted; stderr of the omp process was empty (0 bytes) and the profile's log has no extension, load or swarm entry (only provider-discovery warnings for local model servers that are not running).
 
-**Mounted with real data, elapsed ticking** (the file was written once, never rewritten: the values below are the bar's own extrapolation). The bar sits directly above the editor; the `swarm:` status segment is the text on the status row. First capture 3 s after the TUI was up, second 5 s later; the elapsed of every live row, the swarm clock and the spinner frame advanced by 5 s:
+**Mounted with real data, elapsed ticking** (the file was written once, never rewritten: the values below are the bar's own extrapolation). The bar sits directly above the editor; the `swarm:` status segment is the text on the status row. First capture 3 s after the TUI was up, second 5 s later; the elapsed of every live row, the swarm clock and the spinner frame advanced by 5 s. The rows were drawn by the content-width layout that the full-width bar replaced; what the recording covers is the ticking, not the width:
 
 t+3 s
 ```text
@@ -609,25 +709,45 @@ t+8 s
 
 The failed row (`a10-security`, 1m11s) did not move (settled rows are frozen); the `+1 more` row is the queued `a08-qa`.
 
-**Stale telemetry.** About 39 s after the (never updated) file was written:
+**Not covered by this first recording:** the full-width layout, the stack with Ultrathink's bar and the token chips (the second recording below covers them), and the idle watcher (a swarm started by another process while omp sits idle, a deleted file clearing the marker), which was not re-run on real omp.
+
+### Second recording: full-width layout, stack order and token chips (omp 18.12.2)
+
+Checked against the installed omp (`omp --version` prints `omp/18.12.2`, Nerd Font symbols, theme `dark-lavender`) with this checkout loaded from the operator's own configuration next to Ultrathink and `omp-token-opt`, in a detached tmux session (170×48, resized while it ran). A throwaway extension that is not part of the repository drove omp's event bus on a timeline: at t+2 s a `substrate:status` and a valid `token-opt:savings` snapshot of this session; at t+6 s three subagents (`task:subagent:lifecycle` `started`, then a `task:subagent:progress` frame every second); at t+18 s, t+24 s and t+30 s a completion, a failure (`rate limited`) and a completion; at t+46 s a snapshot of ANOTHER session; at t+50 s a newer snapshot of this session. Nothing was typed into the session. Panes were read with `tmux capture-pane -p`.
+
+**Order and width.** In every pane the four rows above the editor are, from the top, the two swarm rows, Ultrathink's bar and omp's own bar, contiguous and in that order, and each of them is exactly as wide as the terminal. The window was resized while three agents ran, and every row re-fitted at once, to 170, 120, 90, 80, 70, 60, 50 and 40 columns, with the left cap in the first and the right cap in the last column. The pane at 170 columns (powerline glyphs shown as `◖`, `◗` and `│`):
 
 ```text
-◖ swarm: telemetry unavailable ◗
+◖ ⠼ swarm 6s │ 3 run │ 0 queued │ 0 done │ 0 fail       query 120ms │ rtk +2.3k │ cost 12c │ turn 1830ms │ before 64.8k · now 48k │ ttft 420ms │ cache 87% │ saved 16.8k ◗
+◖ ⠼ a05-backend     6s edit swarm/handover.py │ ⠼ a06-frontend     6s bash bun test │ ⠼ a08-qa     6s read docs/swarm-bar.md                                             ◗
+   … Ultrathink's bar, omp's own bar, editor …
+   swarm: 3 run      <- status segment
 ```
 
-**File removed while rows were live.** Seven seconds after start the bar was drawn with all rows; three seconds after `rm .swarm/live.json` the bar was gone from above the editor and the status text was cleared (state back to idle, widget unmounted).
+**The chips narrow by priority and `saved` never moves.** Row 1 at each width, left side and right-hand chips (the swarm itself moved on while the window was resized: an agent completed at t+18 s and one failed at t+24 s, so the counts differ between rows):
 
-**Settling and linger** (started with `SWARM_BAR_LINGER_S=5 SWARM_BAR_FAIL_LINGER_S=8`, file then rewritten as two completed and one failed run):
+| columns | summary (left) | token chips (right) |
+|--------:|----------------|---------------------|
+| 170 | `swarm 6s │ 3 run │ 0 queued │ 0 done │ 0 fail` | `query 120ms │ rtk +2.3k │ cost 12c │ turn 1830ms │ before 64.8k · now 48k │ ttft 420ms │ cache 87% │ saved 16.8k` |
+| 120 | `swarm 8s │ 3 run │ 0 queued │ 0 done │ 0 fail` | `before 64.8k · now 48k │ ttft 420ms │ cache 87% │ saved 16.8k` |
+| 90 | `swarm 10s │ 3 run │ 0 queued │ 0 fail` | `ttft 420ms │ cache 87% │ saved 16.8k` |
+| 80 | `swarm 12s │ 2 run │ 0 fail` | `ttft 420ms │ cache 87% │ saved 16.8k` |
+| 70 | `swarm 14s │ 2 run │ 0 fail` | `ttft 420ms │ cache 87% │ saved 16.8k` (a 2-column gap) |
+| 60 | `swarm 16s │ 2 run │ 0 fail` | `cache 87% │ saved 16.8k` |
+| 50 | `swarm 18s │ 1 run` | `cache 87% │ saved 16.8k` |
+| 40 | `swarm 20s │ 1 run` | `saved 16.8k` |
 
-```
-settled +3 s   ✕ swarm 4m18s │ 0 run │ 0 queued │ 2 done │ 1 fail │ slots 0/4
-               ✕ FAIL a07-data  3m23s boom │ ✓ a05-backend  4m18s │ ✓ a06-frontend  2m22s       status: swarm: 1 fail
-settled +6 s   ✕ swarm 3m23s │ 0 run │ 0 queued │ 0 done │ 1 fail │ slots 0/4                    (done rows past 5 s: gone)
-               ✕ FAIL a07-data  3m23s boom                                                       status: swarm: 1 fail
-settled +11 s  nothing drawn, status cleared                                                     (failed row past 8 s: gone)
-```
+While the swarm was idle, at 170 columns, row 1 read `○ swarm idle` and ten chips (`idle 3000ms` first, `saved 16.8k` last; `bill`/`out` and `graph ready` did not fit), row 2 `no subagents running`.
 
-**Not covered by the live check** (and why): the bar's position relative to Ultrathink's two bars (`--no-extensions` left them out, to keep the profile clean) is pinned by `omp/test/bar_wiring.test.ts`, not by this capture; and the idle watcher (a swarm started by another process while omp sits idle, a deleted file clearing the marker) is pinned by `omp/test/bar_wiring.test.ts` (`describe("idle watcher")`) and was not re-run on real omp.
+**Another session's snapshot is ignored.** The snapshot of the other session at t+46 s changed nothing: row 1 kept `saved 16.8k` and `cache 87%`. The newer snapshot of this session at t+50 s moved them to `saved 21.4k` and `cache 91%`.
+
+**The status segment.** The status row under the editor read `swarm: 3 run` while three agents ran, `swarm: 1 run, 1 fail` after the failure, and was empty while the swarm was idle.
+
+**After settling.** The bar stayed mounted. Rows lingered as in section 3: with everything settled, row 1 read `✕ swarm 24s │ 0 run │ 0 queued │ 2 done │ 1 fail` and the failed `a08-qa` row stayed after the completed rows had lingered out.
+
+**Next to Ultrathink's bar.** One prompt planned by Ultrathink on the session's own model (the only model call of the recording) while the same feed ran: both bars kept their rows and their full width while the window was resized during planning, to 120, 90, 70 and back to 170 columns. Ultrathink's Graph-of-Thought panel belongs to Ultrathink's widget, so while its graph stage ran it was drawn between the swarm bar and Ultrathink's bar.
+
+**Not covered:** one host version, one theme and one font preset; the swarm's own `live.json` source was not used in this recording (the first recording covers it).
 
 ## 11. Refreshing the captures
 
@@ -638,4 +758,4 @@ bun omp/test/fixtures/bar_states.ts --write      # rewrites bar_states.ansi and 
 cd omp && bun test test/render_states.test.ts test/swarm_bar.test.ts
 ```
 
-The script needs omp's own `@oh-my-pi/pi-tui` theme sources (looked up under `$HOME/.local/share/reflex/bun/install/global/` and `$HOME/.bun/install/global/` in `node_modules/@oh-my-pi/pi-tui/src/theme/`; override with `OMP_PI_TUI_THEME_DIR`). The test works without them: it then checks the doc against `bar_states.ansi`, and the colour fixture against the renderer only where the theme package is present. The section above titled "Verified on omp 18.12.1" is a recorded observation, not asserted.
+The script needs omp's own `@oh-my-pi/pi-tui` theme sources (looked up under `$HOME/.local/share/reflex/bun/install/global/` and `$HOME/.bun/install/global/` in `node_modules/@oh-my-pi/pi-tui/src/theme/`; override with `OMP_PI_TUI_THEME_DIR`). The test works without them: it then checks the doc against `bar_states.ansi`, and the colour fixture against the renderer only where the theme package is present. The two recordings in section 10 ("Verified on omp 18.12.1" and the second one on 18.12.2) are recorded observations, not asserted.

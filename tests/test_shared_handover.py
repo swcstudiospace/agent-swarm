@@ -1067,3 +1067,86 @@ def test_a_pinned_seq_names_the_plans_handover_when_a_stale_correlation_reuses_t
     pinned = env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 1})
     assert pinned["status"] == "ok" and pinned["handover"]["correlation_id"] == "corr-1"
     assert env.call("shared_handover_read", "A08", {"task_id": "T-be", "seq": 2})["status"] == "missing"
+
+
+# ---- RV-I review fixes ------------------------------------------------------------------------------------------
+def test_registry_references_are_unchecked_never_missing(env):
+    """RV-I P2-2: `ghcr.io/org/app@sha256:...` has a `/` before its first `:`, so it was read as a workspace path and
+    reported `missing` (failed 1, ok false) although the skills promise `unchecked` for non-file uris."""
+    (env.root / "v1.2").mkdir()
+    (env.root / "v1.2" / "app.js").write_text("x\n", encoding="utf-8")
+    refs = ["ghcr.io/org/app@sha256:" + "a" * 64, "registry.example.com/app:1.2", "docker.io/library/nginx",
+            "org/app:1.2", "localhost:5000/app:1", "oci://reg/app"]
+    outputs = [{"kind": "image", "uri": uri, "digest": "sha256:" + "a" * 64, "producer": "A11"} for uri in refs]
+    outputs.append({"kind": "file", "uri": "v1.2/app.js", "digest": "", "producer": "A11"})  # a dotted workspace directory is a file
+    outputs.append({"kind": "file", "uri": "./org/app:1.2", "digest": "", "producer": "A11"})  # ./ always names a file
+    result = env.call("shared_artifact_check", "A12", {"task_id": "T-build", "agent": "A11", "outputs": outputs})
+    statuses = [r["status"] for r in result["results"]]
+    assert statuses == ["unchecked"] * len(refs) + ["no_digest", "missing"], result["results"]
+    assert all(r["exists"] == "unchecked" and "not a local file" in r["reason"] for r in result["results"][:len(refs)])
+    assert result["failed"] == 1 and result["unchecked"] == len(refs) + 1
+
+
+def test_one_unreadable_file_does_not_abort_the_check(env, monkeypatch):
+    """RV-I P3-1: an OSError while digesting one output escaped as DEPENDENCY_UNAVAILABLE and lost every other result."""
+    (env.root / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    (env.root / "locked.py").write_text("print(2)\n", encoding="utf-8")
+    (env.root / "gone.py").write_text("print(3)\n", encoding="utf-8")
+    real = env.sh._file_digest
+
+    def flaky(path):
+        if path.name == "locked.py":
+            raise PermissionError(13, "Permission denied", str(path))
+        if path.name == "gone.py":
+            raise FileNotFoundError(2, "No such file", str(path))
+        return real(path)
+
+    monkeypatch.setattr(env.sh, "_file_digest", flaky)
+    digest = "sha256:" + hashlib.sha256(b"print(1)\n").hexdigest()
+    outputs = [{"kind": "file", "uri": name, "digest": digest, "producer": "A05"} for name in ("ok.py", "locked.py", "gone.py")]
+    result = env.call("shared_artifact_check", "A08", {"task_id": "T-be", "agent": "A05", "outputs": outputs})
+    assert result["state"] == "SUCCESS", result
+    ok_row, locked, gone = result["results"]
+    assert ok_row["status"] == "ok"
+    assert locked["status"] == "missing" and locked["reason"] == "unreadable: Permission denied" and "locked.py" not in locked["reason"]
+    assert gone["status"] == "missing" and gone["exists"] == "no"
+    assert result["failed"] == 2 and result["ok"] is False
+
+
+def test_validate_sizes_a_draft_with_the_id_the_write_will_use(env, monkeypatch):
+    """RV-I P3-2: the pre-check used `pending.999999`, so a document near the cap of a long task id was declared fine and
+    then summarized by the write (which sizes with `<task_id>.999999`)."""
+    task_id = "T" + "a" * 119
+    doc = {**handover_payload(task_id=task_id, completed=[f"step {i}: " + "x" * 300 for i in range(3)]),
+           "correlation_id": "corr-size", "from_agent": "A05", "blockers": [],
+           "created_wall": 1_760_000_000.5}  # fixed: the float's printed length would move the size by a byte
+    first = env.call("shared_handover_validate", "A05", {"document": doc, "draft": True})
+    assert first["valid"] is True and first["would_summarize"] is False
+    short = env.ho.stored_size({**env.ho._prepare(doc, env.sh.SYSTEM_CLOCK), "handover_id": "pending.999999"})
+    real = first["bytes"]
+    assert short < real
+    monkeypatch.setenv("SWARM_HANDOVER_MAX_BYTES", str(real - 1))  # fits with the short id, not with the real one
+    assert short <= real - 1
+    second = env.call("shared_handover_validate", "A05", {"document": doc, "draft": True})
+    assert second["bytes"] == real and second["would_summarize"] is True
+    written = env.ho.write_handover(doc, root=env.root, emit=False)
+    assert written["summarized"] is True
+
+
+def test_bundle_lists_each_artifact_once_with_its_current_digest(env):
+    """RV-I P3-5a: after a rework the bundle returned the same uri twice (the old stored digest and the new one)."""
+    store = make_world(env)
+    store.add_artifact("T-be", kind="file", uri="src/export.py", digest="sha256:" + "c" * 64, producer="A05")
+    bundle = env.call("shared_handover_bundle", "A05", {"task_id": "T-be"})
+    mine = [a for a in bundle["artifacts"] if a["uri"] == "src/export.py"]
+    assert [a["digest"] for a in mine] == ["sha256:" + "c" * 64], bundle["artifacts"]
+    assert bundle["truncated"] is False
+
+
+def test_bundle_says_when_it_dropped_artifacts(env):
+    """RV-I P3-5b: 30 handover artifacts and one upstream artifact came back as 25 entries with `truncated: false`."""
+    store = make_world(env)
+    for i in range(30):
+        store.add_artifact("T-be", kind="file", uri=f"src/part{i:02d}.py", digest="sha256:" + f"{i:02x}" * 32, producer="A05")
+    bundle = env.call("shared_handover_bundle", "A05", {"task_id": "T-be"})
+    assert len(bundle["artifacts"]) == 25 and bundle["truncated"] is True

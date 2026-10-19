@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createModel, formatElapsed, ingestLive, renderSwarmBar, renderSwarmBarFrame, statusText, type SwarmBarModel, visibleRuns } from "../src/swarm_bar.ts";
+import { displayWidth } from "../src/swarm_dock.ts";
 import { REPO_ROOT } from "./helpers.ts";
 
 /**
@@ -55,7 +56,8 @@ describe("runner live.json sample feeds the bar", () => {
     const model = createModel();
     expect(ingestLive(model, doc, NOW, 0)).toBe(true);
     const lines = plain(model, 200);
-    expect(lines.length).toBeLessThanOrEqual(2);
+    expect(lines.length).toBe(2);
+    for (const line of lines) expect(displayWidth(line)).toBe(200);
     const swarm = doc.swarm as Record<string, number>;
     const summary = lines[0];
     expect(summary).toContain("swarm");
@@ -114,13 +116,15 @@ describe("runner live.json sample feeds the bar", () => {
     expect(rowLine(done, NOW + 5_000)).toContain(formatElapsed(done.elapsed_s).padStart(ELAPSED_FIELD));
   });
 
-  test("a narrow width still prints one summary line and names the worst row without breaking", () => {
+  test("a narrow width still prints the summary and names the worst row: always two rows of exactly the width", () => {
     const model = createModel();
     ingestLive(model, doc, NOW, 0);
-    for (const width of [120, 80, 60, 40]) {
+    for (const width of [120, 80, 60, 40, 20]) {
       const lines = plain(model, width);
-      expect(lines.length).toBeLessThanOrEqual(2);
-      for (const line of lines) expect(line.length).toBeLessThanOrEqual(width);
+      expect(lines.length, `width ${width}`).toBe(2);
+      for (const line of lines) expect(displayWidth(line), `width ${width}: ${JSON.stringify(line)}`).toBe(width);
+      expect(lines[0], `width ${width}`).toContain("swarm");
+      expect(lines[1], `width ${width}`).toContain("FAIL");
     }
     expect(plain(model, 80)[1]).toContain("a14-maintenance");
   });

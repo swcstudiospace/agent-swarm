@@ -1,15 +1,20 @@
 /**
- * Agent Swarm bar: the third aboveEditor widget (key `agent-swarm`) plus a compact `setStatus("swarm", …)` text.
+ * Agent Swarm bar: an aboveEditor widget (key `agent-swarm`, rank 10: above Ultrathink) plus a compact `setStatus("swarm", …)` text.
  * Display-only (v2.2 DESIGN section 6, D4); nothing here may throw into the host. Three parts:
- *   1. pure text: `formatElapsed`, `sanitizeText`, the width-safe `renderSwarmBar` (<= 2 rows);
+ *   1. pure text: `formatElapsed`, `sanitizeText`, the fixed-width `renderSwarmBar` (always exactly 2 rows of exactly `width`
+ *      columns: row 1 the swarm summary on the left and the measured token savings on the right, row 2 the agents or the idle placeholder);
  *   2. a model reducer merging three sources by run id: the omp bus (`task:subagent:progress|lifecycle`), `<swarmDir>/live.json`
  *      (`swarm.live.v1`) and the parent's own `task` tool_call/tool_result rows (last resort). Elapsed is extrapolated with the
  *      consumer's monotonic clock (`performance.now()`), never `Date.now()`;
- *   3. `createSwarmBar`: the per-session controller (mount once, deferred double-tick remount, 1 Hz ticker only while something
- *      is live (an unref'd mtime-only idle watcher of live.json otherwise), headless stderr lines, full teardown). No module-scope state; no fs, spawn or env access before the first event.
+ *   3. `createSwarmBar`: the per-session controller (mounted from the first eligible event until stop, kept in stack order by the
+ *      restack protocol, one deferred remount, token savings from `token-opt:savings` and a one-time `live.json` restore, 1 Hz ticker
+ *      only while something is live (an unref'd mtime-only idle watcher of live.json otherwise), headless stderr lines, full teardown).
+ *      No module-scope state; no fs, spawn or env access before the first event.
  */
 import { readFileSync, type Stats, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { BAR_RANK, createRestack, type Restack } from "./bar_stack.ts";
 import { sessionAgent } from "./context.ts";
 import type {
   EventBus,
@@ -20,14 +25,16 @@ import type {
   WidgetHost,
 } from "./omp-api.ts";
 import { swarmDir as resolveSwarmDir } from "./paths.ts";
-import { band, type BarTheme, clipToWidth, displayWidth, stripAnsi } from "./swarm_dock.ts";
+import { type BarSegment, type BarTheme, clipToWidth, composeBar, displayWidth, fitsBar, stripAnsi } from "./swarm_dock.ts";
+import { isSessionId, parseTokenSavings, type TokenSavingsSnapshot, tokenChips } from "./token_savings.ts";
 
 export const SWARM_BAR_KEY = "agent-swarm";
 export const SWARM_STATUS_KEY = "swarm";
 export const PROGRESS_CHANNEL = "task:subagent:progress";
 export const LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
 export const LIVE_SCHEMA = "swarm.live.v1";
-/** Events after which the bar re-mounts itself last (DESIGN 6); `agent_start` and `turn_end` are the ones Ultrathink also remounts on. */
+export const TOKEN_CHANNEL = "token-opt:savings";
+/** Events after which the bar re-mounts itself (one deferral later, DESIGN 6); the restack protocol keeps it above Ultrathink. */
 export const REMOUNT_EVENTS = [
   "session_start",
   "agent_start",
@@ -65,7 +72,7 @@ const SENSITIVE_TOKENS = words(
 );
 /** `<prefix>_key` / `<prefix>_seed` is a credential only after these prefixes (`SWARM_ED25519_KEY`, `signing_seed`); a bare `key`/`seed`, `sort_key`, `random_seed` stay readable. */
 const KEY_PREFIX_LIST =
-  "api access secret private signing ssh encryption master auth session license licence client ed25519 hmac jwt handoff signer";
+  "api access secret private signing ssh encryption master auth account session license licence client ed25519 hmac jwt handoff signer";
 const KEY_PREFIXES = words(KEY_PREFIX_LIST);
 const KEY_WORDS = words("key seed");
 /** Plurals are counts/labels (`tokens: 1200`, `max_tokens`) unless right after one of these (`SUBSTRATE_OPERATOR_TOKENS`, `api_keys`). */
@@ -131,32 +138,34 @@ const isStrictKey = (name: string): boolean => keyVerdict(VERDICTS.strict, name,
 const PEM = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g;
 const JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g;
 const TOKENS = [
-  /(?<![A-Za-z0-9_])(?:gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g,
+  /(?<![A-Za-z0-9_])(?:gh[oprsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g,
   /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}/g,
-  /(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])/g,
-  /(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}/g,
+  /(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])(?:xox[baprs]|xapp)-[A-Za-z0-9-]{10,}/g,
+  // the shapes scripts/sec_gate.py detects (Stripe, Google, GitHub) plus the other prefixed vendor tokens that appear in logs
+  /(?<![A-Za-z0-9])(?:(?:[spr]k_live|whsec)_[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{30,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_-]{16,}|dop_v1_[A-Za-z0-9]{32,}|hf_[A-Za-z0-9]{30,}|dckr_pat_[A-Za-z0-9_-]{20,}|shpat_[A-Za-z0-9]{32,}|lin_api_[A-Za-z0-9]{30,}|pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{20,})/g,
 ];
-const BEARER = /(?<![A-Za-z0-9])([Bb]earer\s{1,16})[A-Za-z0-9._~+/=-]{16,}/g;
+const BEARER = /(?<![A-Za-z0-9])([Bb]earer[ \t\r\n\f\v]{1,16})[A-Za-z0-9._~+/=-]{16,}/g;
 /** `Authorization: Basic <base64>` (and Proxy-Authorization); a bare "basic <word>" in prose is not touched. */
 const BASIC = /(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}["']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}/gi;
 /** Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header: the rest of the line up to a quote is the credential (Bearer/Basic keep their scheme). */
-const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]{0,3}:(?![ \t]{0,3}(?:Bearer|Basic)\b)[ \t]{0,3})[^\s"'][^\r\n"']{0,511}/gi;
+const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]{0,3}:(?![ \t]{0,3}(?:Bearer|Basic)\b)[ \t]{0,3})[^ \t\r\n\f\v"'][^\r\n"']{0,511}/gi;
 /** scheme://user:password@host: the password runs to the LAST '@' before the first '/' or whitespace. */
-const USERINFO = /(\b[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/\s@:]{0,256}:[^/\s]{0,256}@/g;
+const USERINFO = /((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/ \t\r\n\f\v@:]{0,256}:[^/ \t\r\n\f\v]{0,256}@/g;
 // The loops below are written unrolled (`[^x]*(?:\\(?!")[^x]*)*`, not `(?:[^x]|\\(?!"))*`): same language as the Python
 // patterns, but a megabyte-long value no longer exhausts the regex engine's backtrack stack (which skips the match, i.e. leaks).
-const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^\s&;"'\\]|\\(?!"))[^\s&;"'\\]*(?:\\(?!")[^\s&;"'\\]*)*)`;
+const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^ \t\r\n\f\v&;"'\\]|\\(?!"))[^ \t\r\n\f\v&;"'\\]*(?:\\(?!")[^ \t\r\n\f\v&;"'\\]*)*)`;
 /**
  * NAME=value / NAME = value (any sensitive name) and NAME: value (strict names only; prose-safe), and `--password hunter2` /
  * `-db-password hunter2` (a sensitive flag followed by a separate value that is not another flag). The regexes match only
  * `NAME<sep>`; `scan` consumes the value of a SENSITIVE name and merely steps past a benign name's separator, so a later
  * assignment inside its "value" (`user=alice,password=x`, `--mode a;--password x`) is still scanned.
  */
-const NAME_SEP = /(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,3}[=:][ \t]{0,3})/g;
-const FLAG_SEP = /(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9-]{0,63})([ \t]{1,8})(?![-\s])/g;
+const NAME_SEP = /(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([ \t]{0,32}[=:][ \t]{0,32})/g;
+const FLAG_SEP = /(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9_-]{0,63})([ \t]{1,8})(?![- \t\r\n\f\v])/g;
 const VALUE_AT = new RegExp(VALUE, "y");
 const FLAG_VALUE_AT = new RegExp(
-  String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^\s"'\\]|\\(?!"))[^\s"'\\]*(?:\\(?!")[^\s"'\\]*)*)`,
+  String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^ \t\r\n\f\v"'\\]|\\(?!"))[^ \t\r\n\f\v"'\\]*(?:\\(?!")[^ \t\r\n\f\v"'\\]*)*)`,
   "y",
 );
 
@@ -165,10 +174,10 @@ const FLAG_VALUE_AT = new RegExp(
 // the value goes on. A quote right after any other value is not taken as a continuation: it is as likely the closing quote
 // of an enclosing string.
 const TAIL_NAME = /(?<![A-Za-z0-9_])(?<![A-Za-z0-9_][.-])([A-Za-z_][A-Za-z0-9_.-]{0,127})([=:]?)/y;
-const TAIL_FLAG = /(?<![A-Za-z0-9_-])--?[A-Za-z][A-Za-z0-9-]{0,63}/y;
-const AFTER_NAME = /[ \t]{0,3}([=:])[ \t]{0,3}/y;
-const AFTER_SEP = /[ \t]{0,3}/y;
-const FLAG_GAP = /[ \t]{1,8}(?![-\s])/y;
+const TAIL_FLAG = /(?<![A-Za-z0-9_-])--?[A-Za-z][A-Za-z0-9_-]{0,63}/y;
+const AFTER_NAME = /[ \t]{0,32}([=:])[ \t]{0,32}/y;
+const AFTER_SEP = /[ \t]{0,32}/y;
+const FLAG_GAP = /[ \t]{1,8}(?![- \t\r\n\f\v])/y;
 const TAIL_WINDOW = 200;
 const TAIL_DELIMS = [",", ";", "&", "/", "?"];
 
@@ -220,6 +229,155 @@ function continuation(s: string, pos: number, end: number, valueAt: RegExp): num
 /** Loose verdict for `=` separators, strict (prose-safe) otherwise: the same rule as `_name_hit` in swarm/redact.py. */
 const isNameHit = (name: string, eq: boolean): boolean => (eq ? isSensitiveKey(name) : isStrictKey(name));
 
+// `<vendor>_KEY=<long mixed-case value>` (`STRIPE_KEY`, `SUPABASE_SERVICE_ROLE_KEY`): a bare `*_key` name is too common to mask on its
+// name alone (`sort_key=name`), so it is masked when the VALUE looks like a credential (>= 20 token-alphabet characters, upper and
+// lower case and a digit: not a hash, uuid, path or kebab-case id) and the word before `key` is not a lookup-style qualifier.
+// Twin of `_key_name` / `_long_secret` / `_key_value_end` in swarm/redact.py.
+const VENDOR_KEY_SKIP = words(
+  "cache sort idempotency partition primary foreign public lookup group shard unique index hash object route routing dedupe dedup lock message",
+);
+const LONG_SECRET = /^[A-Za-z0-9_+\/=~.-]{20,}$/;
+/** The value of a `*_key` name inside running text: one token of at most 160 characters, optionally quoted. */
+const KEY_VALUE = /(\\?["']?)([A-Za-z0-9_+\/=~.-]{20,160})(?![A-Za-z0-9_+\/=~.-])/y;
+const KEY_NAMES = new Map<string, boolean>();
+function isKeyName(name: string): boolean {
+  let hit = KEY_NAMES.get(name);
+  if (hit === undefined) {
+    const toks = nameTokens(name);
+    hit = toks.length > 1 && toks[toks.length - 1] === "key" && VENDOR_KEY_SKIP[toks[toks.length - 2]!] !== true;
+    if (KEY_NAMES.size >= VERDICT_CAP) KEY_NAMES.clear();
+    KEY_NAMES.set(name, hit);
+  }
+  return hit;
+}
+function isLongSecret(value: string): boolean {
+  let a = 0;
+  let b = value.length;
+  while (a < b && "\"'\\".includes(value.charAt(a))) a++;
+  while (b > a && "\"'\\".includes(value.charAt(b - 1))) b--;
+  const v = value.slice(a, b);
+  return LONG_SECRET.test(v) && /[0-9]/.test(v) && /[a-z]/.test(v) && /[A-Z]/.test(v);
+}
+/** A sensitive name, or a `*_key` name with a credential-shaped string value (twin of `_credential_pair`). */
+const isCredentialPair = (name: string, value: string): boolean => isSensitiveKey(name) || (isKeyName(name) && isLongSecret(value));
+/** End of the credential-shaped token (and its closing quote) that starts at s[pos], or -1. */
+function keyValueEnd(s: string, pos: number): number {
+  const m = stickyAt(KEY_VALUE, s, pos);
+  if (m === null || !isLongSecret(m[2]!)) return -1;
+  const end = pos + m[0].length;
+  const q = m[1]!;
+  return q !== "" && s.startsWith(q, end) ? end + q.length : end;
+}
+
+// ---- command-line credentials (twins of the `_CLI_*` helpers in swarm/redact.py; explicit ASCII whitespace classes: JS and Python `\s` differ) ----
+const CLI_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|[^ \t\r\n\f\v"'\\;&|]+)`;
+/** `curl -u user:pass`, `--user user:pass`, `--proxy-user a:b` (a docker `-u 1000:1000` uid:gid pair is not a credential). */
+const USER_PASS_FLAG = new RegExp(
+  String.raw`(?<![A-Za-z0-9_-])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))` +
+    String.raw`(?:"[^"\n:]{0,128}:[^"\n]*"|'[^'\n:]{0,128}:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]{1,128}:[^ \t\r\n\f\v"'\\;&|]+)`,
+  "g",
+);
+const OPENSSL_PASS = /(?<![A-Za-z0-9_-])(-pass(?:in|out)?[ \t]{1,8}["']?pass:)[^ \t\r\n\f\v"';&|]+/g;
+/** `<command> ... -<flag><value>` / `-<flag> <value>` within one shell segment (at most 10 arguments after the command). `gluedOnly`: a bare `-p` is a prompt. */
+function cliRe(commands: string, flag: string, gluedOnly = false): RegExp {
+  const after = gluedOnly
+    ? String.raw`(?=[^ \t\r\n\f\v;&|])`
+    : String.raw`(?:[ \t]{1,8}(?=[^ \t\r\n\f\v-])|(?=[^ \t\r\n\f\v;&|]))`;
+  return new RegExp(
+    String.raw`(?<![A-Za-z0-9_./-])((?:${commands})(?:[ \t]+[^ \t\r\n\f\v;&|]{1,128}){0,10}?[ \t]+-${flag}${after})${CLI_VALUE}`,
+    "g",
+  );
+}
+/** [substrings one of which must be present for the regex to be worth running, regex] */
+const CLI_RES: ReadonlyArray<readonly [readonly string[], RegExp]> = [
+  [["-u"], USER_PASS_FLAG],
+  [["-pass"], OPENSSL_PASS],
+  [
+    ["mysql", "mariadb"],
+    cliRe("mysql|mysqladmin|mysqldump|mysqlcheck|mysqlimport|mysqlshow|mysqlpump|mysqlsh|mariadb|mariadb-dump|mariadb-admin", "p", true),
+  ],
+  [
+    ["sshpass", "login", "mongo"],
+    cliRe(
+      String.raw`sshpass|(?:docker|podman|buildah|skopeo|crane|oras|nerdctl)[ \t]+login|helm[ \t]+registry[ \t]+login` +
+        String.raw`|az[ \t]+login|mongo|mongosh|mongodump|mongorestore|mongoexport|mongoimport|mongostat|mongotop`,
+      "p",
+    ),
+  ],
+  [["redis-cli"], cliRe("redis-cli", "a")],
+  [["sqlcmd", "bcp"], cliRe("sqlcmd|bcp", "P")],
+  [["ssh-keygen"], cliRe("ssh-keygen", "N")],
+];
+function maskCli(s: string): string {
+  for (const [hints, rx] of CLI_RES) {
+    if (hints.some((h) => s.includes(h))) s = s.replace(rx, (_m, lead: string) => lead + REDACTED);
+  }
+  return s;
+}
+
+// ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ----
+const YAML_NAME =
+  /(?<![^\n])[ \t]*(?:-[ \t]+)?name[ \t]*:[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\1[ \t]*(?:#[^\r\n]*)?\r?\n([ \t]*)value[ \t]*:[ \t]*(?=[^ \t\r\n#])/g;
+const YAML_BLOCK_KEY = /(?<![^\n])([ \t]*)(?:-[ \t]+)?["']?([A-Za-z_][A-Za-z0-9_.-]{0,127})["']?[ \t]*:[ \t]*(?=[|>])/g;
+const YAML_INDICATOR = /[|>][+-]?[0-9]?[+-]?[ \t]*(?:#[^\r\n]*)?(?=\r?\n|$)/y;
+const isBlankLine = (line: string): boolean => {
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9 && c !== 13) return false;
+  }
+  return true;
+};
+const indentOf = (line: string): number => {
+  let i = 0;
+  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  return i;
+};
+/** End of the scalar that begins at s[start]: a block scalar (`|`, `>-`, ...) runs through the following lines indented deeper than `indent` (blank lines inside it included); any other value is the rest of its line. */
+function yamlValueEnd(s: string, start: number, indent: number): number {
+  const ind = stickyAt(YAML_INDICATOR, s, start);
+  if (ind === null) {
+    let eol = s.indexOf("\n", start);
+    if (eol < 0) eol = s.length;
+    return s.charAt(eol - 1) === "\r" ? eol - 1 : eol;
+  }
+  let end = start + ind[0].length;
+  let pos = s.indexOf("\n", end);
+  while (pos >= 0) {
+    const ls = pos + 1;
+    let le = s.indexOf("\n", ls);
+    if (le < 0) le = s.length;
+    const line = s.slice(ls, le);
+    if (!isBlankLine(line)) {
+      if (indentOf(line) <= indent) break;
+      end = line.endsWith("\r") ? le - 1 : le;
+    }
+    pos = le < s.length ? le : -1;
+  }
+  return end;
+}
+function maskYaml(s: string): string {
+  if (!s.includes("\n") || !s.includes(":")) return s;
+  for (const [rx, indentGroup] of [[YAML_NAME, 3], [YAML_BLOCK_KEY, 1]] as const) {
+    const out: string[] = [];
+    let last = 0;
+    for (const m of s.matchAll(rx)) {
+      const at = m.index as number;
+      if (at < last || !isSensitiveKey(m[2]!)) continue;
+      const start = at + m[0].length;
+      const end = yamlValueEnd(s, start, m[indentGroup]!.length);
+      if (end > start) {
+        out.push(s.slice(last, start), REDACTED);
+        last = end;
+      }
+    }
+    if (out.length > 0) {
+      out.push(s.slice(last));
+      s = out.join("");
+    }
+  }
+  return s;
+}
+
 /** Mask the value that follows every sensitive `NAME<sep>` match of `sep`: one forward pass with a cursor (no recursion, no rescans). */
 function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean): string {
   const out: string[] = [];
@@ -228,10 +386,20 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean): string {
   for (let m = sep.exec(s); m !== null; m = sep.exec(s)) {
     const pos = sep.lastIndex;
     if (eqSep && !m[2]!.includes("=") && s.startsWith("//", pos)) continue; // `auth://host`, `token://x`: a URL scheme, not `NAME: value`
-    if (!isNameHit(m[1]!, eqSep && m[2]!.includes("="))) continue;
-    const v = stickyAt(valueAt, s, pos);
-    if (v === null) continue;
-    let end = pos + v[0].length;
+    const name = m[1]!;
+    const hit = isNameHit(name, eqSep && m[2]!.includes("="));
+    if (!hit && !isKeyName(name)) continue;
+    let end: number;
+    if (hit) {
+      const v = stickyAt(valueAt, s, pos);
+      if (v === null) continue;
+      end = pos + v[0].length;
+    } else {
+      end = keyValueEnd(s, pos);
+      if (end < 0) continue;
+    }
+    // a value an earlier pass already masked (`[REDACTED],`): idempotent, the comma stays
+    if (s.startsWith(REDACTED, pos) && end > pos + REDACTED.length && !/[A-Za-z0-9]/.test(s.charAt(pos + REDACTED.length))) end = pos + REDACTED.length;
     for (let more = continuation(s, pos, end, valueAt); more >= 0; more = continuation(s, pos, end, valueAt)) end = more;
     out.push(s.slice(last, pos), REDACTED);
     last = sep.lastIndex = end;
@@ -242,9 +410,9 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean): string {
 }
 
 /** "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS). */
-const PAIR = /(?<lead>(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,8})(?<v>"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')/g;
+const PAIR = /(?<lead>(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,8})(?<v>"[^"\\]*(?:\\[^\n][^"\\]*)*"|'[^'\\]*(?:\\[^\n][^'\\]*)*')/g;
 /** JSON that was serialised again into a string: {\"password\": \"x\"} */
-const ESC_PAIR = /(\\"(?<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")[^"\\]*(?:\\(?!")[^"\\]*)*(\\")/g;
+const ESC_PAIR = /(?<lead>\\"(?<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")[^"\\]*(?:\\(?!")[^"\\]*)*(?<close>\\")/g;
 
 /** TS port of `swarm/redact.py redact_text`: every secret-looking span becomes `[REDACTED]`. */
 export function redactText(text: string): string {
@@ -255,30 +423,39 @@ export function redactText(text: string): string {
   s = s.replace(BASIC, (_m, lead: string) => lead + REDACTED);
   s = s.replace(USERINFO, (_m, scheme: string) => `${scheme}${REDACTED}@`);
   s = s.replace(HEADER, (_m, lead: string) => lead + REDACTED);
+  s = maskYaml(maskCli(s));
   s = scan(s, NAME_SEP, VALUE_AT, true);
   s = scan(s, FLAG_SEP, FLAG_VALUE_AT, false);
   s = s.replace(PAIR, (...args) => {
     const g = args[args.length - 1] as { lead: string; name: string; v: string };
-    return isSensitiveKey(g.name) ? `${g.lead}${g.v[0]}${REDACTED}${g.v[0]}` : (args[0] as string);
+    return isCredentialPair(g.name, g.v.slice(1, -1)) ? `${g.lead}${g.v[0]}${REDACTED}${g.v[0]}` : (args[0] as string);
   });
   return s.replace(ESC_PAIR, (...args) => {
-    const g = args[args.length - 1] as { name: string };
-    return isSensitiveKey(g.name) ? `${args[1] as string}${REDACTED}${args[2] as string}` : (args[0] as string);
+    const g = args[args.length - 1] as { lead: string; name: string; close: string };
+    return isSensitiveKey(g.name) ? `${g.lead}${REDACTED}${g.close}` : (args[0] as string);
   });
 }
 
 /** Controls, line separators and bidi overrides (display spoofing), replaced by a space or dropped. */
 const CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
 const BIDI = /[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+/** Characters with no visible width or order that can split a secret (controls but tab/CR/LF, zero-width and bidi marks). */
+const INVISIBLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g;
 
 /**
  * Agent-supplied text made safe for a status row: ANSI and control characters stripped, secrets redacted (before clipping,
  * so a cut cannot hide half a token), whitespace collapsed, clipped to `max` columns. Non-strings give "".
+ * Invisible characters are removed BEFORE redaction: a bidi mark, zero-width space or NUL inside a token defeats the patterns,
+ * and deleting it afterwards would re-join the secret into the row.
  */
 export function sanitizeText(input: unknown, max = 120): string {
   if (typeof input !== "string") return "";
-  const redacted = redactText(stripAnsi(boundInput(input)));
-  const flat = redacted.replace(BIDI, "").replace(CONTROLS, " ").replace(/\s+/g, " ").trim();
+  const base = stripAnsi(boundInput(input));
+  const joined = base.replace(INVISIBLE, "");
+  let text = redactText(joined);
+  // nothing to hide in the joined view: keep the original's display (controls become spaces) and redact that view as before
+  if (text === joined && joined !== base) text = redactText(base);
+  const flat = text.replace(BIDI, "").replace(CONTROLS, " ").replace(/\s+/g, " ").trim();
   return clipToWidth(flat, max);
 }
 
@@ -404,6 +581,10 @@ export interface SwarmBarModel {
   /** How long a detached nested row survives without any evidence before it is dropped. */
   detachedMs: number;
   reducedMotion: boolean;
+  /** Measured token savings (`token-opt:savings`); absent until a valid snapshot arrives. */
+  tokens?: TokenSavingsSnapshot;
+  /** This session's id once known; after that a snapshot of another session is never shown. */
+  sessionId?: string;
 }
 
 export interface ModelOptions {
@@ -1129,6 +1310,12 @@ export function barState(model: SwarmBarModel, nowMono: number): Exclude<BarStat
   return rows.some((run) => run.state === "failed" || run.state === "timed_out") ? "failed" : "completed";
 }
 
+/** The token snapshot the bar may show: this session's, or any valid one while the session id is not known yet. */
+export function shownTokens(model: SwarmBarModel): TokenSavingsSnapshot | undefined {
+  const { tokens, sessionId } = model;
+  return tokens !== undefined && (sessionId === undefined || tokens.sessionId === sessionId) ? tokens : undefined;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // 3. Rendering
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1226,16 +1413,6 @@ function rowSegment(run: BarRun, theme: BarTheme | undefined, spin: string, nowM
   };
 }
 
-/** `parts` as one band when it fits `width`; otherwise undefined. */
-function fitBand(theme: BarTheme | undefined, parts: readonly Seg[], width: number): string | undefined {
-  const line = band(theme, parts.map((part) => part.painted), " | ");
-  return displayWidth(line) <= width ? line : undefined;
-}
-
-function plainLine(parts: readonly Seg[], width: number): string {
-  return clipToWidth(parts.map((part) => part.plain).join(" | "), width);
-}
-
 export interface BarFrame {
   lines: string[];
   state: BarState;
@@ -1267,7 +1444,12 @@ function countedRows(rows: readonly BarRun[]): BarRun[] {
   return rows.filter((run) => !skipped.has(run));
 }
 
-function summary(model: SwarmBarModel, rows: readonly BarRun[], theme: BarTheme | undefined, mark: Seg, nowMono: number): Seg[] {
+function prio(priority: number, part: Seg): BarSegment {
+  return { ...part, priority };
+}
+
+/** Row 1, left: priorities 0 (mark, `swarm`, elapsed) .. 6 (slots); the lower the number the later it is dropped. */
+function summary(model: SwarmBarModel, rows: readonly BarRun[], theme: BarTheme | undefined, mark: Seg, nowMono: number): BarSegment[] {
   const count = { run: 0, wait: 0, queued: 0, done: 0, fail: 0, timeout: 0, cancel: 0, stall: 0 };
   for (const run of countedRows(rows)) {
     if (run.state === "running" || run.state === "starting" || run.state === "handing_off") count.run++;
@@ -1282,28 +1464,42 @@ function summary(model: SwarmBarModel, rows: readonly BarRun[], theme: BarTheme 
   const live = rows.some((run) => !isTerminal(run.state));
   let elapsed = rows.reduce((max, run) => Math.max(max, runElapsedS(run, nowMono)), 0);
   if (live && model.swarmTimer) elapsed = Math.max(elapsed, timerAt(model.swarmTimer, nowMono));
-  const parts: Seg[] = [{ plain: `${mark.plain} swarm ${formatElapsed(elapsed)}`, painted: `${mark.painted} ${bold(theme, "swarm")} ${formatElapsed(elapsed)}` }];
-  parts.push(seg(theme, count.run > 0 ? "accent" : "dim", `${count.run} run`));
-  if (count.wait > 0) parts.push(seg(theme, "dim", `${count.wait} wait`));
-  parts.push(seg(theme, "dim", `${count.queued} queued`));
-  parts.push(seg(theme, count.done > 0 ? "success" : "dim", `${count.done} done`));
-  parts.push(seg(theme, count.fail > 0 ? "error" : "dim", `${count.fail} fail`));
-  if (count.timeout > 0) parts.push(seg(theme, "error", `${count.timeout} timeout`));
-  if (count.stall > 0) parts.push(seg(theme, "warning", `${count.stall} stall`));
-  if (count.cancel > 0) parts.push(seg(theme, "muted", `${count.cancel} cancel`));
-  if (model.slotLimit !== undefined) parts.push(seg(theme, "dim", `slots ${count.run}/${model.slotLimit}`));
-  if (model.error) parts.push(seg(theme, "warning", "telemetry unavailable"));
+  const parts: BarSegment[] = [prio(0, { plain: `${mark.plain} swarm ${formatElapsed(elapsed)}`, painted: `${mark.painted} ${bold(theme, "swarm")} ${formatElapsed(elapsed)}` })];
+  parts.push(prio(1, seg(theme, count.run > 0 ? "accent" : "dim", `${count.run} run`)));
+  if (count.wait > 0) parts.push(prio(4, seg(theme, "dim", `${count.wait} wait`)));
+  parts.push(prio(3, seg(theme, "dim", `${count.queued} queued`)));
+  parts.push(prio(4, seg(theme, count.done > 0 ? "success" : "dim", `${count.done} done`)));
+  parts.push(prio(2, seg(theme, count.fail > 0 ? "error" : "dim", `${count.fail} fail`)));
+  if (count.timeout > 0) parts.push(prio(2, seg(theme, "error", `${count.timeout} timeout`)));
+  if (count.stall > 0) parts.push(prio(2, seg(theme, "warning", `${count.stall} stall`)));
+  if (count.cancel > 0) parts.push(prio(5, seg(theme, "muted", `${count.cancel} cancel`)));
+  if (model.slotLimit !== undefined) parts.push(prio(6, seg(theme, "dim", `slots ${count.run}/${model.slotLimit}`)));
+  if (model.error) parts.push(prio(2, seg(theme, "warning", "telemetry unavailable")));
   return parts;
 }
 
-/** The bar as rows (at most 2) plus the state it is in. Pure: the same inputs give the same output. */
+/** Row 1, right: the token chips of the snapshot to show (none before the first measurement: zeros are never invented). */
+function tokenSegments(model: SwarmBarModel, theme: BarTheme | undefined): BarSegment[] {
+  const snapshot = shownTokens(model);
+  if (snapshot === undefined) return [];
+  return tokenChips(snapshot).map((chip) => ({ plain: chip.text, painted: chip.color === "text" ? chip.text : paint(theme, chip.color, chip.text), priority: chip.priority }));
+}
+
+const IDLE_ROW = "no subagents running";
+
+/**
+ * The bar as exactly 2 rows of exactly `width` columns (none for `width <= 0`) plus the state it is in. Idle and error keep the
+ * two rows: a placeholder instead of the agents. Pure: the same inputs give the same output.
+ */
 export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: BarTheme | undefined, nowMono: number): BarFrame {
   const base = barState(model, nowMono);
-  if (width <= 0 || base === "idle") return { lines: [], state: base, shown: 0, hidden: 0 };
+  if (width <= 0) return { lines: [], state: base, shown: 0, hidden: 0 };
+  const chips = tokenSegments(model, theme);
   const rows = visibleRuns(model, nowMono);
   if (rows.length === 0) {
-    const marker = seg(theme, "dim", "swarm: telemetry unavailable");
-    return { lines: [fitBand(theme, [marker], width) ?? clipToWidth(marker.plain, width)], state: "error", shown: 0, hidden: 0 };
+    const head = base === "error" ? seg(theme, "warning", "swarm: telemetry unavailable") : seg(theme, "dim", "○ swarm idle");
+    const lines = [composeBar(theme, [prio(0, head)], chips, width), composeBar(theme, [prio(0, seg(theme, "dim", IDLE_ROW))], [], width)];
+    return { lines, state: base, shown: 0, hidden: 0 };
   }
   const spin = spinner(model, theme, nowMono);
   const live = rows.some((run) => !isTerminal(run.state));
@@ -1316,39 +1512,38 @@ export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: 
       : cancelled
         ? seg(theme, "muted", "⊘")
         : seg(theme, "success", "✓");
-  const head = summary(model, rows, theme, mark, nowMono);
-  let line1: string | undefined;
-  for (let keep = head.length; keep >= 2 && line1 === undefined; keep--) line1 = fitBand(theme, head.slice(0, keep), width);
-  line1 ??= fitBand(theme, head.slice(0, 1), width) ?? plainLine(head, width);
+  const line1 = composeBar(theme, summary(model, rows, theme, mark, nowMono), chips, width);
 
   const candidates = rows.slice(0, MAX_CANDIDATES);
   const cap = rows.length <= 2 ? 40 : rows.length <= 4 ? 24 : 16;
+  const agentParts = (k: number, activityCap: number): BarSegment[] => {
+    const parts = candidates.slice(0, k).map((run, index) => prio(index, rowSegment(run, theme, spin, nowMono, activityCap)));
+    if (rows.length > k) parts.push(prio(k, seg(theme, "dim", `+${rows.length - k} more`)));
+    return parts;
+  };
   let line2: string | undefined;
   let shown = 0;
   // as many rows as fit, each with as much activity as fits; only then fewer rows
   for (let k = candidates.length; k >= 1 && line2 === undefined; k--) {
-    const hiddenCount = rows.length - k;
     for (const activityCap of [cap, 12, 0]) {
-      const parts = candidates.slice(0, k).map((run) => rowSegment(run, theme, spin, nowMono, activityCap));
-      if (hiddenCount > 0) parts.push(seg(theme, "dim", `+${hiddenCount} more`));
-      const fitted = fitBand(theme, parts, width);
-      if (fitted !== undefined) {
-        line2 = fitted;
+      const parts = agentParts(k, activityCap);
+      if (fitsBar(theme, parts, [], width)) {
+        line2 = composeBar(theme, parts, [], width);
         shown = k;
         break;
       }
     }
   }
   if (line2 === undefined) {
-    const only = rowSegment(candidates[0], theme, spin, nowMono, 0);
-    line2 = clipToWidth(rows.length > 1 ? `${only.plain} | +${rows.length - 1} more` : only.plain, width);
+    // not even one row fits: the composer drops `+N more`, then clips the row
+    line2 = composeBar(theme, agentParts(1, 0), [], width);
     shown = 1;
   }
   const hidden = rows.length - shown;
   return { lines: [line1, line2], state: hidden > 0 ? "overflow" : base, shown, hidden };
 }
 
-/** The bar as at most 2 rows, each no wider than `width` columns. */
+/** The bar as exactly 2 rows, each exactly `width` columns wide (no rows for `width <= 0`). */
 export function renderSwarmBar(model: SwarmBarModel, width: number, theme: BarTheme | undefined, nowMono: number): string[] {
   return renderSwarmBarFrame(model, width, theme, nowMono).lines;
 }
@@ -1461,7 +1656,7 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
   let turnActive = false;
   let inflight = 0;
   let lastRender = -Infinity;
-  let wasShown = false;
+  let trailingRender: unknown;
   let lastStatus: string | undefined;
   let staleMs = 30_000;
   /** The last read document came from the in-session Task Store (`producer: "derived"`): written on transitions only, so mtime says nothing about liveness. */
@@ -1471,8 +1666,9 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
   const announced = new Set<string>();
   /** Set by `stop()`; only a new session (`session_start`/`session_switch`) clears it. */
   let closed = false;
-  /** The widget is currently mounted (it is only while there is something to show). */
+  /** The widget is mounted: from the first eligible event until stop. An idle bar stays, drawn as the idle placeholder. */
   let mounted = false;
+  let restack: Restack | undefined;
 
   const safe = (fn: () => void): void => {
     try {
@@ -1515,8 +1711,10 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
     };
   };
 
-  function mount(): void {
+  /** Sets the widget, then announces the rank so every higher-ranked bar re-sets its own below this one. */
+  function mountAndAnnounce(): void {
     ui?.setWidget?.(SWARM_BAR_KEY, factory, { placement: "aboveEditor" });
+    restack?.announce();
   }
 
   function unmount(): void {
@@ -1536,40 +1734,71 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
     if (mode !== "ui" || remountPending) return;
     remountPending = true;
     const mine = generation;
-    // widgets stack in insertion order and re-setting a key moves it to the bottom: land after the other bars' single-tick remounts
-    later(() =>
-      later(() => {
-        remountPending = false;
-        // only while something is showing: an idle bar stays unmounted (no spacer row above the editor)
-        if (mine === generation && mounted) safe(mount);
-      }),
-    );
-  }
-
-  function syncMount(shown: boolean): void {
-    if (shown && !mounted) {
-      mounted = true;
-      safe(mount);
-    } else if (!shown && mounted) {
-      mounted = false;
-      safe(unmount);
-    }
+    // widgets stack in insertion order and re-setting a key moves it to the bottom: re-set one tick after the events that move other
+    // bars; the restack announcement then puts every higher-ranked bar back below this one
+    later(() => {
+      remountPending = false;
+      if (mine === generation && mounted) safe(mountAndAnnounce);
+    });
   }
 
   function render(force: boolean): void {
     if (mode !== "ui") return;
     const now = clock();
-    const shown = barState(model, now) !== "idle";
-    syncMount(shown);
-    if (!shown && !wasShown) return;
     if (!force && now - lastRender < STATUS_RENDER_GAP_MS) return;
-    wasShown = shown;
     lastRender = now;
     safe(() => host?.requestRender());
     const text = statusText(model, now);
     if (text !== lastStatus) {
       lastStatus = text;
       safe(() => ui?.setStatus?.(SWARM_STATUS_KEY, text));
+    }
+  }
+
+  /** A new token snapshot: render now, or once the render gap has passed (snapshots are rare, so none may be left unpainted). */
+  function renderTokens(): void {
+    if (mode !== "ui") return;
+    const wait = STATUS_RENDER_GAP_MS - (clock() - lastRender);
+    if (wait <= 0) return render(true);
+    if (trailingRender !== undefined) return;
+    const handle = timers.setTimeout(() => {
+      trailingRender = undefined;
+      safe(() => render(true));
+    }, wait + 1);
+    (handle as { unref?: () => void } | undefined)?.unref?.();
+    trailingRender = handle;
+  }
+
+  /** The id of this session, read on every event (a resumed or switched session changes it). */
+  function noteSession(ctx: ExtensionContext): void {
+    if (mode !== "ui") return;
+    let id: unknown;
+    try {
+      id = ctx.sessionManager?.getSessionId?.();
+    } catch {
+      id = undefined;
+    }
+    if (!isSessionId(id)) return;
+    model.sessionId = id;
+    // a session switch or resume: the stored snapshot belongs to the session that is gone
+    if (model.tokens !== undefined && model.tokens.sessionId !== id) {
+      model.tokens = undefined;
+      renderTokens();
+    }
+  }
+
+  /** The last snapshot omp-token-opt wrote, once at start: the bar opens with the numbers a restarted session already had. */
+  function restoreTokens(env: Record<string, string | undefined>): void {
+    try {
+      const path = join(env.HOME ? env.HOME : homedir(), ".omp", "agent", "token-opt", LIVE_FILE);
+      if (statSync(path).size > LIVE_MAX_BYTES) return;
+      const snapshot = parseTokenSavings(JSON.parse(readFileSync(path, "utf8")));
+      if (snapshot === undefined || model.tokens !== undefined) return;
+      // a live.json written by another session is not this session's numbers
+      if (model.sessionId !== undefined && snapshot.sessionId !== model.sessionId) return;
+      model.tokens = snapshot;
+    } catch {
+      // missing, unreadable or malformed: nothing to restore
     }
   }
 
@@ -1757,7 +1986,31 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
       } catch {
         liveDir = undefined; // no live.json source; the bus and task rows still work
       }
-      // nothing is mounted yet: the widget appears with the first thing to show (DESIGN 6, idle = unmounted)
+      restack = createRestack(bus, {
+        rank: BAR_RANK.swarm,
+        remount: () => {
+          if (mounted && !closed && mode === "ui") mountAndAnnounce();
+        },
+      });
+      if (bus && typeof bus.on === "function") {
+        unsubs.push(
+          bus.on(TOKEN_CHANNEL, (data) => {
+            safe(() => {
+              const snapshot = parseTokenSavings(data);
+              if (snapshot === undefined) return;
+              // another session's snapshot never replaces this session's last one
+              if (model.sessionId !== undefined && snapshot.sessionId !== model.sessionId) return;
+              model.tokens = snapshot;
+              renderTokens();
+            });
+          }),
+        );
+      }
+      noteSession(ctx);
+      restoreTokens(env);
+      // mounted for the whole session, idle included: the bar's shape never depends on what the swarm is doing
+      mounted = true;
+      safe(mountAndAnnounce);
     }
   }
 
@@ -1767,6 +2020,10 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
     // not start the bar again. Only session_start / session_switch (a new session) reopen it.
     closed = true;
     const hadUi = mode === "ui";
+    restack?.dispose();
+    restack = undefined;
+    if (trailingRender !== undefined) timers.clearTimeout(trailingRender);
+    trailingRender = undefined;
     for (const unsub of unsubs) safe(unsub);
     unsubs = [];
     if (ticker !== undefined) timers.clearInterval(ticker);
@@ -1791,7 +2048,6 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
     turnActive = false;
     inflight = 0;
     lastRender = -Infinity;
-    wasShown = false;
     lastStatus = undefined;
     liveDir = undefined;
     liveDerived = false;
@@ -1807,6 +2063,7 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
         if (closed) return;
         start(ctx);
         if (mode === undefined || mode === "off") return;
+        noteSession(ctx);
         if (name === "turn_start" || name === "before_agent_start" || name === "agent_start") turnActive = true;
         else if (name === "agent_end") {
           turnActive = false;

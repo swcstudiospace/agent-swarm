@@ -29,6 +29,8 @@ export interface SessionEntry {
 export interface SessionManager {
   getEntries(): SessionEntry[];
   getBranch(): SessionEntry[];
+  /** The session's id; read through an optional call because 18.3.1 hosts and test fakes omit it. */
+  getSessionId?(): unknown;
 }
 
 /** Run mode of the host: `tui` is the only one with terminal components. */

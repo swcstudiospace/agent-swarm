@@ -51,8 +51,8 @@ export function createSwarmExtension({ bridge, bar: barOptions }: SwarmExtension
       killInflight(inflight);
       display(() => bar.stop());
     });
-    // DESIGN 6: mount with the first thing to show, then re-mount last after the events that move the other bars
-    // (agent_start and turn_end are the two Ultrathink also remounts on)
+    // DESIGN 6: mount at the first eligible event and keep the bar for the session; re-mount one deferral after the events that
+    // move the other bars (the restack protocol keeps the order: swarm above Ultrathink)
     for (const name of ["session_start", "session_switch", "agent_start", "turn_start", "turn_end", "tool_execution_start", "tool_execution_end", "agent_end"] as const) {
       pi.on(name, (event, ctx) => {
         // omp emits tool_execution_end for every outcome, including a call another extension blocked or an abort: unlike

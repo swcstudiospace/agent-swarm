@@ -77,12 +77,12 @@ Data flow of one task: `reconcile()` and `dispatchable()` find ready tasks; `sel
 | `swarm/subagent_lifecycle.py` | Global slot cap and overdue watchdog |
 | `swarm/handover.py`, `swarm/tools/shared_handover.py`, `swarm/tools/shared_runtime.py` | `swarm.handover.v1` and the shared baseline tools |
 | `swarm/skill_registry.py` | Validates and documents `prompts/skills/` |
-| `omp/src/swarm_bar.ts` | The third bar ([swarm-bar.md](swarm-bar.md)): merges the omp bus, `live.json` (an idle `stat` watcher every `SWARM_BAR_IDLE_POLL_MS`) and the specialists A01 spawns in-session (`inflightTaskDetails`) |
+| `omp/src/swarm_bar.ts` | The swarm bar ([swarm-bar.md](swarm-bar.md)): always mounted, two full-width rows; merges the omp bus, `live.json` (an idle `stat` watcher every `SWARM_BAR_IDLE_POLL_MS`) and the specialists A01 spawns in-session (`inflightTaskDetails`); shows the session's token savings (`token_savings.ts`, `token-opt:savings`) and keeps its place above Ultrathink's bar with the `bars:restack` protocol (`bar_stack.ts`) |
 
 ## Where to read next
 
 - The v2.2 runtime, telemetry, handover, skills, how-to guides, configuration and known limits: [swarm-command-center.md](swarm-command-center.md)
-- Reading the third bar: [swarm-bar.md](swarm-bar.md)
+- Reading the swarm bar: [swarm-bar.md](swarm-bar.md)
 - Tool catalog and the 15 registry pages: `docs/tools/`; skill catalog: `docs/skills/`
 - Envelope, retries, and two worked messages: `docs/acp-topology.md`
 - How to add a tool or skill, regenerate, cancel a run or diagnose a dead peer: `docs/operations-runbook.md`

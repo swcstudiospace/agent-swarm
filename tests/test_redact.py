@@ -53,6 +53,9 @@ def test_shared_vectors(case):
         assert _join(needle) not in out
     for needle in case["must_contain"]:
         assert _join(needle) in out
+    if "expected" in case:
+        assert out == case["expected"]
+    assert redact_text(out) == out  # a masked output is a fixed point
 
 
 def test_megabyte_inputs_are_scanned_in_linear_time():
@@ -506,3 +509,61 @@ def test_megabyte_assignment_floods_are_scanned_in_linear_time_and_still_find_th
         out = redact_text(text)
         assert time.perf_counter() - started < 3.0, unit
         assert out.endswith("password=" + REDACTED) and "hunter2" not in out, unit
+
+
+# ---- RV-J fixes: new carriers (the same shapes run as shared vectors in both implementations) -----------------------------
+def test_new_carrier_flood_inputs_are_linear_and_still_find_the_password():
+    import time
+    for unit in ("mysql ", "docker login ", "sshpass -p ", "-u a:b ", "- name: PASSWORD\n  value: ", "password: |\n  ", "STRIPE_KEY=",
+                 "redis-cli ", "- name: ", "name: PASSWORD\n", "password:  "):
+        text = unit * (1_000_000 // len(unit)) + "\npassword=hunter2"
+        started = time.perf_counter()
+        out = redact_text(text)
+        assert time.perf_counter() - started < 3.0, unit
+        assert out.endswith("password=" + REDACTED) and "hunter2" not in out, unit
+
+
+def test_ten_megabytes_of_new_carrier_text_complete():
+    assert redact_text(("- name: PASSWORD\n  value: x\nmysql -u a -pb db\n" * 250_000)).count(REDACTED) == 500_000
+
+
+@pytest.mark.parametrize("text", [
+    f"{GHP} API_KEY=zzzz1234 mysql -u root -pS3cretPass db docker login -u me -p S3cretPass",
+    "- name: DB_PASSWORD\n  value: pw1\nsecret: |\n  a\n  b\nplain: x\n",
+    "const cfg = { password: \"x1\", user: 'x' }",
+    "STRIPE_KEY=aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE2fG4 curl -u a:b redis-cli -a pw",
+])
+def test_redaction_is_idempotent_on_the_new_carriers(text):
+    once = redact_text(text)
+    assert redact_text(once) == once
+
+
+def test_dict_values_of_vendor_key_names_are_masked_by_shape():
+    long = "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE2fG4"
+    assert redact({"STRIPE_KEY": long, "sort_key": long, "cache_key": long, "SERVICE_KEY": "short"}) == {
+        "STRIPE_KEY": REDACTED, "sort_key": long, "cache_key": long, "SERVICE_KEY": "short"}
+    assert redact_text(f'{{"STRIPE_KEY": "{long}", "sort_key": "{long}"}}') == f'{{"STRIPE_KEY": "{REDACTED}", "sort_key": "{long}"}}'
+
+
+def test_account_key_names_are_sensitive():
+    assert is_sensitive_key("AccountKey") and is_sensitive_key("STORAGE_ACCOUNT_KEY") and is_sensitive_key("SharedAccessKey")
+
+
+# ---- RV-J P2-1: identifiers are never redacted ------------------------------------------------------------------------------
+@pytest.mark.parametrize("task_id", ["sk-onboarding-flow-v2", "github_pat_" + "ABCDEFGHIJKLMNOPQRSTUV", "T-plain-0001"])
+def test_runlog_keeps_identifier_fields_and_redacts_free_text(tmp_path, monkeypatch, task_id):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    from swarm import runlog
+    rec = runlog.emit("swarm.run.activity", {"run_id": f"{task_id}.a1", "handover_id": f"H-{task_id}", "task_id": task_id,
+                                             "text": f"token {GHP} ok", "agent": "a05-backend"},
+                      source="test", correlation_id="c1", task_id=task_id, root=tmp_path, tee=False)
+    assert rec["payload"] == {"run_id": f"{task_id}.a1", "handover_id": f"H-{task_id}", "task_id": task_id,
+                              "text": f"token {REDACTED} ok", "agent": "a05-backend"}
+    assert runlog.read_events(task_id=task_id, root=tmp_path)[0]["payload"]["run_id"] == f"{task_id}.a1"
+
+
+def test_runlog_redacts_an_identifier_field_that_is_not_id_shaped(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
+    from swarm import runlog
+    rec = runlog.emit("x.y", {"run_id": f"oops password={'hunter2hunter2'}"}, source="test", root=tmp_path, tee=False)
+    assert "hunter2" not in rec["payload"]["run_id"]

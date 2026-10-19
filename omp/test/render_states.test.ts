@@ -14,16 +14,18 @@ import {
   plainText,
   renderCaptures,
   SCENARIOS,
+  TOKEN_SCENARIOS,
   WIDTHS,
 } from "./fixtures/bar_states.ts";
 
 /**
- * docs/swarm-bar.md shows every state of the bar at widths 40, 80 and 120 as rendered by the real renderer with the real omp
- * theme. This file keeps that page honest:
+ * docs/swarm-bar.md shows every state of the bar at widths 40, 80 and 120, and its token-savings chips, as rendered by the real
+ * renderer with the real omp theme. This file keeps that page honest:
  *   - the colour fixture (`fixtures/bar_states.ansi`) equals what the renderer produces today (needs omp's pi-tui theme
  *     sources; skipped, loudly, where they are not installed);
  *   - every capture in the doc equals the fixture with the ANSI removed (needs nothing);
- *   - the captures satisfy the bar's contract on their own (width, row count, glyph and word of every state, `+N more`).
+ *   - the captures satisfy the bar's contract on their own (exactly two rows of exactly the capture's width, caps in the same
+ *     columns, glyph and word of every state, `+N more`, chips right-anchored and dropped by priority).
  * Refresh after a renderer change: `bun omp/test/fixtures/bar_states.ts --write` (see the doc, section 11).
  */
 
@@ -46,10 +48,11 @@ describe("bar captures vs the renderer", () => {
   });
 
   test("the fixture covers every scenario at every width, plus the width-less captures", () => {
-    for (const scenario of SCENARIOS) {
+    for (const scenario of [...SCENARIOS, ...TOKEN_SCENARIOS]) {
       for (const width of scenario.widths) expect(Object.keys(fixture)).toContain(`${scenario.name}@${width}`);
     }
     expect(WIDTHS).toEqual([40, 80, 120]);
+    expect(SCENARIOS.map((scenario) => scenario.name)).toEqual(expect.arrayContaining(["idle", "loading", "active", "overflow", "completed", "failed", "error"]));
     for (const key of ["status", "headless", "spinner:animated+0s@80", "spinner:reduced+0s@80", "linger:done+19s@80", "linger:failed+600s@80"]) {
       expect(Object.keys(fixture)).toContain(key);
     }
@@ -71,27 +74,43 @@ describe("bar captures vs the renderer", () => {
 describe("the captures satisfy the bar contract", () => {
   const widthKeys = Object.keys(fixture).filter((key) => widthOf(key) !== undefined);
 
-  test("at most two rows, none wider than its width, no stray escape sequence", () => {
-    expect(widthKeys.length).toBeGreaterThan(30);
+  test("every bar is exactly two rows, every row exactly as wide as its capture says, no stray escape sequence", () => {
+    expect(widthKeys.length).toBeGreaterThan(40);
     for (const key of widthKeys) {
       const width = widthOf(key) as number;
       const lines = fixture[key];
-      expect({ key, rows: lines.length <= 2 }).toEqual({ key, rows: true });
-      for (const line of lines) {
-        expect({ key, width: displayWidth(line) <= width }).toEqual({ key, width: true });
+      // the spinner captures show row 2 only
+      expect({ key, rows: lines.length }).toEqual({ key, rows: key.startsWith("spinner:") ? 1 : 2 });
+      for (const [index, line] of lines.entries()) {
+        expect({ key, row: index, width: displayWidth(line) }).toEqual({ key, row: index, width });
         // every escape is a complete SGR sequence: nothing is left once they are stripped
         expect({ key, stray: stripAnsi(line).includes("\x1b") }).toEqual({ key, stray: false });
       }
     }
   });
 
-  test("idle draws nothing; the settled rows leave exactly at their linger (20 s done, 600 s failed)", () => {
-    for (const width of WIDTHS) expect(fixture[`idle@${width}`]).toEqual([]);
-    expect(fixture["linger:done+0s@80"]).toHaveLength(2);
-    expect(fixture["linger:done+19s@80"]).toHaveLength(2);
-    expect(fixture["linger:done+20s@80"]).toEqual([]);
-    expect(fixture["linger:failed+599s@80"]).toHaveLength(2);
-    expect(fixture["linger:failed+600s@80"]).toEqual([]);
+  test("the caps sit in the first and last column of every row, whatever the state", () => {
+    for (const key of widthKeys) {
+      for (const [index, line] of fixture[key].entries()) {
+        const columns = Array.from(plainText(line));
+        expect({ key, row: index, caps: [columns[0], columns[columns.length - 1]] }).toEqual({ key, row: index, caps: ["◖", "◗"] });
+      }
+    }
+  });
+
+  test("idle keeps its two rows at every width; the settled rows give way to them exactly at their linger (20 s done, 600 s failed)", () => {
+    for (const width of WIDTHS) {
+      const [first, second] = fixture[`idle@${width}`].map(plainText);
+      expect({ width, first: first.includes("○ swarm idle") }).toEqual({ width, first: true });
+      expect({ width, second: second.includes("no subagents running") }).toEqual({ width, second: true });
+    }
+    const first = (key: string): string => plainText(fixture[key][0]);
+    for (const key of ["linger:done+0s@80", "linger:done+19s@80"]) expect({ key, done: first(key).includes("3 done") }).toEqual({ key, done: true });
+    expect(first("linger:done+20s@80")).toContain("○ swarm idle");
+    expect(first("linger:done+20s@80")).not.toContain("done");
+    expect(first("linger:failed+599s@80")).toContain("1 fail");
+    expect(first("linger:failed+600s@80")).toContain("○ swarm idle");
+    expect(plainText(fixture["linger:failed+600s@80"][1])).toContain("no subagents running");
   });
 
   test("a state is never colour alone: every state has its glyph and, where not self-evident, its word", () => {
@@ -137,11 +156,13 @@ describe("the captures satisfy the bar contract", () => {
     expect(counts[1]).toBeGreaterThan(counts[2]);
   });
 
-  test("completed ends in the success mark, failed in the failure mark, error in the marker", () => {
+  test("completed ends in the success mark, failed in the failure mark, error in the marker with the idle placeholder under it", () => {
     for (const width of WIDTHS) {
       expect(plainText(fixture[`completed@${width}`][0])).toContain("✓ swarm");
       expect(plainText(fixture[`failed@${width}`][0])).toContain("✕ swarm");
-      expect(fixture[`error@${width}`].map(plainText)).toEqual(["◖ swarm: telemetry unavailable ◗"]);
+      const [first, second] = fixture[`error@${width}`].map(plainText);
+      expect({ width, first: first.includes("swarm: telemetry unavailable") }).toEqual({ width, first: true });
+      expect({ width, second: second.includes("no subagents running") }).toEqual({ width, second: true });
     }
     expect(plainText(fixture["error-rows@80"][0])).toContain("telemetry unavailable");
   });
@@ -164,6 +185,74 @@ describe("the captures satisfy the bar contract", () => {
   });
 });
 
+describe("the token chips (row 1, right)", () => {
+  /** Contract: on-screen order left to right, and the drop priority of each chip of the full snapshot the fixture draws. */
+  const CHIPS: ReadonlyArray<readonly [string, number]> = [
+    ["graph ready", 11],
+    ["bill 9.4k · out 2.1k", 10],
+    ["idle 1200ms", 9],
+    ["payload 156523c", 8],
+    ["query 85ms", 7],
+    ["rtk +4.1k", 6],
+    ["cost 12c", 5],
+    ["turn 3200ms", 4],
+    ["before 61.4k · now 13.2k", 3],
+    ["ttft 640ms", 2],
+    ["cache 87%", 1],
+    ["saved 48.2k", 0],
+  ];
+  const rows = (key: string): string[] => fixture[key].map(plainText);
+  const shown = (key: string): Array<readonly [string, number]> => CHIPS.filter(([chip]) => rows(key)[0].includes(chip));
+
+  test("chips sit at the right end of row 1 with `saved` right-most; row 2 never carries them", () => {
+    for (const key of ["tokens-active@80", "tokens-active@120", "tokens-idle@120", "tokens-idle@200", "tokens-minimal@80"]) {
+      expect({ key, end: rows(key)[0].endsWith("saved 48.2k ◗") }).toEqual({ key, end: true });
+      expect({ key, row2: rows(key)[1].includes("saved") }).toEqual({ key, row2: false });
+    }
+  });
+
+  test("a wider row shows the chips of a narrower one plus more, in the same on-screen order; the most important are the last to go", () => {
+    // the widest row shows the whole list, in order
+    expect(shown("tokens-idle@200")).toEqual(CHIPS);
+    const at = (chip: string): number => rows("tokens-idle@200")[0].indexOf(chip);
+    CHIPS.slice(1).forEach(([chip], index) => expect({ chip, after: at(chip) > at(CHIPS[index][0]) }).toEqual({ chip, after: true }));
+    for (const [narrow, wide] of [["tokens-idle@120", "tokens-idle@200"], ["tokens-active@80", "tokens-active@120"]]) {
+      const kept = shown(narrow);
+      const more = shown(wide);
+      expect({ narrow, wide, subset: kept.every(([chip]) => more.some(([other]) => other === chip)) }).toEqual({ narrow, wide, subset: true });
+      expect({ narrow, wide, strictlyMore: more.length > kept.length }).toEqual({ narrow, wide, strictlyMore: true });
+    }
+    for (const key of ["tokens-idle@120", "tokens-active@80", "tokens-active@120"]) {
+      const kept = shown(key);
+      const dropped = CHIPS.filter((chip) => !kept.includes(chip));
+      expect({ key, saved: kept.some(([chip]) => chip === "saved 48.2k") }).toEqual({ key, saved: true });
+      expect(dropped.length).toBeGreaterThan(0);
+      // priority, never position: nothing less important than a dropped chip survives
+      expect({ key, ok: Math.max(...kept.map(([, priority]) => priority)) <= Math.min(...dropped.map(([, priority]) => priority)) }).toEqual({ key, ok: true });
+    }
+  });
+
+  test("a snapshot with only the required counts shows only those chips; nothing is invented", () => {
+    const text = rows("tokens-minimal@80")[0];
+    expect(text).toContain("before 61.4k · now 13.2k");
+    expect(text).toContain("saved 48.2k");
+    expect(text).not.toMatch(/cache|ttft|turn \d|cost|rtk|payload|query|bill|graph|idle \d|moved/);
+  });
+
+  test("a snapshot of another session is not drawn, and the chips never change row 2 or the left of row 1", () => {
+    expect(rows("tokens-foreign@80")).toEqual(rows("active@80"));
+    expect(rows("tokens-foreign@80")[0]).not.toMatch(/saved|cache/);
+    expect(rows("tokens-active@80")[1]).toBe(rows("active@80")[1]);
+    expect(rows("tokens-active@80")[0]).toContain("● swarm 5m00s");
+  });
+
+  test("an idle swarm keeps the chips: the idle placeholder on the left, the savings on the right", () => {
+    const [first, second] = rows("tokens-idle@120");
+    expect(first.startsWith("◖ ○ swarm idle")).toBe(true);
+    expect(second).toContain("no subagents running");
+  });
+});
+
 describe("docs/swarm-bar.md names what the bar reads", () => {
   test("every switch and every status word of the renderer is documented", () => {
     for (const name of [
@@ -180,8 +269,29 @@ describe("docs/swarm-bar.md names what the bar reads", () => {
       "task:subagent:lifecycle",
       "setStatus",
       "+N more",
+      "bars:restack",
+      "token-opt:savings",
+      "$HOME/.omp/agent/token-opt/live.json",
     ]) {
       expect({ name, documented: doc.includes(name) }).toEqual({ name, documented: true });
+    }
+    for (const chip of [
+      "graph ready",
+      "bill <n>",
+      "idle <n>ms",
+      "payload <n>c",
+      "query <n>ms",
+      "rtk +<n>",
+      "cost <n>c",
+      "turn <n>ms",
+      "before <n> · now <n>",
+      "prefix moved",
+      "tools moved",
+      "ttft <n>ms",
+      "cache <n>%",
+      "saved <n>",
+    ]) {
+      expect({ chip, documented: doc.includes(`\`${chip}`) }).toEqual({ chip, documented: true });
     }
     for (const word of ["FAIL", "TIMEOUT", "STALL", "queued", "wait", "handoff", "cancelled", "start"]) {
       expect({ word, documented: doc.includes(word) }).toEqual({ word, documented: true });

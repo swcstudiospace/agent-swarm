@@ -2,8 +2,8 @@
 
 v2.2 turns the swarm from a round-by-round runner into a bounded, observable, continuously scheduled runtime. Every
 agent gets a shared baseline of tools and skills plus its own, a versioned handover document passes work between
-agents, one telemetry channel feeds the logs and the UI, and a third omp bar shows every subagent's state and elapsed
-time. Nothing here changes the Task Store state machine, the signed envelopes, the gates or the classifier: the new
+agents, one telemetry channel feeds the logs and the UI, and the omp swarm bar (always mounted, topmost above the editor)
+shows every subagent's state and elapsed time and the session's token savings. Nothing here changes the Task Store state machine, the signed envelopes, the gates or the classifier: the new
 runtime state is a projection over them.
 
 Each statement below was checked against the code and, where it names a command, run in a scratch copy with a
@@ -21,7 +21,7 @@ flowchart LR
   T --> EV[(events.jsonl swarm.event.v1)]
   T --> LV[(live.json swarm.live.v1)]
   DB -.->|derive_snapshot| LV
-  LV --> BAR[omp third bar]
+  LV --> BAR[omp swarm bar]
   PI[pi.events task:subagent:*] --> BAR
   A -->|swarm_catalog / swarm_tool_call| REG[tool registry agents.json]
   A -->|shared_handover_*| HO[(handovers/ corr / task.seq.json)]
@@ -210,7 +210,13 @@ such as `A05`, never slugs), `created_wall`, `goal`, `completed[]`, `remaining[]
 - **Storage:** `<swarm_dir>/handovers/<correlation_id>/<task_id>.<seq>.json`, canonical JSON. `seq` is reserved with an
   exclusive create, so concurrent writers never collide; the newest handover is the highest `seq` inside the task's
   correlation. Writing a document identical in content to the task's newest handover stores nothing new and returns
-  `duplicate: true`; a changed document gets a new `seq`.
+  `duplicate: true`; a changed document gets a new `seq`. The duplicate check reads the newest file before the seq is
+  reserved, so two writers that submit the same document at the same instant both pass it and both are stored (two
+  seqs, same content): the history is append-only and a repeated entry is harmless, so this is intended and not
+  guarded by a lock. An empty reserved file older than 60 seconds (`RESERVE_RECLAIM_S`: the writer died between the
+  reservation and its write) is removed by the next write of that task; when it was the highest `seq` the new
+  document takes that `seq`, so no gap is left. Ids are matched whole (a trailing newline is refused) and the size
+  cap is never above the 1 MiB read limit, whatever `SWARM_HANDOVER_MAX_BYTES` says.
 - **Integrity:** `digest` is the sha256 of the canonical document without its own `digest`. Read recomputes it, so an
   edited file is rejected (`malformed`).
 - **Size:** at most `SWARM_HANDOVER_MAX_BYTES` (16384). A larger document is summarized deterministically, with no
@@ -229,8 +235,10 @@ such as `A05`, never slugs), `created_wall`, `goal`, `completed[]`, `remaining[]
 `from_agent` is always the authenticated caller (a payload that names someone else is refused). Every reader names that
 same producer `task_id`:
 
-- the runner does it for you: each assignment carries a `## Handover` block built from the latest valid handover of
-  every dependency of the task (goal, remaining, blockers, open questions, constraints, artifacts and verification;
+- the runner does it for you: each assignment carries a `## Handover` block built from `inspect_handover(dependency,
+  to_agent=<the task's agent>)`, the same selection and ok/partial gate the shared tools apply (the dependency's own
+  plan, the handover addressed to the receiving agent, else the newest one as context; never a handover of an older
+  plan; goal, remaining, blockers, open questions, constraints, artifacts and verification;
   1200 characters per dependency, 4000 in total; missing, malformed or stale handovers are skipped, a handover is
   context and never gates a dispatch);
 - `shared_handover_read`, `_verify` and `_receipt` with the producer's `task_id` read, judge and acknowledge it
@@ -413,9 +421,11 @@ passed.
 
 ### 9.4 Read the bar
 
-The bar is the third widget above the editor. Summary line: `swarm <elapsed> | N run | N queued | N done | N fail |
-slots R/L`; second line: one row per run, worst state first, `<glyph> <agent> <elapsed> <activity>`. Every state has a
-glyph and a word. The full legend, states, colors and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
+The bar is the topmost widget above the editor (above Ultrathink's bar and omp's own), always mounted, exactly two rows at
+the full terminal width. Row 1: `swarm <elapsed> | N run | N queued | N done | N fail | slots R/L` on the left, the
+session's token savings chips on the right; row 2: one row per run, worst state first, `<glyph> <agent> <elapsed>
+<activity>`, or `no subagents running` when idle. Every state has a glyph and a word. The full legend, states, colors,
+token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 
 ## 10. Configuration
 
@@ -439,7 +449,7 @@ glyph and a word. The full legend, states, colors and degraded markers are in [d
 | `SWARM_HANDOVER_MAX_BYTES` | 16384 | `swarm/handover.py` | Size cap of one handover |
 | `SWARM_HANDOVER_STALE_S` | 21600 | `swarm/handover.py` | Age after which a handover is `stale` |
 | `SWARM_TOOL_OUTPUT_MAX_BYTES` | 262144 | `swarm/tool_registry.py` | Largest registry result in bytes (strict JSON, compact UTF-8); an oversized result is withheld as `PARTIAL_SUCCESS`; clamped to 4096..16777216, a malformed value means the default |
-| `SWARM_BAR` | on | `omp/src/swarm_bar.ts` | `off` disables the bar |
+| `SWARM_BAR` | on | `omp/src/swarm_bar.ts` | `off` disables the bar, its token chips and the status segment |
 | `SWARM_BAR_LINGER_S` / `SWARM_BAR_FAIL_LINGER_S` | 20 / 600 | bar | How long a finished / failed row stays |
 | `SWARM_BAR_REDUCED_MOTION` | unset | bar | `1` freezes the spinner |
 | `SWARM_BAR_IDLE_POLL_MS` | 2000 | `omp/src/swarm_bar.ts` | Period of the idle `stat` watcher of `live.json`; clamped to 500..30000, a malformed value means 2000 |
@@ -511,10 +521,20 @@ failure). A write error names the field (`/artifacts/0/digest: ...`). See the ru
   creates gate reruns and moves tasks to DONE in the Task Store); every other lane tool is READ. This is review and test
   enforced, not an OS sandbox.
 - **Plan mode.** `swarm_tool_call` refuses WRITE tools in omp plan mode.
-- **Redaction.** `runlog.emit` redacts every payload (tokens, keys, `NAME=value` with a sensitive name, URL userinfo,
-  PEM blocks, JWTs) before it is written; the runner redacts the `.md` result evidence of a session before it reaches
-  `results/`; handover free text is redacted before hashing; ids, digests and correlation ids are left alone.
-  Redaction is pattern-based and best effort: do not put secrets in handovers, scratchpad values or log messages.
+- **Redaction.** `runlog.emit` redacts every payload before it is written; the runner redacts the `.md` result evidence of a
+  session before it reaches `results/`; handover free text is redacted before hashing. Identifier fields (`run_id`,
+  `handover_id`, `task_id`, `parent_id`, `correlation_id`, digests) are validated identifiers, not free text, and are left
+  alone: a task id shaped like a token (`sk-onboarding-flow-v2`) keeps its telemetry, handover and timeout state.
+  Redaction is pattern-based and **best effort**, never a guarantee: do not put secrets in handovers, scratchpad values or
+  log messages. Carriers covered (`swarm/redact.py` and its TypeScript twin in the bar, which run the same vectors in
+  `tests/fixtures/redact_cases.json`): vendor tokens (GitHub, Stripe, Google, SendGrid, Slack, npm, GitLab, DigitalOcean,
+  Hugging Face, AWS key ids, JWTs, PEM blocks), `Authorization` / `Cookie` headers, URL userinfo, `NAME=value`,
+  `NAME: value` and `--flag value` with a sensitive name (padding of up to 32 blanks), JSON and re-serialised JSON
+  `"name": "value"` pairs, `<vendor>_KEY=` with a credential-shaped value, Azure `AccountKey=`, command-line forms
+  (`curl -u user:pass`, `mysql -pSECRET`, `sshpass -p`, `docker login -p`, `redis-cli -a`, `sqlcmd -P`, `-passin pass:`),
+  Kubernetes `- name: X_PASSWORD` / `value:` pairs and YAML block scalars (`password: |`). Not covered: a secret that has
+  no recognisable name or shape, `{"name": "DB_PASSWORD", "value": "x"}` JSON pairs, a password containing a quote
+  inside a quoted value, and text split by characters the pattern does not expect.
 - **Audit.** One local-only `swarm.tool.call` event per registry call that is audited (state dir present or WRITE tool):
   tool, caller, state, duration. No payload.
 - **Output and input hygiene.** Registry results are strict JSON and at most `SWARM_TOOL_OUTPUT_MAX_BYTES`; an oversized

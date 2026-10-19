@@ -50,9 +50,10 @@ MANDATORY = ("goal", "remaining", "blockers", "open_questions", "constraints")
 STRING_LISTS = ("completed", "remaining", "blockers", "open_questions", "constraints")
 CLIP_ITEM = 120  # characters an entry of completed/decisions keeps once the document had to be shortened
 MAX_FILE_BYTES = 1 << 20  # a file larger than this is never parsed, whatever the cap says
+RESERVE_RECLAIM_S = 60.0  # an empty reserved handover file older than this was left by a writer that died before it wrote
 MAX_REASON = 400
-_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DIGEST_PLACEHOLDER = "sha256:" + "0" * 64
 _PENDING_ID = "9" * 6  # provisional seq width: the real id is never longer, so a size that fits now still fits later
 _GENERATED = ("handover_id", "created_wall", "digest", "bytes")
@@ -87,8 +88,9 @@ def _env_number(name: str, default: float) -> float:
 
 
 def max_bytes_default() -> int:
-    """Size cap of one stored handover: `SWARM_HANDOVER_MAX_BYTES`, default 16384."""
-    return int(_env_number("SWARM_HANDOVER_MAX_BYTES", DEFAULT_MAX_BYTES))
+    """Size cap of one stored handover: `SWARM_HANDOVER_MAX_BYTES`, default 16384, never above `MAX_FILE_BYTES` (a larger
+    file is refused by every read)."""
+    return min(int(_env_number("SWARM_HANDOVER_MAX_BYTES", DEFAULT_MAX_BYTES)), MAX_FILE_BYTES)
 
 
 def stale_after_default() -> float:
@@ -368,7 +370,7 @@ def list_handovers(task_id: str, *, root: str | Path | None = None, correlation_
     base = handovers_dir(root)
     if not base.is_dir():
         return []
-    pattern = re.compile(r"^" + re.escape(task_id) + r"\.(\d+)\.json$")
+    pattern = re.compile(re.escape(task_id) + r"\.(\d+)\.json\Z")
     dirs = [base / _safe_id(correlation_id, "correlation_id")] if correlation_id else sorted(p for p in base.iterdir() if p.is_dir())
     found: list[Candidate] = []
     for folder in dirs:
@@ -427,11 +429,29 @@ def _reserve(folder: Path, task_id: str, start: int) -> tuple[int, Path]:
 
 
 def _next_seq(folder: Path, task_id: str) -> int:
-    pattern = re.compile(r"^" + re.escape(task_id) + r"\.(\d+)\.json$")
+    """One above the highest seq of `task_id` in `folder`. An EMPTY file older than `RESERVE_RECLAIM_S` is the husk of a
+    writer that died between the reservation and its first write: it is removed (so its seq is reused when it was the
+    highest, and no reader meets a permanently empty file); a young empty file belongs to a writer at work and counts."""
+    pattern = re.compile(re.escape(task_id) + r"\.(\d+)\.json\Z")
+    seqs: list[int] = []
     try:
-        seqs = [int(m.group(1)) for name in os.listdir(folder) if (m := pattern.match(name))]
+        names = os.listdir(folder)
     except OSError:
-        seqs = []
+        return 1
+    for name in names:
+        match = pattern.match(name)
+        if not match:
+            continue
+        try:
+            info = (folder / name).stat()
+            if info.st_size == 0 and time.time() - info.st_mtime > RESERVE_RECLAIM_S:
+                (folder / name).unlink()
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass
+        seqs.append(int(match.group(1)))
     return max(seqs, default=0) + 1
 
 
@@ -577,7 +597,7 @@ def read_handover(ref: str | Path, *, root: str | Path | None = None) -> dict:
             problems.append("/digest: required")
         elif digest != compute_digest(doc):
             problems.append("/digest: does not match the content; the document was modified after it was written")
-        match = re.match(r"^(?P<task>.+)\.(?P<seq>\d+)\.json$", path.name)
+        match = re.match(r"(?P<task>.+)\.(?P<seq>\d+)\.json\Z", path.name)
         if match and (doc["task_id"] != match["task"] or doc["handover_id"] != f"{match['task']}.{match['seq']}"):
             problems.append(f"/handover_id: {doc['handover_id']!r} does not belong to file {path.name}")
         if doc["correlation_id"] != path.parent.name:
@@ -754,7 +774,7 @@ def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = 
 
     Returns `{handover_id, seq, ref, path, digest, bytes, summarized, duplicate, redacted, emitted, document}`.
     """
-    cap = max_bytes if max_bytes is not None else max_bytes_default()
+    cap = min(max_bytes if max_bytes is not None else max_bytes_default(), MAX_FILE_BYTES)
     prepared = _prepare(doc, clock)
     problems = validate_handover(prepared)
     if problems:

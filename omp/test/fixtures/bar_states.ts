@@ -1,6 +1,7 @@
 /**
  * Every state of the Agent Swarm bar, rendered by the REAL renderer (`renderSwarmBar`) with the REAL omp theme
- * (`dark-lavender`, truecolor, nerd symbols: the user's configured theme), at widths 40, 80 and 120.
+ * (`dark-lavender`, truecolor, nerd symbols: the user's configured theme). Every row is exactly as wide as its capture says:
+ * the seven states at widths 40, 80 and 120, and the token-savings captures (`TOKEN_SCENARIOS`) at the widths they name.
  *
  * Used by `omp/test/render_states.test.ts` (docs/swarm-bar.md and `bar_states.ansi` must equal what the renderer produces
  * today). To refresh both after a renderer change, from the repo root:
@@ -26,6 +27,7 @@ import {
   statusText,
 } from "../../src/swarm_bar.ts";
 import { stripAnsi } from "../../src/swarm_dock.ts";
+import type { TokenSavingsSnapshot } from "../../src/token_savings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ANSI_FIXTURE = join(HERE, "bar_states.ansi");
@@ -239,7 +241,7 @@ function backgroundSpecialists(model: SwarmBarModel): void {
 }
 
 export const SCENARIOS: readonly Scenario[] = [
-  { name: "idle", title: "idle: nothing to show", at: T0, widths: WIDTHS, build: () => {} },
+  { name: "idle", title: "idle: two quiet rows, nothing live", at: T0, widths: WIDTHS, build: () => {} },
   {
     name: "loading",
     title: "loading: spawned, nothing reported yet",
@@ -300,6 +302,58 @@ export const SCENARIOS: readonly Scenario[] = [
     widths: WIDTHS,
     reducedMotion: true,
     build: backgroundSpecialists,
+  },
+];
+
+const SESSION = "demo-session";
+
+/** A valid `token-opt:savings` snapshot: the required counts (61.4k before, 13.2k now, 48.2k saved) plus whatever `extra` measures. */
+function snapshot(extra: Partial<TokenSavingsSnapshot> = {}): TokenSavingsSnapshot {
+  return { v: 1, sessionId: SESSION, updatedAt: 1_700_000_000_000, baselineTokens: 61_400, currentTokens: 13_200, savedTokens: 48_200, points: [], ...extra };
+}
+
+/** Every optional measurement the producer can add, so every chip of the doc's table appears when the row is wide enough. */
+const FULL_TOKENS = snapshot({
+  lastTurnMs: 3200,
+  cacheHitPct: 87,
+  lastQueryMs: 85,
+  rtkSavedTokens: 4100,
+  lastPayloadChars: 156_523,
+  ttftMs: 640,
+  lastIdleMs: 1200,
+  costCents: 12,
+  providerInput: 9400,
+  providerOutput: 2100,
+  graphReady: 1,
+});
+
+function withTokens(build: (model: SwarmBarModel) => void, tokens: TokenSavingsSnapshot): (model: SwarmBarModel) => void {
+  return (model) => {
+    build(model);
+    model.sessionId = SESSION;
+    model.tokens = tokens;
+  };
+}
+
+/** Row 1's right-hand token chips. Captured by name and width like the states; kept apart so `SCENARIOS` stays the seven states. */
+export const TOKEN_SCENARIOS: readonly Scenario[] = [
+  {
+    name: "tokens-active",
+    title: "active with a full snapshot: the chips that fit, least important dropped first",
+    at: T0,
+    widths: [80, 120],
+    reducedMotion: true,
+    build: withTokens(fromLive(ACTIVE), FULL_TOKENS),
+  },
+  { name: "tokens-idle", title: "idle with a full snapshot: 200 columns hold the whole chip list", at: T0, widths: [120, 200], build: withTokens(() => {}, FULL_TOKENS) },
+  { name: "tokens-minimal", title: "idle with a snapshot that carries only the required counts", at: T0, widths: [80], build: withTokens(() => {}, snapshot()) },
+  {
+    name: "tokens-foreign",
+    title: "a snapshot of another session is not shown once this session's id is known",
+    at: T0,
+    widths: [80],
+    reducedMotion: true,
+    build: withTokens(fromLive(ACTIVE), snapshot({ sessionId: "another-session", cacheHitPct: 99 })),
   },
 ];
 
@@ -366,11 +420,11 @@ export function headlessLines(): string[] {
 export function renderCaptures(theme: Theme): Captures {
   const captures: Captures = {};
   const statusRows: string[] = [];
-  for (const scenario of SCENARIOS) {
+  for (const scenario of [...SCENARIOS, ...TOKEN_SCENARIOS]) {
     const model = createModel({ reducedMotion: scenario.reducedMotion ?? false });
     scenario.build(model);
     for (const width of scenario.widths) captures[`${scenario.name}@${width}`] = render(theme, model, width, scenario.at);
-    statusRows.push(`${scenario.name.padEnd(12)} ${statusText(model, scenario.at) ?? "(status cleared)"}`);
+    if (SCENARIOS.includes(scenario)) statusRows.push(`${scenario.name.padEnd(12)} ${statusText(model, scenario.at) ?? "(status cleared)"}`);
   }
   captures.status = statusRows;
   for (const entry of LINGER) {
@@ -401,8 +455,6 @@ export function plainText(line: string): string {
   return text;
 }
 
-const NOTHING = "(nothing is drawn)";
-
 export function serializeAnsi(captures: Captures): string {
   return Object.entries(captures)
     .map(([key, lines]) => `#### ${key} (${lines.length})\n${lines.map((line) => `${line}\n`).join("")}`)
@@ -431,12 +483,12 @@ const BLOCK = /<!-- capture:(\S+) -->\n```text\n([\s\S]*?)\n```\n<!-- \/capture 
 /** The captures a doc carries, as plain text rows. */
 export function parseDoc(doc: string): Record<string, string[]> {
   const found: Record<string, string[]> = {};
-  for (const match of doc.matchAll(BLOCK)) found[match[1]] = match[2] === NOTHING ? [] : match[2].split("\n");
+  for (const match of doc.matchAll(BLOCK)) found[match[1]] = match[2].split("\n");
   return found;
 }
 
 function block(key: string, lines: string[]): string {
-  const body = lines.length === 0 ? NOTHING : lines.map(plainText).join("\n");
+  const body = lines.map(plainText).join("\n");
   return `<!-- capture:${key} -->\n\`\`\`text\n${body}\n\`\`\`\n<!-- /capture -->`;
 }
 

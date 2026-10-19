@@ -97,6 +97,14 @@ def clip(value, limit: int = CLIP) -> str | None:
     return _clip_text(value if isinstance(value, str) else str(value), limit)
 
 
+def clip_id(value, limit: int = 64) -> str | None:
+    """Clip an identifier (task, run, handover id) for live.json WITHOUT redaction: validated ids are not free text, and a token-shaped
+    one (`sk-onboarding-flow-v2`) must stay readable and comparable. Anything that is not id-shaped is treated as free text (`clip`)."""
+    if isinstance(value, str) and runlog.ID_RE.fullmatch(value):
+        return value[:limit]
+    return clip(value, limit)
+
+
 @functools.lru_cache(maxsize=4096)
 def _clip_text(raw: str, limit: int) -> str:
     text = " ".join(redact_text(raw).split())
@@ -192,7 +200,7 @@ def _handovers_in(sdir: Path, corr: str | None, tasks: list[dict], side: str = "
                 if not valid:
                     break
                 if handover.agent_id_of(doc[side]) == agent:
-                    out[t["task_id"]] = clip(doc["handover_id"], 64) or doc["handover_id"][:64]
+                    out[t["task_id"]] = clip_id(doc["handover_id"], 64) or doc["handover_id"][:64]
                     break
     except Exception:  # noqa: BLE001 - a display projection: a handover module that misbehaves hides handover_in only
         log.debug("handover_in derivation failed", exc_info=True)
@@ -756,7 +764,7 @@ class Telemetry:
         """Emit `swarm.run.handover` for the run's agent handing work to `to_agent`."""
         with self._lock:
             run = self._run(run_id)
-            run.handover_out = clip(handover_id, 64)
+            run.handover_out = clip_id(handover_id, 64)
             self.emit("swarm.run.handover", {"run_id": run_id, "from_agent": run.agent, "to_agent": to_agent,
                                      "handover_id": handover_id, "digest": digest, "bytes": nbytes,
                                      "summarized": summarized}, task_id=run.task_id)
@@ -1020,7 +1028,7 @@ def derive_snapshot(root: str | Path | None = None, *, clock: Clock = SYSTEM_CLO
             "stalled": bool(state is RunState.RUNNING and since is not None and since > stall_after),
             "activity": clip(lp.get("text") or lp.get("activity")), "tool_calls": int(lp.get("tool_calls") or 0),
             "last_tool": clip(lp.get("tool") or lp.get("last_tool"), 64), "parent": t.get("parent_id"),
-            "handover_in": handover_in.get(t["task_id"]), "handover_out": clip(ho.get("handover_id"), 64), "error": error,
+            "handover_in": handover_in.get(t["task_id"]), "handover_out": clip_id(ho.get("handover_id"), 64), "error": error,
         })
 
     max_parallel = int((tick or {}).get("max_parallel") or _env_int("SWARM_MAX_PARALLEL", DEFAULT_MAX_PARALLEL))

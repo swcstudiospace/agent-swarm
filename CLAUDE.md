@@ -15,7 +15,7 @@ a Claude Code and Grok Build subagent and an omp task agent, generated from the 
 | `.grok/agents/*.md` | **Generated** Grok Build subagents |
 | `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). `tools:` adds the hidden swarm tools per agent (`SWARM_TOOLS`). Not a sandbox: the `tool_call` guard (`omp/src/guard.ts`) enforces the autonomy ceiling, swarm-state and depth rules in swarm sessions; read-only is unenforced |
 | `omp/skills/<name>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`): 15 visible per-agent index skills + `swarm-orchestrate`, and one hidden skill per source in `prompts/skills/<owner>/<short>.md` |
-| `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: eight typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`), the `tool_call` guard (`guard.ts`), the `before_agent_start` context hook (`hooks.ts`), the `/swarm` command (`commands.ts`) and the third bar (`swarm_bar.ts`) |
+| `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: eight typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`), the `tool_call` guard (`guard.ts`), the `before_agent_start` context hook (`hooks.ts`), the `/swarm` command (`commands.ts`) and the swarm bar (`swarm_bar.ts`) |
 | `omp/test/` | **Hand-written** `bun:test` suite for the package (`cd omp && bun run test`) |
 | `.omp/config.yml` | Committed omp project wiring: `extensions:` → `- omp` (the only file in `.omp/`) |
 | `skills/<slug>/SKILL.md` | Per-agent + `orchestrate` skills (copy with `--install-workspace`) |
@@ -128,7 +128,7 @@ The eight tools are `hidden` + `essential`; an agent only gets the ones its gene
 Mutating tools (`swarm_plan`, `swarm_ingest`, `swarm_transition`, `swarm_gate`, `swarm_assignment`) and `/swarm` refuse with E-POLICY in omp plan mode; `swarm_tool_call` refuses tools above READ there. Tests: `cd omp && bun run test` (package suite;
 `extension.test.ts` runs in its own process) and `bun test tests/ts` (root TS suite).
 
-The third bar (`omp/src/swarm_bar.ts`) shows every subagent's state and elapsed time above the editor; see [docs/swarm-bar.md](docs/swarm-bar.md). `SWARM_BAR=off` disables it.
+The swarm bar (`omp/src/swarm_bar.ts`) is the topmost bar above the editor, always mounted (two rows at the full terminal width, idle included): every subagent's state and elapsed time, and the session's token savings on the right of row 1; see [docs/swarm-bar.md](docs/swarm-bar.md). `SWARM_BAR=off` disables it, token chips included.
 
 Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `AGENTS.md` **Hooks**):
 
@@ -155,6 +155,6 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 
 ## v2.2 Swarm Command Center
 
-Continuous scheduler with a lifecycle state machine, one telemetry channel (`events.jsonl` + `live.json`), a versioned handover (`swarm.handover.v1`, `shared_handover_*` tools), a shared tool and skill baseline plus 10 to 15 own tools and skills per agent, and the third omp bar. Architecture, how-to guides, every env var and flag, troubleshooting, the security model and the known limits: [docs/swarm-command-center.md](docs/swarm-command-center.md). Operations (stalled run, cancel, rate limits, intake, `live.json`): [docs/operations-runbook.md](docs/operations-runbook.md).
+Continuous scheduler with a lifecycle state machine, one telemetry channel (`events.jsonl` + `live.json`), a versioned handover (`swarm.handover.v1`, `shared_handover_*` tools), a shared tool and skill baseline plus 10 to 15 own tools and skills per agent, and the omp swarm bar. Architecture, how-to guides, every env var and flag, troubleshooting, the security model and the known limits: [docs/swarm-command-center.md](docs/swarm-command-center.md). Operations (stalled run, cancel, rate limits, intake, `live.json`): [docs/operations-runbook.md](docs/operations-runbook.md).
 
 Registry calls (`swarm_tool_call`, `python3 -m swarm.tool_registry call`) refuse non-finite `number` inputs, return only strict JSON, and withhold a result larger than `SWARM_TOOL_OUTPUT_MAX_BYTES` (default 262144) as `PARTIAL_SUCCESS` with `output_withheld: true`. One failed task never lowers the parallelism; `SWARM_FAIL_STREAK` (default 3, `0` off) consecutive failures of distinct tasks halve it once. The bar's idle watcher period is `SWARM_BAR_IDLE_POLL_MS` (default 2000).

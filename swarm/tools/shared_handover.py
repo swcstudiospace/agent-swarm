@@ -271,7 +271,12 @@ def handover_validate(payload: dict) -> dict:
             doc = ho._prepare(doc, SYSTEM_CLOCK)
         problems = ho.validate_handover(doc)
         cap = ho.max_bytes_default()
-        size = ho.stored_size(doc) if not problems else 0
+        sizing = doc
+        if payload.get("draft") is True and isinstance(doc.get("task_id"), str):
+            # `handover_write` sizes with `<task_id>.<seq>` (a task id of up to 128 characters): the shorter provisional id
+            # would declare a document near the cap fine that the write then summarizes
+            sizing = {**doc, "handover_id": f"{doc['task_id']}.{ho._PENDING_ID}"}
+        size = ho.stored_size(sizing) if not problems else 0
         return {"state": "SUCCESS", "valid": not problems, "errors": [p[:400] for p in problems[:50]],
                 "bytes": size, "cap": cap, "would_summarize": size > cap}
 
@@ -348,7 +353,11 @@ def handover_bundle(payload: dict) -> dict:
             questions += [{"task_id": up["task_id"], "origin": "upstream", "question": q} for q in _upstream_questions(up) if _unresolved(up)]
         if doc:
             questions += [{"task_id": task_id, "origin": "handover", "question": _clip(q)} for q in doc["open_questions"]]
-        sources = [(task_id, (doc or {}).get("artifacts") or []), (task_id, own_artifacts), *upstream_artifacts]
+        # the task's own outputs as `artifact_check` judges them (newest digest per uri, superseded ones dropped), then the upstream rows
+        own_current, _superseded = _current_outputs(doc, own_artifacts)
+        sources = [(task_id, [item for item, _inherited in own_current]), *upstream_artifacts]
+        artifacts = _merge_artifacts(*sources)
+        acceptance = _acceptance(row)
         upstream = []
         for up in upstream_rows:
             result = (up.get("notes_json") or {}).get("result")
@@ -359,13 +368,16 @@ def handover_bundle(payload: dict) -> dict:
         out = {
             "state": "SUCCESS", "task_known": row is not None, "task": _task_view(row) if row else {},
             "goal": _clip((doc or {}).get("goal") or (row or {}).get("title") or "", 2000),
-            "acceptance": _acceptance(row)[:25],
+            "acceptance": acceptance[:25],
             "handover": {"status": status["status"], "reasons": status["reasons"], "document": doc or {},
                          "handover_id": status.get("handover_id", ""), "digest": status.get("digest", ""),
                          **({"context_only": True} if status.get("context_only") else {})},
-            "upstream": upstream[:10], "artifacts": _merge_artifacts(*sources)[:25], "verdicts": verdicts[:8],
+            "upstream": upstream[:10], "artifacts": artifacts[:25], "verdicts": verdicts[:8],
             "lease": _lease_view(row, clock), "attempts": attempts, "open_questions": questions[:MAX_QUESTIONS],
-            "truncated": False, "over_cap": False, "bytes": 0,
+            # a list cut here is cut for the receiver too: `truncated` is the one signal that something is missing
+            "truncated": (len(acceptance) > 25 or len(upstream) > 10 or len(artifacts) > 25 or len(verdicts) > 8
+                          or len(questions) > MAX_QUESTIONS),
+            "over_cap": False, "bytes": 0,
         }
         out = _scrub(out, _lease_ids(row, *upstream_rows))
         return _bound_bundle(out, ho.max_bytes_default() * 2)
@@ -401,7 +413,7 @@ def _bound_bundle(out: dict, cap: int) -> dict:
         room = max(0, cap - others - 256)  # 256: digits of `bytes`, flags and the summary marker the shortening adds
         out["handover"]["document"] = ho.summarize_handover(document, room, best_effort=True)
         shrunk = True
-    out["truncated"] = shrunk
+    out["truncated"] = out["truncated"] or shrunk
     _settle_bytes(out)
     if out["bytes"] > cap:
         out["over_cap"] = True
@@ -459,17 +471,40 @@ def handover_receipt(payload: dict) -> dict:
 
 
 # ---- artifacts -------------------------------------------------------------------------------------------------
+_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:")
+_HOST_SEGMENT_RE = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?\Z")
+
+
+def _is_reference(text: str, root: Path) -> bool:
+    """A relative `text` that names an image or package reference, not a file: it pins a digest (`app@sha256:...`), starts
+    with a registry host (`ghcr.io/org/app`, a dotted first segment) or tags its last segment (`org/app:1.2`). A workspace
+    file of that name wins: `./name` or an existing path is always a file."""
+    if text.startswith(("/", "./", "../")):
+        return False
+    first, sep, _rest = text.partition("/")
+    last = text.rsplit("/", 1)[-1]
+    shaped = "@sha256:" in text or (bool(sep) and _HOST_SEGMENT_RE.match(first) is not None) or ":" in last
+    if not shaped:
+        return False
+    try:
+        return not (root / text).exists()
+    except OSError:
+        return True
+
+
 def _local_path(uri: str) -> tuple[Path | None, str]:
     """The workspace file a uri names, else (None, why it is not checked). Only the workspace and the swarm dir are read."""
     text = uri.strip()
+    root = target_root()
     if text.startswith("file://"):
         parsed = urlparse(text)
         if parsed.netloc not in ("", "localhost"):
             return None, "file uri on a remote host"
         text = unquote(parsed.path)
-    elif re.match(r"^[A-Za-z][A-Za-z0-9+.-]+:", text):
+    elif _SCHEME_RE.match(text):
         return None, f"not a local file ({text.split(':', 1)[0]})"
-    root = target_root()
+    elif _is_reference(text, root):
+        return None, "not a local file (registry or package reference)"
     path = Path(text)
     resolved = (path if path.is_absolute() else root / path).resolve()
     for base in (root.resolve(), swarm_dir().resolve()):
@@ -518,19 +553,26 @@ def _check_output(item: dict, expected: str, inherited: dict | None = None) -> d
     if expected:
         out["producer_ok"] = "yes" if producer == expected else "no"
     path, why = _local_path(uri) if uri else (None, "no uri")
+    unreadable = ""
     if path is not None:
         out["exists"] = "yes" if path.is_file() else "no"
-        if path.is_file():
+        if out["exists"] == "yes":
             try:
                 actual, _size = _file_digest(path)
             except ho.HandoverInvalid as exc:
                 out["reason"] = exc.problems[0][:200]
+            except FileNotFoundError:
+                out["exists"] = "no"  # removed between the check and the read
+            except OSError as exc:  # one locked or unreadable file never costs the results of the other outputs
+                unreadable = f"unreadable: {exc.strerror or type(exc).__name__}"[:200]
             else:
                 out["actual_digest"] = actual
                 out["digest_match"] = "unchecked" if not declared else ("yes" if declared == actual else "no")
     else:
         out["reason"] = why
-    if out["exists"] == "no":
+    if unreadable:
+        out["status"], out["reason"] = "missing", unreadable
+    elif out["exists"] == "no":
         out["status"], out["reason"] = "missing", out["reason"] or "file does not exist"
     elif out["digest_match"] == "no":
         out["status"], out["reason"] = "digest_mismatch", f"declared {declared}, actual {out['actual_digest']}"

@@ -38,6 +38,7 @@ _NAME_RE = re.compile(rf"^{_NAME_PART}$")
 _STEP_RE = re.compile(r"^(\d+)\.\s+\S")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _WORD_RE = re.compile(r"[a-z0-9_]+")
+_CALL_RE = re.compile(r"\bcall(?:s|ing)?\s+`?([a-z0-9_]+)")
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,7 @@ def validate_skills(skills: list[Skill], agents_doc: dict, *, counts: bool = Tru
         if s.size > MAX_BYTES:
             err(f"{s.path}: {s.size} bytes exceeds the {MAX_BYTES}-byte limit")
         _check_tools(s, callers, agent_ids, slug_to_id, err)
+        _check_cited_tools(s, callers, err)
         _check_sections(s, err)
 
     if counts:
@@ -316,6 +318,17 @@ def _check_tools(s: Skill, callers: dict[str, set[str]], agent_ids: set[str], sl
                 err(f"{s.path}: shared skill uses {tool!r}, which {', '.join(missing)} may not call")
         elif s.owner_dir in slug_to_id and slug_to_id[s.owner_dir] not in callers[tool]:
             err(f"{s.path}: owner {s.owner_dir} ({slug_to_id[s.owner_dir]}) is not a permitted caller of {tool!r}")
+
+
+def _check_cited_tools(s: Skill, callers: dict[str, set[str]], err) -> None:
+    """Every registry tool a Procedure step calls (`call <tool>`, `Call `<tool>``) must be in the skill's own `tools`
+    list: the list is what the agent page and the generated skill advertise. A tool only mentioned (`never call the
+    <tool>`, `<tool> gives only names`) is prose, not a call."""
+    listed = set(s.tools)
+    for number, text in _procedure_steps(s.body):
+        called = {m.group(1) for m in _CALL_RE.finditer(text.lower())}
+        for tool in sorted(called & callers.keys() - listed):
+            err(f"{s.path}: procedure step {number} calls tool {tool!r}, which is not in the skill's tools list")
 
 
 def _check_sections(s: Skill, err) -> None:

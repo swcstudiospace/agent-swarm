@@ -342,3 +342,24 @@ def test_cli_unreadable_registry_is_not_a_pass(tmp_path):
 def test_real_tree_sources_are_valid_apart_from_counts():
     doc = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
     assert sr.validate_skills(sr.load_skills(ROOT), doc, counts=False) == []
+
+
+def test_a_tool_a_step_calls_must_be_in_the_tools_list(tmp_path):
+    """RV-I P3-8: handover-emit step 5 relied on `shared_handover_bundle` while its `tools:` list omitted it."""
+    text = (FIXTURES / "valid.md").read_text()
+    text = text.replace("2. Compare the normalized shapes pairwise with `be_route_collision`",
+                        "2. Call `be_coverage_delta` for the numbers, then compare the shapes pairwise with `be_route_collision`")
+    _place(tmp_path, "", OWNER, "route-review", text)
+    errors = _errors(tmp_path)
+    assert any("route-review.md" in e and "step 2 calls tool 'be_coverage_delta'" in e for e in errors), errors
+    listed = text.replace("[be_route_norm, be_route_collision]", "[be_route_norm, be_route_collision, be_coverage_delta]")
+    _place(tmp_path, "", OWNER, "route-review", listed)
+    assert _errors(tmp_path) == []
+
+
+def test_a_tool_a_step_only_mentions_is_not_a_call(tmp_path):
+    text = (FIXTURES / "valid.md").read_text().replace(
+        "3. Record the verdict in `notes.md` using the `write` tool.",
+        "3. Record the verdict in `notes.md` using the `write` tool; never call the `be_coverage_delta` registry tool here.")
+    _place(tmp_path, "", OWNER, "route-review", text)
+    assert _errors(tmp_path) == []

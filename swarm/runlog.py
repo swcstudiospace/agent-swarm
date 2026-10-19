@@ -8,6 +8,7 @@ Logging paths spec lives in swarm.paths.logging_paths().
 """
 from __future__ import annotations
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -36,11 +37,29 @@ def redact_leases(value):
     return value
 
 
+# Identifier fields are validated identifiers, not free text (the top-level `task_id` / `correlation_id` of a record are not redacted
+# either), and readers join on them (`telemetry.derive_snapshot` keys activity, handover and timeout state by `run_id`): a token-shaped
+# task id such as `sk-onboarding-flow-v2` must survive redaction instead of becoming `[REDACTED].a1`. Only free text is redacted.
+_ID_KEYS = ("run_id", "handover_id", "task_id", "parent_id", "correlation_id")
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _redact_payload(payload):
+    plain = redact_leases(payload)
+    clean = redact(plain)
+    if isinstance(plain, dict) and isinstance(clean, dict):
+        for key in _ID_KEYS:
+            value = plain.get(key)
+            if isinstance(value, str) and key in clean and ID_RE.fullmatch(value):
+                clean[key] = value
+    return clean
+
+
 def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | None = None,
          task_id: str | None = None, root: str | Path | None = None, tee: bool = True) -> dict:
     """Append one record to the run log; `tee=False` (dry runs) keeps it local and never sends it to substrate. Lease ids
-    are dropped from the payload (`redact_leases`), then secrets are replaced (`redact.redact`); the caller's own payload
-    object is left as it is."""
+    are dropped from the payload (`redact_leases`), then secrets are replaced (`redact.redact`) in everything but the identifier
+    fields `_ID_KEYS`; the caller's own payload object is left as it is."""
     log_file = _log_file(root, create=True)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -48,7 +67,7 @@ def emit(event_type: str, payload: dict, *, source: str, correlation_id: str | N
         "source": source,
         "correlation_id": correlation_id,
         "task_id": task_id,
-        "payload": redact(redact_leases(payload)),
+        "payload": _redact_payload(payload),
         "msg_id": uuid.uuid4().hex,
     }
     with log_file.open("a", encoding="utf-8") as fh:

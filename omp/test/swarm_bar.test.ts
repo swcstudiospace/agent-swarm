@@ -23,11 +23,13 @@ import {
   sanitizeText,
   runElapsedS,
   settleOrphanedSpawns,
+  shownTokens,
   statusText,
   type SwarmBarModel,
   visibleRuns,
 } from "../src/swarm_bar.ts";
 import { displayWidth, stripAnsi, type BarTheme } from "../src/swarm_dock.ts";
+import type { TokenSavingsSnapshot } from "../src/token_savings.ts";
 import { REPO_ROOT } from "./helpers.ts";
 
 const T0 = 1_000_000;
@@ -104,6 +106,151 @@ function hasStrayEscape(line: string): boolean {
   return line.replace(/\x1b\[[0-9;]*m/g, "").includes("\x1b");
 }
 
+/** A theme whose every member throws: the bar must still draw plain rows. */
+const throwingTheme: BarTheme = {
+  fg: () => {
+    throw new Error("boom");
+  },
+  bold: () => {
+    throw new Error("boom");
+  },
+  getSpinnerFrames: () => {
+    throw new Error("boom");
+  },
+  getBgAnsi: () => {
+    throw new Error("boom");
+  },
+  getFgAnsi: () => {
+    throw new Error("boom");
+  },
+  get sep(): never {
+    throw new Error("boom");
+  },
+};
+/** A transparent bar (`\x1b[49m` background): powerline pieces but no caps. */
+const transparentTheme: BarTheme = { ...powerlineTheme, getBgAnsi: () => "\x1b[49m" };
+/** Theme variants of invariant I1: none, colours only, full powerline, transparent, partial (no separators), throwing. */
+const themeVariants: Array<[string, BarTheme | undefined]> = [
+  ["no theme", undefined],
+  ["colors only", colorTheme],
+  ["powerline", powerlineTheme],
+  ["transparent", transparentTheme],
+  ["partial powerline", { ...colorTheme, getBgAnsi: powerlineTheme.getBgAnsi }],
+  ["throwing", throwingTheme],
+];
+
+/** What the user reads of a plain row: the right padding removed. */
+const visible = (row: string): string => stripAnsi(row).trimEnd();
+
+function savings(extra: Partial<TokenSavingsSnapshot> = {}): TokenSavingsSnapshot {
+  return { v: 1, sessionId: "sess-1", updatedAt: 1, baselineTokens: 10_000, currentTokens: 4_000, savedTokens: 6_000, points: [], ...extra };
+}
+/** Every optional measurement present. The provider cache tokens (77.7k, 33.3k) are unlike every other number on screen. */
+const FULL_SAVINGS = savings({
+  lastTurnMs: 900,
+  cacheHitPct: 62,
+  lastQueryMs: 40,
+  rtkSavedTokens: 1500,
+  lastPayloadChars: 156523,
+  ttftMs: 310,
+  lastIdleMs: 1200,
+  costCents: 12,
+  providerInput: 90_000,
+  providerOutput: 50_000,
+  providerCacheRead: 77_700,
+  providerCacheWrite: 33_300,
+  prefixChanged: 1,
+  toolsChanged: 1,
+  graphReady: 1,
+});
+
+/** A piece of row 1 with the priority the contract gives it; lists are in on-screen order. */
+type Piece = [text: string, priority: number];
+/** Row 1, left, of the `mixed()` model with a telemetry error. */
+const MIXED_PIECES: Piece[] = [
+  ["● swarm 10m00s", 0],
+  ["2 run", 1],
+  ["1 wait", 4],
+  ["1 queued", 3],
+  ["1 done", 4],
+  ["1 fail", 2],
+  ["1 timeout", 2],
+  ["1 stall", 2],
+  ["1 cancel", 5],
+  ["slots 2/4", 6],
+  ["telemetry unavailable", 2],
+];
+/** Row 1, right, of `FULL_SAVINGS`. */
+const CHIP_PIECES: Piece[] = [
+  ["graph ready", 11],
+  ["bill 90k · out 50k", 10],
+  ["idle 1200ms", 9],
+  ["payload 156523c", 8],
+  ["query 40ms", 7],
+  ["rtk +1.5k", 6],
+  ["cost 12c", 5],
+  ["turn 900ms", 4],
+  ["before 10k · now 4k", 3],
+  ["prefix moved", 2],
+  ["tools moved", 2],
+  ["ttft 310ms", 2],
+  ["cache 62%", 1],
+  ["saved 6k", 0],
+];
+
+/**
+ * The drop rule at every width 1..300: the row is exactly the width; a piece shown at one width is shown at every wider one;
+ * the pieces on screen keep their order; and a piece is missing only if every piece that stayed has a smaller priority number
+ * (or the same number and an earlier place). Widths where the identity (the first piece) is itself clipped are skipped.
+ */
+function expectDropOrder(label: string, render: (width: number) => string, pieces: readonly Piece[]): void {
+  let before = new Set<number>();
+  for (let width = 1; width <= 300; width++) {
+    const row = render(width);
+    if (displayWidth(row) !== width) throw new Error(`${label}@${width}: ${displayWidth(row)} columns: ${JSON.stringify(row)}`);
+    const shown = new Set<number>();
+    if (row.includes(pieces[0][0])) pieces.forEach(([text], index) => void (row.includes(text) && shown.add(index)));
+    for (const gone of before) if (!shown.has(gone)) throw new Error(`${label}@${width}: "${pieces[gone][0]}" was shown at ${width - 1} and vanished: ${JSON.stringify(row)}`);
+    let last = -1;
+    for (const index of [...shown].sort((a, b) => a - b)) {
+      const at = row.indexOf(pieces[index][0]);
+      if (at <= last) throw new Error(`${label}@${width}: "${pieces[index][0]}" is out of order: ${JSON.stringify(row)}`);
+      last = at;
+    }
+    if (shown.size > 0) {
+      for (const kept of shown) {
+        for (let gone = 0; gone < pieces.length; gone++) {
+          if (shown.has(gone)) continue;
+          const [, keptPriority] = pieces[kept];
+          const [, gonePriority] = pieces[gone];
+          if (keptPriority > gonePriority || (keptPriority === gonePriority && kept > gone)) {
+            throw new Error(`${label}@${width}: "${pieces[gone][0]}" (P${gonePriority}) was dropped while "${pieces[kept][0]}" (P${keptPriority}) stayed: ${JSON.stringify(row)}`);
+          }
+        }
+      }
+    }
+    before = shown;
+  }
+}
+
+/** The narrowest width 1..300 at which `text` is on screen. */
+function firstWidth(render: (width: number) => string, text: string): number | undefined {
+  for (let width = 1; width <= 300; width++) if (render(width).includes(text)) return width;
+  return undefined;
+}
+
+/** `texts` come on screen in this order as the row widens, one strictly after the other. */
+function expectAppearOrder(label: string, render: (width: number) => string, texts: readonly string[]): void {
+  const widths = texts.map((text) => firstWidth(render, text));
+  const got = Object.fromEntries(texts.map((text, index) => [text, widths[index]]));
+  texts.forEach((text, index) => {
+    const width = widths[index];
+    if (width === undefined) throw new Error(`${label}: "${text}" never appears up to 300 columns: ${JSON.stringify(got)}`);
+    const earlier = widths[index - 1];
+    if (earlier !== undefined && width <= earlier) throw new Error(`${label}: "${text}" must need more columns than "${texts[index - 1]}": ${JSON.stringify(got)}`);
+  });
+}
+
 describe("formatElapsed", () => {
   const cases = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "elapsed_cases.json"), "utf8")) as Array<[number | string, string]>;
   test("is byte-identical to the Python twin for every fixture case", () => {
@@ -127,6 +274,7 @@ describe("redactText shared vectors", () => {
     input: Needle;
     must_not_contain: Needle[];
     must_contain: Needle[];
+    expected?: string;
   }
   const flat = (value: Needle): string => (typeof value === "string" ? value : value.join(""));
   const { cases } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[] };
@@ -137,6 +285,8 @@ describe("redactText shared vectors", () => {
       const out = redactText(flat(vector.input));
       for (const needle of vector.must_not_contain) expect({ name: vector.name, leaked: out.includes(flat(needle)) }).toEqual({ name: vector.name, leaked: false });
       for (const needle of vector.must_contain) expect({ name: vector.name, kept: out.includes(flat(needle)) }).toEqual({ name: vector.name, kept: true });
+      if (vector.expected !== undefined) expect({ name: vector.name, out }).toEqual({ name: vector.name, out: vector.expected });
+      expect({ name: vector.name, fixedPoint: redactText(out) === out }).toEqual({ name: vector.name, fixedPoint: true }); // a masked output is a fixed point
     }
   });
   test("tests/fixtures/redact_generated.json: 6000 seeded option lists give exactly the Python suite's output (reference model + wild shapes)", () => {
@@ -243,6 +393,32 @@ describe("sanitization", () => {
   test("redaction runs before clipping, so a cut cannot leave half a token behind", () => {
     const out = sanitizeText(`${"y".repeat(20)} ghp_${"b".repeat(40)}`, 30);
     expect(out).not.toContain("ghp_b");
+  });
+
+  test("a secret split by bidi, zero-width or control characters is redacted before they are stripped (they must not re-join it)", () => {
+    const ghp = `ghp_${"Zq8Lm3Nv5Bx7Cd9Fg1Hj2Kp4Rs6Tw0Yu3Ab"}`;
+    for (const mark of ["\u202e", "\u200b", "\u2066", "\ufeff", "\u0000", "\u0007", "\u009b"]) {
+      const split = `${ghp.slice(0, 6)}${mark}${ghp.slice(6)}`;
+      expect({ mark, out: sanitizeText(`x ${split} y`) }).toEqual({ mark, out: "x [REDACTED] y" });
+      expect({ mark, out: sanitizeText(`pass${mark}word=hunter2secret`) }).toEqual({ mark, out: "password=[REDACTED]" });
+      expect({ mark, out: sanitizeText(`AKIAABCDEF${mark}GHIJ012345`) }).toEqual({ mark, out: "[REDACTED]" });
+    }
+    // text without a secret keeps its display: controls still become spaces, bidi marks are still dropped
+    expect(sanitizeText("a\u0000b\u202ec")).toBe("a bc");
+  });
+
+  test("re-serialised JSON pairs keep their structure (the closing escaped quote is not replaced by the key name)", () => {
+    expect(redactText(String.raw`x={\"password\":\"abc\",\"user\":\"u\"}`)).toBe(String.raw`x={\"password\":\"[REDACTED]\",\"user\":\"u\"}`);
+  });
+
+  test("1 MB floods of the command-line, YAML and vendor-key carriers stay linear and still find the trailing password", () => {
+    for (const unit of ["mysql ", "docker login ", "sshpass -p ", "-u a:b ", "- name: PASSWORD\n  value: ", "password: |\n  ", "STRIPE_KEY=", "redis-cli ", "- name: ", "password:  "]) {
+      const started = performance.now();
+      const out = redactText(`${unit.repeat(Math.floor(1_000_000 / unit.length))}\npassword=hunter2`);
+      expect({ unit, fast: performance.now() - started < 300 }).toEqual({ unit, fast: true });
+      expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
+    }
+    expect(redactText("- name: PASSWORD\n  value: x\nmysql -u a -pb db\n".repeat(250_000)).split("[REDACTED]").length - 1).toBe(500_000);
   });
 
   test("long input is bounded before masking: 100 KB of URL-credential lookalikes does not stall, the head survives", () => {
@@ -668,103 +844,159 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     expect(renderSwarmBarFrame(states.overflow, 40, undefined, T0).state).toBe("overflow");
   });
 
-  test("snapshot of every state at every width", () => {
-    const states = sample();
-    const frames: Record<string, string[]> = {};
-    for (const [name, model] of Object.entries(states)) {
-      for (const width of [20, 40, 80, 160]) frames[`${name}@${width}`] = plain(model, width, at[name] ?? T0);
-    }
-    const expected: Record<string, string[]> = {
-      "idle@20": [],
-      "idle@40": [],
-      "idle@80": [],
-      "idle@160": [],
-      "loading@20": ["● swarm 0s | 1 run", "● start a05-backend…"],
-      "loading@40": ["● swarm 0s | 1 run | 0 queued | 0 done", "● start a05-backend     0s"],
-      "loading@80": ["● swarm 0s | 1 run | 0 queued | 0 done | 0 fail", "● start a05-backend     0s"],
-      "loading@160": ["● swarm 0s | 1 run | 0 queued | 0 done | 0 fail", "● start a05-backend     0s"],
-      "active@20": ["● swarm 4m12s", "● a05-backend  4m12…"],
-      "active@40": ["● swarm 4m12s | 1 run | 1 wait", "● a05-backend  4m12s | +2 more"],
-      "active@80": [
-        "● swarm 4m12s | 1 run | 1 wait | 1 queued | 0 done | 0 fail | slots 1/4",
-        "● a05-backend  4m12s | ◌ wait a07-data     0s | ○ queued a06-frontend     0s",
+  test("at 160 columns every state draws its two rows: the summary, then the agents or the placeholder", () => {
+    const rows = Object.fromEntries(Object.entries(sample()).map(([name, model]) => [name, plain(model, 160, at[name] ?? T0).map(visible)]));
+    expect(rows).toEqual({
+      idle: ["○ swarm idle", "no subagents running"],
+      loading: ["● swarm 0s │ 1 run │ 0 queued │ 0 done │ 0 fail", "● start a05-backend     0s"],
+      active: [
+        "● swarm 4m12s │ 1 run │ 1 wait │ 1 queued │ 0 done │ 0 fail │ slots 1/4",
+        "● a05-backend  4m12s wire the handover bridge │ ◌ wait a07-data     0s │ ○ queued a06-frontend     0s",
       ],
-      "active@160": [
-        "● swarm 4m12s | 1 run | 1 wait | 1 queued | 0 done | 0 fail | slots 1/4",
-        "● a05-backend  4m12s wire the handover bridge | ◌ wait a07-data     0s | ○ queued a06-frontend     0s",
+      overflow: [
+        "● swarm 1m30s │ 9 run │ 0 queued │ 0 done │ 1 fail",
+        "✕ FAIL a09-reviewer  1m30s │ ● agent-number-8     8s │ ● agent-number-7     7s │ ● agent-number-6     6s │ ● agent-number-5     5s │ +5 more",
       ],
-      "overflow@20": ["● swarm 1m30s", "✕ FAIL a09-reviewer…"],
-      "overflow@40": ["● swarm 1m30s | 9 run | 0 queued", "✕ FAIL a09-reviewer  1m30s | +9 more"],
-      "overflow@80": [
-        "● swarm 1m30s | 9 run | 0 queued | 0 done | 1 fail",
-        "✕ FAIL a09-reviewer  1m30s | ● agent-number-8     8s reading files | +8 more",
-      ],
-      "overflow@160": [
-        "● swarm 1m30s | 9 run | 0 queued | 0 done | 1 fail",
-        "✕ FAIL a09-reviewer  1m30s | ● agent-number-8     8s | ● agent-number-7     7s | ● agent-number-6     6s | ● agent-number-5     5s | +5 more",
-      ],
-      "completed@20": ["✓ swarm 1m01s", "✓ a05-backend  1m01s"],
-      "completed@40": ["✓ swarm 1m01s | 0 run | 0 queued", "✓ a05-backend  1m01s"],
-      "completed@80": ["✓ swarm 1m01s | 0 run | 0 queued | 1 done | 0 fail", "✓ a05-backend  1m01s"],
-      "completed@160": ["✓ swarm 1m01s | 0 run | 0 queued | 1 done | 0 fail", "✓ a05-backend  1m01s"],
-      "failed@20": ["✕ swarm 1h01m", "✕ FAIL a05-backend …"],
-      "failed@40": ["✕ swarm 1h01m | 0 run | 0 queued", "✕ FAIL a05-backend  1h01m"],
-      "failed@80": ["✕ swarm 1h01m | 0 run | 0 queued | 0 done | 1 fail", "✕ FAIL a05-backend  1h01m"],
-      "failed@160": ["✕ swarm 1h01m | 0 run | 0 queued | 0 done | 1 fail", "✕ FAIL a05-backend  1h01m"],
-      "error@20": ["swarm: telemetry un…"],
-      "error@40": ["swarm: telemetry unavailable"],
-      "error@80": ["swarm: telemetry unavailable"],
-      "error@160": ["swarm: telemetry unavailable"],
-    };
-    expect(frames).toEqual(expected);
+      completed: ["✓ swarm 1m01s │ 0 run │ 0 queued │ 1 done │ 0 fail", "✓ a05-backend  1m01s"],
+      failed: ["✕ swarm 1h01m │ 0 run │ 0 queued │ 0 done │ 1 fail", "✕ FAIL a05-backend  1h01m"],
+      error: ["swarm: telemetry unavailable", "no subagents running"],
+    });
   });
 
-  test("no line is ever wider than the width, with or without color, and no escape is ever cut", () => {
-    const states = sample();
-    for (const theme of [undefined, colorTheme, powerlineTheme]) {
-      for (const [name, model] of Object.entries(states)) {
-        for (let width = 1; width <= 200; width++) {
-          const lines = renderSwarmBar(model, width, theme, at[name] ?? T0);
-          expect(lines.length).toBeLessThanOrEqual(2);
-          for (const line of lines) {
-            if (displayWidth(line) > width || hasStrayEscape(line)) throw new Error(`${name}@${width} (${theme === undefined ? "plain" : "themed"}): ${JSON.stringify(line)}`);
+  test("narrower bars still lead with the identity and the worst row", () => {
+    const heads: Record<string, string> = {
+      idle: "○ swarm idle",
+      loading: "● swarm 0s",
+      active: "● swarm 4m12s",
+      overflow: "● swarm 1m30s",
+      completed: "✓ swarm 1m01s",
+      failed: "✕ swarm 1h01m",
+      error: "swarm: telemetry unavailable",
+    };
+    const firstRows: Record<string, string> = {
+      idle: "no subagents running",
+      loading: "● start a05-backend",
+      active: "● a05-backend",
+      overflow: "✕ FAIL a09-reviewer",
+      completed: "✓ a05-backend",
+      failed: "✕ FAIL a05-backend",
+      error: "no subagents running",
+    };
+    for (const width of [40, 80, 160]) {
+      for (const [name, model] of Object.entries(sample())) {
+        const [row1, row2] = plain(model, width, at[name] ?? T0).map(visible);
+        expect(row1.startsWith(heads[name]), `${name}@${width} row 1: ${row1}`).toBe(true);
+        expect(row2.startsWith(firstRows[name]), `${name}@${width} row 2: ${row2}`).toBe(true);
+      }
+    }
+  });
+
+  test("every state, theme and width 1..300: exactly 2 rows of exactly the width and no cut escape, with and without token chips (I1, I2, I5)", () => {
+    for (const [themeName, theme] of themeVariants) {
+      for (const [name, base] of Object.entries(sample())) {
+        for (const tokens of [undefined, FULL_SAVINGS]) {
+          const model: SwarmBarModel = tokens ? { ...base, tokens } : base;
+          for (let width = 1; width <= 300; width++) {
+            const lines = renderSwarmBar(model, width, theme, at[name] ?? T0);
+            if (lines.length !== 2 || lines.some((line) => displayWidth(line) !== width || hasStrayEscape(line))) {
+              throw new Error(`${name}@${width} (${themeName}, ${tokens ? "tokens" : "no tokens"}): ${JSON.stringify(lines)}`);
+            }
           }
+        }
+      }
+    }
+  }, 30_000);
+
+  test("a powerline row starts with the open cap and ends with the close cap in every state from 12 columns; a transparent bar has no caps; under 12 columns rows are plain (I3)", () => {
+    const { powerlineCapLeft: open, powerlineLeft: close, powerlineThinLeft: thin } = powerlineTheme.sep!;
+    for (const [name, model] of Object.entries(sample())) {
+      for (let width = 1; width <= 300; width++) {
+        for (const row of renderSwarmBar(model, width, powerlineTheme, at[name] ?? T0).map(stripAnsi)) {
+          const capped = row.startsWith(open) && row.endsWith(close);
+          if (capped !== width >= 12 || (width < 12 && row.includes(thin))) throw new Error(`${name}@${width} (powerline): ${JSON.stringify(row)}`);
+        }
+        for (const row of renderSwarmBar(model, width, transparentTheme, at[name] ?? T0).map(stripAnsi)) {
+          if (row.includes(open) || row.includes(close)) throw new Error(`${name}@${width} (transparent): ${JSON.stringify(row)}`);
         }
       }
     }
   });
 
-  test("the plain fallback replaces color when color would not fit, and carries no escapes", () => {
-    const model = sample().active;
-    const narrow = renderSwarmBar(model, 12, powerlineTheme, T0);
-    for (const line of narrow) expect(line.includes("\x1b")).toBe(false);
-    expect(renderSwarmBar(model, 160, powerlineTheme, T0).some((line) => line.includes("\x1b"))).toBe(true);
-  });
-
-  test("wide CJK and emoji agent text clips by display columns, never by code units", () => {
+  test("wide CJK and emoji agent text clips by display columns, never by code units: still exactly the width", () => {
     const model = createModel();
     progress(model, { id: "w", agent: "日本語エージェント名前長い", intent: "👨‍👩‍👧 読み込み中のファイル 🚀 とても長い説明テキスト".repeat(3) }, T0);
     for (let width = 1; width <= 120; width++) {
-      for (const theme of [undefined, colorTheme]) {
-        for (const line of renderSwarmBar(model, width, theme, T0)) expect(displayWidth(line)).toBeLessThanOrEqual(width);
+      for (const [themeName, theme] of themeVariants) {
+        const lines = renderSwarmBar(model, width, theme, T0);
+        if (lines.length !== 2 || lines.some((line) => displayWidth(line) !== width)) throw new Error(`cjk@${width} (${themeName}): ${JSON.stringify(lines)}`);
       }
     }
   });
 
-  test("a model with nothing to show and a width of 0 render no rows", () => {
-    expect(renderSwarmBar(createModel(), 80, colorTheme, T0)).toEqual([]);
-    expect(renderSwarmBar(sample().active, 0, colorTheme, T0)).toEqual([]);
+  test("a width of 0 or less renders no rows in any state", () => {
+    for (const [name, model] of Object.entries(sample())) {
+      for (const width of [0, -1, -80]) {
+        expect(renderSwarmBar(model, width, colorTheme, at[name] ?? T0), `${name}@${width}`).toEqual([]);
+        expect(renderSwarmBarFrame(model, width, colorTheme, at[name] ?? T0).lines, `${name}@${width} frame`).toEqual([]);
+      }
+    }
+  });
+
+  test("idle keeps both rows: the idle marker and the placeholder, with the token chips when a snapshot exists", () => {
+    const idle = sample().idle;
+    for (const width of [40, 160]) {
+      const frame = renderSwarmBarFrame(idle, width, undefined, T0);
+      expect(frame, `idle@${width}`).toMatchObject({ state: "idle", shown: 0, hidden: 0 });
+      expect(frame.lines.map(visible)).toEqual(["○ swarm idle", "no subagents running"]);
+    }
+    const measured: SwarmBarModel = { ...idle, tokens: savings() };
+    const [row1, row2] = plain(measured, 160, T0);
+    expect(visible(row1)).toMatch(/^○ swarm idle +before 10k · now 4k │ saved 6k$/);
+    expect(visible(row2)).toBe("no subagents running");
+    const [themed1, themed2] = renderSwarmBar(measured, 160, powerlineTheme, T0);
+    expect(stripAnsi(themed1)).toContain("saved 6k");
+    expect(stripAnsi(themed2)).toContain("no subagents running");
+  });
+
+  test("a telemetry error without rows keeps both rows: the warning, the idle placeholder, and the chips when a snapshot exists", () => {
+    const error = sample().error;
+    for (const width of [40, 160]) {
+      const frame = renderSwarmBarFrame(error, width, undefined, T0);
+      expect(frame, `error@${width}`).toMatchObject({ state: "error", shown: 0, hidden: 0 });
+      expect(frame.lines.map(visible)).toEqual(["swarm: telemetry unavailable", "no subagents running"]);
+    }
+    const measured: SwarmBarModel = { ...error, tokens: savings() };
+    const [row1, row2] = plain(measured, 160, T0);
+    expect(visible(row1)).toMatch(/^swarm: telemetry unavailable +before 10k · now 4k │ saved 6k$/);
+    expect(visible(row2)).toBe("no subagents running");
+    // narrower: the warning is the identity of the row and the placeholder row is unchanged
+    expect(visible(plain(measured, 40, T0)[0])).toMatch(/^swarm: telemetry unavailable/);
+    expect(visible(plain(measured, 40, T0)[1])).toBe("no subagents running");
+  });
+
+  test("rows linger, then the bar goes back to the idle placeholder instead of disappearing", () => {
+    const model = createModel();
+    progress(model, { id: "ok", agent: "good", durationMs: 0 }, T0);
+    progress(model, { id: "ok", agent: "good", status: "completed", durationMs: 1000 }, T0 + SEC);
+    const lingering = renderSwarmBarFrame(model, 80, undefined, T0 + 5 * SEC);
+    expect(lingering.state).toBe("completed");
+    expect(visible(lingering.lines[1])).toContain("good");
+    const after = renderSwarmBarFrame(model, 80, undefined, T0 + 22 * SEC);
+    expect(after.state).toBe("idle");
+    expect(after.lines.map(visible)).toEqual(["○ swarm idle", "no subagents running"]);
   });
 
   test("telemetry marker: alone when there are no rows, as a segment next to rows otherwise", () => {
     const model = createModel();
     model.error = "live.json stale";
     const alone = renderSwarmBar(model, 80, undefined, T0);
-    expect(alone).toEqual(["swarm: telemetry unavailable"]);
+    expect(alone).toHaveLength(2);
+    expect(visible(alone[0])).toBe("swarm: telemetry unavailable");
     progress(model, { id: "r", agent: "a05" }, T0);
     const withRows = renderSwarmBar(model, 160, undefined, T0);
-    expect(withRows[0]).toContain("telemetry unavailable");
     expect(withRows).toHaveLength(2);
+    expect(withRows[0]).toContain("telemetry unavailable");
+    expect(withRows[1]).toContain("a05");
   });
 });
 
@@ -841,13 +1073,23 @@ describe("render: overflow ordering and labels", () => {
   test("when rows do not fit the worst states stay and the rest become +N more", () => {
     const lines = plain(mixed(), 60, T0);
     expect(lines[1]).toContain("f-failed");
-    expect(lines[1]).toMatch(/\+\d+ more$/);
+    expect(lines[1].trimEnd()).toMatch(/\+\d+ more$/);
     expect(lines[1]).not.toContain("l-done");
     const frame: BarFrame = renderSwarmBarFrame(mixed(), 60, undefined, T0);
     expect(frame.state).toBe("overflow");
     expect(frame.shown + frame.hidden).toBe(8);
     const count = Number(/\+(\d+) more/.exec(frame.lines[1])?.[1]);
     expect(count).toBe(frame.hidden);
+  });
+
+  test("when not even one row fits, `+N more` goes first and the row is clipped with an ellipsis, still exactly the width", () => {
+    const frame = renderSwarmBarFrame(mixed(), 14, undefined, T0);
+    expect(frame.lines).toHaveLength(2);
+    expect(frame.lines.map((line) => displayWidth(line))).toEqual([14, 14]);
+    expect(frame.lines[1]).not.toContain("more");
+    expect(frame.lines[1].startsWith("✕ FAIL")).toBe(true);
+    expect(frame.lines[1].endsWith("…")).toBe(true);
+    expect(frame.shown).toBe(1);
   });
 
   test("the summary counts every state", () => {
@@ -891,6 +1133,169 @@ describe("render: overflow ordering and labels", () => {
     const lines = renderSwarmBar(mixed(), 200, throwing, T0);
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain("f-failed");
+    for (const line of lines) expect(displayWidth(line)).toBe(200);
+  });
+
+  describe("row 1: priorities and token chips", () => {
+    /** The mixed model with a telemetry error: every left segment the summary can have. */
+    function flooded(): SwarmBarModel {
+      const model = mixed();
+      model.error = "live.json stale";
+      return model;
+    }
+
+    test("summary segments leave in priority order as the row narrows: identity last, then run, failures and telemetry, queued, wait and done, cancel, slots", () => {
+      const model = flooded();
+      const render = (width: number) => plain(model, width, T0)[0];
+      expectDropOrder("summary", render, MIXED_PIECES);
+      expectAppearOrder("summary", render, [
+        "● swarm 10m00s",
+        "2 run",
+        "1 fail",
+        "1 timeout",
+        "1 stall",
+        "telemetry unavailable",
+        "1 queued",
+        "1 wait",
+        "1 done",
+        "1 cancel",
+        "slots 2/4",
+      ]);
+    });
+
+    test("the identity is the last thing standing, clipped with an ellipsis when it alone is too wide", () => {
+      const model = flooded();
+      expect(visible(plain(model, 14, T0)[0])).toBe("● swarm 10m00s");
+      const clipped = plain(model, 8, T0)[0];
+      expect(clipped.startsWith("● swarm")).toBe(true);
+      expect(clipped.endsWith("…")).toBe(true);
+      expect(displayWidth(clipped)).toBe(8);
+    });
+
+    test("with token chips on the right the same priorities rule both groups together", () => {
+      const model: SwarmBarModel = { ...flooded(), tokens: FULL_SAVINGS };
+      expectDropOrder("summary+chips", (width) => plain(model, width, T0)[0], [...MIXED_PIECES, ...CHIP_PIECES]);
+    });
+
+    test("no snapshot, no chips: nothing is invented, not even zeros", () => {
+      const running = createModel();
+      progress(running, { id: "a", agent: "a05" }, T0);
+      for (const model of [createModel(), running, flooded()]) {
+        for (const width of [60, 160, 300]) {
+          expect(plain(model, width, T0)[0], `width ${width}`).not.toMatch(/\b(saved|before|cache|ttft|bill|payload|rtk|cost|query|turn|prefix|tools|graph)\b/);
+        }
+      }
+      expect(visible(plain(createModel(), 160, T0)[0])).toBe("○ swarm idle");
+    });
+
+    test("a minimal snapshot shows what was measured and nothing else; a measured zero is shown as a zero", () => {
+      const idle = (tokens: TokenSavingsSnapshot): SwarmBarModel => ({ ...createModel(), tokens });
+      const chips = (model: SwarmBarModel) => visible(plain(model, 160, T0)[0]).replace(/^○ swarm idle\s+/, "");
+      expect(chips(idle(savings()))).toBe("before 10k · now 4k │ saved 6k");
+      expect(chips(idle(savings({ currentTokens: 10_000, savedTokens: 0 })))).toBe("before 10k · now 10k │ saved 0");
+      // each half of the provider bill appears on its own
+      expect(chips(idle(savings({ providerInput: 90_000 })))).toBe("bill 90k │ before 10k · now 4k │ saved 6k");
+      expect(chips(idle(savings({ providerOutput: 50_000 })))).toBe("out 50k │ before 10k · now 4k │ saved 6k");
+    });
+
+    test("saved is the right-most chip and the right edge never moves with what the summary says", () => {
+      const running = createModel();
+      progress(running, { id: "a", agent: "a05", intent: "x".repeat(60) }, T0);
+      const error = createModel();
+      error.error = "live.json stale";
+      const models: Record<string, SwarmBarModel> = { idle: createModel(), running, mixed: mixed(), error };
+      const { powerlineLeft: close } = powerlineTheme.sep!;
+      const column = (row: string): number => {
+        const text = stripAnsi(row);
+        expect(text, "saved is on screen").toContain("saved 6k");
+        return displayWidth(text.slice(0, text.lastIndexOf("saved 6k")));
+      };
+      for (const width of [60, 80, 160, 300]) {
+        for (const [name, model] of Object.entries(models)) {
+          const measured: SwarmBarModel = { ...model, tokens: savings() };
+          const [plainRow] = plain(measured, width, T0);
+          expect(plainRow.endsWith("saved 6k"), `${name}@${width} plain: ${JSON.stringify(plainRow)}`).toBe(true);
+          expect(column(plainRow), `${name}@${width} plain`).toBe(width - "saved 6k".length);
+          const [capped] = renderSwarmBar(measured, width, powerlineTheme, T0);
+          expect(stripAnsi(capped).endsWith(`saved 6k ${close}`), `${name}@${width} powerline: ${JSON.stringify(stripAnsi(capped))}`).toBe(true);
+          expect(column(capped), `${name}@${width} powerline`).toBe(width - displayWidth(`saved 6k ${close}`));
+        }
+      }
+    });
+
+    test("chips leave in priority order as the row narrows, and saved survives longest", () => {
+      const model: SwarmBarModel = { ...createModel(), tokens: FULL_SAVINGS };
+      const render = (width: number) => plain(model, width, T0)[0];
+      expectDropOrder("chips", render, [["○ swarm idle", 0], ...CHIP_PIECES]);
+      expectAppearOrder("chips", render, [
+        "saved 6k",
+        "cache 62%",
+        "prefix moved",
+        "tools moved",
+        "ttft 310ms",
+        "before 10k · now 4k",
+        "turn 900ms",
+        "cost 12c",
+        "rtk +1.5k",
+        "query 40ms",
+        "payload 156523c",
+        "idle 1200ms",
+        "bill 90k · out 50k",
+        "graph ready",
+      ]);
+    });
+
+    test("the chips are shown in every state a row can be in", () => {
+      const running = createModel();
+      progress(running, { id: "a", agent: "a05" }, T0);
+      const error = createModel();
+      error.error = "live.json stale";
+      const failed = createModel();
+      progress(failed, { id: "f", agent: "bad", status: "failed", durationMs: 1000 }, T0);
+      for (const [name, model] of Object.entries({ idle: createModel(), running, error, failed, mixed: mixed() })) {
+        const [row1, row2] = plain({ ...model, tokens: FULL_SAVINGS }, 300, T0);
+        expect(row1, name).toContain("cache 62%");
+        expect(row1, name).toContain("saved 6k");
+        expect(row2, `${name} row 2 carries no chips`).not.toContain("saved");
+      }
+    });
+
+    test("provider bill, cache and cost values are never folded into saved", () => {
+      const model: SwarmBarModel = { ...createModel(), tokens: FULL_SAVINGS };
+      const row = plain(model, 300, T0)[0];
+      expect(row.endsWith("saved 6k")).toBe(true); // baseline 10k - current 4k, nothing else
+      expect(row).toContain("bill 90k · out 50k");
+      expect(row).toContain("cache 62%");
+      for (const leaked of ["77.7k", "33.3k", "saved 90k", "saved 140k"]) expect(row).not.toContain(leaked);
+      // the provider numbers do not move saved either
+      const other = savings({ providerInput: 1, providerOutput: 2, costCents: 3, cacheHitPct: 4 });
+      expect(plain({ ...createModel(), tokens: other }, 300, T0)[0].endsWith("saved 6k")).toBe(true);
+    });
+
+    test("shownTokens: this session's snapshot, or any valid snapshot before the session id is known, never another session's", () => {
+      const model = createModel();
+      expect(shownTokens(model)).toBeUndefined();
+      model.tokens = savings({ sessionId: "other" });
+      expect(shownTokens(model)).toBe(model.tokens);
+      expect(plain(model, 160, T0)[0]).toContain("saved 6k");
+      model.sessionId = "mine";
+      expect(shownTokens(model)).toBeUndefined();
+      expect(plain(model, 160, T0)[0]).not.toContain("saved");
+      expect(visible(plain(model, 160, T0)[0])).toBe("○ swarm idle");
+      model.tokens = savings({ sessionId: "mine" });
+      expect(shownTokens(model)).toBe(model.tokens);
+      expect(plain(model, 160, T0)[0]).toContain("saved 6k");
+      model.tokens = undefined;
+      expect(shownTokens(model)).toBeUndefined();
+    });
+
+    test("chip colours: saved is green when it is a saving and dim at zero, a moved prefix is a warning", () => {
+      const row = (tokens: TokenSavingsSnapshot) => renderSwarmBar({ ...createModel(), tokens }, 200, colorTheme, T0)[0];
+      expect(row(savings())).toContain("\x1b[32msaved 6k\x1b[39m");
+      expect(row(savings({ currentTokens: 10_000, savedTokens: 0 }))).toContain("\x1b[90msaved 0\x1b[39m");
+      expect(row(savings({ prefixChanged: 1 }))).toContain("\x1b[33mprefix moved\x1b[39m");
+      expect(row(savings())).not.toContain("prefix moved");
+    });
   });
 });
 

@@ -8,7 +8,7 @@ oversize, wrong caller) stop the receiver with the BLOCKED clarification payload
 Which task id: a handover is filed under the PRODUCER's task id with `to_agent` set. Evidence pinned below:
 `handover_write` has no parameter for a receiver task; `list_handovers`/`read_handover` key files by `<task_id>.<seq>`;
 `write_receipt` is keyed `<task_id>.receipt.<to_agent>.<digest>`; `swarm_run.handover_section` reads
-`latest_handover(dep)` for each dependency of the task it assigns. The receiver therefore reads under its UPSTREAM ids.
+`inspect_handover(dep, to_agent=<receiver>)` for each dependency of the task it assigns. The receiver therefore reads under its UPSTREAM ids.
 """
 from __future__ import annotations
 
@@ -215,7 +215,7 @@ def test_a08_continues_from_the_handover_alone(world):
 
 
 def test_the_runner_shows_the_same_handover_to_the_dependent_task(world):
-    """swarm_run.handover_section reads `latest_handover(<dependency id>)`: the producer-id filing is what it expects."""
+    """swarm_run.handover_section inspects `<dependency id>`: the producer-id filing is what it expects."""
     finish_upstream(world)
     ok(emit(world))
     mod = sc._runner()
@@ -463,3 +463,38 @@ def test_a_final_result_without_a_digest_does_not_discard_the_handovers_digest(w
     assert checked["results"][0]["inherited"]["source"] == "handover T-be.1" and checked["verified"] is True
     (world.root / "src" / "export.py").write_text(EXPORT + "# edited after the result\n")
     assert ok(call("shared_artifact_check", "A08", {"task_id": "T-be"}))["results"][0]["status"] == "digest_mismatch"
+
+
+# ------------------------------------------------------------------------------------------------ RV-I P2-1: one selection
+def _raw_handover(world, *, corr, to_agent, goal, wall_offset_s=0.0):
+    clock = importlib.import_module("swarm.clock").FakeClock(start_wall=time.time() - wall_offset_s)
+    doc = {"correlation_id": corr, "task_id": "T-be", "from_agent": "A05", "to_agent": to_agent, "goal": goal,
+           "completed": ["did it"], "remaining": ["finish it"], "decisions": [], "artifacts": [], "open_questions": [],
+           "blockers": [], "constraints": [], "verification": {"status": "partial", "confidence": 0.5, "checks": []}}
+    return ho.write_handover(doc, root=world.root, clock=clock, emit=False)
+
+
+def test_the_runner_never_shows_a_handover_of_an_older_plan(world):
+    """RV-I P2-1: `handover_status` judged the task's own plan but `latest_handover(to_agent=...)` scanned every correlation,
+    so a handover of an older run addressed to the receiver was put in the prompt next to the fresh one for another agent."""
+    finish_upstream(world)
+    _raw_handover(world, corr="corr-old", to_agent="A08", goal="OLD PLAN goal for A08")
+    ok(emit(world, to_agent="A15", goal="Document the CSV export for the release notes"))
+    mod = sc._runner()
+    section = mod.handover_section(world.store.get("T-qa"), world.root)
+    assert "OLD PLAN" not in section, section
+    assert "Document the CSV export for the release notes" in section  # the plan's newest handover, as context
+    status, doc = ho.inspect_handover("T-be", root=world.root, to_agent="A08")
+    assert status["context_only"] is True and doc["goal"].startswith("Document the CSV export")
+
+
+def test_the_runner_skips_a_stale_handover_addressed_to_the_receiver(world):
+    """RV-I P2-1 (B): the receiver's own handover was 10 h old, a fresh one went to another agent: the tools say `stale`, the
+    prompt used to print the old goal because the newest handover of the task was fine."""
+    finish_upstream(world)
+    _raw_handover(world, corr=CORR, to_agent="A08", goal="STALE goal for A08", wall_offset_s=10 * 3600)
+    ok(emit(world, to_agent="A15", goal="Document the CSV export for the release notes"))
+    status, _doc = ho.inspect_handover("T-be", root=world.root, to_agent="A08")
+    assert status["status"] == "stale"
+    mod = sc._runner()
+    assert mod.handover_section(world.store.get("T-qa"), world.root) == ""

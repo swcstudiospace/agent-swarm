@@ -633,3 +633,67 @@ def test_a_document_near_the_cap_is_summarized_for_the_real_id_of_a_long_task_id
     assert written["summarized"] is True and written["bytes"] <= cap
     stored = env.sdir / "handovers" / "corr-size-2" / f"{task_id}.1.json"
     assert len(stored.read_bytes()) == written["bytes"] and env.ho.read_handover(stored, root=env.root)["summarized"] is True
+
+
+# ---- RV-I review fixes ------------------------------------------------------------------------------------------
+def test_ids_and_digests_refuse_a_trailing_newline(env):
+    """RV-I P3-3: `$` matches before a trailing newline, so `T1\\n` passed as an id and filed `T1\\n.1.json`, which the
+    file-name consistency check of `read_handover` then never matched."""
+    for bad in ("T1-be\n", "corr-1\n"):
+        with pytest.raises(env.ho.HandoverInvalid):
+            env.ho._safe_id(bad, "task_id")
+    with pytest.raises(env.ho.HandoverInvalid):
+        env.write(base(task_id="T1-be\n"))
+    with pytest.raises(env.ho.HandoverInvalid):
+        env.write(base(correlation_id="corr-1\n"))
+    assert not (env.sdir / "handovers").exists() or list((env.sdir / "handovers").iterdir()) == []
+    written = env.write()
+    with pytest.raises(env.ho.HandoverInvalid):
+        env.ho.write_receipt("T1-be", by="A08", digest=written["digest"] + "\n", root=env.root, clock=env.clock)
+    assert env.ho.write_receipt("T1-be", by="A08", digest=written["digest"], root=env.root, clock=env.clock)[1] is False
+
+
+def test_the_write_cap_never_exceeds_the_read_limit(env, monkeypatch):
+    """RV-I P3-4: `SWARM_HANDOVER_MAX_BYTES=4000000` let a 1.2 MB handover be written that every read then refused."""
+    monkeypatch.setenv("SWARM_HANDOVER_MAX_BYTES", "4000000")
+    assert env.ho.max_bytes_default() == env.ho.MAX_FILE_BYTES
+    big = base(completed=[f"step {i}: " + "x" * 900 for i in range(1400)])
+    written = env.write(big, max_bytes=4_000_000)
+    assert written["bytes"] <= env.ho.MAX_FILE_BYTES and written["summarized"] is True
+    assert env.ho.read_handover(written["ref"], root=env.root)["handover_id"] == written["handover_id"]
+
+
+def _husk(env, seq, age_s, task="T1-be", corr="corr-1"):
+    path = env.file(task, seq, corr)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    stamp = env.ho.time.time() - age_s
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_an_old_empty_reserved_file_is_reclaimed_and_its_seq_reused(env):
+    """RV-I P3-7: a writer killed between the O_EXCL create and `os.replace` left a 0-byte `T1-be.2.json` forever, and every
+    later write skipped to seq 3 (a gap a reader that scans seq upward stops at)."""
+    env.write()
+    husk = _husk(env, 2, age_s=env.ho.RESERVE_RECLAIM_S + 60)
+    second = env.write(base(goal="A changed goal"))
+    assert second["seq"] == 2 and second["handover_id"] == "T1-be.2" and husk.stat().st_size > 0
+    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == [1, 2]
+    assert env.ho.read_handover("T1-be.2", root=env.root)["goal"] == "A changed goal"
+
+
+def test_a_young_empty_reserved_file_belongs_to_a_writer_at_work(env):
+    env.write()
+    husk = _husk(env, 2, age_s=1)
+    third = env.write(base(goal="A changed goal"))
+    assert third["seq"] == 3 and husk.stat().st_size == 0
+
+
+def test_an_old_empty_file_below_a_valid_one_is_removed(env):
+    env.write()
+    env.write(base(goal="second goal"))
+    env.file(seq=1).unlink()
+    husk = _husk(env, 1, age_s=env.ho.RESERVE_RECLAIM_S + 60)  # a dead writer's husk under a valid seq 2
+    third = env.write(base(goal="third goal"))
+    assert third["seq"] == 3 and not husk.exists()
