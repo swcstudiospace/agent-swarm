@@ -600,6 +600,85 @@ def test_ten_megabytes_of_new_carrier_text_complete():
     assert redact_text(("- name: PASSWORD\n  value: x\nmysql -u a -pb db\n" * 250_000)).count(REDACTED) == 500_000
 
 
+# ---- GL6 round 6: command checks read whole arguments, Markdown delimiters around an option ---------------------------------------------
+_COMMAND_LINES = {  # name -> (text before the secret, text after it, whether the flag glues the value to itself)
+    "docker login": ("docker login -u me -p ", ""),
+    "podman login": ("podman login -p ", " reg.io"),
+    "helm registry login": ("helm registry login reg.io -p ", ""),
+    "az login": ("az login -u me -p ", ""),
+    "sshpass": ("sshpass -p ", " ssh host"),
+    "mysql": ("mysql -u root -p", " db"),
+    "mongosh": ("mongosh --host h -u me -p ", ""),
+    "redis-cli": ("redis-cli -a ", " ping"),
+    "sqlcmd": ("sqlcmd -S h -U sa -P ", ""),
+    "ssh-keygen": ("ssh-keygen -t ed25519 -N ", " -f k"),
+}
+
+
+@pytest.mark.parametrize("count", [0, 1, 10, 11, 40])
+@pytest.mark.parametrize("size", [1, 128, 129, 1000])
+@pytest.mark.parametrize("name", list(_COMMAND_LINES))
+def test_command_flags_are_checked_after_arguments_of_any_length_and_number(name, size, count):
+    """A password flag is found after any number of arguments of any length (a regex that skipped at most 10 arguments of 128 characters
+    left the password of `docker login -u admin:<300 characters> -p pw` readable)."""
+    before, after = _COMMAND_LINES[name]
+    secret = _token("plain", size + count, 16)
+    head, tail = before.split(" -")[0], " -" + " -".join(before.split(" -")[1:])
+    arguments = "".join(f" --argument{i}=" + "v" * size for i in range(count))
+    text = head + arguments + tail + secret + after
+    assert redact_text(text) == head + arguments + tail + REDACTED + after
+
+
+@pytest.mark.parametrize("wrapper", [("`", "`"), ("(", ")"), ("[", "]"), ("<", ">"), ("**", "**"), ("*", "*"), ("__", "__"), ("~~", "~~"), ('"', '"'), ("'", "'"),
+                                     ("{", "}"), ("**`", "`**"), ("(`", "`)"), ("[`", "`](docs)"), ('\\"', '\\"'), ("$(", ")"), ("<code>", "</code>")])
+@pytest.mark.parametrize("option", ["--user admin:%s", "-u admin:%s", "--user=admin:%s", "-u=admin:%s", "--proxy-user a:%s", "docker login -u me -p %s",
+                                    "mysql -u root -p%s db", "sshpass -p %s ssh h", "redis-cli -a %s ping", "sqlcmd -S h -P %s", "openssl rsa -passin pass:%s"])
+def test_markdown_delimiters_around_a_command_option_keep_its_password_masked(wrapper, option):
+    """`--user admin:hunter2` in backticks, parentheses, bold, brackets, quotes ... : the option may follow any delimiter."""
+    secret = _token("plain", 7, 18)
+    opener, closer = wrapper
+    text = f"Run {opener}{option % secret}{closer} now"
+    out = redact_text(text)
+    assert secret not in out and REDACTED in out and out.startswith(f"Run {opener}") and out.count(REDACTED) == 1, (text, out)
+
+
+def test_the_round_six_review_findings():
+    assert redact_text("docker login -u admin: -p pw123") == f"docker login -u admin: -p {REDACTED}"
+    assert redact_text("docker login -u admin:" + "x" * 200 + " -p pw123 reg.io") == f"docker login -u {REDACTED} -p {REDACTED} reg.io"
+    assert redact_text("Run `--user admin:hunter2` now") == f"Run `--user {REDACTED} now"
+    assert redact_text("Run (--user=admin:hunter2)") == f"Run (--user={REDACTED}"
+    assert redact_text("**--user admin:hunter2**") == f"**--user {REDACTED}"
+    assert redact_text('"--user admin:hunter2" ok') == f'"--user {REDACTED}" ok'
+
+
+def test_a_new_line_or_a_semicolon_ends_the_command_whose_flags_are_checked():
+    unchanged = "docker login reg.io\nls -p x\nmysql -u root -p\nredis-cli -h h -p 6379 ping\ndocker login reg.io; ls -p x && tar -a y"
+    assert redact_text(unchanged) == unchanged
+    assert redact_text("mysql -u root\nls -pSECRETX") == "mysql -u root\nls -pSECRETX"
+
+
+def test_unterminated_and_escaped_quoted_command_values():
+    assert redact_text("sshpass -p 'abc def") == f"sshpass -p {REDACTED}"
+    assert redact_text('docker login -p \\"abc def\\" reg') == f"docker login -p {REDACTED} reg"
+    assert redact_text('curl -u "admin:my pass" https://h') == f"curl -u {REDACTED} https://h"
+
+
+def test_a_credential_value_that_swallowed_the_next_sensitive_name_still_masks_that_names_value():
+    assert redact_text('run --token \\"--password hunter2') == f'run --token \\"{REDACTED} {REDACTED}'
+    assert redact_text('--api-key = {--password=\\"user:hunter2\\"') == f"--api-key {REDACTED} {REDACTED}"
+
+
+@pytest.mark.parametrize("unit", ["mysql -u a ", "docker login x ", "`--user a:", "docker login -p ", "redis-cli -a ", "-passin pass:", "--cmd=mysql ", "-u=-u=",
+                                  "x -u ", "-u  ", "mysql -p'", 'sshpass -p "', "docker login -u a: -p ", "sqlcmd -P ", "ssh-keygen -N ", "__-u a:", "(-u a:"])
+def test_command_line_floods_are_linear_and_still_find_the_trailing_password(unit):
+    import time
+    text = unit * (1_000_000 // len(unit)) + "\npassword=hunter2"
+    started = time.perf_counter()
+    out = redact_text(text)
+    assert time.perf_counter() - started < 3.0, unit
+    assert out.endswith("password=" + REDACTED) and "hunter2" not in out, unit
+
+
 @pytest.mark.parametrize("text", [
     f"{GHP} API_KEY=zzzz1234 mysql -u root -pS3cretPass db docker login -u me -p S3cretPass",
     "- name: DB_PASSWORD\n  value: pw1\nsecret: |\n  a\n  b\nplain: x\n",
@@ -869,9 +948,34 @@ _CARRIERS = (
     ("bearer_wide_gap", ("bearer",), "Authorization: Bearer   %S%"),
     ("curl_user_secret", ("user",), "curl -u %S%:pw https://h.test"),
     ("yaml_block_folded", ("lines",), "token: >-\n  %S%\nnext: 1"),
+    # round 6: command checks skip complete arguments (any length, any number), Markdown delimiters around an option, a command glued to
+    # another word, a value that swallowed the next sensitive name
+    ("cli_docker_login_incomplete_user", ("cli",), "docker login -u admin: -p %S% reg.io"),
+    ("cli_docker_login_long_user", ("cli",), "docker login -u admin:" + "x" * 200 + " -p %S% reg.io"),
+    ("cli_docker_login_long_argument", ("cli",), "docker login --registry-mirror=https://" + "m" * 200 + ".io -p %S%"),
+    ("cli_mysql_many_long_arguments", ("cli",), "mysqldump --opt a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 " + "z" * 300 + " -u root -p%S% db"),
+    ("cli_redis_many_long_arguments", ("cli",), "redis-cli " + " ".join(f"--opt{i}=" + "v" * 140 for i in range(12)) + " -a %S% ping"),
+    ("cli_sqlcmd_long_server", ("cli",), "sqlcmd -S " + "h" * 200 + " -U sa -P %S%"),
+    ("cli_sshpass_many_arguments", ("cli",), "sshpass -e -o A=1 -o B=2 -o C=3 -o D=4 -t -t -p %S% ssh -v host"),
+    ("cli_helm_registry_long_argument", ("cli",), "helm registry login reg.io --insecure " + "q" * 200 + " -u me -p %S%"),
+    ("cli_user_in_backticks", ("cli",), "Run `--user admin:%S%` to log in"),
+    ("cli_user_in_parentheses", ("cli",), "(--user admin:%S%)"),
+    ("cli_user_in_brackets", ("cli",), "[-u admin:%S%]"),
+    ("cli_user_in_angle_brackets", ("cli",), "<--user=admin:%S%>"),
+    ("cli_user_in_bold", ("cli",), "**--proxy-user a:%S%**"),
+    ("cli_user_in_underscores", ("cli",), "__-u a:%S%__"),
+    ("cli_user_in_double_quotes", ("cli",), 'see "--user admin:%S%" above'),
+    ("cli_user_after_equals", ("cli",), 'OPTS="-u admin:%S%" x=-u y:%S%'),
+    ("cli_docker_login_in_backticks", ("cli",), "`docker login -u me -p %S%`"),
+    ("cli_mysql_in_parentheses", ("cli",), "(mysql -u root -p%S% db)"),
+    ("cli_command_glued_to_a_flag", ("cli",), "--cmd=redis-cli -a %S% ping"),
+    ("cli_command_path", ("cli",), "/usr/bin/mysql -u root -p%S%"),
+    ("cli_escaped_quote_value", ("cli",), "docker login -p \\\"%S%\\\" reg"),
+    ("flag_swallowed_by_open_quote", ("plain",), "run --token \\\"--password %S%"),
+    ("flag_swallowed_name", ("plain",), "--api-key = {--password=\\\"%S%\\\""),
 )
-_PROP_PREFIXES = ("", "run ", "error: ", "cmd: ", "(", "{")
-_PROP_SUFFIXES = ("", " done", "\nnext line", " ok.", ")", "}")
+_PROP_PREFIXES = ("", "run ", "error: ", "cmd: ", "(", "{", "`", "**", "(`", "[", "<")
+_PROP_SUFFIXES = ("", " done", "\nnext line", " ok.", ")", "}", "`", "**", "`)", "]", ">")
 _PROP_JOINERS = (" ", "\n", " ; ", "\t")
 
 
@@ -989,6 +1093,7 @@ _RANDOM_FRAGMENTS = (
     "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----", "MIIEowIBAAKCAQEA", "mysql ", "docker login ", "sshpass ", "curl ", "redis-cli ",
     "sqlcmd ", "openssl ", "pass:", "STRIPE_KEY", "{{tok:mixed:5:33}}", "- name: ", "name: ", "value: ", "|\n  ", "  value: ",
     "DB_PASSWORD", "[REDACTED]", "1000:1000", "a:b", "user:pw@", "u:p@h", "pw", "x=1", "a=b", "--", "-",
+    "`--user ", "**", "__", "~~", "<", ">", "sshpass -p ", "docker login -u a: -p ", "--cmd=", "--token ", "redis-cli -a ", "-passin ", "--user=a:", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 )
 
 

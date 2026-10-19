@@ -21,9 +21,10 @@ userinfo, PEM, token shapes, command lines) reads the ORIGINAL text and only rep
 `redact_spans` unions overlapping or touching spans and `redact_text` replaces each union by ONE `[REDACTED]`. Nothing is rewritten
 while detecting, so no detector ever measures a value another detector already shortened, the order of detectors is irrelevant, and a
 secret hidden by any one of them is hidden. A detector that needs a boundary scans linearly to the TRUE end of the value: a value is
-never cut by a length cap (a cap would leave a readable tail). Only syntax is bounded (a name <= 127 characters, a gap <= 32 blanks, at
-most 10 arguments of <= 128 characters between a command and its password flag); every quantifier that can be re-entered from many start
-positions is bounded, or its failed scans are remembered, so adversarial input of megabytes is scanned in time linear in its size.
+never cut by a length cap (a cap would leave a readable tail). Only syntax is bounded (a name <= 127 characters, a gap <= 32 blanks);
+command lines are read word by word (see "command-line credentials" below), so no argument is ever skipped by length or count. Every
+quantifier that can be re-entered from many start positions is bounded, or its failed scans are remembered, so adversarial input of
+megabytes is scanned in time linear in its size.
 Masking is idempotent on every shared vector; a mask can newly expose a word boundary (`AKIA...--password x`) and let a second pass hide
 more, never less.
 Best effort, not a guarantee: it covers the carriers above plus the command-line forms `curl -u user:pass`, `mysql -pSECRET`,
@@ -230,43 +231,149 @@ def _key_value_end(s: str, pos: int) -> tuple[int, int]:
 
 
 # ---- command-line credentials ---------------------------------------------------------------------------------------------
-# `curl -u user:pass`, `--user user:pass`, `--proxy-user a:b` (a docker `-u 1000:1000` uid:gid pair is not a credential).
-_CLI_VALUE = r"""(?:"[^"\n]*"|'[^'\n]*'|[^ \t\r\n\f\v"'\\;&|]+)"""
-# explicit ASCII whitespace classes below (`\s` differs between Python and JS: the twin in omp/src/swarm_bar.ts must agree byte for byte)
-# The flag must start a shell word (start of text, whitespace, a quote or `;&|(`): a flag glued to a previous word's characters
-# (`x=-u=-u=...`) cannot start inside another candidate's user token, so the unbounded user part below is scanned once per token.
-_USER_PASS_FLAG_RE = re.compile(
-    r"""(?<![^ \t\r\n\f\v"'\\;&|(])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))"""
-    r"""(?:"[^"\n:]*:[^"\n]*"|'[^'\n:]*:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]+:[^ \t\r\n\f\v"'\\;&|]+)""")
-_OPENSSL_PASS_RE = re.compile(r"""(?<![A-Za-z0-9_-])(-pass(?:in|out)?[ \t]{1,8}["']?pass:)[^ \t\r\n\f\v"';&|]+""")
+# `curl -u user:pass`, `--user user:pass`, `--proxy-user a:b` (a docker `-u 1000:1000` uid:gid pair is not a credential), `mysql -pSECRET`,
+# `docker login -p`, `sshpass -p`, `redis-cli -a`, `sqlcmd -P`, `ssh-keygen -N`, `openssl -passin pass:X`.
+# A command line is read WORD by word, never through a regex that has to SKIP arguments: a regex needs a bound on the length and the
+# number of the arguments it skips, and an argument above the bound (`docker login -u admin:<300 characters> -p pw`) hid the password after
+# it. A word ends at a blank (` \t\r\n\f\v`) or at `;&|`; a segment (the arguments of one command) ends at a newline or at `;&|`. An option
+# is a word that starts with `-` after any run of delimiters (backtick, quote, `(`, `[`, `{`, `<`, Markdown emphasis ...); its value is the
+# next word (or the `=value` / `-pVALUE` attached form), taken whole: a quoted value to its closing quote, an unterminated one to the end
+# of its line, any other to the next blank, `;&|` or quote. Nothing is capped, nothing reads text another detector rewrote, and every
+# scan moves forward only: a value that failed a check is remembered (`run`, `colon` below), so `x=-u=-u=-u=...` stays linear.
+_CLI_BREAKS = "\r\n\f\v;&|"
+_CLI_STOPS = " \t" + _CLI_BREAKS
+_CLI_WORD_RE = re.compile(r"[^ \t\r\n\f\v;&|]+")
+_CLI_BLANKS_RE = re.compile(r"[ \t]*")
+_CLI_UNQUOTED_RE = re.compile(r"""[^ \t\r\n\f\v;&|"']+""")
+_CLI_LINE_RE = re.compile(r"[^\r\n]*")
+_CLI_QUOTED_RES = {'"': re.compile(r'"[^"\n]*"'), "'": re.compile(r"'[^'\n]*'"),
+                   '\\"': re.compile(r'\\"[^\n]*?\\"'), "\\'": re.compile(r"\\'[^\n]*?\\'")}
+_CLI_UID_GID_RE = re.compile(r"[0-9]{1,10}:[0-9]{1,10}")
+# `-u`/`--user`/`--proxy-user` value, and the openssl `-pass`/`-passin`/`-passout` pass:X form; the option may follow ANY non-name character
+# (a backtick, a quote, a bracket, `=`, `_` of Markdown emphasis ...), not a letter, digit or `-`.
+_CLI_OPTION_RE = re.compile(r"(?<![A-Za-z0-9-])(?:(?:--user|--proxy-user|-u)(=|(?=[ \t]))|(-pass(?:in|out)?)(?=[ \t]))")
+_CLI_CORE_RE = re.compile(r"[A-Za-z0-9_./-]+")
+_CLI_NOT_LEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-")
+_CLI_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-")  # no `_`: no command name has one, `__mysql` is emphasis
+_CLI_TRAIL = "`\"')]}>*_~,.:!?"  # closers that may follow a bare option word (`-p`)
+# the commands whose flags are checked (kind bits), the first words of a two-word command, the flag letter of each kind
+_CLI_MYSQL, _CLI_LOGIN, _CLI_REDIS, _CLI_SQLCMD, _CLI_KEYGEN = 1, 2, 4, 8, 16
+_CLI_COMMANDS = {
+    **dict.fromkeys(("mysql", "mysqladmin", "mysqldump", "mysqlcheck", "mysqlimport", "mysqlshow", "mysqlpump", "mysqlsh", "mariadb",
+                     "mariadb-dump", "mariadb-admin"), _CLI_MYSQL),
+    **dict.fromkeys(("sshpass", "mongo", "mongosh", "mongodump", "mongorestore", "mongoexport", "mongoimport", "mongostat", "mongotop"), _CLI_LOGIN),
+    "redis-cli": _CLI_REDIS, "sqlcmd": _CLI_SQLCMD, "bcp": _CLI_SQLCMD, "ssh-keygen": _CLI_KEYGEN}
+_CLI_TWO_WORD = {**dict.fromkeys(("docker", "podman", "buildah", "skopeo", "crane", "oras", "nerdctl", "az"), 1), "helm": 2}  # 1: `login`; 2: `registry login`
+_CLI_FLAG_KINDS = {"p": _CLI_MYSQL | _CLI_LOGIN, "a": _CLI_REDIS, "P": _CLI_SQLCMD, "N": _CLI_KEYGEN}
+_CLI_COMMAND_HINTS = ("mysql", "mariadb", "sshpass", "login", "mongo", "redis-cli", "sqlcmd", "bcp", "ssh-keygen")
 
 
-def _cli_re(commands: str, flag: str, *, glued_only: bool = False) -> re.Pattern[str]:
-    """`<command> ... -<flag><value>` / `-<flag> <value>` within one shell segment (at most 10 arguments after the command; the lazy
-    gap finds the first such flag). `glued_only`: the value must touch the flag (`mysql -pSECRET`; a bare `-p` is a prompt)."""
-    after = r"(?=[^ \t\r\n\f\v;&|])" if glued_only else r"(?:[ \t]{1,8}(?=[^ \t\r\n\f\v-])|(?=[^ \t\r\n\f\v;&|]))"
-    return re.compile(rf"(?<![A-Za-z0-9_./-])((?:{commands})(?:[ \t]+[^ \t\r\n\f\v;&|]{{1,128}}){{0,10}}?[ \t]+-{flag}{after}){_CLI_VALUE}")
+def _cli_value_end(s: str, start: int) -> int:
+    """End of the value that starts at s[start] (not a blank, not `;&|`): a quoted value runs to its closing quote, or to the end of the
+    line when it never closes (a truncated log line); any other value to the next blank, `;&|` or quote. `start` when it is empty."""
+    c = s[start]
+    if c == "\\" and s[start + 1:start + 2] in ('"', "'"):
+        c = s[start:start + 2]
+    rx = _CLI_QUOTED_RES.get(c)
+    if rx is not None:
+        m = rx.match(s, start)
+        return m.end() if m else _CLI_LINE_RE.match(s, start).end()
+    m = _CLI_UNQUOTED_RE.match(s, start)
+    return m.end() if m else start
 
 
-# (substrings that must be present for the regex to be worth running, regex)
-_CLI_RES = (
-    (("-u",), _USER_PASS_FLAG_RE),
-    (("-pass",), _OPENSSL_PASS_RE),
-    (("mysql", "mariadb"), _cli_re(r"mysql|mysqladmin|mysqldump|mysqlcheck|mysqlimport|mysqlshow|mysqlpump|mysqlsh|mariadb|mariadb-dump|mariadb-admin",
-                                   "p", glued_only=True)),
-    (("sshpass", "login", "mongo"), _cli_re(r"sshpass|(?:docker|podman|buildah|skopeo|crane|oras|nerdctl)[ \t]+login|helm[ \t]+registry[ \t]+login"
-                                            r"|az[ \t]+login|mongo|mongosh|mongodump|mongorestore|mongoexport|mongoimport|mongostat|mongotop", "p")),
-    (("redis-cli",), _cli_re("redis-cli", "a")),
-    (("sqlcmd", "bcp"), _cli_re("sqlcmd|bcp", "P")),
-    (("ssh-keygen",), _cli_re("ssh-keygen", "N")),
-)
+def _cli_option_spans(s: str, add) -> None:
+    """The values of `-u user:pass` (and `--user`, `--proxy-user`, also `=user:pass`) and of `-passin pass:X`."""
+    if "-u" not in s and "-pass" not in s:
+        return
+    n = len(s)
+    run_from = run_to = -1  # [run_from, run_to) holds no blank, `;&|` or quote: the unquoted run every start inside it ends at
+    colon_from, colon_at = 0, -1  # no ':' in [colon_from, colon_at), a ':' at colon_at (n when there is none)
+    pushed_end = -1  # end of the last unquoted value reported: a later start (starts only grow) inside that run is covered
+    for m in _CLI_OPTION_RE.finditer(s):
+        start = m.end() if m.group(1) == "=" else _CLI_BLANKS_RE.match(s, m.end()).end()
+        if start < pushed_end or start >= n or s[start] in _CLI_STOPS:
+            continue  # (a start inside a reported run is covered)
+        if m.group(2) is not None:  # openssl: `-passin pass:SECRET`, `-passin "pass:SECRET"`
+            q = start + 1 if s[start] in "\"'" else start
+            if s.startswith("pass:", q):
+                value = _CLI_UNQUOTED_RE.match(s, q + 5)
+                if value:
+                    add((q + 5, value.end()))
+            continue
+        c = s[start]
+        if c in "\"'" or (c == "\\" and s[start + 1:start + 2] in ('"', "'")):
+            end = _cli_value_end(s, start)
+            if s.find(":", start + 1, end) >= 0:
+                add((start, end))
+            continue
+        if not run_from <= start < run_to:
+            run_from, run_to = start, _CLI_UNQUOTED_RE.match(s, start).end()
+        if not colon_from <= start <= colon_at:
+            colon_from = start
+            colon_at = s.find(":", start)
+            if colon_at < 0:
+                colon_at = n
+        # a user, `:`, a password (both non-empty); a docker uid:gid pair is not a credential
+        if start < colon_at and colon_at + 1 < run_to and not (colon_at - start <= 10 and run_to - colon_at <= 11
+                                                               and _CLI_UID_GID_RE.fullmatch(s, start, run_to)):
+            add((start, run_to))
+            pushed_end = run_to
+
+
+def _cli_command_spans(s: str, add) -> None:
+    """The password flag of `mysql -pSECRET`, `docker login -p SECRET`, `sshpass -p`, `redis-cli -a`, `sqlcmd -P`, `ssh-keygen -N`: once
+    a command is seen in a segment its flag is checked in EVERY later word of that segment, however long or numerous the arguments."""
+    if not any(h in s for h in _CLI_COMMAND_HINTS):
+        return
+    active = pending = want = prev_end = 0  # command kinds seen in this segment; `login` expected; a flag's value expected
+    for m in _CLI_WORD_RE.finditer(s):
+        start, end = m.span()
+        if (start != prev_end + 1 or s[prev_end] not in " \t") and s[prev_end:start].strip(" \t"):
+            active = pending = want = 0  # a newline or `;&|`: the next command
+        prev_end = end
+        if want:  # the value is taken whole, and its words are still read: a value can hold the next command (`redis-cli -a $(sshpass -p x)`)
+            want = 0
+            if s[start] != "-":
+                value_end = _cli_value_end(s, start)
+                if value_end > start:
+                    add((start, value_end))
+        at = start
+        while at < end and s[at] not in _CLI_NOT_LEAD:  # `, ", (, [, <, ** ... may precede an option
+            at += 1
+        if at < end and s[at] == "-":
+            pending = 0
+            kinds = active & _CLI_FLAG_KINDS.get(s[at + 1:at + 2], 0) if active else 0
+            if kinds:
+                if s[at + 2:end].strip(_CLI_TRAIL):  # `-pSECRET`: the value touches the flag
+                    add((at + 2, _cli_value_end(s, at + 2)))
+                    continue
+                if kinds != _CLI_MYSQL:  # a bare `-p` is a prompt for mysql, not for the others: the value is the next word
+                    want = 1
+        if pending:
+            core = _CLI_CORE_RE.search(s, start, end) if end - start <= 24 else None
+            if pending == 2:
+                pending = 3 if core and core[0] == "registry" else 0
+            else:
+                if core and core[0] == "login":
+                    active |= _CLI_LOGIN
+                pending = 0
+        base_start = end
+        floor = max(start, end - 41)
+        while base_start > floor and s[base_start - 1] in _CLI_NAME_CHARS:
+            base_start -= 1
+        if base_start < end and end - base_start <= 40:  # the command name is the last run of name characters (`/usr/bin/mysql`, `$(mysql`)
+            base = s[base_start:end]
+            kind = _CLI_COMMANDS.get(base)
+            if kind:
+                active |= kind
+            elif base in _CLI_TWO_WORD:
+                pending = _CLI_TWO_WORD[base]
 
 
 def _cli_spans(s: str, add) -> None:
-    for hints, rx in _CLI_RES:
-        if any(h in s for h in hints):
-            for m in rx.finditer(s):
-                add((m.end(1), m.end()))
+    _cli_option_spans(s, add)
+    _cli_command_spans(s, add)
 
 
 # ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ------------------------
@@ -348,6 +455,20 @@ def _continuation(s: str, pos: int, end: int, value_re: re.Pattern[str]) -> int:
     return -1 if v is None else v.end()
 
 
+_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+
+
+def _tail_name_start(s: str, floor: int, end: int) -> int:
+    """Where the name (and its `=`/`:`) that a value may have swallowed at its end starts: at most 130 characters back, never before `floor`."""
+    i = end
+    if i > floor and s[i - 1] in "=:":
+        i -= 1
+    low = max(floor, i - 130)
+    while i > low and s[i - 1] in _NAME_CHARS:
+        i -= 1
+    return i
+
+
 def _open_quote_value(s: str, pos: int, value_re: re.Pattern[str]) -> re.Match[str] | None:
     """The value of a name whose opening quote never closes on its line (`password="abc def`, a truncated log line): the quote is
     noise and the bare value after it is the secret. None when `s[pos]` is no quote."""
@@ -368,9 +489,12 @@ def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bo
         if not hit and not _key_name(name):
             continue
         start = pos
+        reopen = False
         if hit:
-            if (v := value_re.match(s, pos)) is None and (v := _open_quote_value(s, pos, value_re)) is None:
-                continue
+            if (v := value_re.match(s, pos)) is None:
+                if (v := _open_quote_value(s, pos, value_re)) is None:
+                    continue
+                reopen = True
             start, end = v.start(), v.end()
             if s.startswith(REDACTED, start) and end > start + len(REDACTED) and s[start + len(REDACTED)] not in _ALNUM:
                 end = start + len(REDACTED)  # an already-masked value (`[REDACTED],x`) ends where the mask does, like a closing quote
@@ -384,7 +508,9 @@ def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bo
         while (more := _continuation(s, pos, end, value_re)) >= 0:
             end = more
         add((start, end))
-        pos = end
+        # the value of a quote that never closes is a guess (`--token "--password x`): scanning goes on INSIDE it. A value can also end
+        # with the NAME of the next assignment (`--api-key = {--password=\"x\"`): scanning resumes where that name starts
+        pos = start if reopen else _tail_name_start(s, pos, end)
 
 
 def _pair_spans(s: str, add) -> None:

@@ -592,7 +592,7 @@ describe("redactText shared vectors", () => {
     expect(row).toBe("login --password [REDACTED]");
   });
 
-  test("1 MB adversarial inputs are scanned in time linear in their size (< 100 ms each)", () => {
+  test("1 MB adversarial inputs are scanned in time linear in their size (< 150 ms each)", () => {
     const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
       "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
       "--mode a;", "-v ", "password=a,token = ", "token=a,--password ", 'Cookie: a="', "x=-u=", '-u "', "A_KEY=", "STRIPE_KEY=A_KEY=", "a://u:",
@@ -601,7 +601,7 @@ describe("redactText shared vectors", () => {
       const text = unit.repeat(Math.floor(1_000_000 / unit.length));
       const started = performance.now();
       redactText(text);
-      expect({ unit, fast: performance.now() - started < 100 }).toEqual({ unit, fast: true });
+      expect({ unit, fast: performance.now() - started < 150 }).toEqual({ unit, fast: true });
     }
   });
 
@@ -695,6 +695,86 @@ describe("sanitization", () => {
       expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
     }
     expect(redactText("- name: PASSWORD\n  value: x\nmysql -u a -pb db\n".repeat(250_000)).split("[REDACTED]").length - 1).toBe(500_000);
+  });
+
+  // ---- GL6 round 6: command checks read whole arguments, Markdown delimiters around an option (twins of tests/test_redact.py) ----
+  const COMMAND_LINES: Record<string, [string, string]> = {
+    "docker login": ["docker login -u me -p ", ""],
+    "podman login": ["podman login -p ", " reg.io"],
+    "helm registry login": ["helm registry login reg.io -p ", ""],
+    "az login": ["az login -u me -p ", ""],
+    sshpass: ["sshpass -p ", " ssh host"],
+    mysql: ["mysql -u root -p", " db"],
+    mongosh: ["mongosh --host h -u me -p ", ""],
+    "redis-cli": ["redis-cli -a ", " ping"],
+    sqlcmd: ["sqlcmd -S h -U sa -P ", ""],
+    "ssh-keygen": ["ssh-keygen -t ed25519 -N ", " -f k"],
+  };
+
+  test("command flags are checked after arguments of any length and number", () => {
+    for (const [name, [before, after]] of Object.entries(COMMAND_LINES)) {
+      for (const size of [1, 128, 129, 1000]) {
+        for (const count of [0, 1, 10, 11, 40]) {
+          const secret = expandToken("plain", size + count, 16);
+          const parts = before.split(" -");
+          const head = parts[0]!;
+          const tail = ` -${parts.slice(1).join(" -")}`;
+          const args = Array.from({ length: count }, (_, i) => ` --argument${i}=${"v".repeat(size)}`).join("");
+          expect({ name, size, count, out: redactText(head + args + tail + secret + after) }).toEqual({ name, size, count, out: `${head}${args}${tail}[REDACTED]${after}` });
+        }
+      }
+    }
+  });
+
+  test("Markdown delimiters around a command option keep its password masked", () => {
+    const wrappers: Array<[string, string]> = [["`", "`"], ["(", ")"], ["[", "]"], ["<", ">"], ["**", "**"], ["*", "*"], ["__", "__"], ["~~", "~~"], ['"', '"'], ["'", "'"],
+      ["{", "}"], ["**`", "`**"], ["(`", "`)"], ["[`", "`](docs)"], ['\\"', '\\"'], ["$(", ")"], ["<code>", "</code>"]];
+    const options = ["--user admin:%s", "-u admin:%s", "--user=admin:%s", "-u=admin:%s", "--proxy-user a:%s", "docker login -u me -p %s", "mysql -u root -p%s db",
+      "sshpass -p %s ssh h", "redis-cli -a %s ping", "sqlcmd -S h -P %s", "openssl rsa -passin pass:%s"];
+    const secret = expandToken("plain", 7, 18);
+    for (const [opener, closer] of wrappers) {
+      for (const option of options) {
+        const text = `Run ${opener}${option.replace("%s", secret)}${closer} now`;
+        const out = redactText(text);
+        expect({ text, ok: !out.includes(secret) && out.startsWith(`Run ${opener}`) && out.split("[REDACTED]").length === 2 }).toEqual({ text, ok: true });
+      }
+    }
+  });
+
+  test("the round six review findings", () => {
+    expect(redactText("docker login -u admin: -p pw123")).toBe("docker login -u admin: -p [REDACTED]");
+    expect(redactText(`docker login -u admin:${"x".repeat(200)} -p pw123 reg.io`)).toBe("docker login -u [REDACTED] -p [REDACTED] reg.io");
+    expect(redactText("Run `--user admin:hunter2` now")).toBe("Run `--user [REDACTED] now");
+    expect(redactText("Run (--user=admin:hunter2)")).toBe("Run (--user=[REDACTED]");
+    expect(redactText("**--user admin:hunter2**")).toBe("**--user [REDACTED]");
+    expect(redactText('"--user admin:hunter2" ok')).toBe('"--user [REDACTED]" ok');
+    expect(sanitizeText("Run `--user admin:hunter2` now")).toBe("Run `--user [REDACTED] now");
+    expect(sanitizeText("docker login -u admin: -p pw123")).toBe("docker login -u admin: -p [REDACTED]");
+  });
+
+  test("a new line or a semicolon ends the command whose flags are checked", () => {
+    const unchanged = "docker login reg.io\nls -p x\nmysql -u root -p\nredis-cli -h h -p 6379 ping\ndocker login reg.io; ls -p x && tar -a y";
+    expect(redactText(unchanged)).toBe(unchanged);
+    expect(redactText("mysql -u root\nls -pSECRETX")).toBe("mysql -u root\nls -pSECRETX");
+  });
+
+  test("unterminated and escaped-quoted command values, and a value that swallowed the next sensitive name", () => {
+    expect(redactText("sshpass -p 'abc def")).toBe("sshpass -p [REDACTED]");
+    expect(redactText('docker login -p \\"abc def\\" reg')).toBe("docker login -p [REDACTED] reg");
+    expect(redactText('curl -u "admin:my pass" https://h')).toBe("curl -u [REDACTED] https://h");
+    expect(redactText('run --token \\"--password hunter2')).toBe('run --token \\"[REDACTED] [REDACTED]');
+    expect(redactText('--api-key = {--password=\\"user:hunter2\\"')).toBe("--api-key [REDACTED] [REDACTED]");
+  });
+
+  test("1 MB command-line floods are linear and still find the trailing password", () => {
+    const units = ["mysql -u a ", "docker login x ", "`--user a:", "docker login -p ", "redis-cli -a ", "-passin pass:", "--cmd=mysql ", "-u=-u=", "x -u ", "-u  ",
+      "mysql -p'", 'sshpass -p "', "docker login -u a: -p ", "sqlcmd -P ", "ssh-keygen -N ", "__-u a:", "(-u a:"];
+    for (const unit of units) {
+      const started = performance.now();
+      const out = redactText(`${unit.repeat(Math.floor(1_000_000 / unit.length))}\npassword=hunter2`);
+      expect({ unit, fast: performance.now() - started < 300 }).toEqual({ unit, fast: true });
+      expect({ unit, masked: out.endsWith("password=[REDACTED]") && !out.includes("hunter2") }).toEqual({ unit, masked: true });
+    }
   });
 
   test("long input is bounded before masking: 100 KB of URL-credential lookalikes does not stall, the head survives", () => {

@@ -282,51 +282,255 @@ function keyValueEnd(s: string, pos: number): [number, number] {
   return [q !== "" && s.startsWith(q, runEnd) ? runEnd + q.length : runEnd, runEnd];
 }
 
-// ---- command-line credentials (twins of the `_CLI_*` helpers in swarm/redact.py; explicit ASCII whitespace classes: JS and Python `\s` differ) ----
-const CLI_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|[^ \t\r\n\f\v"'\\;&|]+)`;
-/** `curl -u user:pass`, `--user user:pass`, `--proxy-user a:b` (a docker `-u 1000:1000` uid:gid pair is not a credential). */
-const USER_PASS_FLAG = new RegExp(
-  // the flag must start a shell word: a flag glued to a previous word's characters (`x=-u=-u=...`) cannot start inside another candidate's user token
-  String.raw`(?<![^ \t\r\n\f\v"'\\;&|(])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))` +
-    String.raw`(?:"[^"\n:]*:[^"\n]*"|'[^'\n:]*:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]+:[^ \t\r\n\f\v"'\\;&|]+)`,
-  "g",
-);
-const OPENSSL_PASS = /(?<![A-Za-z0-9_-])(-pass(?:in|out)?[ \t]{1,8}["']?pass:)[^ \t\r\n\f\v"';&|]+/g;
-/** `<command> ... -<flag><value>` / `-<flag> <value>` within one shell segment (at most 10 arguments after the command). `gluedOnly`: a bare `-p` is a prompt. */
-function cliRe(commands: string, flag: string, gluedOnly = false): RegExp {
-  const after = gluedOnly
-    ? String.raw`(?=[^ \t\r\n\f\v;&|])`
-    : String.raw`(?:[ \t]{1,8}(?=[^ \t\r\n\f\v-])|(?=[^ \t\r\n\f\v;&|]))`;
-  return new RegExp(
-    String.raw`(?<![A-Za-z0-9_./-])((?:${commands})(?:[ \t]+[^ \t\r\n\f\v;&|]{1,128}){0,10}?[ \t]+-${flag}${after})${CLI_VALUE}`,
-    "g",
-  );
-}
-/** [substrings one of which must be present for the regex to be worth running, regex] */
-const CLI_RES: ReadonlyArray<readonly [readonly string[], RegExp]> = [
-  [["-u"], USER_PASS_FLAG],
-  [["-pass"], OPENSSL_PASS],
-  [
-    ["mysql", "mariadb"],
-    cliRe("mysql|mysqladmin|mysqldump|mysqlcheck|mysqlimport|mysqlshow|mysqlpump|mysqlsh|mariadb|mariadb-dump|mariadb-admin", "p", true),
-  ],
-  [
-    ["sshpass", "login", "mongo"],
-    cliRe(
-      String.raw`sshpass|(?:docker|podman|buildah|skopeo|crane|oras|nerdctl)[ \t]+login|helm[ \t]+registry[ \t]+login` +
-        String.raw`|az[ \t]+login|mongo|mongosh|mongodump|mongorestore|mongoexport|mongoimport|mongostat|mongotop`,
-      "p",
-    ),
-  ],
-  [["redis-cli"], cliRe("redis-cli", "a")],
-  [["sqlcmd", "bcp"], cliRe("sqlcmd|bcp", "P")],
-  [["ssh-keygen"], cliRe("ssh-keygen", "N")],
-];
-function cliSpans(s: string, spans: number[]): void {
-  for (const [hints, rx] of CLI_RES) {
-    if (!hints.some((h) => s.includes(h))) continue;
-    for (const m of s.matchAll(rx)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length);
+// ---- command-line credentials (twins of the `_cli_*` helpers in swarm/redact.py; explicit ASCII whitespace classes: JS and Python `\s` differ) ----
+// A command line is read WORD by word, never through a regex that has to skip arguments (a bound on their length or number hid the password
+// after a long argument): a word ends at a blank or at `;&|`, a segment (the arguments of one command) at a newline or `;&|`. An option is a
+// word that starts with `-` after any run of delimiters (backtick, quote, bracket, Markdown emphasis ...); its value is the next word (or the
+// attached `=value` / `-pVALUE`), taken whole. Nothing is capped and every scan moves forward only (failed checks are remembered).
+const CLI_BREAKS = "\r\n\f\v;&|";
+const CLI_STOPS = ` \t${CLI_BREAKS}`;
+const CLI_WORD = /[^ \t\r\n\f\v;&|]+/g;
+const CLI_UNQUOTED = /[^ \t\r\n\f\v;&|"']+/y;
+const CLI_LINE = /[^\r\n]*/y;
+/** A lookup table without a prototype: a command word such as `constructor` or `__proto__` finds nothing. */
+const table = <V>(entries: Record<string, V>): Record<string, V> => Object.assign(Object.create(null) as Record<string, V>, entries);
+const CLI_QUOTED = table<RegExp>({
+  '"': /"[^"\n]*"/y,
+  "'": /'[^'\n]*'/y,
+  '\\"': /\\"[^\n]*?\\"/y,
+  "\\'": /\\'[^\n]*?\\'/y,
+});
+const CLI_UID_GID = /^[0-9]{1,10}:[0-9]{1,10}$/;
+const CLI_CORE = /[A-Za-z0-9_./-]+/;
+const isAlnumDash = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45;
+const isNameChar = (c: number): boolean => isAlnumDash(c) || c === 95 || c === 46;
+/** A character of a command name: no `_` (no command name has one; `__mysql` is emphasis). */
+const isCommandChar = (c: number): boolean => isAlnumDash(c) || c === 46;
+const CLI_TRAIL = "`\"')]}>*_~,.:!?"; // closers that may follow a bare option word (`-p`)
+const CLI_MYSQL = 1;
+const CLI_LOGIN = 2;
+const CLI_REDIS = 4;
+const CLI_SQLCMD = 8;
+const CLI_KEYGEN = 16;
+const CLI_COMMANDS = table<number>({
+  mysql: CLI_MYSQL,
+  mysqladmin: CLI_MYSQL,
+  mysqldump: CLI_MYSQL,
+  mysqlcheck: CLI_MYSQL,
+  mysqlimport: CLI_MYSQL,
+  mysqlshow: CLI_MYSQL,
+  mysqlpump: CLI_MYSQL,
+  mysqlsh: CLI_MYSQL,
+  mariadb: CLI_MYSQL,
+  "mariadb-dump": CLI_MYSQL,
+  "mariadb-admin": CLI_MYSQL,
+  sshpass: CLI_LOGIN,
+  mongo: CLI_LOGIN,
+  mongosh: CLI_LOGIN,
+  mongodump: CLI_LOGIN,
+  mongorestore: CLI_LOGIN,
+  mongoexport: CLI_LOGIN,
+  mongoimport: CLI_LOGIN,
+  mongostat: CLI_LOGIN,
+  mongotop: CLI_LOGIN,
+  "redis-cli": CLI_REDIS,
+  sqlcmd: CLI_SQLCMD,
+  bcp: CLI_SQLCMD,
+  "ssh-keygen": CLI_KEYGEN,
+});
+/** First words of a two-word command: 1 = `<word> login`, 2 = `helm registry login`. */
+const CLI_TWO_WORD = table<number>({ docker: 1, podman: 1, buildah: 1, skopeo: 1, crane: 1, oras: 1, nerdctl: 1, az: 1, helm: 2 });
+/** The flag letter of each command kind. */
+const CLI_FLAG_KINDS = table<number>({ p: CLI_MYSQL | CLI_LOGIN, a: CLI_REDIS, P: CLI_SQLCMD, N: CLI_KEYGEN });
+const CLI_COMMAND_HINTS = ["mysql", "mariadb", "sshpass", "login", "mongo", "redis-cli", "sqlcmd", "bcp", "ssh-keygen"];
+
+/** Whether `s[from, to)` holds a character that is neither a space nor a tab. */
+function hasNonBlank(s: string, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== 32 && c !== 9) return true;
   }
+  return false;
+}
+/** Whether `s[from, to)` holds a character that is not one of the closers in `CLI_TRAIL`. */
+function hasNonTrail(s: string, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) if (!CLI_TRAIL.includes(s.charAt(i))) return true;
+  return false;
+}
+/** Whether `s[from, to)` holds `ch` (a bounded scan: `indexOf` would read past `to`). */
+function hasChar(s: string, ch: string, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) if (s.charAt(i) === ch) return true;
+  return false;
+}
+
+/** End of the run of characters from `start` that holds no blank, `;&|` or quote (`CLI_UNQUOTED`, as a loop: no match object). */
+function unquotedEnd(s: string, start: number): number {
+  let i = start;
+  for (; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 13 || c === 10 || c === 12 || c === 11 || c === 59 || c === 38 || c === 124 || c === 34 || c === 39) break;
+  }
+  return i;
+}
+
+/**
+ * End of the value that starts at s[start] (not a blank, not `;&|`): a quoted value runs to its closing quote, or to the end of the line
+ * when it never closes (a truncated log line); any other value to the next blank, `;&|` or quote. `start` when it is empty.
+ */
+function cliValueEnd(s: string, start: number): number {
+  let c = s.charAt(start);
+  if (c === "\\") {
+    const d = s.charAt(start + 1);
+    if (d === '"' || d === "'") c += d;
+  }
+  const rx = CLI_QUOTED[c];
+  if (rx !== undefined) {
+    const m = stickyAt(rx, s, start);
+    return start + (m !== null ? m[0].length : (stickyAt(CLI_LINE, s, start) as RegExpExecArray)[0].length);
+  }
+  const m = stickyAt(CLI_UNQUOTED, s, start);
+  return m === null ? start : start + m[0].length;
+}
+
+/**
+ * The values of `-u user:pass` (and `--user`, `--proxy-user`, also `=user:pass`) and of `-passin pass:X` (`-pass`, `-passout`): the option may
+ * follow ANY character that is not a letter, digit or `-` (a backtick, a quote, a bracket, `=`, the `_` of Markdown emphasis ...).
+ */
+function cliOptionSpans(s: string, spans: number[]): void {
+  if (!s.includes("-u") && !s.includes("-pass")) return;
+  const n = s.length;
+  let runFrom = -1; // [runFrom, runTo) holds no blank, `;&|` or quote: the unquoted run every start inside it ends at
+  let runTo = -1;
+  let colonFrom = 0; // no ':' in [colonFrom, colonAt), a ':' at colonAt (n when there is none)
+  let colonAt = -1;
+  let pushedEnd = -1; // end of the last unquoted value reported: a later start (starts only grow) inside that run is covered
+  for (let at = s.indexOf("-"); at >= 0; at = s.indexOf("-", at + 1)) {
+    if (at > 0 && isAlnumDash(s.charCodeAt(at - 1))) continue; // the option does not continue a word
+    // the option (`CLI_OPTION` in swarm/redact.py, spelled out: a regex match object per candidate costs more than the scan)
+    const c1 = s.charCodeAt(at + 1);
+    let end = -1;
+    let openssl = false;
+    if (c1 === 117) end = at + 2; // -u
+    else if (c1 === 45) end = s.startsWith("--user", at) ? at + 6 : s.startsWith("--proxy-user", at) ? at + 12 : -1;
+    else if (c1 === 112 && s.startsWith("-pass", at)) {
+      end = s.startsWith("in", at + 5) ? at + 7 : s.startsWith("out", at + 5) ? at + 8 : at + 5;
+      openssl = true;
+    }
+    if (end < 0) continue;
+    const after = s.charCodeAt(end);
+    const blank = after === 32 || after === 9;
+    if (!blank && (openssl || after !== 61)) continue; // `=` follows the -u family only
+    let start = end;
+    if (blank) {
+      while (start < n && (s.charCodeAt(start) === 32 || s.charCodeAt(start) === 9)) start++;
+    } else {
+      start++;
+    }
+    if (start < pushedEnd || start >= n || CLI_STOPS.includes(s.charAt(start))) continue; // (a start inside a reported run is covered)
+    const c = s.charAt(start);
+    if (openssl) {
+      // openssl: `-passin pass:SECRET`, `-passin "pass:SECRET"`
+      const q = c === '"' || c === "'" ? start + 1 : start;
+      if (s.startsWith("pass:", q)) {
+        const value = stickyAt(CLI_UNQUOTED, s, q + 5);
+        if (value !== null) spans.push(q + 5, q + 5 + value[0].length);
+      }
+      continue;
+    }
+    const d = s.charAt(start + 1);
+    if (c === '"' || c === "'" || (c === "\\" && (d === '"' || d === "'"))) {
+      const end = cliValueEnd(s, start);
+      if (hasChar(s, ":", start + 1, end)) spans.push(start, end);
+      continue;
+    }
+    if (!(runFrom <= start && start < runTo)) {
+      runFrom = start;
+      runTo = unquotedEnd(s, start);
+    }
+    if (!(colonFrom <= start && start <= colonAt)) {
+      colonFrom = start;
+      colonAt = s.indexOf(":", start);
+      if (colonAt < 0) colonAt = n;
+    }
+    // a user, `:`, a password (both non-empty); a docker uid:gid pair is not a credential
+    if (
+      start < colonAt &&
+      colonAt + 1 < runTo &&
+      !(colonAt - start <= 10 && runTo - colonAt <= 11 && CLI_UID_GID.test(s.slice(start, runTo)))
+    ) {
+      spans.push(start, runTo);
+      pushedEnd = runTo;
+    }
+  }
+}
+
+/**
+ * The password flag of `mysql -pSECRET`, `docker login -p SECRET`, `sshpass -p`, `redis-cli -a`, `sqlcmd -P`, `ssh-keygen -N`: once a command is
+ * seen in a segment its flag is checked in EVERY later word of that segment, however long or numerous the arguments.
+ */
+function cliCommandSpans(s: string, spans: number[]): void {
+  if (!CLI_COMMAND_HINTS.some((h) => s.includes(h))) return;
+  let active = 0; // command kinds seen in this segment
+  let pending = 0; // a two-word command's next word
+  let want = 0; // the next word is the value of a bare flag
+  let prevEnd = 0;
+  for (const m of s.matchAll(CLI_WORD)) {
+    const start = m.index as number;
+    const end = start + m[0].length;
+    if ((start !== prevEnd + 1 || (s.charCodeAt(prevEnd) !== 32 && s.charCodeAt(prevEnd) !== 9)) && hasNonBlank(s, prevEnd, start)) {
+      active = pending = want = 0; // a newline or `;&|`: the next command
+    }
+    prevEnd = end;
+    if (want !== 0) {
+      // the value is taken whole, and its words are still read: a value can hold the next command (`redis-cli -a $(sshpass -p x)`)
+      want = 0;
+      if (s.charAt(start) !== "-") {
+        const valueEnd = cliValueEnd(s, start);
+        if (valueEnd > start) spans.push(start, valueEnd);
+      }
+    }
+    let at = start;
+    while (at < end && !isAlnumDash(s.charCodeAt(at))) at++; // `, ", (, [, <, ** ... may precede an option
+    if (at < end && s.charAt(at) === "-") {
+      pending = 0;
+      const kinds = active !== 0 ? active & (CLI_FLAG_KINDS[s.charAt(at + 1)] ?? 0) : 0;
+      if (kinds !== 0) {
+        if (hasNonTrail(s, at + 2, end)) {
+          // `-pSECRET`: the value touches the flag
+          spans.push(at + 2, cliValueEnd(s, at + 2));
+          continue;
+        }
+        if (kinds !== CLI_MYSQL) want = 1; // a bare `-p` is a prompt for mysql, not for the others: the value is the next word
+      }
+    }
+    if (pending !== 0) {
+      const core = end - start <= 24 ? CLI_CORE.exec(s.slice(start, end)) : null;
+      if (pending === 2) {
+        pending = core !== null && core[0] === "registry" ? 3 : 0;
+      } else {
+        if (core !== null && core[0] === "login") active |= CLI_LOGIN;
+        pending = 0;
+      }
+    }
+    let baseStart = end;
+    const floor = Math.max(start, end - 41);
+    while (baseStart > floor && isCommandChar(s.charCodeAt(baseStart - 1))) baseStart--;
+    if (baseStart < end && end - baseStart <= 40) {
+      // the command name is the last run of name characters (`/usr/bin/mysql`, `$(mysql`)
+      const base = s.slice(baseStart, end);
+      const kind = CLI_COMMANDS[base];
+      if (kind !== undefined) active |= kind;
+      else {
+        const two = CLI_TWO_WORD[base];
+        if (two !== undefined) pending = two;
+      }
+    }
+  }
+}
+
+function cliSpans(s: string, spans: number[]): void {
+  cliOptionSpans(s, spans);
+  cliCommandSpans(s, spans);
 }
 
 // ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ----
@@ -394,6 +598,15 @@ function openQuoteValue(s: string, pos: number, valueAt: RegExp): [number, numbe
   return v === null ? null : [pos + skip, pos + skip + v[0].length];
 }
 
+/** Where the name (and its `=`/`:`) that a value may have swallowed at its end starts: at most 130 characters back, never before `floor` (twin of `_tail_name_start`). */
+function tailNameStart(s: string, floor: number, end: number): number {
+  let i = end;
+  if (i > floor && (s.charAt(i - 1) === "=" || s.charAt(i - 1) === ":")) i--;
+  const low = Math.max(floor, i - 130);
+  while (i > low && isNameChar(s.charCodeAt(i - 1))) i--;
+  return i;
+}
+
 /** Report the value that follows every sensitive `NAME<sep>` match of `sep`: one forward pass with a cursor (no recursion, no rescans). */
 function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: number[]): void {
   let keyFail = 0;
@@ -406,6 +619,7 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: nu
     if (!hit && !isKeyName(name)) continue;
     let start = pos;
     let end: number;
+    let reopen = false;
     if (hit) {
       const v = stickyAt(valueAt, s, pos);
       if (v !== null) {
@@ -414,6 +628,7 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: nu
         const open = openQuoteValue(s, pos, valueAt);
         if (open === null) continue;
         [start, end] = open;
+        reopen = true;
       }
       // an already-masked value (`[REDACTED],x`) ends where the mask does, like a closing quote
       if (s.startsWith(REDACTED, start) && end > start + REDACTED.length && !/[A-Za-z0-9]/.test(s.charAt(start + REDACTED.length))) end = start + REDACTED.length;
@@ -428,7 +643,8 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: nu
     }
     for (let more = continuation(s, pos, end, valueAt); more >= 0; more = continuation(s, pos, end, valueAt)) end = more;
     spans.push(start, end);
-    sep.lastIndex = end;
+    // the value of a quote that never closes is a guess (`--token "--password x`): scanning goes on INSIDE it. A value can also end with the NAME of the next assignment (`--api-key = {--password=\"x\"`): scanning resumes where that name starts
+    sep.lastIndex = reopen ? start : tailNameStart(s, pos, end);
   }
 }
 
