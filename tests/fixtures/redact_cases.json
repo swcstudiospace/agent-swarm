@@ -249,7 +249,12 @@
     {"name": "R4: a comment value, then a prose apostrophe on the next line, opens no quote", "input": "# PASSWORD=\"{{tok:urlsafe:609:12}}\"\n# it's the user's note\necho 'ok'\n", "must_not_contain": [["{{tok:urlsafe:609:12}}"]], "must_contain": ["# it's the user's note", "echo 'ok'"], "expected": "# PASSWORD=[REDACTED]\n# it's the user's note\necho 'ok'\n"},
     {"name": "R5: a multi-line value joined to two quoted segments outside a comment (unchanged)", "input": "PASSWORD=\"{{tok:urlsafe:610:12}}\n{{tok:urlsafe:611:12}}\"'{{tok:urlsafe:612:12}}'\necho done\n", "must_not_contain": [["{{tok:urlsafe:610:12}}"], ["{{tok:urlsafe:611:12}}"], ["{{tok:urlsafe:612:12}}"]], "must_contain": ["echo done"], "expected": "PASSWORD=[REDACTED]\necho done\n"},
     {"name": "R6 (review P2, earlier): a comment's apostrophe before a multi-line double-quoted secret", "input": "# '\nPASSWORD=\"{{tok:urlsafe:613:12}}\n{{tok:urlsafe:614:12}}\"\n", "must_not_contain": [["{{tok:urlsafe:613:12}}"], ["{{tok:urlsafe:614:12}}"]], "must_contain": ["# '"], "expected": "# '\nPASSWORD=[REDACTED]\n"},
-    {"name": "R7: a comment value that runs onto the next line and joins a quoted segment there", "input": "# PASSWORD=\"{{tok:urlsafe:615:12}}\n{{tok:urlsafe:616:12}}\"' tail'\necho ok\n", "must_not_contain": [["{{tok:urlsafe:615:12}}"], ["{{tok:urlsafe:616:12}}"], "tail'"], "must_contain": ["echo ok"], "expected": "# PASSWORD=[REDACTED]\necho ok\n"},
+    {"name": "R7: a comment value stops at its line (shell semantics): the next line is read from a clean state, so its quoted segment is no part of the value", "input": "# PASSWORD=\"alpha\nbeta\"' tail'\necho ok\n", "must_not_contain": ["alpha"], "must_contain": ["echo ok"], "expected": "# PASSWORD=[REDACTED]\nbeta\"' tail'\necho ok\n"},
+    {"name": "F1 (review P2): a quote a comment's glued value leaves open does not cross the newline, so TOKEN= is read as it would be alone", "input": "# PASSWORD=\"example\"'\nTOKEN='alpha\ns3cr3t'", "must_not_contain": ["example", "alpha", "s3cr3t"], "must_contain": ["# PASSWORD=", "TOKEN="], "expected": "# PASSWORD=[REDACTED]\nTOKEN=[REDACTED]"},
+    {"name": "F2: the F1 assignment with the comment removed is masked the same way", "input": "TOKEN='alpha\ns3cr3t'", "must_not_contain": ["alpha", "s3cr3t"], "must_contain": [], "expected": "TOKEN=[REDACTED]"},
+    {"name": "F3: a comment with a glued quoted value, then a multi-line TOKEN value on the next line", "input": "# PASSWORD=\"alpha\"'beta'\"gamma\"\nTOKEN='delta\nepsilon'\n", "must_not_contain": ["alpha", "beta", "gamma", "delta", "epsilon"], "must_contain": [], "expected": "# PASSWORD=[REDACTED]\nTOKEN=[REDACTED]\n"},
+    {"name": "F4: a comment whose glued value is the last text of the string, with no newline", "input": "# PASSWORD=\"alpha\"'beta'\"gamma\"", "must_not_contain": ["alpha", "beta", "gamma"], "must_contain": [], "expected": "# PASSWORD=[REDACTED]"},
+    {"name": "F5: a comment with a glued quoted value, then a command line", "input": "# PASSWORD=\"alpha\"'beta'\"gamma\"\necho ok", "must_not_contain": ["alpha", "beta", "gamma"], "must_contain": ["echo ok"], "expected": "# PASSWORD=[REDACTED]\necho ok"},
     {"name": "R8: an unclosed double quote in a comment value runs to the end of its line only", "input": "# PASSWORD=\"{{tok:urlsafe:617:12}}\nnext line\n", "must_not_contain": [["{{tok:urlsafe:617:12}}"]], "must_contain": ["next line"], "expected": "# PASSWORD=[REDACTED]\nnext line\n"},
     {"name": "R9: a#b is a word, so its assignment is no comment and its joined segments are one value", "input": "echo a#PASSWORD=\"{{tok:urlsafe:618:12}}\"'x' ok\n", "must_not_contain": [["{{tok:urlsafe:618:12}}"], "'x'"], "must_contain": ["echo a#PASSWORD=", " ok"], "expected": "echo a#PASSWORD=[REDACTED] ok\n"},
     {"name": "R10: a prose apostrophe after a closed comment value stays prose", "input": "# PASSWORD=\"{{tok:urlsafe:619:12}}\" it's\n", "must_not_contain": [["{{tok:urlsafe:619:12}}"]], "must_contain": ["it's"], "expected": "# PASSWORD=[REDACTED] it's\n"},
@@ -309,7 +314,7 @@
       "# PASSWORD=\"{S}\"'{S}'\"{S}\"",
       "# TOKEN='{S}'\"{S}\"'{S}'\"{S}\"",
       "# DB_PASSWORD=\"{S}\"'{S}' # it's ok",
-      "# PASSWORD=\"{S}\n{S}\"'{S}'",
+      "# PASSWORD=\"{S}\"'{S}'\nPASSWORD=\"{S}\n{S}\"'{S}'",
       "# '\nPASSWORD=\"{S}\n{S}\"",
       "# it's the user's note\nPASSWORD=\"{S}\"'{S}'",
       "# PASSWORD=\"{S}\"\n# it's ok\necho 'done'",
@@ -328,7 +333,7 @@
       "# PASSWORD=\"{S}\" # '",
       "# PASSWORD='{S}'\"{S}\" it's"
     ],
-    "sha256": "c5b02898f8250dd895917720f2dc3b0c724f9a2f2119851720e9d32a27e1acf4"
+    "sha256": "2b4480e9989190e59b1036615ced838e6cf1681484fdcb48a21db2aa317f3e9e"
   },
   "property_joined": {
     "_doc": "Seeded shell-like snippets whose joined words carry blanks inside quoted segments (`ab'c d'SECRET`, `x\"a b\"'SECRET'`, `ab'c {SECRET} d'ef`), for swarm/redact.py and omp/src/swarm_bar.ts. Every template is ONE balanced line (each quote it opens it closes, prose apostrophes aside), so no unclosed quote precedes an assignment: a stray quote's closer ends a value by design (an enclosing close), which would put a glued planted secret outside the value. Drawn exactly as `property` is (xorshift32 from `seed`; 2 to 4 templates, then one of templates[secret_from:]; every `{S}`, left to right, is a fresh planted secret `{{tok:urlsafe:INDEX:20}}`, INDEX = 100000 + the running count). Both suites: no planted secret survives the redaction, and the SHA-256 of the outputs joined with NUL is `sha256` (Python == TypeScript for every case).",
@@ -346,5 +351,37 @@
       "TOKEN=\"a b\"x{S} visible"
     ],
     "sha256": "c260ceb01996bda95dd750497a1cbbcaabe96676621a7c31efbe96ecd7999f60"
+  },
+  "property_comment_lines": {
+    "_doc": "Seeded shell-like snippets whose comments carry stray quotes (`# '`, `# it's`, `# PASSWORD=\"it's`, unclosed sensitive values) before sensitive assignments on later lines, for swarm/redact.py and omp/src/swarm_bar.ts. A comment's quote state ends with its line (the lexer closes what the comment opened), so every assignment after it is read as on a clean line: no 6-byte window of a planted secret survives. Drawn as `property` is (xorshift32 from `seed`; 2 to 4 templates, then one of templates[secret_from:]; every `{S}`, left to right, is a fresh planted secret).",
+    "seed": 20263,
+    "count": 600,
+    "secret_from": 14,
+    "templates": [
+      "# it's ok '",
+      "# PASSWORD=x'y",
+      "# TOKEN=\"ab'c d\"'e",
+      "# '",
+      "# don't \"",
+      "# PASSWORD=\"it's",
+      "# API_KEY: 'x",
+      "# mysql -p'x",
+      "echo \"it's\" # 'x",
+      "# note: x'y",
+      "# {\"password\": \"x",
+      "# --password \"x",
+      "x && # it's",
+      "# PASSWORD='a b' it's",
+      "TOKEN='{S}'",
+      "PASSWORD=\"{S}\"",
+      "DB_PASSWORD={S}",
+      "--password \"{S}\" x",
+      "API_KEY: '{S}'",
+      "{\"password\": \"{S}\"}",
+      "PASSWORD=\"{S}\"'{S}' tail",
+      "mysql -p'{S}' db",
+      "echo ok"
+    ],
+    "sha256": "bedc17ac2ba5566ff09442f519d1309e0ad554405f507d663d259558592f5bb0"
   }
 }

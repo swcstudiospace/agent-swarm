@@ -221,6 +221,9 @@ function bareEnd(s: string, i: number, kind: number): number {
 //     of one word (`--password :;` is a flag and also `password :`) make one value, the longer. A quote that nothing closes runs to the end
 //     of its line. `a#b`, `$#`, `\#` and a `#` inside an open quote are not comments. "Outside quotes" is the lexer's own view: no quote is
 //     open on its stack at that point (an unclosed quote still counts as open).
+//   * a comment's quote state is bounded by its LINE (shell semantics): at the newline that ends a comment, every quote opened inside it is
+//     closed without a closer and runs to that line's end; the lexer never carries an open quote out of a comment, so the next line is read from
+//     a clean state (`# PASSWORD="x"'` then `TOKEN='alpha` and `s3cr3t'` read exactly as `TOKEN='alpha` and `s3cr3t'` with no comment above).
 //   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
 //     detectors mask from the value start to the end of that line, never a part of it.
 //   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
@@ -364,8 +367,20 @@ class Lexer {
     let vgap = 0; // ... and the text from here to the next quote is not yet checked for its end
     let vjoin = true; // whether that word ends at a `;` or `&` as well as at a blank
     let vseg = -1; // the mate of a prose quote that opened a quoted segment of that word: the blanks up to it are inside the quotes
+    let commentOpen = false; // a comment began and no mark has come after its line yet: the first mark after that line closes the quotes it opened
     for (let p = 0; p < len; p++) {
       const c = s.charCodeAt(p);
+      if (commentOpen && p >= skipTo && (c === 34 || c === 39 || c === 35)) {
+        // rule (a): the comment's line has ended; no quote it opened outlives that line
+        commentOpen = false;
+        for (let k = 0; k < sp; k++) {
+          const o = stack[k]!;
+          link[o] = i; // the mark that ends it; `how` stays UNCLOSED, so the value it opened runs to the end of its line
+          lost.push(o);
+        }
+        sp = 0;
+        cnt.clear();
+      }
       if (c === 35) {
         if (p >= skipTo && sp === 0 && commentAt(s, p)) {
           let e = p;
@@ -374,6 +389,7 @@ class Lexer {
           starts = valueStarts(s.slice(p, e)).map(([k, joins]): [number, boolean] => [p + k, joins]);
           si = 0;
           vact = false;
+          commentOpen = true;
         }
         continue;
       }

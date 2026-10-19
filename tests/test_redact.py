@@ -124,6 +124,18 @@ def test_lexer_roles_for_comments_and_words():
     assert list(_Lexer("# PASSWORD=ab'c d' x'").role) == [_CONTENT, _CONTENT, _CONTENT]
 
 
+def test_a_quote_a_comment_leaves_open_is_closed_at_its_newline():
+    """Rule (a): the lexer never carries a quote out of a comment. The `'` that the comment's glued value leaves open is unclosed (it runs to that
+    line's end), and the `'` of the next line's assignment opens a quote of its own: the lexer reads `# PASSWORD="example"'` + `TOKEN='alpha` +
+    `s3cr3t'` as it reads `TOKEN='alpha` + `s3cr3t'` alone (the same roles on the TOKEN line, the comment's quote unclosed)."""
+    from swarm.redact import _CLOSE, _CLOSED, _OPEN, _UNCLOSED, _Lexer
+    lex = _Lexer("# PASSWORD=\"example\"'\nTOKEN='alpha\ns3cr3t'")
+    assert list(lex.role) == [_OPEN, _CLOSE, _OPEN, _OPEN, _CLOSE]
+    assert (lex.how[2], lex.link[2]) == (_UNCLOSED, 3)
+    assert (lex.how[3], lex.link[3]) == (_CLOSED, 4)
+    assert list(_Lexer("TOKEN='alpha\ns3cr3t'").role) == [_OPEN, _CLOSE]
+
+
 def test_the_review_case_a_comment_value_of_joined_segments_is_masked_whole():
     """`# PASSWORD="first"' secret tail'` left `secret tail'` readable: the value of a sensitive name is one shell word in a comment too."""
     assert redact_text("# PASSWORD=\"first\"' secret tail'") == "# PASSWORD=" + REDACTED
@@ -138,7 +150,6 @@ def test_the_review_case_a_comment_value_of_joined_segments_is_masked_whole():
     "API_KEY: \"{{tok:urlsafe:710:12}}\"'{{tok:urlsafe:711:12}}'",
     '{"password": "{{tok:urlsafe:712:12}}"}',
     "PASSWORD=\"it's {{tok:urlsafe:713:12}}\"",
-    "PASSWORD=\"{{tok:urlsafe:714:12}}\n{{tok:urlsafe:715:12}}\"'{{tok:urlsafe:716:12}}' end",
 ])
 def test_a_comment_value_is_masked_exactly_as_the_same_assignment_outside_a_comment(line):
     """The value span of a sensitive name reads the same in a comment as outside one: `# ` + line masks what line masks, and no secret survives."""
@@ -156,6 +167,40 @@ def test_comment_property_snippets_leak_no_planted_secret_and_match_typescript()
     spec = _SHARED_DOC["property_comments"]
     snippets = _property_snippets(spec)
     assert len(snippets) == spec["count"] == 800
+    outs = []
+    for text in snippets:
+        out = redact_text(expand_tokens(text))
+        for placeholder in _PLANTED.findall(text):
+            secret = expand_tokens(placeholder)
+            assert not any(secret[k:k + 6] in out for k in range(len(secret) - 5)), (text, out)
+        outs.append(out)
+    assert hashlib.sha256("\u0000".join(outs).encode("utf-8")).hexdigest() == spec["sha256"]
+
+
+@pytest.mark.parametrize("rest", [
+    "TOKEN='{{tok:urlsafe:717:12}}\n{{tok:urlsafe:718:12}}'\necho done\n",
+    "DB_PASSWORD=\"{{tok:urlsafe:717:12}}\"'{{tok:urlsafe:718:12}}' tail\n",
+])
+def test_a_comment_value_stops_at_its_line_and_the_next_line_reads_as_it_does_alone(rest):
+    """Shell semantics (rules (b) and (c)): a value that a sensitive name starts in a comment ends at the end of that comment's line, and the quote
+    the comment leaves open never crosses the newline. The next line is read from a clean state: the output is the comment's own mask plus the
+    mask of the rest read alone, and every secret of the later sensitive assignment is masked."""
+    first = expand_tokens("# PASSWORD=\"{{tok:urlsafe:714:12}}\"'{{tok:urlsafe:719:12}}'")
+    tail = expand_tokens(rest)
+    out = redact_text(first + "\n" + tail)
+    assert out == redact_text(first) + "\n" + redact_text(tail)
+    assert out.startswith("# PASSWORD=" + REDACTED + "\n")
+    for placeholder in _PLANTED.findall(rest) + ["{{tok:urlsafe:714:12}}", "{{tok:urlsafe:719:12}}"]:
+        assert expand_tokens(placeholder) not in out
+
+
+def test_comment_line_property_snippets_leak_no_planted_secret_and_match_typescript():
+    """Comments with stray quotes (`# '`, `# it's`, an unclosed sensitive value) precede sensitive assignments on later lines (the shared
+    `property_comment_lines` spec, drawn as `property` is): a comment's quote state ends with its line, so no 6-byte window of a planted secret
+    survives, and the digest of all outputs is the one omp/test/swarm_bar.test.ts pins too (Python == TypeScript for every case)."""
+    spec = _SHARED_DOC["property_comment_lines"]
+    snippets = _property_snippets(spec)
+    assert len(snippets) == spec["count"] == 600
     outs = []
     for text in snippets:
         out = redact_text(expand_tokens(text))
@@ -1437,7 +1482,10 @@ def generate_noise_cases(seed: int, count: int) -> list[dict]:
         joiner = "\n" if label.startswith("yaml") else rng.choice(_NOISE_JOINERS)
         where = rng.choice(("before", "after", "both", "restart"))
         before, after = rng.choice(_NOISE_FRAGMENTS), rng.choice(_NOISE_FRAGMENTS)
-        text = {"before": before + joiner + body, "after": body + joiner + after, "both": before + joiner + body + joiner + after,
+        # a comment ends with its line (shell semantics), so a multi-line carrier that a comment fragment would start on that line is put on
+        # the next one: it is then read from a clean state, as it is after a newline (the joiner is drawn above either way)
+        before_joiner = "\n" if label in _ML_LABELS and before.startswith("#") else joiner
+        text = {"before": before + before_joiner + body, "after": body + joiner + after, "both": before + before_joiner + body + joiner + after,
                 "restart": body + "\n" + rng.choice(_NOISE_LINES)}[where]
         cases.append({"input": text})
     return cases

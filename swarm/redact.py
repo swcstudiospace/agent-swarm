@@ -200,6 +200,9 @@ _EOL_RE = re.compile(r"[\r\n]")
 #     of one word (`--password :;` is a flag and also `password :`) make one value, the longer. A quote that nothing closes runs to the end
 #     of its line. `a#b`, `$#`, `\#` and a `#` inside an open quote are not comments. "Outside quotes" is the lexer's own view: no quote is
 #     open on its stack at that point (an unclosed quote still counts as open).
+#   * a comment's quote state is bounded by its LINE (shell semantics): at the newline that ends a comment, every quote opened inside it is
+#     closed without a closer and runs to that line's end; the lexer never carries an open quote out of a comment, so the next line is read from
+#     a clean state (`# PASSWORD="x"'` then `TOKEN='alpha` and `s3cr3t'` read exactly as `TOKEN='alpha` and `s3cr3t'` with no comment above).
 #   * quotes of any kind may span lines. A quote that nothing closes runs to the end of its LINE as a value (a truncated log line): the
 #     detectors mask from the value start to the end of that line, never a part of it.
 #   * a detector that sees a quote where it expects the start of a value asks the lexer: OPEN gives the value's end, a quote the lexer takes
@@ -312,14 +315,23 @@ class _Lexer:
         vgap = 0  # ... and the text from here to the next quote is not yet checked for its end
         vjoin = True  # whether that word ends at a `;` or `&` as well as at a blank
         vseg = -1  # the mate of a prose quote that opened a quoted segment of that word: the blanks up to it are inside the quotes
+        comment_open = False  # a comment began and no mark has come after its line yet: the first mark after that line closes the quotes it opened
         for mm in _LEX_RE.finditer(s):
             p = mm.start()
+            if comment_open and p >= skip_to:  # rule (a): the comment's line has ended; no quote it opened outlives that line
+                comment_open = False
+                for o in stack:
+                    link[o] = i  # the mark that ends it; `how` stays UNCLOSED, so the value it opened runs to the end of its line
+                stack.clear()
+                kstack.clear()
+                cnt.clear()
             if s[p] == "#":  # a `#` inside a comment, or inside a quote, is plain text
                 if p >= skip_to and not stack and _comment_at(s, p):
                     eol = _EOL_RE.search(s, p)
                     skip_to = eol.start() if eol else len(s)
                     starts = [(p + k, j) for k, j in _value_starts(s[p:skip_to])]
                     si, vact = 0, False
+                    comment_open = True
                 continue
             r = p
             while r and s[r - 1] == "\\":

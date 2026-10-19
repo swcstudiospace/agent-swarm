@@ -461,7 +461,7 @@ describe("redactText shared vectors", () => {
     templates: string[];
     sha256: string;
   }
-  const shared = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[]; property: PropertySpec; property_comments: PropertySpec; property_joined: PropertySpec };
+  const shared = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[]; property: PropertySpec; property_comments: PropertySpec; property_joined: PropertySpec; property_comment_lines: PropertySpec };
   const { cases } = shared;
 
   test("tests/fixtures/redact_cases.json: the same vectors tests/test_redact.py runs against swarm/redact.py", () => {
@@ -541,6 +541,35 @@ describe("redactText shared vectors", () => {
     expect(outs.length).toBe(spec.count);
     expect(createHash("sha256").update(outs.join("\u0000"), "utf8").digest("hex")).toBe(spec.sha256);
   });
+
+  test("tests/fixtures/redact_cases.json property_comment_lines: stray quotes in comments before sensitive assignments leak no 6-byte window of a planted secret and hash to the Python suite's digest", () => {
+    // the twin of `test_comment_line_property_snippets_leak_no_planted_secret_and_match_typescript`: the same draws, templates and placeholders
+    const spec = shared.property_comment_lines;
+    const next = xorshift(spec.seed);
+    const first = spec.secret_from;
+    let planted = 0;
+    const outs: string[] = [];
+    const leaks: string[] = [];
+    for (let c = 0; c < spec.count; c++) {
+      const parts: string[] = [];
+      const k = 2 + next(3);
+      for (let j = 0; j < k; j++) parts.push(spec.templates[next(spec.templates.length)]!);
+      parts.push(spec.templates[first + next(spec.templates.length - first)]!);
+      const text = `${parts.join("\n")}\n`.replace(/\{S\}/g, () => `{{tok:urlsafe:${100000 + ++planted}:20}}`);
+      const out = redactText(expandTokens(text));
+      for (const m of text.matchAll(TOKEN_RE)) {
+        const secret = expandTokens(m[0]);
+        for (let w = 0; w + 6 <= secret.length; w++) {
+          if (out.includes(secret.slice(w, w + 6))) leaks.push(text);
+        }
+      }
+      outs.push(out);
+    }
+    expect(outs.length).toBe(spec.count);
+    expect(leaks.slice(0, 3)).toEqual([]);
+    expect(createHash("sha256").update(outs.join("\u0000"), "utf8").digest("hex")).toBe(spec.sha256);
+  });
+
   test("tests/fixtures/redact_generated.json: 6000 seeded option lists give exactly the Python suite's output (reference model + wild shapes)", () => {
     type Generated = Array<{ input: string; expected: string }>;
     const { cases: generated, wild } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_generated.json"), "utf8")) as {
