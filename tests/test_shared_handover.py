@@ -915,21 +915,30 @@ ACK = "ack contract-api 2.0.0"
 
 
 def _breaking_change_reply_scan(env, caller, task_id, consumers=CONSUMERS, ack=ACK):
-    """Step 8 of `a03-architect--breaking-change`, as the skill words it: read `seq` = 1, 2, 3, ... until `status` is
-    `missing`, skip an entry that is no document (`found` false), count a reply whose `from_agent` is a consumer and whose
-    `decisions` hold the ack. Returns (the acks, the last seq read)."""
-    acks, seq = {}, 1
-    while True:
-        read = env.call("shared_handover_read", caller, {"task_id": task_id, "seq": seq})
-        assert read["state"] == "SUCCESS", (seq, read)  # the end of the history is never an error
-        if read["status"] == "missing":
-            return acks, seq
+    """Step 8 of `a03-architect--breaking-change`, as the skill words it: read the newest handover addressed to the
+    caller (none: no reply); its `handover_id` ends in `.<N>`; read `seq` = 1..N, a `missing` below N is a gap and is
+    skipped, an entry that is no document (`found` false) is skipped; count a reply whose `from_agent` is a consumer and
+    whose `decisions` hold the ack. A first read that is `malformed` has no id: stop after three consecutive `missing`.
+    Returns (the acks, the last seq read; 0 when nothing is addressed to the caller)."""
+    first = env.call("shared_handover_read", caller, {"task_id": task_id})
+    assert first["state"] == "SUCCESS", first
+    if first["status"] == "missing" or first.get("context_only"):
+        return {}, 0
+    last = int(first["handover"]["handover_id"].rsplit(".", 1)[1]) if first["handover"] else None
+    acks, seq, run = {}, 0, 0
+    while last is None or seq < last:
+        seq += 1
         assert seq < 50, "the scan did not end"
+        read = env.call("shared_handover_read", caller, {"task_id": task_id, "seq": seq})
+        assert read["state"] == "SUCCESS", (seq, read)  # a gap and the end of the history are never errors
+        run = run + 1 if read["status"] == "missing" else 0
+        if last is None and run == 3:
+            return acks, seq
         if read["found"]:
             doc = read["handover"]
             if doc["from_agent"] in consumers and any(ack in d["decision"] for d in doc["decisions"]):
                 acks[doc["from_agent"]] = "2.0.0"
-        seq += 1
+    return acks, seq
 
 
 def _architect_asks(env):
@@ -951,13 +960,13 @@ def test_the_breaking_change_reply_scan_ends_cleanly_when_every_consumer_replied
     for consumer in CONSUMERS:
         assert _consumer_replies(env, consumer)["state"] == "SUCCESS"
     acks, end = _breaking_change_reply_scan(env, "A03", "T-be")
-    assert acks == {"A05": "2.0.0", "A06": "2.0.0"} and end == 5  # seq 1-2 asks, 3-4 replies, 5 is the end
+    assert acks == {"A05": "2.0.0", "A06": "2.0.0"} and end == 4  # seq 1-2 asks, 3-4 replies: 4 is the newest addressed to A03
 
 
 def test_the_breaking_change_reply_scan_ends_cleanly_when_no_consumer_replied(env):
     _architect_asks(env)
-    assert _breaking_change_reply_scan(env, "A03", "T-be") == ({}, 3)
-    assert _breaking_change_reply_scan(env, "A03", "T-none") == ({}, 1)  # a task that has no handover at all
+    assert _breaking_change_reply_scan(env, "A03", "T-be") == ({}, 0)  # the newest handover is addressed to a consumer
+    assert _breaking_change_reply_scan(env, "A03", "T-none") == ({}, 0)  # a task that has no handover at all
 
 
 def test_the_breaking_change_reply_scan_goes_past_a_handover_that_is_no_document(env):
@@ -967,7 +976,43 @@ def test_the_breaking_change_reply_scan_goes_past_a_handover_that_is_no_document
     _consumer_replies(env, "A06")
     assert env.call("shared_handover_read", "A03", {"task_id": "T-be", "seq": 3})["status"] == "malformed"
     acks, end = _breaking_change_reply_scan(env, "A03", "T-be")
-    assert acks == {"A06": "2.0.0"} and end == 5
+    assert acks == {"A06": "2.0.0"} and end == 4
+
+
+def test_the_breaking_change_reply_scan_reads_past_a_gap_in_the_history(env):
+    """Round 5: a history that has a gap (older writers left empty reservations, a restored backup lost a file) used to
+    end the scan at the first `missing` seq, so a saved acknowledgement behind the gap was reported absent."""
+    _architect_asks(env)
+    _consumer_replies(env, "A05")
+    _consumer_replies(env, "A06")
+    gone = env.sdir / "handovers" / "corr-1" / "T-be.3.json"
+    gone.unlink()  # seq 3 is gone: A05's reply is lost, A06's reply (seq 4) is behind the gap
+    assert env.call("shared_handover_read", "A03", {"task_id": "T-be", "seq": 3})["status"] == "missing"
+    acks, end = _breaking_change_reply_scan(env, "A03", "T-be")
+    assert acks == {"A06": "2.0.0"} and end == 4
+    seq = 1  # the old procedure (stop at the first `missing`) never reaches seq 4
+    while env.call("shared_handover_read", "A03", {"task_id": "T-be", "seq": seq})["status"] != "missing":
+        seq += 1
+    assert seq == 3
+
+
+def test_writers_that_die_never_create_a_gap_for_the_reply_scan(env, monkeypatch):
+    _architect_asks(env)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("writer died after its temp write")
+
+    with monkeypatch.context() as m:
+        m.setattr(env.ho.os, "link", boom)
+        try:
+            died = _consumer_replies(env, "A05")
+        except RuntimeError:
+            died = {"state": "FAILED"}
+    assert died["state"] != "SUCCESS"
+    _consumer_replies(env, "A06")
+    acks, end = _breaking_change_reply_scan(env, "A03", "T-be")
+    assert acks == {"A06": "2.0.0"} and end == 3  # the surviving reply took seq 3: no gap
+    assert not list((env.sdir / "handovers" / "corr-1").glob("T-be.4.json"))
 
 
 def test_handover_readers_agree_with_a_reference_model_on_random_histories(env):
@@ -1112,6 +1157,40 @@ def test_an_absent_local_file_is_missing_not_unchecked(env, uri):
 def test_only_declared_reference_forms_are_unchecked(env, uri, kind):
     one = _check_one(env, uri, kind)
     assert (one["status"], one["exists"]) == ("unchecked", "unchecked") and "not a local file" in one["reason"], one
+
+
+@pytest.mark.parametrize("uri", ["ghcr.io/org/app:1.2", "ghcr.io/org/app", "registry.example.com:5000/team/app:1",
+                                 "localhost/app:1", "localhost:5000/app", "10.0.0.5:5000/app:2", "docker.io/library/nginx"])
+def test_a_build_artifact_image_reference_is_unchecked(env, uri):
+    """Round 5: `devops_build_record.py --image ghcr.io/org/app:1.2` saves the image under kind `build.artifact`; it was read
+    as a workspace path and came back `missing`, which stops the shared intake skill."""
+    for kind in ("build.artifact", "Build.Artifact", "provenance.attestation"):
+        one = _check_one(env, uri, kind)
+        assert (one["status"], one["exists"]) == ("unchecked", "unchecked") and "not a local file" in one["reason"], (kind, one)
+    for kind in ("code", "file", "code.patch", "test.results"):  # every other kind keeps path semantics
+        one = _check_one(env, uri, kind)
+        assert (one["status"], one["exists"]) == ("missing", "no"), (kind, uri, one)
+
+
+def test_a_build_artifact_path_is_checked_like_any_file(env):
+    (env.root / "dist").mkdir()
+    for uri in ("dist/app.tar", "v1.2/app.js", "org/app:1.2", "app:1.2"):  # no registry host: a path
+        one = _check_one(env, uri, "build.artifact")
+        assert (one["status"], one["exists"]) == ("missing", "no"), (uri, one)
+    (env.root / "dist" / "app.tar").write_bytes(b"tar\n")
+    digest = "sha256:" + hashlib.sha256(b"tar\n").hexdigest()
+    out = {"kind": "build.artifact", "uri": "dist/app.tar", "digest": digest, "producer": "A11"}
+    one = env.call("shared_artifact_check", "A12", {"task_id": "T-build", "agent": "A11", "outputs": [out]})["results"][0]
+    assert (one["status"], one["exists"]) == ("ok", "yes"), one
+
+
+def test_a_local_file_named_like_an_image_wins_for_a_build_artifact(env):
+    (env.root / "ghcr.io" / "org").mkdir(parents=True)
+    (env.root / "ghcr.io" / "org" / "app:1.2").write_bytes(b"x\n")
+    digest = "sha256:" + hashlib.sha256(b"x\n").hexdigest()
+    out = {"kind": "build.artifact", "uri": "ghcr.io/org/app:1.2", "digest": digest, "producer": "A11"}
+    one = env.call("shared_artifact_check", "A12", {"task_id": "T-build", "agent": "A11", "outputs": [out]})["results"][0]
+    assert (one["status"], one["exists"]) == ("ok", "yes"), one
 
 
 def test_an_existing_local_file_wins_over_every_reference_form(env):

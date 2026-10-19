@@ -207,15 +207,18 @@ such as `A05`, never slugs), `created_wall`, `goal`, `completed[]`, `remaining[]
 `artifacts[{kind, uri, digest, producer}]`, `open_questions[]`, `blockers[]`, `constraints[]`,
 `verification{status: verified|partial|unverified, confidence 0..1, checks[]}`, `summarized`, `bytes`, `digest`.
 
-- **Storage:** `<swarm_dir>/handovers/<correlation_id>/<task_id>.<seq>.json`, canonical JSON. `seq` is reserved with an
-  exclusive create, so concurrent writers never collide; the newest handover is the highest `seq` inside the task's
-  correlation. Writing a document identical in content to the task's newest handover stores nothing new and returns
-  `duplicate: true`; a changed document gets a new `seq`. The duplicate check reads the newest file before the seq is
-  reserved, so two writers that submit the same document at the same instant both pass it and both are stored (two
-  seqs, same content): the history is append-only and a repeated entry is harmless, so this is intended and not
-  guarded by a lock. An empty reserved file is never removed or reused, whatever its age (age is not ownership: its
-  writer may still be about to publish); a writer that died between the reservation and its write leaves a harmless
-  gap in the `seq` numbers and readers skip the empty file. Ids are matched whole (a trailing newline is refused) and
+- **Storage:** `<swarm_dir>/handovers/<correlation_id>/<task_id>.<seq>.json`, canonical JSON. The writer builds the
+  complete document for a candidate `seq`, writes it to a temp file in the same folder (`.<name>.<pid>.<random>.tmp`)
+  and publishes it with `os.link` (exclusive and atomic): the final name never exists empty, a taken `seq` fails with
+  FileExistsError and the next one is tried, so concurrent writers never collide and a writer that dies leaves no gap
+  in the `seq` numbers. Readers and the scan ignore stray temp files, which are never reclaimed (age is not ownership).
+  Only on a file system without hard links is the file created with `O_EXCL` and written in place; there a crash can
+  leave a partial file at its `seq` (read as `malformed`, never skipped). The newest handover is the highest `seq`
+  inside the task's correlation. Writing a document identical in content to the task's newest handover stores nothing
+  new and returns `duplicate: true`; a changed document gets a new `seq`. The duplicate check reads the newest file
+  before the seq is published, so two writers that submit the same document at the same instant both pass it and both
+  are stored (two seqs, same content): the history is append-only and a repeated entry is harmless, so this is intended
+  and not guarded by a lock. Ids are matched whole (a trailing newline is refused) and
   the size cap is never above the 1 MiB read limit, whatever `SWARM_HANDOVER_MAX_BYTES` says.
 - **Integrity:** `digest` is the sha256 of the canonical document without its own `digest`. Read recomputes it, so an
   edited file is rejected (`malformed`).

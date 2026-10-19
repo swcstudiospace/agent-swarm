@@ -3,9 +3,11 @@
 Pins: A->B continuation from the document alone, validation by field on write AND read, digest tamper detection, the
 size cap with mandatory sections intact, the five statuses, race-safe seq across threads and processes, the
 `swarm.run.handover` event, idempotent receipts."""
+import errno
 import importlib
 import json
 import os
+import random
 import subprocess
 import sys
 import textwrap
@@ -694,3 +696,164 @@ def test_an_old_empty_file_below_a_valid_one_is_left_alone(env):
     husk = _husk(env, 1, age_s=30 * 86400)
     third = env.write(base(goal="third goal"))
     assert third["seq"] == 3 and husk.exists()
+
+
+# ---- greploop round 5: atomic exclusive publish (no visible reservation, so no gap) ---------------------------
+WRITER = textwrap.dedent("""
+    import json, sys
+    sys.path.insert(0, {root!r})
+    from swarm import handover as ho
+    who, count = sys.argv[1], int(sys.argv[2])
+    out = []
+    for n in range(count):
+        doc = {{"correlation_id": "corr-1", "task_id": "T1-be", "from_agent": "A05", "to_agent": "A08",
+                "goal": f"{{who}}-{{n}}", "completed": [], "remaining": ["x"], "decisions": [], "artifacts": [],
+                "open_questions": [], "blockers": [], "constraints": [],
+                "verification": {{"status": "unverified", "confidence": 0.0, "checks": []}}}}
+        r = ho.write_handover(doc, emit=False)
+        out.append([r["seq"], r["digest"], r["handover_id"]])
+    print(json.dumps(out))
+""")
+
+
+def _folder(env):
+    return env.sdir / "handovers" / "corr-1"
+
+
+def _seqs(env):
+    if not _folder(env).exists():
+        return []
+    return sorted(int(p.name.split(".")[1]) for p in _folder(env).glob("T1-be.*.json"))
+
+
+def _strays(env):
+    return [p.name for p in _folder(env).iterdir() if p.name.endswith(".tmp")]
+
+
+def test_eight_processes_writing_twenty_handovers_each_leave_distinct_gap_free_seqs(env):
+    script = WRITER.format(root=str(ROOT))
+    procs = [subprocess.Popen([sys.executable, "-c", script, f"p{i}", "20"], stdout=subprocess.PIPE, text=True,
+                              env={**os.environ, "SWARM_DIR": str(env.sdir)}) for i in range(8)]
+    returned = []
+    for proc in procs:
+        out, _ = proc.communicate(timeout=240)
+        assert proc.returncode == 0
+        returned += json.loads(out)
+    assert sorted(r[0] for r in returned) == list(range(1, 161))
+    assert _seqs(env) == list(range(1, 161))  # no gap, no extra file
+    assert _strays(env) == []
+    for seq, digest, handover_id in returned:  # every returned digest is the file at ITS seq
+        stored = env.ho.read_handover(f"T1-be.{seq}", root=env.root)
+        assert stored["digest"] == digest and stored["handover_id"] == handover_id == f"T1-be.{seq}"
+
+
+def test_a_writer_killed_between_the_temp_write_and_the_link_leaves_no_gap_and_no_garbage(env):
+    env.write()
+    crash = WRITER.format(root=str(ROOT)).replace(
+        "who, count", "import os, signal\nos.link = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)\nwho, count", 1)
+    proc = subprocess.run([sys.executable, "-c", crash, "dead", "1"], env={**os.environ, "SWARM_DIR": str(env.sdir)},
+                          capture_output=True, timeout=60)
+    assert proc.returncode == -9
+    strays = _strays(env)
+    assert len(strays) == 1 and strays[0].startswith(".T1-be.2.json.")  # the dead writer's temp file stays, hidden
+    assert _seqs(env) == [1]  # nothing visible at seq 2: no reservation, no partial document
+    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == [1]
+    assert env.status()["handover_id"] == "T1-be.1"
+    after = env.write(base(goal="after the crash"))
+    assert after["seq"] == 2 and _seqs(env) == [1, 2]  # the next writer takes the very next seq: the history has no gap
+    assert env.ho.read_handover("T1-be.2", root=env.root)["digest"] == after["digest"]
+    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == [1, 2]
+    assert _strays(env) == strays  # never reclaimed by a later writer
+
+
+def test_an_in_process_failure_after_the_temp_write_leaves_nothing_behind(env, monkeypatch):
+    env.write()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("disk gone")
+
+    with monkeypatch.context() as m:
+        m.setattr(env.ho.os, "link", boom)
+        with pytest.raises(RuntimeError):
+            env.write(base(goal="never lands"))
+    assert sorted(p.name for p in _folder(env).iterdir()) == ["T1-be.1.json"]
+
+
+def test_a_seq_taken_by_another_writer_is_retried_with_a_document_rebuilt_for_the_next_seq(env, monkeypatch):
+    env.write()
+    real_link, taken = env.ho.os.link, []
+
+    def racing_link(src, dst, **kw):
+        if not taken:  # another writer publishes seq 2 between this writer's listing and its link
+            taken.append(dst)
+            Path(dst).write_text("{}", encoding="utf-8")
+        return real_link(src, dst, **kw)
+
+    with monkeypatch.context() as m:
+        m.setattr(env.ho.os, "link", racing_link)
+        written = env.write(base(goal="lands third"))
+    assert taken and written["seq"] == 3 and written["handover_id"] == "T1-be.3"
+    stored = env.ho.read_handover("T1-be.3", root=env.root)
+    assert stored["digest"] == written["digest"] and stored["handover_id"] == "T1-be.3"
+    assert _strays(env) == []
+
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP])
+def test_without_hard_links_the_file_is_created_with_o_excl(env, monkeypatch, code):
+    def no_links(*_a, **_k):
+        raise OSError(code, "hard links not supported")
+
+    with monkeypatch.context() as m:
+        m.setattr(env.ho.os, "link", no_links)
+        first, second = env.write(base(goal="one")), env.write(base(goal="two"))
+    assert (first["seq"], second["seq"]) == (1, 2) and _seqs(env) == [1, 2]
+    for written in (first, second):
+        assert env.ho.read_handover(f"T1-be.{written['seq']}", root=env.root)["digest"] == written["digest"]
+    assert _strays(env) == []
+
+
+def test_stray_temp_files_are_invisible_to_every_reader(env):
+    env.write()
+    for name in (".T1-be.2.json.123.deadbeef.tmp", ".T1-be.9.json.1.aa.tmp"):
+        (_folder(env) / name).write_text('{"half":', encoding="utf-8")
+    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == [1]
+    assert env.status(seq=2)["status"] == "missing"
+    assert env.write(base(goal="next"))["seq"] == 2
+
+
+@pytest.mark.parametrize("trial", range(25))
+def test_property_no_interleaving_of_writes_crashes_and_strays_ever_leaves_a_gap(env, monkeypatch, trial):
+    """The class: whatever mix of successful writes, writers that die after their temp write and stray temp files, the
+    published seqs are exactly 1..n, every returned digest is the file at its seq and nothing but whole documents is
+    listed."""
+    rng = random.Random(trial)
+    real_link = env.ho.os.link
+    returned, mode = [], {"crash": False}
+
+    def link(src, dst, **kw):
+        if mode["crash"]:
+            raise KeyboardInterrupt  # a writer that dies right after its temp write, before anything is visible
+        return real_link(src, dst, **kw)
+
+    with monkeypatch.context() as m:
+        m.setattr(env.ho.os, "link", link)
+        for step in range(rng.randint(5, 25)):
+            op = rng.choice(["write", "write", "write", "crash", "stray"])
+            if op == "stray":
+                _folder(env).mkdir(parents=True, exist_ok=True)
+                name = f".T1-be.{rng.randint(1, 40)}.json.{rng.randint(1, 99999)}.{step:08x}.tmp"
+                (_folder(env) / name).write_text("{", encoding="utf-8")
+                continue
+            mode["crash"] = op == "crash"
+            try:
+                returned.append(env.write(base(goal=f"trial {trial} step {step}")))
+            except KeyboardInterrupt:
+                assert op == "crash"
+            mode["crash"] = False
+            published = _seqs(env)
+            assert published == list(range(1, len(published) + 1)), (trial, step, published)
+    published = _seqs(env)
+    assert published == list(range(1, len(returned) + 1))
+    assert [c.seq for c in env.ho.list_handovers("T1-be", root=env.root)] == published
+    for written in returned:
+        assert env.ho.read_handover(f"T1-be.{written['seq']}", root=env.root)["digest"] == written["digest"]

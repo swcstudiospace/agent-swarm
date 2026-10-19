@@ -5,8 +5,9 @@ artifacts with digests, open questions and blockers, and how far the work was ve
 from the document alone.
 
 Storage: `<swarm_dir>/handovers/<correlation_id>/<task_id>.<seq>.json`, one canonical-JSON file per handover. `seq` is
-monotonic per task and race-safe across processes (the number is reserved with an O_EXCL create, the content lands with
-temp + os.replace). Identity in documents is the AGENT ID (`A05`), never a slug.
+monotonic per task, race-safe across processes and gap-free: the complete file is written to a temp file and published
+with `os.link` (exclusive, atomic), so a writer that dies never leaves a visible reservation. Identity in documents is
+the AGENT ID (`A05`), never a slug.
 
 Integrity: `digest` is sha256 over the canonical JSON (sorted keys, compact separators) of the document without its
 `digest` field. Write and read both validate against `schemas/handover.v1.json` plus the semantic rules of
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import functools
 import hashlib
 import json
@@ -29,7 +31,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from .clock import SYSTEM_CLOCK, Clock
 from .errors import ErrorCode, SwarmError
@@ -360,7 +362,8 @@ def _safe_id(value: object, what: str) -> str:
 
 
 def list_handovers(task_id: str, *, root: str | Path | None = None, correlation_id: str | None = None) -> list[Candidate]:
-    """Stored handovers of a task, oldest first. Empty files (a seq reserved by a writer still at work) are skipped.
+    """Stored handovers of a task, oldest first. Temp files (`.<name>.<pid>.<random>.tmp`) never match and empty files
+    (left only by older writers or the O_EXCL fallback) are skipped.
 
     Order is by `seq` within a correlation, never by file mtime (a clock that stepped back, writers finishing out of
     order or a restored copy invert mtimes). Across correlations the task's own plan (Task Store row) comes last, then
@@ -399,37 +402,65 @@ def list_handovers(task_id: str, *, root: str | Path | None = None, correlation_
     return found
 
 
-def _write_atomic(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+_PUBLISH_ATTEMPTS = 1000
+_NO_HARDLINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}
 
 
-def _reserve(folder: Path, task_id: str, start: int) -> tuple[int, Path]:
-    """Claim the next free seq with an O_EXCL create; two writers never get the same number."""
-    seq = start
-    while True:
+def _publish_exclusive(folder: Path, task_id: str, build: Callable[[int], bytes]) -> tuple[int, Path, bytes]:
+    """Publish one handover at the lowest free seq, atomically and exclusively; returns `(seq, path, data)`.
+
+    `build(seq)` returns the complete file bytes for that candidate seq (the document embeds `seq`/`handover_id`, so it
+    is rebuilt on every retry). The bytes are written to a unique temp file next to the target
+    (`.<name>.<pid>.<random>.tmp`, which no reader lists or scans) and published with `os.link(tmp, final)`: the final
+    name appears complete or not at all and fails with FileExistsError when another writer took the seq, then the next
+    seq is tried. A writer that dies at any point therefore never leaves a visible reservation, so seqs have no gaps;
+    its stray temp file is ignored by every reader and is deliberately not reclaimed (age is not ownership).
+
+    Only where hard links are unsupported (EPERM/ENOTSUP/...) the file is created with O_CREAT|O_EXCL, written and
+    fsynced in place. That fallback has a crash window that can leave a partial or empty file at its seq; readers treat
+    a malformed newest file as malformed (never skipped) and an empty file is not listed, and the seq is never reused."""
+    seq = _next_seq(folder, task_id)
+    use_links = True
+    for _ in range(_PUBLISH_ATTEMPTS):
+        data = build(seq)
         path = folder / f"{task_id}.{seq}.json"
+        if use_links:
+            tmp = folder / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+            try:
+                with open(tmp, "xb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                try:
+                    os.link(tmp, path)
+                    return seq, path, data
+                except FileExistsError:  # another writer published this seq first
+                    seq = max(seq + 1, _next_seq(folder, task_id))
+                    continue
+                except OSError as exc:
+                    if exc.errno not in _NO_HARDLINKS:
+                        raise
+                    use_links = False  # same seq again through the O_EXCL fallback
+                    continue
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            seq += 1
+            seq = max(seq + 1, _next_seq(folder, task_id))
             continue
-        os.close(fd)
-        return seq, path
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return seq, path, data
+    raise SwarmError(ErrorCode.E_INTERNAL, f"no free handover seq for {task_id} after {_PUBLISH_ATTEMPTS} attempts")
 
 
 def _next_seq(folder: Path, task_id: str) -> int:
-    """One above the highest seq of `task_id` in `folder`, empty reserved files included: a file of a writer that died
-    after its reservation leaves a harmless gap and is never reused or removed (age is not ownership)."""
+    """One above the highest published seq of `task_id` in `folder`. Temp files never match; a stray empty or partial
+    file (older writers, the O_EXCL fallback) still counts, so its seq is never reused or removed."""
     pattern = re.compile(re.escape(task_id) + r"\.(\d+)\.json\Z")
     try:
         seqs = [int(m.group(1)) for name in os.listdir(folder) if (m := pattern.match(name))]
@@ -752,8 +783,8 @@ def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = 
     filled in. Invalid documents raise HandoverInvalid naming every field. Secrets in text are replaced by
     `[REDACTED]` before the digest is computed. A document over `SWARM_HANDOVER_MAX_BYTES` is summarized
     (`summarize_handover`). A document identical in content to the task's newest handover is not written again
-    (`duplicate: true`, the existing one is returned). Otherwise the next seq is reserved race-safely, the file is
-    written atomically and `swarm.run.handover` is emitted.
+    (`duplicate: true`, the existing one is returned). Otherwise the complete document is published at the next free seq
+    with a temp file + `os.link` (exclusive and atomic: no visible reservation, no gaps) and `swarm.run.handover` is emitted.
 
     Returns `{handover_id, seq, ref, path, digest, bytes, summarized, duplicate, redacted, emitted, document}`.
     """
@@ -781,19 +812,21 @@ def write_handover(doc: dict, *, root: str | Path | None = None, clock: Clock = 
                         "ref": f"{corr}/{previous['handover_id']}", "path": existing[-1].path,
                         "digest": previous["digest"], "bytes": previous["bytes"], "summarized": previous["summarized"],
                         "duplicate": True, "redacted": redacted, "emitted": False, "document": previous}
-    seq, path = _reserve(folder, task_id, _next_seq(folder, task_id))
-    try:
-        body["handover_id"] = f"{task_id}.{seq}"
-        final = _sized(body)
+    built: dict = {}
+
+    def build(seq: int) -> bytes:  # the document embeds its seq: rebuilt for every candidate seq
+        candidate = dict(body)
+        candidate["handover_id"] = f"{task_id}.{seq}"
+        final = _sized(candidate)
         final["digest"] = compute_digest(final)
         data = canonical(final)
         if len(data) != final["bytes"] or len(data) > cap:
             raise SwarmError(ErrorCode.E_INTERNAL, f"handover sized {final['bytes']} but serialized {len(data)} bytes (cap {cap})")
-        _write_atomic(path, data)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            path.unlink()
-        raise
+        built["final"] = final
+        return data
+
+    seq, path, _data = _publish_exclusive(folder, task_id, build)
+    final = built["final"]
     emitted = False
     if emit:
         with StoreReader(root) as store:

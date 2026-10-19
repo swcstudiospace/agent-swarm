@@ -473,16 +473,26 @@ def handover_receipt(payload: dict) -> dict:
 # ---- artifacts -------------------------------------------------------------------------------------------------
 _SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 _REFERENCE_KINDS = frozenset({"image", "container", "registry", "package", "url", "link"})
+# Kinds whose uri is a file or an image reference (`devops_build_record.py` saves `--image` under `build.artifact`; A11
+# lists the attestation under `provenance.attestation`). Only an image-shaped uri is a reference for these.
+_FILE_OR_IMAGE_KINDS = frozenset({"build.artifact", "provenance.attestation"})
+_IMAGE_RE = re.compile(
+    r"(?:localhost|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z0-9-]*|[A-Za-z0-9.-]+:\d+)"  # host: dotted (letter TLD), localhost or host:port
+    r"/[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?(?:@sha(?:256|512):[0-9A-Fa-f]+)?\Z")
 
 
 def _is_reference(text: str, kind: str, root: Path) -> bool:
-    """A relative `text` that names an image or package reference, not a file. Only declared forms count: a digest pin
-    (`app@sha256:...`, `@sha512:`) or an output `kind` of image, container, registry, package, url or link. Everything
-    else is a local path, however dotted or colon-bearing (`v1.2/app.js`, `ghcr.io/x/y.md`), so an absent file is
+    """A relative `text` that names an image or package reference, not a file. Declared forms count: a digest pin
+    (`app@sha256:...`, `@sha512:`), an output `kind` of image, container, registry, package, url or link, or, for the
+    kinds `build.artifact` and `provenance.attestation` ONLY, an image-shaped uri (`host[:port]/path[:tag][@sha256:...]`
+    whose host has a dot with a letter TLD or a port, or is `localhost`: `ghcr.io/org/app:1.2`). Everything else is a
+    local path, however dotted or colon-bearing (`v1.2/app.js`, `ghcr.io/x/y.md` of kind code), so an absent file is
     `missing`, never `unchecked`. A workspace file of that name always wins; `./name` and absolute paths are files."""
     if text.startswith(("/", "./", "../")):
         return False
-    if "@sha256:" not in text and "@sha512:" not in text and kind.strip().lower() not in _REFERENCE_KINDS:
+    kind = kind.strip().lower()
+    if "@sha256:" not in text and "@sha512:" not in text and kind not in _REFERENCE_KINDS \
+            and not (kind in _FILE_OR_IMAGE_KINDS and _IMAGE_RE.match(text)):
         return False
     try:
         return not (root / text).exists()

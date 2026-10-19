@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import itertools
 import json
 import os
 import random
+import re
+import string
 from pathlib import Path
 
 import pytest
 
 from swarm import runlog
-from swarm.redact import REDACTED, is_sensitive_key, redact, redact_text
+from swarm.redact import REDACTED, is_sensitive_key, redact, redact_spans, redact_text
 
 # Built at runtime so no secret-shaped literal sits in the repo.
 GHP = "ghp_" + "a1B2c3D4" * 5
@@ -18,7 +22,7 @@ PAT = "github_pat_" + "11ABCDEFG0" * 3
 SK = "sk-" + "Zx9Qw8Er7Ty6Ui5O"
 AKIA = "AKIA" + "ABCDEFGHIJ012345"
 SLACK = "xoxb-" + "1234567890-abcdefghij"
-JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+JWT = "eyJhbGciOiJIUzI1NiJ9" + "." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0" + "." + "dBjftJeZ4CVPmB92K27uhbUJU1p1r"
 PEM = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabc/def+ghi=\n-----END RSA PRIVATE KEY-----"
 DIGEST = "sha256:" + "ab12" * 16
 
@@ -39,7 +43,8 @@ def test_bearer_keeps_scheme_and_hides_token():
 
 
 def _join(value):
-    return value if isinstance(value, str) else "".join(value)
+    """A vector string: one string or a list of fragments, with its `{{tok:...}}` secret placeholders expanded."""
+    return expand_tokens(value if isinstance(value, str) else "".join(value))
 
 
 _SHARED = json.loads((Path(__file__).parent / "fixtures" / "redact_cases.json").read_text(encoding="utf-8"))["cases"]
@@ -62,7 +67,8 @@ def test_megabyte_inputs_are_scanned_in_linear_time():
     import time
     for unit in ("a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
                  "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
-                 "--mode a;", "-v ", "password=a,token = ", "token=a,--password "):
+                 "--mode a;", "-v ", "password=a,token = ", "token=a,--password ", 'Cookie: a="', "x=-u=", '-u "', "A_KEY=", "STRIPE_KEY=A_KEY=",
+                 "a://u:", 'password="', "-u=a:", 'Cookie: a="b" ', "-u a:", "--user=-u="):
         text = unit * (1_000_000 // len(unit))
         started = time.perf_counter()
         redact_text(text)
@@ -479,23 +485,87 @@ def test_wild_option_lists_never_leak_a_sensitive_value():
     assert leaks[:3] == []
 
 
+def _golden_tokens() -> list[list[str]]:
+    refs = [f"{{{{tok:{kind}:{i}{'' if length is None else f':{length}'}}}}}" for kind in _TOKEN_KINDS for i, length in enumerate((None, 40, 513))]
+    return [[ref, hashlib.sha256(expand_tokens(ref).encode("utf-8")).hexdigest()[:16]] for ref in refs]
+
+
+def _generated_fixture() -> dict:
+    strings = generate_random_strings(_RANDOM_SEED, _RANDOM_COUNT)
+    return {
+        "_doc": _FIXTURE_DOC,
+        "tokens": _golden_tokens(),
+        "seed": _GENERATED_SEED,
+        "cases": [{"input": c["input"], "expected": c["expected"]} for c in generate_option_cases(_GENERATED_SEED, _GENERATED_COUNT)],
+        "wild_seed": _WILD_SEED,
+        "wild": [{"input": c["input"], "expected": redact_text(c["input"])} for c in generate_wild_cases(_WILD_SEED, _WILD_COUNT)],
+        "property_seed": _PROPERTY_SEED,
+        "property": [c | {"digest": _digest(expand_tokens(c["input"]))} for c in generate_property_cases(_PROPERTY_SEED, _PROPERTY_EXTRA)],
+        # the random strings are rebuilt in both languages from the seed and the fragment table; only digests of the Python outputs are stored
+        "random": {"seed": _RANDOM_SEED, "count": _RANDOM_COUNT, "fragments": list(_RANDOM_FRAGMENTS),
+                   "inputs": hashlib.sha256("\u0000".join(strings).encode("utf-8")).hexdigest()[:16],
+                   "digests": [_digest(s) for s in strings]},
+    }
+
+
 def test_generated_fixture_is_current_and_matches_the_python_output():
     """tests/fixtures/redact_generated.json is also run by omp/test/swarm_bar.test.ts, so Python and TypeScript give identical
     output. Regenerate with REGENERATE_REDACT_FIXTURE=1 after an intended behavior change (and review the diff)."""
-    option_lists = generate_option_cases(_GENERATED_SEED, _GENERATED_COUNT)
-    wanted = {
-        "seed": _GENERATED_SEED,
-        "cases": [{"input": c["input"], "expected": c["expected"]} for c in option_lists],
-        "wild_seed": _WILD_SEED,
-        "wild": [{"input": c["input"], "expected": redact_text(c["input"])} for c in generate_wild_cases(_WILD_SEED, _WILD_COUNT)],
-    }
+    wanted = _generated_fixture()
     if os.environ.get("REGENERATE_REDACT_FIXTURE") == "1":
-        def rows(key):
-            return ",\n".join("  " + json.dumps(c, ensure_ascii=False) for c in wanted[key])
+        def rows(items):
+            return ",\n".join("  " + json.dumps(c, ensure_ascii=False) for c in items)
+        random_part = wanted["random"]
+        digest_rows = ",\n".join("   " + ", ".join(json.dumps(d) for d in random_part["digests"][i:i + 10])
+                                 for i in range(0, len(random_part["digests"]), 10))
         _GENERATED_PATH.write_text(
-            f'{{"seed": {_GENERATED_SEED}, "wild_seed": {_WILD_SEED}, "cases": [\n{rows("cases")}\n], "wild": [\n{rows("wild")}\n]}}\n',
-            encoding="utf-8")
+            f'{{"_doc": {json.dumps(_FIXTURE_DOC)},\n"tokens": [\n{rows(wanted["tokens"])}\n],\n"seed": {_GENERATED_SEED}, "wild_seed": {_WILD_SEED}, "property_seed": {_PROPERTY_SEED}, "cases": [\n{rows(wanted["cases"])}\n], '
+            f'"wild": [\n{rows(wanted["wild"])}\n], "property": [\n{rows(wanted["property"])}\n], "random": {{"seed": {_RANDOM_SEED}, '
+            f'"count": {_RANDOM_COUNT}, "inputs": "{random_part["inputs"]}", "fragments": {json.dumps(random_part["fragments"])}, '
+            f'"digests": [\n{digest_rows}\n]}}}}\n', encoding="utf-8")
     assert json.loads(_GENERATED_PATH.read_text(encoding="utf-8")) == wanted
+
+
+def test_the_property_cases_in_the_shared_fixture_are_sound():
+    cases = json.loads(_GENERATED_PATH.read_text(encoding="utf-8"))["property"]
+    assert len(cases) > 2000
+    assert _leaks(cases)[:3] == []
+
+
+def test_token_placeholders_expand_deterministically_to_provider_shapes():
+    """The `tokens` golden digests of the fixture pin the expansion algorithm; omp/test/swarm_bar.test.ts checks the same digests."""
+    fixture = json.loads(_GENERATED_PATH.read_text(encoding="utf-8"))
+    assert len(fixture["tokens"]) == len(_TOKEN_KINDS) * 3
+    for ref, sha in fixture["tokens"]:
+        assert hashlib.sha256(expand_tokens(ref).encode("utf-8")).hexdigest()[:16] == sha, ref
+    shapes = {"aws_key": r"AKIA[A-Z2-7]{16}", "aws_secret": r"[A-Za-z0-9/+]{40}", "ghp": r"ghp_[A-Za-z0-9]{36}", "github_pat": r"github_pat_[A-Za-z0-9_]{82}",
+              "xoxb": r"xoxb-[A-Za-z0-9-]{50}", "sk_live": r"sk_live_[A-Za-z0-9]{24}", "aiza": r"AIza[A-Za-z0-9_-]{35}",
+              "sg": r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}", "npm": r"npm_[A-Za-z0-9]{36}", "glpat": r"glpat-[A-Za-z0-9_-]{20}",
+              "jwt": r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "pem": r"([A-Za-z0-9+/]{64}\n)*[A-Za-z0-9+/]{1,64}"}
+    for kind, shape in shapes.items():
+        assert re.fullmatch(shape, _token(kind, 9)), kind
+    assert expand_tokens("a {{tok:ghp:1}} b {{tok:ghp:1:60}}") == f"a {_token('ghp', 1)} b {_token('ghp', 1, 60)}" and len(_token("ghp", 1, 60)) == 60
+    assert _token("ghp", 1) != _token("ghp", 2) and "{{" not in expand_tokens("{{tok:jwt:3:600}}")
+    text, spans = expand_with_spans("x={{tok:plain:1:12}};y={{tok:aws_key:2}}")
+    assert [text[a:b] for a, b in spans] == [_token("plain", 1, 12), _token("aws_key", 2)]
+
+
+_SECRET_SHAPES = re.compile(
+    r"(?:AKIA|ASIA)[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[abprs]-[A-Za-z0-9-]{10,}|(?:sk|rk|pk)_live_[A-Za-z0-9]{16,}"
+    r"|AIza[0-9A-Za-z_-]{35}|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}|npm_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}"
+    r"|eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,}|(?i:aws_secret_access_key)\W{0,4}[A-Za-z0-9/+=]{40}"
+    r"|(?i:(?:key|secret|token|passw(?:or)?d)[\"']?\s*[=:]\s*[\"']?)[A-Za-z0-9/+=_~.-]{32,}")
+_DOCUMENTED_EXAMPLES = ("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+
+def test_the_shared_fixtures_hold_no_secret_shaped_literal():
+    """GitHub push protection rejects a push that carries one: secrets are `{{tok:...}}` placeholders, expanded only at runtime."""
+    found = []
+    for name in ("redact_generated.json", "redact_cases.json"):
+        text = (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+        found += [(name, m[0][:40]) for m in _SECRET_SHAPES.finditer(text)
+                  if not any(example in m[0] for example in _DOCUMENTED_EXAMPLES) and not re.search(r"(.{4,16})\1", m[0])]  # patterned filler (`a` * 16, `0123456789abcdef` * 4) is not a secret
+    assert found[:5] == []
 
 
 def test_value_scanning_is_idempotent_on_generated_cases():
@@ -534,15 +604,15 @@ def test_ten_megabytes_of_new_carrier_text_complete():
     f"{GHP} API_KEY=zzzz1234 mysql -u root -pS3cretPass db docker login -u me -p S3cretPass",
     "- name: DB_PASSWORD\n  value: pw1\nsecret: |\n  a\n  b\nplain: x\n",
     "const cfg = { password: \"x1\", user: 'x' }",
-    "STRIPE_KEY=aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE2fG4 curl -u a:b redis-cli -a pw",
+    "STRIPE_KEY={{tok:mixed:3:33}} curl -u a:b redis-cli -a pw",
 ])
 def test_redaction_is_idempotent_on_the_new_carriers(text):
-    once = redact_text(text)
+    once = redact_text(expand_tokens(text))
     assert redact_text(once) == once
 
 
 def test_dict_values_of_vendor_key_names_are_masked_by_shape():
-    long = "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE2fG4"
+    long = _token("mixed", 4, 33)
     assert redact({"STRIPE_KEY": long, "sort_key": long, "cache_key": long, "SERVICE_KEY": "short"}) == {
         "STRIPE_KEY": REDACTED, "sort_key": long, "cache_key": long, "SERVICE_KEY": "short"}
     assert redact_text(f'{{"STRIPE_KEY": "{long}", "sort_key": "{long}"}}') == f'{{"STRIPE_KEY": "{REDACTED}", "sort_key": "{long}"}}'
@@ -570,3 +640,368 @@ def test_runlog_redacts_an_identifier_field_that_is_not_id_shaped(tmp_path, monk
     from swarm import runlog
     rec = runlog.emit("x.y", {"run_id": f"oops password={'hunter2hunter2'}"}, source="test", root=tmp_path, tee=False)
     assert "hunter2" not in rec["payload"]["run_id"]
+
+
+# ---- secret placeholders: no secret-shaped literal sits in the repo (GitHub push protection rejects them) ----------------------------
+# A fixture stores `{{tok:KIND:INDEX}}` or `{{tok:KIND:INDEX:LENGTH}}`; this file and omp/test/swarm_bar.test.ts expand it at runtime with
+# ONE algorithm, written identically in both languages (`_token` here, `token` there; pinned by the `tokens` golden digests of the fixture):
+#   seed  = FNV-1a 32-bit over the UTF-8 bytes of "KIND:INDEX:LENGTH" (LENGTH is 0 when omitted); state = seed, or 1 when that is 0
+#   next(bound) = one xorshift32 step (x ^= x << 13; x ^= x >> 17; x ^= x << 5, 32 bits), then state % bound
+#   every random character is ALPHABET[next(len(ALPHABET))], drawn left to right; LENGTH is the whole token (default: the provider's own)
+#   KIND: ghp gho ghs ghu (prefix + alnum, 40) github_pat (93) xoxb xoxp (55) sk (51) sk_live (32) aiza (39) glpat (26) npm (40)
+#         aws_key (AKIA + [A-Z2-7], 20) aws_secret ([A-Za-z0-9/+], 40) sg (SG.22.43) jwt (eyJ.part.sig, 80) pem (64-column body, 128)
+#         plain comma quoted urlsafe bearer b64 mixed userinfo user cli lines (generic value shapes of a given LENGTH, default 24..33)
+# `expected` outputs never hold a secret (they hold [REDACTED]); a secret check compares against the expanded token.
+_TOKEN_RE = re.compile(r"\{\{tok:([a-z0-9_]+):(\d+)(?::(\d+))?\}\}")
+_ALNUM_CHARS = string.ascii_letters + string.digits
+_PLAIN_CHARS = _ALNUM_CHARS + "_.-+/=~"
+_URLSAFE_CHARS = _ALNUM_CHARS + "_-"
+_TOKEN_PREFIXED = {  # kind -> (prefix, alphabet after it, default total length)
+    "ghp": ("ghp_", _ALNUM_CHARS, 40), "gho": ("gho_", _ALNUM_CHARS, 40), "ghs": ("ghs_", _ALNUM_CHARS, 40), "ghu": ("ghu_", _ALNUM_CHARS, 40),
+    "github_pat": ("github_pat_", _ALNUM_CHARS + "_", 93), "xoxb": ("xoxb-", _ALNUM_CHARS + "-", 55), "xoxp": ("xoxp-", _ALNUM_CHARS + "-", 55),
+    "sk": ("sk-", _URLSAFE_CHARS, 51), "sk_live": ("sk_live_", _ALNUM_CHARS, 32), "aiza": ("AIza", _URLSAFE_CHARS, 39),
+    "glpat": ("glpat-", _URLSAFE_CHARS, 26), "npm": ("npm_", _ALNUM_CHARS, 40), "aws_key": ("AKIA", string.ascii_uppercase + "234567", 20),
+}
+
+_TOKEN_KINDS = (*_TOKEN_PREFIXED, "sg", "aws_secret", "jwt", "plain", "comma", "quoted", "urlsafe", "bearer", "b64", "mixed", "pem", "userinfo",
+                "user", "cli", "lines")
+_FIXTURE_DOC = ("Shared vectors for swarm/redact.py (tests/test_redact.py) and omp/src/swarm_bar.ts (omp/test/swarm_bar.test.ts). No secret-shaped "
+                "literal is stored (GitHub push protection): a planted secret is a placeholder `{{tok:KIND:INDEX}}` or `{{tok:KIND:INDEX:LENGTH}}` "
+                "that both suites expand at runtime with one algorithm. seed = FNV-1a 32 over the UTF-8 bytes of 'KIND:INDEX:LENGTH' (LENGTH 0 when "
+                "omitted), state = seed or 1; next(bound) = xorshift32 step (<<13, >>17, <<5) then state % bound; each random character is "
+                "ALPHABET[next(len)], drawn in order; LENGTH is the whole token. `property` secrets are exactly the expanded placeholders; "
+                "`tokens` pins the algorithm as [placeholder, first 16 hex of sha256(expansion)]; `expected` holds [REDACTED], never a secret.")
+
+
+class _Xorshift:
+    """xorshift32: the same few lines in tests (Python) and omp/test/swarm_bar.test.ts, so both build identical strings from a seed."""
+
+    def __init__(self, seed: int):
+        self.state = seed & 0xFFFFFFFF or 1
+
+    def next(self, bound: int) -> int:
+        x = self.state
+        x = (x ^ (x << 13)) & 0xFFFFFFFF
+        x = x ^ (x >> 17)
+        x = (x ^ (x << 5)) & 0xFFFFFFFF
+        self.state = x
+        return x % bound
+
+
+def _fnv1a32(text: str) -> int:
+    h = 0x811C9DC5
+    for byte in text.encode("utf-8"):
+        h = ((h ^ byte) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _pick(rng: _Xorshift, alphabet: str, n: int) -> str:
+    return "".join(alphabet[rng.next(len(alphabet))] for _ in range(n))
+
+
+def _token(kind: str, index: int, length: int | None = None) -> str:
+    rng = _Xorshift(_fnv1a32(f"{kind}:{index}:{length or 0}"))
+    if kind in _TOKEN_PREFIXED:
+        prefix, alphabet, default = _TOKEN_PREFIXED[kind]
+        return prefix + _pick(rng, alphabet, max(length or default, len(prefix)) - len(prefix))
+    if kind == "sg":
+        return "SG." + _pick(rng, _URLSAFE_CHARS, 22) + "." + _pick(rng, _URLSAFE_CHARS, 43)
+    if kind == "aws_secret":
+        return _pick(rng, _ALNUM_CHARS + "/+", length or 40)
+    if kind == "jwt":
+        rest = max(length or 80, 15) - 15  # `eyJ` + 5, `.` + 5, `.`
+        a, b = rng.next(rest + 1), rng.next(rest + 1)
+        first, second = min(a, b), max(a, b)
+        return "eyJ" + _pick(rng, _URLSAFE_CHARS, 5 + first) + "." + _pick(rng, _URLSAFE_CHARS, 5 + second - first) + "." + _pick(rng, _URLSAFE_CHARS, rest - second)
+    if kind == "plain":
+        n = length or 24
+        return _pick(rng, _ALNUM_CHARS, 1) + _pick(rng, _PLAIN_CHARS, n - 1)
+    if kind == "comma":
+        n, text = max(length or 24, 3), ""
+        while len(text) < n:
+            text += _pick(rng, _ALNUM_CHARS, 1 + rng.next(12)) + ","
+        return text[: n - 1] + "z"
+    if kind == "quoted":
+        n = length or 24
+        head = _pick(rng, _ALNUM_CHARS, 1)
+        if n == 1:
+            return head
+        return head + _pick(rng, _ALNUM_CHARS + " ,;:=/+.-", n - 2) + _pick(rng, _ALNUM_CHARS, 1)
+    if kind == "urlsafe":
+        return _pick(rng, _URLSAFE_CHARS, length or 32)
+    if kind == "bearer":
+        return _pick(rng, _ALNUM_CHARS + "._~+/=-", length or 32)
+    if kind == "b64":
+        return _pick(rng, _ALNUM_CHARS + "+/_-", length or 32)
+    if kind == "mixed":
+        body = _pick(rng, _ALNUM_CHARS + "_+/=~.-", max(length or 33, 3))
+        upper, lower, digit = (string.ascii_uppercase[rng.next(26)], string.ascii_lowercase[rng.next(26)], string.digits[rng.next(10)])
+        return upper + lower + digit + body[3:]
+    if kind == "pem":
+        n = length or 128
+        body = _pick(rng, _ALNUM_CHARS + "+/", n)
+        return "\n".join(body[i:i + 64] for i in range(0, n, 64))
+    if kind == "userinfo":
+        n = length or 24
+        head = _pick(rng, _ALNUM_CHARS, 1)
+        if n == 1:
+            return head
+        return head + _pick(rng, _ALNUM_CHARS + "_.~%!$'()*+,;=:@-", n - 2) + _pick(rng, _ALNUM_CHARS, 1)
+    if kind == "user":
+        return _pick(rng, _ALNUM_CHARS + "_.~%-", length or 24)
+    if kind == "cli":
+        return _pick(rng, _ALNUM_CHARS, 1) + _pick(rng, _ALNUM_CHARS + "_.~%+,=:@!*-", (length or 24) - 1)
+    if kind == "lines":
+        n = length or 80
+        body = _pick(rng, _ALNUM_CHARS, n)
+        return "\n  ".join(body[i:i + 40] for i in range(0, n, 40))
+    raise ValueError(f"unknown token kind {kind!r}")
+
+
+def expand_tokens(text: str) -> str:
+    return _TOKEN_RE.sub(lambda m: _token(m[1], int(m[2]), int(m[3]) if m[3] else None), text)
+
+
+def expand_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """The expanded text and the `(start, end)` of every expanded token in it."""
+    out, spans, last, size = [], [], 0, 0
+    for m in _TOKEN_RE.finditer(text):
+        out.append(text[last:m.start()])
+        size += m.start() - last
+        token = _token(m[1], int(m[2]), int(m[3]) if m[3] else None)
+        spans.append((size, size + len(token)))
+        out.append(token)
+        size += len(token)
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out), spans
+
+
+# carrier secret kind -> (token kind, smallest length); `vendor` draws one of _VENDORS
+_VENDORS = (("ghp", 24), ("sk", 19), ("xoxb", 15), ("github_pat", 31), ("glpat", 22), ("npm", 34), ("aws_key", 20))  # (token kind, smallest length)
+_KINDS = {"plain": ("plain", 1), "comma": ("comma", 3), "jwt": ("jwt", 15), "vendor": ("vendor", 20), "bearer": ("bearer", 16),
+          "b64": ("b64", 4), "mixed": ("mixed", 20), "quoted": ("quoted", 1), "jsontext": ("quoted", 1), "pem": ("pem", 1),
+          "userinfo": ("userinfo", 1), "user": ("user", 1), "cli": ("cli", 1), "lines": ("lines", 1)}
+
+
+# ---- class-level properties (GL5-B): every detector reads the ORIGINAL text and reports spans; one union replaces them -------------
+# 1. soundness: a secret of ANY length (1..5000) planted in ANY carrier is covered, byte for byte, by the reported spans;
+# 2. union: spans(a + "\n" + b) == spans(a) + shifted spans(b), in every order (a detector never reads another's rewrite);
+# 3. parity: omp/test/swarm_bar.test.ts replays the same cases (and 50k random strings) and gets identical spans and output.
+_PROPERTY_SEED, _PROPERTY_EXTRA = 20241021, 1200
+_RANDOM_SEED, _RANDOM_COUNT = 20241022, 50_000
+_SENSITIVE_NAMES = ("password", "API_KEY", "github_token", "client_secret", "db_password", "ANTHROPIC_API_KEY", "SECRET", "access_token",
+                    "authToken", "PGPASSWORD", "refreshtoken")
+_STRICT_NAMES = ("password", "token", "API_KEY", "client_secret", "db_password", "access_token", "authToken")  # prose-safe `NAME: value`
+_FLAG_NAMES = ("--password", "--api-key", "--db-password", "-password", "--client-secret", "--token")
+_EDGE_LENGTHS = (1, 2, 20, 160, 161, 512, 513, 5000)  # 160 / 512 were the value caps of the old patterns
+
+
+_ANY = ("plain", "comma", "jwt")
+# (label, secret kinds, template): %S% the planted secret, %N% a sensitive name, %T% a prose-safe sensitive name, %F% a sensitive flag
+_CARRIERS = (
+    ("env_bare", ("plain", "comma", "jwt", "vendor", "mixed"), "%N%=%S%"),
+    ("env_dq", ("quoted", "plain", "comma", "jwt"), '%N%="%S%"'),
+    ("env_sq", ("quoted", "plain", "jwt"), "%N%='%S%'"),
+    ("env_escaped", ("quoted", "plain"), 'set %N%=\\"%S%\\" now'),
+    ("env_export", ("plain", "jwt"), "export %N%=%S%"),
+    ("env_unterminated", ("plain", "jwt"), '%N%="%S%'),
+    ("colon_bare", ("plain", "comma", "jwt", "vendor"), "%T%: %S%"),
+    ("colon_spaced", ("plain", "jwt"), "%T% : %S%"),
+    ("colon_dq", ("quoted", "plain"), '%T%: "%S%"'),
+    ("flag_space", _ANY, "run %F% %S%"),
+    ("flag_equals", ("plain", "jwt"), "run %F%=%S%"),
+    ("flag_dq", ("quoted", "plain"), 'run %F% "%S%"'),
+    ("flag_sq", ("quoted",), "run %F% '%S%'"),
+    ("flag_escaped", ("quoted",), 'run %F% \\"%S%\\"'),
+    ("json_dq", ("jsontext", "plain"), '{"%N%": "%S%", "user": "bob"}'),
+    ("json_sq", ("jsontext",), "{'%N%': '%S%'}"),
+    ("json_escaped", ("jsontext",), '{"data": "{\\"%N%\\": \\"%S%\\", \\"n\\": 1}"}'),
+    ("cookie", ("plain", "jwt", "comma", "mixed"), "Cookie: session=%S%; theme=dark"),
+    ("cookie_late", ("plain", "jwt"), "Cookie: a=1; theme=dark; session=%S%"),
+    ("set_cookie", ("plain", "jwt"), "Set-Cookie: sid=%S%; Path=/; HttpOnly"),
+    ("cookie_in_single_quotes", ("plain", "jwt"), "curl -H 'Cookie: sid=%S%' https://h.test"),
+    ("cookie_in_double_quotes", ("plain", "jwt"), 'log "Cookie: sid=%S%" end'),
+    ("cookie_quoted_value", ("plain", "jwt"), 'Set-Cookie: session="%S%"; Path=/'),
+    ("cookie_quoted_middle", ("plain", "jwt"), 'Cookie: a=1; session="%S%"; b=2'),
+    ("authorization_token", ("plain", "jwt", "comma"), "Authorization: Token %S%"),
+    ("proxy_authorization", ("plain", "jwt"), "Proxy-Authorization: Negotiate %S%"),
+    ("x_api_key", ("plain", "jwt", "mixed"), "X-Api-Key: %S%"),
+    ("bearer", ("bearer",), "Authorization: Bearer %S%"),
+    ("bearer_quoted", ("bearer",), "-H 'Authorization: Bearer %S%'"),
+    ("bearer_bare", ("bearer",), "bearer %S%"),
+    ("basic", ("b64",), "Authorization: Basic %S%"),
+    ("userinfo_password", ("userinfo",), "git clone postgres://user:%S%@host:5432/db now"),
+    ("userinfo_empty_user", ("userinfo",), "redis://:%S%@cache:6379/0"),
+    ("userinfo_user", ("user",), "https://%S%:x@h.test/p"),
+    ("shape_prose", ("jwt", "vendor"), "error: %S% was rejected"),
+    ("shape_parenthesized", ("jwt", "vendor"), "(%S%)"),
+    ("shape_query", ("jwt", "vendor"), "https://h.test/cb?code=%S%&x=1"),
+    ("pem", ("pem",), "-----BEGIN PRIVATE KEY-----\n%S%\n-----END PRIVATE KEY-----"),
+    ("yaml_env_pair", ("plain", "jwt", "vendor"), "- name: DB_PASSWORD\n  value: %S%\n- name: X\n  value: y"),
+    ("yaml_env_pair_quoted", ("plain", "jwt"), '  - name: API_TOKEN\n    value: "%S%"'),
+    ("yaml_block", ("lines",), "secret: |\n  %S%\nplain: x"),
+    ("cli_curl_user", ("cli",), "curl -u user:%S% https://h.test"),
+    ("cli_curl_long_user", ("cli",), "curl --user admin:%S% -s"),
+    ("cli_curl_quoted", ("cli",), 'curl -u "user:%S%" https://h'),
+    ("cli_mysql_glued", ("cli",), "mysql -u root -p%S% db"),
+    ("cli_sshpass", ("cli",), "sshpass -p %S% ssh h"),
+    ("cli_docker_login", ("cli",), "docker login -u me -p %S% registry.io"),
+    ("cli_redis", ("cli",), "redis-cli -a %S% ping"),
+    ("cli_sqlcmd", ("cli",), "sqlcmd -S h -P %S%"),
+    ("cli_openssl", ("cli",), "openssl enc -passin pass:%S%"),
+    ("vendor_key_equals", ("mixed",), "STRIPE_KEY=%S%"),
+    ("vendor_key_quoted", ("mixed",), 'SUPABASE_SERVICE_ROLE_KEY="%S%"'),
+    ("vendor_key_colon", ("mixed",), "STRIPE_KEY: %S%"),
+    ("vendor_key_json", ("mixed",), "{'STRIPE_KEY': '%S%'}"),
+    ("credential_list", ("comma",), "SUBSTRATE_OPERATOR_TOKENS=%S%"),
+    ("chained_colon", ("plain",), "password=a,token = %S%"),
+    ("chained_flag", ("plain",), "key=a;--password %S%"),
+    ("benign_then_secret", ("plain",), 'user=alice,password="x y",token: %S%'),
+    ("env_spaced", ("plain", "jwt"), "%N% = %S%"),
+    ("env_spaced_dq", ("quoted", "plain"), '%N% = "%S%"'),
+    ("env_query", ("plain", "jwt"), "https://h.test/x?token=%S%&page=2"),
+    ("env_dotenv_lines", ("plain", "jwt"), "A=1\nPASSWORD=%S%\nB=2"),
+    ("cookie_wide_gap", ("plain", "jwt"), "Cookie:     session=%S%"),
+    ("cookie_lowercase", ("plain", "jwt"), "cookie: session=%S%"),
+    ("set_cookie_uppercase", ("plain", "jwt"), "SET-COOKIE: sid=%S%; Secure"),
+    ("http_crlf", ("plain", "jwt"), "GET / HTTP/1.1\r\nCookie: sid=%S%\r\nHost: x"),
+    ("bearer_wide_gap", ("bearer",), "Authorization: Bearer   %S%"),
+    ("curl_user_secret", ("user",), "curl -u %S%:pw https://h.test"),
+    ("yaml_block_folded", ("lines",), "token: >-\n  %S%\nnext: 1"),
+)
+_PROP_PREFIXES = ("", "run ", "error: ", "cmd: ", "(", "{")
+_PROP_SUFFIXES = ("", " done", "\nnext line", " ok.", ")", "}")
+_PROP_JOINERS = (" ", "\n", " ; ", "\t")
+
+
+def _plant(rng: random.Random, label: str, kinds: tuple, template: str, length: int, serial: int) -> str:
+    """One carrier: its text, with the planted secret as a `{{tok:KIND:serial:LENGTH}}` placeholder (expanded by `expand_with_spans`)."""
+    kind, floor = _KINDS[rng.choice(kinds)]
+    if kind == "vendor":
+        kind, floor = rng.choice(_VENDORS)
+    size = 20 if kind == "aws_key" else max(length, floor)  # an AWS key id has no length of its own
+    body = (template.replace("%N%", rng.choice(_SENSITIVE_NAMES)).replace("%T%", rng.choice(_STRICT_NAMES)).replace("%F%", rng.choice(_FLAG_NAMES)))
+    prefix, suffix = rng.choice(("", "\n") if label.startswith("yaml") else _PROP_PREFIXES), rng.choice(_PROP_SUFFIXES)  # YAML keys start a line
+    return prefix + body.replace("%S%", f"{{{{tok:{kind}:{serial}:{size}}}}}") + suffix
+
+
+def _case(text: str, label: str) -> dict:
+    return {"input": text} | ({"open": 1} if label == "env_unterminated" else {})
+
+
+def generate_property_cases(seed: int, extra: int) -> list[dict]:
+    """Every carrier at every edge length, then `extra` random (carrier, length) draws, then `extra // 4` pairs of closed carriers on one
+    line. Each case is `{"input": text}` (ASCII; the secrets are `{{tok:...}}` placeholders, so the planted ranges are the expanded
+    tokens: `expand_with_spans`), plus `"open": 1` for a carrier that leaves a quote open (it would pair with the next carrier's quote)."""
+    rng = random.Random(seed)
+    serial = itertools.count()
+    cases = []
+    for label, kinds, template in _CARRIERS:
+        for length in _EDGE_LENGTHS:
+            cases.append(_case(_plant(rng, label, kinds, template, length, next(serial)), label))
+    for _ in range(extra):
+        draw = rng.random()
+        length = rng.randint(1, 40) if draw < 0.6 else rng.randint(41, 600) if draw < 0.9 else rng.randint(601, 5000)
+        label, kinds, template = rng.choice(_CARRIERS)
+        cases.append(_case(_plant(rng, label, kinds, template, length, next(serial)), label))
+    closed = [c for c in _CARRIERS if c[0] != "env_unterminated"]
+    for _ in range(extra // 4):
+        (first_label, first_kinds, first_template), (second_label, second_kinds, second_template) = rng.choice(closed), rng.choice(closed)
+        first = _plant(rng, first_label, first_kinds, first_template, rng.randint(1, 200), next(serial))
+        second = _plant(rng, second_label, second_kinds, second_template, rng.randint(1, 200), next(serial))
+        joiner = "\n" if second_label.startswith("yaml") else rng.choice(_PROP_JOINERS)  # YAML keys start a line
+        cases.append({"input": first + joiner + second})
+    return cases
+
+
+def _covered(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    return any(a <= start and end <= b for a, b in spans)  # merged spans are maximal: a covered range lies inside ONE of them
+
+
+def _leaks(cases: list[dict]) -> list[tuple]:
+    leaks = []
+    for case in cases:
+        text, secrets = expand_with_spans(case["input"])
+        spans = redact_spans(text)
+        for start, end in secrets:
+            if not _covered(spans, start, end):
+                leaks.append((text[:200], text[start:end][:80], redact_text(text)[:200]))
+    return leaks
+
+
+def test_a_planted_secret_of_any_length_is_covered_in_every_carrier():
+    """Soundness: no byte of a planted secret (1..5000 characters: JWTs, cookies, comma lists, quoted values, glued flags, ...) survives
+    in any carrier. A length cap, or a detector measuring a value another had already shortened, fails here."""
+    assert _leaks(generate_property_cases(_PROPERTY_SEED, 2000) + generate_property_cases(7, 1500) + generate_property_cases(8, 1500))[:3] == []
+
+
+@pytest.mark.parametrize("length", [513, 600, 4096, 100_000])
+@pytest.mark.parametrize("carrier", ["Cookie: session=%s", "Set-Cookie: session=%s; Path=/", "Cookie: a=1; session=%s; theme=dark",
+                                     "curl -H 'Cookie: session=%s' https://h.test", "Authorization: Token %s"])
+def test_long_session_cookies_are_masked_whole(carrier, length):
+    """The Greptile finding: a header value longer than the old 512-character cap kept its tail, and the JWT pass could no longer
+    recognise those bytes. Every byte of the token goes, whatever its length."""
+    jwt = _token("jwt", length, length)
+    text = "saw " + carrier % jwt + " next"
+    out = redact_text(text)
+    at = 4 + carrier.index("%s")
+    assert _covered(redact_spans(text), at, at + len(jwt))
+    assert not any(jwt[i:i + 12] in out for i in range(0, len(jwt) - 12, 7)) and out.startswith("saw ") and REDACTED in out
+
+
+def _joined_spans(parts: list[str], joiner: str) -> list[tuple[int, int]]:
+    spans, offset = [], 0
+    for part in parts:
+        spans += [(a + offset, b + offset) for a, b in redact_spans(part)]
+        offset += len(part) + len(joiner)
+    return spans
+
+
+def _union_groups(cases: list[dict]) -> list[tuple[list[str], str]]:
+    """Index-derived (so the TypeScript twin builds the same ones) groups of three closed carriers, each in both orders; every seventh
+    group is joined by a blank line instead of a newline."""
+    closed = [expand_tokens(c["input"]) for c in cases if "open" not in c][:700]
+    n = len(closed)
+    groups = []
+    for i in range(n):
+        trio = [closed[i], closed[(i * 7 + 3) % n], closed[(i * 13 + 5) % n]]
+        joiner = "\n\n" if i % 7 == 0 else "\n"
+        groups += [(trio, joiner), (trio[::-1], joiner)]
+    return groups
+
+
+def test_redacting_is_invariant_under_splitting_into_carriers_in_any_order():
+    """The union property: detectors only read the original text, so carriers joined by a newline neither hide nor expose each other."""
+    for parts, joiner in _union_groups(json.loads(_GENERATED_PATH.read_text(encoding="utf-8"))["property"]):
+        assert redact_spans(joiner.join(parts)) == _joined_spans(parts, joiner), parts
+        assert redact_text(joiner.join(parts)) == joiner.join(redact_text(p) for p in parts)
+
+
+# ---- seeded random strings: the parity corpus shared with the TypeScript twin ---------------------------------------------------
+_RANDOM_FRAGMENTS = (
+    "password", "token", "API_KEY", "client_secret", "db_password", "authToken", "SECRET", "user", "mode", "name", "id", "x", "abc", "S3cret",
+    "=", ":", " = ", ": ", "  ", " ", "\t", ",", ";", "&", "\n", "\r\n", "/", "?", "#", "(", ")", "{", "}", "[", "]", "|", "@", "-", ".", "_", "!",
+    '"', "'", '\\"', "\\", "--password ", "--api-key ", "--user ", "-u ", "-p", "-pass ", "-a ", "--mode ", "-v ", "Bearer ", "Basic ", "Cookie: ",
+    "Set-Cookie: ", "Authorization: ", "Proxy-Authorization: ", "X-Api-Key: ", "://", "https://", "postgres://", "a.b", "k.x", "é", "日本",
+    "\u00a0", "\u0085", "\u2028", "\ufeff", "\u200b",
+    "{{tok:jwt:1}}", "{{tok:ghp:1}}", "{{tok:sk:1}}", "{{tok:aws_key:1}}", "{{tok:xoxb:1}}", "{{tok:github_pat:1}}", "eyJhbGciOiJIUzI1NiJ9", "ghp_", "sk-", "AKIA", "sk-aaaaaaaaaaaaaaaa", "AKIAIOSFODNN7EXAMPLE",
+    "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----", "MIIEowIBAAKCAQEA", "mysql ", "docker login ", "sshpass ", "curl ", "redis-cli ",
+    "sqlcmd ", "openssl ", "pass:", "STRIPE_KEY", "{{tok:mixed:5:33}}", "- name: ", "name: ", "value: ", "|\n  ", "  value: ",
+    "DB_PASSWORD", "[REDACTED]", "1000:1000", "a:b", "user:pw@", "u:p@h", "pw", "x=1", "a=b", "--", "-",
+)
+
+
+def generate_random_strings(seed: int, count: int) -> list[str]:
+    fragments = [expand_tokens(f) for f in _RANDOM_FRAGMENTS]  # the table holds placeholders, never a secret-shaped literal
+    rng = _Xorshift(seed)
+    out = []
+    for _ in range(count):
+        out.append("".join(fragments[rng.next(len(fragments))] for _ in range(2 + rng.next(11))))
+    return out
+
+
+def _digest(text: str) -> str:
+    """8 hex digits over the redacted output and the reported spans (UTF-16 offsets: the corpus is BMP-only, so they equal Python's)."""
+    spans = ";".join(f"{a},{b}" for a, b in redact_spans(text))
+    return hashlib.sha256((redact_text(text) + "\u0000" + spans).encode("utf-8", "surrogatepass")).hexdigest()[:8]

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -17,6 +18,7 @@ import {
   isDetached,
   nextExpiryMs,
   pruneExpired,
+  redactSpans,
   redactText,
   renderSwarmBar,
   renderSwarmBarFrame,
@@ -34,6 +36,163 @@ import { REPO_ROOT } from "./helpers.ts";
 
 const T0 = 1_000_000;
 const SEC = 1000;
+
+/**
+ * Secret placeholders: no secret-shaped literal sits in the repo (GitHub push protection rejects them). A fixture stores `{{tok:KIND:INDEX}}`
+ * or `{{tok:KIND:INDEX:LENGTH}}`; this file and tests/test_redact.py expand it at runtime with ONE algorithm, identical in both languages
+ * (`_token` there, `token` here; pinned by the `tokens` golden digests of tests/fixtures/redact_generated.json):
+ *   seed  = FNV-1a 32-bit over the UTF-8 bytes of "KIND:INDEX:LENGTH" (LENGTH is 0 when omitted); state = seed, or 1 when that is 0
+ *   next(bound) = one xorshift32 step (x ^= x << 13; x ^= x >> 17; x ^= x << 5, 32 bits), then state % bound
+ *   every random character is ALPHABET[next(len(ALPHABET))], drawn left to right; LENGTH is the whole token (default: the provider's own)
+ */
+const TOKEN_RE = /\{\{tok:([a-z0-9_]+):(\d+)(?::(\d+))?\}\}/g;
+const UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const LOWER = "abcdefghijklmnopqrstuvwxyz";
+const DIGITS = "0123456789";
+const ALNUM = LOWER + UPPER + DIGITS;
+const PLAIN_CHARS = `${ALNUM}_.-+/=~`;
+const URLSAFE_CHARS = `${ALNUM}_-`;
+/** kind -> [prefix, alphabet after it, default total length] */
+const TOKEN_PREFIXED: Record<string, [string, string, number]> = {
+  ghp: ["ghp_", ALNUM, 40],
+  gho: ["gho_", ALNUM, 40],
+  ghs: ["ghs_", ALNUM, 40],
+  ghu: ["ghu_", ALNUM, 40],
+  github_pat: ["github_pat_", `${ALNUM}_`, 93],
+  xoxb: ["xoxb-", `${ALNUM}-`, 55],
+  xoxp: ["xoxp-", `${ALNUM}-`, 55],
+  sk: ["sk-", URLSAFE_CHARS, 51],
+  sk_live: ["sk_live_", ALNUM, 32],
+  aiza: ["AIza", URLSAFE_CHARS, 39],
+  glpat: ["glpat-", URLSAFE_CHARS, 26],
+  npm: ["npm_", ALNUM, 40],
+  aws_key: ["AKIA", `${UPPER}234567`, 20],
+};
+
+function fnv1a32(text: string): number {
+  let h = 0x811c9dc5;
+  for (const byte of Buffer.from(text, "utf8")) h = Math.imul(h ^ byte, 0x01000193) >>> 0;
+  return h;
+}
+
+/** xorshift32, the twin of `_Xorshift` in tests/test_redact.py. */
+function xorshift(seed: number): (bound: number) => number {
+  let state = seed >>> 0 || 1;
+  return (bound) => {
+    state = (state ^ (state << 13)) >>> 0;
+    state = (state ^ (state >>> 17)) >>> 0;
+    state = (state ^ (state << 5)) >>> 0;
+    return state % bound;
+  };
+}
+
+function expandToken(kind: string, index: number, length?: number): string {
+  const next = xorshift(fnv1a32(`${kind}:${index}:${length || 0}`));
+  const pick = (alphabet: string, n: number): string => {
+    let out = "";
+    for (let i = 0; i < n; i++) out += alphabet[next(alphabet.length)]!;
+    return out;
+  };
+  const prefixed = TOKEN_PREFIXED[kind];
+  if (prefixed) {
+    const [prefix, alphabet, fallback] = prefixed;
+    return prefix + pick(alphabet, Math.max(length || fallback, prefix.length) - prefix.length);
+  }
+  switch (kind) {
+    case "sg":
+      return `SG.${pick(URLSAFE_CHARS, 22)}.${pick(URLSAFE_CHARS, 43)}`;
+    case "aws_secret":
+      return pick(`${ALNUM}/+`, length || 40);
+    case "jwt": {
+      const rest = Math.max(length || 80, 15) - 15; // `eyJ` + 5, `.` + 5, `.`
+      const a = next(rest + 1);
+      const b = next(rest + 1);
+      const first = Math.min(a, b);
+      const second = Math.max(a, b);
+      const head = pick(URLSAFE_CHARS, 5 + first);
+      const body = pick(URLSAFE_CHARS, 5 + second - first);
+      return `eyJ${head}.${body}.${pick(URLSAFE_CHARS, rest - second)}`;
+    }
+    case "plain": {
+      const n = length || 24;
+      return pick(ALNUM, 1) + pick(PLAIN_CHARS, n - 1);
+    }
+    case "comma": {
+      const n = Math.max(length || 24, 3);
+      let text = "";
+      while (text.length < n) text += `${pick(ALNUM, 1 + next(12))},`;
+      return `${text.slice(0, n - 1)}z`;
+    }
+    case "quoted": {
+      const n = length || 24;
+      const head = pick(ALNUM, 1);
+      if (n === 1) return head;
+      const middle = pick(`${ALNUM} ,;:=/+.-`, n - 2);
+      return head + middle + pick(ALNUM, 1);
+    }
+    case "urlsafe":
+      return pick(URLSAFE_CHARS, length || 32);
+    case "bearer":
+      return pick(`${ALNUM}._~+/=-`, length || 32);
+    case "b64":
+      return pick(`${ALNUM}+/_-`, length || 32);
+    case "mixed": {
+      const body = pick(`${ALNUM}_+/=~.-`, Math.max(length || 33, 3));
+      const upper = UPPER[next(26)]!;
+      const lower = LOWER[next(26)]!;
+      const digit = DIGITS[next(10)]!;
+      return upper + lower + digit + body.slice(3);
+    }
+    case "pem": {
+      const n = length || 128;
+      const body = pick(`${ALNUM}+/`, n);
+      const rows: string[] = [];
+      for (let i = 0; i < n; i += 64) rows.push(body.slice(i, i + 64));
+      return rows.join("\n");
+    }
+    case "userinfo": {
+      const n = length || 24;
+      const head = pick(ALNUM, 1);
+      if (n === 1) return head;
+      const middle = pick(`${ALNUM}_.~%!$'()*+,;=:@-`, n - 2);
+      return head + middle + pick(ALNUM, 1);
+    }
+    case "user":
+      return pick(`${ALNUM}_.~%-`, length || 24);
+    case "cli": {
+      const head = pick(ALNUM, 1);
+      return head + pick(`${ALNUM}_.~%+,=:@!*-`, (length || 24) - 1);
+    }
+    case "lines": {
+      const n = length || 80;
+      const body = pick(ALNUM, n);
+      const rows: string[] = [];
+      for (let i = 0; i < n; i += 40) rows.push(body.slice(i, i + 40));
+      return rows.join("\n  ");
+    }
+    default:
+      throw new Error(`unknown token kind ${kind}`);
+  }
+}
+
+function expandTokens(text: string): string {
+  return text.replace(TOKEN_RE, (_m, kind: string, index: string, length?: string) => expandToken(kind, Number(index), length ? Number(length) : undefined));
+}
+
+/** The expanded text and the `[start, end]` of every expanded token in it. */
+function expandWithSpans(text: string): { text: string; secrets: Array<[number, number]> } {
+  let out = "";
+  let last = 0;
+  const secrets: Array<[number, number]> = [];
+  for (const m of text.matchAll(TOKEN_RE)) {
+    out += text.slice(last, m.index);
+    const token = expandToken(m[1]!, Number(m[2]), m[3] ? Number(m[3]) : undefined);
+    secrets.push([out.length, out.length + token.length]);
+    out += token;
+    last = m.index! + m[0].length;
+  }
+  return { text: out + text.slice(last), secrets };
+}
 
 /** A theme that colors with plain SGR sequences, like omp's `fg`, and throws on an unknown color. */
 const colorTheme: BarTheme = {
@@ -276,7 +435,7 @@ describe("redactText shared vectors", () => {
     must_contain: Needle[];
     expected?: string;
   }
-  const flat = (value: Needle): string => (typeof value === "string" ? value : value.join(""));
+  const flat = (value: Needle): string => expandTokens(typeof value === "string" ? value : value.join("")); // `{{tok:...}}` secrets expand at runtime
   const { cases } = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_cases.json"), "utf8")) as { cases: Vector[] };
 
   test("tests/fixtures/redact_cases.json: the same vectors tests/test_redact.py runs against swarm/redact.py", () => {
@@ -303,6 +462,122 @@ describe("redactText shared vectors", () => {
     }
   });
 
+  /** The class-level properties (GL5-B): detectors report spans on the ORIGINAL text, one union replaces them. */
+  describe("span properties (shared tests/fixtures/redact_generated.json)", () => {
+    interface PropertyCase {
+      input: string; // with `{{tok:...}}` placeholders: the planted secrets are exactly the expanded tokens
+      digest: string;
+      open?: number;
+    }
+    const fixture = JSON.parse(readFileSync(join(REPO_ROOT, "tests", "fixtures", "redact_generated.json"), "utf8")) as {
+      property: PropertyCase[];
+      random: { seed: number; count: number; fragments: string[]; inputs: string; digests: string[] };
+      tokens: Array<[string, string]>;
+    };
+    const property = fixture.property.map((c) => ({ ...c, ...expandWithSpans(c.input) })); // text: the expanded input, secrets: its planted ranges
+    const digest = (text: string): string => {
+      const spans = redactSpans(text).map(([a, b]) => `${a},${b}`).join(";");
+      return createHash("sha256").update(`${redactText(text)}\u0000${spans}`, "utf8").digest("hex").slice(0, 8);
+    };
+    const covered = (spans: Array<[number, number]>, start: number, end: number): boolean => spans.some(([a, b]) => a <= start && end <= b);
+
+    test("soundness: no byte of a planted secret (1..5000 characters, any carrier) survives", () => {
+      expect(property.length).toBeGreaterThan(2000);
+      const leaks = property.filter((c) => c.secrets.some(([start, end]) => !covered(redactSpans(c.text), start, end)));
+      expect(leaks.slice(0, 3).map((c) => c.text.slice(0, 200))).toEqual([]);
+    });
+
+    test("the placeholder expansion is the Python algorithm: golden digests and provider shapes", () => {
+      expect(fixture.tokens.length).toBeGreaterThan(60);
+      const wrong = fixture.tokens.filter(([ref, sha]) => createHash("sha256").update(expandTokens(ref), "utf8").digest("hex").slice(0, 16) !== sha);
+      expect(wrong.map(([ref]) => ref)).toEqual([]);
+      const shapes: Record<string, RegExp> = {
+        aws_key: /^AKIA[A-Z2-7]{16}$/,
+        aws_secret: /^[A-Za-z0-9/+]{40}$/,
+        ghp: /^ghp_[A-Za-z0-9]{36}$/,
+        github_pat: /^github_pat_[A-Za-z0-9_]{82}$/,
+        xoxb: /^xoxb-[A-Za-z0-9-]{50}$/,
+        sk_live: /^sk_live_[A-Za-z0-9]{24}$/,
+        aiza: /^AIza[A-Za-z0-9_-]{35}$/,
+        sg: /^SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/,
+        npm: /^npm_[A-Za-z0-9]{36}$/,
+        glpat: /^glpat-[A-Za-z0-9_-]{20}$/,
+        jwt: /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
+        pem: /^([A-Za-z0-9+/]{64}\n)*[A-Za-z0-9+/]{1,64}$/,
+      };
+      for (const [kind, shape] of Object.entries(shapes)) expect({ kind, ok: shape.test(expandToken(kind, 9)) }).toEqual({ kind, ok: true });
+      const { text, secrets } = expandWithSpans("x={{tok:plain:1:12}};y={{tok:aws_key:2}}");
+      expect(secrets.map(([a, b]) => text.slice(a, b))).toEqual([expandToken("plain", 1, 12), expandToken("aws_key", 2)]);
+    });
+
+    test("the structured cases give the Python spans and output byte for byte", () => {
+      const wrong = property.filter((c) => digest(c.text) !== c.digest);
+      expect(wrong.slice(0, 3).map((c) => c.text.slice(0, 200))).toEqual([]);
+    });
+
+    test("union: splitting the input into carriers, in any order, changes no span", () => {
+      const closed = property.filter((c) => c.open === undefined).map((c) => c.text).slice(0, 700);
+      const n = closed.length;
+      expect(n).toBe(700);
+      for (let i = 0; i < n; i++) {
+        const trio = [closed[i]!, closed[(i * 7 + 3) % n]!, closed[(i * 13 + 5) % n]!];
+        const joiner = i % 7 === 0 ? "\n\n" : "\n";
+        for (const parts of [trio, [...trio].reverse()]) {
+          const expected: Array<[number, number]> = [];
+          let offset = 0;
+          for (const part of parts) {
+            for (const [a, b] of redactSpans(part)) expected.push([a + offset, b + offset]);
+            offset += part.length + joiner.length;
+          }
+          const joined = parts.join(joiner);
+          expect(redactSpans(joined)).toEqual(expected);
+          expect(redactText(joined)).toBe(parts.map(redactText).join(joiner));
+        }
+      }
+    });
+
+    test("50k seeded random strings: TypeScript and Python agree on every output and span", () => {
+      const { seed, count, inputs, digests } = fixture.random;
+      const fragments = fixture.random.fragments.map(expandTokens); // the table holds placeholders, never a secret-shaped literal
+      expect(count).toBe(50_000);
+      let state = seed >>> 0 || 1; // xorshift32, the twin of `_Xorshift` in tests/test_redact.py
+      const next = (bound: number): number => {
+        state = (state ^ (state << 13)) >>> 0;
+        state = (state ^ (state >>> 17)) >>> 0;
+        state = (state ^ (state << 5)) >>> 0;
+        return state % bound;
+      };
+      const strings: string[] = [];
+      for (let i = 0; i < count; i++) {
+        let text = "";
+        for (let k = 2 + next(11); k > 0; k--) text += fragments[next(fragments.length)]!;
+        strings.push(text);
+      }
+      expect(createHash("sha256").update(strings.join("\u0000"), "utf8").digest("hex").slice(0, 16)).toBe(inputs);
+      const wrong: number[] = [];
+      strings.forEach((text, i) => {
+        if (digest(text) !== digests[i]) wrong.push(i);
+      });
+      expect(wrong.slice(0, 3).map((i) => strings[i])).toEqual([]);
+    });
+
+    test("long session cookies (513, 4096 and 100000 characters) are masked whole", () => {
+      const b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+      for (const length of [513, 4096, 100_000]) {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.";
+        for (let i = 0; jwt.length < length; i++) jwt += b64[(i * 7 + (i >> 3)) % b64.length]!;
+        for (const carrier of ["Cookie: session=%s", "Set-Cookie: session=%s; Path=/", "curl -H 'Cookie: session=%s' https://h.test", "Authorization: Token %s"]) {
+          const text = `saw ${carrier.replace("%s", jwt)} next`;
+          const out = redactText(text);
+          const at = 4 + carrier.indexOf("%s");
+          expect({ length, carrier, covered: covered(redactSpans(text), at, at + jwt.length) }).toEqual({ length, carrier, covered: true });
+          for (let i = 0; i + 12 <= jwt.length; i += 997) expect(out.includes(jwt.slice(i, i + 12))).toBe(false);
+          expect(sanitizeText(text, 400).includes(jwt.slice(-40))).toBe(false);
+        }
+      }
+    });
+  });
+
   test("1 MB assignment floods are linear and still find the trailing password", () => {
     for (const unit of ["a=", "a=a=", "user=a,", "user=a;", "x=1&"]) {
       const started = performance.now();
@@ -320,7 +595,8 @@ describe("redactText shared vectors", () => {
   test("1 MB adversarial inputs are scanned in time linear in their size (< 100 ms each)", () => {
     const units = ["a://b:b:b:", "--password ", "mode=fast ", "'a':'", "Authorization: Basic ", "-----BEGIN PRIVATE KEY-----", "Bearer ", "a.b-",
       "SWARM_ED25519_KEY=", "SWARM_ED25519_KEY_FILE=", "a,", "k=a,", "--ed25519-key ", "ed25519.seed.", "Cookie: ", "Authorization:x",
-      "--mode a;", "-v ", "password=a,token = ", "token=a,--password "];
+      "--mode a;", "-v ", "password=a,token = ", "token=a,--password ", 'Cookie: a="', "x=-u=", '-u "', "A_KEY=", "STRIPE_KEY=A_KEY=", "a://u:",
+      'password="', "-u=a:", 'Cookie: a="b" ', "-u a:", "--user=-u="];
     for (const unit of units) {
       const text = unit.repeat(Math.floor(1_000_000 / unit.length));
       const started = performance.now();

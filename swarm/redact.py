@@ -14,9 +14,18 @@
     contain `@`).
 A benign name never hides a later assignment (`user=alice,password=x`, `--mode a;--password x`): the scan is one forward pass
 that steps past a benign separator, while a sensitive name masks its whole comma-bearing value.
-Identifiers (task ids, run ids, correlation ids, `sha256:<64 hex>` digests) and ordinary prose never match. Every
-quantifier that can be re-entered from many start positions is bounded, so adversarial input of hundreds of KB is
-scanned in time linear in its size.
+Identifiers (task ids, run ids, correlation ids, `sha256:<64 hex>` digests) and ordinary prose never match.
+
+How a string is redacted (the design that keeps passes from interacting): EVERY detector (names, flags, headers, JSON/YAML pairs, URL
+userinfo, PEM, token shapes, command lines) reads the ORIGINAL text and only reports `(start, end)` spans of what must disappear;
+`redact_spans` unions overlapping or touching spans and `redact_text` replaces each union by ONE `[REDACTED]`. Nothing is rewritten
+while detecting, so no detector ever measures a value another detector already shortened, the order of detectors is irrelevant, and a
+secret hidden by any one of them is hidden. A detector that needs a boundary scans linearly to the TRUE end of the value: a value is
+never cut by a length cap (a cap would leave a readable tail). Only syntax is bounded (a name <= 127 characters, a gap <= 32 blanks, at
+most 10 arguments of <= 128 characters between a command and its password flag); every quantifier that can be re-entered from many start
+positions is bounded, or its failed scans are remembered, so adversarial input of megabytes is scanned in time linear in its size.
+Masking is idempotent on every shared vector; a mask can newly expose a word boundary (`AKIA...--password x`) and let a second pass hide
+more, never less.
 Best effort, not a guarantee: it covers the carriers above plus the command-line forms `curl -u user:pass`, `mysql -pSECRET`,
 `sshpass -p`, `docker login -p`, `redis-cli -a`, `sqlcmd -P`, `-pass pass:X`; vendor tokens (GitHub, Stripe, Google, SendGrid, Slack, npm,
 GitLab, DigitalOcean, AWS key ids, ...); `<vendor>_KEY=<long mixed-case value>`; and YAML `- name: X_PASSWORD` / `value:` pairs and
@@ -129,12 +138,17 @@ _BEARER_RE = re.compile(r"(?<![A-Za-z0-9])([Bb]earer\s{1,16})[A-Za-z0-9._~+/=-]{
 _BASIC_RE = re.compile(r"(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}[\"']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}",
                        re.IGNORECASE | re.ASCII)
 # Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header (`Authorization: Token x`, `Cookie: sid=x; theme=dark`): the rest of
-# the line up to a quote is the credential. Bearer/Basic keep their scheme visible (handled above).
-_HEADER_RE = re.compile(r"(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]{0,3}:(?![ \t]{0,3}(?:Bearer|Basic)\b)[ \t]{0,3})[^\s\"'][^\r\n\"']{0,511}",
+# the line is the credential (Bearer/Basic keep their scheme visible, see above). The regex matches the lead only; `_header_end`
+# scans the value to its TRUE end (line end, or an enclosing quote that does not open a quoted cookie value): never a length cap,
+# a cap would leave the tail of a long session token readable.
+_HEADER_RE = re.compile(r"(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]*:(?![ \t]*(?:Bearer|Basic)\b)[ \t]*)(?=[^\s\"'])",
                         re.IGNORECASE | re.ASCII)
+_HEADER_STOP_RE = re.compile(r"[\r\n\"']")
+_HEADER_CLOSE_RES = {'"': re.compile(r"[\r\n\"]"), "'": re.compile(r"[\r\n']")}
 # scheme://user:password@host: the user cannot contain ':' (so the split is unambiguous), the password runs to the LAST
-# '@' before the first '/' or whitespace (`postgres://u:p@ss@host/db`).
-_USERINFO_RE = re.compile(r"((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/\s@:]{0,256}:[^/\s]{0,256}@", re.ASCII)
+# '@' before the first '/' or whitespace (`postgres://u:p@ss@host/db`). Neither part is length-capped: a scan stops at the next
+# '/' (every `://` ends the previous scan), so the scans of different schemes never overlap.
+_USERINFO_RE = re.compile(r"((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/\s@:]*:[^/\s]*@", re.ASCII)
 # ',' is part of an unquoted value (`TOKENS=one,two`): a credential may contain it, and a list of credentials is comma-joined.
 _VALUE = r"""(\\"(?:[^"\\\n]|\\(?!"))*\\"|"[^"\n]*"|'[^'\n]*'|(?:[^\s&;"'\\]|\\(?!"))+)"""
 # The second lookbehind keeps a `a.b.c.d` / `a-b-c` run from re-starting a 128-char scan at every dot or dash.
@@ -180,9 +194,10 @@ _TAIL_DELIMS = (",", ";", "&", "/", "?")
 _VENDOR_KEY_SKIP = frozenset({"cache", "sort", "idempotency", "partition", "primary", "foreign", "public", "lookup", "group", "shard",
                               "unique", "index", "hash", "object", "route", "routing", "dedupe", "dedup", "lock", "message"})
 _LONG_SECRET_RE = re.compile(r"[A-Za-z0-9_+/=~.-]{20,}")
-# the value of a `*_key` name inside running text: one token of at most 160 characters, optionally quoted (bounded, so a long run
-# of `STRIPE_KEY=` repeats is not re-read in full at every name)
-_KEY_VALUE_RE = re.compile(r"""(\\?["']?)([A-Za-z0-9_+/=~.-]{20,160})(?![A-Za-z0-9_+/=~.-])""")
+_DIGIT_RE, _LOWER_RE, _UPPER_RE = re.compile("[0-9]"), re.compile("[a-z]"), re.compile("[A-Z]")
+# the value of a `*_key` name inside running text: the WHOLE token (never length-capped: a cap leaves the tail readable), optionally
+# quoted. `_scan` remembers where a failed check ended, so a long run of `STRIPE_KEY=` repeats is not re-read at every name.
+_KEY_VALUE_RE = re.compile(r"""(\\?["']?)([A-Za-z0-9_+/=~.-]{20,})""")
 
 
 @functools.lru_cache(maxsize=4096)
@@ -193,8 +208,8 @@ def _key_name(name: str) -> bool:
 
 def _long_secret(value: str) -> bool:
     v = value.strip("\"'\\")
-    return (_LONG_SECRET_RE.fullmatch(v) is not None and any(c.isdigit() for c in v)
-            and any("a" <= c <= "z" for c in v) and any("A" <= c <= "Z" for c in v))
+    return (_LONG_SECRET_RE.fullmatch(v) is not None and _DIGIT_RE.search(v) is not None
+            and _LOWER_RE.search(v) is not None and _UPPER_RE.search(v) is not None)
 
 
 def _credential_pair(name: object, value: object) -> bool:
@@ -202,22 +217,27 @@ def _credential_pair(name: object, value: object) -> bool:
     return is_sensitive_key(name) or (isinstance(name, str) and isinstance(value, str) and _key_name(name) and _long_secret(value))
 
 
-def _key_value_end(s: str, pos: int) -> int:
-    """End of the credential-shaped token (and its closing quote) that starts at s[pos], or -1."""
+def _key_value_end(s: str, pos: int) -> tuple[int, int]:
+    """(end of the credential-shaped token and its closing quote that starts at s[pos], or -1; end of the token run that was checked,
+    or 0 when there is no run). A failed check fails for every later start inside the same run: a suffix has no more classes."""
     m = _KEY_VALUE_RE.match(s, pos)
-    if m is None or not _long_secret(m.group(2)):
-        return -1
+    if m is None:
+        return -1, 0
+    if not _long_secret(m.group(2)):
+        return -1, m.end()
     end, q = m.end(), m.group(1)
-    return end + len(q) if q and s.startswith(q, end) else end
+    return (end + len(q) if q and s.startswith(q, end) else end), m.end()
 
 
 # ---- command-line credentials ---------------------------------------------------------------------------------------------
 # `curl -u user:pass`, `--user user:pass`, `--proxy-user a:b` (a docker `-u 1000:1000` uid:gid pair is not a credential).
 _CLI_VALUE = r"""(?:"[^"\n]*"|'[^'\n]*'|[^ \t\r\n\f\v"'\\;&|]+)"""
 # explicit ASCII whitespace classes below (`\s` differs between Python and JS: the twin in omp/src/swarm_bar.ts must agree byte for byte)
+# The flag must start a shell word (start of text, whitespace, a quote or `;&|(`): a flag glued to a previous word's characters
+# (`x=-u=-u=...`) cannot start inside another candidate's user token, so the unbounded user part below is scanned once per token.
 _USER_PASS_FLAG_RE = re.compile(
-    r"""(?<![A-Za-z0-9_-])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))"""
-    r"""(?:"[^"\n:]{0,128}:[^"\n]*"|'[^'\n:]{0,128}:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]{1,128}:[^ \t\r\n\f\v"'\\;&|]+)""")
+    r"""(?<![^ \t\r\n\f\v"'\\;&|(])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))"""
+    r"""(?:"[^"\n:]*:[^"\n]*"|'[^'\n:]*:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]+:[^ \t\r\n\f\v"'\\;&|]+)""")
 _OPENSSL_PASS_RE = re.compile(r"""(?<![A-Za-z0-9_-])(-pass(?:in|out)?[ \t]{1,8}["']?pass:)[^ \t\r\n\f\v"';&|]+""")
 
 
@@ -242,11 +262,11 @@ _CLI_RES = (
 )
 
 
-def _mask_cli(s: str) -> str:
+def _cli_spans(s: str, add) -> None:
     for hints, rx in _CLI_RES:
         if any(h in s for h in hints):
-            s = rx.sub(lambda m: m.group(1) + REDACTED, s)
-    return s
+            for m in rx.finditer(s):
+                add((m.end(1), m.end()))
 
 
 # ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ------------------------
@@ -279,11 +299,10 @@ def _yaml_value_end(s: str, start: int, indent: int) -> int:
     return end
 
 
-def _mask_yaml(s: str) -> str:
+def _yaml_spans(s: str, add) -> None:
     if "\n" not in s or ":" not in s:
-        return s
+        return
     for rx, indent_group in ((_YAML_NAME_RE, 3), (_YAML_BLOCK_KEY_RE, 1)):
-        out: list[str] = []
         last = 0
         for m in rx.finditer(s):
             if m.start() < last or not is_sensitive_key(m.group(2)):
@@ -291,13 +310,8 @@ def _mask_yaml(s: str) -> str:
             start = m.end()
             end = _yaml_value_end(s, start, len(m.group(indent_group)))
             if end > start:
-                out.append(s[last:start])
-                out.append(REDACTED)
+                add((start, end))
                 last = end
-        if out:
-            out.append(s[last:])
-            s = "".join(out)
-    return s
 
 
 def _continuation(s: str, pos: int, end: int, value_re: re.Pattern[str]) -> int:
@@ -334,11 +348,17 @@ def _continuation(s: str, pos: int, end: int, value_re: re.Pattern[str]) -> int:
     return -1 if v is None else v.end()
 
 
-def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bool) -> str:
-    """Mask the value that follows every sensitive `NAME<sep>` match of `sep_re`: one forward pass with a cursor (no
+def _open_quote_value(s: str, pos: int, value_re: re.Pattern[str]) -> re.Match[str] | None:
+    """The value of a name whose opening quote never closes on its line (`password="abc def`, a truncated log line): the quote is
+    noise and the bare value after it is the secret. None when `s[pos]` is no quote."""
+    skip = 2 if s.startswith('\\"', pos) else 1 if s[pos:pos + 1] in ('"', "'") else 0
+    return value_re.match(s, pos + skip) if skip else None
+
+
+def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bool, add) -> None:
+    """Report the value that follows every sensitive `NAME<sep>` match of `sep_re`: one forward pass with a cursor (no
     recursion, no rescans). A benign name only moves the cursor past its separator, so what looks like its value is scanned too."""
-    out: list[str] = []
-    pos = last = 0
+    pos = key_fail = 0
     while (m := sep_re.search(s, pos)) is not None:
         pos = m.end()
         if eq_sep and "=" not in m.group(2) and s.startswith("//", pos):
@@ -347,55 +367,120 @@ def _scan(s: str, sep_re: re.Pattern[str], value_re: re.Pattern[str], eq_sep: bo
         hit = _name_hit(name, eq_sep and "=" in m.group(2))
         if not hit and not _key_name(name):
             continue
+        start = pos
         if hit:
-            if (v := value_re.match(s, pos)) is None:
+            if (v := value_re.match(s, pos)) is None and (v := _open_quote_value(s, pos, value_re)) is None:
                 continue
-            end = v.end()
-        elif (end := _key_value_end(s, pos)) < 0:
-            continue
-        if s.startswith(REDACTED, pos) and end > pos + len(REDACTED) and s[pos + len(REDACTED)] not in _ALNUM:
-            end = pos + len(REDACTED)  # a value an earlier pass already masked (`[REDACTED],`): idempotent, the comma stays
+            start, end = v.start(), v.end()
+            if s.startswith(REDACTED, start) and end > start + len(REDACTED) and s[start + len(REDACTED)] not in _ALNUM:
+                end = start + len(REDACTED)  # an already-masked value (`[REDACTED],x`) ends where the mask does, like a closing quote
+        else:
+            if pos < key_fail:
+                continue  # inside a token run whose tail was already found not to look like a credential
+            end, run_end = _key_value_end(s, pos)
+            if end < 0:
+                key_fail = max(key_fail, run_end)
+                continue
         while (more := _continuation(s, pos, end, value_re)) >= 0:
             end = more
-        out.append(s[last:pos])
-        out.append(REDACTED)
-        last = pos = end
-    if not out:
-        return s
-    out.append(s[last:])
-    return "".join(out)
+        add((start, end))
+        pos = end
 
 
-def _pair(m: re.Match[str]) -> str:
-    v = m.group("v")
-    if not _credential_pair(m.group("name"), v[1:-1]):
-        return m.group(0)
-    return f"{m.group(1)}{v[0]}{REDACTED}{v[0]}"
+def _pair_spans(s: str, add) -> None:
+    for m in _PAIR_RE.finditer(s):
+        v = m.group("v")
+        if len(v) > 2 and _credential_pair(m.group("name"), v[1:-1]):
+            add((m.start("v") + 1, m.end("v") - 1))
+    for m in _ESC_PAIR_RE.finditer(s):
+        if m.end(1) < m.start(3) and is_sensitive_key(m.group("name")):
+            add((m.end(1), m.start(3)))
 
 
-def _esc_pair(m: re.Match[str]) -> str:
-    return f"{m.group(1)}{REDACTED}{m.group(3)}" if is_sensitive_key(m.group("name")) else m.group(0)
+def _header_end(s: str, value_start: int) -> int:
+    """End of the header value that begins at `value_start` (the first non-blank, non-quote character): the end of the line, or an
+    enclosing quote. A quote right after `=` opens a quoted cookie value (`session="..."`) and is skipped to its closing quote; a
+    quote that never closes on the line ends the value. Each character is read once."""
+    i = value_start + 1
+    while (m := _HEADER_STOP_RE.search(s, i)) is not None:
+        j = m.start()
+        c = s[j]
+        if c == "\r" or c == "\n" or s[j - 1] != "=":
+            return j
+        close = _HEADER_CLOSE_RES[c].search(s, j + 1)
+        if close is None or s[close.start()] != c:
+            return j
+        i = close.end()
+    return len(s)
+
+
+def _header_spans(s: str, add) -> None:
+    pos = 0
+    while (m := _HEADER_RE.search(s, pos)) is not None:
+        pos = _header_end(s, m.end())
+        add((m.end(), pos))
+
+
+def _spans(s: str) -> list[tuple[int, int]]:
+    """Every `(start, end)` of `s` that must disappear. EVERY detector reads the original text and only reports: nothing is rewritten
+    while detecting, so no detector can measure a value another detector has already shortened, and the union below does not depend
+    on the order in which they run."""
+    spans: list[tuple[int, int]] = []
+    add = spans.append
+    for m in _PEM_RE.finditer(s):
+        add((m.start(), m.end()))
+    for rx in (_BEARER_RE, _BASIC_RE):
+        for m in rx.finditer(s):
+            add((m.end(1), m.end()))
+    for m in _USERINFO_RE.finditer(s):
+        add((m.end(1), m.end() - 1))  # the '@' stays
+    _header_spans(s, add)
+    _cli_spans(s, add)
+    _yaml_spans(s, add)
+    _scan(s, _NAME_SEP_RE, _VALUE_RE, True, add)
+    _scan(s, _FLAG_SEP_RE, _FLAG_VALUE_RE, False, add)
+    for rx in (_JWT_RE, *_TOKEN_RES):
+        for m in rx.finditer(s):
+            add((m.start(), m.end()))
+    _pair_spans(s, add)
+    return spans
+
+
+def redact_spans(s: str) -> list[tuple[int, int]]:
+    """The disjoint, ascending `(start, end)` ranges of `s` that `redact_text` replaces: the union of every detector's spans, where
+    overlapping or touching spans become one range."""
+    if not isinstance(s, str) or len(s) < 6:
+        return []
+    spans = _spans(s)
+    if not spans:
+        return []
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    cur_start, cur_end = spans[0]
+    for start, end in spans:
+        if start > cur_end:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+        elif end > cur_end:
+            cur_end = end
+    merged.append((cur_start, cur_end))
+    return merged
 
 
 def redact_text(s: str) -> str:
-    """Replace every secret-looking span of `s` with `[REDACTED]`; everything else is returned unchanged."""
-    if not isinstance(s, str) or len(s) < 6:
+    """Replace every secret-looking span of `s` with `[REDACTED]`; everything else is returned unchanged. Overlapping or touching
+    spans of different detectors become ONE `[REDACTED]`."""
+    merged = redact_spans(s)
+    if not merged:
         return s
-    s = _PEM_RE.sub(REDACTED, s)
-    s = _BEARER_RE.sub(lambda m: m.group(1) + REDACTED, s)
-    s = _BASIC_RE.sub(lambda m: m.group(1) + REDACTED, s)
-    s = _USERINFO_RE.sub(lambda m: f"{m.group(1)}{REDACTED}@", s)
-    s = _HEADER_RE.sub(lambda m: m.group(1) + REDACTED, s)
-    s = _mask_yaml(_mask_cli(s))
-    s = _scan(s, _NAME_SEP_RE, _VALUE_RE, True)
-    s = _scan(s, _FLAG_SEP_RE, _FLAG_VALUE_RE, False)
-    # Token shapes run AFTER the name passes: a sensitive NAME owns its whole value up to the original boundary
-    # (`SECRET=ghp_x,second`), so a shape may not shrink that value to `[REDACTED]` before the name pass has measured it.
-    s = _JWT_RE.sub(REDACTED, s)
-    for rx in _TOKEN_RES:
-        s = rx.sub(REDACTED, s)
-    s = _PAIR_RE.sub(_pair, s)
-    return _ESC_PAIR_RE.sub(_esc_pair, s)
+    out: list[str] = []
+    last = 0
+    for start, end in merged:
+        out.append(s[last:start])
+        out.append(REDACTED)
+        last = end
+    out.append(s[last:])
+    return "".join(out)
 
 
 def _walk(value, level: int, max_depth: int, sensitive: bool):

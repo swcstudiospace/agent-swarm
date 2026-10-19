@@ -148,10 +148,19 @@ const TOKENS = [
 const BEARER = /(?<![A-Za-z0-9])([Bb]earer[ \t\r\n\f\v]{1,16})[A-Za-z0-9._~+/=-]{16,}/g;
 /** `Authorization: Basic <base64>` (and Proxy-Authorization); a bare "basic <word>" in prose is not touched. */
 const BASIC = /(?<![A-Za-z0-9])((?:Proxy-)?Authorization[ \t]{0,3}[:=][ \t]{0,3}["']?Basic[ \t]{1,16})[A-Za-z0-9+/_-]{4,}={0,2}/gi;
-/** Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header: the rest of the line up to a quote is the credential (Bearer/Basic keep their scheme). */
-const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]{0,3}:(?![ \t]{0,3}(?:Bearer|Basic)\b)[ \t]{0,3})[^ \t\r\n\f\v"'][^\r\n"']{0,511}/gi;
-/** scheme://user:password@host: the password runs to the LAST '@' before the first '/' or whitespace. */
-const USERINFO = /((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/ \t\r\n\f\v@:]{0,256}:[^/ \t\r\n\f\v]{0,256}@/g;
+/**
+ * Any other `Cookie:` / `Set-Cookie:` / `Authorization:` header: the rest of the line is the credential (Bearer/Basic keep their scheme).
+ * The regex matches the lead only; `headerEnd` scans the value to its TRUE end (line end, or an enclosing quote that does not open a quoted
+ * cookie value): never a length cap, a cap would leave the tail of a long session token readable.
+ */
+const HEADER = /(?<![A-Za-z0-9_-])((?:Set-|Proxy-)?(?:Cookie|Authorization)[ \t]*:(?![ \t]*(?:Bearer|Basic)\b)[ \t]*)(?=[^ \t\r\n\f\v"'])/gi;
+const HEADER_STOP = /[\r\n"']/g;
+const HEADER_CLOSE: Record<string, RegExp> = { '"': /[\r\n"]/g, "'": /[\r\n']/g };
+/**
+ * scheme://user:password@host: the password runs to the LAST '@' before the first '/' or whitespace. Neither part is length-capped: a scan
+ * stops at the next '/' (every `://` ends the previous scan), so the scans of different schemes never overlap.
+ */
+const USERINFO = /((?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^/ \t\r\n\f\v@:]*:[^/ \t\r\n\f\v]*@/g;
 // The loops below are written unrolled (`[^x]*(?:\\(?!")[^x]*)*`, not `(?:[^x]|\\(?!"))*`): same language as the Python
 // patterns, but a megabyte-long value no longer exhausts the regex engine's backtrack stack (which skips the match, i.e. leaks).
 const VALUE = String.raw`(\\"[^"\\\n]*(?:\\(?!")[^"\\\n]*)*\\"|"[^"\n]*"|'[^'\n]*'|(?=[^ \t\r\n\f\v&;"'\\]|\\(?!"))[^ \t\r\n\f\v&;"'\\]*(?:\\(?!")[^ \t\r\n\f\v&;"'\\]*)*)`;
@@ -237,8 +246,8 @@ const VENDOR_KEY_SKIP = words(
   "cache sort idempotency partition primary foreign public lookup group shard unique index hash object route routing dedupe dedup lock message",
 );
 const LONG_SECRET = /^[A-Za-z0-9_+\/=~.-]{20,}$/;
-/** The value of a `*_key` name inside running text: one token of at most 160 characters, optionally quoted. */
-const KEY_VALUE = /(\\?["']?)([A-Za-z0-9_+\/=~.-]{20,160})(?![A-Za-z0-9_+\/=~.-])/y;
+/** The value of a `*_key` name inside running text: the WHOLE token (never length-capped), optionally quoted. */
+const KEY_VALUE = /(\\?["']?)([A-Za-z0-9_+\/=~.-]{20,})/y;
 const KEY_NAMES = new Map<string, boolean>();
 function isKeyName(name: string): boolean {
   let hit = KEY_NAMES.get(name);
@@ -260,21 +269,26 @@ function isLongSecret(value: string): boolean {
 }
 /** A sensitive name, or a `*_key` name with a credential-shaped string value (twin of `_credential_pair`). */
 const isCredentialPair = (name: string, value: string): boolean => isSensitiveKey(name) || (isKeyName(name) && isLongSecret(value));
-/** End of the credential-shaped token (and its closing quote) that starts at s[pos], or -1. */
-function keyValueEnd(s: string, pos: number): number {
+/**
+ * [end of the credential-shaped token (and its closing quote) that starts at s[pos], or -1; end of the token run that was checked, or 0].
+ * A failed check fails for every later start inside the same run: a suffix has no more character classes.
+ */
+function keyValueEnd(s: string, pos: number): [number, number] {
   const m = stickyAt(KEY_VALUE, s, pos);
-  if (m === null || !isLongSecret(m[2]!)) return -1;
-  const end = pos + m[0].length;
+  if (m === null) return [-1, 0];
+  const runEnd = pos + m[0].length;
+  if (!isLongSecret(m[2]!)) return [-1, runEnd];
   const q = m[1]!;
-  return q !== "" && s.startsWith(q, end) ? end + q.length : end;
+  return [q !== "" && s.startsWith(q, runEnd) ? runEnd + q.length : runEnd, runEnd];
 }
 
 // ---- command-line credentials (twins of the `_CLI_*` helpers in swarm/redact.py; explicit ASCII whitespace classes: JS and Python `\s` differ) ----
 const CLI_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|[^ \t\r\n\f\v"'\\;&|]+)`;
 /** `curl -u user:pass`, `--user user:pass`, `--proxy-user a:b` (a docker `-u 1000:1000` uid:gid pair is not a credential). */
 const USER_PASS_FLAG = new RegExp(
-  String.raw`(?<![A-Za-z0-9_-])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))` +
-    String.raw`(?:"[^"\n:]{0,128}:[^"\n]*"|'[^'\n:]{0,128}:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]{1,128}:[^ \t\r\n\f\v"'\\;&|]+)`,
+  // the flag must start a shell word: a flag glued to a previous word's characters (`x=-u=-u=...`) cannot start inside another candidate's user token
+  String.raw`(?<![^ \t\r\n\f\v"'\\;&|(])((?:-u|--user|--proxy-user)(?:[ \t]{1,8}|=))(?![0-9]{1,10}:[0-9]{1,10}(?:[ \t\r\n\f\v"';&|]|$))` +
+    String.raw`(?:"[^"\n:]*:[^"\n]*"|'[^'\n:]*:[^'\n]*'|[^ \t\r\n\f\v:"'\\;&|]+:[^ \t\r\n\f\v"'\\;&|]+)`,
   "g",
 );
 const OPENSSL_PASS = /(?<![A-Za-z0-9_-])(-pass(?:in|out)?[ \t]{1,8}["']?pass:)[^ \t\r\n\f\v"';&|]+/g;
@@ -308,11 +322,11 @@ const CLI_RES: ReadonlyArray<readonly [readonly string[], RegExp]> = [
   [["sqlcmd", "bcp"], cliRe("sqlcmd|bcp", "P")],
   [["ssh-keygen"], cliRe("ssh-keygen", "N")],
 ];
-function maskCli(s: string): string {
+function cliSpans(s: string, spans: number[]): void {
   for (const [hints, rx] of CLI_RES) {
-    if (hints.some((h) => s.includes(h))) s = s.replace(rx, (_m, lead: string) => lead + REDACTED);
+    if (!hints.some((h) => s.includes(h))) continue;
+    for (const m of s.matchAll(rx)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length);
   }
-  return s;
 }
 
 // ---- YAML: `- name: DB_PASSWORD` / `value: x` pairs (Kubernetes env) and block scalars (`password: |`) ----
@@ -355,10 +369,9 @@ function yamlValueEnd(s: string, start: number, indent: number): number {
   }
   return end;
 }
-function maskYaml(s: string): string {
-  if (!s.includes("\n") || !s.includes(":")) return s;
+function yamlSpans(s: string, spans: number[]): void {
+  if (!s.includes("\n") || !s.includes(":")) return;
   for (const [rx, indentGroup] of [[YAML_NAME, 3], [YAML_BLOCK_KEY, 1]] as const) {
-    const out: string[] = [];
     let last = 0;
     for (const m of s.matchAll(rx)) {
       const at = m.index as number;
@@ -366,22 +379,24 @@ function maskYaml(s: string): string {
       const start = at + m[0].length;
       const end = yamlValueEnd(s, start, m[indentGroup]!.length);
       if (end > start) {
-        out.push(s.slice(last, start), REDACTED);
+        spans.push(start, end);
         last = end;
       }
     }
-    if (out.length > 0) {
-      out.push(s.slice(last));
-      s = out.join("");
-    }
   }
-  return s;
 }
 
-/** Mask the value that follows every sensitive `NAME<sep>` match of `sep`: one forward pass with a cursor (no recursion, no rescans). */
-function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean): string {
-  const out: string[] = [];
-  let last = 0;
+/** `valueAt` at the bare value after an opening quote that never closes on its line (`password="abc def`, a truncated log line): the quote is noise. */
+function openQuoteValue(s: string, pos: number, valueAt: RegExp): [number, number] | null {
+  const skip = s.startsWith('\\"', pos) ? 2 : s.charAt(pos) === '"' || s.charAt(pos) === "'" ? 1 : 0;
+  if (skip === 0) return null;
+  const v = stickyAt(valueAt, s, pos + skip);
+  return v === null ? null : [pos + skip, pos + skip + v[0].length];
+}
+
+/** Report the value that follows every sensitive `NAME<sep>` match of `sep`: one forward pass with a cursor (no recursion, no rescans). */
+function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean, spans: number[]): void {
+  let keyFail = 0;
   sep.lastIndex = 0;
   for (let m = sep.exec(s); m !== null; m = sep.exec(s)) {
     const pos = sep.lastIndex;
@@ -389,24 +404,62 @@ function scan(s: string, sep: RegExp, valueAt: RegExp, eqSep: boolean): string {
     const name = m[1]!;
     const hit = isNameHit(name, eqSep && m[2]!.includes("="));
     if (!hit && !isKeyName(name)) continue;
+    let start = pos;
     let end: number;
     if (hit) {
       const v = stickyAt(valueAt, s, pos);
-      if (v === null) continue;
-      end = pos + v[0].length;
+      if (v !== null) {
+        end = pos + v[0].length;
+      } else {
+        const open = openQuoteValue(s, pos, valueAt);
+        if (open === null) continue;
+        [start, end] = open;
+      }
+      // an already-masked value (`[REDACTED],x`) ends where the mask does, like a closing quote
+      if (s.startsWith(REDACTED, start) && end > start + REDACTED.length && !/[A-Za-z0-9]/.test(s.charAt(start + REDACTED.length))) end = start + REDACTED.length;
     } else {
-      end = keyValueEnd(s, pos);
-      if (end < 0) continue;
+      if (pos < keyFail) continue; // inside a token run whose tail was already found not to look like a credential
+      const [keyEnd, runEnd] = keyValueEnd(s, pos);
+      if (keyEnd < 0) {
+        keyFail = Math.max(keyFail, runEnd);
+        continue;
+      }
+      end = keyEnd;
     }
-    // a value an earlier pass already masked (`[REDACTED],`): idempotent, the comma stays
-    if (s.startsWith(REDACTED, pos) && end > pos + REDACTED.length && !/[A-Za-z0-9]/.test(s.charAt(pos + REDACTED.length))) end = pos + REDACTED.length;
     for (let more = continuation(s, pos, end, valueAt); more >= 0; more = continuation(s, pos, end, valueAt)) end = more;
-    out.push(s.slice(last, pos), REDACTED);
-    last = sep.lastIndex = end;
+    spans.push(start, end);
+    sep.lastIndex = end;
   }
-  if (out.length === 0) return s;
-  out.push(s.slice(last));
-  return out.join("");
+}
+
+/** End of the header value that begins at `valueStart`: the end of the line, or an enclosing quote. A quote right after `=` opens a quoted cookie value and is skipped to its closing quote; a quote that never closes on the line ends the value. */
+function headerEnd(s: string, valueStart: number): number {
+  let i = valueStart + 1;
+  for (;;) {
+    HEADER_STOP.lastIndex = i;
+    const m = HEADER_STOP.exec(s);
+    if (m === null) return s.length;
+    const j = m.index;
+    const c = m[0];
+    if (c === "\r" || c === "\n" || s.charAt(j - 1) !== "=") return j;
+    const close = HEADER_CLOSE[c]!;
+    close.lastIndex = j + 1;
+    const k = close.exec(s);
+    if (k === null || k[0] !== c) return j;
+    i = k.index + 1;
+  }
+}
+
+function headerSpans(s: string, spans: number[]): void {
+  let pos = 0;
+  for (;;) {
+    HEADER.lastIndex = pos;
+    const m = HEADER.exec(s);
+    if (m === null) return;
+    const start = m.index + m[0].length;
+    pos = headerEnd(s, start);
+    spans.push(start, pos);
+  }
 }
 
 /** "name": "value", 'name': 'value', "name": 'value' (JSON, Python repr, JS). */
@@ -414,28 +467,94 @@ const PAIR = /(?<lead>(?<q>["'])(?<name>[^"'\\\n]{1,80})\k<q>[ \t]{0,8}:[ \t]{0,
 /** JSON that was serialised again into a string: {\"password\": \"x\"} */
 const ESC_PAIR = /(?<lead>\\"(?<name>[^"'\\\n]{1,80})\\"[ \t]{0,8}:[ \t]{0,8}\\")[^"\\]*(?:\\(?!")[^"\\]*)*(?<close>\\")/g;
 
-/** TS port of `swarm/redact.py redact_text`: every secret-looking span becomes `[REDACTED]`. */
+/** "name": "value" pairs with a sensitive name (and `*_key` names with a credential-shaped value): the string between the quotes. */
+function pairSpans(s: string, spans: number[]): void {
+  for (const m of s.matchAll(PAIR)) {
+    const g = m.groups as { lead: string; name: string; v: string };
+    if (g.v.length > 2 && isCredentialPair(g.name, g.v.slice(1, -1))) {
+      const at = (m.index as number) + g.lead.length;
+      spans.push(at + 1, at + g.v.length - 1);
+    }
+  }
+  for (const m of s.matchAll(ESC_PAIR)) {
+    const g = m.groups as { lead: string; name: string; close: string };
+    const start = (m.index as number) + g.lead.length;
+    const end = (m.index as number) + m[0].length - g.close.length;
+    if (start < end && isSensitiveKey(g.name)) spans.push(start, end);
+  }
+}
+
+/**
+ * Every [start, end) of `s` that must disappear, as a flat list. EVERY detector reads the original text and only reports: nothing is
+ * rewritten while detecting, so no detector can measure a value another detector has already shortened, and the union in `redactText`
+ * does not depend on the order in which they run.
+ */
+function collectSpans(s: string): number[] {
+  const spans: number[] = [];
+  for (const m of s.matchAll(PEM)) spans.push(m.index as number, (m.index as number) + m[0].length);
+  for (const rx of [BEARER, BASIC]) {
+    for (const m of s.matchAll(rx)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length);
+  }
+  for (const m of s.matchAll(USERINFO)) spans.push((m.index as number) + m[1]!.length, (m.index as number) + m[0].length - 1); // the '@' stays
+  headerSpans(s, spans);
+  cliSpans(s, spans);
+  yamlSpans(s, spans);
+  scan(s, NAME_SEP, VALUE_AT, true, spans);
+  scan(s, FLAG_SEP, FLAG_VALUE_AT, false, spans);
+  for (const rx of [JWT, ...TOKENS]) {
+    for (const m of s.matchAll(rx)) spans.push(m.index as number, (m.index as number) + m[0].length);
+  }
+  pairSpans(s, spans);
+  return spans;
+}
+
+/** Disjoint, ascending `[start, end)` ranges as a flat list (`[s0, e0, s1, e1, ...]`): the union of every detector's spans, overlapping or touching spans merged. */
+function unionSpans(text: string): number[] {
+  if (text.length < 6) return [];
+  const spans = collectSpans(text);
+  if (spans.length === 0) return spans;
+  // union by coverage count: +1 at every start, -1 at every end, then one linear walk (no sort)
+  const cover = new Int32Array(text.length + 1);
+  for (let i = 0; i < spans.length; i += 2) {
+    cover[spans[i]!]!++;
+    cover[spans[i + 1]!]!--;
+  }
+  const merged: number[] = [];
+  let depth = 0;
+  let open = -1;
+  for (let i = 0; i < text.length; i++) {
+    depth += cover[i]!;
+    if (depth > 0) {
+      if (open < 0) open = i;
+    } else if (open >= 0) {
+      merged.push(open, i);
+      open = -1;
+    }
+  }
+  if (open >= 0) merged.push(open, text.length);
+  return merged;
+}
+
+/** TS twin of `swarm/redact.py redact_spans`: the disjoint, ascending `[start, end)` ranges `redactText` replaces (UTF-16 offsets). */
+export function redactSpans(text: string): Array<[number, number]> {
+  const flat = unionSpans(text);
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i < flat.length; i += 2) out.push([flat[i]!, flat[i + 1]!]);
+  return out;
+}
+
+/** TS port of `swarm/redact.py redact_text`: every secret-looking span becomes `[REDACTED]`; overlapping or touching spans of different detectors become ONE `[REDACTED]`. */
 export function redactText(text: string): string {
-  if (text.length < 6) return text;
-  let s = text.replace(PEM, REDACTED);
-  s = s.replace(BEARER, (_m, lead: string) => lead + REDACTED);
-  s = s.replace(BASIC, (_m, lead: string) => lead + REDACTED);
-  s = s.replace(USERINFO, (_m, scheme: string) => `${scheme}${REDACTED}@`);
-  s = s.replace(HEADER, (_m, lead: string) => lead + REDACTED);
-  s = maskYaml(maskCli(s));
-  s = scan(s, NAME_SEP, VALUE_AT, true);
-  s = scan(s, FLAG_SEP, FLAG_VALUE_AT, false);
-  // Token shapes run AFTER the name passes: a sensitive NAME owns its whole value up to the original boundary (`SECRET=ghp_x,second`).
-  s = s.replace(JWT, REDACTED);
-  for (const rx of TOKENS) s = s.replace(rx, REDACTED);
-  s = s.replace(PAIR, (...args) => {
-    const g = args[args.length - 1] as { lead: string; name: string; v: string };
-    return isCredentialPair(g.name, g.v.slice(1, -1)) ? `${g.lead}${g.v[0]}${REDACTED}${g.v[0]}` : (args[0] as string);
-  });
-  return s.replace(ESC_PAIR, (...args) => {
-    const g = args[args.length - 1] as { lead: string; name: string; close: string };
-    return isSensitiveKey(g.name) ? `${g.lead}${REDACTED}${g.close}` : (args[0] as string);
-  });
+  const merged = unionSpans(text);
+  if (merged.length === 0) return text;
+  const out: string[] = [];
+  let last = 0;
+  for (let i = 0; i < merged.length; i += 2) {
+    out.push(text.slice(last, merged[i]), REDACTED);
+    last = merged[i + 1]!;
+  }
+  out.push(text.slice(last));
+  return out.join("");
 }
 
 /** Controls, line separators and bidi overrides (display spoofing), replaced by a space or dropped. */
