@@ -663,6 +663,37 @@ def test_unterminated_and_escaped_quoted_command_values():
     assert redact_text('curl -u "admin:my pass" https://h') == f"curl -u {REDACTED} https://h"
 
 
+_PUNCT_PASSWORDS = ["!!!", "***", "...", "---", "()", "<>", "$$", "#1", "+++", "%%", "~~", "{}", "[]", "?!", "a*b", "** **"]
+_PUNCT_FLAGS = [("mysql -u root ", "p", " db"), ("mariadb ", "p", " -e x"), ("sshpass ", "p", " ssh host"), ("mongosh --host h ", "p", " x"),
+                ("docker login -u me ", "p", " reg.io"), ("helm registry login reg.io ", "p", ""), ("redis-cli ", "a", " ping"),
+                ("sqlcmd -S h ", "P", " -Q q"), ("ssh-keygen ", "N", " -f k")]
+
+
+@pytest.mark.parametrize("password", _PUNCT_PASSWORDS)
+@pytest.mark.parametrize("command, flag, after", _PUNCT_FLAGS)
+def test_a_punctuation_only_command_password_is_masked_exactly_in_every_attached_form(command, flag, after, password):
+    """GL7: `mysql -p'!!!'` and `sshpass -p'***' ssh host` kept the password (and masked `ssh`): a quoted attached value is a value whatever it holds,
+    an unquoted one is unless it is only the closers of Markdown/prose that end the word; the span is the value, the quotes inside it."""
+    closers = set("`\"')]}>*_.,;:")
+    for quote in ("'", '"'):
+        out = redact_text(f"{command}-{flag}{quote}{password}{quote}{after}")
+        assert out == f"{command}-{flag}{REDACTED}{after}", out
+    if " " not in password and not set(password) <= closers:  # only a quoted value holds a blank; `-p()` is `(-p)` closing, so only a non-closer is read unquoted
+        out = redact_text(f"{command}-{flag}{password}{after}")
+        assert out == f"{command}-{flag}{REDACTED}{after}", out
+    if command.split()[0] not in ("mysql", "mariadb"):  # a bare `-p` of mysql is a prompt; the others take the next word
+        assert redact_text(f"{command}-{flag} '{password}'{after}") == f"{command}-{flag} {REDACTED}{after}"
+        if " " not in password and password[0] != "-":  # a following word that starts with `-` is the next option
+            assert redact_text(f"{command}-{flag} {password}{after}") == f"{command}-{flag} {REDACTED}{after}"
+
+
+def test_a_flag_word_in_prose_is_not_a_password_but_its_glued_punctuation_is():
+    prose = "run `mysql -p` now; use (mysql -p) now; **mysql -p** then; \"mysql -p\" ok; mysql \"-p\" and \"-p\" ok; '-p', '-u' for mysql; mysql **-p**, ok"
+    assert redact_text(prose) == prose
+    assert redact_text("mysql -p!!! db") == f"mysql -p{REDACTED} db"
+    assert redact_text("sshpass -p'&x' ssh host; sshpass -p\"&\" ssh h") == f"sshpass -p{REDACTED} ssh host; sshpass -p{REDACTED} ssh h"
+
+
 def test_a_credential_value_that_swallowed_the_next_sensitive_name_still_masks_that_names_value():
     assert redact_text('run --token \\"--password hunter2') == f'run --token \\"{REDACTED} {REDACTED}'
     assert redact_text('--api-key = {--password=\\"user:hunter2\\"') == f"--api-key {REDACTED} {REDACTED}"

@@ -306,7 +306,7 @@ const isAlnumDash = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && 
 const isNameChar = (c: number): boolean => isAlnumDash(c) || c === 95 || c === 46;
 /** A character of a command name: no `_` (no command name has one; `__mysql` is emphasis). */
 const isCommandChar = (c: number): boolean => isAlnumDash(c) || c === 46;
-const CLI_TRAIL = "`\"')]}>*_~,.:!?"; // closers that may follow a bare option word (`-p`)
+const CLI_CLOSERS = "`\"')]}>*_.,;:"; // Markdown/prose closers: a word `-p` followed by only these is a flag in prose, not `-pPASSWORD`
 const CLI_MYSQL = 1;
 const CLI_LOGIN = 2;
 const CLI_REDIS = 4;
@@ -352,15 +352,34 @@ function hasNonBlank(s: string, from: number, to: number): boolean {
   }
   return false;
 }
-/** Whether `s[from, to)` holds a character that is not one of the closers in `CLI_TRAIL`. */
-function hasNonTrail(s: string, from: number, to: number): boolean {
-  for (let i = from; i < to; i++) if (!CLI_TRAIL.includes(s.charAt(i))) return true;
+/** Whether `s[from, to)` holds a character that is not one of the closers in `CLI_CLOSERS`. */
+function hasNonCloser(s: string, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) if (!CLI_CLOSERS.includes(s.charAt(i))) return true;
   return false;
 }
 /** Whether `s[from, to)` holds `ch` (a bounded scan: `indexOf` would read past `to`). */
 function hasChar(s: string, ch: string, from: number, to: number): boolean {
   for (let i = from; i < to; i++) if (s.charAt(i) === ch) return true;
   return false;
+}
+/**
+ * Whether the flag at s[at, at + 2) (`-p`) of the word s[start, end) carries its value attached: `-pVALUE`, `-p'VALUE'`. A quote that opens
+ * the value (one the word's own prefix did not open: `"-p"` is a closer) makes everything after it the value, even when it is only
+ * punctuation; an unquoted value is one unless it is made only of closers (`-p`, `(-p)`, `**-p**`) that end the word.
+ */
+function cliAttached(s: string, start: number, at: number, end: number): boolean {
+  const v = at + 2;
+  if (v >= end) return false;
+  const c = s.charAt(v);
+  let quote = 0; // the length of the quote that opens the value
+  if (c === '"' || c === "'") quote = 1;
+  else if (c === "\\" && (s.charAt(v + 1) === '"' || s.charAt(v + 1) === "'")) quote = 2;
+  if (quote !== 0 && !hasChar(s, s.charAt(v + quote - 1), start, at)) {
+    // a lone quote opens a value only where `;&|` ended the word (`-p"&x"`): `"mysql -p" ok` is prose
+    const next = s.charCodeAt(end);
+    return end - v > quote || next === 59 || next === 38 || next === 124;
+  }
+  return hasNonCloser(s, v, end);
 }
 
 /** End of the run of characters from `start` that holds no blank, `;&|` or quote (`CLI_UNQUOTED`, as a loop: no match object). */
@@ -495,7 +514,7 @@ function cliCommandSpans(s: string, spans: number[]): void {
       pending = 0;
       const kinds = active !== 0 ? active & (CLI_FLAG_KINDS[s.charAt(at + 1)] ?? 0) : 0;
       if (kinds !== 0) {
-        if (hasNonTrail(s, at + 2, end)) {
+        if (cliAttached(s, start, at, end)) {
           // `-pSECRET`: the value touches the flag
           spans.push(at + 2, cliValueEnd(s, at + 2));
           continue;

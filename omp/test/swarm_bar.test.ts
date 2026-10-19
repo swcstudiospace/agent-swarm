@@ -758,6 +758,39 @@ describe("sanitization", () => {
     expect(redactText("mysql -u root\nls -pSECRETX")).toBe("mysql -u root\nls -pSECRETX");
   });
 
+  const PUNCT_PASSWORDS = ["!!!", "***", "...", "---", "()", "<>", "$$", "#1", "+++", "%%", "~~", "{}", "[]", "?!", "a*b", "** **"];
+  const PUNCT_FLAGS: Array<[string, string, string]> = [
+    ["mysql -u root ", "p", " db"],
+    ["mariadb ", "p", " -e x"],
+    ["sshpass ", "p", " ssh host"],
+    ["mongosh --host h ", "p", " x"],
+    ["docker login -u me ", "p", " reg.io"],
+    ["helm registry login reg.io ", "p", ""],
+    ["redis-cli ", "a", " ping"],
+    ["sqlcmd -S h ", "P", " -Q q"],
+    ["ssh-keygen ", "N", " -f k"],
+  ];
+  test("a punctuation-only command password is masked exactly in every attached and separate form (tests/test_redact.py's sweep)", () => {
+    const closers = new Set("`\"')]}>*_.,;:");
+    for (const [command, flag, after] of PUNCT_FLAGS) {
+      for (const password of PUNCT_PASSWORDS) {
+        for (const quote of ["'", '"']) expect(redactText(`${command}-${flag}${quote}${password}${quote}${after}`)).toBe(`${command}-${flag}[REDACTED]${after}`);
+        if (!password.includes(" ") && ![...password].every((c) => closers.has(c))) expect(redactText(`${command}-${flag}${password}${after}`)).toBe(`${command}-${flag}[REDACTED]${after}`);
+        if (!command.startsWith("mysql") && !command.startsWith("mariadb")) {
+          expect(redactText(`${command}-${flag} '${password}'${after}`)).toBe(`${command}-${flag} [REDACTED]${after}`);
+          if (!password.includes(" ") && !password.startsWith("-")) expect(redactText(`${command}-${flag} ${password}${after}`)).toBe(`${command}-${flag} [REDACTED]${after}`);
+        }
+      }
+    }
+  });
+
+  test("a flag word in prose is not a password but its glued punctuation is", () => {
+    const prose = "run `mysql -p` now; use (mysql -p) now; **mysql -p** then; \"mysql -p\" ok; mysql \"-p\" and \"-p\" ok; '-p', '-u' for mysql; mysql **-p**, ok";
+    expect(redactText(prose)).toBe(prose);
+    expect(redactText("mysql -p!!! db")).toBe("mysql -p[REDACTED] db");
+    expect(redactText("sshpass -p'&x' ssh host; sshpass -p\"&\" ssh h")).toBe("sshpass -p[REDACTED] ssh host; sshpass -p[REDACTED] ssh h");
+  });
+
   test("unterminated and escaped-quoted command values, and a value that swallowed the next sensitive name", () => {
     expect(redactText("sshpass -p 'abc def")).toBe("sshpass -p [REDACTED]");
     expect(redactText('docker login -p \\"abc def\\" reg')).toBe("docker login -p [REDACTED] reg");

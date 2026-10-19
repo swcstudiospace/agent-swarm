@@ -255,7 +255,7 @@ _CLI_OPTION_RE = re.compile(r"(?<![A-Za-z0-9-])(?:(?:--user|--proxy-user|-u)(=|(
 _CLI_CORE_RE = re.compile(r"[A-Za-z0-9_./-]+")
 _CLI_NOT_LEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-")
 _CLI_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-")  # no `_`: no command name has one, `__mysql` is emphasis
-_CLI_TRAIL = "`\"')]}>*_~,.:!?"  # closers that may follow a bare option word (`-p`)
+_CLI_CLOSERS = frozenset("`\"')]}>*_.,;:")  # Markdown/prose closers: a word `-p` followed by only these is a flag in prose, not `-pPASSWORD`
 # the commands whose flags are checked (kind bits), the first words of a two-word command, the flag letter of each kind
 _CLI_MYSQL, _CLI_LOGIN, _CLI_REDIS, _CLI_SQLCMD, _CLI_KEYGEN = 1, 2, 4, 8, 16
 _CLI_COMMANDS = {
@@ -266,6 +266,20 @@ _CLI_COMMANDS = {
 _CLI_TWO_WORD = {**dict.fromkeys(("docker", "podman", "buildah", "skopeo", "crane", "oras", "nerdctl", "az"), 1), "helm": 2}  # 1: `login`; 2: `registry login`
 _CLI_FLAG_KINDS = {"p": _CLI_MYSQL | _CLI_LOGIN, "a": _CLI_REDIS, "P": _CLI_SQLCMD, "N": _CLI_KEYGEN}
 _CLI_COMMAND_HINTS = ("mysql", "mariadb", "sshpass", "login", "mongo", "redis-cli", "sqlcmd", "bcp", "ssh-keygen")
+
+
+def _cli_attached(s: str, start: int, at: int, end: int) -> bool:
+    """Whether the flag at s[at:at + 2] (`-p`) of the word s[start:end] carries its value attached: `-pVALUE`, `-p'VALUE'`.
+    A quote that opens the value (one the word's own prefix did not open: `"-p"` is a closer) makes everything after it the value, even when it is
+    only punctuation; an unquoted value is one unless it is made only of closers (`-p`, `(-p)`, `**-p**`) that end the word."""
+    v = at + 2
+    if v >= end:
+        return False
+    c = s[v]
+    quote = c if c in ('"', "'") else s[v:v + 2] if c == "\\" and s[v + 1:v + 2] in ('"', "'") else ""
+    if quote and quote[-1] not in s[start:at]:
+        return end - v > len(quote) or s[end:end + 1] in (";", "&", "|")  # a lone quote opens a value only where `;&|` ended the word (`-p"&x"`): `"mysql -p" ok`
+    return any(ch not in _CLI_CLOSERS for ch in s[v:end])
 
 
 def _cli_value_end(s: str, start: int) -> int:
@@ -345,7 +359,7 @@ def _cli_command_spans(s: str, add) -> None:
             pending = 0
             kinds = active & _CLI_FLAG_KINDS.get(s[at + 1:at + 2], 0) if active else 0
             if kinds:
-                if s[at + 2:end].strip(_CLI_TRAIL):  # `-pSECRET`: the value touches the flag
+                if _cli_attached(s, start, at, end):  # `-pSECRET`: the value touches the flag
                     add((at + 2, _cli_value_end(s, at + 2)))
                     continue
                 if kinds != _CLI_MYSQL:  # a bare `-p` is a prompt for mysql, not for the others: the value is the next word

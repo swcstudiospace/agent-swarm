@@ -39,6 +39,13 @@ def emit(ev):
 
 starts = sum(1 for ln in open(LOG) if json.loads(ln)["ev"] == "start" and json.loads(ln)["tid"] == tid) if os.path.exists(LOG) else 0
 rec("start", n=starts + 1)
+barrier = c.get("barrier", 0)  # wait until N sessions of this run have started: they are then alive together, on any machine
+if barrier:
+    limit = time.time() + 30
+    while time.time() < limit:
+        if len({json.loads(ln)["tid"] for ln in open(LOG) if json.loads(ln)["ev"] == "start"}) >= barrier:
+            break
+        time.sleep(0.02)
 emit({"type": "session", "version": 3, "id": "fake-" + tid, "cwd": os.getcwd()})
 for tool in c.get("tools", []):
     emit({"type": "tool_execution_start", "toolName": tool["name"], "args": tool.get("args", {})})
@@ -187,7 +194,7 @@ def _runner():
 
 # ------------------------------------------------------------------------------------------ overlap, caps, refill
 def test_two_sessions_overlap(tmp_path):
-    rig = Rig(tmp_path, [_task("a"), _task("b")], {"*": {"sleep": 0.6}})
+    rig = Rig(tmp_path, [_task("a"), _task("b")], {"*": {"sleep": 0.6, "barrier": 2}})
     r = rig.run("--max-parallel", "2")
     assert r.returncode == 0, r.stdout + r.stderr
     (a,), (b,) = rig.spans()["T-a"], rig.spans()["T-b"]
@@ -903,7 +910,7 @@ def test_a_rate_limit_burst_halves_parallelism_once_and_recovery_clears_degraded
     marker is cleared (live.json and a `recovered` swarm.degraded event)."""
     tasks = [_task(f"t{i}", agent="A05" if i % 2 else "A06", cap="code.backend" if i % 2 else "code.frontend")
              for i in range(8)]
-    rig = Rig(tmp_path, tasks, {"*": {"fail_first": 1, "sleep": 0.5, "stderr": "HTTP 429 rate limit exceeded"}},
+    rig = Rig(tmp_path, tasks, {"*": {"fail_first": 1, "sleep": 0.5, "barrier": 8, "stderr": "HTTP 429 rate limit exceeded"}},
               SWARM_RATE_COOLDOWN_S="0", SWARM_RETRY_BASE_S="0.2")
     r = rig.run("--max-parallel", "8")
     assert r.returncode == 0, r.stdout + r.stderr
