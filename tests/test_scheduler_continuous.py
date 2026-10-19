@@ -744,8 +744,12 @@ def test_assignment_prompt_adds_a_compact_handover_per_dependency(tmp_path, monk
            "remaining": [f"step {i}" for i in range(9)], "blockers": ["waiting on schema"],
            "artifacts": [{"kind": "design.contract", "uri": "file://c.md", "digest": "sha256:" + "a" * 64}],
            "verification": {"status": "partial", "confidence": 0.5}}
-    fake = SimpleNamespace(handover_status=lambda tid, root=None: {"status": "ok" if tid == "T-up" else "stale"},
-                           latest_handover=lambda tid, root=None, to_agent=None: doc)
+
+    def inspect(tid, root=None, to_agent=None, **_kw):  # the real call: (status, document) for ONE file
+        status = {"status": "ok" if tid == "T-up" else "stale"}
+        return status, (doc if status["status"] == "ok" else None)
+
+    fake = SimpleNamespace(inspect_handover=inspect)
     monkeypatch.setitem(sys.modules, "swarm.handover", fake)
     task = store.get("T-down")
     prompt = mod.assignment_prompt(store, task, {"id": "A05", "slug": "a05-backend"}, tmp_path)
@@ -770,8 +774,7 @@ def test_assignment_prompt_without_a_handover_module_is_unchanged(tmp_path, monk
 
     without = body(mod.assignment_prompt(store, task, {"id": "A05", "slug": "a05-backend"}, tmp_path))
     assert "## Handover" not in without
-    empty = SimpleNamespace(handover_status=lambda tid, root=None: {"status": "missing"},
-                            latest_handover=lambda tid, root=None, to_agent=None: None)
+    empty = SimpleNamespace(inspect_handover=lambda tid, root=None, to_agent=None, **_kw: ({"status": "missing"}, None))
     monkeypatch.setitem(sys.modules, "swarm.handover", empty)
     assert body(mod.assignment_prompt(store, task, {"id": "A05", "slug": "a05-backend"}, tmp_path)) == without
 

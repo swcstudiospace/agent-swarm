@@ -216,7 +216,7 @@ def handover_section(task: dict, repo: Path) -> str:
             # one inspection decides and supplies the document: the dependency's plan (correlation), staleness and the
             # receiver's own handover first (a task can hand over to several receivers, A15 and A14 of one release), the
             # newest one as context when none is addressed to it: exactly what the shared handover tools would return
-            status, doc = inspect_fn(dep, root=repo, to_agent=receiver or None)
+            status, doc = inspect_fn(dep, root=repo, to_agent=receiver or None, correlation_id=task.get("correlation_id"))
         except (SwarmError, OSError, ValueError):
             continue
         if (status or {}).get("status") in ("ok", "partial") and isinstance(doc, dict):
