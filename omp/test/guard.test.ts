@@ -1317,6 +1317,12 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
   });
 
   test("a printf whose first argument is an expansion may be -v: it is a writer token, so the run needs approval", () => {
+    expect(guardToolCall(bash('opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts'), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("the same expanded -v write with an inherited mainnet also needs approval", () => {
     const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
     expect(guardToolCall(bash('opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts'), inherited)?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
@@ -1325,6 +1331,28 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
 
   test("a printf with a static format and an expanded value is a reader: a bare test run with no environment network passes", () => {
     expect(guardToolCall(bash('printf "%s\\n" "$x"; hardhat test'), insideAs(A26))).toBeUndefined();
+  });
+
+  test("a loop whose body is a local test writes nothing to HARDHAT_NETWORK: the bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash("for i in 1 2; do hardhat test; done"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("unset of another name is not a writer token: a bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash("unset OTHER; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("a single-quoted dollar is literal, not an expansion: a bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash("printf 'cost: $5\\n'; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("a -v after the printf format is a value, not an option: a bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash("printf '%s' -v; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("an expanded printf -v with no inherited network needs approval for a bare test run too", () => {
+    expect(guardToolCall(bash('opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat test'), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
   });
 });
 

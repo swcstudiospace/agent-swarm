@@ -2335,11 +2335,32 @@ const UNREAD_NETWORK = "<unread>";
 /** A shell assignment word, `NAME=` or `NAME+=`. */
 const ASSIGNMENT_WORD = /^[A-Za-z_]\w*\+?=/;
 /** Builtins that write shell variables from their operands (the names they are given), and `eval`/`source`/`.`, which run code. */
-const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|unset|read|mapfile|readarray|getopts|let|for|select|eval|source|\.|\(\()$/;
+const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|read|mapfile|readarray|getopts|let|eval|source|\.|\(\()$/;
 /** The wrappers that run their operand as the command (`command`, `builtin`, `exec`): what they wrap is classified instead. */
 const WRAPPER_COMMAND = /^(?:command|builtin|exec)$/;
-/** A word that expands at run time, or a cut substitution. */
-const DYNAMIC_WORD = /[$`\u0001]/;
+/**
+ * Whether a raw shell word expands: a `$` or backtick outside single quotes (a backslash-escaped one is literal), or a cut
+ * substitution. Inside single quotes both are literal.
+ */
+function expandsWord(raw: string): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === CUT) return true;
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      continue;
+    }
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "'" && quote === undefined) quote = "'";
+    else if (c === '"') quote = quote === '"' ? undefined : '"';
+    else if (c === "$" || c === "`") return true;
+  }
+  return false;
+}
 
 /** The value of an unquoted `HARDHAT_NETWORK=v` word: empty is unnamed, a value the guard cannot read is UNREAD_NETWORK. */
 function networkValue(word: string): NetworkValue {
@@ -2366,7 +2387,8 @@ function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
  */
 function networkWrites(item: Normalized): NetworkWrite[] {
   const prefix = shellWords(item.prefix).map(unquote);
-  const words = shellWords(item.text).map(unquote);
+  const raw = shellWords(item.text);
+  const words = raw.map(unquote);
   const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w));
   if (at === -1) {
     if (prefix.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites([...prefix, ...words], true);
@@ -2377,7 +2399,7 @@ function networkWrites(item: Normalized): NetworkWrite[] {
   const [name = "", ...args] = rest;
   if (plainShape && name === "export" && args.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites(args, true);
   if (plainShape && name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
-  return writerToken(name, args) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+  return writerToken(raw.slice(raw.length - rest.length)) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
 }
 
 /** The command a wrapper (`command`, `builtin`, `exec`) runs, with the wrapper's own flags dropped. */
@@ -2391,17 +2413,34 @@ function unwrapCommand(cmd: string[]): string[] {
 }
 
 /**
- * A writer token: after the wrappers, a writer builtin or `((`, a dynamic command name, an option word holding an expansion,
- * or `printf` with a `-v` word or with an expansion as its first argument (that expansion may be `-v`). Readers (printenv,
- * echo, printf with a static first argument, test, ls, grep, cat) are not writer tokens, whatever they name or expand.
+ * A writer token, over the raw words of a command after its wrappers: a dynamic command name; `printf` that may take `-v`
+ * (printfWrites); `for`/`select` whose loop name or `unset` whose operands expand or name HARDHAT_NETWORK; a writer
+ * builtin or `((`; or any option word holding an expansion. Readers (printenv, echo, printf with a static leading format,
+ * test, ls, grep, cat) are not writer tokens, whatever they name or expand.
  */
-function writerToken(name: string, args: string[]): boolean {
-  return (
-    WRITER_COMMAND.test(name) ||
-    DYNAMIC_WORD.test(name) ||
-    (name === "printf" && (args.some((w) => w.startsWith("-v")) || DYNAMIC_WORD.test(args[0] ?? ""))) ||
-    args.some((w) => w.startsWith("-") && DYNAMIC_WORD.test(w))
-  );
+function writerToken(raw: string[]): boolean {
+  const [head = "", ...args] = raw;
+  const name = unquote(head);
+  if (expandsWord(head)) return true;
+  if (name === "printf") return printfWrites(args);
+  if (name === "for" || name === "select") return args.slice(0, 1).some((w) => expandsWord(w) || unquote(w).includes("HARDHAT_NETWORK"));
+  if (name === "unset") return args.some((w) => expandsWord(w) || unquote(w).includes("HARDHAT_NETWORK"));
+  return WRITER_COMMAND.test(name) || args.some((w) => unquote(w).startsWith("-") && expandsWord(w));
+}
+
+/**
+ * printf takes options only before its format word, so only leading words count: a word that expands may be `-v` (a writer
+ * token), a word starting with `-v` names a variable, and the format or a `--` ends the options. A `-v` after the format is a
+ * value.
+ */
+function printfWrites(args: string[]): boolean {
+  for (const w of args) {
+    if (expandsWord(w)) return true;
+    const value = unquote(w);
+    if (value === "--" || !value.startsWith("-")) return false;
+    if (value.startsWith("-v")) return true;
+  }
+  return false;
 }
 
 /** Every value any write under `items` (payloads included) may leave, as if all of them ran. */
