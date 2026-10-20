@@ -1315,6 +1315,17 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
   test("a plain static export of another name changes nothing: a bare test run with no environment network passes", () => {
     expect(guardToolCall(bash("export OTHER=1; hardhat test"), insideAs(A26))).toBeUndefined();
   });
+
+  test("a printf whose first argument is an expansion may be -v: it is a writer token, so the run needs approval", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash('opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts'), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("a printf with a static format and an expanded value is a reader: a bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash('printf "%s\\n" "$x"; hardhat test'), insideAs(A26))).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

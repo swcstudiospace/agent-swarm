@@ -2339,7 +2339,7 @@ const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|unset|read|map
 /** The wrappers that run their operand as the command (`command`, `builtin`, `exec`): what they wrap is classified instead. */
 const WRAPPER_COMMAND = /^(?:command|builtin|exec)$/;
 /** A word that expands at run time, or a cut substitution. */
-const DYNAMIC_WORD = /[$\u0001]/;
+const DYNAMIC_WORD = /[$`\u0001]/;
 
 /** The value of an unquoted `HARDHAT_NETWORK=v` word: empty is unnamed, a value the guard cannot read is UNREAD_NETWORK. */
 function networkValue(word: string): NetworkValue {
@@ -2391,15 +2391,15 @@ function unwrapCommand(cmd: string[]): string[] {
 }
 
 /**
- * A writer token: after the wrappers, a writer builtin or `((`, `printf` with a word starting with `-v`, a dynamic command
- * name, or an option word holding an expansion. Readers (printenv, echo, printf with a static format, test, ls, grep, cat)
- * are not writer tokens, whatever they name or expand.
+ * A writer token: after the wrappers, a writer builtin or `((`, a dynamic command name, an option word holding an expansion,
+ * or `printf` with a `-v` word or with an expansion as its first argument (that expansion may be `-v`). Readers (printenv,
+ * echo, printf with a static first argument, test, ls, grep, cat) are not writer tokens, whatever they name or expand.
  */
 function writerToken(name: string, args: string[]): boolean {
   return (
     WRITER_COMMAND.test(name) ||
     DYNAMIC_WORD.test(name) ||
-    (name === "printf" && args.some((w) => w.startsWith("-v"))) ||
+    (name === "printf" && (args.some((w) => w.startsWith("-v")) || DYNAMIC_WORD.test(args[0] ?? ""))) ||
     args.some((w) => w.startsWith("-") && DYNAMIC_WORD.test(w))
   );
 }
