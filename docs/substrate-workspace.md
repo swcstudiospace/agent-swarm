@@ -15,7 +15,7 @@ the installer, the runner and the lease bridge), `swarm/substrate_mcp.json` (the
 ```bash
 export SUBSTRATE_TOKEN_SWARM_A01_ORCH=… … SUBSTRATE_TOKEN_SWARM_A30_CUSTODY=…   # the values the server holds, one per agent (30)
 python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run   # the additions and the env files, nothing written
-python3 scripts/build_agents.py --install-workspace /path/to/ws             # [--runtimes claude,grok,omp] [--no-substrate]
+python3 scripts/build_agents.py --install-workspace /path/to/ws             # [--runtimes claude,grok,omp,cursor] [--no-substrate]
 ```
 
 The install writes two things besides the agents, skills, hooks and omp package it always wrote.
@@ -26,6 +26,7 @@ The install writes two things besides the agents, skills, hooks and omp package 
 |---|---|---|
 | claude, omp | `<ws>/.mcp.json` | `mcpServers.substrate = {type: http, url: ${SUBSTRATE_URL}/mcp, headers: {Authorization: Bearer ${SUBSTRATE_TOKEN}}}` |
 | grok | `<ws>/.grok/config.toml` | `[mcp_servers.substrate]` with the same `url` and `headers` |
+| cursor | `<ws>/.cursor/mcp.json` | the same JSON entry as claude and omp |
 
 The entry is the one agent-substrate's projector emits (`bun packages/projector/src/swarm-workspace.ts --spec`), vendored
 in `swarm/substrate_mcp.json` because this repository is public and installs without that private checkout. The rules are
