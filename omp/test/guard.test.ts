@@ -1276,6 +1276,29 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
     );
   });
+
+  test("a printf -v target built at run time is unknown: it may be HARDHAT_NETWORK, so the run needs approval", () => {
+    expect(guardToolCall(bash('printf -v"$target" mainnet; hardhat run scripts/deploy.ts'), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("an attached printf -vNAME names HARDHAT_NETWORK literally: the run needs approval", () => {
+    expect(guardToolCall(bash("printf -vHARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("a read into a dynamic name is unknown: with inherited mainnet the run still needs approval", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash('read -r "$v" <<< x; hardhat run scripts/deploy.ts'), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("readers that name or expand HARDHAT_NETWORK stay readers: printenv and a printf format do not hide a local test run", () => {
+    expect(guardToolCall(bash("printenv HARDHAT_NETWORK; printf '%s' \"$PWD\"; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

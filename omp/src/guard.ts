@@ -2377,17 +2377,15 @@ function networkWrites(item: Normalized): NetworkWrite[] {
   const [name = "", ...args] = rest;
   // a sourced file runs code this guard cannot read: it may set HARDHAT_NETWORK, in any form and with or without expansion
   if (name === "source" || name === ".") return [{ value: UNREAD_NETWORK, plain: false }];
-  // a reader (printenv, printf without -v, echo, test, ...) never writes a variable, whatever it names or expands
-  if (!writesVariables(name, args)) return [];
-  // the names a writer assigns: every operand, or for `printf -v NAME` only the word after `-v`
-  const v = args.findIndex((w) => w.startsWith("-v"));
-  const targets = name === "printf" ? args.slice(v + 1, v + 2) : args;
-  const dynamic = DYNAMIC_WORD.test(name) || targets.some((w) => DYNAMIC_WORD.test(w) && !ASSIGNMENT_WORD.test(w));
-  if (prefix.length === 0 && !dynamic && !wrapped) {
+  // a reader (printenv, printf without -v, echo, test, ...) writes no variable, whatever it names or expands
+  const targets = variableTargets(name, args);
+  if (targets === undefined) return [];
+  if (!targets.unknown && prefix.length === 0 && !wrapped) {
     if (name === "export" && args.every((w) => !w.startsWith("-"))) return assignmentWrites(args, true);
     if (name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
   }
-  return dynamic || rest.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+  // a name or option the guard cannot read may be HARDHAT_NETWORK: it adds the non-local value, keeping the old ones
+  return targets.unknown || targets.words.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
 }
 
 /** The command a wrapper (`command`, `builtin`, `exec`) runs, with the wrapper's own flags dropped. */
@@ -2400,11 +2398,46 @@ function unwrapCommand(cmd: string[]): string[] {
   return cmd.slice(i);
 }
 
-/** Whether a command can write a shell variable: a writer builtin, `printf -v`, or a name only known at run time. */
-function writesVariables(name: string, args: string[]): boolean {
-  if (DYNAMIC_WORD.test(name)) return true;
-  if (name === "printf") return args.some((w) => w.startsWith("-v"));
-  return WRITER_COMMAND.test(name);
+/**
+ * The words a command names as variables, and whether one of them is unknown until run time; undefined when it writes no
+ * variable. A generic writer names every operand (an assignment `NAME=v` names NAME, so its value may hold anything);
+ * `for`/`select` name their first operand and `getopts` its second; printf names only through `-v` (printfTargets).
+ */
+function variableTargets(name: string, args: string[]): { words: string[]; unknown: boolean } | undefined {
+  if (DYNAMIC_WORD.test(name)) return { words: [name], unknown: true };
+  if (name === "printf") return printfTargets(args);
+  if (name === "for" || name === "select" || name === "getopts") {
+    const named = name === "getopts" ? args.slice(1, 2) : args.slice(0, 1);
+    return { words: named, unknown: named.some((w) => DYNAMIC_WORD.test(w)) };
+  }
+  if (!WRITER_COMMAND.test(name)) return undefined;
+  return { words: args, unknown: args.some((w) => DYNAMIC_WORD.test(w) && !ASSIGNMENT_WORD.test(w)) };
+}
+
+/**
+ * printf writes only through `-v NAME`, attached (`-vNAME`) or separate, as getopt reads its leading option words. A
+ * leading word that holds an expansion may expand to an option, so it is unknown; the format and the values after it are
+ * never names. Undefined when printf has no `-v` and no unknown option word.
+ */
+function printfTargets(args: string[]): { words: string[]; unknown: boolean } | undefined {
+  const words: string[] = [];
+  let named = false;
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i];
+    if (DYNAMIC_WORD.test(w)) return { words: [...words, w], unknown: true };
+    if (w === "--" || !w.startsWith("-")) break;
+    words.push(w);
+    if (w === "-v") {
+      named = true;
+      const target = args[i + 1] ?? "";
+      words.push(target);
+      if (DYNAMIC_WORD.test(target)) return { words, unknown: true };
+      i++;
+    } else if (w.startsWith("-v")) {
+      named = true;
+    }
+  }
+  return named ? { words, unknown: false } : undefined;
 }
 
 /** Every value any write under `items` (payloads included) may leave, as if all of them ran. */
