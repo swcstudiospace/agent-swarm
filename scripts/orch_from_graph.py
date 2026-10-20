@@ -5,7 +5,7 @@ The summary is the Desk Lead export: graphId, nodes (id, kind, title, steps,
 depends_on) and optional waves. This writes a plan orch_plan.py accepts as
 ``--pattern custom --plan <file> --graph-id <graphId>``.
 
-Kind map (through agents.json, never an agent outside the fifteen):
+Kind map (through agents.json, never an agent outside the thirty):
 
 - understand → A02 ``req.spec``
 - synthesize → A01 ``plan.decompose``
@@ -23,11 +23,19 @@ Owned-file rules, first match:
 
 - ``*.md`` → A15 docs
 - ``*.sql`` or a ``migrations/`` path → A07 data
+- ``*.sol``, ``*.vy``, ``foundry.toml``, ``hardhat.config.*``, or a ``.json``/``.yaml``/``.yml`` file under ``contracts/`` → A26
+  smart contracts (a ``.ts`` or ``.py`` file under ``contracts/`` is an API or pact contract and keeps its code owner)
+- anything under a ``web3/`` or ``wagmi/`` directory, or a script (``.ts`` ``.tsx`` ``.js`` ``.jsx``) under ``wallet/`` → A29 dapp and wallet
+- ``kustomization.yaml``, or a ``.json``/``.yaml``/``.yml`` file under ``charts/``, ``helm/``, ``k8s/``, ``kubernetes/``,
+  ``manifests/`` or ``overlays/`` that is not under a components, frontend or ui directory → A22 GitOps
+- a ``Dockerfile`` or ``Dockerfile.<variant>`` (not ``dockerfile_lint.py``) → A18 supply chain
+- ``asyncapi.<yaml|yml|json|ts|js>`` or ``serverless.<yaml|yml|json|ts|js>`` → A19 event-driven
+- ``catalog-info.yaml`` → A17 platform
 - ``*.tsx`` / ``*.jsx`` / ``*.css`` or a components, frontend or ui directory → A06
 - ``infra/``, ``.github/workflows/``, ``*.tf``, ``*.sh`` → A11
 - ``*.py`` ``*.go`` ``*.rs`` ``*.ts`` ``*.js`` ``*.toml`` ``*.yml`` ``*.yaml`` → A05
 
-Implementation agents (A05, A06, A07, A11) are medium risk with review and
+Implementation agents (A05, A06, A07, A11, A17, A18, A19, A22, A26, A29) are medium risk with review and
 quality gates. Every other agent is low risk with a review gate. The plan
 records ``summary_sha256`` of the summary file's raw bytes.
 """
@@ -47,7 +55,8 @@ from swarm.substrate_tee import is_graph_id  # noqa: E402
 
 _FILE = re.compile(
     r"(?<![\w@./-])"
-    r"((?:[\w.-]+/)*[\w.-]+\.(?:py|ts|tsx|js|jsx|go|rs|sql|md|sh|yml|yaml|toml|tf|css|html))"
+    r"((?:[\w.-]+/)*(?:[\w.-]+\.(?:py|ts|tsx|js|jsx|go|rs|sql|md|sh|yml|yaml|toml|tf|css|html|json|sol|vy)"
+    r"|Dockerfile(?:[.-][\w-]+)*))"
     r"(?![\w.-])"
 )
 _DESIGN_KINDS = frozenset({"decompose", "generate", "refine"})
@@ -63,9 +72,29 @@ _OWNER_CAPABILITY = {
     "A07": "data.migration",
     "A11": "iac.change",
     "A15": "docs.bundle",
+    "A17": "platform.catalog",
+    "A18": "supply.image",
+    "A19": "event.topology",
+    "A22": "gitops.manifest",
+    "A26": "web3.contract",
+    "A29": "dapp.wallet",
 }
-_MEDIUM = frozenset({"A05", "A06", "A07", "A11"})
+_MEDIUM = frozenset({"A05", "A06", "A07", "A11", "A17", "A18", "A19", "A22", "A26", "A29"})
 _UI_DIRS = frozenset({"components", "frontend", "ui"})
+_WEB3_DIRS = frozenset({"web3", "wagmi"})
+_CLUSTER_DIRS = frozenset({"charts", "helm", "k8s", "kubernetes", "manifests", "overlays"})
+_CLUSTER_FILES = frozenset({"kustomization.yaml", "kustomization.yml"})
+_CATALOG_FILES = frozenset({"catalog-info.yaml", "catalog-info.yml"})
+# A domain directory claims only what the old routes did not own: data files (a `.ts` in `contracts/` is an API
+# contract, a `.tsx` in `components/overlays/` is UI), and in `wallet/` script files only (a fintech wallet service
+# is not a dapp). A Dockerfile is the whole base name, so `dockerfile_lint.py` stays code; asyncapi/serverless are
+# the config files, so `serverless.test.ts` stays a test.
+_DATA_EXT = (".json", ".yaml", ".yml")
+_SCRIPT_EXT = (".ts", ".tsx", ".js", ".jsx")
+_DOCKERFILE = re.compile(r"dockerfile(?:[.-][\w-]+)*")
+_SOURCE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".sh", ".sql", ".yaml", ".yml", ".toml", ".tf", ".css",
+               ".html", ".json", ".sol", ".vy")
+_EVENT_CONFIG = re.compile(r"(?:asyncapi|serverless)\.(?:ya?ml|json|ts|js)")
 # orch_plan stores "{prefix}-{id}". The default prefix is "T" + 4 hex + "-"
 # (6 characters). A collision fallback uses 6 hex (8 characters); the default
 # is what a fresh plan gets. A split appends "-aNN" (4). check_task_id allows
@@ -84,13 +113,28 @@ def _owner(path: str) -> str | None:
     lower = path.lower()
     base = lower.rsplit("/", 1)[-1]
     parts = lower.split("/")
+    dirs = parts[:-1]
     if base.endswith(".md"):
         return "A15"
-    if base.endswith(".sql") or "migrations" in parts[:-1]:
+    if base.endswith(".sql") or "migrations" in dirs:
         return "A07"
-    if base.endswith((".tsx", ".jsx", ".css")) or any(part in _UI_DIRS for part in parts[:-1]):
+    if (base.endswith((".sol", ".vy")) or base == "foundry.toml" or base.startswith("hardhat.config.")
+            or ("contracts" in dirs and base.endswith(_DATA_EXT))):
+        return "A26"
+    if any(part in _WEB3_DIRS for part in dirs) or ("wallet" in dirs and base.endswith(_SCRIPT_EXT)):
+        return "A29"
+    if base in _CLUSTER_FILES or (base.endswith(_DATA_EXT) and any(part in _CLUSTER_DIRS for part in dirs)
+                                  and not any(part in _UI_DIRS for part in dirs)):
+        return "A22"
+    if _DOCKERFILE.fullmatch(base) and not base.endswith(_SOURCE_EXT):
+        return "A18"
+    if _EVENT_CONFIG.fullmatch(base):
+        return "A19"
+    if base in _CATALOG_FILES:
+        return "A17"
+    if base.endswith((".tsx", ".jsx", ".css")) or any(part in _UI_DIRS for part in dirs):
         return "A06"
-    if "infra" in parts[:-1] or ".github" in parts[:-1] or base.endswith((".tf", ".sh")):
+    if "infra" in dirs or ".github" in dirs or base.endswith((".tf", ".sh")):
         return "A11"
     if base.endswith((".py", ".go", ".rs", ".ts", ".js", ".toml", ".yml", ".yaml")):
         return "A05"
@@ -348,8 +392,8 @@ def _risk_gates(agent: str) -> tuple[str, list[str]]:
 
 def _manifest() -> dict[str, dict]:
     agents = load_manifest()
-    if len(agents) != 15:
-        raise SwarmError(ErrorCode.E_CONTRACT, f"agents.json has {len(agents)} agents; the swarm has 15")
+    if len(agents) != 30:
+        raise SwarmError(ErrorCode.E_CONTRACT, f"agents.json has {len(agents)} agents; the swarm has 30")
     return {agent["id"]: agent for agent in agents}
 
 
@@ -393,7 +437,7 @@ def convert(data: dict, summary_sha256: str) -> dict:
         for (agent, capability), task_id in zip(agents, id_of[node["id"]]):
             spec = manifest.get(agent)
             if spec is None:
-                raise SwarmError(ErrorCode.E_INPUT, f"agent {agent} is outside the 15")
+                raise SwarmError(ErrorCode.E_INPUT, f"agent {agent} is outside the 30")
             if capability not in spec["capabilities"]:
                 raise SwarmError(ErrorCode.E_CONTRACT, f"{agent} does not offer {capability}")
             risk, gates = _risk_gates(agent)

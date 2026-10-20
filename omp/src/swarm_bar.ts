@@ -1,8 +1,9 @@
 /**
- * Agent Swarm bar: an aboveEditor widget (key `agent-swarm`, rank 10: above Ultrathink) plus a compact `setStatus("swarm", …)` text.
+ * Agent Swarm bar: an aboveEditor widget (key `agent-swarm`, rank 10: above Ultrathink).
  * Display-only (v2.2 DESIGN section 6, D4); nothing here may throw into the host. Three parts:
- *   1. pure text: `formatElapsed`, `sanitizeText`, the fixed-width `renderSwarmBar` (always exactly 2 rows of exactly `width`
- *      columns: row 1 the swarm summary on the left and the measured token savings on the right, row 2 the agents or the idle placeholder);
+ *   1. pure text: `formatElapsed`, `sanitizeText`, the fixed-width `renderSwarmBar` (exactly `width` columns per row: while
+ *      agents run, 2 rows, row 1 the swarm summary on the left and the measured token savings on the right, row 2 the agents; idle
+ *      and telemetry error, 1 row, the head with the token savings);
  *   2. a model reducer merging three sources by run id: the omp bus (`task:subagent:progress|lifecycle`), `<swarmDir>/live.json`
  *      (`swarm.live.v1`) and the parent's own `task` tool_call/tool_result rows (last resort). Elapsed is extrapolated with the
  *      consumer's monotonic clock (`performance.now()`), never `Date.now()`;
@@ -29,7 +30,6 @@ import { type BarSegment, type BarTheme, clipToWidth, composeBar, displayWidth, 
 import { isSessionId, parseTokenSavings, type TokenSavingsSnapshot, tokenChips } from "./token_savings.ts";
 
 export const SWARM_BAR_KEY = "agent-swarm";
-export const SWARM_STATUS_KEY = "swarm";
 export const PROGRESS_CHANNEL = "task:subagent:progress";
 export const LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
 export const LIVE_SCHEMA = "swarm.live.v1";
@@ -2304,7 +2304,7 @@ function labelOf(run: BarRun, spin: string): Label {
 }
 
 const ELAPSED_COLUMNS = 6;
-const AGENT_COLUMNS = 18;
+const AGENT_COLUMNS = 22; // the longest slug in the 30-agent roster (a30-custody-compliance) is shown whole
 
 function rowSegment(run: BarRun, theme: BarTheme | undefined, spin: string, nowMono: number, activityCap: number): Seg {
   const label = labelOf(run, spin);
@@ -2391,11 +2391,10 @@ function tokenSegments(model: SwarmBarModel, theme: BarTheme | undefined): BarSe
   return tokenChips(snapshot).map((chip) => ({ plain: chip.text, painted: chip.color === "text" ? chip.text : paint(theme, chip.color, chip.text), priority: chip.priority }));
 }
 
-const IDLE_ROW = "no subagents running";
-
 /**
- * The bar as exactly 2 rows of exactly `width` columns (none for `width <= 0`) plus the state it is in. Idle and error keep the
- * two rows: a placeholder instead of the agents. Pure: the same inputs give the same output.
+ * The bar's rows, each exactly `width` columns (none for `width <= 0`), plus the state it is in. Busy is two rows: the swarm
+ * summary and the agents. Idle and telemetry error are one row: the head with the token chips, no placeholder. Pure: the same
+ * inputs give the same output.
  */
 export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: BarTheme | undefined, nowMono: number): BarFrame {
   const base = barState(model, nowMono);
@@ -2404,7 +2403,7 @@ export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: 
   const rows = visibleRuns(model, nowMono);
   if (rows.length === 0) {
     const head = base === "error" ? seg(theme, "warning", "swarm: telemetry unavailable") : seg(theme, "dim", "○ swarm idle");
-    const lines = [composeBar(theme, [prio(0, head)], chips, width), composeBar(theme, [prio(0, seg(theme, "dim", IDLE_ROW))], [], width)];
+    const lines = [composeBar(theme, [prio(0, head)], chips, width)];
     return { lines, state: base, shown: 0, hidden: 0 };
   }
   const spin = spinner(model, theme, nowMono);
@@ -2449,28 +2448,9 @@ export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: 
   return { lines: [line1, line2], state: hidden > 0 ? "overflow" : base, shown, hidden };
 }
 
-/** The bar as exactly 2 rows, each exactly `width` columns wide (no rows for `width <= 0`). */
+/** The bar's rows, each exactly `width` columns wide: two while agents run, one when idle or in telemetry error (none for `width <= 0`). */
 export function renderSwarmBar(model: SwarmBarModel, width: number, theme: BarTheme | undefined, nowMono: number): string[] {
   return renderSwarmBarFrame(model, width, theme, nowMono).lines;
-}
-
-/** Compact one-line text for `setStatus("swarm", …)`; undefined when nothing is live or failing. */
-export function statusText(model: SwarmBarModel, nowMono: number): string | undefined {
-  const rows = visibleRuns(model, nowMono);
-  const count = { run: 0, queued: 0, wait: 0, fail: 0 };
-  for (const run of countedRows(rows)) {
-    if (run.state === "running" || run.state === "starting" || run.state === "handing_off") count.run++;
-    else if (run.state === "queued") count.queued++;
-    else if (run.state === "waiting") count.wait++;
-    else if (run.state === "failed" || run.state === "timed_out") count.fail++;
-  }
-  const parts = [
-    count.run > 0 ? `${count.run} run` : "",
-    count.wait > 0 ? `${count.wait} wait` : "",
-    count.queued > 0 ? `${count.queued} queued` : "",
-    count.fail > 0 ? `${count.fail} fail` : "",
-  ].filter((part) => part.length > 0);
-  return parts.length === 0 ? undefined : `swarm: ${parts.join(", ")}`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -2515,13 +2495,13 @@ export interface SwarmBar {
   taskSpawn(ctx: ExtensionContext, input: unknown, toolCallId: string | undefined): void;
   /** The matching tool result. */
   taskResult(ctx: ExtensionContext, toolCallId: string | undefined, isError: boolean): void;
-  /** Unsubscribe, clear timers, remove widget and status. Safe to call twice. */
+  /** Unsubscribe, clear timers, remove widget. Safe to call twice. */
   stop(): void;
 }
 
 type Mode = "off" | "ui" | "headless";
 
-const STATUS_RENDER_GAP_MS = 250;
+const RENDER_GAP_MS = 250;
 const TICK_MS = 1000;
 const LIVE_FILE = "live.json";
 const LIVE_MAX_BYTES = 1_048_576;
@@ -2563,7 +2543,6 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
   let inflight = 0;
   let lastRender = -Infinity;
   let trailingRender: unknown;
-  let lastStatus: string | undefined;
   let staleMs = 30_000;
   /** The last read document came from the in-session Task Store (`producer: "derived"`): written on transitions only, so mtime says nothing about liveness. */
   let liveDerived = false;
@@ -2572,7 +2551,7 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
   const announced = new Set<string>();
   /** Set by `stop()`; only a new session (`session_start`/`session_switch`) clears it. */
   let closed = false;
-  /** The widget is mounted: from the first eligible event until stop. An idle bar stays, drawn as the idle placeholder. */
+  /** The widget is mounted: from the first eligible event until stop. An idle bar stays, drawn as its one idle head row. */
   let mounted = false;
   let restack: Restack | undefined;
 
@@ -2651,20 +2630,15 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
   function render(force: boolean): void {
     if (mode !== "ui") return;
     const now = clock();
-    if (!force && now - lastRender < STATUS_RENDER_GAP_MS) return;
+    if (!force && now - lastRender < RENDER_GAP_MS) return;
     lastRender = now;
     safe(() => host?.requestRender());
-    const text = statusText(model, now);
-    if (text !== lastStatus) {
-      lastStatus = text;
-      safe(() => ui?.setStatus?.(SWARM_STATUS_KEY, text));
-    }
   }
 
   /** A new token snapshot: render now, or once the render gap has passed (snapshots are rare, so none may be left unpainted). */
   function renderTokens(): void {
     if (mode !== "ui") return;
-    const wait = STATUS_RENDER_GAP_MS - (clock() - lastRender);
+    const wait = RENDER_GAP_MS - (clock() - lastRender);
     if (wait <= 0) return render(true);
     if (trailingRender !== undefined) return;
     const handle = timers.setTimeout(() => {
@@ -2942,10 +2916,7 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
     watchKey = undefined;
     wake = undefined;
     remountPending = false;
-    if (hadUi) {
-      if (mounted) safe(unmount);
-      safe(() => ui?.setStatus?.(SWARM_STATUS_KEY, undefined));
-    }
+    if (hadUi && mounted) safe(unmount);
     mounted = false;
     mode = undefined;
     model = createModel();
@@ -2954,7 +2925,6 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
     turnActive = false;
     inflight = 0;
     lastRender = -Infinity;
-    lastStatus = undefined;
     liveDir = undefined;
     liveDerived = false;
     liveStamp = undefined;

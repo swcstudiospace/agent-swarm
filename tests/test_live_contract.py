@@ -1,7 +1,7 @@
 """Runner -> bar contract for `<swarm_dir>/live.json` (v2.2 section 4.5).
 
 tests/fixtures/live_runner_sample.json is a mid-run snapshot that the REAL `scripts/swarm_run.py` wrote while it ran the
-17-task DAG of tests/test_e2e_swarm.py (regenerate: `SWARM_WRITE_LIVE_FIXTURE=1 python3 -m pytest tests/test_e2e_swarm.py
+32-task DAG of tests/test_e2e_swarm.py (regenerate: `SWARM_WRITE_LIVE_FIXTURE=1 python3 -m pytest tests/test_e2e_swarm.py
 -k fixture`). This file pins what the producer promises about it; omp/test/live_contract.test.ts feeds the same bytes to the
 bar's ingestion and renderer.
 """

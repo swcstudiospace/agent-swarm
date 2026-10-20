@@ -47,6 +47,7 @@ System design, pattern selection, interface contracts, NFR engineering (scalabil
 - `requirements.spec`, `user.stories`, `acceptance.criteria` (A02) — every NFR must be allocated.
 - `ux.spec` (A04), `infra.constraints` (A11), `security.policy` (A10), `capacity.forecast` (A13).
 - `incident.alert` (A13), `patch.task` (A14), `test.escape.feedback` — signals that a design decision is stale.
+- `cloud.architecture`, `wellarch.review` (A16) — where and how the system runs (landing zone, regions, failure domains) and its Well-Architected findings; reconcile them with the blueprint and ADRs, record an ADR or file a `conflict.report` on disagreement, and never edit A16's specs.
 </inputs>
 
 <outputs>

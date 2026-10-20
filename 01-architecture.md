@@ -2,9 +2,10 @@
 
 **Version:** 1.0.0 · **Status:** Stable · **Audience:** Swarm operators, agent developers, platform engineers
 
-AgentSwarm is a distributed swarm of 15 specialized software engineering agents that
+AgentSwarm is a distributed swarm of 30 specialized software engineering agents that
 collectively cover the full SDLC — requirements, design, coding, testing, deployment,
-monitoring, and maintenance. The design goals are:
+monitoring, and maintenance — through the 15 core agents A01–A15 and three domain lanes of
+five agents each: cloud-native (A16–A20), cluster (A21–A25) and Web3 (A26–A30). The design goals are:
 
 - **Parallel execution** — independent agents work concurrently on a shared task DAG.
 - **Dynamic workload balancing** — tasks flow to the least-loaded capable agent class.
@@ -17,7 +18,7 @@ monitoring, and maintenance. The design goals are:
 
 ---
 
-## 1. The 15 Agents (at a glance)
+## 1. The 30 Agents (at a glance)
 
 | ID | Code | Agent | SDLC phase | Single-writer artifact ownership |
 |----|------|-------|------------|----------------------------------|
@@ -36,10 +37,28 @@ monitoring, and maintenance. The design goals are:
 | A13 | `OBS` | Observability / SRE Agent | Monitoring | SLOs, dashboards, incident declarations |
 | A14 | `MAINT` | Maintenance Engineer | Maintenance | Patch tasks, dependency bumps, tech-debt register |
 | A15 | `DOC` | Documentation Engineer | Cross-cutting | Docs bundles, API references, runbooks |
+| A16 | `CLOUD` | Cloud-Native Architect | Design | `cloud.architecture`, `resilience.design`, `landing.zone.spec`, `wellarch.review` |
+| A17 | `PLAT` | Platform Engineer | Deployment | `service.catalog.entry`, `golden.path.template`, `platform.claim`, `platform.scorecard` |
+| A18 | `SUPPLY` | Supply-Chain Security Engineer | Testing / Security | `supply.attestation.bundle`, `sbom.bundle`, `image.policy.report`, `vex.statements` |
+| A19 | `EVENT` | Event-Driven & Serverless Engineer | Coding | `event.topology.spec`, `event.schema.set`, `serverless.config`; event and function source code (`code.patch`) |
+| A20 | `FINOPS` | FinOps & GreenOps Analyst | Maintenance | `cost.report`, `budget.policy`, `rightsizing.plan`, `carbon.report` |
+| A21 | `K8S` | Kubernetes Cluster Operator | Deployment | `cluster.capacity.report`, `cluster.upgrade.plan`, `cluster.fleet.status` |
+| A22 | `GITOPS` | GitOps & Progressive Delivery Engineer | Deployment | `gitops.manifests`, `rollout.plan`, `promotion.record`, `drift.report` |
+| A23 | `MESH` | Service Mesh & Networking Engineer | Deployment | `mesh.policy.set`, `traffic.plan`, `netpol.coverage.report` |
+| A24 | `KSEC` | Cluster Security & Policy Engineer | Testing / Security | `cluster.policy.set`, `cluster.security.findings`, `policy.exception.register` |
+| A25 | `RESIL` | Resilience & Chaos Engineer | Deployment | `resilience.report`, `chaos.plan`, `backup.coverage.report`, `dr.runbook` |
+| A26 | `SOL` | Smart Contract Engineer | Coding | `contract.abi`, `contract.deploy.plan`, `gas.report`; contract source code (`code.patch`) |
+| A27 | `AUDIT` | Smart Contract Auditor | Testing / Security | `audit.findings`, `audit.report`, `invariant.suite` |
+| A28 | `CHAIN` | Blockchain Infrastructure Engineer | Deployment | `chain.infra.plan`, `rpc.policy`, `indexer.spec` |
+| A29 | `DAPP` | dApp & Wallet Integration Engineer | Coding | `dapp.integration.spec`, `wallet.flow.spec`; wallet and chain integration source code (`code.patch`) |
+| A30 | `CUSTODY` | Web3 Custody & Compliance Engineer | Deployment / Compliance | `custody.policy.set`, `custody.evidence.pack`, `key.ceremony.plan` |
 
 **Accountability rule:** for every artifact type above there is exactly one single-writer
 agent. All other agents read those artifacts or request changes via messages — never by
 writing directly. This eliminates write conflicts by construction (see [04-integration-plan.md](04-integration-plan.md)).
+Source code (`code.patch`) is the one type several agents write — A05, A06, A19, A26 and A29, each in its own path set —
+and `gate.verdict` is written only by the four gate owners A08, A09, A10 and A12. A16–A30 own no gate: their work
+flows through those four.
 
 ---
 
@@ -61,6 +80,11 @@ writing directly. This eliminates write conflicts by construction (see [04-integ
               └──────────────┘ └──────────┘ └────────────┘
               │ Verify lane: QA REV SEC      │ Sustain lane: OBS MAINT DOC
               └──────────────────────────────┴────────────┘
+              ┌─ Domain lanes (A16–A30): same offer/assign, same gates ─┐
+              │ Cloud-Native  CLOUD PLAT SUPPLY EVENT FINOPS            │
+              │ Cluster       K8S GITOPS MESH KSEC RESIL                │
+              │ Web3          SOL AUDIT CHAIN DAPP CUSTODY              │
+              └────────────────────┬────────────────────────────────────┘
                                    │
         ┌──────────────────────────┼───────────────────────────┐
         ▼                          ▼                           ▼
@@ -75,11 +99,11 @@ writing directly. This eliminates write conflicts by construction (see [04-integ
 | Plane | Members | Role |
 |-------|---------|------|
 | Control | A01 | Planning, scheduling, arbitration, swarm health |
-| Delivery | A02, A03, A04, A07 | Requirements → design → data contracts |
-| Build | A05, A06 | Implementation (parallel, contract-bounded) |
-| Verify | A08, A09, A10 | Quality, review, security gates |
-| Operate | A11, A12, A13 | Environments, releases, production monitoring |
-| Sustain | A14, A15 | Maintenance, knowledge capture |
+| Delivery | A02, A03, A04, A07, A16 | Requirements → design → data contracts; cloud architecture |
+| Build | A05, A06, A19, A26, A29 | Implementation (parallel, contract-bounded): backend, frontend, events and functions, contracts, wallet integration |
+| Verify | A08, A09, A10, A18, A24, A27 | Quality, review, security gates; supply-chain, cluster-policy and contract-audit evidence |
+| Operate | A11, A12, A13, A17, A21, A22, A23, A25, A28, A30 | Environments, releases, production monitoring; platform, cluster, GitOps, mesh, resilience, chain infrastructure, custody evidence |
+| Sustain | A14, A15, A20 | Maintenance, knowledge capture, cost and carbon |
 
 ### 2.2 Infrastructure services (shared, not agents)
 
@@ -95,11 +119,11 @@ writing directly. This eliminates write conflicts by construction (see [04-integ
 ## 3. Task model & execution
 
 1. **Ingest** — a project brief, change request, or incident enters via the gateway; A01 validates and stores it as a root task.
-2. **Decompose** — A02 (requirements) then A03 (architecture/data/UX contracts) refine the brief into a typed task DAG. Each task carries: capability tag, input artifacts, acceptance criteria, budget, risk class.
+2. **Decompose** — A02 (requirements) then A03 (architecture/data/UX contracts) refine the brief into a typed task DAG. Each task carries: capability tag, input artifacts, acceptance criteria, budget, risk class. The `cloud-native`, `cluster` and `web3` patterns add the A16–A30 steps ([04-integration-plan.md §3.4–3.6](04-integration-plan.md)); cluster and web3 implementer tasks carry risk class high.
 3. **Offer/claim** — A01 publishes `task.offer` to the capability subject. Matching agent classes bid with load scores; A01 awards the lowest-load/best-fit claimant (or pushes directly for P0 work).
 4. **Execute** — agents work in parallel wherever DAG dependencies allow. Long tasks checkpoint progress into the Task Store (resumable, idempotent).
-5. **Gates** — outputs pass QA (A08), review (A09), and security (A10) verdicts. Gate failures loop back to the producing agent with structured feedback (bounded rework cycles; see §6).
-6. **Deliver** — A11 provisions/deploys, A12 promotes via canary with guardrails, A13 watches SLOs, A14 patches, A15 documents.
+5. **Gates** — outputs pass QA (A08), review (A09), and security (A10) verdicts, and the release gate (A12) for high risk. Gate failures loop back to the producing agent with structured feedback (bounded rework cycles; see §6).
+6. **Deliver** — A11 provisions/deploys, A12 promotes via canary with guardrails, A13 watches SLOs, A14 patches, A15 documents. In the domain lanes A22 prepares the GitOps rollout and promotion PRs, A28 plans the blockchain infrastructure and A30 supplies custody evidence; A12 still decides what ships.
 
 Task state machine (authoritative definitions in [02-message-protocol.md](02-message-protocol.md)):
 
@@ -174,7 +198,7 @@ then re-plans the subtree, then escalates (§5).
 | Document | Content |
 |----------|---------|
 | [02-message-protocol.md](02-message-protocol.md) | Envelope, subjects, task lifecycle, payload schema conventions |
-| [03-agents/](03-agents/) | 15 agent specifications (A01–A15) |
+| [03-agents/](03-agents/) | 30 agent specifications (A01–A30) |
 | [04-integration-plan.md](04-integration-plan.md) | Interaction matrix, event flows, conflict resolution |
 | [05-deployment-guide.md](05-deployment-guide.md) | Deployment, configuration, bootstrap, operations |
 | [06-testing-protocols.md](06-testing-protocols.md) | Unit/contract/integration/chaos/E2E test protocols |

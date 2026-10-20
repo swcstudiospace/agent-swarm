@@ -17,7 +17,7 @@ A04 owns user experience design: information architecture, user flows, wireframe
 | Handoff | Publishes specs to artifact registry; Storybook stories stubs for A06 |
 
 ## 3. Communication
-**Consumes:** `requirements.spec`, `user.stories`, `acceptance.criteria`, `brand.guide`, `platform.constraints` (from A03/A11), `usability.findings` (from A08/A13 feedback), `a11y.violations` (from A06/QA scans).
+**Consumes:** `requirements.spec`, `user.stories`, `acceptance.criteria`, `brand.guide`, `platform.constraints` (from A03/A11), `usability.findings` (from A08/A13 feedback), `a11y.violations` (from A06/QA scans), `wallet.flow.spec` (A29).
 **Produces:** `design.system.tokens`, `ui.wireframes`, `ux.spec`, `a11y.targets`, `usability.findings`.
 
 ```json

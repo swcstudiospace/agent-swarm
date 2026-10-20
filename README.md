@@ -1,14 +1,14 @@
-# AgentSwarm — 15-Agent Software Engineering Swarm
+# AgentSwarm — 30-Agent Software Engineering Swarm
 
-A complete design specification for a distributed swarm of 15 specialized AI agents that plan, build, verify, ship, and maintain production software collaboratively — with parallel execution, dynamic workload balancing, and self-organization.
+A complete design specification for a distributed swarm of 30 specialized AI agents that plan, build, verify, ship, and maintain production software collaboratively — with parallel execution, dynamic workload balancing, and self-organization. A01–A15 cover the SDLC; A16–A30 add three domains of five agents each: cloud-native, cluster and Web3.
 
 ## Document map
 
 | # | Document | Contents |
 |---|----------|----------|
-| 1 | [01-architecture.md](01-architecture.md) | Swarm topology, 15-agent roster, task model, load balancing, self-organization, rework/escalation |
+| 1 | [01-architecture.md](01-architecture.md) | Swarm topology, 30-agent roster, task model, load balancing, self-organization, rework/escalation |
 | 2 | [02-message-protocol.md](02-message-protocol.md) | Envelope `swarm.v1`, subjects & delivery semantics, task lifecycle state machine, shared error taxonomy, autonomy levels L0–L4 |
-| 3 | [03-agents/](03-agents/) | Full specifications A01–A15 (7 sections each: purpose, stack, I/O formats, decision logic & autonomy, error handling, metrics, security) |
+| 3 | [03-agents/](03-agents/) | Full specifications A01–A30 (7 sections each: purpose, stack, I/O formats, decision logic & autonomy, error handling, metrics, security) |
 | 4 | [04-integration-plan.md](04-integration-plan.md) | Interaction matrix, data-sharing substrate, reference event flows, contract governance, conflict-resolution ladder, autonomy interlocks |
 | 5 | [05-deployment-guide.md](05-deployment-guide.md) | Packaging, agent manifests, bootstrap sequence, config matrix, profiles, rollout, swarm observability, security baseline, sizing |
 | 6 | [06-testing-protocols.md](06-testing-protocols.md) | 7-level validation: golden tasks → contracts → integration flows → chaos → E2E benchmark → security red-team → prod invariants |
@@ -16,6 +16,7 @@ A complete design specification for a distributed swarm of 15 specialized AI age
 | 8 | [CLAUDE.md](CLAUDE.md) · [prompts/](prompts/) · [scripts/](scripts/) · [swarm/](swarm/) | Runnable implementation: subagent prompts, per-agent Python tools, orchestration runtime |
 | 9 | [docs/substrate-integration.md](docs/substrate-integration.md) | Platform pointer: how the spec's substrates map onto [Agent Substrate](https://github.com/swcstudiospace/agent-substrate) |
 | 10 | [docs/swarm-command-center.md](docs/swarm-command-center.md) · [docs/swarm-bar.md](docs/swarm-bar.md) · [docs/operations-runbook.md](docs/operations-runbook.md) | v2.2 runtime: continuous scheduler, telemetry, handover, tools and skills per agent, the omp bar; how-to guides, configuration, troubleshooting, known limits |
+| 11 | [docs/tools/catalog.md](docs/tools/catalog.md) · [docs/skills/catalog.md](docs/skills/catalog.md) | Generated per-agent catalogs of the 30 agents' registered tools and skills |
 
 ## Platform
 
@@ -30,10 +31,11 @@ in that set. The integration ADR lives in that repo
 [docs/substrate-integration.md](docs/substrate-integration.md) is the mirror pointer here. No swarm
 runtime behaviour depends on it today.
 
-## The 15 agents
+## The 30 agents
 
 | ID | Code | Role | Phase |
 |----|------|------|-------|
+| | | **Core SDLC (A01–A15)** | |
 | A01 | `ORCH` | Swarm Orchestrator — planning, scheduling, arbitration | Control |
 | A02 | `REQ` | Requirements Engineer — stories, acceptance criteria | Requirements |
 | A03 | `ARCH` | Solution Architect — blueprint, contracts, ADRs | Design |
@@ -49,6 +51,26 @@ runtime behaviour depends on it today.
 | A13 | `OBS` | Observability / SRE — SLOs, alerts, incidents | Monitoring |
 | A14 | `MAINT` | Maintenance Engineer — patches, debt, EOL | Maintenance |
 | A15 | `DOC` | Documentation Engineer — docs, runbooks, references | Cross-cutting |
+| | | **Cloud-Native domain (A16–A20)** | |
+| A16 | `CLOUD` | Cloud-Native Architect — landing zones, regional resilience, residency | Design |
+| A17 | `PLAT` | Platform Engineer — golden paths, service catalog, platform APIs | Deployment |
+| A18 | `SUPPLY` | Supply-Chain Security Engineer — images, SBOM, provenance, signatures | Cross-cutting |
+| A19 | `EVENT` | Event-Driven & Serverless Engineer — brokers, event schemas, consumers | Coding |
+| A20 | `FINOPS` | FinOps & GreenOps Analyst — cost, budgets, carbon | Maintenance |
+| | | **Cluster domain (A21–A25)** | |
+| A21 | `K8S` | Kubernetes Cluster Operator — upgrades, capacity, node pools | Deployment |
+| A22 | `GITOPS` | GitOps & Progressive Delivery Engineer — Argo CD/Flux, overlays, rollouts | Deployment |
+| A23 | `MESH` | Service Mesh & Networking Engineer — mTLS, ingress, NetworkPolicy | Deployment |
+| A24 | `KSEC` | Cluster Security & Policy Engineer — admission policy, RBAC, Pod Security | Cross-cutting |
+| A25 | `RESIL` | Resilience & Chaos Engineer — PDB, probes, backup, DR, chaos | Monitoring |
+| | | **Web3 domain (A26–A30)** | |
+| A26 | `SOL` | Smart Contract Engineer — contracts, tests, gas, deployment plans | Coding |
+| A27 | `AUDIT` | Smart Contract Auditor — static analysis, invariants, attack models | Quality |
+| A28 | `CHAIN` | Blockchain Infrastructure Engineer — nodes, RPC policy, indexers | Deployment |
+| A29 | `DAPP` | dApp & Wallet Integration Engineer — wallets, signing flows | Coding |
+| A30 | `CUSTODY` | Web3 Custody & Compliance Engineer — multisig, key ceremonies, screening | Deployment |
+
+A01–A15 are the core SDLC agents. A16–A30 are three specialist domains of five agents each: Cloud-Native (A16–A20), Cluster (A21–A25) and Web3 (A26–A30). No new agent owns a gate: A08, A09, A10 and A12 remain the only gate owners, and the domain agents' work flows through them. Each agent has a shared baseline of tools and skills plus 10 to 15 of its own; the per-agent lists are the generated catalogs [docs/tools/catalog.md](docs/tools/catalog.md) and [docs/skills/catalog.md](docs/skills/catalog.md).
 
 **Complementarity guarantee:** every SDLC phase has exactly one accountable (single-writer) agent per artifact class; overlap is limited to consumer/producer relationships, and every artifact row has ≥ 1 consumer (see interaction matrix).
 
@@ -83,6 +105,8 @@ python3 scripts/receipt_export.py --repo /path/to/codebase --json  # desk verifi
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
 
+`orch_plan.py --pattern` takes `feature` (13 tasks), `hotfix` (8), `dependency` (8), the three domain patterns `cloud-native` (15 tasks, with A16–A20), `cluster` (12, with A21–A25) and `web3` (14, with A26–A30), each also running the core gates and release agents, `parallel` (one short lane per disjoint path set) and `custom --plan plan.json`. The `cluster` and `web3` patterns pin their implementer tasks to risk class `high` (all four gates); `cloud-native` follows `--risk-class`. A file path in a graph plan (`scripts/orch_from_graph.py`) routes to the owning specialist, e.g. `*.sol` to A26, `charts/` to A22, `Dockerfile*` to A18.
+
 `scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
 
 Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE` (which must be an absolute path),
@@ -99,7 +123,7 @@ Grok headless dispatch currently fails closed because its installed interface do
 the old stdin transport. Start a fresh OMP process after updating the extension.
 
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
-`a02-requirements` … `a15-docs` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
+`a02-requirements` … `a30-custody-compliance` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
 
 ### Swarm Command Center (v2.2)
 
@@ -115,7 +139,7 @@ outside the workspace holding that agent's `SUBSTRATE_TOKEN`, taken from `SUBSTR
 environment ([docs/substrate-workspace.md](docs/substrate-workspace.md)). The install step writes only inside `<ws>` (never into this repo or `~/.omp`), except the per-agent substrate credential env files under `${XDG_CONFIG_HOME:-~/.config}/agent-swarm/agents/` (outside the workspace by design; skipped with `--no-substrate`); the regeneration pass may update this repo's tracked generated files.
 It refuses (exit 2, nothing written) a workspace inside this checkout, equal to `$HOME` or inside `~/.omp`, any
 destination reached through a symlink (the file or a parent dir under `<ws>`), a runtime that cannot call MCP, and an
-agent whose token it cannot deliver; for the last it prints what you must create.
+agent whose token it cannot deliver; for the last it prints what you must create. The substrate wiring needs one token per agent, 30 in all (`SUBSTRATE_TOKEN_<SURFACE>`); the surfaces of A16–A30 must exist on the agent-substrate server, otherwise install with `--no-substrate`.
 
 ```bash
 python3 scripts/build_agents.py --install-workspace /path/to/ws                  # omp link mode (default)
@@ -164,7 +188,7 @@ Python scripts there.
 
 ## Cursor cloud agents
 
-`.cursor/agents/` holds one generated subagent per slug (`a01-orchestrator` … `a15-docs`). `python3 scripts/build_agents.py` writes them from `prompts/` plus a Cursor preamble, and `--check` fails if a file drifts. Frontmatter is `name`, `description`, and `model: inherit` ([Cursor subagents](https://cursor.com/docs/subagents)).
+`.cursor/agents/` holds one generated subagent per slug (`a01-orchestrator` … `a30-custody-compliance`). `python3 scripts/build_agents.py` writes them from `prompts/` plus a Cursor preamble, and `--check` fails if a file drifts. Frontmatter is `name`, `description`, and `model: inherit` ([Cursor subagents](https://cursor.com/docs/subagents)).
 
 Cursor cloud sessions are advisory. No signing key is present (`SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY` and `SWARM_REQUIRE_KEY` unset), so gate scripts record nothing and nothing from that session counts as APPROVED. A missing signing key is the expected Cursor state and is not E-DEP: the agent accepts an unsigned `task.assign` from the parent session or `a01-orchestrator` and does not sign. Every gate script (`qa_gate`, `rev_gate`, `sec_gate`, `rel_plan`) runs only as a non-recording preview through python3 with `SWARM_AGENT_SESSION=1` in its environment. The bun twin `scripts/ts/sec_gate.ts` is not that preview. Non-gate results use `orch_status.py --ingest --advisory`, which saves the result and does not attempt APPROVED or DONE. The script writes an advisory envelope file and records no verdict rows. The agent never sets `SWARM_SIGNING_KEY`, `SWARM_ED25519_KEY` or `SWARM_ALLOW_INSECURE_DEV_KEY`, never signs or records a verdict, and never ingests a gate result or transitions a task to APPROVED or DONE. A gate result that fails, is refused or is unrecorded is advisory, never a pass. `render_cursor` rewrites A01's in-session ingest lines so a gate result is not ingested: A01 transitions that gate task to BLOCKED (`advisory preview recorded no verdict rows; human records the gate`), stops the scheduling loop, and leaves dependents unscheduled. A missing Task Store, `python3` or git is still E-DEP. The merge gate is Greptile, run by Desk Quality. A Cursor agent never merges a pull request, enables auto-merge, pushes to a protected branch or deletes a branch. Work ends at a draft PR, and a human merges after that gate. Where the shared prompt grants a merge or an auto-merge, `render_cursor` rewrites the line into draft-PR wording (A14 and A09). Worker branches follow the host repository. In a Programming Desk repo that is `bot-0N-<seat>/<task_id>`, where `bot-0N-<seat>` is the `ownership.yaml` owner of the files being changed, because the desk `gates.yml` rejects any prefix other than `^bot-0[0-6]-[a-z0-9-]+$`. `render_cursor` rewrites `swarm/<task_id>` (A05, A06) and `auto-fix/*` (A09) to `<seat-prefix>/<task_id>`. The substitution table raises if an expected pattern is missing from the prompt body. Those rewrites are Cursor-only; the Claude, Grok and omp renders keep the shared prompt. Nesting stops at two levels: the parent may spawn `a01-orchestrator`, A01 may spawn the other slugs, and those specialists must not spawn further.
 
@@ -176,7 +200,7 @@ python3 "$SWARM_ROOT/scripts/<tool>.py" --root <target repo> --json
 
 `<target repo>` is the git toplevel of the repo being edited. Repo-local `scripts/` is used only when `SWARM_ROOT` is unset and the working tree is this agent-swarm checkout. In any other repo, including one that already has its own `scripts/` directory, the agents stop until `SWARM_ROOT` is set. That is the setup a follow-up install into `swcstudiospace/programming-desk` depends on.
 
-The installer copies only `.cursor/` (the 15 agents, `.cursor/rules/agent-swarm.mdc`, and a provenance stamp). It does not write MCP config or env files and it does not wire substrate.
+The installer copies only `.cursor/` (the 30 agents, `.cursor/rules/agent-swarm.mdc`, and a provenance stamp). It does not write MCP config or env files and it does not wire substrate.
 
 ```bash
 python3 scripts/_install_cursor.py --target /path/to/repo            # copy
@@ -189,9 +213,9 @@ It refuses a symlink on the way, a target inside this checkout or equal to `$HOM
 
 ## Grok Bot seat map
 
-`python3 scripts/build_agents.py` also writes `grokbot/swarm/seat-map.json` and one `grokbot/skills/swarm-<lane>/SKILL.md` per manifest lane (`control`, `delivery`, `code`, `verify`, `ops`, `sustain`). `--check` fails if those files drift. The generator does not write under `.grok/` and does not touch the hand-written `grokbot/skills/swarm-cloud-dispatch/SKILL.md`. There is no sixteenth role.
+`python3 scripts/build_agents.py` also writes `grokbot/swarm/seat-map.json` and one `grokbot/skills/swarm-<lane>/SKILL.md` per manifest lane (`control`, `delivery`, `code`, `verify`, `ops`, `sustain`). `--check` fails if those files drift. The generator does not write under `.grok/` and does not touch the hand-written `grokbot/skills/swarm-cloud-dispatch/SKILL.md`. There is no role beyond A30.
 
-The map lists each of the 15 roles with a home (`desk-lead`, a desk seat, `executor`, `routine` or `cloud`), the seat that verifies the work, path globs, that seat's verification tools, and the autonomy ceiling from `agents.json`. Android, iOS and desktop are routing rules, because the swarm has no mobile or desktop role: `android/**` (and Kotlin/Gradle) to `bot-03-android`, `ios/**` (and Swift/Xcode) to `bot-04-ios`, desktop shells (`desktop/**`, `electron/**`, `tauri/**`) to `bot-02-web-edge`. A routing rule wins over a role path glob. When two roles both match, the longest path glob wins, and an equal length goes to the lowest role id, so the shared `scripts/code_checks.py` and `scripts/ts/code_checks.ts` (A05 and A06) resolve to A05. A lead-owned doc stays with Desk Lead when its literal glob is longer than `docs/**`. UX design paths stay with `bot-01-systems-backend`, matching `design/**` in the desk ownership manifest.
+The map lists each of the 30 roles with a home (`desk-lead`, a desk seat, `executor`, `routine` or `cloud`), the seat that verifies the work, path globs, that seat's verification tools, and the autonomy ceiling from `agents.json`. Android, iOS and desktop are routing rules, because the swarm has no mobile or desktop role: `android/**` (and Kotlin/Gradle) to `bot-03-android`, `ios/**` (and Swift/Xcode) to `bot-04-ios`, desktop shells (`desktop/**`, `electron/**`, `tauri/**`) to `bot-02-web-edge`. A routing rule wins over a role path glob. When two roles both match, the longest path glob wins, and an equal length goes to the lowest role id, so the shared `scripts/code_checks.py` and `scripts/ts/code_checks.ts` (A05 and A06) resolve to A05. A lead-owned doc stays with Desk Lead when its literal glob is longer than `docs/**`. UX design paths stay with `bot-01-systems-backend`, matching `design/**` in the desk ownership manifest.
 
 Each lane skill reads prompts and runs scripts from `$SWARM_ROOT`, the pinned agent-swarm checkout, and passes `--root` for the target repo. A target such as programming-desk does not contain the swarm runtime.
 

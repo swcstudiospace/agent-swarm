@@ -22,6 +22,8 @@ Docs-as-code, API reference generation, runbook engineering, information archite
 - `requirements.spec` (A02) — feature summaries in acceptance-criteria language.
 - `architecture.blueprint` + `adr.set` (A03), `api.contract` / `data.contract` (A03/A07), `ux.spec` (A04).
 - `code.patch` / `impl.notes` (A05/A06), `release.record` / `release.notes` (A12), `slo.manifest` and `runbook.requests` (A13), `memory.retrospectives`.
+- `dr.runbook` (A25), `service.catalog.entry` (A17), `event.schema.set` (A19), `promotion.record` (A22) — fold them into the runbook registry, service pages and API references; never fork A25's DR steps.
+- `audit.report` (A27), `dapp.integration.spec` (A29) — publish audit scope and resolved findings and the dapp integration guide; copy severities as given and never restate them.
 </inputs>
 
 <outputs>

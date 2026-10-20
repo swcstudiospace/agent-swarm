@@ -13,11 +13,14 @@ import type { ToolCallEvent, ToolCallResult } from "./omp-api.ts";
 
 export const ORCHESTRATOR = "a01-orchestrator";
 
-/** The 15 swarm agents (copied from agents.json agents[].slug; guard.test.ts pins the list against agents.json). */
+/** The 30 swarm agents (copied from agents.json agents[].slug; guard.test.ts pins the list against agents.json). */
 export const SWARM_SLUGS: readonly string[] = [
   "a01-orchestrator", "a02-requirements", "a03-architect", "a04-ux-designer", "a05-backend",
   "a06-frontend", "a07-data", "a08-qa", "a09-reviewer", "a10-security",
   "a11-devops", "a12-release", "a13-observability", "a14-maintenance", "a15-docs",
+  "a16-cloud-architect", "a17-platform-engineer", "a18-supply-chain", "a19-event-driven", "a20-finops",
+  "a21-cluster-ops", "a22-gitops", "a23-mesh-network", "a24-cluster-security", "a25-resilience",
+  "a26-smart-contract", "a27-contract-audit", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance",
 ];
 
 /** Tools that move Task Store state: A01 only, for every caller including the unidentified main session (D-05). */
@@ -2094,6 +2097,366 @@ function orchStateScript(seg: Segment): boolean {
 /** `claude` / `grok` / `omp` (a path's basename too): a nested agent CLI has no swarm guard and still reaches MCP. */
 const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(seg.words[0] ?? "");
 
+/** A flag name that never takes the next word as its value. */
+const NO_VALUE_FLAG = /(?!)/;
+
+/**
+ * A CLI's words after its program word, up to a `--` (the words after it are another command's): the positional
+ * words, and every flag with its value (`--flag=value`, `-fvalue`, or the next word for a flag `valueFlag` names).
+ */
+function cliArgs(rest: string[], valueFlag: RegExp): { positional: string[]; flags: CliFlag[] } {
+  const positional: string[] = [];
+  const flags: CliFlag[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w === "--") break;
+    if (!w.startsWith("-") || w === "-") {
+      positional.push(w);
+      continue;
+    }
+    const long = /^(--[^=]+)(?:=(.*))?$/.exec(w);
+    const flag = long === null ? w.slice(0, 2) : long[1];
+    let value = long === null ? (w.length > 2 ? w.slice(2).replace(/^=/, "") : undefined) : long[2];
+    if (value === undefined && valueFlag.test(flag)) value = rest[++i];
+    flags.push({ flag, value });
+  }
+  return { positional, flags };
+}
+
+/** A flag of a parsed command line, with its value when it has one. */
+interface CliFlag {
+  flag: string;
+  value: string | undefined;
+}
+/** A boolean flag that is on: present, and not given a false value (`--prune=false`). */
+const flagOn = (flags: CliFlag[], name: string) => flags.some((f) => f.flag === name && !/^(?:false|0|no)$/i.test(f.value ?? ""));
+/** A word names prod: a D-04 marker or release tag, also as a dotted part of a host name (`argocd.prod.example.com`). */
+const prodWord = (w: string) => isProdMarker(w) || w.split(".").some(isProdMarker);
+/** The values of the flags `names` matches. */
+const flagValues = (flags: CliFlag[], names: RegExp): string[] => flags.flatMap((f) => (names.test(f.flag) && f.value !== undefined ? [f.value] : []));
+
+/** A command word that only prints or searches its operands and never runs them (`echo cast send`, `grep -rn argocd app sync prod .`). */
+const INERT_COMMAND = /^(?:echo|printf|grep|egrep|fgrep|rg|ag|ack|man|whatis|apropos|which|whereis|type)$/;
+/**
+ * `check(at)` for every word naming one of `tools` (toolAt's match), unless the command is an INERT_COMMAND. Every
+ * occurrence counts: a directory, container or `--cwd` value named like the tool may come first (`docker run -w /src/cast img cast send`).
+ */
+const eachTool = (words: string[], tools: RegExp, check: (at: number) => boolean): boolean =>
+  !INERT_COMMAND.test(words[0] ?? "") && words.some((w, at) => tools.test(posix.basename(w).replace(/@[^/]*$/, "")) && check(at));
+/** `--help` (unless `--help=false`) or a bare `-h` before a `--`: the CLI prints usage and exits, whatever verb it follows. */
+const helpOnly = (flags: CliFlag[]) => flagOn(flags, "--help") || flags.some((f) => f.flag === "-h" && f.value === undefined);
+/** cliArgs of the words after the tool at `at`; a launcher's own `--` right after the tool (`npm exec hardhat -- run …`) is skipped. */
+const argsAfter = (words: string[], at: number, valueFlag: RegExp) => cliArgs(words.slice(words[at + 1] === "--" ? at + 2 : at + 1), valueFlag);
+/**
+ * Where a CLI's verb can start among its `positional` words: the first word when the tool is the command itself, and
+ * also the second when a launcher put a word before it (`docker run --entrypoint cast img send` names the image first).
+ */
+const verbStarts = (positional: string[], at: number): string[][] => (at === 0 ? [positional] : [positional, positional.slice(1)]);
+
+const ARGOCD_VALUE_FLAG =
+  /^(?:--server|--auth-token|--argocd-context|--config|--kube-context|--kubeconfig|-H|--header|-p|--project|-N|--app-namespace|-l|--selector|-o|--output|--revision|--repo|--dest-server|--dest-namespace|--dest-name|--name|--path|--patch|--patch-file|--type|-f|--file|--values|--parameter|--helm-set|--helm-set-string|--helm-set-file|--kustomize-image|--sync-policy|--sync-option|--loglevel|--logformat|--grpc-web-root-path|--controller-name|--server-name|--client-crt|--client-crt-key|--redis-name|--repo-server-name|--label|--resource|--timeout|--retry-limit)$/;
+/** argocd flags whose value names where the change lands (the D-04 markers apply to these values and to the operands). */
+const ARGOCD_TARGET_FLAG = /^(?:--server|--argocd-context|--kube-context|--dest-server|--dest-namespace|--dest-name|-N|--app-namespace|-p|--project|--name|-l|--selector)$/;
+const ARGOCD_GROUP = /^(?:app|appset|cluster|repo|repocreds|proj|account|cert|gpg|context|login|logout|relogin|admin|version|notifications|completion|configure|help)$/;
+const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
+  app: {
+    change: /^(?:sync|rollback|delete|set|patch|terminate-op|delete-resource)$/,
+    other: /^(?:get|list|ls|diff|history|logs|wait|manifests|resources|actions|create|unset|edit)$/,
+  },
+  appset: { change: /^(?:create|delete)$/, other: /^(?:get|list|generate)$/ },
+  cluster: { change: /^(?:add|rm|create|delete|set|rotate-auth)$/, other: /^(?:get|list|role|windows|edit)$/ },
+  repo: { change: /^(?:add|rm|create|delete)$/, other: /^(?:get|list|set|role|windows|rotate-auth|edit)$/ },
+  proj: { change: /^(?:add|rm|create|delete|set|(?:add|remove)-[\w-]+)$/, other: /^(?:get|list|role|windows|rotate-auth|edit)$/ },
+};
+
+/**
+ * `argocd app sync|rollback|delete|set|patch|terminate-op|delete-resource`, `argocd appset create|delete` and `argocd
+ * cluster|repo|proj add|rm|create|delete` (also `cluster set|rotate-auth`, `proj set|add-*|remove-*`) that land in prod
+ * (a D-04 marker in an operand or in the value of a destination or selector flag: `--server`, `--dest-namespace`,
+ * `--project`, `-l` …) or that prune, force or replace (`--prune`, `--force`, `--replace`, unless `=false`). The verb is
+ * the first positional after the group word that is a known verb, so a flag value never stands in for it; `--dry-run` is
+ * exempt only as argocd's own flag, and `--help` prints usage. get, list, diff, history, logs, wait and manifests never match.
+ */
+function argocdChange({ words }: Segment): boolean {
+  return eachTool(words, /^argocd$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, ARGOCD_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    const g = positional.findIndex((w) => ARGOCD_GROUP.test(w));
+    const verbs = g === -1 ? undefined : ARGOCD_VERBS[positional[g]];
+    if (verbs === undefined) return false;
+    const v = positional.findIndex((w, i) => i > g && (verbs.change.test(w) || verbs.other.test(w)));
+    // `--dry-run`, `--dry-run=client|server|true` render only; an exemption counts only as argocd's own flag, not as another flag's value
+    const dryRun = flags.some((f) => f.flag === "--dry-run" && (f.value === undefined || /^(?:client|server|true)$/.test(f.value)));
+    if (v === -1 || !verbs.change.test(positional[v]) || dryRun) return false;
+    if (["--prune", "--force", "--replace"].some((f) => flagOn(flags, f))) return true;
+    return [...positional.slice(v + 1), ...flagValues(flags, ARGOCD_TARGET_FLAG)].some(prodWord);
+  });
+}
+
+const FLUX_VALUE_FLAG = /^(?:-n|--namespace|--context|--kubeconfig|--timeout|--as|--as-group|--cache-dir|--server|--token)$/;
+const FLUX_FLAG_TARGET = /^(?:-n|--namespace|--context|--kubeconfig)$/;
+const FLUX_ALWAYS = /^(?:delete|uninstall|bootstrap)$/;
+const FLUX_PROD = /^(?:suspend|resume)$/;
+const FLUX_OTHER =
+  /^(?:get|check|export|build|diff|events|logs|tree|trace|stats|version|create|reconcile|install|push|pull|tag|completion|help|migrate|envsubst|debug|patch)$/;
+
+/**
+ * `flux delete|uninstall|bootstrap` always, `flux suspend|resume` with a D-04 marker in an operand or in the value of
+ * `-n`/`--namespace`/`--context`/`--kubeconfig`. The verb is the first positional that is a flux command.
+ */
+function fluxChange({ words }: Segment): boolean {
+  return eachTool(words, /^flux$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, FLUX_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    const v = positional.findIndex((w) => FLUX_ALWAYS.test(w) || FLUX_PROD.test(w) || FLUX_OTHER.test(w));
+    if (v === -1) return false;
+    if (FLUX_ALWAYS.test(positional[v])) return true;
+    return FLUX_PROD.test(positional[v]) && [...positional.slice(v + 1), ...flagValues(flags, FLUX_FLAG_TARGET)].some(prodWord);
+  });
+}
+
+const MESH_VALUE_FLAG =
+  /^(?:-f|--filename|-s|--set|-r|--revision|-n|--namespace|-i|--istioNamespace|-L|--linkerd-namespace|-c|--kubeconfig|--context|-o|--output|--manifests|--charts|--helm-set|--version|--repository|--chart-directory|--datapath-mode)$/;
+
+/** `istioctl|linkerd|cilium install|uninstall|upgrade`, also `istioctl x uninstall`; analyze, manifest generate, x precheck, version, check, status and `--help` never match. */
+function meshLifecycle({ words }: Segment): boolean {
+  return eachTool(words, /^(?:istioctl|linkerd|cilium)$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, MESH_VALUE_FLAG);
+    return !helpOnly(flags) && positional.some((w) => /^(?:install|uninstall|upgrade)$/.test(w));
+  });
+}
+
+const VELERO_VALUE_FLAG =
+  /^(?:-n|--namespace|--kubecontext|--kubeconfig|--features|--cacert|--client-qps|--client-burst|--client-page-size|-v|--v|--vmodule|--log_dir|--log_file|--log_file_max_size|--log_backtrace_at|--stderrthreshold|-o|--output|-l|--selector|--from-backup|--from-schedule)$/;
+const VELERO_OBJECT = /^(?:backup|restore|schedule|backup-location|snapshot-location)$/;
+
+/** `velero install|uninstall`, `restore create`, and `backup|restore|schedule|backup-location|snapshot-location delete` (also `velero create restore`, `velero delete <object>`); backup create, get, describe and `--help` never match. */
+function veleroChange({ words }: Segment): boolean {
+  return eachTool(words, /^velero$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, VELERO_VALUE_FLAG);
+    return (
+      !helpOnly(flags) &&
+      verbStarts(positional, at).some(
+        ([first = "", second = ""]) =>
+          /^(?:install|uninstall)$/.test(first) ||
+          (first === "restore" && second === "create") ||
+          (first === "create" && second === "restore") ||
+          (VELERO_OBJECT.test(first) && second === "delete") ||
+          (first === "delete" && VELERO_OBJECT.test(second)),
+      )
+    );
+  });
+}
+
+const EKSCTL_VALUE_FLAG = /^(?:-f|--config-file|-c|--cluster|--region|--profile|-n|--name|--nodes|--nodegroup-name|--version)$/;
+const GCLOUD_VALUE_FLAG = /^(?:--project|--zone|--region|--account|--configuration|--format|--impersonate-service-account|--billing-project|--verbosity|--filter|--flatten|--limit|--sort-by|--page-size)$/;
+const GCLOUD_CLUSTER_CHANGE = /^(?:create|create-auto|upgrade|resize|update)$/;
+const GCLOUD_CLUSTER_OTHER = /^(?:delete|describe|list|get-credentials|get-upgrade-info|get-values)$/;
+const AZ_VALUE_FLAG = /^(?:-g|--resource-group|-n|--name|--subscription|-l|--location|-o|--output|--query|--cluster-name|--nodepool-name|--kubernetes-version|--node-count|-c)$/;
+const AKS_CHANGE = /^(?:create|upgrade|scale|update|start|stop|rotate-certs)$/;
+const AKS_OTHER = /^(?:delete|show|list|get-credentials|get-upgrades|get-versions|browse|wait|check-acr|kanalyze|kollect|operation-abort|install-cli|command)$/;
+const AKS_NODEPOOL_CHANGE = /^(?:add|scale|update|upgrade|start|stop)$/;
+
+const EKSCTL_CHANGE = /^(?:create|delete|upgrade|scale|update(?:-[\w-]+)?)$/;
+
+/**
+ * Managed-cluster lifecycle: `eksctl create|delete|upgrade|scale|update` (also `eksctl utils update-*`); `gcloud container
+ * clusters|node-pools create|create-auto|upgrade|resize|update`; `az aks create|upgrade|scale|update|start|stop|rotate-certs` and
+ * `az aks nodepool add|scale|update|upgrade|start|stop`. A gcloud/az `delete` is cloud-destructive's (an earlier row),
+ * and get, list, describe, show, get-credentials and `--help` never match.
+ */
+function managedClusterChange({ words }: Segment): boolean {
+  return eachTool(words, /^(?:eksctl|gcloud|az)$/, (at) => {
+    const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
+    const { positional, flags } = argsAfter(words, at, tool === "eksctl" ? EKSCTL_VALUE_FLAG : tool === "gcloud" ? GCLOUD_VALUE_FLAG : AZ_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    if (tool === "eksctl") return positional.some((w) => EKSCTL_CHANGE.test(w));
+    if (tool === "gcloud") {
+      const c = positional.indexOf("container");
+      const g = c === -1 ? -1 : positional.findIndex((w, i) => i > c && /^(?:clusters|node-pools)$/.test(w));
+      const v = g === -1 ? -1 : positional.findIndex((w, i) => i > g && (GCLOUD_CLUSTER_CHANGE.test(w) || GCLOUD_CLUSTER_OTHER.test(w)));
+      return v !== -1 && GCLOUD_CLUSTER_CHANGE.test(positional[v]);
+    }
+    const aks = positional.indexOf("aks");
+    if (aks === -1) return false;
+    const after = positional.slice(aks + 1);
+    const v = after.findIndex((w) => AKS_CHANGE.test(w) || w === "nodepool" || AKS_OTHER.test(w));
+    if (v === -1) return false;
+    if (after[v] !== "nodepool") return AKS_CHANGE.test(after[v]);
+    return after.slice(v + 1).some((w) => AKS_NODEPOOL_CHANGE.test(w));
+  });
+}
+
+const KUBEADM_VERB = /^(?:init|join|reset|upgrade|token|certs|config|version|kubeconfig|completion|help)$/;
+/** kubeadm flags that take the next word, whatever it looks like (`--cri-socket --help` is a socket named `--help`). */
+const KUBEADM_VALUE_FLAG =
+  /^(?:--config|--kubeconfig|--cri-socket|--node-name|--token|--discovery-token|--discovery-token-ca-cert-hash|--discovery-token-unsafe-skip-ca-verification|--discovery-file|--certificate-key|--tls-bootstrap-token|--apiserver-advertise-address|--apiserver-bind-port|--apiserver-cert-extra-sans|--control-plane-endpoint|--pod-network-cidr|--service-cidr|--service-dns-domain|--kubernetes-version|--image-repository|--cert-dir|--ignore-preflight-errors|--patches|--skip-phases|--feature-gates|--rootfs|--ttl|-v|--v)$/;
+
+/** `kubeadm init|join|reset|upgrade`; `upgrade plan|diff` only read, and token, certs, config, version and `--help` never match. */
+function kubeadmChange({ words }: Segment): boolean {
+  return eachTool(words, /^kubeadm$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, KUBEADM_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    const v = positional.findIndex((w) => KUBEADM_VERB.test(w));
+    if (v === -1) return false;
+    if (positional[v] === "upgrade") return !/^(?:plan|diff)$/.test(positional[v + 1] ?? "");
+    return /^(?:init|join|reset)$/.test(positional[v]);
+  });
+}
+
+/** A network name that is a local chain: no transaction reaches a public network (`--network localhost`). */
+const LOCAL_CHAIN_NETWORK = /^(?:hardhat|localhost|anvil|development|local)$/i;
+/** An anchor cluster that is local: `localnet` (`l`), or a loopback URL. */
+const LOCAL_ANCHOR_CLUSTER = /^(?:localnet|l|localhost|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?)$/i;
+/** Options foundry's cast and forge take a value for: the global ones that may precede the verb (`cast --color never send`) and the wallet selectors (so `cast wallet address --account deployer` has no key operand). */
+const FOUNDRY_VALUE_FLAG = /^(?:--color|-j|--threads|--network|--account|--keystore|--password|--password-file|--from|--mnemonic-index|--mnemonic-derivation-path|--hd-path)$/;
+const FRAMEWORK_VALUE_FLAG = /^--(?:network|config|tsconfig|root|cache-path|max-memory)$/;
+/** The first two words (`verb sub`) of a framework command that talks to the chain its network names. */
+const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
+  hardhat: /^(?:run|deploy|console|test|ignition deploy)(?: |$)/,
+  truffle: /^(?:migrate|deploy|exec|console|test)(?: |$)/,
+  brownie: /^(?:run|console|test)(?: |$)/,
+};
+
+/** `HARDHAT_NETWORK=name`, assigned on the segment or exported earlier on the same command line. */
+const HARDHAT_ENV = /(?:^|[\s;&|(])HARDHAT_NETWORK=([^\s;&|)]+)/;
+
+/**
+ * `hardhat run|deploy|ignition deploy|console|test`, `truffle migrate|deploy|exec|console|test`, `brownie
+ * run|console|test` against a `--network` that is not a local one: any of several `--network` flags that is not local
+ * counts, and `HARDHAT_NETWORK` is the network of a hardhat command that gives no flag (a run without either is the
+ * in-process chain). compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
+ */
+function frameworkDeploy({ words, marked }: Segment, command: string): boolean {
+  return eachTool(words, /^(?:hardhat|truffle|brownie)$/, (at) => {
+    const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
+    const { positional, flags } = argsAfter(words, at, FRAMEWORK_VALUE_FLAG);
+    if (helpOnly(flags) || !verbStarts(positional, at).some((p) => FRAMEWORK_NETWORK_VERB[tool].test(p.slice(0, 2).join(" ")))) return false;
+    const named = flags.filter((f) => f.flag === "--network");
+    if (named.length > 0) return named.some((f) => f.value !== undefined && !LOCAL_CHAIN_NETWORK.test(f.value));
+    const env = tool === "hardhat" ? (HARDHAT_ENV.exec(marked) ?? HARDHAT_ENV.exec(command))?.[1] : undefined;
+    return env !== undefined && !LOCAL_CHAIN_NETWORK.test(unquote(env));
+  });
+}
+
+/** `forge script … --broadcast|--resume` and `forge create` (also `c`); `forge script` without them only simulates, test, build, fmt never match. */
+function forgeBroadcast({ words }: Segment): boolean {
+  return eachTool(words, /^forge$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    return verbStarts(positional, at).some(([verb]) => verb === "create" || verb === "c" || (verb === "script" && (flagOn(flags, "--broadcast") || flagOn(flags, "--resume"))));
+  });
+}
+
+/**
+ * The `group verb` words of the cast subcommands that submit a transaction (short aliases included): `send|s`,
+ * `publish|p`, `batch-send|bs`, `erc20|erc20-token transfer|approve|mint|burn|permit`, `erc4626|vault
+ * deposit|mint|withdraw|redeem`, `safe create|execute|propose|sign|add-delegate|remove-delegate`, and the Tempo
+ * `tip20`, `tip403`, `receive-policy`, `keychain`, `storage-credits`, `vaddr` and `tempo zone` writes.
+ */
+const CAST_SUBMIT =
+  /^(?:(?:send|s|publish|p|batch-send|bs)|(?:erc20|erc20-token) (?:transfer|approve|a|mint|m|burn|bu|permit)|(?:erc4626|vault) (?:deposit|mint|withdraw|redeem)|safe (?:create|execute|propose|sign|add-delegate|remove-delegate)|tip20 (?:create|c|logo-set|grant-role|revoke-role)|tip403 (?:create|whitelist|blacklist)|receive-policy (?:set|claim|burn)|(?:keychain|kc) (?:authorize|auth|revoke|rev|burn-witness|update-limit|ul|set-scope|ss|remove-scope|rs|add-call|set-limit|remove-target)|(?:storage-credits|sc) (?:set-mode|set-budget)|vaddr (?:create|c)|tempo zone (?:deposit|withdraw))(?: |$)/;
+
+/**
+ * `cast send|publish|batch-send` and the other submitting subcommands (CAST_SUBMIT), and `cast rpc|rp` of a `*_send*`
+ * method (`eth_sendRawTransaction`, `personal_sendTransaction`, `wallet_sendCalls`, `eth_sendBundle`); call, balance,
+ * block, 4byte, and `mktx`/`batch-mktx` (they sign and print, nothing reaches a network) only read or sign offline.
+ */
+function castBroadcast({ words }: Segment): boolean {
+  return eachTool(words, /^cast$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    return verbStarts(positional, at).some((p) => CAST_SUBMIT.test(p.slice(0, 3).join(" ")) || (/^(?:rpc|rp)$/.test(p[0] ?? "") && p.some((w) => /^[a-z0-9]+_send/i.test(w))));
+  });
+}
+
+const SOLANA_VALUE_FLAG = /^(?:-u|--url|--ws|-k|--keypair|-C|--config|--commitment|--output|--fee-payer|--owner|--program-id)$/;
+const SPL_VALUE_FLAG = /^(?:-u|--url|-C|--config|--owner|--fee-payer|--program-id|--output|--verbosity|--with-compute-unit-price|--with-compute-unit-limit)$/;
+const NEAR_VALUE_FLAG = /^--(?:networkId|accountId|masterAccount|nodeUrl|keyPath|helperUrl|walletUrl)$/;
+const SUI_VALUE_FLAG = /^--(?:client\.config|gas|gas-budget|gas-price)$/;
+const ANCHOR_VALUE_FLAG = /^--(?:provider\.cluster|provider\.wallet|program-name|program-keypair|program-id|cwd)$|^-p$/;
+/** The first two words (`verb sub`) of a solana, spl-token, starkli, sui or aptos command that submits a transaction. */
+const CHAIN_SUBMIT: Record<string, RegExp> = {
+  solana:
+    /^(?:transfer|deploy|create-stake-account|delegate-stake|deactivate-stake|withdraw-stake|split-stake|merge-stake|stake-authorize|create-vote-account|withdraw-from-vote-account|create-nonce-account|withdraw-from-nonce-account|program (?:deploy|upgrade|write-buffer|close|extend|migrate|set-buffer-authority|set-upgrade-authority))(?: |$)/,
+  "spl-token":
+    /^(?:transfer|mint|burn|approve|revoke|create-token|create-account|close-account|close-mint|authorize|freeze|thaw|wrap|unwrap|sync-native|gc|set-transfer-fee|initialize-metadata|update-metadata|withdraw-excess-lamports)(?: |$)/,
+  starkli: /^(?:invoke|deploy|declare|account deploy)(?: |$)/,
+  sui: /^client (?:call|publish|upgrade|transfer|transfer-sui|pay|pay-sui|pay-all-sui|split-coin|merge-coin|ptb|execute-signed-tx)(?: |$)/,
+  aptos: /^(?:move (?:publish|run|run-script|deploy-object|upgrade-object|upgrade-object-package|create-object-and-publish-package)|account (?:transfer|create|create-resource-account|rotate-key)|stake (?!show-))/,
+};
+/** anchor commands that put a program or its IDL on a cluster. */
+const ANCHOR_DEPLOY = /^(?:deploy|upgrade|migrate|idl (?:init|upgrade|set-authority|write-buffer|erase-authority|close|create-buffer))(?: |$)/;
+
+/** near-cli (`send|call|deploy|create-account|delete-account|stake|add-key|delete-key`) and near-cli-rs (`tokens … send-*`, `contract deploy|call-function … as-transaction`, `account create-account|delete-account|add-key|delete-key`, `transaction send-signed-transaction`) writes; `view`, `state` and `as-read-only` only read. */
+function nearSubmits(p: string[]): boolean {
+  const [verb = "", sub = ""] = p;
+  if (/^(?:send|send-near|call|deploy|dev-deploy|create-account|delete-account|stake|add-key|delete-key)$/.test(verb)) return true;
+  if (verb === "tokens") return p.some((w) => /^send-(?:near|ft|nft)$/.test(w));
+  if (verb === "contract") return sub === "deploy" || (sub === "call-function" && p.includes("as-transaction"));
+  if (verb === "account") return p.some((w) => /^(?:create-account|delete-account|add-key|delete-key)$/.test(w));
+  return verb === "transaction" && sub === "send-signed-transaction";
+}
+
+/**
+ * Submitting or deploying on a non-EVM chain: `solana transfer|program deploy|upgrade|write-buffer|close|…` and the
+ * stake, vote and nonce fund moves, `anchor deploy|upgrade|migrate|idl init|upgrade|…` unless `--provider.cluster` is
+ * local (an anchor run that names no cluster reads it from Anchor.toml and cannot be judged: it counts; `anchor test`
+ * counts only with a remote cluster), `spl-token transfer|mint|burn|approve|create-token|create-account|…`, near (see
+ * nearSubmits), `starkli invoke|deploy|declare` (and `account deploy`), `sui client call|publish|upgrade|transfer|pay|split-coin|ptb|…`,
+ * `aptos move publish|run|deploy-object|…`, `aptos account transfer|create`, `aptos stake` writes. `--help` never matches.
+ */
+function otherChainBroadcast({ words }: Segment): boolean {
+  return eachTool(words, /^(?:solana|anchor|spl-token|near|starkli|sui|aptos)$/, (at) => {
+    const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
+    const valueFlag =
+      tool === "solana" ? SOLANA_VALUE_FLAG : tool === "spl-token" ? SPL_VALUE_FLAG : tool === "near" ? NEAR_VALUE_FLAG : tool === "sui" ? SUI_VALUE_FLAG : ANCHOR_VALUE_FLAG;
+    const { positional, flags } = argsAfter(words, at, valueFlag);
+    if (helpOnly(flags)) return false;
+    const starts = verbStarts(positional, at);
+    if (tool === "near") return starts.some(nearSubmits);
+    if (tool !== "anchor") return starts.some((p) => CHAIN_SUBMIT[tool].test(p.slice(0, 2).join(" ")));
+    const clusters = flags.filter((f) => f.flag === "--provider.cluster");
+    const local = clusters.length > 0 && clusters.every((f) => f.value !== undefined && LOCAL_ANCHOR_CLUSTER.test(f.value));
+    return starts.some((p) => {
+      const verb = p.slice(0, 2).join(" ");
+      return ANCHOR_DEPLOY.test(verb) ? !local : /^test(?: |$)/.test(verb) && clusters.length > 0 && !local;
+    });
+  });
+}
+
+/** A flag that hands a private key, mnemonic or secret key to a command (`--private-key 0x…`, `--private-keys=…`, `--mnemonics`, `--mnemonic-passphrase`, `--raw-private-key`). */
+const KEY_FLAG = /^--(?:raw-)?(?:private-keys?|mnemonics?|mnemonic-paths?|mnemonic-passphrases?|secret-keys?)(?:=|$)/;
+const CAST_WALLET_KEY_VERB = /^(?:new|n|new-mnemonic|nm|vanity|va|import|i|private-key|pk|derive-private-key|derive|d|decrypt-keystore|dk|sign|s|sign-auth|sa)$/;
+
+/**
+ * Key material on a command line: any command carrying a KEY_FLAG (every word counts, also after `--`, except for a
+ * text search, whose operands are patterns), `cast wallet new|new-mnemonic|vanity|import|private-key|derive|decrypt-keystore|sign|sign-auth`
+ * and `cast wallet address <key>` (aliases included), `solana-keygen new|recover|grind`, `geth account new|import`.
+ * Whatever network the command targets, a key typed on a command line lands in shell history and logs. `--help` never matches.
+ */
+function chainKeyMaterial({ words }: Segment): boolean {
+  const search = /^(?:grep|egrep|fgrep|rg|ag|ack)$/.test(words[0] ?? "") || git(words).sub === "grep";
+  if (!search && words.some((w) => KEY_FLAG.test(w))) return true;
+  return (
+    eachTool(words, /^cast$/, (at) => {
+      const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
+      const wallet = verbStarts(positional, at).some(([group = "", verb = "", arg]) => /^(?:wallet|w)$/.test(group) && (CAST_WALLET_KEY_VERB.test(verb) || (/^(?:address|a|addr)$/.test(verb) && arg !== undefined)));
+      return wallet && !helpOnly(flags);
+    }) ||
+    eachTool(words, /^solana-keygen$/, (at) => {
+      const { positional, flags } = argsAfter(words, at, NO_VALUE_FLAG);
+      return !helpOnly(flags) && /^(?:new|recover|grind)$/.test(positional[0] ?? "");
+    }) ||
+    // geth's global options (`--datadir d`) may come first: the verb is the word after `account`
+    eachTool(words, /^geth$/, (at) => {
+      const { positional, flags } = argsAfter(words, at, NO_VALUE_FLAG);
+      const account = positional.indexOf("account");
+      return !helpOnly(flags) && account !== -1 && /^(?:new|import)$/.test(positional[account + 1] ?? "");
+    })
+  );
+}
+
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
   {
@@ -2407,6 +2770,65 @@ export const RULES: readonly Rule[] = [
     },
     samples: ["aws ec2 terminate-instances --instance-ids i-1", "gcloud app deploy", "aws --profile prod s3 rm s3://b/x", "aws s3 sync . s3://b --delete", "az group delete -n rg"],
   },
+  // A21-A25 cluster tooling (prod_infra, L3): the cluster, GitOps, mesh and recovery lanes
+  {
+    id: "argocd-change",
+    capability: "prod_infra",
+    agents: ["a22-gitops", "a21-cluster-ops"],
+    pattern: argocdChange,
+    samples: [
+      "argocd app sync prod-api",
+      "argocd app sync api --prune",
+      "argocd app rollback api 3 --server argocd.prod.example.com",
+      "argocd app delete api --force",
+      "argocd cluster add prod-ctx",
+      "argocd proj create payments --server argocd.production.example.com",
+      "argocd app sync -l env=prod",
+      "argocd appset delete prod-set",
+    ],
+  },
+  {
+    id: "flux-change",
+    capability: "prod_infra",
+    agents: ["a22-gitops", "a21-cluster-ops"],
+    pattern: fluxChange,
+    samples: ["flux delete kustomization apps", "flux uninstall --silent", "flux bootstrap github --owner=o --repository=fleet", "flux suspend kustomization prod-apps", "flux resume helmrelease api -n production"],
+  },
+  {
+    id: "mesh-lifecycle",
+    capability: "prod_infra",
+    agents: ["a23-mesh-network", "a21-cluster-ops"],
+    pattern: meshLifecycle,
+    samples: ["istioctl install --set profile=default", "istioctl uninstall --purge", "istioctl x uninstall --purge", "linkerd upgrade | kubectl apply -f -", "cilium install", "cilium uninstall"],
+  },
+  {
+    id: "velero-change",
+    capability: "prod_infra",
+    agents: ["a25-resilience", "a21-cluster-ops"],
+    pattern: veleroChange,
+    samples: ["velero restore create --from-backup nightly", "velero backup delete nightly --confirm", "velero schedule delete nightly", "velero uninstall", "velero install --provider aws"],
+  },
+  {
+    id: "managed-cluster-lifecycle",
+    capability: "prod_infra",
+    agents: ["a21-cluster-ops"],
+    pattern: managedClusterChange,
+    samples: [
+      "eksctl create cluster -f cluster.yaml",
+      "eksctl scale nodegroup --cluster c -n ng --nodes 5",
+      "gcloud container clusters create c --zone us-central1-a",
+      "gcloud container node-pools update pool --cluster c --enable-autoscaling",
+      "az aks create -g rg -n c",
+      "az aks nodepool scale -g rg --cluster-name c -n pool --node-count 3",
+    ],
+  },
+  {
+    id: "kubeadm-lifecycle",
+    capability: "prod_infra",
+    agents: ["a21-cluster-ops"],
+    pattern: kubeadmChange,
+    samples: ["kubeadm init --pod-network-cidr=10.244.0.0/16", "kubeadm join 10.0.0.1:6443 --token t", "kubeadm reset -f", "kubeadm upgrade apply v1.30.0"],
+  },
   // A12 prod_high_risk (L4)
   {
     id: "vercel-prod",
@@ -2483,6 +2905,62 @@ export const RULES: readonly Rule[] = [
     agents: ["a12-release"],
     pattern: pushToProtected,
     samples: ["git push --tags", "git push origin main", "git push origin HEAD:master", "git push origin v1.2.0", "git push origin :main", "git push origin --delete main", "gh pr merge 12 --squash"],
+  },
+  // A26-A30 web3 lanes: a transaction or a deploy leaves the session only through a human
+  {
+    id: "chain-broadcast",
+    capability: "chain_broadcast",
+    agents: ["a26-smart-contract", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance"],
+    pattern: (seg, _facts, command) => castBroadcast(seg) || forgeBroadcast(seg) || frameworkDeploy(seg, command) || otherChainBroadcast(seg),
+    samples: [
+      "cast send 0xabc 'transfer(address,uint256)' 0xdef 1",
+      "cast publish 0x02f8",
+      "cast rpc eth_sendRawTransaction 0x02f8",
+      "forge script script/Deploy.s.sol --rpc-url sepolia --broadcast",
+      "forge script script/Deploy.s.sol --resume",
+      "forge create src/C.sol:C --rpc-url sepolia",
+      "npx hardhat run scripts/deploy.ts --network sepolia",
+      "hardhat ignition deploy ignition/modules/C.ts --network mainnet",
+      "HARDHAT_NETWORK=mainnet npx hardhat deploy",
+      "truffle migrate --network mainnet",
+      "brownie run deploy --network sepolia",
+      "solana transfer RecipientPubkey 1",
+      "solana program deploy target/deploy/p.so",
+      "anchor deploy --provider.cluster devnet",
+      "anchor migrate",
+      "spl-token transfer Mint 1 Recipient",
+      "near call c.testnet m '{}' --accountId a.testnet",
+      "starkli invoke 0xabc transfer 0x1 1",
+      "sui client publish --gas-budget 100000000",
+      "aptos move publish --named-addresses a=default",
+      "cast p 0x02f8",
+      "cast erc20 transfer 0xtoken 0xdef 1",
+      "forge c src/C.sol:C --rpc-url sepolia",
+      "docker run --rm --entrypoint cast img send 0xabc 'f()'",
+      "hardhat console --network mainnet",
+      "solana program write-buffer target/deploy/p.so",
+      "aptos account transfer --account 0x1 --amount 1",
+    ],
+  },
+  {
+    id: "chain-key-material",
+    capability: "chain_key_material",
+    agents: ["a26-smart-contract", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance"],
+    pattern: chainKeyMaterial,
+    samples: [
+      "cast call 0xabc 'owner()' --private-key 0x01",
+      "forge test --mnemonic 'test test test'",
+      "cast wallet new",
+      "cast wallet import deployer --interactive",
+      "cast wallet sign 'hello'",
+      "solana-keygen new -o id.json",
+      "solana-keygen recover",
+      "geth account new",
+      "somecli --secret-key=abc",
+      "forge script S.s.sol --private-keys 0x01,0x02",
+      "cast wallet derive 'a b c'",
+      "cast wallet public-key --raw-private-key 0x01",
+    ],
   },
 ];
 

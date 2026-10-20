@@ -17,7 +17,7 @@ A08 owns the quality gate: translates A02's acceptance criteria into executable 
 | Management | Allure/ReportPortal for runs & defect dedup; quality dashboards for A13/A15 |
 
 ## 3. Communication
-**Consumes:** `acceptance.criteria`, `task.result`/`code.patch`, `build.artifact` (A11), `ux.spec` (expected UI behavior), `schema.migration`, `deploy.telemetry` (prod signals feeding escape analysis).
+**Consumes:** `acceptance.criteria`, `task.result`/`code.patch`, `build.artifact` (A11), `ux.spec` (expected UI behavior), `schema.migration`, `deploy.telemetry` (prod signals feeding escape analysis), `invariant.suite` (A27), `gas.report` (A26).
 **Produces:** `test.plan`, `test.suite` (code, in `tests/` ownership zone), `test.results`, `defect.report`, `coverage.report`, `gate.verdict (quality)`.
 
 ```json

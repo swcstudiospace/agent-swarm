@@ -24,9 +24,9 @@ import {
  *   - the colour fixture (`fixtures/bar_states.ansi`) equals what the renderer produces today (needs omp's pi-tui theme
  *     sources; skipped, loudly, where they are not installed);
  *   - every capture in the doc equals the fixture with the ANSI removed (needs nothing);
- *   - the captures satisfy the bar's contract on their own (exactly two rows of exactly the capture's width, caps in the same
+ *   - the captures satisfy the bar's contract on their own (one row when nothing runs, two when agents run, each exactly the capture's width, caps in the same
  *     columns, glyph and word of every state, `+N more`, chips right-anchored and dropped by priority).
- * Refresh after a renderer change: `bun omp/test/fixtures/bar_states.ts --write` (see the doc, section 11).
+ * Refresh after a renderer change: `bun omp/test/fixtures/bar_states.ts --write` (see the doc, section 10).
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -39,6 +39,9 @@ const widthOf = (key: string): number | undefined => {
   const match = /@(\d+)$/.exec(key);
   return match ? Number(match[1]) : undefined;
 };
+
+/** Captures that are one row: the idle and telemetry-error states (no agents running) and the spinner captures (the agent row alone). */
+const ONE_ROW = /^(idle@|error@|tokens-idle@|tokens-minimal@|linger:done\+20s@|linger:failed\+600s@|spinner:)/;
 
 describe("bar captures vs the renderer", () => {
   test.skipIf(theme === undefined)("the colour fixture is exactly what the real renderer and the real theme produce today", () => {
@@ -53,7 +56,7 @@ describe("bar captures vs the renderer", () => {
     }
     expect(WIDTHS).toEqual([40, 80, 120]);
     expect(SCENARIOS.map((scenario) => scenario.name)).toEqual(expect.arrayContaining(["idle", "loading", "active", "overflow", "completed", "failed", "error"]));
-    for (const key of ["status", "headless", "spinner:animated+0s@80", "spinner:reduced+0s@80", "linger:done+19s@80", "linger:failed+600s@80"]) {
+    for (const key of ["headless", "spinner:animated+0s@80", "spinner:reduced+0s@80", "linger:done+19s@80", "linger:failed+600s@80"]) {
       expect(Object.keys(fixture)).toContain(key);
     }
   });
@@ -74,13 +77,13 @@ describe("bar captures vs the renderer", () => {
 describe("the captures satisfy the bar contract", () => {
   const widthKeys = Object.keys(fixture).filter((key) => widthOf(key) !== undefined);
 
-  test("every bar is exactly two rows, every row exactly as wide as its capture says, no stray escape sequence", () => {
+  test("every bar is one row when nothing runs and two when agents run, every row exactly as wide as its capture says, no stray escape sequence", () => {
     expect(widthKeys.length).toBeGreaterThan(40);
     for (const key of widthKeys) {
       const width = widthOf(key) as number;
       const lines = fixture[key];
-      // the spinner captures show row 2 only
-      expect({ key, rows: lines.length }).toEqual({ key, rows: key.startsWith("spinner:") ? 1 : 2 });
+      // the spinner captures show row 2 only; idle and telemetry error show their one row
+      expect({ key, rows: lines.length }).toEqual({ key, rows: ONE_ROW.test(key) ? 1 : 2 });
       for (const [index, line] of lines.entries()) {
         expect({ key, row: index, width: displayWidth(line) }).toEqual({ key, row: index, width });
         // every escape is a complete SGR sequence: nothing is left once they are stripped
@@ -98,11 +101,11 @@ describe("the captures satisfy the bar contract", () => {
     }
   });
 
-  test("idle keeps its two rows at every width; the settled rows give way to them exactly at their linger (20 s done, 600 s failed)", () => {
+  test("idle is one row at every width; the settled rows give way to it exactly at their linger (20 s done, 600 s failed)", () => {
     for (const width of WIDTHS) {
-      const [first, second] = fixture[`idle@${width}`].map(plainText);
-      expect({ width, first: first.includes("○ swarm idle") }).toEqual({ width, first: true });
-      expect({ width, second: second.includes("no subagents running") }).toEqual({ width, second: true });
+      const lines = fixture[`idle@${width}`].map(plainText);
+      expect({ width, rows: lines.length }).toEqual({ width, rows: 1 });
+      expect({ width, first: lines[0].includes("○ swarm idle") }).toEqual({ width, first: true });
     }
     const first = (key: string): string => plainText(fixture[key][0]);
     for (const key of ["linger:done+0s@80", "linger:done+19s@80"]) expect({ key, done: first(key).includes("3 done") }).toEqual({ key, done: true });
@@ -110,7 +113,7 @@ describe("the captures satisfy the bar contract", () => {
     expect(first("linger:done+20s@80")).not.toContain("done");
     expect(first("linger:failed+599s@80")).toContain("1 fail");
     expect(first("linger:failed+600s@80")).toContain("○ swarm idle");
-    expect(plainText(fixture["linger:failed+600s@80"][1])).toContain("no subagents running");
+    expect(fixture["linger:failed+600s@80"]).toHaveLength(1); // the idle row alone, no placeholder under it
   });
 
   test("a state is never colour alone: every state has its glyph and, where not self-evident, its word", () => {
@@ -156,13 +159,13 @@ describe("the captures satisfy the bar contract", () => {
     expect(counts[1]).toBeGreaterThan(counts[2]);
   });
 
-  test("completed ends in the success mark, failed in the failure mark, error in the marker with the idle placeholder under it", () => {
+  test("completed ends in the success mark, failed in the failure mark, error in the marker alone", () => {
     for (const width of WIDTHS) {
       expect(plainText(fixture[`completed@${width}`][0])).toContain("✓ swarm");
       expect(plainText(fixture[`failed@${width}`][0])).toContain("✕ swarm");
-      const [first, second] = fixture[`error@${width}`].map(plainText);
-      expect({ width, first: first.includes("swarm: telemetry unavailable") }).toEqual({ width, first: true });
-      expect({ width, second: second.includes("no subagents running") }).toEqual({ width, second: true });
+      const lines = fixture[`error@${width}`].map(plainText);
+      expect({ width, rows: lines.length }).toEqual({ width, rows: 1 });
+      expect({ width, first: lines[0].includes("swarm: telemetry unavailable") }).toEqual({ width, first: true });
     }
     expect(plainText(fixture["error-rows@80"][0])).toContain("telemetry unavailable");
   });
@@ -207,7 +210,7 @@ describe("the token chips (row 1, right)", () => {
   test("chips sit at the right end of row 1 with `saved` right-most; row 2 never carries them", () => {
     for (const key of ["tokens-active@80", "tokens-active@120", "tokens-idle@120", "tokens-idle@200", "tokens-minimal@80"]) {
       expect({ key, end: rows(key)[0].endsWith("saved 48.2k ◗") }).toEqual({ key, end: true });
-      expect({ key, row2: rows(key)[1].includes("saved") }).toEqual({ key, row2: false });
+      expect({ key, below: rows(key).slice(1).join("\n").includes("saved") }).toEqual({ key, below: false });
     }
   });
 
@@ -246,10 +249,10 @@ describe("the token chips (row 1, right)", () => {
     expect(rows("tokens-active@80")[0]).toContain("● swarm 5m00s");
   });
 
-  test("an idle swarm keeps the chips: the idle placeholder on the left, the savings on the right", () => {
-    const [first, second] = rows("tokens-idle@120");
-    expect(first.startsWith("◖ ○ swarm idle")).toBe(true);
-    expect(second).toContain("no subagents running");
+  test("an idle swarm keeps the chips in its one row: the idle marker on the left, the savings on the right", () => {
+    const lines = rows("tokens-idle@120");
+    expect(lines).toHaveLength(1);
+    expect(lines[0].startsWith("◖ ○ swarm idle")).toBe(true);
   });
 });
 
@@ -267,7 +270,6 @@ describe("docs/swarm-bar.md names what the bar reads", () => {
       "live.json",
       "task:subagent:progress",
       "task:subagent:lifecycle",
-      "setStatus",
       "+N more",
       "bars:restack",
       "token-opt:savings",

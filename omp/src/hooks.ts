@@ -26,7 +26,7 @@ export const SWARM_CONTEXT = `## AgentSwarm
 This is SDLC work (including requests that say "orchestrate"): route it through the AgentSwarm instead of implementing it in this session.
 - Run \`/swarm <brief>\` with the request as the brief, or
 - call \`task\` with \`agent: "a01-orchestrator"\` and the request as the brief.
-A01 plans the work and dispatches a02–a15 by slug (parallel waves, bounded concurrency).
+A01 plans the work and dispatches a02–a30 by slug (parallel waves, bounded concurrency).
 `;
 
 /** Appended on /gsd-autonomous. Does not refuse the command and does not replace the milestone loop. */

@@ -17,7 +17,7 @@ A14 owns the post-release lifecycle: dependency freshness and patching, hotfix o
 | Regression watch | Post-deploy error/telemetry diffing with A13 |
 
 ## 3. Communication
-**Consumes:** `incident.alert` (A13), `vulnerability.report` (A10), `cve.kev.feed`, `telemetry.anomaly` (regression signals), `upstream.eol.notice`, `tech.debt.signals` (from REV/ARCH quality reports), `escape.feedback`.
+**Consumes:** `incident.alert` (A13), `vulnerability.report` (A10), `cve.kev.feed`, `telemetry.anomaly` (regression signals), `upstream.eol.notice`, `tech.debt.signals` (from REV/ARCH quality reports), `escape.feedback`, `platform.scorecard` (A17), `vex.statements` + `sbom.bundle` (A18), `policy.exception.register` (A24), `cluster.upgrade.plan` (A21).
 **Produces:** `patch.task`, `hotfix.task`, `dependency.bump.pr` (via A05/A06/A07 workers or own worktree), `maintenance.backlog`, `eol.report`, `tech.debt.register`, `patch.regression.report`.
 
 ```json

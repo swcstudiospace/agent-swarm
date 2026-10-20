@@ -9,6 +9,9 @@ runtime state is a projection over them.
 Each statement below was checked against the code and, where it names a command, run in a scratch copy with a
 temporary `SWARM_DIR`. Section 13 lists the known limits, and why.
 
+v2.3 grows the roster from 15 to 30 agents (A16 to A30) on the same runtime. The counts below are the 30-agent
+state; section 9.1 is the checklist for adding an agent and section 16 lists what v2.3 changed.
+
 ## 1. Architecture
 
 ```mermaid
@@ -252,7 +255,7 @@ same producer `task_id`:
   pause and escalation reuse the same task); for a fresh dependent task that is `missing`, and `bundle` still returns
   the goal, acceptance criteria and `upstream[]` (state, satisfied, summary, needs) of its dependencies.
 
-Tools (all callable by all 15 agents): `shared_handover_write`, `_read`, `_validate` (`draft: true` fills the generated
+Tools (all callable by all 30 agents): `shared_handover_write`, `_read`, `_validate` (`draft: true` fills the generated
 fields), `_bundle`, `_verify`, `_receipt`, `shared_artifact_digest`, `_check`, `shared_dod_check`,
 `shared_open_findings`, `shared_attempt_history`, `shared_lease_state`, `shared_open_questions`. Procedures:
 `swarm-handover-emit` and `swarm-handover-intake` (autoloaded by every omp agent).
@@ -260,7 +263,7 @@ fields), `_bundle`, `_verify`, `_receipt`, `shared_artifact_digest`, `_check`, `
 ## 6. Shared baseline
 
 `agents.json` `shared_baseline` lists the shared tools and skills every agent has. It is validated: each listed tool
-must be a shared tool all 15 agents may call, each listed skill must have a source in `prompts/skills/shared/`.
+must be a shared tool all 30 agents may call, each listed skill must have a source in `prompts/skills/shared/`.
 
 - **Handover tools (13):** the list in section 5.
 - **Runtime tools (8):** `shared_status_report` (latest progress of the caller's own task; emits
@@ -278,14 +281,13 @@ must be a shared tool all 15 agents may call, each listed skill must have a sour
   `swarm-provenance-trust`, `swarm-rework-intake`, `swarm-scratchpad-protocol`, `swarm-self-verify`,
   `swarm-status-reporting`.
 
-Each agent also has its own tools (`registered_tools`, 12 each; A15 has 13) and its own hidden skills
-(`prompts/skills/<slug>/`, 10 to 12). The counts are data: `agents.json` `capability_policy`
+Each agent also has its own tools (`registered_tools`, 12 to 13 per agent: 12 for 21 agents, 13 for A15, A19, A22, A23 and A26 to A30) and its own hidden skills (`prompts/skills/<slug>/`, 10 to 14 per agent). The counts are data: `agents.json` `capability_policy`
 (`tools`/`skills` `min` and `max`, optionally `combined`; `enforce` defaults to true). Today it reads 10 to 15 for
 both. `python3 -m swarm.tool_registry check` and `python3 -m swarm.skill_registry check` enforce it.
 
 ## 7. Call path: `swarm_catalog` and `swarm_tool_call`
 
-Prompt bodies keep their hand-written tool inventory (omp agents are capped at 64 KiB and A01 is at about 58 KiB), so
+Prompt bodies keep their hand-written tool inventory (omp agents are capped at 64 KiB and A01, the largest, renders at about 59.1 KiB), so
 new tools and skills are discovered, not listed in prompts.
 
 ```
@@ -326,9 +328,9 @@ swarm_tool_call {name, input}  ->  call --name --input     -> call_tool(name, ca
 
 - **Sources:** `prompts/skills/<owner>/<short>.md`, where `<owner>` is an agent slug or `shared`.
 - **Rendering:** each source becomes a hidden, flat skill `omp/skills/<name>/SKILL.md` with
-  `disable-model-invocation: true`; omp lists it only through a `skill://<name>` link. Only the 15 per-agent index
-  skills (`omp/skills/<slug>/`) and `swarm-orchestrate` are visible (`tests/test_capability_acceptance.py` caps the
-  visible set at 16).
+  `disable-model-invocation: true`; omp lists it only through a `skill://<name>` link. Only the 30 per-agent index
+  skills (`omp/skills/<slug>/`) and `swarm-orchestrate` are visible, 31 in all: `tests/test_capability_acceptance.py`
+  computes the cap as the agent count plus one (`MAX_VISIBLE_OMP_SKILLS = len(AGENTS) + 1`), so it grows with the roster.
 - **Index skill:** generated per agent with its `registered_tools` (name, tier, purpose) and its skills
   (`skill://<name>` plus the description).
 - **Autoload:** every omp agent autoloads its index skill and `swarm-handover-intake`, `swarm-handover-emit`; A01 also
@@ -342,34 +344,70 @@ swarm_tool_call {name, input}  ->  call --name --input     -> call_tool(name, ca
 
 ### 9.1 Add a subagent
 
-The swarm is fixed at 15 agents and several places pin that, so a sixteenth agent is a deliberate change, not a
-config edit. Checklist (grep for `range(1, 16)`, `== 15` and `A15` to find any place missed):
+The roster is data in `agents.json`, but several places list the agents by id and several tests pin the count, so a new
+agent is a deliberate change across all of the places below, not a config edit. v2.3 took the swarm from 15 to 30 agents
+(A16 to A30) through this list. Grep for `range(1, 31)`, `== 30` and `A30` to find a place a thirty-first agent would
+miss (a count that is only a number in a test is listed in step 8).
 
-1. `03-agents/A16-<name>.md`: the seven-section spec. `prompts/A16-<name>.md`: the XML prompt with `<agent id="A16"`,
-   the 20 tag pairs listed in `AGENTS.md` (Testing & QA), `<script path=`, `python3 scripts/` and `scripts/ts/`, ending
-   with `</agent>`. Keep it short: `omp/agents/a01-orchestrator.md` leaves about 5.7 KiB under
-   `OMP_AGENT_MAX_BYTES` (64 KiB), and every agent file is capped by the same test.
-2. `agents.json`, in `agents`: `id`, `code`, `slug`, `name`, `class`, `lane`, `model`, `spec`, `prompt`,
-   `description`, `capabilities`, `consumes`, `produces`, `max_parallel`, `autonomy_ceiling`, `tools`, `scripts`,
-   `registered_tools`. Nobody hand-edits `registered_tools`: use the intake flow of 9.2 (the owner prefix comes from
-   `PREFIX` in `swarm/tool_registry.py`).
-3. Code that lists the agents: `PREFIX` in `swarm/tool_registry.py`; `SWARM_SLUGS` in `omp/src/guard.ts` (pinned
-   against `agents.json` by `omp/test/guard.test.ts`); `SWARM_TOOLS` in `scripts/build_agents.py` (`range(1, 16)`),
-   the grokbot seat map (`exactly 15 roles`), `AGENT_SURFACES` in `swarm/substrate_tee.py`, `_LANE_AGENTS` and the
-   capability map in `swarm/blast_radius.py`, `scripts/orch_from_graph.py` (`len(agents) != 15`), and the plan
-   patterns in `scripts/orch_plan.py` if the agent takes part in a DAG.
-4. The agent's scripts and TS twins (`scripts/<lane>_<verb>.py`, `scripts/ts/<stem>.ts`), then 10 to 15 tools
-   (9.2) and 10 to 15 skills (9.3) so `capability_policy` holds.
-5. Regenerate: `python3 scripts/build_agents.py`, `python3 scripts/_write_skills.py`,
-   `python3 -m swarm.tool_registry docs`, `python3 -m swarm.tool_registry gen-tests`,
-   `python3 -m swarm.skill_registry docs`.
-6. Tests that pin the count and must change with it: `tests/test_capability_acceptance.py`, `tests/test_swarm.py`,
+1. **Spec and prompt.** `03-agents/A31-<name>.md`: the seven-section spec. `prompts/A31-<name>.md`: the XML prompt with
+   `<agent id="A31"`, the 20 tag pairs listed in `AGENTS.md` (Testing & QA), `<script path=`, `python3 scripts/` and
+   `scripts/ts/`, ending with `</agent>`. Size: keep the prompt body to about 52 KB. `prompts/A01-orchestrator.md` is the
+   largest prompt at 52781 bytes and its omp render, `omp/agents/a01-orchestrator.md`, 60569 bytes; every
+   omp agent file must stay at or under `OMP_AGENT_MAX_BYTES` (64 KiB) and `a01-orchestrator` must remain the largest
+   (`test_omp_size_bound` in `tests/test_omp_agents.py`, `test_omp_agent_files_fit_and_the_orchestrator_is_largest` in
+   `tests/test_capability_acceptance.py`). The omp render adds a preamble to the prompt, so a body near A01's size would
+   overtake it.
+2. **Roster entry.** `agents.json`, in `agents`: `id`, `code`, `slug`, `name`, `class` (`control`, `delivery`, `build`,
+   `verify`, `operate` or `sustain`), `lane`, `model` (optional: only A01, A03, A09, A10 and A15 set it), `spec`, `prompt`,
+   `description`, `capabilities` (use ids no other agent offers: `orch_plan.py` and `blast_radius.py` take the first agent
+   that offers a capability, and `code.patch`, offered by A05 and A06, is the one shared id), `consumes`, `produces`, `max_parallel`, `autonomy_ceiling` (capability to `L2`..`L4`),
+   `tools`, `scripts`, `registered_tools`. Nobody hand-edits `registered_tools`: use the intake flow of 9.2. If the new
+   agent produces an artifact type that an existing agent takes, add it to that agent's `consumes`: the ACP routing
+   table and `shared_route_check` derive from `consumes` and `produces` and there is no peer list.
+3. **Code that lists the agents.**
+   - `PREFIX` in `swarm/tool_registry.py`: the owner prefix of the agent's tool names.
+   - `AGENT_SURFACES` in `swarm/substrate_tee.py` (`swarm-<id>-<code>`, lower case) and `SWARM_SURFACES` in
+     `swarm/memory.py`; `tests/test_substrate_tee.py` and `tests/test_swarm_memory.py` pin them against `agents.json` and
+     each other. The surface must also exist on the agent-substrate server, and a workspace install with substrate tokens
+     needs `SUBSTRATE_TOKEN_<SURFACE>` for it ([substrate-workspace.md](substrate-workspace.md)).
+   - `SWARM_SLUGS` in `omp/src/guard.ts` (pinned against `agents.json` by `omp/test/guard.test.ts`).
+   - In `scripts/build_agents.py`: `SWARM_TOOLS` (`range(1, 31)`), `_ROLE_HOME` (the grokbot seat map: `render_grokbot`
+     raises unless the manifest is exactly the 30 roles) and, where the agent owns desk path families, `_DESK_GLOBS`
+     (optional: script paths from `agents.json` are added for every role).
+   - `DONT` in `scripts/_write_skills.py`: the "Don't use for" line of the agent's generated skills (a missing id is a
+     `KeyError`).
+   - `_LANE_AGENTS` and `_DEFAULT_CAPABILITY` in `swarm/blast_radius.py`: a lane agent may own a parallel lane; the default
+     capability must be one of the agent's own. A01 and the four gate agents are not lane agents.
+   - `scripts/orch_from_graph.py`: the manifest-size check (`len(agents) != 30`), the file-path rules in `_owner` (an
+     agent that owns a path family, for example `.sol` to A26 or `charts/` to A22), `_OWNER_CAPABILITY` and `_MEDIUM`
+     (implementers that get a quality gate as well as a review gate).
+   - `PATTERNS` in `scripts/orch_plan.py` if the agent takes part in a DAG. v2.3 added `cloud-native` (15 tasks),
+     `cluster` (12) and `web3` (14); `cluster` and `web3` mark their implementer rows `risk_class` high, which selects
+     all four gates. A new agent does not own a gate: A08, A09, A10 and A12 stay the only gate owners.
+   - `RULES` in `omp/src/guard.ts` when the agent's work could reach production or move funds (section 12). A row needs
+     a `capability`, a `pattern` and `samples` that `guard.test.ts` runs; its `agents` field is documentation only, every
+     swarm session is blocked.
+4. **Shared baseline grants.** Every `shared_baseline` tool must permit every agent (the registry check names the
+   missing ids). Add the new id to those tools' `permitted_callers` with `registry/intake/grants.json`
+   (`{tool_name: [agent ids to add]}`, 9.2).
+5. **Tools.** A fragment `registry/intake/<slug>.tools.json` with 10 to 15 READ tools (9.2), handlers in
+   `swarm/tools/aNN_tools.py`. Intake fragments are merged and deleted by `scripts/_registry_intake.py --apply`.
+6. **Skills.** 10 to 15 sources in `prompts/skills/<slug>/` (9.3). The per-agent index skill is generated.
+7. **Scripts.** The agent's CLI tools `scripts/<lane>_<verb>.py` and their Bun twins `scripts/ts/<stem>.ts`, named in the
+   prompt's `<script path=` entries and in `agents.json` `scripts`.
+8. **Tests that pin the count and must change with it:** `tests/test_capability_acceptance.py`, `tests/test_swarm.py`,
    `tests/test_lane_tools.py`, `tests/test_tool_registry.py`, `tests/test_acp.py`, `tests/test_render_rules.py`,
    `tests/test_cursor_agents.py`, `tests/test_grokbot_export.py`, `tests/test_substrate_tee.py`,
-   `tests/test_swarm_memory.py`, `tests/test_orch_from_graph.py`, `tests/test_shared_handover.py`,
-   `tests/test_shared_runtime.py`, `tests/test_omp_agents.py`; add `tests/test_tools_a16.py`.
-7. Gates: `python3 scripts/build_agents.py --check`, `python3 -m swarm.tool_registry check`,
-   `python3 -m swarm.skill_registry check`, `python3 -m pytest`, `cd omp && bun run test`.
+   `tests/test_swarm_memory.py`, `tests/test_orch_from_graph.py`, `tests/test_roster_routing.py`,
+   `tests/test_shared_handover.py`, `tests/test_shared_runtime.py`, `tests/test_omp_agents.py`,
+   `tests/test_e2e_swarm.py`; add `tests/test_tools_a31.py` for the new tools. In `omp/`, `test/guard.test.ts` pins
+   `SWARM_SLUGS` and the new guard rows.
+9. **Regenerate** (never hand-edit the output): `python3 scripts/build_agents.py` (`.claude`, `.grok`, `.cursor`,
+   `omp/agents`, `omp/skills`, `grokbot`), `python3 scripts/_write_skills.py` (`skills/**`),
+   `python3 -m swarm.tool_registry docs` and `gen-tests` (`docs/tools/**`, `tests/generated/**`),
+   `python3 -m swarm.skill_registry docs` (`docs/skills/**`).
+10. **Gates:** `python3 scripts/build_agents.py --check`, `python3 -m swarm.tool_registry check`,
+    `python3 -m swarm.skill_registry check`, `python3 -m pytest`, `cd omp && bun run test`.
 
 ### 9.2 Add a tool
 
@@ -406,7 +444,7 @@ registry check passed, and the generated contract tests and `test_capability_acc
 1. `prompts/skills/<owner>/<short>.md`, `<owner>` an agent slug or `shared`. Frontmatter, flat `key: value`:
    `name` (`<slug>--<short>`, or `swarm-<short>` for shared; `<short>` equals the file stem), `description` (one line,
    at most 160 characters, starting with `Use when`), `owner` (the directory name), `tools: [a, b]` (registry tools
-   the procedure calls; the owner must be a permitted caller, shared skills need tools all 15 may call).
+   the procedure calls; the owner must be a permitted caller, shared skills need tools all 30 may call).
 2. Body, in this order and with no other `##` heading: `## When to Use`, `## Procedure` (numbered, in sequence, and
    every step must name a tool or script it uses, a host tool such as `read`, `grep`, `bash` counts), `## Outputs`,
    `## Failure Handling`, `## Handover`.
@@ -424,10 +462,11 @@ passed.
 
 ### 9.4 Read the bar
 
-The bar is the topmost widget above the editor (above Ultrathink's bar and omp's own), always mounted, exactly two rows at
-the full terminal width. Row 1: `swarm <elapsed> | N run | N queued | N done | N fail | slots R/L` on the left, the
-session's token savings chips on the right; row 2: one row per run, worst state first, `<glyph> <agent> <elapsed>
-<activity>`, or `no subagents running` when idle. Every state has a glyph and a word. The full legend, states, colors,
+The bar is the topmost widget above the editor (above Ultrathink's bar and omp's own), always mounted, at the full terminal
+width. Row 1: `swarm <elapsed> | N run | N queued | N done | N fail | slots R/L` on the left, the session's token savings chips on
+the right. While agents run, row 2: one row per run, worst state first, `<glyph> <agent> <elapsed> <activity>`. When nothing runs
+(idle, or telemetry unavailable with no rows) the bar is the single row 1, with no placeholder under it. Every state has a glyph
+and a word. The full legend, states, colors,
 token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 
 ## 10. Configuration
@@ -452,7 +491,7 @@ token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 | `SWARM_HANDOVER_MAX_BYTES` | 16384 | `swarm/handover.py` | Size cap of one handover |
 | `SWARM_HANDOVER_STALE_S` | 21600 | `swarm/handover.py` | Age after which a handover is `stale` |
 | `SWARM_TOOL_OUTPUT_MAX_BYTES` | 262144 | `swarm/tool_registry.py` | Largest registry result in bytes (strict JSON, compact UTF-8); an oversized result is withheld as `PARTIAL_SUCCESS`; clamped to 4096..16777216, a malformed value means the default |
-| `SWARM_BAR` | on | `omp/src/swarm_bar.ts` | `off` disables the bar, its token chips and the status segment |
+| `SWARM_BAR` | on | `omp/src/swarm_bar.ts` | `off` disables the bar and its token chips |
 | `SWARM_BAR_LINGER_S` / `SWARM_BAR_FAIL_LINGER_S` | 20 / 600 | bar | How long a finished / failed row stays |
 | `SWARM_BAR_REDUCED_MOTION` | unset | bar | `1` freezes the spinner |
 | `SWARM_BAR_IDLE_POLL_MS` | 2000 | `omp/src/swarm_bar.ts` | Period of the idle `stat` watcher of `live.json`; clamped to 500..30000, a malformed value means 2000 |
@@ -545,7 +584,27 @@ failure). A write error names the field (`/artifacts/0/digest: ...`). See the ru
 - **Limits.** Input 100 000 bytes per call, tool output 262144 bytes by default, handover 16384 bytes
   (`SWARM_HANDOVER_MAX_BYTES`), skill source 6 KiB, scratchpad values 8 KiB, per-tool `timeout_s`, `runs` capped at 64 in
   `live.json`.
-- **Unchanged.** Signing, gates, the guard in `omp/src/guard.ts` (it also blocks writes into `.swarm/`), and the
+- **Guard rows for the cluster and web3 lanes (v2.3).** `RULES` in `omp/src/guard.ts` gained seven rows. A matching
+  `bash` command in any swarm session is blocked with `BLOCKED needs: human-approval (<capability>: <row id>)`; the rows'
+  `agents` lists (the lane that owns the capability) are documentation, not an allow list. Read-only and render-only forms
+  pass. All seven rows also pass `--help` (`--help=false` still blocks) and a bare `-h`, and a command whose word is a
+  text printer or searcher (`echo`, `printf`, `grep`, `rg`, `man`, `which`, ...), which never runs its operands.
+
+  | Row id | Capability | Blocks | Passes |
+  |---|---|---|---|
+  | `argocd-change` | `prod_infra` | `argocd app sync\|rollback\|delete\|set\|patch\|terminate-op\|delete-resource`, `appset create\|delete`, and `cluster\|repo\|proj add\|rm\|create\|delete` (also `cluster set\|rotate-auth`, `proj set\|add-*\|remove-*`) that name a production marker (`prod`, `production`, `main`, `master`, a release tag) in an operand or in a destination or selector flag (`--server`, `--dest-namespace`, `--project`, `-l`/`--selector` ...), or carry `--prune`, `--force` or `--replace` | `get`, `list`, `diff`, `history`, `logs`, `wait`, `manifests`; `--dry-run` |
+  | `flux-change` | `prod_infra` | `flux delete\|uninstall\|bootstrap`; `flux suspend\|resume` with a production marker in an operand or `-n`/`--namespace`/`--context`/`--kubeconfig` | `get`, `check`, `diff`, `export`, `reconcile`, `logs`, a `suspend`/`resume` of a non-production target |
+  | `mesh-lifecycle` | `prod_infra` | `istioctl`, `linkerd` or `cilium` `install\|uninstall\|upgrade` (also `istioctl x uninstall`), whatever the cluster | `analyze`, `manifest generate`, `x precheck`, `version`, `check`, `status` |
+  | `velero-change` | `prod_infra` | `velero install\|uninstall`, `restore create`, and `delete` of a backup, restore, schedule, backup location or snapshot location | `backup create`, `get`, `describe` |
+  | `managed-cluster-lifecycle` | `prod_infra` | `eksctl create\|delete\|upgrade\|scale\|update` (also `eksctl utils update-*`); `gcloud container clusters\|node-pools create\|create-auto\|upgrade\|resize\|update`; `az aks create\|upgrade\|scale\|update\|start\|stop\|rotate-certs` and `az aks nodepool add\|scale\|update\|upgrade\|start\|stop` | `get`, `list`, `describe`, `show`, `get-credentials` |
+  | `kubeadm-lifecycle` | `prod_infra` | `kubeadm init\|join\|reset\|upgrade` | `upgrade plan`, `upgrade diff`, `token`, `certs`, `config`, `version` |
+  | `chain-broadcast` | `chain_broadcast` | `cast send\|s\|publish\|p\|batch-send\|bs`, the writes of `cast erc20\|erc4626\|vault\|safe` (`erc20 transfer\|approve\|mint\|burn\|permit`, `safe create\|execute\|propose\|sign` ...), `cast rpc\|rp` of a `*_send*` method; `forge script ... --broadcast\|--resume`, `forge create\|c`; `hardhat run\|deploy\|ignition deploy\|console\|test`, `truffle migrate\|deploy\|exec\|console\|test`, `brownie run\|console\|test` on a `--network` that is not local (or a `HARDHAT_NETWORK` set or exported earlier on the same line); `solana transfer`, `solana program deploy\|upgrade\|write-buffer\|close\|...` and the stake, vote and nonce fund moves; `anchor deploy\|upgrade\|migrate\|idl init\|upgrade\|...` unless the cluster is local; `spl-token transfer\|mint\|burn\|approve\|create-token\|...`; near writes (`send`, `call`, `deploy`, `tokens ... send-*`, ...); `starkli invoke\|deploy\|declare`; `sui client call\|publish\|upgrade\|transfer\|pay\|split-coin\|ptb\|...`; `aptos move publish\|run\|run-script\|deploy-object\|...`, `aptos account transfer\|create`, `aptos stake` writes | `cast call`, `balance`, `block`, `mktx`; `forge script` without `--broadcast`; `forge test`, `build`; `compile`; a local network (`hardhat`, `localhost`, `anvil`, `development`, `local`) |
+  | `chain-key-material` | `chain_key_material` | any command carrying `--private-key(s)`, `--mnemonic(s)`, `--mnemonic-path(s)`, `--mnemonic-passphrase(s)`, `--secret-key(s)` or `--raw-private-key`; `cast wallet new\|new-mnemonic\|vanity\|import\|private-key\|derive\|decrypt-keystore\|sign\|sign-auth` and `cast wallet address <key>` (aliases included); `solana-keygen new\|recover\|grind`; `geth account new\|import` | commands that carry no key material; a text search (`grep`, `rg`) of a flag name |
+
+  The `prod_infra` rows sit with the existing A11 rows (`terraform-apply-destroy`, `helm-release-change`,
+  `kubectl-prod-change`, `cloud-destructive`). `gcloud container clusters delete` and `az aks delete` stay in
+  `cloud-destructive`, not in `managed-cluster-lifecycle`. `guard.test.ts` runs every row's `samples`.
+- **Unchanged.** Signing, gates, the rest of the guard in `omp/src/guard.ts` (it also blocks writes into `.swarm/`), and the
   classifier are as before.
 
 ## 13. Known limits
@@ -580,19 +639,32 @@ failure). A write error names the field (`/artifacts/0/digest: ...`). See the ru
 - **`notes.claims` has no planner flag.** Set it on the task (section 4); a directory claim needs a trailing `/`.
 - **Counts.** `capability_policy` is an agreed working default of 10 to 15; change it in `agents.json` and every check
   follows.
+- **The substrate must know all 30 surfaces.** `AGENT_SURFACES` lists `swarm-a16-cloud` to `swarm-a30-custody`, but the
+  closed set of surfaces lives on the agent-substrate server, outside this repository. Until A16 to A30 exist there, a
+  workspace install with substrate tokens fails for them and `--no-substrate` is the way to install
+  ([substrate-workspace.md](substrate-workspace.md)).
+- **A16 to A30 analyse what the caller hands them.** Their lane tools are READ tier and their handlers import only the
+  standard library and `swarm.tools.support`: none reads a cluster, a chain, a cloud account or a key. Live state
+  (a node's version, a contract's bytecode, a bill) has to arrive in the task inputs or the handover.
+- **The v2.3 guard rows read command text and some cannot tell production from a scratch environment.** `argocd-change`
+  and `flux suspend|resume` test for a production marker; `flux delete|uninstall|bootstrap`, `mesh-lifecycle`,
+  `velero-change`, `managed-cluster-lifecycle` and `kubeadm-lifecycle` block on the verb alone, so a throwaway cluster
+  needs the same human approval. `chain-broadcast` and `chain-key-material` see only the command line: a transaction or a
+  key that a script or an SDK handles without such a command is not seen (the residual of every `bash` row).
 - **Redaction is best effort** (section 12), and `await_input`/`begin_handoff` are not driven by the scheduler
   (section 2).
 
 ## 14. Tests
 
 `python3 -m pytest --collect-only -q -p no:cacheprovider` lists the tests per file. At the close of v2.2 it listed
-8053 tests in 106 files. Per-agent suites:
+8053 tests in 106 files. Per-agent suites (v2.3 counts, `--collect-only -qq` over `tests/test_tools_a*.py`):
 
 | Suite | Files | Tests | Pins |
 |---|---|---|---|
-| `tests/test_tools_aNN.py` | 15 | 859 | behaviour of the v2.2 tools of agent aNN: output values, boundaries, error paths |
-| `tests/test_tools_aNN_existing.py` | 15 | 2900 | behaviour of the v2.1 lane tools of aNN, written against the handler (the generated contract only proves the declared states) |
-| `tests/generated/test_tool_contracts.py` | 1 | 1237 | the generated contract probes of every registry tool |
+| `tests/test_tools_aNN.py`, A01 to A15 | 15 | 859 | behaviour of the v2.2 tools of agent aNN: output values, boundaries, error paths |
+| `tests/test_tools_aNN.py`, A16 to A30 | 15 | 3264 | behaviour of every lane tool of the v2.3 agents (A16 to A30 have no v2.1 tools, so no `_existing` file) |
+| `tests/test_tools_aNN_existing.py` | 15 | 2900 | behaviour of the v2.1 lane tools of A01 to A15, written against the handler (the generated contract only proves the declared states) |
+| `tests/generated/test_tool_contracts.py` | 1 | 2365 | the generated contract probes of every registry tool: six per tool (394 tools, lane and shared) plus `test_unregistered_name_is_not_callable` |
 
 Isolation: `tests/conftest.py` gives every test its own `SWARM_DIR` when the process has none (autouse
 `_repo_swarm_state_is_untouched`), so a registry call never writes into the checkout's `.swarm/`. The generated
@@ -647,3 +719,52 @@ per streak (section 4); `.md` result evidence is redacted; the cancel flag path 
 | `sec_credential_scan` | every detector is linear in the line length (bounded repetition or a token-boundary lookbehind), so a long line cannot stall it |
 | `sec_line_entropy` | counts characters with `collections.Counter` (one pass); `text` is capped at `maxLength` 100000 |
 | `docs_terminology_drift` | the violation list is a capped sample (`MAX_REPORTED_VIOLATIONS` 500, `violations_truncated`); `violation_count` and `by_term` stay exact |
+
+## 16. Changelog v2.3
+
+The v2.3 changes, in the order of the layers. The runtime of sections 2 to 8 is unchanged.
+
+**Roster** (`agents.json`): 15 agents became 30. A16 to A30 form three domains of five. Each new agent has
+12 to 13 registered READ tools and 12 to 14 skills of its own on top of the shared baseline (21 tools and 12
+skills, unchanged); the roster now holds 369 lane tools and 364 agent skills.
+
+| Domain | Agents |
+|---|---|
+| Cloud-Native | A16 Cloud-Native Architect, A17 Platform Engineer, A18 Supply-Chain Security Engineer, A19 Event-Driven & Serverless Engineer, A20 FinOps & GreenOps Analyst |
+| Cluster | A21 Kubernetes Cluster Operator, A22 GitOps & Progressive Delivery Engineer, A23 Service Mesh & Networking Engineer, A24 Cluster Security & Policy Engineer, A25 Resilience & Chaos Engineer |
+| Web3 | A26 Smart Contract Engineer, A27 Smart Contract Auditor, A28 Blockchain Infrastructure Engineer, A29 dApp & Wallet Integration Engineer, A30 Web3 Custody & Compliance Engineer |
+
+The new agents' L4 ceilings (a human decides) are: A16 `commitment_or_exit_plan`; A18 `signing_key_change`; A20 `commitment_purchase`; A21 `cluster_delete`; A22 `prod_prune`; A24 `exception_grant`; A25 `dr_failover_prod`; A26 `mainnet_deploy` and `fund_moving`; A27 `accept_risk`; A28 `validator_key_ops`; A30 `key_ceremony` and `fund_moving`.
+
+**Gates unchanged.** No new agent owns a gate: A08, A09, A10 and A12 are still the only gate owners, and the work of the
+new agents flows through them.
+
+**Plans** (`scripts/orch_plan.py`, `scripts/orch_from_graph.py`, `swarm/blast_radius.py`): three new `PATTERNS`,
+`cloud-native` (15 tasks), `cluster` (12) and `web3` (14), selectable with `--pattern`. The `cluster` and `web3` rows that
+implement (A22 manifests, A26, A29) are `risk_class` high, so all four gates apply; `cloud-native` follows the plan's risk
+class. `orch_from_graph.py` routes a graph step to an owner by file path: `*.sol`, `*.vy`, `contracts/`, `foundry.toml`
+and `hardhat.config.*` to A26; `web3/`, `wallet/` and `wagmi/` to A29; `charts/`, `helm/`, `k8s/`, `kubernetes/`,
+`manifests/`, `overlays/` and `kustomization.yaml` to A22; `Dockerfile*` to A18; `asyncapi.*` and `serverless.*` to A19;
+`catalog-info.yaml` to A17. Blast-radius lanes (`_LANE_AGENTS`) cover 25 agents: every one except A01, A08, A09, A10 and
+A12.
+
+**Registry and ACP:** owner prefixes `cloud_`, `plat_`, `supply_`, `event_`, `finops_`, `k8s_`, `gitops_`, `mesh_`,
+`kpol_`, `resil_`, `sol_`, `audit_`, `chain_`, `dapp_` and `custody_`; the 21 baseline tools permit all 30 agents. The
+new artifact types are in the new agents' `produces`; 11 existing agents (A03, A04, A05, A06, A08, A10, A11, A12, A13, A14, A15) gained them in `consumes`, so the ACP routing
+table gives them routes without a peer list.
+
+**Guard** (`omp/src/guard.ts`): rows `argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`,
+`managed-cluster-lifecycle` and `kubeadm-lifecycle` (capability `prod_infra`) and `chain-broadcast` and
+`chain-key-material` (capabilities `chain_broadcast` and `chain_key_material`); what each blocks and passes is in
+section 12.
+
+**Bar** (`omp/src/swarm_bar.ts`): the footer status text `swarm: <counts>` (`setStatus`) is removed. The bar above the
+editor is unchanged and is the one place the counts appear; `SWARM_BAR=off` disables the bar and its token chips
+([swarm-bar.md](swarm-bar.md)).
+
+**Substrate:** `AGENT_SURFACES` (`swarm/substrate_tee.py`) and `SWARM_SURFACES` (`swarm/memory.py`) gain A16 to A30 as
+`swarm-<id>-<code>`; a workspace install with substrate tokens needs `SUBSTRATE_TOKEN_<SURFACE>` for all 30
+([substrate-workspace.md](substrate-workspace.md)).
+
+**omp skills:** 30 per-agent index skills plus `swarm-orchestrate` are visible (31); every omp agent file stays at or
+under 64 KiB, with `a01-orchestrator` the largest.

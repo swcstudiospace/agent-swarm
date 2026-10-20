@@ -652,11 +652,11 @@ def test_no_proxy_bypasses_the_proxy(monkeypatch, http_server, fake_dns):
 # --- tables -------------------------------------------------------------------------------------------------
 def test_surfaces_match_agents_json():
     agents = json.loads((ROOT / "agents.json").read_text())["agents"]
-    assert {a["id"] for a in agents} == set(tee_mod.AGENT_SURFACES) and len(agents) == 15
+    assert {a["id"] for a in agents} == set(tee_mod.AGENT_SURFACES) and len(agents) == 30
     for a in agents:
         assert tee_mod.AGENT_SURFACES[a["id"]] == f"swarm-{a['id'].lower()}-{a['code'].lower()}"
-    assert list(tee_mod.AGENT_SURFACES.values())[0] == "swarm-a01-orch" and list(tee_mod.AGENT_SURFACES.values())[-1] == "swarm-a15-doc"
-    assert [i for i in tee_mod.AGENT_SURFACES] == [f"A{n:02d}" for n in range(1, 16)]
+    assert list(tee_mod.AGENT_SURFACES.values())[0] == "swarm-a01-orch" and list(tee_mod.AGENT_SURFACES.values())[-1] == "swarm-a30-custody"
+    assert [i for i in tee_mod.AGENT_SURFACES] == [f"A{n:02d}" for n in range(1, 31)]
 
 
 EVENT_KINDS = {"session.start", "prompt", "claim", "tool.call", "file.edit", "shell", "commit", "pr", "handoff", "session.end",
@@ -738,11 +738,12 @@ def test_script_agent_ids_are_known():
 @pytest.mark.parametrize("rec,agent", [
     ({"source": "A05@code_checks"}, "A05"),
     ({"source": "A15@docs_bundle"}, "A15"),
+    ({"source": "A30@custody_policy_check"}, "A30"),
     ({"source": "swarm.envelope", "payload": {"source": "A08@local"}}, "A08"),
     ({"source": "swarm.envelope", "payload": {"source": "A99"}}, None),
     ({"source": "swarm.envelope", "payload": {}}, None),
     ({"source": "t"}, None),
-    ({"source": "A16@x"}, None),
+    ({"source": "A31@x"}, None),
 ])
 def test_agent_of(rec, agent):
     assert tee_mod.agent_of(rec) == agent

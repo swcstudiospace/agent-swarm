@@ -17,7 +17,7 @@ A13 owns production truth: SLOs, dashboards, alerting, anomaly detection, tracin
 | Synthetic | External probes for user-journey level checks |
 
 ## 3. Communication
-**Consumes:** `deployment.event` (from A12), `release.record`, `telemetry.raw` (pipelines), `slo.targets` (from A03 bindings / A02 NFRs), `runbook` updates (A15), `incident.response` (humans/A14).
+**Consumes:** `deployment.event` (from A12), `release.record`, `telemetry.raw` (pipelines), `slo.targets` (from A03 bindings / A02 NFRs), `runbook` updates (A15), `incident.response` (humans/A14), `resilience.design` (A16), `platform.scorecard` (A17), `cluster.fleet.status` (A21), `drift.report` + `rollout.plan` (A22), `backup.coverage.report` (A25), `indexer.spec` (A28), `event.topology.spec` (A19).
 **Produces:** `incident.alert`, `anomaly.event`, `slo.report`, `capacity.forecast`, `dashboard.bundle`, `performance.baseline`, `deploy.telemetry` (guardrail stream for A12), `escape.feedback`.
 
 ```json

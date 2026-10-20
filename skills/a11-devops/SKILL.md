@@ -35,7 +35,7 @@ Don't use for: Do not write product business logic.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: architecture.blueprint, code.patch, security.gate.verdict, promote.command.
+2. Read upstream artifacts in consumes: architecture.blueprint, code.patch, security.gate.verdict, promote.command, landing.zone.spec, platform.claim, gitops.manifests, serverless.config.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only build.artifact, iac.change, environment.record, ci.pipeline.
 5. Finish with markdown summary + one fenced json `task.result`.

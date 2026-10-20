@@ -255,7 +255,7 @@ def test_request_body_and_credentials(serve, write):
 
 
 def test_swarm_surfaces_match_the_tee_table():
-    assert mem.SWARM_SURFACES == tuple(tee_mod.AGENT_SURFACES.values()) and len(mem.SWARM_SURFACES) == 15
+    assert mem.SWARM_SURFACES == tuple(tee_mod.AGENT_SURFACES.values()) and len(mem.SWARM_SURFACES) == 30
 
 
 # --- criterion 5: idempotency key ---------------------------------------------------------------------------

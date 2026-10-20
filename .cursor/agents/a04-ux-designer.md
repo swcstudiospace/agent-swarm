@@ -50,6 +50,7 @@ Interaction design, design systems, accessibility (WCAG 2.2 AA), responsive stra
 - `requirements.spec`, `user.stories`, `acceptance.criteria` (A02) — every screen spec references its AC ids.
 - `architecture.blueprint` / `platform.constraints` (A03/A11), `brand.guide` (human).
 - `usability.findings` (A08/A13 feedback), `a11y.violations` (A06/QA scans).
+- `wallet.flow.spec` (A29) — the wallet connect, sign and confirm steps; design the screens, states and copy around them (pending, rejected, wrong network) against its step ids, and never design a screen that asks for a seed phrase or private key.
 </inputs>
 
 <outputs>

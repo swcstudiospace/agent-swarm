@@ -17,7 +17,7 @@ A15 owns the knowledge layer: user guides, developer docs, API references, opera
 | Diagrams | Mermaid-as-code from C4/blueprint exports |
 
 ## 3. Communication
-**Consumes:** `requirements.spec` (feature summaries), `architecture.blueprint` + `adr.set` (A03), `api.contract`/`data.contract` (A03/A07), `ux.spec` (user-facing behavior), `release.record`/`release.notes` (A12), `runbook.requests` (A13), `impl.notes` (A05/A06), `memory.retrospectives`.
+**Consumes:** `requirements.spec` (feature summaries), `architecture.blueprint` + `adr.set` (A03), `api.contract`/`data.contract` (A03/A07), `ux.spec` (user-facing behavior), `release.record`/`release.notes` (A12), `runbook.requests` (A13), `impl.notes` (A05/A06), `memory.retrospectives`, `dr.runbook` (A25), `service.catalog.entry` (A17), `event.schema.set` (A19), `promotion.record` (A22), `audit.report` (A27), `dapp.integration.spec` (A29).
 **Produces:** `docs.bundle`, `api.reference`, `runbook`, `onboarding.guide`, `changelog.site`, `doc.coverage.report`, `stale.docs.alert`.
 
 ```json

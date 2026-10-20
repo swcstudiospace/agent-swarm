@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { createModel, formatElapsed, ingestLive, renderSwarmBar, renderSwarmBarFrame, statusText, type SwarmBarModel, visibleRuns } from "../src/swarm_bar.ts";
+import { createModel, formatElapsed, ingestLive, renderSwarmBar, renderSwarmBarFrame, type SwarmBarModel, visibleRuns } from "../src/swarm_bar.ts";
 import { displayWidth } from "../src/swarm_dock.ts";
 import { REPO_ROOT } from "./helpers.ts";
 
@@ -49,7 +49,7 @@ describe("runner live.json sample feeds the bar", () => {
     expect(doc.schema).toBe("swarm.live.v1");
     const states = new Set(doc.runs.map((r) => r.state));
     for (const needed of ["running", "queued", "completed", "waiting", "failed"]) expect(states.has(needed)).toBe(true);
-    expect(new Set(doc.runs.map((r) => r.agent)).size).toBe(15);
+    expect(new Set(doc.runs.map((r) => r.agent)).size).toBe(30);
   });
 
   test("ingestion accepts it and the summary line carries the runner's own counts", () => {
@@ -66,7 +66,6 @@ describe("runner live.json sample feeds the bar", () => {
     expect(summary).toContain(`${swarm.completed} done`);
     expect(summary).toContain(`${swarm.failed} fail`);
     expect(summary).toContain(`slots ${swarm.running}/${swarm.effective_parallel}`);
-    expect(statusText(model, NOW)).toContain(`${swarm.running} run`);
   });
 
   test("every row is either drawn or counted in '+N more'", () => {
@@ -80,7 +79,7 @@ describe("runner live.json sample feeds the bar", () => {
     expect(order[0]).toBe("failed");
   });
 
-  test("each of the 15 agents is named with a fixed-width elapsed timer, in every state", () => {
+  test("each of the 30 agents is named with a fixed-width elapsed timer, in every state", () => {
     const agents = new Set<string>();
     for (const run of doc.runs) {
       const line = rowLine(run, NOW);
@@ -90,7 +89,7 @@ describe("runner live.json sample feeds the bar", () => {
       expect(found![1].trim()).toBe(formatElapsed(run.elapsed_s));
       agents.add(run.agent);
     }
-    expect(agents.size).toBe(15);
+    expect(agents.size).toBe(30);
   });
 
   test("state words and glyphs follow the runner's states (never color alone)", () => {

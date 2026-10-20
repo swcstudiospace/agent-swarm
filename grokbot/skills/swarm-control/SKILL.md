@@ -2,7 +2,7 @@
 name: swarm-control
 description: >
   Grok Bot lane control for a01-orchestrator.
-  Use when Desk Lead routes work to this lane of the 15 AgentSwarm roles.
+  Use when Desk Lead routes work to this lane of the 30 AgentSwarm roles.
 disable-model-invocation: false
 ---
 
@@ -18,7 +18,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 
 ## Procedure
 
-1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 15 roles.
+1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 30 roles.
 2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Among role globs, the longest match wins, and an equal length goes to the lowest role id. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.
 3. Run that role's scripts from the pinned checkout: `python3 "$SWARM_ROOT/scripts/<script>.py" --root <target repo> --json` (the bun twin is `bun "$SWARM_ROOT/scripts/ts/<script>.ts" --root <target repo> --json`). `<target repo>` is the git toplevel being edited. Do not run a `scripts/` path from the target tree. Stay inside the role's path globs and autonomy ceiling.
 4. Verify with the seat's verification tools from the seat map.

@@ -1,8 +1,8 @@
 ---
 name: swarm-delivery
 description: >
-  Grok Bot lane delivery for a02-requirements, a03-architect, a04-ux-designer.
-  Use when Desk Lead routes work to this lane of the 15 AgentSwarm roles.
+  Grok Bot lane delivery for a02-requirements, a03-architect, a04-ux-designer, a16-cloud-architect.
+  Use when Desk Lead routes work to this lane of the 30 AgentSwarm roles.
 disable-model-invocation: false
 ---
 
@@ -14,11 +14,11 @@ Regenerate with `python3 scripts/build_agents.py`.
 ## When to Use
 
 - The assignment belongs to lane `delivery`.
-- The role slug is one of: a02-requirements, a03-architect, a04-ux-designer.
+- The role slug is one of: a02-requirements, a03-architect, a04-ux-designer, a16-cloud-architect.
 
 ## Procedure
 
-1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 15 roles.
+1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 30 roles.
 2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Among role globs, the longest match wins, and an equal length goes to the lowest role id. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.
 3. Run that role's scripts from the pinned checkout: `python3 "$SWARM_ROOT/scripts/<script>.py" --root <target repo> --json` (the bun twin is `bun "$SWARM_ROOT/scripts/ts/<script>.ts" --root <target repo> --json`). `<target repo>` is the git toplevel being edited. Do not run a `scripts/` path from the target tree. Stay inside the role's path globs and autonomy ceiling.
 4. Verify with the seat's verification tools from the seat map.
@@ -49,3 +49,11 @@ Regenerate with `python3 scripts/build_agents.py`.
 - Home: `bot-01-systems-backend`. Seat: `bot-01-systems-backend`.
 - Autonomy ceiling: brand_change=L3, spec=L2.
 - Scripts: `$SWARM_ROOT/scripts/ux_tokens.py`.
+
+### A16 CLOUD (a16-cloud-architect)
+
+- Prompt: `$SWARM_ROOT/prompts/A16-cloud-architect.md`
+- Role: Senior Cloud-Native Architect (A16 CLOUD, slug a16-cloud-architect) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A16-cloud-architect.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for cloud.architecture, resilience.design, landing.zone.spec, wellarch.review.
+- Home: `executor`. Seat: `bot-05-infrastructure`.
+- Autonomy ceiling: commitment_or_exit_plan=L4, design=L2, provider_or_region_change=L3.
+- Scripts: `$SWARM_ROOT/scripts/cloud_readiness_scan.py`.

@@ -20,7 +20,10 @@ from .taskstore import GATES_BY_RISK
 _FENCE = re.compile(r"```blast-radii[^\n]*\n(.*?)```", re.DOTALL)
 _SLICE_ID = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _RESERVED = frozenset({"join", "rev", "qa", "sec", "rel"})
-_LANE_AGENTS = frozenset({"A02", "A03", "A04", "A05", "A06", "A07", "A11", "A13", "A14", "A15"})
+_LANE_AGENTS = frozenset({"A02", "A03", "A04", "A05", "A06", "A07", "A11", "A13", "A14", "A15",
+                          "A16", "A17", "A18", "A19", "A20", "A21", "A22", "A23", "A24", "A25",
+                          "A26", "A27", "A28", "A29", "A30"})
+# One default capability per lane agent, kept in step with _LANE_AGENTS; each is in that agent's capabilities.
 _DEFAULT_CAPABILITY = {
     "A02": "req.spec",
     "A03": "design.blueprint",
@@ -32,6 +35,21 @@ _DEFAULT_CAPABILITY = {
     "A13": "obs.slo",
     "A14": "maint.patch",
     "A15": "docs.bundle",
+    "A16": "cloud.architecture",
+    "A17": "platform.golden_path",
+    "A18": "supply.image",
+    "A19": "event.topology",
+    "A20": "finops.model",
+    "A21": "cluster.capacity",
+    "A22": "gitops.manifest",
+    "A23": "mesh.traffic",
+    "A24": "kpol.admission",
+    "A25": "resilience.backup",
+    "A26": "web3.contract",
+    "A27": "audit.static",
+    "A28": "chain.node",
+    "A29": "dapp.wallet",
+    "A30": "custody.policy",
 }
 _GATE_ROWS = {
     "review": ("rev", "gate.review", "A09", "Greptile review of the merged branch",

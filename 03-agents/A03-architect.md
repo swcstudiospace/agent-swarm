@@ -17,7 +17,7 @@ A03 owns "how it's built": system architecture (C4 model), technology selection,
 | Memory | Reads past ADRs + retrospectives; writes decision patterns |
 
 ## 3. Communication
-**Consumes:** `requirements.spec`, `user.stories`, `acceptance.criteria`, `ux.spec` (A04), `infra.constraints` (A11), `security.policy` (A10), `test.escape.feedback`, `capacity.forecast` (A13).
+**Consumes:** `requirements.spec`, `user.stories`, `acceptance.criteria`, `ux.spec` (A04), `infra.constraints` (A11), `security.policy` (A10), `test.escape.feedback`, `capacity.forecast` (A13), `cloud.architecture` + `wellarch.review` (A16).
 **Produces:** `architecture.blueprint`, `adr.set`, `api.contract`, `tech.stack.selection`, `threat.model`, `capacity.model`, `review.standards` (coding standards input for A09).
 
 ```json

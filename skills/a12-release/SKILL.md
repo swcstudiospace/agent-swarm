@@ -33,7 +33,7 @@ Don't use for: Do not write application code.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: gate.verdict, build.artifact, deploy.telemetry, incident.alert, acceptance.criteria.
+2. Read upstream artifacts in consumes: gate.verdict, build.artifact, deploy.telemetry, incident.alert, acceptance.criteria, rollout.plan, traffic.plan, cluster.upgrade.plan.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only release.plan, release.record, promote.command, rollback.command, gate.verdict.
 5. Finish with markdown summary + one fenced json `task.result`.

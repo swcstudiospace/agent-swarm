@@ -17,7 +17,7 @@ A05 implements server-side functionality: services, business logic, persistence 
 | Data | Consumes A07 migrations/ORM models; never authors migrations |
 
 ## 3. Communication
-**Consumes:** `task.assign`, `api.contract`, `architecture.blueprint`, `schema.migration` (A07), `ux.spec` (behavior contracts), `review.comments` (A09), `security.findings` (A10), `test.results` (A08), `defect.report`.
+**Consumes:** `task.assign`, `api.contract`, `architecture.blueprint`, `schema.migration` (A07), `ux.spec` (behavior contracts), `review.comments` (A09), `security.findings` (A10), `test.results` (A08), `defect.report`, `event.topology.spec` (A19), `golden.path.template` (A17).
 **Produces:** `code.patch` (PR), `code.manifest` (deps+SBOM), `impl.notes`, `task.status/result`, `dependency.request`, `contract.change.request`.
 
 ```json

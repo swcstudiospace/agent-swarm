@@ -26,7 +26,7 @@ const STATES = [
 
 /** orch_plan.py choices: --pattern (PATTERNS only: `custom` needs --plan <path>, which no tool exposes), --risk-class
  * (taskstore.py GATES_BY_RISK), --priority. */
-export const PATTERNS = ["feature", "hotfix", "dependency", "parallel"] as const;
+export const PATTERNS = ["feature", "hotfix", "dependency", "cloud-native", "cluster", "web3", "parallel"] as const;
 export const RISK_CLASSES = ["low", "medium", "high"] as const;
 const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 
@@ -281,7 +281,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
           type: "string",
           enum: PATTERNS,
           description:
-            "DAG pattern: feature (13 tasks), hotfix (8), dependency (8), parallel (one lane per slices[] entry, then one Greptile review). parallel requires slices.",
+            "DAG pattern: feature (13 tasks), hotfix (8), dependency (8), cloud-native (15: cloud architecture, events, golden path, cost, image), cluster (12: capacity, traffic, admission policy, GitOps, resilience; manifests are risk high), web3 (14: custody policy, contracts, audit, dapp; contracts and dapp are risk high), parallel (one lane per slices[] entry, then one Greptile review). parallel requires slices.",
         },
         slices: {
           type: "array",

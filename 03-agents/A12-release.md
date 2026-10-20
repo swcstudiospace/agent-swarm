@@ -17,7 +17,7 @@ A12 owns the release gate and release execution: release planning/queueing, chan
 | Comms | Release notes → A15; announce events → A13/A14 context |
 
 ## 3. Communication
-**Consumes:** `quality.gate.verdict` (A08), `security.gate.verdict` (A10), `review.verdict` summary (A09 via A01), `build.artifact` (A11), `release.request` (A01/human), `deploy.telemetry` (A13 live guardrails), `rollback.command` (own), `incident.alert` (A13 — triggers release freeze).
+**Consumes:** `quality.gate.verdict` (A08), `security.gate.verdict` (A10), `review.verdict` summary (A09 via A01), `build.artifact` (A11), `release.request` (A01/human), `deploy.telemetry` (A13 live guardrails), `rollback.command` (own), `incident.alert` (A13 — triggers release freeze), `rollout.plan` (A22), `traffic.plan` (A23), `cluster.upgrade.plan` (A21), `resilience.report` + `chaos.plan` (A25), `audit.report` (A27), `contract.deploy.plan` (A26), `custody.evidence.pack` + `key.ceremony.plan` (A30), `supply.attestation.bundle` (A18).
 **Produces:** `release.plan`, `release.notes`, `deploy.approval.request` (when L3), `promote.command` / `rollback.command` (signed), `release.record`, `release.freeze`.
 
 ```json
@@ -42,6 +42,7 @@ A12 owns the release gate and release execution: release planning/queueing, chan
 4. **Freeze law:** any `incident.alert` sev≥2 ⇒ swarm-wide deploy freeze (L2); only the declaring authority (A13/human) may unfreeze.
 5. **Windowing:** respects change-freeze calendars and low-traffic windows; collisions auto-rescheduled ×2 then escalated.
 6. **Boundary:** cannot deploy what lacks a `build.artifact` with provenance; cannot override A08/A10 verdicts; cannot delete release records (append-only).
+7. **Web3 and cluster targets:** for web3 targets the release plan requires `audit.report`, `contract.deploy.plan` and `custody.evidence.pack` before it can be approved; mainnet deployment and fund movement are human-only (L4). Cluster targets require `rollout.plan`, `traffic.plan`, `cluster.upgrade.plan` and `resilience.report`. A missing required artifact blocks the release gate with the artifact named.
 
 ## 5. Error handling & fallbacks
 - **Canary metrics pipeline down:** cannot evaluate guardrails ⇒ promotion halts at current step (fail-closed), never proceeds blind.

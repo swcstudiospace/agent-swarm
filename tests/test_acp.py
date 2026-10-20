@@ -17,7 +17,7 @@ HAPPY = {
 
 def test_routes_are_derived_from_the_manifest():
     table = routing_table()
-    assert set(table) == {f"A{n:02d}" for n in range(1, 16)}
+    assert set(table) == {f"A{n:02d}" for n in range(1, 31)}
     assert table["A03"]["endpoint"] == "inproc://A03"
     assert "requirements.spec" in table["A02"]["produces"]
     assert "requirements.spec" in table["A03"]["accepts"]

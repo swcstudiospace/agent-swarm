@@ -119,7 +119,7 @@ def test_registry_pages_have_the_six_sections_and_no_placeholders():
     data = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
     pages = render_docs(data)
     agent_pages = [text for rel, text in pages.items() if rel.startswith("docs/tools/agents/")]
-    assert len(agent_pages) == 15
+    assert len(agent_pages) == 30
     for text in agent_pages:
         for heading in SECTIONS:
             assert heading in text

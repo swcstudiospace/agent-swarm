@@ -1,7 +1,7 @@
 # AgentSwarm — Claude Code project guide
 
 This repo is both the **design spec** (`01-*.md` … `07-*.md`, `03-agents/`) and a **runnable
-Claude Code subagent swarm** built from it. Fifteen agents (A01–A15) cover the SDLC; each one is
+Claude Code subagent swarm** built from it. Thirty agents (A01–A30) cover the SDLC and three specialist domains: A01–A15 are the core SDLC agents, A16–A30 are cloud-native (A16–A20), cluster (A21–A25) and Web3 (A26–A30), five agents each; each one is
 a Claude Code and Grok Build subagent and an omp task agent, generated from the Prompt-Uplift XML prompt in `prompts/`; its tools are Python plus TypeScript twins (`scripts/ts/`). Skills: `skills/<slug>/SKILL.md`. Orchestration: `skills/orchestrate/SKILL.md` + `hooks/user_prompt_submit.py` (Claude Code), or `/swarm <brief>` + the `before_agent_start` context hook (omp).
 
 ## Layout
@@ -14,7 +14,7 @@ a Claude Code and Grok Build subagent and an omp task agent, generated from the 
 | `.claude/agents/*.md` | **Generated** Claude Code subagents (`python3 scripts/build_agents.py`) |
 | `.grok/agents/*.md` | **Generated** Grok Build subagents |
 | `omp/agents/*.md` | **Generated** omp task agents (`build_agents.py`; `--check` covers them). `tools:` adds the hidden swarm tools per agent (`SWARM_TOOLS`). Not a sandbox: the `tool_call` guard (`omp/src/guard.ts`) enforces the autonomy ceiling, swarm-state and depth rules in swarm sessions; read-only is unenforced |
-| `omp/skills/<name>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`): 15 visible per-agent index skills + `swarm-orchestrate`, and one hidden skill per source in `prompts/skills/<owner>/<short>.md` |
+| `omp/skills/<name>/SKILL.md` | **Generated** omp skills (`build_agents.py`, `_write_skills.py`): 30 visible per-agent index skills + `swarm-orchestrate`, and one hidden skill per source in `prompts/skills/<owner>/<short>.md` |
 | `omp/package.json`, `omp/src/` | **Hand-written** omp extension package: eight typed `swarm_*` tools over one python bridge (`omp/src/bridge.ts`), the `tool_call` guard (`guard.ts`), the `before_agent_start` context hook (`hooks.ts`), the `/swarm` command (`commands.ts`) and the swarm bar (`swarm_bar.ts`) |
 | `omp/test/` | **Hand-written** `bun:test` suite for the package (`cd omp && bun run test`) |
 | `.omp/config.yml` | Committed omp project wiring: `extensions:` → `- omp` (the only file in `.omp/`) |
@@ -25,7 +25,7 @@ a Claude Code and Grok Build subagent and an omp task agent, generated from the 
 | `swarm/` | Runtime toolkit: envelope (signed `swarm.v1`), Task Store (SQLite state machine), gates, manifest, run log; v2.2: `lifecycle`, `telemetry`, `handover`, `tool_registry`, `skill_registry`, `claims`, `retry`, `limiter`, and `swarm/tools/` (the registry handlers) |
 | `scripts/` | Per-agent tools (see table below) + orchestration (`orch_plan.py`, `orch_status.py`, `swarm_run.py`, `swarm_live.py`, `swarm_tool.py`) + generators (`build_agents.py`, `_write_skills.py`, `_registry_intake.py`, `_install_omp.py`) |
 | `.swarm/` | Runtime state (task DB, plans, verdicts, assignments, results, `events.jsonl`, `live.json`, `handovers/`). Resolved per call: `SWARM_DIR` (made absolute) → `<git toplevel of --root/--repo or cwd>/.swarm` → `<dir>/.swarm`. Created with its own `.gitignore` of `*`. |
-| `tests/` | `pytest -q`; every test gets its own `SWARM_DIR`; per-agent tool suites `test_tools_aNN.py` (v2.2 tools) and `test_tools_aNN_existing.py` (v2.1 tools), plus the generated `tests/generated/test_tool_contracts.py` |
+| `tests/` | `pytest -q`; every test gets its own `SWARM_DIR`; per-agent tool suites `test_tools_aNN.py` (registry tools, A01–A30) and `test_tools_aNN_existing.py` (v2.1 lane tools, A01–A15), plus the generated `tests/generated/test_tool_contracts.py` |
 
 ## Agent → subagent → scripts
 
@@ -46,6 +46,21 @@ a Claude Code and Grok Build subagent and an omp task agent, generated from the 
 | A13 OBS | `a13-observability` | `obs_slo.py` |
 | A14 MAINT | `a14-maintenance` | `maint_deps.py` |
 | A15 DOC | `a15-docs` | `docs_bundle.py` |
+| A16 CLOUD | `a16-cloud-architect` | `cloud_readiness_scan.py` |
+| A17 PLAT | `a17-platform-engineer` | `plat_catalog_lint.py` |
+| A18 SUPPLY | `a18-supply-chain` | `supply_image_lint.py` |
+| A19 EVENT | `a19-event-driven` | `event_schema_check.py` |
+| A20 FINOPS | `a20-finops` | `finops_cost_scan.py` |
+| A21 K8S | `a21-cluster-ops` | `k8s_manifest_check.py` |
+| A22 GITOPS | `a22-gitops` | `gitops_repo_check.py` |
+| A23 MESH | `a23-mesh-network` | `mesh_policy_check.py` |
+| A24 KSEC | `a24-cluster-security` | `kpol_manifest_scan.py` |
+| A25 RESIL | `a25-resilience` | `resil_manifest_check.py` |
+| A26 SOL | `a26-smart-contract` | `sol_contract_lint.py` |
+| A27 AUDIT | `a27-contract-audit` | `audit_findings_check.py` |
+| A28 CHAIN | `a28-chain-infra` | `chain_config_check.py` |
+| A29 DAPP | `a29-dapp-wallet` | `dapp_wallet_check.py` |
+| A30 CUSTODY | `a30-custody-compliance` | `custody_policy_check.py` |
 
 Every script shares one CLI contract (`swarm/script_base.py`): `--task-id`, `--correlation-id`,
 `--root`, `--json`, `--dry-run`, exact spellings only (`allow_abbrev=False`: `--ing` exits 2); exit 0 ok / 1 finding-fail / 2 taxonomy error; appends to
@@ -54,7 +69,7 @@ Every script shares one CLI contract (`swarm/script_base.py`): `--task-id`, `--c
 ## Running the swarm
 
 ```bash
-# 1. plan: brief → task DAG (patterns: feature | hotfix | dependency | parallel | custom --plan plan.json)
+# 1. plan: brief → task DAG (patterns: feature | hotfix | dependency | cloud-native | cluster | web3 | parallel | custom --plan plan.json)
 python3 scripts/orch_plan.py --repo /path/to/codebase --brief brief.md --pattern feature --risk-class medium
 #    parallel: a blast-radii JSON block, --slices, or --slices-json. Same agent, several lanes,
 #    each on its own worktree; join merges; one Greptile review of the merged branch.
@@ -116,14 +131,14 @@ The eight tools are `hidden` + `essential`; an agent only gets the ones its gene
 
 | Tool | Granted to | Runs |
 |---|---|---|
-| `swarm_plan` | A01 | `orch_plan.py` (feature / hotfix / dependency) |
+| `swarm_plan` | A01 | `orch_plan.py` (feature / hotfix / dependency / cloud-native / cluster / web3 / parallel) |
 | `swarm_status` | A01 | `orch_status.py` (read-only) |
 | `swarm_ingest` | A01 | `orch_status.py --ingest` (task.result v1 object) |
 | `swarm_transition` | A01 | `orch_status.py --transition` |
 | `swarm_assignment` | A01 | verified signed `task.assign` and prompt of a leased task |
 | `swarm_gate` | A08, A09, A10, A12 | `qa_gate` / `rev_gate` / `sec_gate` / `rel_plan` (findings in, signed verdict out) |
-| `swarm_catalog` | all 15 | `swarm_tool.py catalog`: registry tools and skills the agent may use |
-| `swarm_tool_call` | all 15 | `swarm_tool.py call`: one registry tool, caller = the session's own agent |
+| `swarm_catalog` | all 30 | `swarm_tool.py catalog`: registry tools and skills the agent may use |
+| `swarm_tool_call` | all 30 | `swarm_tool.py call`: one registry tool, caller = the session's own agent |
 
 Mutating tools (`swarm_plan`, `swarm_ingest`, `swarm_transition`, `swarm_gate`, `swarm_assignment`) and `/swarm` refuse with E-POLICY in omp plan mode; `swarm_tool_call` refuses tools above READ there. Tests: `cd omp && bun run test` (package suite;
 `extension.test.ts` runs in its own process) and `bun test tests/ts` (root TS suite).
@@ -133,8 +148,8 @@ The swarm bar (`omp/src/swarm_bar.ts`) is the topmost bar above the editor, alwa
 Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `AGENTS.md` **Hooks**):
 
 - `before_agent_start`: SDLC-shaped prompts in a top-level session get a `## AgentSwarm` part pointing at `/swarm` and `task` with `a01-orchestrator`; subagents, `SWARM_CHILD=1`/`SWARM_AGENT` sessions and non-SDLC prompts get nothing. An Ultrathink/Prompt-Uplift XML prompt is classified by its unescaped `<ORIGINAL>` text (else the whole prompt), matching the plugin's headless kickoff.
-- `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)`; `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval`, MCP tools (`mcp__*` calls and `write` to `xd://mcp__*`, `(mcp: …)`) and writes into `.swarm/`, `.omp/`, `~/.omp` block.
-- `/swarm <brief> [--pattern=feature|hotfix|dependency|parallel] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`, correlation id = uuid5 of pattern, risk and brief, so an identical brief reuses its plan), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and holds the session on `isIdle()` until that turn ends (10 s start timeout; hold cap `SWARM_DISPATCH_HOLD_MS`, else 30 min with a UI and unbounded in `-p`/rpc; a cap expiry is a warning saying the plan was dispatched) before draining with `waitForIdle`. Usage, plan mode and `E-CONTRACT` conflicts never dispatch; without a UI they are reported on stderr as `[/swarm] …`.
+- `tool_call` (swarm sessions, identity from `session_init.agent` else `SWARM_AGENT`): the `RULES` table in `omp/src/guard.ts` blocks with `BLOCKED needs: human-approval (<capability>: <rule id>)` (cluster tooling of A21–A25 under `prod_infra`: `argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle`, `kubeadm-lifecycle`; Web3 `chain_broadcast` / `chain_key_material` for A26, A28, A29, A30); `swarm_transition`/`swarm_ingest` from anyone but A01 block with `BLOCKED needs: human-approval (swarm-state)` in every session; A01 without `task` can only yield `BLOCKED needs: depth`; `eval`, MCP tools (`mcp__*` calls and `write` to `xd://mcp__*`, `(mcp: …)`) and writes into `.swarm/`, `.omp/`, `~/.omp` block.
+- `/swarm <brief> [--pattern=feature|hotfix|dependency|cloud-native|cluster|web3|parallel] [--risk=low|medium|high]`: plans through the bridge (same argv as `swarm_plan`, correlation id = uuid5 of pattern, risk and brief, so an identical brief reuses its plan), then sends a `[agent-swarm:dispatch]` prompt that calls `task` once with `a01-orchestrator` and `{correlation_id, capability: "plan.execute", ready_tasks}`, and holds the session on `isIdle()` until that turn ends (10 s start timeout; hold cap `SWARM_DISPATCH_HOLD_MS`, else 30 min with a UI and unbounded in `-p`/rpc; a cap expiry is a warning saying the plan was dispatched) before draining with `waitForIdle`. Usage, plan mode and `E-CONTRACT` conflicts never dispatch; without a UI they are reported on stderr as `[/swarm] …`.
 
 ## Rules the runtime enforces (mirrors the spec)
 
@@ -150,7 +165,7 @@ Hooks and the guard (Phase 4; the full contract, rule ids and residuals are in `
 - Change behaviour in `prompts/` (keep the XML tag set — `tests/test_swarm.py` checks it), then run
   `python3 scripts/build_agents.py` (`.claude/agents/`, `.grok/agents/`, `omp/agents/`, `omp/skills/`) and `python3 scripts/_write_skills.py`, and commit the regenerated files.
 - New tool: handler in `swarm/tools/aNN_tools.py` + fragment `registry/intake/<slug>.tools.json`, then `python3 scripts/_registry_intake.py --check` / `--apply`, `python3 -m swarm.tool_registry check|docs|gen-tests`. New skill: `prompts/skills/<owner>/<short>.md`, then `python3 -m swarm.skill_registry check|docs`. Each agent keeps 10 to 15 of each (`capability_policy`). Steps and limits: [docs/swarm-command-center.md](docs/swarm-command-center.md) section 9.
-- New agent: add to `agents.json`, write `prompts/`, scripts, regenerate. See `07-scalability.md` and the checklist in `docs/swarm-command-center.md` (several tests pin exactly 15 agents).
+- New agent: add to `agents.json`, write `prompts/`, scripts, regenerate. See `07-scalability.md` and the checklist in `docs/swarm-command-center.md` (several tests pin exactly 30 agents).
 - Keep scripts stdlib-only; optional tools must degrade to `skipped:tool-missing`.
 
 ## v2.2 Swarm Command Center

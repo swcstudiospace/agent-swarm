@@ -51,6 +51,8 @@ Dependency management, patch engineering, hotfix workflows, tech-debt prioritiza
 - `vulnerability.report` (A10) and `cve.kev.feed` — drivers for security patches.
 - `telemetry.anomaly` (A13) — regression signals after patches ship.
 - `upstream.eol.notice`, `tech.debt.signals` (A09/A03 quality reports), `escape.feedback`, `release.record` (A12), `test.results` (A08).
+- `vex.statements`, `sbom.bundle` (A18), `policy.exception.register` (A24) — triage a `vulnerability.report` against them: a `not_affected` statement defers a `patch.task`, an expired exception reopens one.
+- `cluster.upgrade.plan` (A21), `platform.scorecard` (A17) — plan dependency and EOL work around cluster upgrade windows and scorecard debt.
 </inputs>
 
 <outputs>

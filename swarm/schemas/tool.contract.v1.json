@@ -18,8 +18,8 @@
     "examples"
   ],
   "properties": {
-    "name": {"type": "string", "description": "Lane-prefixed unique name: orch_, req_, arch_, ux_, be_, fe_, data_, qa_, rev_, sec_, devops_, rel_, obs_, maint_, docs_, or shared_."},
-    "owner": {"type": "string", "description": "Agent id A01–A15, or shared."},
+    "name": {"type": "string", "description": "Lane-prefixed unique name: orch_, req_, arch_, ux_, be_, fe_, data_, qa_, rev_, sec_, devops_, rel_, obs_, maint_, docs_, cloud_, plat_, supply_, event_, finops_, k8s_, gitops_, mesh_, kpol_, resil_, sol_, audit_, chain_, dapp_, custody_, or shared_."},
+    "owner": {"type": "string", "description": "Agent id A01–A30, or shared."},
     "purpose": {"type": "string", "minLength": 1},
     "input_schema": {"type": "object"},
     "output_schema": {"type": "object"},

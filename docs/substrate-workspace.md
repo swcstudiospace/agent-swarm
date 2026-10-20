@@ -13,7 +13,7 @@ the installer, the runner and the lease bridge), `swarm/substrate_mcp.json` (the
 ## Install
 
 ```bash
-export SUBSTRATE_TOKEN_SWARM_A01_ORCH=… … SUBSTRATE_TOKEN_SWARM_A15_DOC=…   # the values the server holds, one per agent
+export SUBSTRATE_TOKEN_SWARM_A01_ORCH=… … SUBSTRATE_TOKEN_SWARM_A30_CUSTODY=…   # the values the server holds, one per agent (30)
 python3 scripts/build_agents.py --install-workspace /path/to/ws --dry-run   # the additions and the env files, nothing written
 python3 scripts/build_agents.py --install-workspace /path/to/ws             # [--runtimes claude,grok,omp] [--no-substrate]
 ```
@@ -57,6 +57,8 @@ that already holds a usable token (0600, this user's, exactly that one line) is 
 by hand. When an agent has neither, the install prints each missing variable and the file it would go to, and exits 2
 with nothing written: an install that wires the config without the token would 401 on every call, while the brief and the
 trail fail open, so the agent would look almost healthy. The installer never reads `/etc/substrate/substrate.env`.
+
+The install needs one token per agent, 30 in all. A16 to A30 are 15 surfaces added in v2.3 (`swarm-a16-cloud` … `swarm-a30-custody`, variables `SUBSTRATE_TOKEN_SWARM_A16_CLOUD` … `SUBSTRATE_TOKEN_SWARM_A30_CUSTODY`); they must exist on the agent-substrate server, whose closed set of surfaces is not in this repository, before a workspace install with substrate tokens. Until they do, install with `--no-substrate`.
 
 It also refuses (exit 2, nothing written):
 
@@ -140,6 +142,6 @@ presents the same value as `SUBSTRATE_TOKEN`. The full split is in agent-substra
 0600 separates OS accounts, not processes of one account. `swarm_run.py` starts every agent as the same user, so each
 agent could read its siblings' env files and authenticate as them, and possession of a token is the identity. What S1's
 identity work buys is real and bounded: no caller can name another surface over its own token, and accidental
-misattribution and shared-holder lease renewal stop. The 15 identities are attributable, not unforgeable, among agents
+misattribution and shared-holder lease renewal stop. The 30 identities are attributable, not unforgeable, among agents
 sharing an account. A separate OS principal per agent, or a broker handing each process only its own short-lived
 credential, would make them a security boundary; neither is in S4.

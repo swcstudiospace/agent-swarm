@@ -1,8 +1,8 @@
 ---
 name: swarm-code
 description: >
-  Grok Bot lane code for a05-backend, a06-frontend, a07-data.
-  Use when Desk Lead routes work to this lane of the 15 AgentSwarm roles.
+  Grok Bot lane code for a05-backend, a06-frontend, a07-data, a19-event-driven, a26-smart-contract, a29-dapp-wallet.
+  Use when Desk Lead routes work to this lane of the 30 AgentSwarm roles.
 disable-model-invocation: false
 ---
 
@@ -14,11 +14,11 @@ Regenerate with `python3 scripts/build_agents.py`.
 ## When to Use
 
 - The assignment belongs to lane `code`.
-- The role slug is one of: a05-backend, a06-frontend, a07-data.
+- The role slug is one of: a05-backend, a06-frontend, a07-data, a19-event-driven, a26-smart-contract, a29-dapp-wallet.
 
 ## Procedure
 
-1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 15 roles.
+1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 30 roles.
 2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Among role globs, the longest match wins, and an equal length goes to the lowest role id. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.
 3. Run that role's scripts from the pinned checkout: `python3 "$SWARM_ROOT/scripts/<script>.py" --root <target repo> --json` (the bun twin is `bun "$SWARM_ROOT/scripts/ts/<script>.ts" --root <target repo> --json`). `<target repo>` is the git toplevel being edited. Do not run a `scripts/` path from the target tree. Stay inside the role's path globs and autonomy ceiling.
 4. Verify with the seat's verification tools from the seat map.
@@ -49,3 +49,27 @@ Regenerate with `python3 scripts/build_agents.py`.
 - Home: `bot-01-systems-backend`. Seat: `bot-01-systems-backend`.
 - Autonomy ceiling: destructive_ddl=L4, migration=L2.
 - Scripts: `$SWARM_ROOT/scripts/data_migration_check.py`.
+
+### A19 EVENT (a19-event-driven)
+
+- Prompt: `$SWARM_ROOT/prompts/A19-event-driven.md`
+- Role: Senior Event-Driven &amp; Serverless Engineer (A19 EVENT, slug a19-event-driven) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A19-event-driven.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for event.topology.spec, event.schema.set, serverless.config, code.patch.
+- Home: `bot-01-systems-backend`. Seat: `bot-01-systems-backend`.
+- Autonomy ceiling: breaking_event_schema=L3, event_design=L2, prod_replay_or_backfill=L3.
+- Scripts: `$SWARM_ROOT/scripts/event_schema_check.py`.
+
+### A26 SOL (a26-smart-contract)
+
+- Prompt: `$SWARM_ROOT/prompts/A26-smart-contract.md`
+- Role: Senior Smart Contract Engineer (A26 SOL, slug a26-smart-contract) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A26-smart-contract.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for code.patch, contract.abi, contract.deploy.plan, gas.report.
+- Home: `bot-01-systems-backend`. Seat: `bot-01-systems-backend`.
+- Autonomy ceiling: code=L2, fund_moving=L4, mainnet_deploy=L4, proxy_upgrade=L3.
+- Scripts: `$SWARM_ROOT/scripts/sol_contract_lint.py`.
+
+### A29 DAPP (a29-dapp-wallet)
+
+- Prompt: `$SWARM_ROOT/prompts/A29-dapp-wallet.md`
+- Role: Senior dApp &amp; Wallet Integration Engineer (A29 DAPP, slug a29-dapp-wallet) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A29-dapp-wallet.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for code.patch, dapp.integration.spec, wallet.flow.spec.
+- Home: `bot-02-web-edge`. Seat: `bot-02-web-edge`.
+- Autonomy ceiling: code=L2, mainnet_enable=L3, signing_flow_change=L3.
+- Scripts: `$SWARM_ROOT/scripts/dapp_wallet_check.py`.

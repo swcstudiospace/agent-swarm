@@ -18,7 +18,7 @@ A11 owns the platform: CI pipelines, infrastructure-as-code, environments (ephem
 | Cost | Cloud billing APIs (read-only) for per-env cost telemetry |
 
 ## 3. Communication
-**Consumes:** `architecture.blueprint` (topology inputs), `infra.constraints`, `release.request` (A12), `environment.request` (any agent, via A01), `security.gate.verdict` (deploys gated), `infra.drift.alert` (A13/self), `rollback.command` (A12).
+**Consumes:** `architecture.blueprint` (topology inputs), `infra.constraints`, `release.request` (A12), `environment.request` (any agent, via A01), `security.gate.verdict` (deploys gated), `infra.drift.alert` (A13/self), `rollback.command` (A12), `landing.zone.spec` (A16), `platform.claim` (A17), `gitops.manifests` (A22), `serverless.config` (A19), `budget.policy` (A20), `image.policy.report` (A18), `chain.infra.plan` + `rpc.policy` (A28).
 **Produces:** `environment.provisioned`, `ci.pipeline`, `build.artifact`, `deployment.manifest`, `infra.drift.report`, `cost.report`, `environment.decommissioned`.
 
 ```json

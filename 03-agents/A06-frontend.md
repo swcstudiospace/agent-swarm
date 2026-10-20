@@ -17,7 +17,7 @@ A06 implements client applications (web/PWA; mobile wrappers out of scope for v1
 | Build | Vite/Next; output contracts to A11 pipelines |
 
 ## 3. Communication
-**Consumes:** `task.assign`, `ux.spec`, `design.system.tokens`, `api.contract`, `review.comments`, `security.findings`, `a11y.violations`, `perf.budget` (from A03/A13).
+**Consumes:** `task.assign`, `ux.spec`, `design.system.tokens`, `api.contract`, `review.comments`, `security.findings`, `a11y.violations`, `perf.budget` (from A03/A13), `dapp.integration.spec` + `wallet.flow.spec` (A29).
 **Produces:** `code.patch`, `component.catalog` (Storybook), `impl.notes`, `a11y.selfcheck.report`, `perf.report`, `contract.change.request`.
 
 ```json

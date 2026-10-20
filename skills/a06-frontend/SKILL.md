@@ -35,7 +35,7 @@ Don't use for: Do not edit backend or schema.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: api.contract, design.system.tokens, ux.spec, acceptance.criteria, review.verdict, gate.verdict.
+2. Read upstream artifacts in consumes: api.contract, design.system.tokens, ux.spec, acceptance.criteria, review.verdict, gate.verdict, dapp.integration.spec, wallet.flow.spec.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only code.patch, component.tests, task.result.
 5. Finish with markdown summary + one fenced json `task.result`.

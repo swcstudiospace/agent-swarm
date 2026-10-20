@@ -49,6 +49,9 @@ CI/CD engineering, Kubernetes operations, IaC (Terraform/OpenTofu), environment 
 - `code.patch` (A05/A06/A07) — what to build; `release.request` / `promote.command` / `rollback.command` (A12).
 - `environment.request` (any agent, routed via A01).
 - `security.gate.verdict` (A10) — deploys are gated on it; `infra.drift.alert` (A13 or self).
+- `landing.zone.spec` (A16), `platform.claim` (A17), `gitops.manifests` (A22), `serverless.config` (A19) — turn each into `iac.change` and `ci.pipeline` work; the GitOps controller applies manifests, you wire the pipeline that publishes them.
+- `budget.policy` (A20), `image.policy.report` (A18) — encode budgets as IaC guardrails and fail the build pipeline on an image-policy violation.
+- `chain.infra.plan`, `rpc.policy` (A28) — provision the generic infrastructure under chain nodes and RPC; keep the plan's network guard (testnet by default) and route mainnet changes to A01 for approval.
 </inputs>
 
 <outputs>

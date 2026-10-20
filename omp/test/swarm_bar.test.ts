@@ -26,7 +26,6 @@ import {
   runElapsedS,
   settleOrphanedSpawns,
   shownTokens,
-  statusText,
   type SwarmBarModel,
   visibleRuns,
 } from "../src/swarm_bar.ts";
@@ -1291,7 +1290,6 @@ describe("reducer: sources", () => {
         expect(summary).toContain("2 run");
         expect(summary).toContain("1 done");
         expect(summary).toContain("0 fail");
-        expect(statusText(model, T0)).toBe("swarm: 2 run");
       }
     });
 
@@ -1473,10 +1471,10 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     expect(renderSwarmBarFrame(states.overflow, 40, undefined, T0).state).toBe("overflow");
   });
 
-  test("at 160 columns every state draws its two rows: the summary, then the agents or the placeholder", () => {
+  test("at 160 columns every state draws its rows: the summary, then the agents when some run; idle and telemetry error draw the summary alone", () => {
     const rows = Object.fromEntries(Object.entries(sample()).map(([name, model]) => [name, plain(model, 160, at[name] ?? T0).map(visible)]));
     expect(rows).toEqual({
-      idle: ["○ swarm idle", "no subagents running"],
+      idle: ["○ swarm idle"],
       loading: ["● swarm 0s │ 1 run │ 0 queued │ 0 done │ 0 fail", "● start a05-backend     0s"],
       active: [
         "● swarm 4m12s │ 1 run │ 1 wait │ 1 queued │ 0 done │ 0 fail │ slots 1/4",
@@ -1488,7 +1486,7 @@ describe("render: states at widths 20, 40, 80, 160", () => {
       ],
       completed: ["✓ swarm 1m01s │ 0 run │ 0 queued │ 1 done │ 0 fail", "✓ a05-backend  1m01s"],
       failed: ["✕ swarm 1h01m │ 0 run │ 0 queued │ 0 done │ 1 fail", "✕ FAIL a05-backend  1h01m"],
-      error: ["swarm: telemetry unavailable", "no subagents running"],
+      error: ["swarm: telemetry unavailable"],
     });
   });
 
@@ -1502,32 +1500,38 @@ describe("render: states at widths 20, 40, 80, 160", () => {
       failed: "✕ swarm 1h01m",
       error: "swarm: telemetry unavailable",
     };
-    const firstRows: Record<string, string> = {
-      idle: "no subagents running",
+    const firstRows: Record<string, string | undefined> = {
+      idle: undefined,
       loading: "● start a05-backend",
       active: "● a05-backend",
       overflow: "✕ FAIL a09-reviewer",
       completed: "✓ a05-backend",
       failed: "✕ FAIL a05-backend",
-      error: "no subagents running",
+      error: undefined,
     };
     for (const width of [40, 80, 160]) {
       for (const [name, model] of Object.entries(sample())) {
-        const [row1, row2] = plain(model, width, at[name] ?? T0).map(visible);
-        expect(row1.startsWith(heads[name]), `${name}@${width} row 1: ${row1}`).toBe(true);
-        expect(row2.startsWith(firstRows[name]), `${name}@${width} row 2: ${row2}`).toBe(true);
+        const rows = plain(model, width, at[name] ?? T0).map(visible);
+        expect(rows[0].startsWith(heads[name]), `${name}@${width} row 1: ${rows[0]}`).toBe(true);
+        const agentRow = firstRows[name];
+        if (agentRow === undefined) {
+          expect(rows, `${name}@${width} has no agent row`).toHaveLength(1);
+        } else {
+          expect(rows, `${name}@${width} two rows`).toHaveLength(2);
+          expect(rows[1].startsWith(agentRow), `${name}@${width} row 2: ${rows[1]}`).toBe(true);
+        }
       }
     }
   });
 
-  test("every state, theme and width 1..300: exactly 2 rows of exactly the width and no cut escape, with and without token chips (I1, I2, I5)", () => {
+  test("every state, theme and width 1..300: one row for idle and telemetry error, two for agents, each exactly the width and no cut escape, with and without token chips (I1, I2, I5)", () => {
     for (const [themeName, theme] of themeVariants) {
       for (const [name, base] of Object.entries(sample())) {
         for (const tokens of [undefined, FULL_SAVINGS]) {
           const model: SwarmBarModel = tokens ? { ...base, tokens } : base;
           for (let width = 1; width <= 300; width++) {
             const lines = renderSwarmBar(model, width, theme, at[name] ?? T0);
-            if (lines.length !== 2 || lines.some((line) => displayWidth(line) !== width || hasStrayEscape(line))) {
+            if (lines.length !== (name === "idle" || name === "error" ? 1 : 2) || lines.some((line) => displayWidth(line) !== width || hasStrayEscape(line))) {
               throw new Error(`${name}@${width} (${themeName}, ${tokens ? "tokens" : "no tokens"}): ${JSON.stringify(lines)}`);
             }
           }
@@ -1571,39 +1575,39 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     }
   });
 
-  test("idle keeps both rows: the idle marker and the placeholder, with the token chips when a snapshot exists", () => {
+  test("idle is one row: the idle marker, with the token chips when a snapshot exists and no placeholder", () => {
     const idle = sample().idle;
     for (const width of [40, 160]) {
       const frame = renderSwarmBarFrame(idle, width, undefined, T0);
       expect(frame, `idle@${width}`).toMatchObject({ state: "idle", shown: 0, hidden: 0 });
-      expect(frame.lines.map(visible)).toEqual(["○ swarm idle", "no subagents running"]);
+      expect(frame.lines.map(visible)).toEqual(["○ swarm idle"]);
     }
     const measured: SwarmBarModel = { ...idle, tokens: savings() };
-    const [row1, row2] = plain(measured, 160, T0);
-    expect(visible(row1)).toMatch(/^○ swarm idle +before 10k · now 4k │ saved 6k$/);
-    expect(visible(row2)).toBe("no subagents running");
-    const [themed1, themed2] = renderSwarmBar(measured, 160, powerlineTheme, T0);
-    expect(stripAnsi(themed1)).toContain("saved 6k");
-    expect(stripAnsi(themed2)).toContain("no subagents running");
+    const lines = plain(measured, 160, T0);
+    expect(lines).toHaveLength(1);
+    expect(visible(lines[0])).toMatch(/^○ swarm idle +before 10k · now 4k │ saved 6k$/);
+    const themed = renderSwarmBar(measured, 160, powerlineTheme, T0);
+    expect(themed).toHaveLength(1);
+    expect(stripAnsi(themed[0])).toContain("saved 6k");
   });
 
-  test("a telemetry error without rows keeps both rows: the warning, the idle placeholder, and the chips when a snapshot exists", () => {
+  test("a telemetry error without rows is one row: the warning, and the chips when a snapshot exists", () => {
     const error = sample().error;
     for (const width of [40, 160]) {
       const frame = renderSwarmBarFrame(error, width, undefined, T0);
       expect(frame, `error@${width}`).toMatchObject({ state: "error", shown: 0, hidden: 0 });
-      expect(frame.lines.map(visible)).toEqual(["swarm: telemetry unavailable", "no subagents running"]);
+      expect(frame.lines.map(visible)).toEqual(["swarm: telemetry unavailable"]);
     }
     const measured: SwarmBarModel = { ...error, tokens: savings() };
-    const [row1, row2] = plain(measured, 160, T0);
-    expect(visible(row1)).toMatch(/^swarm: telemetry unavailable +before 10k · now 4k │ saved 6k$/);
-    expect(visible(row2)).toBe("no subagents running");
-    // narrower: the warning is the identity of the row and the placeholder row is unchanged
+    const lines = plain(measured, 160, T0);
+    expect(lines).toHaveLength(1);
+    expect(visible(lines[0])).toMatch(/^swarm: telemetry unavailable +before 10k · now 4k │ saved 6k$/);
+    // narrower: the warning is still the identity of the only row
+    expect(plain(measured, 40, T0)).toHaveLength(1);
     expect(visible(plain(measured, 40, T0)[0])).toMatch(/^swarm: telemetry unavailable/);
-    expect(visible(plain(measured, 40, T0)[1])).toBe("no subagents running");
   });
 
-  test("rows linger, then the bar goes back to the idle placeholder instead of disappearing", () => {
+  test("rows linger, then the bar goes back to the idle row instead of disappearing", () => {
     const model = createModel();
     progress(model, { id: "ok", agent: "good", durationMs: 0 }, T0);
     progress(model, { id: "ok", agent: "good", status: "completed", durationMs: 1000 }, T0 + SEC);
@@ -1612,14 +1616,14 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     expect(visible(lingering.lines[1])).toContain("good");
     const after = renderSwarmBarFrame(model, 80, undefined, T0 + 22 * SEC);
     expect(after.state).toBe("idle");
-    expect(after.lines.map(visible)).toEqual(["○ swarm idle", "no subagents running"]);
+    expect(after.lines.map(visible)).toEqual(["○ swarm idle"]);
   });
 
   test("telemetry marker: alone when there are no rows, as a segment next to rows otherwise", () => {
     const model = createModel();
     model.error = "live.json stale";
     const alone = renderSwarmBar(model, 80, undefined, T0);
-    expect(alone).toHaveLength(2);
+    expect(alone).toHaveLength(1);
     expect(visible(alone[0])).toBe("swarm: telemetry unavailable");
     progress(model, { id: "r", agent: "a05" }, T0);
     const withRows = renderSwarmBar(model, 160, undefined, T0);
@@ -1882,10 +1886,10 @@ describe("render: overflow ordering and labels", () => {
       const failed = createModel();
       progress(failed, { id: "f", agent: "bad", status: "failed", durationMs: 1000 }, T0);
       for (const [name, model] of Object.entries({ idle: createModel(), running, error, failed, mixed: mixed() })) {
-        const [row1, row2] = plain({ ...model, tokens: FULL_SAVINGS }, 300, T0);
+        const [row1, ...below] = plain({ ...model, tokens: FULL_SAVINGS }, 300, T0);
         expect(row1, name).toContain("cache 62%");
         expect(row1, name).toContain("saved 6k");
-        expect(row2, `${name} row 2 carries no chips`).not.toContain("saved");
+        expect(below.join("\n"), `${name} rows below the first carry no chips`).not.toContain("saved");
       }
     });
 
@@ -1928,22 +1932,25 @@ describe("render: overflow ordering and labels", () => {
   });
 });
 
-describe("status text", () => {
-  test("compact counts while work is live or failing, nothing otherwise", () => {
+describe("header counts", () => {
+  test("counts of live and failing work, and nothing once the failure ages out", () => {
     const model = createModel();
-    expect(statusText(model, T0)).toBeUndefined();
     progress(model, { id: "a", agent: "a" }, T0);
     progress(model, { id: "q", agent: "q", status: "pending", index: 1 }, T0);
-    expect(statusText(model, T0)).toBe("swarm: 1 run, 1 queued");
+    const live = renderSwarmBar(model, 200, undefined, T0)[0];
+    expect(live).toContain("1 run");
+    expect(live).toContain("1 queued");
     progress(model, { id: "a", agent: "a", status: "failed", durationMs: 1000 }, T0 + SEC);
     progress(model, { id: "q", agent: "q", status: "completed", durationMs: 1000, index: 1 }, T0 + SEC);
-    expect(statusText(model, T0 + SEC)).toBe("swarm: 1 fail");
-    expect(statusText(model, T0 + 700 * SEC)).toBeUndefined();
+    const failed = renderSwarmBar(model, 200, undefined, T0 + SEC)[0];
+    expect(failed).toContain("1 fail");
+    expect(failed).toContain("0 run");
+    expect(renderSwarmBar(model, 200, undefined, T0 + 700 * SEC)[0]).toContain("○ swarm idle");
   });
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// In-session specialists: rows read from the parent's `progress.inflightTaskDetails` (the A01 -> a02..a15 flow)
+// In-session specialists: rows read from the parent's `progress.inflightTaskDetails` (the A01 -> a02..a30 flow)
 // ---------------------------------------------------------------------------------------------------------------------
 
 /** One `AgentProgress` entry of `TaskToolDetails.progress`, shaped like omp's executor (pi-tui tools/task.ts). */
@@ -2303,7 +2310,6 @@ describe("in-session specialists: joined with live.json", () => {
     expect(visibleRuns(model, t).filter((run) => run.agent === "a05-backend")).toHaveLength(3);
     // ...yet the swarm counts the agent's larger side once: A01 + 2 lanes
     expect(renderSwarmBar(model, 200, undefined, t)[0]).toContain("3 run");
-    expect(statusText(model, t)).toBe("swarm: 3 run");
     // a second store row (two lanes each side): still two specialists, not four
     ingestLive(model, live([liveRun("T1111-be", "a05-backend", "running"), liveRun("T2222-be", "a05-backend", "running")]), t + SEC);
     expect(renderSwarmBar(model, 200, undefined, t + SEC)[0]).toContain("3 run");
@@ -2482,7 +2488,6 @@ describe("agent identity across sources", () => {
       expect(keyRows(model, t, "a02")[0].state).toBe("completed");
       expect(keyRows(model, t, "a03")[0].state).toBe("running");
       expect(visibleRuns(model, t)).toHaveLength(14); // A01 + the store's 13 rows
-      expect(statusText(model, t)).toBe("swarm: 2 run, 10 wait, 1 queued");
       const header = renderSwarmBar(model, 240, undefined, t)[0];
       for (const part of ["2 run", "10 wait", "1 queued", "1 done"]) expect(header).toContain(part);
     }
@@ -2496,7 +2501,7 @@ describe("agent identity across sources", () => {
     expect(keyRows(model, t, "a03")).toHaveLength(1);
     expect(keyRows(model, t, "a03")[0].parentKey).toBeDefined();
     expect(keyRows(model, t, "a03")[0].parts.live?.taskId).toBe("T38a7-arch");
-    expect(statusText(model, t)).toBe("swarm: 2 run, 10 wait, 1 queued");
+    expect(renderSwarmBar(model, 240, undefined, t)[0]).toContain("2 run");
   });
 
   test("a nested text naming another task of the same agent still blocks the slug join", () => {
@@ -2506,7 +2511,7 @@ describe("agent identity across sources", () => {
     a01Spawn(model, t, [lane("T38a7-other", "a03-architect", "Other", 3000)]);
     expect(keyRows(model, t, "a03")).toHaveLength(2);
     // the summary still counts the agent once: the store knows one A03 row
-    expect(statusText(model, t)).toBe("swarm: 2 run, 10 wait, 1 queued");
+    expect(renderSwarmBar(model, 240, undefined, t)[0]).toContain("2 run");
   });
 
   test("a top-level bus row and the derived row of the same agent are one row (the twin check compares keys)", () => {
@@ -2554,7 +2559,7 @@ describe("background specialists (details.async)", () => {
     expect(rowsLine).toMatch(/a05-backend\s+\d+m?\d*s~/);
     expect(rowsLine).toMatch(/a06-frontend\s+\d+m?\d*s~/);
     expect(rowsLine).toMatch(/a01-orchestrator\s+\d+m?\d*s(?!~)/);
-    expect(statusText(model, T0 + 60 * SEC)).toBe("swarm: 3 run");
+    expect(renderSwarmBar(model, 220, undefined, T0 + 60 * SEC)[0]).toContain("3 run");
   });
 
   test("a frame without `async` names its rows as ordinary (blocking) specialists: not detached while the call is in flight", () => {

@@ -22,6 +22,8 @@ SLO engineering, telemetry pipelines, statistical anomaly detection, incident ma
 - `architecture.blueprint` (A03) and `slo.targets` (A03 bindings / A02 NFRs) — what to measure and the objectives.
 - `release.record` / `deployment.event` (A12), `build.artifact` (A11) — suspect changes for correlation.
 - `telemetry.raw` (pipelines), `runbook` updates in `docs.bundle` (A15), `incident.response` (humans/A14).
+- `resilience.design` (A16), `backup.coverage.report` (A25), `cluster.fleet.status` (A21), `drift.report` and `rollout.plan` (A22) — derive SLOs, alerts and dashboards from them; backup gaps, drift and stalled rollouts become `anomaly.event` or `incident.alert`.
+- `platform.scorecard` (A17), `event.topology.spec` (A19), `indexer.spec` (A28) — add platform health, event-lag and indexer-lag SLIs to `slo.manifest` and `dashboard.bundle`.
 </inputs>
 
 <outputs>

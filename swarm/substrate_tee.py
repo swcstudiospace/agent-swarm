@@ -39,6 +39,21 @@ AGENT_SURFACES: dict[str, str] = {
     "A13": "swarm-a13-obs",
     "A14": "swarm-a14-maint",
     "A15": "swarm-a15-doc",
+    "A16": "swarm-a16-cloud",
+    "A17": "swarm-a17-plat",
+    "A18": "swarm-a18-supply",
+    "A19": "swarm-a19-event",
+    "A20": "swarm-a20-finops",
+    "A21": "swarm-a21-k8s",
+    "A22": "swarm-a22-gitops",
+    "A23": "swarm-a23-mesh",
+    "A24": "swarm-a24-ksec",
+    "A25": "swarm-a25-resil",
+    "A26": "swarm-a26-sol",
+    "A27": "swarm-a27-audit",
+    "A28": "swarm-a28-chain",
+    "A29": "swarm-a29-dapp",
+    "A30": "swarm-a30-custody",
 }
 
 # A swarm session names its agent, replica and graph: `<AGENT>@<replica>:<graph_id>`. The substrate refuses a swarm claim
@@ -152,7 +167,7 @@ _AGENT_RE = re.compile(r"^(A\d{2})(?:@|$)")
 
 
 def agent_of(record: Mapping) -> str | None:
-    """The emitting agent id (A01..A15) of a run-log record, or None when it names none.
+    """The emitting agent id (A01..A30) of a run-log record, or None when it names none.
 
     Ctx.emit stamps ``source = "<agent id>@<script>"``. The one non-agent source that still has an identity is
     ``swarm.envelope`` (security.dev_key), whose payload carries the signing agent as ``source``.

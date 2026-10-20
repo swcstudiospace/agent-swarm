@@ -5,7 +5,7 @@ import type { Bridge } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import { BAR_RANK, createRestack, RESTACK_CHANNEL } from "../src/bar_stack.ts";
 import type { EventBus, ExtensionContext, SessionEntry, WidgetComponent, WidgetFactory, WidgetHost } from "../src/omp-api.ts";
-import { LIFECYCLE_CHANNEL, PROGRESS_CHANNEL, SWARM_BAR_KEY, SWARM_STATUS_KEY, TOKEN_CHANNEL, type BarTimers } from "../src/swarm_bar.ts";
+import { LIFECYCLE_CHANNEL, PROGRESS_CHANNEL, SWARM_BAR_KEY, TOKEN_CHANNEL, type BarTimers } from "../src/swarm_bar.ts";
 import { displayWidth, stripAnsi, type BarTheme } from "../src/swarm_dock.ts";
 import { fakeCtx, fakePi, type FakePi, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
@@ -86,24 +86,15 @@ interface WidgetCall {
   content: string[] | WidgetFactory | undefined;
   options?: { placement?: string };
 }
-interface StatusCall {
-  op: "status";
-  key: string;
-  text: string | undefined;
-}
-type UiCall = WidgetCall | StatusCall;
 
 /** The host side of `ctx.ui`: widgets stack in insertion order, re-setting a key moves it to the bottom and disposes the old component. */
 function fakeUi(options: { throwOnWidget?: boolean; theme?: BarTheme } = {}) {
-  const calls: UiCall[] = [];
+  const calls: WidgetCall[] = [];
   const stack = new Map<string, WidgetComponent | string[]>();
   const tui = { renders: 0, requestRender() { this.renders++; } } satisfies WidgetHost & { renders: number };
   let throwOnWidget = options.throwOnWidget ?? false;
   const ui = {
     notify() {},
-    setStatus(key: string, text: string | undefined) {
-      calls.push({ op: "status", key, text });
-    },
     setWidget(key: string, content: string[] | WidgetFactory | undefined, widgetOptions?: { placement?: string }) {
       if (throwOnWidget) throw new Error("host widget failure");
       calls.push({ op: "widget", key, content, options: widgetOptions });
@@ -122,7 +113,6 @@ function fakeUi(options: { throwOnWidget?: boolean; theme?: BarTheme } = {}) {
     stack,
     widgetCalls: () => calls.filter((call): call is WidgetCall => call.op === "widget"),
     order: () => [...stack.keys()],
-    statuses: () => calls.filter((call): call is StatusCall => call.op === "status").map((call) => call.text),
     /** The component's rows exactly as rendered (colours stripped, padding kept). */
     rows(width = 120): string[] {
       const component = stack.get(SWARM_BAR_KEY);
@@ -220,9 +210,9 @@ function frame(id: string, agent: string, status: string, durationMs = 0, extra:
   };
 }
 
-/** The two rows of the bar when nothing runs, and when only the telemetry marker is up (no token snapshot). */
-const IDLE = ["○ swarm idle", "no subagents running"];
-const TELEMETRY = ["swarm: telemetry unavailable", "no subagents running"];
+/** The one row of the bar when nothing runs, and when only the telemetry marker is up (no token snapshot). No placeholder row. */
+const IDLE = ["○ swarm idle"];
+const TELEMETRY = ["swarm: telemetry unavailable"];
 
 /** Zero-delay timeouts: the deferred remount. */
 const pendingRemounts = (h: Harness): number => [...h.timers.timeouts.values()].filter((t) => t.ms === 0).length;
@@ -249,7 +239,6 @@ describe("mounting", () => {
     expect(typeof widgets[0].content).toBe("function");
     expect(h.host.order()).toEqual([SWARM_BAR_KEY]);
     expect(h.host.lines()).toEqual(IDLE);
-    expect(h.host.statuses()).toEqual([]);
   });
 
   test("whichever eligible event comes first mounts the bar, once", () => {
@@ -420,7 +409,7 @@ describe("ticker, status and lingering", () => {
     h.bus.emit(LIFECYCLE_CHANNEL, { id: "a", agent: "a05-backend", status: "started", index: 0 });
     expect(h.timers.count(1000)).toBe(1);
     expect(h.timers.intervals.size).toBe(1); // the watcher yields to the ticker: never two pollers
-    expect(h.host.statuses().at(-1)).toBe("swarm: 1 run");
+    expect(h.host.lines()[0]).toContain("1 run");
 
     h.clock.mono += 7000;
     h.timers.tickInterval();
@@ -428,7 +417,6 @@ describe("ticker, status and lingering", () => {
     h.bus.emit(LIFECYCLE_CHANNEL, { id: "a", agent: "a05-backend", status: "completed", index: 0 });
     expect(h.timers.count(1000)).toBe(0);
     expect(h.timers.count(2000)).toBe(1);
-    expect(h.host.statuses().at(-1)).toBeUndefined();
     expect(h.host.lines()[1]).toMatch(/✓ a05-backend\s+7s/);
 
     // the settled row lingers 20 s and one wake-up removes it
@@ -445,14 +433,13 @@ describe("ticker, status and lingering", () => {
     h.fire("session_start");
     h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "running", 0));
     h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "failed", 5000));
-    expect(h.host.statuses().at(-1)).toBe("swarm: 1 fail");
+    expect(h.host.lines()[0]).toContain("1 fail");
     h.clock.mono += 60_000;
     h.timers.wakeUp();
     expect(h.host.lines().join("\n")).toContain("✕ FAIL");
     h.clock.mono += 600_000;
     h.timers.wakeUp();
     expect(h.host.lines()).toEqual(IDLE);
-    expect(h.host.statuses().at(-1)).toBeUndefined();
   });
 
   test("the linger windows and reduced motion come from the environment", () => {
@@ -633,7 +620,7 @@ describe("headless -p", () => {
 });
 
 describe("teardown", () => {
-  test("session_shutdown unsubscribes, clears timers, removes the widget and the status text", () => {
+  test("session_shutdown unsubscribes, clears timers and removes the widget", () => {
     const h = harness();
     h.fire("session_start");
     h.bus.emit(LIFECYCLE_CHANNEL, { id: "a", agent: "a05-backend", status: "started", index: 0 });
@@ -646,7 +633,7 @@ describe("teardown", () => {
     expect([...h.timers.timeouts.values()]).toHaveLength(0);
     expect(h.host.order()).toEqual([]);
     expect(h.host.widgetCalls().at(-1)).toMatchObject({ key: SWARM_BAR_KEY, content: undefined });
-    expect(h.host.calls.at(-1)).toEqual({ op: "status", key: SWARM_STATUS_KEY, text: undefined });
+    expect(h.host.calls.at(-1)).toBe(h.host.widgetCalls().at(-1));
     // late bus frames and events no longer do anything
     const before = h.host.calls.length;
     h.bus.emit(LIFECYCLE_CHANNEL, { id: "b", agent: "x", status: "started", index: 0 });
@@ -822,7 +809,7 @@ describe("failure isolation", () => {
     expect(h.host.lines()).toEqual(IDLE); // the blocked call got no row
   });
 
-  test("every width gives exactly two rows of exactly that width, for a themed, a powerline, a throwing and an empty theme, idle or busy", () => {
+  test("idle and telemetry error give exactly one row, busy gives exactly two, every row exactly that width, for a themed, a powerline, a throwing and an empty theme", () => {
     const hostile: BarTheme = {
       fg() {
         throw new Error("no such color");
@@ -847,27 +834,37 @@ describe("failure isolation", () => {
       sep: { powerlineThinLeft: "\ue0b3", powerlineCapLeft: "\ue0b6", powerlineLeft: "\ue0b0" },
     };
     const tokens = savings({ lastTurnMs: 840, cacheHitPct: 72, lastQueryMs: 15, rtkSavedTokens: 2500, lastPayloadChars: 4096, ttftMs: 120, lastIdleMs: 40, costCents: 3, providerInput: 1500, providerOutput: 300, prefixChanged: 1, toolsChanged: 1, graphReady: 1 });
-    const states: Record<string, (h: Harness) => void> = {
-      idle: () => {},
-      busy: (h) => {
-        h.bus.emit(PROGRESS_CHANNEL, frame("a", "日本語".repeat(20), "running", 0, { currentToolIntent: "🚀".repeat(80) }));
-        h.bus.emit(PROGRESS_CHANNEL, frame("b", "a06-frontend", "running", 4000));
-        h.bus.emit(TOKEN_CHANNEL, tokens);
+    const errorDir = join(tmpDir("swarm-width-"), ".swarm");
+    mkdirSync(errorDir, { recursive: true });
+    writeFileSync(join(errorDir, "live.json"), "{ not json");
+    const states: Record<string, { swarmDir?: string; rows: number; setup: (h: Harness) => void }> = {
+      idle: { rows: 1, setup: () => {} },
+      error: { rows: 1, swarmDir: errorDir, setup: () => {} },
+      busy: {
+        rows: 2,
+        setup: (h) => {
+          h.bus.emit(PROGRESS_CHANNEL, frame("a", "日本語".repeat(20), "running", 0, { currentToolIntent: "🚀".repeat(80) }));
+          h.bus.emit(PROGRESS_CHANNEL, frame("b", "a06-frontend", "running", 4000));
+          h.bus.emit(TOKEN_CHANNEL, tokens);
+        },
       },
-      failed: (h) => {
-        h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "failed", 5000));
-        h.bus.emit(TOKEN_CHANNEL, tokens);
+      failed: {
+        rows: 2,
+        setup: (h) => {
+          h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "failed", 5000));
+          h.bus.emit(TOKEN_CHANNEL, tokens);
+        },
       },
     };
     for (const [themeName, custom] of Object.entries({ themed: theme, powerline, throwing: hostile, empty: {} as BarTheme })) {
-      for (const [stateName, setup] of Object.entries(states)) {
-        const h = harness({ hostOptions: { theme: custom } });
+      for (const [stateName, state] of Object.entries(states)) {
+        const h = harness({ hostOptions: { theme: custom }, swarmDir: state.swarmDir });
         h.fire("session_start");
-        setup(h);
+        state.setup(h);
         const bad: string[] = [];
         for (let width = 1; width <= 300; width++) {
           const widths = h.host.rows(width).map((row) => displayWidth(row));
-          if (widths.length !== 2 || widths.some((columns) => columns !== width)) bad.push(`${themeName}/${stateName}@${width}: rows ${JSON.stringify(widths)}`);
+          if (widths.length !== state.rows || widths.some((columns) => columns !== width)) bad.push(`${themeName}/${stateName}@${width}: rows ${JSON.stringify(widths)}`);
         }
         expect(bad.slice(0, 5)).toEqual([]);
         expect(h.host.rows(0)).toEqual([]);
@@ -916,7 +913,6 @@ describe("task tool rows (last resort)", () => {
     expect(h.host.lines()[0]).toContain("1 cancel");
     expect(h.host.lines()[0]).not.toContain("1 fail");
     expect(h.host.lines()[1]).toContain("⊘ cancelled");
-    expect(h.host.statuses().at(-1)).toBeUndefined();
   });
 
   test("tool_execution_end of another tool never settles a task row", () => {
@@ -936,7 +932,6 @@ describe("task tool rows (last resort)", () => {
     expect(h.timers.count(1000)).toBe(1);
     h.fire("agent_end");
     expect(h.host.lines()[1]).toContain("⊘ cancelled");
-    expect(h.host.statuses().at(-1)).toBeUndefined();
     expect(h.timers.count(1000)).toBe(0);
     // an hour later nothing is left on screen
     h.clock.mono += 3_600_000;
@@ -1056,7 +1051,6 @@ describe("live.json", () => {
     h.fire("turn_start");
     expect(h.host.lines()).toEqual(IDLE);
     expect(h.host.order()).toEqual([SWARM_BAR_KEY]);
-    expect(h.host.statuses()).toEqual([]);
     // and it never turns into a warning later
     h.clock.mono += 3_600_000;
     h.fire("turn_start");
@@ -1188,7 +1182,7 @@ describe("idle watcher", () => {
     expect(h.host.widgetCalls().filter((call) => call.content === undefined)).toEqual([]);
   });
 
-  test("an unchanged file, or none, costs no setWidget, requestRender or setStatus over 50 ticks", () => {
+  test("an unchanged file, or none, costs no setWidget or requestRender over 50 ticks", () => {
     const dir = liveDir();
     const settled = join(dir, "live.json");
     for (const present of [false, true]) {
@@ -1241,7 +1235,6 @@ describe("idle watcher", () => {
     for (let i = 0; i < 50; i++) history.timers.tickInterval();
     expect(history.host.lines()).toEqual(IDLE);
     expect(history.host.widgetCalls()).toHaveLength(1); // the mount; the ancient file changed nothing since
-    expect(history.host.statuses()).toEqual([]);
 
     const dead = new Date(Date.now() - 100_000);
     utimesSync(path, dead, dead);
@@ -1320,7 +1313,7 @@ describe("idle watcher", () => {
   });
 });
 
-describe("in-session specialists (A01 spawning a02..a15)", () => {
+describe("in-session specialists (A01 spawning a02..a30)", () => {
   const lane = (id: string, agent: string, status: string, durationMs: number, extra: Record<string, unknown> = {}) => ({
     index: 0,
     id,
@@ -1362,7 +1355,6 @@ describe("in-session specialists (A01 spawning a02..a15)", () => {
     const settled = h.host.lines();
     expect(settled[0]).toMatch(/1 run .*1 done .*1 fail/);
     expect(settled[1]).toContain("✕ FAIL a06-frontend");
-    expect(h.host.statuses().at(-1)).toBe("swarm: 1 run, 1 fail");
   });
 
   test("a specialist named by live.json and by A01's frame is one row, joined by task id", () => {
@@ -1517,7 +1509,8 @@ describe("RV-F late fixes: the derived live.json, background specialists, the ev
     expect(later[0]).toContain("2 run");
     expect(later[0]).not.toContain("cancel");
     expect(later.join("\n")).not.toContain("telemetry unavailable");
-    expect(h.host.statuses().at(-1)).toBe("swarm: 2 run, 10 wait, 1 queued");
+    expect(later[0]).toContain("10 wait");
+    expect(later[0]).toContain("1 queued");
   });
 
   test("headless -p: a detached specialist never prints `cancelled` while A01 runs or after it completes", () => {
@@ -1591,7 +1584,6 @@ describe("token savings on row 1", () => {
     expect(first).toContain("before 5k · now 3.8k");
     expect(first.trimEnd().endsWith("saved 1.2k")).toBe(true);
     expect(displayWidth(first)).toBe(120);
-    expect(h.host.statuses()).toEqual([]); // a token snapshot never touches the status text
   });
 
   test("later snapshots replace the numbers, whichever way they went", () => {

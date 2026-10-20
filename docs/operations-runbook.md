@@ -66,7 +66,7 @@ updated extension code; changing a separate shell cannot refresh an already-runn
 
 Tools and skills are added through intake fragments, never by editing `agents.json` by hand. Full steps with the field list and limits are in [swarm-command-center.md](swarm-command-center.md) (sections 9.2 and 9.3). In short:
 
-1. Handler `fn(payload) -> dict` in `swarm/tools/aNN_tools.py`, wrapped by `support.respond`. Owner prefix from `PREFIX` in `swarm/tool_registry.py` (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`, `shared_`).
+1. Handler `fn(payload) -> dict` in `swarm/tools/aNN_tools.py`, wrapped by `support.respond`. Owner prefix from `PREFIX` in `swarm/tool_registry.py` (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`, `cloud_`, `plat_`, `supply_`, `event_`, `finops_`, `k8s_`, `gitops_`, `mesh_`, `kpol_`, `resil_`, `sol_`, `audit_`, `chain_`, `dapp_`, `custody_`, `shared_`).
 2. Fragment `registry/intake/<slug>.tools.json` (complete `swarm.tool.v1` entries; `<slug>` may be `shared`), and `registry/intake/grants.json` for extra callers of an existing tool.
 3. `python3 scripts/_registry_intake.py --check`, then `--apply`.
 4. `python3 -m swarm.tool_registry check`, `docs`, `gen-tests`, then `python3 scripts/build_agents.py`.
@@ -76,7 +76,7 @@ A skill is `prompts/skills/<owner>/<short>.md`: `python3 -m swarm.skill_registry
 
 Each agent holds 10 to 15 lane tools and 10 to 15 skills (`agents.json` `capability_policy`); the check fails outside that range. Do not invent tools or skills to reach a count: each needs a purpose, a contract and a test.
 
-A shared tool has `owner: shared`, a `shared_` name and goes to `shared_tools` (the merge puts it there). `shared_baseline` tools must permit all 15 agents (validated). For any other shared tool, list the agents that already perform the operation; by convention a one-caller helper stays a lane tool (not validated).
+A shared tool has `owner: shared`, a `shared_` name and goes to `shared_tools` (the merge puts it there). `shared_baseline` tools must permit all 30 agents (validated). For any other shared tool, list the agents that already perform the operation; by convention a one-caller helper stays a lane tool (not validated).
 
 ## Change ACP permissions
 

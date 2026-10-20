@@ -35,7 +35,7 @@ Don't use for: Do not write product source or schema DDL.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: requirements.spec, acceptance.criteria, incident.alert, patch.task.
+2. Read upstream artifacts in consumes: requirements.spec, acceptance.criteria, incident.alert, patch.task, cloud.architecture, wellarch.review.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only architecture.blueprint, api.contract, adr.set, tech.stack.
 5. Finish with markdown summary + one fenced json `task.result`.

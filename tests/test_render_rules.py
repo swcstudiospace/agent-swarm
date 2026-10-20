@@ -53,8 +53,8 @@ def _text(render: str, slug: str) -> str:
     return (RENDERS[render] / f"{slug}.md").read_text(encoding="utf-8")
 
 
-def test_there_are_fifteen_agents_in_each_of_the_four_renders():
-    assert len(AGENTS) == 15
+def test_there_are_thirty_agents_in_each_of_the_four_renders():
+    assert len(AGENTS) == 30
     for render, directory in RENDERS.items():
         assert {p.name for p in directory.glob("*.md")} == {f"{a['slug']}.md" for a in AGENTS}, render
 

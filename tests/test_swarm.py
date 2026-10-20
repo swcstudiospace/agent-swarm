@@ -102,9 +102,9 @@ def test_make_verdict_signed_and_derived(swarm_dir):
 def test_manifest_consistency():
     from swarm.manifest import load_manifest
     agents = load_manifest()
-    assert len(agents) == 15
+    assert len(agents) == 30
     ids = [a["id"] for a in agents]
-    assert ids == [f"A{i:02d}" for i in range(1, 16)]
+    assert ids == [f"A{i:02d}" for i in range(1, 31)]
     for a in agents:
         assert (ROOT / a["spec"]).exists(), a["spec"]
         assert (ROOT / a["prompt"]).exists(), a["prompt"]

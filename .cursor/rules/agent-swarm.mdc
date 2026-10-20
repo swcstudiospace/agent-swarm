@@ -1,5 +1,5 @@
 ---
-description: Apply when this repo is running AgentSwarm through the Cursor subagents in .cursor/agents (a01-orchestrator and a02-requirements through a15-docs).
+description: Apply when this repo is running AgentSwarm through the Cursor subagents in .cursor/agents (a01-orchestrator and a02-requirements through a30-custody-compliance).
 alwaysApply: false
 ---
 
@@ -13,6 +13,6 @@ alwaysApply: false
 
 Cursor cloud sessions are advisory. No signing key is present (`SWARM_ED25519_KEY` and `SWARM_REQUIRE_KEY` are unset). Gate scripts record nothing. Nothing this session produces counts as APPROVED. The merge gate is Greptile, run by Desk Quality.
 
-Nesting stops at two levels. The parent session may spawn `a01-orchestrator`. A01 may spawn the other fourteen slugs with the Task tool (`subagent_type` is the slug). Those specialists must not spawn further subagents.
+Nesting stops at two levels. The parent session may spawn `a01-orchestrator`. A01 may spawn the other twenty-nine slugs with the Task tool (`subagent_type` is the slug). Those specialists must not spawn further subagents.
 
 Do not start an unattended headless runner. Dispatch by spawning the Cursor subagents above.

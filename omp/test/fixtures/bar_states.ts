@@ -24,7 +24,6 @@ import {
   ingestTaskSpawn,
   renderSwarmBar,
   type SwarmBarModel,
-  statusText,
 } from "../../src/swarm_bar.ts";
 import { stripAnsi } from "../../src/swarm_dock.ts";
 import type { TokenSavingsSnapshot } from "../../src/token_savings.ts";
@@ -419,14 +418,11 @@ export function headlessLines(): string[] {
 /** Every capture the doc shows, rendered now. */
 export function renderCaptures(theme: Theme): Captures {
   const captures: Captures = {};
-  const statusRows: string[] = [];
   for (const scenario of [...SCENARIOS, ...TOKEN_SCENARIOS]) {
     const model = createModel({ reducedMotion: scenario.reducedMotion ?? false });
     scenario.build(model);
     for (const width of scenario.widths) captures[`${scenario.name}@${width}`] = render(theme, model, width, scenario.at);
-    if (SCENARIOS.includes(scenario)) statusRows.push(`${scenario.name.padEnd(12)} ${statusText(model, scenario.at) ?? "(status cleared)"}`);
   }
-  captures.status = statusRows;
   for (const entry of LINGER) {
     const model = createModel({ reducedMotion: true });
     entry.build(model);

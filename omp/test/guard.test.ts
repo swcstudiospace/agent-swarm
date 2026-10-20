@@ -839,6 +839,362 @@ describe("HOOK-02", () => {
   );
 });
 
+describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
+  const insideAs = (agent: string): GuardFacts => ({ agent, restricted: false, planMode: false, hasTask: true, topLevel: false, env: {}, cwd: CWD, home: HOME, tmp: TMP, runtimeRoots: [] });
+  const bash = (command: string) => call("bash", { command });
+  const A21 = "a21-cluster-ops";
+  const A22 = "a22-gitops";
+  const A23 = "a23-mesh-network";
+  const A25 = "a25-resilience";
+  const A26 = "a26-smart-contract";
+  const A28 = "a28-chain-infra";
+
+  test("a rule's agents are real swarm slugs (messaging only, so a typo would silently name nobody)", () => {
+    for (const rule of RULES) for (const agent of rule.agents ?? []) expect(SWARM_SLUGS).toContain(agent);
+  });
+
+  test.each<[string, string, string]>([
+    // argocd: a prod marker in an operand or a destination flag, or prune/force/replace
+    ["argocd app sync prod-api", A22, "argocd-change"],
+    ["argocd app sync api --prune", A22, "argocd-change"],
+    ["argocd app sync api --replace", A22, "argocd-change"],
+    ["argocd app sync api --force --server staging.example.com", A22, "argocd-change"],
+    ["argocd app delete api --force", A22, "argocd-change"],
+    ["argocd app rollback api 3 --server argocd.prod.example.com", A22, "argocd-change"],
+    ["argocd app set api -p production", A22, "argocd-change"],
+    ["argocd app patch api --patch '{}' --dest-namespace production", A22, "argocd-change"],
+    ["argocd app terminate-op prod-api", A22, "argocd-change"],
+    ["argocd app --server argocd.example.com sync prod-api", A22, "argocd-change"],
+    ["argocd cluster add prod-ctx", A21, "argocd-change"],
+    ["argocd cluster rm https://prod.example.com", A21, "argocd-change"],
+    ["argocd repo add https://git.example.com/org/main-app", A22, "argocd-change"],
+    ["argocd proj delete production", A22, "argocd-change"],
+    // the dry-run exemption counts only as argocd's own flag
+    ["argocd app sync prod-api --dry-run=false", A22, "argocd-change"],
+    ["argocd app sync prod-api --helm-set --dry-run", A22, "argocd-change"],
+    ["argocd app sync prod-api -- --dry-run", A22, "argocd-change"],
+    ["argocd app sync api --prune --dry-run=none", A22, "argocd-change"],
+    ["flux delete helmrelease api -n apps", A22, "flux-change"],
+    ["flux uninstall", A22, "flux-change"],
+    ["flux -n flux-system bootstrap git --url=ssh://g/f", A22, "flux-change"],
+    ["flux suspend kustomization apps --context prod-cluster", A22, "flux-change"],
+    ["flux resume helmrelease main-app", A22, "flux-change"],
+    ["flux resume kustomization apps -n production", A22, "flux-change"],
+    ["istioctl install -y", A23, "mesh-lifecycle"],
+    ["istioctl -i istio-system upgrade", A23, "mesh-lifecycle"],
+    ["istioctl experimental uninstall --purge", A23, "mesh-lifecycle"],
+    ["linkerd install --crds", A23, "mesh-lifecycle"],
+    ["linkerd viz install", A23, "mesh-lifecycle"],
+    ["cilium upgrade --version 1.16.0", A23, "mesh-lifecycle"],
+    ["velero restore create --from-backup nightly", A25, "velero-change"],
+    ["velero -n backups restore create r1 --from-backup b", A25, "velero-change"],
+    ["velero backup delete b1 --confirm", A25, "velero-change"],
+    ["velero restore delete r1", A25, "velero-change"],
+    ["velero schedule delete s1", A25, "velero-change"],
+    ["velero install --provider aws", A25, "velero-change"],
+    ["velero delete backup b1", A25, "velero-change"],
+    ["eksctl create cluster --name c", A21, "managed-cluster-lifecycle"],
+    ["eksctl upgrade cluster -f c.yaml --approve", A21, "managed-cluster-lifecycle"],
+    ["eksctl update addon --cluster c --name vpc-cni", A21, "managed-cluster-lifecycle"],
+    ["eksctl delete cluster --name c", A21, "managed-cluster-lifecycle"],
+    ["gcloud container clusters upgrade c --master --zone z", A21, "managed-cluster-lifecycle"],
+    ["gcloud --project p container clusters resize c --num-nodes 5", A21, "managed-cluster-lifecycle"],
+    ["gcloud beta container clusters create-auto c --region r", A21, "managed-cluster-lifecycle"],
+    ["gcloud container node-pools create pool --cluster c", A21, "managed-cluster-lifecycle"],
+    ["az aks upgrade -g rg -n c --kubernetes-version 1.30", A21, "managed-cluster-lifecycle"],
+    ["az aks scale -g rg -n c --node-count 5", A21, "managed-cluster-lifecycle"],
+    ["az aks update -g rg -n c", A21, "managed-cluster-lifecycle"],
+    ["az aks nodepool add -g rg --cluster-name c -n pool", A21, "managed-cluster-lifecycle"],
+    ["az aks nodepool upgrade -g rg --cluster-name c -n pool", A21, "managed-cluster-lifecycle"],
+    ["kubeadm init", A21, "kubeadm-lifecycle"],
+    ["kubeadm join 10.0.0.1:6443 --token t --discovery-token-ca-cert-hash sha256:x", A21, "kubeadm-lifecycle"],
+    ["kubeadm reset --force", A21, "kubeadm-lifecycle"],
+    ["kubeadm upgrade node", A21, "kubeadm-lifecycle"],
+    ["kubeadm upgrade", A21, "kubeadm-lifecycle"],
+    // a selector that picks prod apps, and the argocd verbs that delete a resource or change a project/cluster
+    ["argocd app sync -l env=prod", A22, "argocd-change"],
+    ["argocd app sync --selector=env=prod", A22, "argocd-change"],
+    ["argocd app delete-resource prod-api --kind Pod --name p", A22, "argocd-change"],
+    ["argocd appset delete prod-set", A22, "argocd-change"],
+    ["argocd appset create prod-set.yaml", A22, "argocd-change"],
+    ["argocd proj add-destination prod https://k.example.com ns", A22, "argocd-change"],
+    ["argocd proj remove-source production https://git.example.com/r", A22, "argocd-change"],
+    ["argocd cluster set prod-ctx --namespace x", A21, "argocd-change"],
+    ["argocd cluster rotate-auth prod-ctx", A21, "argocd-change"],
+    // `--help=false` is no help request
+    ["kubeadm reset --help=false", A21, "kubeadm-lifecycle"],
+    ["kubeadm reset --cri-socket --help", A21, "kubeadm-lifecycle"],
+    ["kubeadm init --config --help", A21, "kubeadm-lifecycle"],
+    ["argocd app sync prod-api --revision --help", A22, "argocd-change"],
+    // a directory, container or --cwd value named like the tool may come before the tool itself
+    ["docker run --name argocd img argocd app sync prod-api", A22, "argocd-change"],
+    ["docker run -w /opt/kubeadm img kubeadm reset -f", A21, "kubeadm-lifecycle"],
+    ["docker run -w /opt/velero img velero uninstall", A25, "velero-change"],
+    // velero's global options (`-v 5`, `--log_dir d`) and a launcher that puts words before the verb (`--entrypoint velero img …`)
+    ["velero -v 5 restore create --from-backup b", A25, "velero-change"],
+    ["velero --log_dir /tmp backup delete b", A25, "velero-change"],
+    ["docker run --rm --entrypoint velero img restore create --from-backup b", A25, "velero-change"],
+    ["eksctl utils update-kube-proxy --cluster c", A21, "managed-cluster-lifecycle"],
+    ["eksctl utils update-coredns --cluster c --approve", A21, "managed-cluster-lifecycle"],
+  ])("cluster spelling: %s blocks for %s as %s", (command, agent, id) => {
+    expect(guardToolCall(bash(command), insideAs(agent))?.reason).toBe(`BLOCKED needs: human-approval (prod_infra: ${id})`);
+  });
+
+  test.each<[string, string]>([
+    // argocd read verbs, dry-run, a non-prod target without prune/force/replace
+    ...[
+      "argocd app get prod-api", "argocd app list", "argocd app diff prod-api", "argocd app history prod-api", "argocd app logs prod-api",
+      "argocd app wait prod-api --health", "argocd app manifests prod-api", "argocd app sync api", "argocd app sync staging-api",
+      "argocd app sync prod-api --dry-run", "argocd app sync prod-api --dry-run=client", "argocd app sync prod-api --prune --dry-run",
+      "argocd app sync api --prune=false", "argocd app sync api --server argocd.staging.example.com", "argocd cluster list", "argocd cluster get prod-ctx",
+      "argocd repo list", "argocd proj get production", "argocd cluster add staging-ctx", "argocd version", "argocd login argocd.prod.example.com",
+    ].map((c): [string, string] => [c, A22]),
+    ...[
+      "flux get kustomizations -n production", "flux check", "flux get helmreleases --context prod", "flux suspend kustomization apps -n flux-system",
+      "flux resume kustomization apps", "flux reconcile kustomization prod-apps", "flux logs -n production", "flux version", "flux export source git x",
+    ].map((c): [string, string] => [c, A22]),
+    ...[
+      "istioctl analyze -n production", "istioctl manifest generate --set profile=demo", "istioctl x precheck", "istioctl version", "istioctl proxy-status",
+      "istioctl analyze -f install.yaml", "linkerd check", "linkerd viz stat deploy -n production", "cilium status", "cilium connectivity test", "cilium hubble port-forward",
+    ].map((c): [string, string] => [c, A23]),
+    ...[
+      "velero backup create nightly", "velero backup get", "velero backup describe nightly", "velero restore get", "velero restore describe r1",
+      "velero schedule get", "velero schedule create nightly --schedule '0 1 * * *'", "velero version", "velero backup logs nightly",
+    ].map((c): [string, string] => [c, A25]),
+    ...[
+      "eksctl get cluster", "eksctl get nodegroup --cluster c", "eksctl version", "eksctl utils describe-stacks --cluster c",
+      "gcloud container clusters list", "gcloud container clusters describe c --zone z", "gcloud container clusters get-credentials c --zone z",
+      "gcloud container node-pools list --cluster c", "gcloud config list",
+      "az aks show -g rg -n c", "az aks list", "az aks get-credentials -g rg -n c", "az aks nodepool list -g rg --cluster-name c",
+      "az aks nodepool show -g rg --cluster-name c -n pool", "az aks get-upgrades -g rg -n c", "az account show",
+      "kubeadm upgrade plan", "kubeadm upgrade diff v1.30.0", "kubeadm token list", "kubeadm version", "kubeadm certs check-expiration", "kubeadm config print init-defaults",
+    ].map((c): [string, string] => [c, A21]),
+    // `--help`/`-h` print usage whatever verb they follow; a text printer or searcher never runs its operands
+    ...[
+      "argocd app sync prod-api --help", "argocd cluster add prod-ctx -h", "echo argocd app sync prod-api", "grep -rn argocd app sync prod docs",
+      "flux delete --help", "flux uninstall -h", "flux bootstrap github --help", "echo flux uninstall",
+      "istioctl install --help", "linkerd upgrade -h", "cilium uninstall --help", "printf '%s' istioctl install",
+      "velero restore create --help", "velero uninstall -h", "echo velero uninstall",
+      "eksctl create cluster --help", "eksctl delete cluster -h", "gcloud container clusters create --help", "az aks create --help", "az aks upgrade -h", "echo eksctl create cluster",
+      "kubeadm init --help", "kubeadm reset -h", "kubeadm upgrade apply --help", "echo kubeadm reset",
+      "argocd appset list", "argocd appset get prod-set", "argocd proj role create prod r", "argocd cluster get prod-ctx",
+    ].map((c): [string, string] => [c, A21]),
+  ])("cluster read-only or exempt form: %s passes for %s", (command, agent) => {
+    expect(guardToolCall(bash(command), insideAs(agent))).toBeUndefined();
+  });
+
+  test.each([
+    ["gcloud container clusters delete c --zone z", "cloud-destructive"],
+    ["az aks delete -g rg -n c", "cloud-destructive"],
+    ["az aks nodepool delete -g rg --cluster-name c -n pool", "cloud-destructive"],
+  ])("a managed-cluster delete is the existing cloud-destructive row, not a second one: %s", (command, id) => {
+    expect(guardToolCall(bash(command), insideAs(A21))?.reason).toBe(`BLOCKED needs: human-approval (prod_infra: ${id})`);
+  });
+
+  test.each<[string, string]>([
+    ["cast send 0xabc 'transfer(address,uint256)' 0xdef 1", "chain-broadcast"],
+    ["cast s 0xabc 'f()'", "chain-broadcast"],
+    ["cast send --rpc-url http://localhost:8545 0xabc 'f()'", "chain-broadcast"],
+    ["cast publish 0x02f8", "chain-broadcast"],
+    ["cast rpc eth_sendRawTransaction 0x02f8", "chain-broadcast"],
+    ["cast rpc --rpc-url sepolia eth_sendTransaction '{}'", "chain-broadcast"],
+    ["forge script script/Deploy.s.sol --rpc-url sepolia --broadcast", "chain-broadcast"],
+    ["forge script script/Deploy.s.sol:Deploy --broadcast --verify", "chain-broadcast"],
+    ["forge script script/Deploy.s.sol --resume", "chain-broadcast"],
+    ["forge create src/C.sol:C --rpc-url sepolia", "chain-broadcast"],
+    ["npx hardhat run scripts/deploy.ts --network sepolia", "chain-broadcast"],
+    ["npx hardhat --network sepolia run scripts/deploy.ts", "chain-broadcast"],
+    ["yarn hardhat deploy --network=arbitrum", "chain-broadcast"],
+    ["hardhat ignition deploy ignition/modules/C.ts --network mainnet", "chain-broadcast"],
+    ["HARDHAT_NETWORK=mainnet npx hardhat run scripts/deploy.ts", "chain-broadcast"],
+    ["truffle migrate --network mainnet", "chain-broadcast"],
+    ["truffle deploy --network goerli", "chain-broadcast"],
+    ["brownie run scripts/deploy.py --network mainnet", "chain-broadcast"],
+    ["brownie run scripts/deploy.py --network mainnet-fork", "chain-broadcast"],
+    ["solana transfer Recipient 1 --allow-unfunded-recipient", "chain-broadcast"],
+    ["solana -u mainnet-beta transfer Recipient 1", "chain-broadcast"],
+    ["solana program deploy target/deploy/p.so", "chain-broadcast"],
+    ["solana program upgrade target/deploy/p.so ProgramId", "chain-broadcast"],
+    ["anchor deploy", "chain-broadcast"],
+    ["anchor deploy --provider.cluster devnet", "chain-broadcast"],
+    ["anchor upgrade target/deploy/p.so --program-id P --provider.cluster mainnet", "chain-broadcast"],
+    ["anchor migrate --provider.cluster https://api.mainnet-beta.solana.com", "chain-broadcast"],
+    ["spl-token transfer Mint 1 Recipient", "chain-broadcast"],
+    ["spl-token --url devnet mint Mint 10", "chain-broadcast"],
+    ["spl-token burn Account 1", "chain-broadcast"],
+    ["spl-token approve Account 1 Delegate", "chain-broadcast"],
+    ["near send a.testnet b.testnet 1", "chain-broadcast"],
+    ["near call c.testnet m '{}' --accountId a.testnet", "chain-broadcast"],
+    ["near deploy --accountId a.testnet --wasmFile c.wasm", "chain-broadcast"],
+    ["starkli invoke 0xabc transfer 0x1 1", "chain-broadcast"],
+    ["starkli deploy 0xclass", "chain-broadcast"],
+    ["starkli declare c.json", "chain-broadcast"],
+    ["sui client call --package 0x1 --module m --function f", "chain-broadcast"],
+    ["sui client publish --gas-budget 100000000", "chain-broadcast"],
+    ["sui client transfer --to 0x1 --object-id 0x2", "chain-broadcast"],
+    ["aptos move publish --named-addresses a=default", "chain-broadcast"],
+    ["aptos move run --function-id 0x1::m::f", "chain-broadcast"],
+    // key material blocks whatever the network
+    ["cast call 0xabc 'f()' --private-key 0x01", "chain-key-material"],
+    ["forge test --private-key=0x01", "chain-key-material"],
+    ["hardhat run s.ts --network localhost --private-key 0x01", "chain-key-material"],
+    ["forge script S.s.sol --mnemonic 'a b c'", "chain-key-material"],
+    ["forge script S.s.sol --mnemonic-path m.txt", "chain-key-material"],
+    ["somecli --secret-key k", "chain-key-material"],
+    ["bash -c 'forge test --private-key 0x01'", "chain-key-material"],
+    ["cast wallet new", "chain-key-material"],
+    ["cast wallet new-mnemonic --words 12", "chain-key-material"],
+    ["cast wallet vanity --starts-with 0xdead", "chain-key-material"],
+    ["cast wallet import deployer --interactive", "chain-key-material"],
+    ["cast wallet private-key 'a b c'", "chain-key-material"],
+    ["cast wallet decrypt-keystore deployer", "chain-key-material"],
+    ["cast wallet sign 'hello'", "chain-key-material"],
+    ["solana-keygen new --outfile id.json", "chain-key-material"],
+    ["solana-keygen recover prompt:", "chain-key-material"],
+    ["geth account new", "chain-key-material"],
+    ["geth --datadir d account import k.txt", "chain-key-material"],
+    // cast's short aliases and its other subcommands that submit: `p` publish, `rp` rpc, `bs` batch-send, erc20/erc4626/safe writes
+    ["cast p 0x02f8", "chain-broadcast"],
+    ["cast rp eth_sendRawTransaction 0x02f8", "chain-broadcast"],
+    ["cast rpc personal_sendTransaction '{}' pw", "chain-broadcast"],
+    ["cast rpc wallet_sendCalls '{}'", "chain-broadcast"],
+    ["cast rpc eth_sendBundle '{}'", "chain-broadcast"],
+    ["cast bs --rpc-url sepolia", "chain-broadcast"],
+    ["cast batch-send --rpc-url sepolia", "chain-broadcast"],
+    ["cast erc20 transfer 0xtoken 0xdef 1", "chain-broadcast"],
+    ["cast erc20 approve 0xtoken 0xdef 1", "chain-broadcast"],
+    ["cast erc20 a 0xtoken 0xdef 1", "chain-broadcast"],
+    ["cast erc20 m 0xtoken 0xdef 1", "chain-broadcast"],
+    ["cast erc20-token burn 0xtoken 1", "chain-broadcast"],
+    ["cast vault deposit 0xvault 1", "chain-broadcast"],
+    ["cast erc4626 redeem 0xvault 1", "chain-broadcast"],
+    ["cast safe execute 0xsafe 0xhash", "chain-broadcast"],
+    ["cast safe propose 0xsafe 0xto 0x", "chain-broadcast"],
+    ["cast tip20 create name SYM USD 0xadmin", "chain-broadcast"],
+    // global options before the verb, and a launcher that puts the image before it
+    ["cast --color never send 0xabc 'f()'", "chain-broadcast"],
+    ["cast -j 4 publish 0x02f8", "chain-broadcast"],
+    ["forge --color never create src/C.sol:C", "chain-broadcast"],
+    ["forge c src/C.sol:C --rpc-url sepolia", "chain-broadcast"],
+    ["docker run --rm --entrypoint cast ghcr.io/foundry-rs/foundry send 0xabc 'f()'", "chain-broadcast"],
+    ["docker run --entrypoint forge img script S.s.sol --broadcast", "chain-broadcast"],
+    // hardhat's global `--max-memory N` before the verb; a second `--network` cannot launder the first; console/exec/test reach the chain too
+    ["hardhat --max-memory 4096 run scripts/deploy.ts --network sepolia", "chain-broadcast"],
+    ["hardhat run scripts/deploy.ts --network localhost --network mainnet", "chain-broadcast"],
+    ["hardhat console --network mainnet", "chain-broadcast"],
+    ["hardhat test --network sepolia", "chain-broadcast"],
+    ["truffle exec scripts/s.js --network mainnet", "chain-broadcast"],
+    ["truffle console --network mainnet", "chain-broadcast"],
+    ["truffle test --network mainnet", "chain-broadcast"],
+    ["brownie console --network mainnet", "chain-broadcast"],
+    ["brownie test --network mainnet", "chain-broadcast"],
+    // solana buffers, upgrades and stake moves; anchor idl and a remote test; spl-token account and authority changes
+    ["solana program write-buffer target/deploy/p.so", "chain-broadcast"],
+    ["solana program close ProgramId", "chain-broadcast"],
+    ["solana program set-upgrade-authority ProgramId --new-upgrade-authority X", "chain-broadcast"],
+    ["solana --ws wss://api.mainnet-beta.solana.com transfer Recipient 1", "chain-broadcast"],
+    ["solana delegate-stake StakeAccount VoteAccount", "chain-broadcast"],
+    ["solana withdraw-stake StakeAccount Recipient 1", "chain-broadcast"],
+    ["anchor idl init -f target/idl/p.json ProgramId", "chain-broadcast"],
+    ["anchor idl upgrade -f target/idl/p.json ProgramId --provider.cluster mainnet", "chain-broadcast"],
+    ["anchor test --provider.cluster devnet --skip-local-validator", "chain-broadcast"],
+    ["spl-token create-token", "chain-broadcast"],
+    ["spl-token create-account Mint", "chain-broadcast"],
+    ["spl-token close-account Account", "chain-broadcast"],
+    ["spl-token authorize Mint mint --disable", "chain-broadcast"],
+    ["spl-token wrap 1", "chain-broadcast"],
+    // near-cli(-rs), sui and aptos: other ways to move funds or deploy
+    ["near send-near a.testnet b.testnet 1", "chain-broadcast"],
+    ["near create-account x.testnet --masterAccount a.testnet", "chain-broadcast"],
+    ["near --networkId mainnet call c.near m '{}' --accountId a.near", "chain-broadcast"],
+    ["near tokens a.testnet send-near b.testnet '1 NEAR' network-config testnet sign-with-keychain send", "chain-broadcast"],
+    ["near contract call-function as-transaction c.testnet m json-args '{}' prepaid-gas '30 Tgas' attached-deposit '0 NEAR' sign-as a.testnet network-config testnet sign-with-keychain send", "chain-broadcast"],
+    ["near contract deploy c.testnet use-file c.wasm without-init-call network-config testnet sign-with-keychain send", "chain-broadcast"],
+    ["sui client split-coin --coin-id 0x1 --amounts 1", "chain-broadcast"],
+    ["sui client ptb --move-call 0x1::m::f", "chain-broadcast"],
+    ["sui client execute-signed-tx --tx-bytes b --signatures s", "chain-broadcast"],
+    ["aptos move deploy-object --address-name a", "chain-broadcast"],
+    ["aptos account transfer --account 0x1 --amount 1", "chain-broadcast"],
+    ["aptos stake add-stake --amount 1", "chain-broadcast"],
+    // key material: the multi-key and raw flags, and the wallet verbs and aliases that print or take a key
+    ["forge script S.s.sol --private-keys 0x01,0x02", "chain-key-material"],
+    ["forge script S.s.sol --mnemonics m.txt", "chain-key-material"],
+    ["forge script S.s.sol --mnemonic-paths m.txt", "chain-key-material"],
+    ["forge script S.s.sol --mnemonic-passphrases pw", "chain-key-material"],
+    ["cast call 0xabc --mnemonic-passphrase=pw", "chain-key-material"],
+    ["cast wallet public-key --raw-private-key 0x01", "chain-key-material"],
+    ["cast wallet address 0x01", "chain-key-material"],
+    ["cast wallet a 0x01", "chain-key-material"],
+    ["cast wallet derive 'a b c'", "chain-key-material"],
+    ["cast w d 'a b c'", "chain-key-material"],
+    ["cast wallet sa --nonce 1", "chain-key-material"],
+    ["cast wallet derive-private-key 'a b c' 1", "chain-key-material"],
+    ["cast --color never wallet new", "chain-key-material"],
+    ["docker run --rm img cast wallet new", "chain-key-material"],
+    // HARDHAT_NETWORK exported or assigned earlier in the same command line is the network of the run after it
+    ["export HARDHAT_NETWORK=mainnet && npx hardhat run scripts/deploy.ts", "chain-broadcast"],
+    ["HARDHAT_NETWORK=mainnet; npx hardhat deploy", "chain-broadcast"],
+    ["docker run --name cast --network host img cast send 0xabc 'f()'", "chain-broadcast"],
+    ["docker run -w /src/forge img forge script S.s.sol --broadcast", "chain-broadcast"],
+    ["docker run -w /opt/solana img solana transfer Recipient 1", "chain-broadcast"],
+    ["docker run -w /opt/cast img cast wallet new", "chain-key-material"],
+    // a launcher's own `--` right after the tool: the tool's arguments follow it
+    ["npm exec hardhat -- run scripts/deploy.ts --network sepolia", "chain-broadcast"],
+    ["npm --prefix hardhat run hardhat -- run scripts/deploy.ts --network sepolia", "chain-broadcast"],
+    ["pnpm exec forge -- script S.s.sol --broadcast", "chain-broadcast"],
+    ["npm exec -- cast wallet new", "chain-key-material"],
+  ])("chain spelling: %s blocks as %s for a26", (command, id) => {
+    const capability = id === "chain-broadcast" ? "chain_broadcast" : "chain_key_material";
+    expect(guardToolCall(bash(command), insideAs(A26))?.reason).toBe(`BLOCKED needs: human-approval (${capability}: ${id})`);
+    expect(guardToolCall(bash(command), { ...insideAs(A26), agent: undefined, topLevel: true })).toBeUndefined();
+  });
+
+  test.each([
+    "cast call 0xabc 'owner()(address)'", "cast balance 0xabc", "cast block latest", "cast 4byte 0xa9059cbb", "cast keccak 'x'", "cast to-wei 1 ether",
+    "cast rpc eth_blockNumber", "cast rpc --rpc-url sepolia eth_getBalance 0xabc latest", "cast wallet list", "cast wallet verify --address 0xabc m s",
+    "forge test", "forge build", "forge fmt", "forge test -vvv --fork-url sepolia", "forge script script/Deploy.s.sol", "forge script script/Deploy.s.sol --rpc-url sepolia",
+    "forge script script/Deploy.s.sol --broadcast=false", "forge inspect C abi", "anvil", "anvil --fork-url sepolia",
+    "hardhat test", "npx hardhat compile", "hardhat run scripts/deploy.ts", "hardhat run scripts/deploy.ts --network localhost",
+    "npx hardhat run scripts/deploy.ts --network hardhat", "npx hardhat --network anvil run scripts/deploy.ts", "hardhat deploy --network local",
+    "hardhat ignition deploy ignition/modules/C.ts --network localhost", "HARDHAT_NETWORK=localhost npx hardhat run s.ts", "hardhat ignition visualize ignition/modules/C.ts",
+    "truffle migrate --network development", "truffle compile", "truffle test", "brownie run scripts/deploy.py --network development", "brownie compile", "brownie test",
+    "solana balance", "solana -u devnet balance", "solana program show ProgramId", "solana address", "solana-test-validator",
+    "anchor build", "anchor test", "anchor deploy --provider.cluster localnet", "anchor deploy --provider.cluster http://127.0.0.1:8899", "anchor migrate --provider.cluster l",
+    "spl-token balance Mint", "spl-token accounts", "near view c.testnet m '{}'", "near state a.testnet", "starkli call 0xabc balance_of 0x1", "starkli balance 0xabc",
+    "sui client balance", "sui client objects", "sui move build", "aptos move compile", "aptos move test", "aptos account list",
+    "solana-keygen pubkey id.json", "solana-keygen verify PubKey id.json", "geth account list", "geth version", "echo private-key", "cat mnemonic.md",
+    // --help prints usage; a text printer or searcher never runs or feeds its operands
+    "cast send --help", "cast s -h", "cast publish --help", "forge create --help", "forge c -h", "forge script --broadcast --help", "hardhat run --help", "hardhat deploy -h",
+    "truffle migrate --help", "anchor deploy --help", "solana transfer --help", "solana program deploy -h", "spl-token transfer --help", "near call --help", "starkli invoke --help",
+    "sui client call --help", "aptos move publish --help", "echo cast send 0xabc", "echo forge create", "printf '%s\\n' forge script --broadcast", "grep -rn cast send src",
+    "rg forge create contracts", "man cast", "which forge", "cast wallet new --help", "solana-keygen new -h", "geth account new --help",
+    "grep -rn -- '--private-key' docs", "rg -e '--private-key' .", "git grep -- --mnemonic", "grep -r private-key .",
+    // cast, hardhat, anchor and the rest that only read, or stay local, or sign offline
+    "cast erc20 balance 0xtoken 0xabc", "cast erc20 allowance 0xtoken 0xa 0xb", "cast vault info 0xvault", "cast safe simulate 0xsafe 0xhash", "cast safe list-delegates 0xsafe",
+    "cast --color never call 0xabc 'f()'", "cast mktx 0xabc 'f()'", "cast wallet address --account deployer", "cast wallet verify --address 0xabc m s",
+    "hardhat --max-memory 4096 test", "hardhat console", "hardhat test --network localhost", "truffle exec scripts/s.js", "truffle test", "brownie console", "brownie test",
+    "anchor test", "anchor test --provider.cluster localnet", "anchor idl fetch ProgramId", "spl-token display Mint", "spl-token supply Mint",
+    "near contract call-function as-read-only c.testnet m json-args '{}' network-config testnet now", "near tokens a.testnet view-near-balance network-config testnet now",
+    "sui client dry-run-transaction --tx-bytes b", "aptos move view --function-id 0x1::m::f", "aptos stake show-stake-pool --owner-address 0x1",
+    "export HARDHAT_NETWORK=localhost && npx hardhat run scripts/deploy.ts", "export HARDHAT_NETWORK=mainnet && npx hardhat run s.ts --network localhost",
+  ])("chain read-only or local form: %s passes for a26", (command) => {
+    expect(guardToolCall(bash(command), insideAs(A26))).toBeUndefined();
+  });
+
+  test("the chain rows guard every swarm session: `agents` is messaging, the new lanes and the old ones alike", () => {
+    for (const slug of SWARM_SLUGS) {
+      expect(guardToolCall(bash("cast send 0xabc 'f()'"), insideAs(slug))?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+      expect(guardToolCall(bash("cast call 0xabc 'f()' --private-key 0x01"), insideAs(slug))?.reason).toBe("BLOCKED needs: human-approval (chain_key_material: chain-key-material)");
+    }
+  });
+
+  test("a chain command inside a chained line is found in whichever segment it sits", () => {
+    expect(guardToolCall(bash("forge build && forge script S.s.sol --broadcast"), insideAs(A28))?.reason).toEndWith(": chain-broadcast)");
+    expect(guardToolCall(bash("cd contracts && sudo -E cast send 0xabc 'f()'"), insideAs(A28))?.reason).toEndWith(": chain-broadcast)");
+    expect(guardToolCall(bash("forge build && forge test"), insideAs(A28))).toBeUndefined();
+  });
+});
+
 describe("HOOK-03 shell twin and D-08", () => {
   const B05 = "a05-backend";
   const facts = (agent: string | undefined, extra: Partial<GuardFacts> = {}): GuardFacts => ({

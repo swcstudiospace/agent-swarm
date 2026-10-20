@@ -1,6 +1,6 @@
 # Architecture overview
 
-AgentSwarm is a 15-agent software-delivery loop. A01 owns the plan. The other agents do one lane each (requirements, architecture, UX, backend, frontend, data, test, review, security, devops, release, observability, maintenance, docs). This page is the map of the layers added in v2.1 (registry, shared pool, ACP) and v2.2 (continuous runtime, telemetry, handover, skills, the omp bar). Agent prompts and lane scripts are unchanged.
+AgentSwarm is a 30-agent software-delivery loop. A01 owns the plan. The other agents do one lane each. A02 to A15 are the delivery core (requirements, architecture, UX, backend, frontend, data, test, review, security, devops, release, observability, maintenance, docs). A16 to A30 are three specialist domains of five agents each: Cloud-Native (A16 cloud architecture, A17 platform engineering, A18 supply-chain security, A19 event-driven and serverless, A20 FinOps and GreenOps), Cluster (A21 cluster operations, A22 GitOps and progressive delivery, A23 service mesh and networking, A24 cluster security and policy, A25 resilience and chaos) and Web3 (A26 smart contracts, A27 contract audit, A28 chain infrastructure, A29 dApp and wallet integration, A30 custody and compliance). The roster is `agents.json`; the new domains arrived in v2.3. No new agent owns a gate: A08 (quality), A09 (review), A10 (security) and A12 (release) stay the only gate owners, and the new lanes reach them through the plan. This page is the map of the layers added in v2.1 (registry, shared pool, ACP) and v2.2 (continuous runtime, telemetry, handover, skills, the omp bar), and of how the three domains plug into them.
 
 ## Topology
 
@@ -14,30 +14,58 @@ flowchart LR
     Shared[shared pool]
     Matrix[ACP permission matrix]
   end
-  subgraph peers [Specialists]
+  subgraph core [Delivery core A02 to A15]
     A02[A02 requirements]
     A03[A03 architect]
-    Gates[A08 to A12 gates]
+    Gates[A08 A09 A10 A12 gates]
+  end
+  subgraph cloud [Cloud-Native A16 to A20]
+    A16[A16 cloud architect]
+    A19[A19 event-driven]
+    A20[A20 FinOps]
+  end
+  subgraph cluster [Cluster A21 to A25]
+    A21[A21 cluster operator]
+    A22[A22 GitOps]
+    A24[A24 cluster security]
+  end
+  subgraph web3 [Web3 A26 to A30]
+    A26[A26 smart contracts]
+    A27[A27 auditor]
+    A30[A30 custody]
   end
   A01 --> Lane
   A01 --> Matrix
   A02 -->|requirements.spec| A03
+  A16 -->|cloud.architecture| A03
+  A16 -->|cloud.architecture| A20
+  A16 -->|cloud.architecture| A19
+  A21 -->|cluster.capacity.report| A20
+  A22 -->|gitops.manifests| A24
+  A26 -->|contract.abi| A27
+  A30 -->|custody.policy.set| A26
+  A24 -->|cluster.security.findings| Gates
+  A27 -->|audit.findings| Gates
   Gates -->|gate.verdict| A01
   Matrix --> Shared
   Matrix --> Lane
 ```
+
+The edges are examples taken from each agent's `produces` and `consumes` in `agents.json`; the full permission matrix has one row per agent and is derived from them (see [acp-topology.md](acp-topology.md)).
 
 End-to-end trace for one feature:
 
 1. A01 decomposes the brief. `orch_dag_order` orders the task graph. `orch_budget_class` returns the risk budget the planner already uses.
 2. A02 checks acceptance text with `req_gwt_check` and may call `shared_verdict` on the finding severities.
 3. A03 and A04 publish contracts and tokens. A05 and A06 implement against them and share `shared_toolchain` / `shared_check_plan` (the old `code_checks.py` pair).
-4. A08–A12 gates call `shared_verdict`. A denial is UNAUTHORIZED plus an audit row. A passing gate is a `gate.verdict` message A01 already consumes.
+4. The A08, A09, A10 and A12 gates call `shared_verdict`. A denial is UNAUTHORIZED plus an audit row. A passing gate is a `gate.verdict` message A01 already consumes.
 5. A11 records the git head with `shared_git_head`. A12 builds the canary steps. A13 computes burn. A peer that never answers is retried, then dead-lettered, and a sick peer is circuit-broken. The caller's own lane tools keep running.
+
+The three domains enter that trace through `PATTERNS` in `scripts/orch_plan.py` (`cloud-native`, `cluster`, `web3`) or, for a graph summary, through the file-path routing in `scripts/orch_from_graph.py`. The same gates close each plan: A08, A09 and A10 run on the implementer rows, A12 owns the release, and the cluster and web3 implementer rows default to `risk_class` high, which selects all four. `cloud-native` is 15 tasks (A02, A03, A16, A19, A05, A17, A20, A18, the A08, A09, A10 gates, A11, A12, A13, A15), `cluster` 12 (A21, A23, A24, A22 manifests, A25, the three gates, A22 rollout, A12, A13, A15) and `web3` 14 (A02, A03, A30, A26, A29, A27, A28, the three gates, A11, A12, A13, A15).
 
 ## Tool layer
 
-`agents.json` is the only registry (`tool_contract: swarm.tool.v1`). Each agent has `registered_tools` (10 to 15, set by `capability_policy`). Cross-lane operations live in top-level `shared_tools`; `shared_baseline` names the ones all 15 agents may call. `python3 -m swarm.tool_registry call` and, for omp sessions, `swarm_catalog` / `swarm_tool_call` (through `scripts/swarm_tool.py`) are the only paths that import a handler. An unknown name returns `INVALID_INPUT` and does not import anything. Existing `scripts/*.py` entrypoints still run as they did in v2.0. New tools arrive as `registry/intake/` fragments merged by `scripts/_registry_intake.py`, never by hand edits.
+`agents.json` is the only registry (`tool_contract: swarm.tool.v1`). Each agent has `registered_tools` (10 to 15, set by `capability_policy`). Cross-lane operations live in top-level `shared_tools`; `shared_baseline` names the ones all 30 agents may call. `python3 -m swarm.tool_registry call` and, for omp sessions, `swarm_catalog` / `swarm_tool_call` (through `scripts/swarm_tool.py`) are the only paths that import a handler. An unknown name returns `INVALID_INPUT` and does not import anything. Existing `scripts/*.py` entrypoints still run as they did in v2.0. New tools arrive as `registry/intake/` fragments merged by `scripts/_registry_intake.py`, never by hand edits.
 
 Every registered tool ends in exactly one of: SUCCESS, INVALID_INPUT (names the field), UNAUTHORIZED (echoes the caller), DEPENDENCY_UNAVAILABLE, TIMEOUT, or PARTIAL_SUCCESS (includes `completed_fraction`). Two registry guards apply to every tool: a `number` input must be finite (NaN and Infinity are `INVALID_INPUT`), and a result must be strict JSON and at most `SWARM_TOOL_OUTPUT_MAX_BYTES` (default 262144); a larger one is withheld as `PARTIAL_SUCCESS` with `output_withheld: true`.
 
@@ -83,6 +111,6 @@ Data flow of one task: `reconcile()` and `dispatchable()` find ready tasks; `sel
 
 - The v2.2 runtime, telemetry, handover, skills, how-to guides, configuration and known limits: [swarm-command-center.md](swarm-command-center.md)
 - Reading the swarm bar: [swarm-bar.md](swarm-bar.md)
-- Tool catalog and the 15 registry pages: `docs/tools/`; skill catalog: `docs/skills/`
+- Tool catalog and the 30 per-agent registry pages: `docs/tools/`; skill catalog: `docs/skills/`
 - Envelope, retries, and two worked messages: `docs/acp-topology.md`
 - How to add a tool or skill, regenerate, cancel a run or diagnose a dead peer: `docs/operations-runbook.md`

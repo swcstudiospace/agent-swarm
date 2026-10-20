@@ -567,7 +567,7 @@ def test_registry_entries_satisfy_the_contract(registry):
         assert tool is not None, name
         errors, ok = live._check_tool(tool, "shared", agent_ids, ROOT)
         assert errors == [] and ok, errors
-        assert sorted(tool["permitted_callers"]) == sorted(agent_ids) and len(agent_ids) == 15
+        assert sorted(tool["permitted_callers"]) == sorted(agent_ids) and len(agent_ids) == 30
         expected_tier = "WRITE" if name in ("shared_status_report", "shared_scratchpad_put", "shared_escalate", "shared_log_emit") else "READ"
         assert live.tool_tier(tool) == expected_tier
 

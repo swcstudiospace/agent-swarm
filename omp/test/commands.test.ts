@@ -294,6 +294,9 @@ test.each([
   ["--pattern=hotfix --risk=high fix login", "fix login", "hotfix", "high"],
   ["fix login --risk=low", "fix login", "feature", "low"],
   ["migrate  the   users table --pattern=dependency", "migrate  the   users table", "dependency", "medium"],
+  ["--pattern=cloud-native add an event-driven ingest", "add an event-driven ingest", "cloud-native", "medium"],
+  ["roll out the payments overlay --pattern=cluster --risk=high", "roll out the payments overlay", "cluster", "high"],
+  ["--pattern=web3 ship the staking vault", "ship the staking vault", "web3", "medium"],
 ])("flags: %s → brief %j, pattern %s, risk %s", async (args, brief, pattern, risk) => {
   const repo = gitRepo();
   const { log, swarm } = session();

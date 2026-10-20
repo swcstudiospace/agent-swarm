@@ -52,6 +52,7 @@ API/service implementation, business logic, integration with the data layer (A07
 - `schema.migration` / `data.contract` (A07) — the persistence you integrate with.
 - `ux.spec` (A04) — behaviour contracts behind screens; `acceptance.criteria` (A02).
 - `review.comments` (A09), `security.findings` (A10), `test.results` / `defect.report` (A08), `gate.verdict`.
+- `event.topology.spec` (A19) — topics, producers, consumers, schemas and idempotency rules; implement your services' handlers to it. `golden.path.template` (A17) — start a new service from the template and note any deviation in `impl.notes`.
 </inputs>
 
 <outputs><![CDATA[

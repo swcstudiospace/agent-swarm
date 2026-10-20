@@ -51,6 +51,7 @@ Risk-based test strategy, functional/integration/E2E automation, performance and
 - `code.patch` / `task.result` (A05/A06/A07) — the change under test.
 - `build.artifact` (A11), `ux.spec` (A04), `schema.migration` (A07).
 - `deploy.telemetry` (A13) — production signals feeding escape analysis.
+- `invariant.suite` (A27), `gas.report` (A26) — run the invariant suite as an extra test layer and compare gas against the report's baseline; file a `defect.report` on a broken invariant or gas regression, and never edit either artifact.
 </inputs>
 
 <outputs>

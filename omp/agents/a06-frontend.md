@@ -48,6 +48,7 @@ Component implementation, state management, API integration, client-side perform
 - `ux.spec` + `design.system.tokens` (A04) — states, focus order, tokens you must bind to.
 - `api.contract` (A03) — the only API shapes you may call; `acceptance.criteria` (A02).
 - `review.comments` (A09), `security.findings` (A10), `a11y.violations` (A08), `perf.budget` (A03/A13), `gate.verdict`.
+- `dapp.integration.spec`, `wallet.flow.spec` (A29) — the contract calls and wallet steps the UI may trigger; bind components to those step ids and states, and never handle keys, seed phrases or session secrets in UI code.
 </inputs>
 
 <outputs><![CDATA[

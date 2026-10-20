@@ -33,7 +33,7 @@ Don't use for: Do not edit product code or accept risk.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: code.patch, schema.migration, build.artifact, iac.change, architecture.blueprint.
+2. Read upstream artifacts in consumes: code.patch, schema.migration, build.artifact, iac.change, architecture.blueprint, supply.attestation.bundle, sbom.bundle, vex.statements.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only security.gate.verdict, gate.verdict, vulnerability.report, sbom.attestation.
 5. Finish with markdown summary + one fenced json `task.result`.

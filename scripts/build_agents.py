@@ -62,7 +62,7 @@ _ROLE_SWARM_TOOLS = {
     "A10": ["swarm_gate"],
     "A12": ["swarm_gate"],
 }
-SWARM_TOOLS = {f"A{n:02d}": _ROLE_SWARM_TOOLS.get(f"A{n:02d}", []) + REGISTRY_BRIDGE_TOOLS for n in range(1, 16)}
+SWARM_TOOLS = {f"A{n:02d}": _ROLE_SWARM_TOOLS.get(f"A{n:02d}", []) + REGISTRY_BRIDGE_TOOLS for n in range(1, 31)}
 # Fail-closed ceiling: only A01 leases and requests canonical assignments; only gate agents record verdicts. The
 # registry bridge is the one grant every agent may hold.
 ORCH_SWARM_TOOLS = {"swarm_plan", "swarm_status", "swarm_ingest", "swarm_transition", "swarm_assignment"}
@@ -91,7 +91,7 @@ You are running as a Claude Code subagent inside the AgentSwarm (see README.md, 
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Finish with: (1) a short markdown summary, (2) exactly one fenced ```json block that is your `task.result` (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
 - Fail closed. Respect autonomy ceilings: for anything at L3/L4, stop and report `"state": "BLOCKED", "needs": "human-approval: …"`.
-- Spawn sibling agents with the Agent tool, `subagent_type` = their slug (a02-requirements … a15-docs).
+- Spawn sibling agents with the Agent tool, `subagent_type` = their slug (a02-requirements … a30-custody-compliance).
 """ + SHARED_RULES + "</swarm_runtime>\n"
 
 GROK_PREAMBLE = """You are running as a Grok Build subagent inside the AgentSwarm (see README.md, 01-architecture.md, 02-message-protocol.md).
@@ -99,7 +99,7 @@ GROK_PREAMBLE = """You are running as a Grok Build subagent inside the AgentSwar
 - Repository root contains `swarm/` (runtime toolkit), `scripts/` (your tools) and `.swarm/` (task store, verdicts, event log).
 - The assignment you receive is a `task.assign` payload: task_id, correlation_id, capability, inputs[], acceptance[], budget, risk_class. Echo task_id and correlation_id in every script call (`--task-id`, `--correlation-id`) and in your final JSON.
 - Run tools via `python3 scripts/<name>.py --json` or `bun scripts/ts/<name>.ts --json`. Never fabricate script output.
-- Spawn sibling agents with `spawn_subagent` and `subagent_type` set to the agent slug (a01-orchestrator … a15-docs).
+- Spawn sibling agents with `spawn_subagent` and `subagent_type` set to the agent slug (a01-orchestrator … a30-custody-compliance).
 - Grok tools: `read_file`, `grep`, `run_terminal_command`. Do not invent Claude-only tool names.
 - Only write inside your single-writer artifact zone (see <outputs>). To change anything else, describe the request in your final report for A01 to route.
 - Finish with: (1) a short markdown summary, (2) exactly one fenced json block that is your `task.result` (or gate verdict) payload as defined in <output_format>. Set "state" to IN_REVIEW when work is complete, FAILED with an "error" {code,message} from the shared taxonomy when it is not, or BLOCKED with "needs" when an input is missing.
@@ -171,7 +171,7 @@ _CURSOR_COMMON = """You are running as a Cursor subagent inside the AgentSwarm (
 """
 _CURSOR_ORCH = (
     "- Nesting: Cursor allows two levels. You may spawn specialists with the Task tool, setting subagent_type "
-    "to the slug (a02-requirements through a15-docs). Launch independent specialists in parallel. A specialist "
+    "to the slug (a02-requirements through a30-custody-compliance). Launch independent specialists in parallel. A specialist "
     "is the second level and must not spawn further subagents. Do not spawn a01-orchestrator.\n"
 )
 _CURSOR_SPEC = (
@@ -332,7 +332,7 @@ OMP_ORCH_PREAMBLE = """<swarm_runtime>
   - (b) Otherwise, if no `task` (or `_task`) tool is among your tool definitions: immediately yield state "BLOCKED" with needs "depth", never IN_REVIEW, without reading, running or writing anything first.
 """ + _OMP_COMMON + """- Lease: use `swarm_transition` to move each ready task through CLAIMED to IN_PROGRESS before requesting its specialist assignment. Preserve the normal approval controls and single-writer artifact zones.
 - Assignment: call only `swarm_assignment` with the leased `task_id` and its `correlation_id`. It reads the current Task Store lease and returns the canonical signed `task.assign` envelope, exact `assignment_prompt` text in `prompt`, and manifest `agent_slug`. Require `status: "ok"` and `assignment_verified: true`; unsigned, advisory, dry-run, refused or missing assignments confer no dispatch authority. Never construct or sign an assignment yourself, provide a signing payload, access signing material, use generic `eval`/`xd://run_code`, or write raw swarm state to obtain one.
-- Dispatch: only after the verified assignment, spawn the specialist via the omp `task` tool with `agent` set to the returned `agent_slug` (a02-requirements … a15-docs) and `task` set to the returned `prompt` unchanged; do not reconstruct the envelope or prompt. Batch independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
+- Dispatch: only after the verified assignment, spawn the specialist via the omp `task` tool with `agent` set to the returned `agent_slug` (a02-requirements … a30-custody-compliance) and `task` set to the returned `prompt` unchanged; do not reconstruct the envelope or prompt. Batch independent items in tasks[]. Set `schemaMode: "strict"` on every task item for a08-qa, a09-reviewer, a10-security and a12-release, and on A01 ingest dispatches.
 - Final yield (omp): your final `yield` is the task.result that swarm-orchestrate step 8 defines (`task_id`, `state`, `summary_md`). The swarm.status block from <output_format> goes into `summary_md`; it is never yielded as-is.
 </swarm_runtime>
 """
@@ -421,6 +421,21 @@ _ROLE_HOME: dict[str, tuple[str, str]] = {
     "A13": ("bot-05-infrastructure", "bot-05-infrastructure"),
     "A14": ("routine", "bot-01-systems-backend"),
     "A15": ("executor", "bot-06-quality-security"),
+    "A16": ("executor", "bot-05-infrastructure"),
+    "A17": ("executor", "bot-05-infrastructure"),
+    "A18": ("bot-06-quality-security", "bot-06-quality-security"),
+    "A19": ("bot-01-systems-backend", "bot-01-systems-backend"),
+    "A20": ("routine", "bot-05-infrastructure"),
+    "A21": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A22": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A23": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A24": ("bot-06-quality-security", "bot-06-quality-security"),
+    "A25": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A26": ("bot-01-systems-backend", "bot-01-systems-backend"),
+    "A27": ("bot-06-quality-security", "bot-06-quality-security"),
+    "A28": ("bot-05-infrastructure", "bot-05-infrastructure"),
+    "A29": ("bot-02-web-edge", "bot-02-web-edge"),
+    "A30": ("executor", "bot-06-quality-security"),
 }
 # Desk path families from ownership.yaml, partitioned so a role does not also claim
 # android, ios or desktop. Those three are routing rules below. Script paths from
@@ -467,6 +482,21 @@ _DESK_GLOBS: dict[str, tuple[str, ...]] = {
     ),
     "A12": ("deploy/**",),
     "A15": ("README.md", "docs/**"),
+    "A16": ("cloud/**", "landing-zone/**"),
+    "A17": ("catalog-info.yaml", "platform/**"),
+    "A18": ("provenance/**", "sbom/**", "slsa/**"),
+    "A19": ("asyncapi/**", "events/**", "functions/**", "serverless.yml"),
+    "A20": ("cost/**", "finops/**"),
+    "A21": ("cluster-api/**", "clusters/**"),
+    "A22": ("**/kustomization.yaml", "argocd/**", "charts/**", "flux/**", "gitops/**", "overlays/**"),
+    "A23": ("gateway/**", "istio/**", "mesh/**", "network-policies/**"),
+    "A24": ("gatekeeper/**", "kyverno/**", "policies/**"),
+    "A25": ("chaos/**", "resilience/**"),
+    "A26": ("**/*.sol", "foundry.toml", "hardhat.config.js", "hardhat.config.ts", "onchain/**"),
+    "A27": ("audits/**",),
+    "A28": ("chain/**", "indexers/**", "nodes/**"),
+    "A29": ("apps/dapp/**", "dapp/**", "wallet/**"),
+    "A30": ("compliance/**", "custody/**"),
 }
 _ROUTING: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("android", "bot-03-android", ("android/**", "**/*.kt", "**/*.kts", "**/build.gradle")),
@@ -600,7 +630,7 @@ def _lane_skill(lane: str, members: list[dict]) -> str:
         f"name: swarm-{lane}",
         "description: >",
         f"  Grok Bot lane {lane} for {slugs}.",
-        "  Use when Desk Lead routes work to this lane of the 15 AgentSwarm roles.",
+        "  Use when Desk Lead routes work to this lane of the 30 AgentSwarm roles.",
         "disable-model-invocation: false",
         "---",
         "",
@@ -616,7 +646,7 @@ def _lane_skill(lane: str, members: list[dict]) -> str:
         "",
         "## Procedure",
         "",
-        "1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 15 roles.",
+        "1. Read the role prompt at `$SWARM_ROOT/<prompt>` below. `$SWARM_ROOT` is the pinned agent-swarm checkout. The target repo does not contain these prompts. The swarm has exactly these 30 roles.",
         "2. Route the change with `grokbot/swarm/seat-map.json`. A routing rule wins over role path globs. Among role globs, the longest match wins, and an equal length goes to the lowest role id. Android paths go to bot-03, iOS paths to bot-04, and desktop shells to bot-02.",
         "3. Run that role's scripts from the pinned checkout: `python3 \"$SWARM_ROOT/scripts/<script>.py\" --root <target repo> --json` (the bun twin is `bun \"$SWARM_ROOT/scripts/ts/<script>.ts\" --root <target repo> --json`). `<target repo>` is the git toplevel being edited. Do not run a `scripts/` path from the target tree. Stay inside the role's path globs and autonomy ceiling.",
         "4. Verify with the seat's verification tools from the seat map.",
@@ -647,11 +677,11 @@ def render_grokbot(agents: list[dict]) -> dict[str, str]:
     """Relative path → file text for the seat map and one skill per lane.
 
     Does not emit swarm-cloud-dispatch or anything under .grok/. Raises when the
-    manifest is not the existing 15 roles, so a new agent cannot appear here by drift.
+    manifest is not the 30 roles, so a new agent cannot appear here by drift.
     """
     ids = [a["id"] for a in agents]
-    if len(agents) != 15 or set(ids) != {f"A{n:02d}" for n in range(1, 16)}:
-        raise ValueError(f"grokbot seat map covers exactly 15 roles (A01–A15), got {sorted(ids)}")
+    if len(agents) != 30 or set(ids) != {f"A{n:02d}" for n in range(1, 31)}:
+        raise ValueError(f"grokbot seat map covers exactly 30 roles (A01–A30), got {sorted(ids)}")
     missing = [i for i in ids if i not in _ROLE_HOME]
     if missing:
         raise ValueError(f"grokbot seat map has no home for {', '.join(missing)}")
@@ -1187,7 +1217,7 @@ def main() -> int:
     defaults = manifest_raw.get("defaults", {})
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
     # Validate the Grok Bot roster before any generated file is written. A rejected
-    # manifest (SWARM_AGENTS_FILE with a role outside A01–A15) must leave the other
+    # manifest (SWARM_AGENTS_FILE with a role outside A01–A30) must leave the other
     # exports untouched.
     agents = list(load_manifest())
     try:

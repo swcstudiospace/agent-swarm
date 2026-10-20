@@ -92,7 +92,7 @@ def test_existing_entries_are_kept_and_a_second_run_changes_nothing(tree, gws, h
     r = _install(tree, gws, home)
     assert r.returncode == 0, r.stdout + r.stderr
     assert _snapshot(gws, _env_dir(gws, home)) == first
-    assert "already has substrate (claude, omp)" in r.stdout and "15 unchanged" in r.stdout
+    assert "already has substrate (claude, omp)" in r.stdout and f"{len(AGENTS)} unchanged" in r.stdout
 
 
 # ---------------------------------------------------------------- INST-02: what the generated files may not hold

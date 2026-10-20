@@ -51,10 +51,10 @@ def _snapshot(root: Path) -> dict[str, bytes]:
     return out
 
 
-def test_exactly_fifteen_cursor_agents():
+def test_exactly_thirty_cursor_agents():
     agents = load_manifest()
     slugs = {a["slug"] for a in agents}
-    assert len(slugs) == 15
+    assert len(slugs) == 30
     assert {p.name for p in CURSOR.glob("*.md")} == {f"{s}.md" for s in slugs}
     assert not list(CURSOR.glob("*")) or {p.suffix for p in CURSOR.iterdir()} <= {".md"}
 
@@ -92,7 +92,7 @@ def test_cursor_agents_forbid_merge_and_auto_merge():
         assert "open a draft PR and report instead" in pre, agent["slug"]
         assert _MERGE_GRANT.search(text) is None, agent["slug"]
         assert _MERGE_GRANT.search(body) is None, agent["slug"]
-    assert seen == 15
+    assert seen == 30
 
 
 def test_cursor_agents_ban_headless_runners_even_on_request():
@@ -130,7 +130,7 @@ def test_cursor_agents_use_desk_branch_names():
         assert _DESK_BRANCH_RE in text, agent["slug"]
         assert "bot-0N-<seat>/<task_id>" in text, agent["slug"]
         assert "ownership.yaml" in text, agent["slug"]
-    assert seen == 15
+    assert seen == 30
     # Cursor rewrites these; the shared prompts stay the claude/grok/omp contract.
     assert "swarm/<task_id>" in (ROOT / "prompts/A05-backend.md").read_text(encoding="utf-8")
     assert "swarm/<task_id>" in (ROOT / "prompts/A06-frontend.md").read_text(encoding="utf-8")
@@ -161,7 +161,7 @@ def test_cursor_gate_scripts_are_non_recording_previews():
         assert "through python3 or the bun twin" not in pre, agent["slug"]
         assert "Gate scripts record nothing." in text
         assert "Nothing this session produces counts as APPROVED." in text
-    assert seen == 15
+    assert seen == 30
     a01 = (CURSOR / "a01-orchestrator.md").read_text(encoding="utf-8")
     assert a01.count('--transition <id> BLOCKED --reason "advisory preview recorded no verdict rows; human records the gate"') == 2
     assert a01.count("stop the scheduling loop and do not spawn tasks that depend on it") == 2

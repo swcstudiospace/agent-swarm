@@ -33,7 +33,7 @@ Don't use for: Do not rewrite product code to match docs.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: requirements.spec, architecture.blueprint, api.contract, code.patch, release.record, slo.manifest.
+2. Read upstream artifacts in consumes: requirements.spec, architecture.blueprint, api.contract, code.patch, release.record, slo.manifest, dr.runbook, service.catalog.entry.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only docs.bundle, api.reference, runbook, changelog.
 5. Finish with markdown summary + one fenced json `task.result`.

@@ -35,7 +35,7 @@ Don't use for: Do not patch product code.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: acceptance.criteria, code.patch, build.artifact, ux.spec, schema.migration.
+2. Read upstream artifacts in consumes: acceptance.criteria, code.patch, build.artifact, ux.spec, schema.migration, invariant.suite, gas.report.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only test.plan, test.suite, test.results, defect.report, gate.verdict.
 5. Finish with markdown summary + one fenced json `task.result`.
