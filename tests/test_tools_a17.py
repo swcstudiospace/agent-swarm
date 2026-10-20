@@ -733,8 +733,8 @@ def test_dora_no_failures_leaves_recovery_out_of_the_overall_band():
 
 def test_dora_two_incidents_on_one_deployment_count_once_and_use_the_latest_resolution():
     result = dora([dep(i) for i in range(7)], [inc(3, resolve_min=30), inc(3, after_min=20, resolve_min=90)])
-    # recovery runs from the incident start: the latest incident started at +20 min and resolved at +90 min, so 70 min
-    assert (result["failed_deployment_count"], result["median_recovery_hours"]) == (1, 1.1667)
+    # recovery runs from deployed_at to the latest resolved_at: the latest resolution is +90 min, so 1.5 h
+    assert (result["failed_deployment_count"], result["median_recovery_hours"]) == (1, 1.5)
     unresolved = dora([dep(i) for i in range(7)], [inc(3, resolve_min=30), inc(3, after_min=20, resolved=False)])
     assert unresolved["unresolved_failure_count"] == 1 and unresolved["median_recovery_hours"] == -1.0
 
@@ -1467,8 +1467,8 @@ def test_severity_decisions_ignore_the_letter_case_of_lifecycle_and_tier():
     assert has(off, "no-golden-path", "major", "a")
 
 
-def test_dora_recovery_runs_from_the_incident_start_not_from_the_deployment():
-    # the incident starts eight days after the deploy and lasts 30 minutes: recovery is 0.5 h, not 191.5 h measured from deployed_at
+def test_dora_recovery_runs_from_the_deployment_to_the_latest_resolution():
+    # contract basis: deployed_at -> latest resolved_at. d0 deploys at T0+12h; the incident resolves 8 days + 30 min later, so 192.5 h (low)
     late = {"started_at": iso(T0 + timedelta(days=8, hours=12)), "resolved_at": iso(T0 + timedelta(days=8, hours=12, minutes=30)), "deployment_id": "d0"}
     result = dora([dep(0)], [late], days=20)
-    assert (result["failed_deployment_count"], result["median_recovery_hours"], result["recovery_band"]) == (1, 0.5, "elite")
+    assert (result["failed_deployment_count"], result["median_recovery_hours"], result["recovery_band"]) == (1, 192.5, "low")

@@ -1376,6 +1376,25 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     );
   });
 
+  test("a quoted assignment is a command, not a write: it does not override an inherited mainnet", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("'HARDHAT_NETWORK=localhost'; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash("\\HARDHAT_NETWORK=localhost; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    // with no inherited network the quoted word writes nothing and nobody writes unreadably, so the bare run passes
+    expect(guardToolCall(bash("'HARDHAT_NETWORK=localhost'; hardhat run scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("an if-prefixed quoted assignment stays blocked: stripping the keyword must not invent a plain write", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("if 'HARDHAT_NETWORK=localhost'; then :; fi; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
   test("an assignment expansion in an argument is a writer: ${HARDHAT_NETWORK:=mainnet} needs approval with no environment network", () => {
     expect(guardToolCall(bash(": ${HARDHAT_NETWORK:=mainnet}; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",

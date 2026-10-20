@@ -230,7 +230,7 @@ def run(args, ctx) -> dict:
     findings.sort(key=lambda f: (-SEVERITY_RANK[f["severity"]], f["location"], f["id"]))
     policy_fail = any(SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"] for f in findings)
     return {
-        "status": "fail" if policy_fail and counters["unparsable"] == 0 else "ok",
+        "status": "fail" if policy_fail else "ok",
         "target_version": target_label,
         "files_scanned": counters["parsed"],
         "manifests_scanned": manifests,

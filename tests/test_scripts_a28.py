@@ -246,6 +246,7 @@ def test_unparseable_chain_ids_are_minor(tmp_path, value):
 
 @pytest.mark.parametrize("name,chain_id,rule,severity", [
     ("sepolia", 1, "chain-id-name-mismatch", "blocker"),
+    ("ethereum-sepolia", 1, "chain-id-name-mismatch", "blocker"),
     ("Ethereum Mainnet", 11155111, "chain-id-name-mismatch", "blocker"),
     ("Base", 8453, None, None),
     ("base-sepolia", 8453, "chain-id-name-mismatch", "blocker"),
@@ -277,6 +278,13 @@ def test_a_bare_alias_of_another_chain_is_a_minor_note_not_a_blocker(tmp_path):
     write(tmp_path, "base.json", net(84532, name="base"))
     _, out = cli(tmp_path)
     assert out["status"] == "ok" and [(f["rule"], f["severity"]) for f in out["findings"]] == [("chain-id-name-mismatch", "minor")]
+
+
+def test_unambiguous_testnet_alias_on_a_mainnet_chain_id_blocks(tmp_path):
+    write(tmp_path, "spoof.json", net(1, name="ethereum-sepolia", allowMainnet=True))
+    code, out = cli(tmp_path)
+    assert code == 1 and out["status"] == "fail"
+    assert [(f["rule"], f["severity"]) for f in out["findings"] if f["rule"] == "chain-id-name-mismatch"] == [("chain-id-name-mismatch", "blocker")]
 
 
 def test_endpoint_host_must_agree_with_the_chain_id_class(tmp_path):

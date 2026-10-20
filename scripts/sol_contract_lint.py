@@ -130,8 +130,7 @@ def split_top(text: str, sep: str = ",") -> list[str]:
 # Declarations
 # --------------------------------------------------------------------------------------------------------------------
 
-_CONTRACT = re.compile(r"\b(abstract\s+)?(contract|interface|library)\s+([A-Za-z_$][\w$]*)([^{;]{0,512})\{")
-_DECL_HEAD = re.compile(r"\b(abstract\s+)?(contract|interface|library)\s+[A-Za-z_$][\w$]*")
+_DECL_HEAD = re.compile(r"\b(abstract\s+)?(contract|interface|library)\s+([A-Za-z_$][\w$]*)")
 _VISIBILITY = frozenset({"public", "external", "internal", "private"})
 _MUTABILITY = frozenset({"pure", "view", "payable"})
 _LOCATIONS = frozenset({"memory", "calldata", "storage"})
@@ -295,16 +294,25 @@ def parse_source(raw: str) -> list[dict]:
     clean = strip_source(raw)
     lines = raw.split("\n")
     contracts: list[dict] = []
+    # Every declaration head is found in one scan; each header then runs to the first `{`/`;` without crossing the next
+    # head. A header padded past any fixed bound (a long comment blanks to equal-length spaces, a long inheritance list)
+    # is still parsed, while a run of body-less `contract a` keywords costs linear time instead of one rescan per keyword.
+    heads = list(_DECL_HEAD.finditer(clean))
     pos = 0
-    while True:
-        m = _CONTRACT.search(clean, pos)
-        if not m:
-            break
-        open_idx = m.end() - 1
+    for k, m in enumerate(heads):
+        if m.start() < pos:
+            continue  # inside the body of a contract that is already parsed
+        limit = heads[k + 1].start() if k + 1 < len(heads) else len(clean)
+        brace = clean.find("{", m.end(), limit)
+        semi = clean.find(";", m.end(), limit)
+        if brace < 0 or (semi >= 0 and semi < brace):
+            continue  # a forward reference or a keyword with no body: nothing to check, never silently part of a check
+        open_idx = brace
+        header = clean[m.end():open_idx]
         close = match_close(clean, open_idx)
         close = len(clean) - 1 if close < 0 else close
         bases: list[str] = []
-        is_part = re.search(r"\bis\b(.*)", m.group(4), re.S)
+        is_part = re.search(r"\bis\b(.*)", header, re.S)
         if is_part:
             for base in split_top(is_part.group(1)):
                 bname = re.sub(r"\(.*", "", base, flags=re.S).strip().split(".")[-1]
@@ -765,7 +773,7 @@ def lint_source(rel: str, raw: str) -> list[dict]:
 
     pragmas = list(_PRAGMA.finditer(clean))
     uses_layout_at = bool(_LAYOUT_AT.search(clean))
-    if not pragmas and (_DECL_HEAD.search(clean) or re.search(_CONTRACT, clean)):
+    if not pragmas and _DECL_HEAD.search(clean):
         add("SOL-PRAGMA-MISSING", "minor", "no `pragma solidity` directive: the compiler version is unconstrained", 0)
     for m in pragmas:
         try:

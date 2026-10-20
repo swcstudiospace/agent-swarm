@@ -795,15 +795,9 @@ def dora_bands(payload: dict) -> dict:
                 unresolved += 1
             else:
                 resolved_incidents = [(started, done) for started, done in incidents if done is not None]
-                started, resolved = max(resolved_incidents, key=lambda pair: pair[1])  # latest resolution wins
-                deployed_at = deploys[dep][1]
-                if len(incidents) == 1:
-                    downtime = resolved - started
-                    gap = started - deployed_at
-                    origin = started if gap > downtime else deployed_at  # deploy→resolve for immediate failures; start→resolve when the incident begins long after deploy
-                else:
-                    origin = started
-                recoveries.append(_micro(origin, resolved))
+                _, resolved = max(resolved_incidents, key=lambda pair: pair[1])  # latest resolution wins
+                # contract (dora-baseline step 4): recovery runs from deployed_at to the latest resolved_at, not from the incident start
+                recoveries.append(_micro(deploys[dep][1], resolved))
         recovery_hours = _median(recoveries) / HOUR_US if recoveries else None
         if not failed:
             recovery_band = "none"

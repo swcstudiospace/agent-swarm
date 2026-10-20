@@ -220,8 +220,13 @@ class _Scan:
         shown = _safe_name(name)
         expected = NAME_TO_ID.get(norm)
         if expected is not None and expected != chain_id:
-            if CANONICAL_NAME_TO_ID.get(norm) == expected and not _ambiguous_name(norm):
+            says_test = not _tokens(norm).isdisjoint(TESTNET_NAME_TOKENS)
+            if says_test and cls == "mainnet":
+                self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} says test network but chain id {chain_id} is a mainnet")
+            elif not _ambiguous_name(norm):
                 self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} belongs to chain id {expected}, the file says {chain_id}")
+            elif "mainnet" in norm and cls in ("testnet", "local"):
+                self.add(rel, "chain-id-name-mismatch", "major", where, f"the network name {shown!r} says mainnet but chain id {chain_id} is a {cls} chain")
             else:
                 self.add(rel, "chain-id-name-mismatch", "minor", where, f"the network name {shown!r} is not the full name of chain id {expected} and may mean another network; the file says {chain_id}")
         elif expected is None:

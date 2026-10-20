@@ -494,6 +494,28 @@ def test_contract_headers_still_match_under_the_length_bound():
     small = module.parse_source("pragma solidity 0.8.28;\ncontract Vault is Ownable, ReentrancyGuard {\n}\n")
     assert [(c["name"], c["bases"]) for c in small] == [("Vault", ["Ownable", "ReentrancyGuard"])]
 
+def test_contract_after_a_long_comment_block_is_still_checked():
+    module = load_module()
+    header_comment = "/* " + "n" * 600 + " */"  # blanks to 600+ spaces: the old 512-char header bound skipped this contract
+    src = ("pragma solidity 0.8.28;\n"
+           "contract Short { uint256 a; function poke() external { a += 1; } }\n"
+           f"contract Vulnerable {header_comment} is Ownable {{\n"
+           " function mint(address to) external { _mint(to, 1); }\n"
+           "}\n")
+    contracts = module.parse_source(src)
+    assert [c["name"] for c in contracts] == ["Short", "Vulnerable"]
+    assert contracts[1]["bases"] == ["Ownable"]
+    mint = next(f for f in contracts[1]["functions"] if f["name"] == "mint")
+    assert mint["visibility"] == "external" and mint["has_body"] and mint["body"].strip()
+    assert module.guards(mint, module._callable_index(contracts)) == []  # unguarded: the access matrix must flag it
+
+
+def test_contract_with_a_header_past_the_old_length_bound_is_still_checked():
+    module = load_module()
+    bases = ", ".join(f"B{i}" for i in range(160))  # a header of about 1100 characters, no comment involved
+    contracts = module.parse_source(f"pragma solidity 0.8.28;\ncontract Long is {bases} {{ }}\n")
+    assert [(c["name"], len(c["bases"])) for c in contracts] == [("Long", 160)]
+
 
 def test_lint_redaction_of_a_long_unbroken_run_is_linear_and_normal_tokens_are_unchanged():
     import time

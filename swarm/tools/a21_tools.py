@@ -972,7 +972,7 @@ def _addon_compatibility(payload: dict) -> dict:
             if cand[0] > cand[1]:
                 raise _Bad("addons", f"add-on {name!r}: candidate_min_k8s is above candidate_max_k8s")
         broken = [m for m in path if not lo <= m <= hi]
-        status, upgrade_at = "compatible", ""
+        status, upgrade_at, needs_migration = "compatible", "", False
         if broken:
             status = "blocked"
             if cand is not None:
@@ -980,11 +980,22 @@ def _addon_compatibility(payload: dict) -> dict:
                     installed_ok = all(lo <= m <= hi for m in path if m < switch)
                     candidate_ok = all(cand[0] <= m <= cand[1] for m in path if m >= switch)
                     if installed_ok and candidate_ok:
+                        if lo <= cur <= hi and not (lo <= switch <= hi and cand[0] <= switch <= cand[1]):
+                            # The split covers both sides but no control-plane minor supports both
+                            # versions, so the swap cannot run while either is installed: the
+                            # add-on needs an out-of-band migration, not an in-place upgrade.
+                            needs_migration = True
+                            break
                         status, upgrade_at = "upgrade_required", _label(switch)
                         break
         first_break = _label(broken[0]) if broken else ""
         if status == "blocked":
-            reason = "no candidate version supplied" if cand is None else "the candidate does not cover the whole upgrade path"
+            if cand is None:
+                reason = "no candidate version supplied"
+            elif needs_migration:
+                reason = "the installed and candidate versions share no supported control-plane version for the swap; migrate the add-on separately from the control-plane upgrade"
+            else:
+                reason = "the candidate does not cover the whole upgrade path"
             findings.append(_finding(f"addon/{name}/blocked", "blocker", f"{addon['kind']} add-on {name} {addon['version']} supports {_label(lo)}..{_label(hi)} and fails at {first_break}; {reason}"))
         elif status == "upgrade_required":
             when = "before the control-plane upgrade starts" if upgrade_at == _label(cur) else f"while the control plane is at {upgrade_at}"
@@ -1003,7 +1014,7 @@ def _addon_compatibility(payload: dict) -> dict:
 
 
 def addon_compatibility(payload: dict) -> dict:
-    """An add-on must support every minor on the upgrade path; otherwise find the earliest control-plane minor at which it can be swapped for a candidate version covering the rest."""
+    """An add-on must support every minor on the upgrade path; otherwise find the earliest control-plane minor supported by both the installed and candidate versions at which it can be swapped for a candidate version covering the rest."""
 
     def work() -> dict:
         try:

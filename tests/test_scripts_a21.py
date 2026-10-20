@@ -193,14 +193,14 @@ def test_unparsable_yaml_and_alias_bombs_are_counted_not_fatal(tmp_path):
     assert code == 0 and result["files_skipped"]["unparsable"] == 3 and result["files_scanned"] == 0 and result["findings"] == []
 
 
-def test_an_invalid_calendar_date_in_yaml_is_counted_unparsable_and_the_scan_continues(tmp_path):
+def test_an_unparsable_file_does_not_mask_a_blocking_manifest(tmp_path):
     pytest.importorskip("yaml")
     put(tmp_path, "bad-date.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: stamped\ncreated: 2021-02-30\n")
     put(tmp_path, "ing.json", {"apiVersion": "extensions/v1beta1", "kind": "Ingress", "metadata": {"name": "site"}})
     proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--json", "--target-version", "1.22"],
                           capture_output=True, text=True, env=_scrubbed_base_env(), cwd=ROOT, timeout=60)
     result = json.loads(proc.stdout)
-    assert "Traceback" not in proc.stderr and result["status"] == "ok"
+    assert "Traceback" not in proc.stderr and result["status"] == "fail"
     assert proc.returncode == 1
     assert result["files_skipped"]["unparsable"] == 1 and (result["files_scanned"], result["manifests_scanned"]) == (1, 1)
     assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "ing.json")]

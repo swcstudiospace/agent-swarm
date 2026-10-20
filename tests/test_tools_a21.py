@@ -1415,11 +1415,23 @@ def test_review_an_empty_certificate_list_is_invalid_input_not_a_false_ok():
     assert (result["state"], result["field"]) == ("INVALID_INPUT", "certs")
 
 
-def test_review_addon_candidate_switch_after_the_installed_range_ends_is_upgrade_required():
-    # add-on supports 1.28-1.29; the control plane moves 1.29 -> 1.30 and the candidate covers 1.30-1.31: swap at 1.30
+def test_review_addon_versions_without_a_shared_supported_minor_are_blocked():
+    # installed 1.28-1.29, candidate 1.30-1.31, control plane 1.29 -> 1.30: no minor supports
+    # both versions, so the swap can run neither on 1.29 (candidate unsupported) nor on 1.30
+    # (installed unsupported): the path needs a separate migration, not an in-place upgrade.
     result = ok("k8s_addon_compatibility", {"current_version": "1.29", "target_version": "1.30", "addons": [addon(lo="1.28", hi="1.29", cand=("1.30", "1.31"))]})
-    assert result["addons"][0] == {"name": "calico", "kind": "cni", "status": "upgrade_required", "upgrade_at": "1.30", "first_incompatible": "1.30"}
-    assert (result["upgrade_required_count"], result["blocked_count"], result["verdict"]) == (1, 0, "upgrades_needed")
+    assert result["addons"][0] == {"name": "calico", "kind": "cni", "status": "blocked", "upgrade_at": "", "first_incompatible": "1.30"}
+    assert (result["upgrade_required_count"], result["blocked_count"], result["verdict"]) == (0, 1, "blocked")
+    assert finds(result) == [("addon/calico/blocked", "blocker")] and "migrate the add-on separately" in result["findings"][0]["summary"]
+
+
+def test_review_addon_disjoint_ranges_stay_blocked_over_a_longer_path():
+    # Same disjoint 1.28-1.29/1.30-1.31 fixture over 1.28 -> 1.31: the split covers both sides
+    # but still shares no supported minor for the swap.
+    result = ok("k8s_addon_compatibility", {"current_version": "1.28", "target_version": "1.31", "addons": [addon(lo="1.28", hi="1.29", cand=("1.30", "1.31"))]})
+    assert result["addons"][0]["status"] == "blocked" and result["addons"][0]["upgrade_at"] == ""
+    assert (result["upgrade_required_count"], result["blocked_count"], result["verdict"]) == (0, 1, "blocked")
+    assert "migrate the add-on separately" in result["findings"][0]["summary"]
 
 
 def test_review_a_non_positive_duration_is_invalid_input_not_an_allowed_change():

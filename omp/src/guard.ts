@@ -2397,9 +2397,11 @@ function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
  * (`NAME=v cmd`) is that command's alone and never persists. Every other writer is nonPlainWriter's.
  */
 function networkWrites(item: Normalized): NetworkWrite[] {
-  const { prefix, words, at } = itemWords(item);
-  const prefixWords = prefix.filter((w) => !COMPOUND_KEYWORD.test(w));
-  if (at === -1) return prefixWords.every((w) => ASSIGNMENT_WORD.test(w)) ? assignmentWrites([...prefixWords, ...words], true) : [];
+  const { prefix, prefixRaw, words, at } = itemWords(item);
+  const keep = prefix.map((w) => !COMPOUND_KEYWORD.test(w));
+  const prefixWords = prefix.filter((_, i) => keep[i]);
+  // Stripping a keyword prefix must not invent a write: only bare `NAME=` words assign, so anything else runs a command and no plain write is recorded (fail closed).
+  if (at === -1) return prefixRaw.filter((_, i) => keep[i]).every((w) => ASSIGNMENT_WORD.test(w)) ? assignmentWrites([...prefixWords, ...words], true) : [];
   const rest = unwrapCommand(words.slice(at));
   if (prefixWords.length > 0 || rest.length !== words.length - at) return [];
   const [name = "", ...args] = rest;
@@ -2431,11 +2433,12 @@ function writerToken(raw: string[]): boolean {
   return WRITER_COMMAND.test(name) || args.some((w) => unquote(w).startsWith("-") && expandsWord(w));
 }
 
-/** An item's prefix words, its command words (raw and unquoted), and the index of its first non-assignment word (-1: none). */
-function itemWords(item: Normalized): { prefix: string[]; raw: string[]; words: string[]; at: number } {
+/** An item's prefix words, its command words (raw and unquoted), and the index of its first non-assignment word (-1: none). Only a bare `NAME=` word assigns in command position: a quoted or escaped word (`'HARDHAT_NETWORK=localhost'`, `\HARDHAT_NETWORK=v`) is a command name, so the assignment test runs on the raw word. (`export`/`unset` operands below are still read unquoted: quote removal happens before they assign.) */
+function itemWords(item: Normalized): { prefix: string[]; prefixRaw: string[]; raw: string[]; words: string[]; at: number } {
   const raw = shellWords(item.text);
   const words = raw.map(unquote);
-  return { prefix: shellWords(item.prefix).map(unquote), raw, words, at: words.findIndex((w) => !ASSIGNMENT_WORD.test(w)) };
+  const prefixRaw = shellWords(item.prefix);
+  return { prefix: prefixRaw.map(unquote), prefixRaw, raw, words, at: raw.findIndex((w) => !ASSIGNMENT_WORD.test(w)) };
 }
 
 /**
@@ -2445,11 +2448,13 @@ function itemWords(item: Normalized): { prefix: string[]; raw: string[]; words: 
  */
 function nonPlainWriter(item: Normalized): boolean {
   if (item.opaque) return true;
-  const { prefix, raw, words, at } = itemWords(item);
+  const { prefix, prefixRaw, raw, words, at } = itemWords(item);
   if (prefix.some((w) => CODE_PREFIX.test(w))) return true;
-  const prefixWords = prefix.filter((w) => !COMPOUND_KEYWORD.test(w));
+  const keep = prefix.map((w) => !COMPOUND_KEYWORD.test(w));
+  const prefixWords = prefix.filter((_, i) => keep[i]);
   if (at === -1) {
-    return !prefixWords.every((w) => ASSIGNMENT_WORD.test(w)) && prefixWords.some((w) => w.includes("HARDHAT_NETWORK"));
+    // A quoted or escaped word is a command naming HARDHAT_NETWORK, never an assignment: not a plain write, so a writer (fail closed).
+    return !prefixRaw.filter((_, i) => keep[i]).every((w) => ASSIGNMENT_WORD.test(w)) && prefixWords.some((w) => w.includes("HARDHAT_NETWORK"));
   }
   const rest = unwrapCommand(words.slice(at));
   const cmd = raw.slice(raw.length - rest.length);
