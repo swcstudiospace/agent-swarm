@@ -137,8 +137,8 @@ def _instructions(text: str) -> list[tuple[str, str]]:
         joined.append(pending.strip())
     parsed = []
     for line in joined:
-        keyword, _, argument = line.partition(" ")
-        parsed.append((keyword.upper(), argument.strip()))
+        keyword, *argument = re.split(r"\s+", line, maxsplit=1)  # any whitespace separates the keyword, as Docker does
+        parsed.append((keyword.upper(), argument[0].strip() if argument else ""))
     return parsed
 
 
@@ -167,20 +167,43 @@ def _tag_keys(text: str) -> set[str]:
     return found
 
 
+class _Malformed(Exception):
+    """A workload with a non-mapping nested field: the scan counts it and skips it, the rest of the file is still scanned."""
+
+
+def _mapping(value) -> dict:
+    """A nested field as a mapping: a missing or empty value reads as {}; any other non-mapping value makes the workload malformed."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    raise _Malformed
+
+
 def _workload(doc: dict, path: str) -> dict | None:
-    if doc.get("kind") not in WORKLOAD_KINDS or not isinstance(doc.get("spec"), dict):
+    """Facts of a Deployment, StatefulSet or DaemonSet; None for other kinds. Raises _Malformed when a nested field is not a mapping."""
+    if doc.get("kind") not in WORKLOAD_KINDS or doc.get("spec") is None:
         return None
-    pod = ((doc["spec"].get("template") or {}).get("spec")) or {}
-    containers = [c for c in (pod.get("containers") or []) if isinstance(c, dict)]
-    replicas = doc["spec"].get("replicas")
+    spec = _mapping(doc["spec"])
+    pod = _mapping(_mapping(spec.get("template")).get("spec"))
+    metadata = _mapping(doc.get("metadata"))
+    labels = _mapping(metadata.get("labels"))
+    raw_containers = pod.get("containers") or []
+    if not isinstance(raw_containers, list):
+        raise _Malformed
+    containers = [c for c in raw_containers if isinstance(c, dict)]
+    resources = [_mapping(c.get("resources")) for c in containers]
+    lifecycles = [_mapping(c.get("lifecycle")) for c in containers]
+    affinity = _mapping(pod.get("affinity"))
+    replicas = spec.get("replicas")
     return {
-        "path": path, "kind": doc["kind"], "name": a16_tools._safe_label(str((doc.get("metadata") or {}).get("name", "?"))),
+        "path": path, "kind": doc["kind"], "name": a16_tools._safe_label(str(metadata.get("name", "?"))),
         "replicas": replicas if isinstance(replicas, int) and not isinstance(replicas, bool) else None,
         "has_probe": any(c.get(k) for c in containers for k in ("readinessProbe", "livenessProbe", "startupProbe")),
-        "no_requests": sorted(a16_tools._safe_label(str(c.get("name", "?"))) for c in containers if not ((c.get("resources") or {}).get("requests"))),
-        "spread": bool(pod.get("topologySpreadConstraints") or ((pod.get("affinity") or {}).get("podAntiAffinity"))),
-        "graceful": "terminationGracePeriodSeconds" in pod or any(((c.get("lifecycle") or {}).get("preStop")) for c in containers),
-        "labels": sorted(((doc.get("metadata") or {}).get("labels") or {})),
+        "no_requests": sorted(a16_tools._safe_label(str(c.get("name", "?"))) for c, res in zip(containers, resources) if not res.get("requests")),
+        "spread": bool(pod.get("topologySpreadConstraints") or affinity.get("podAntiAffinity")),
+        "graceful": "terminationGracePeriodSeconds" in pod or any(lc.get("preStop") for lc in lifecycles),
+        "labels": sorted(str(key) for key in labels),
     }
 
 
@@ -219,7 +242,7 @@ def scan_tree(root: Path, target: Path) -> dict:
         "files_scanned": 0, "files_skipped": 0, "truncated": False, "ci": [], "env_files": [], "sources": [], "env_reads": [], "sigterm": [],
         "dockerfiles": [], "compose_health": [], "workloads": [], "scalers": [], "k8s_labels": [], "yaml_skipped": [], "unparseable": [],
         "iac": [], "iac_compute": [], "iac_database": [], "multi_az": [], "multi_az_off": [], "backup": [], "encryption": [], "autoscaling": [],
-        "tags": [], "tag_keys": set(), "efficiency": [], "helm": [],
+        "tags": [], "tag_keys": set(), "efficiency": [], "helm": [], "malformed": [],
     }
     seen = 0
 
@@ -307,7 +330,11 @@ def scan_tree(root: Path, target: Path) -> dict:
                 facts["unparseable"].append(rel)
                 continue
             for doc in docs:
-                workload = _workload(doc, rel)
+                try:
+                    workload = _workload(doc, rel)
+                except _Malformed:
+                    facts["malformed"].append(rel)
+                    continue
                 if workload:
                     facts["workloads"].append(workload)
                     facts["k8s_labels"].extend(workload["labels"])
@@ -444,6 +471,7 @@ def run(args, ctx) -> dict:
                                  f"skipped:tool-missing: PyYAML is not importable; {len(facts['yaml_skipped'])} Kubernetes YAML manifest(s) were not analysed",
                                  facts["yaml_skipped"][0]))
     findings.extend(_finding("scan", "manifest-unparseable", "info", "manifest is not valid YAML/JSON and was not analysed", p) for p in facts["unparseable"])
+    findings.extend(_finding("scan", "workload-malformed", "info", "a workload has a non-mapping metadata, spec, template or container field: not analysed", p) for p in facts["malformed"])
     if facts["truncated"]:
         findings.append(_finding("scan", "scan-truncated", "info", f"the scan stopped after {MAX_FILES} files; findings cover the files seen so far"))
     pillars, overall = score(findings, facts)

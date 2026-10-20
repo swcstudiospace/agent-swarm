@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -326,6 +327,21 @@ def test_unchecked_low_level_calls(snippet, flagged):
     assert bool(rules) is flagged
 
 
+@pytest.mark.parametrize("snippet, calls", [
+    ('    function f(address a, bool c) external { emit E(); if (c) a.call{value: 1}(""); }', 1),
+    ('    function f(address a, bool c) external { emit E(); if (c) { a.call{value: 1}(""); } }', 1),
+    ('    function f(address a, bool c) external { emit E(); if (c) if (c) a.call{value: 1}(""); }', 1),
+    ('    function f(address a, bool c) external { emit E(); while (c) a.call{value: 1}(""); }', 1),
+    ('    function f(address a, bool c) external { emit E(); if (c) a.call{value: 1}(""); else a.call{value: 1}(""); }', 2),
+    ('    function f(address a, bool c) external { emit E(); if (c) (bool ok, ) = a.call{value: 1}(""); require(ok); }', 0),
+    ('    function f(address a, bool c) external { emit E(); if (c) require(a.call{value: 1}("")); }', 0),
+    ('    function f(address a, bool c) external { emit E(); if (a.call{value: 1}("")) emit E(); }', 0),
+])
+def test_a_bare_if_or_loop_body_call_is_unchecked_but_a_call_in_a_condition_is_not(snippet, calls):
+    rules = [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert len(rules) == calls
+
+
 @pytest.mark.parametrize("snippet, severity", [
     ('    function f(address t, bytes memory d) external { emit E(); (bool ok, ) = t.delegatecall(d); require(ok); }', "major"),
     ('    function f(address t, bytes memory d) public { emit E(); (bool ok, ) = t.delegatecall(d); require(ok); }', "major"),
@@ -442,3 +458,48 @@ def test_lint_is_linear_on_adversarial_files(name, source):
     started = time.perf_counter()
     module.lint_source("a.sol", source)
     assert time.perf_counter() - started < 15, name
+
+
+# --- adversarial inputs: a FIFO, quadratic regex work, a bare if body ----------------------------------------------------
+
+
+def lint_bounded(tmp_path: Path, *args: str):
+    """The real-mode scan in a child process with a deadline: a hang fails the test instead of stalling the run."""
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "sol_contract_lint.py"), "--root", str(tmp_path), "--json", *args],
+                            capture_output=True, text=True, timeout=60, cwd=ROOT, env={**os.environ, "SWARM_DIR": str(tmp_path / ".swarm-state")})
+    return result, json.loads(result.stdout)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_fifo_named_like_a_contract_is_unreadable_and_the_scan_finishes(tmp_path):
+    write(tmp_path, "fifodir/Ok.sol", VAULT)
+    os.mkfifo(tmp_path / "fifodir" / "Hang.sol")
+    result, data = lint_bounded(tmp_path, "--path", "fifodir")
+    assert result.returncode == 1 and data["files_scanned"] == 1 and data["skipped"]["unreadable"] == 1
+    assert [f["location"] for f in by_rule(data, "SOL-SELFDESTRUCT")] == ["fifodir/Ok.sol:13"]
+
+
+def test_repeated_contract_keywords_without_a_body_finish_quickly(tmp_path):
+    write(tmp_path, "mc/Q.sol", "contract a " * 16000)
+    result, data = lint_bounded(tmp_path, "--path", "mc")
+    assert result.returncode == 0 and data["files_scanned"] == 1
+    assert [f["location"] for f in by_rule(data, "SOL-PRAGMA-MISSING")] == ["mc/Q.sol:1"]
+
+
+def test_contract_headers_still_match_under_the_length_bound():
+    module = load_module()
+    bases = ", ".join(f"B{i}" for i in range(80))  # a header of about 390 characters
+    long_header = module.parse_source(f"pragma solidity 0.8.28;\ncontract Long is {bases} {{ }}\n")
+    assert [(c["name"], c["kind"], len(c["bases"])) for c in long_header] == [("Long", "contract", 80)]
+    small = module.parse_source("pragma solidity 0.8.28;\ncontract Vault is Ownable, ReentrancyGuard {\n}\n")
+    assert [(c["name"], c["bases"]) for c in small] == [("Vault", ["Ownable", "ReentrancyGuard"])]
+
+
+def test_lint_redaction_of_a_long_unbroken_run_is_linear_and_normal_tokens_are_unchanged():
+    import time
+    module = load_module()
+    started = time.perf_counter()
+    clipped = module.redact("g" * 40000)
+    assert time.perf_counter() - started < 2
+    assert clipped == "g" * 72 + "..." and module.redact("g" * 40000 + "1") == "<redacted 40001 chars>"
+    assert module.redact(CANARY_TOKEN) == "<redacted 40 chars>"

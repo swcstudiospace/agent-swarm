@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import bisect
 import json
 import re
 import shlex
@@ -235,10 +236,19 @@ def _secret_name(name: str) -> bool:
     return any(word in upper for word in ("PASSWORD", "PASSWD", "APIKEY", "SECRET"))  # camelCase names such as dbPassword
 
 
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _split_word(text: str) -> tuple[str, str]:
+    """First whitespace-delimited word and the rest: a tab separates Dockerfile words exactly as a space does."""
+    word, *rest = _WHITESPACE.split(text, maxsplit=1)
+    return word, (rest[0] if rest else "")
+
+
 def _split_flags(rest: str) -> tuple[list[str], str]:
     flags: list[str] = []
     while rest.startswith("--") and len(flags) < 50:
-        token, _, rest = rest.partition(" ")
+        token, rest = _split_word(rest)
         flags.append(token)
         rest = rest.lstrip()
     return flags, rest
@@ -264,7 +274,9 @@ def _parse_dockerfile(content: str) -> list[dict]:
             escape = match.group(2)
         index += 1
     out: list[dict] = []
-    unterminated: set[str] = set()  # delimiters with no terminator line left in the file: never searched again (keeps the scan linear)
+    terminators: dict[str, list[int]] = {}  # stripped line -> ascending line numbers, so each heredoc terminator is a bisect, never a rescan
+    for number, line in enumerate(lines):
+        terminators.setdefault(line.strip(), []).append(number)
     while index < len(lines):
         stripped = lines[index].strip()
         if not stripped or stripped.startswith("#"):
@@ -286,17 +298,16 @@ def _parse_dockerfile(content: str) -> list[dict]:
             parts.append(stripped)
             break
         logical = " ".join(p for p in parts if p)
-        head, _, rest = logical.partition(" ")
+        head, rest = _split_word(logical)
         keyword = head.upper()
         body: list[str] = []
         if keyword in ("RUN", "COPY", "ADD"):
             for _quote, delimiter in _HEREDOC.findall(logical):
-                if delimiter in unterminated:
-                    continue
-                end = next((i for i in range(index, len(lines)) if lines[i].strip() == delimiter), None)
-                if end is None:
-                    unterminated.add(delimiter)
-                    continue  # no terminator line: `<<` is shell arithmetic (`$((1<<N))`) or a stray token, not a heredoc
+                candidates = terminators.get(delimiter, [])
+                position = bisect.bisect_left(candidates, index)
+                if position == len(candidates):
+                    continue  # no terminator line after this instruction: `<<` is shell arithmetic (`$((1<<N))`) or a stray token, not a heredoc
+                end = candidates[position]
                 body.extend(lines[index:end])
                 index = end + 1
         flags, args = _split_flags(rest.strip())

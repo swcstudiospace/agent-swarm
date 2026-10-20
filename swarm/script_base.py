@@ -93,7 +93,9 @@ class AgentScript:
             result.setdefault("status", "ok")
             ctx.emit(f"script.{self.name}", result)
             self._print(result, args.json)
-            return self.EXIT_FAIL if result.get("status") == "fail" else self.EXIT_OK
+            findings = result.get("findings") or []
+            policy_fail = any(f.get("severity") in ("blocker", "major") for f in findings)
+            return self.EXIT_FAIL if result.get("status") == "fail" or policy_fail else self.EXIT_OK
         except SwarmError as e:
             err = {"agent": self.agent_id, "script": self.name, "status": "error", "error": e.to_dict()}
             ctx.emit(f"script.{self.name}.error", err)

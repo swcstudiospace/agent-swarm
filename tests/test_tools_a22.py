@@ -2266,3 +2266,27 @@ def test_review_results_stay_far_below_the_output_limit():
     steps = [{"setWeight": 10}] * 1001
     invalid("gitops_rollout_check", {"rollout": rollout({"steps": steps}), "analysis_templates": []}, "rollout")
     assert check_rollout(rollout({"steps": [{"setWeight": 10}] * 999 + [ANALYSIS_STEP]}), max_first_step_weight=100)["step_count"] == 1000
+
+
+def test_image_semver_range_with_a_long_whitespace_run_is_rejected_promptly():
+    import time
+    started = time.perf_counter()
+    adversarial = "1" + "  1" * 40 + " a!"
+    invalid("gitops_image_policy", {"image": "r.io/a/web:1.4.2", "candidate_tags": TAGS, "require_digest": False,
+                                    "policy": {"type": "semver", "range": adversarial}}, "policy")
+    assert time.perf_counter() - started < 2.0
+
+
+def test_image_semver_normal_ranges_still_match():
+    bounded = semver(">=1.2 <2.0")
+    assert (bounded["selected_tag"], bounded["eligible_count"], bounded["current_in_range"]) == ("1.10.0", 4, True)
+    exact = image("r.io/a/web:1.2.3", ["1.2.3", "1.2.4"], {"type": "semver", "range": "1.2.3"})
+    assert (exact["selected_tag"], exact["eligible_count"], exact["current_in_range"]) == ("1.2.3", 1, True)
+
+
+@pytest.mark.parametrize("name,flagged", [("DB_PASS", True), ("dbPass", True), ("pass", True), ("passport", False), ("PASSPORT_NUMBER", False),
+                                          ("BYPASS_MODE", False)])
+def test_secret_scan_pass_is_a_secret_word_only_as_a_whole_word(name, flagged):
+    result = scan(deployment_with_env({"name": name, "value": "hunter2hunter2"}))
+    expected = {"plaintext-env:Deployment/app/d:spec.template.spec.containers[0].env[0]": "major"} if flagged else {}
+    assert severities(result) == expected and result["exposure_count"] == int(flagged)

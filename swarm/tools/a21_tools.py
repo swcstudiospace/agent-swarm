@@ -626,6 +626,8 @@ def _etcd_health(payload: dict) -> dict:
     in_use = payload.get("db_size_in_use_bytes")
     if in_use is not None and in_use > size:
         raise _Bad("db_size_in_use_bytes", "db_size_in_use_bytes cannot exceed db_size_bytes")
+    if quota <= 0:
+        raise _Bad("quota_bytes", "quota_bytes must be greater than 0")
     _unique(payload["members"], "name", "members", "member name")
     findings: list[dict] = []
     used_pct = Decimal(size) * HUNDRED / Decimal(quota)
@@ -787,6 +789,8 @@ def autoscaler_sanity(payload: dict) -> dict:
 def _cert_expiry(payload: dict) -> dict:
     now = _timestamp(payload["now"], "now")
     _unique(payload["certs"], "name", "certs", "certificate name")
+    if not payload["certs"]:
+        raise _Bad("certs", "at least one certificate is required")
     rows: list[tuple[datetime, dict]] = []
     counts = {"expired": 0, "critical": 0, "warning": 0, "notice": 0, "ok": 0}
     findings: list[dict] = []
@@ -973,7 +977,7 @@ def _addon_compatibility(payload: dict) -> dict:
             status = "blocked"
             if cand is not None:
                 for switch in path:
-                    installed_ok = switch == cur or all(lo <= m <= hi for m in path if m <= switch)
+                    installed_ok = all(lo <= m <= hi for m in path if m < switch)
                     candidate_ok = all(cand[0] <= m <= cand[1] for m in path if m >= switch)
                     if installed_ok and candidate_ok:
                         status, upgrade_at = "upgrade_required", _label(switch)
@@ -1020,6 +1024,9 @@ def _fleet_drift(payload: dict) -> dict:
     allowed_lag = payload.get("max_minor_lag", 1)
     clusters = payload["clusters"]
     _unique(clusters, "name", "clusters", "cluster name")
+    for cluster in clusters:
+        if cluster["environment"] not in _ENV_RANK:
+            raise _Bad("clusters", f"cluster {cluster['name']!r}: environment must be one of {', '.join(_ENV_RANK)}")
     parsed = [(c, _minor(c["version"], "clusters")) for c in sorted(clusters, key=lambda c: c["name"])]
     findings: list[dict] = []
     rows: list[dict] = []
@@ -1099,6 +1106,8 @@ def _occurrences(window: dict, around: datetime, days: int):
 
 def _maintenance_window(payload: dict) -> dict:
     start = _timestamp(payload["proposed_start"], "proposed_start")
+    if payload["duration_minutes"] < 1:
+        raise _Bad("duration_minutes", "duration_minutes must be at least 1")
     duration = timedelta(minutes=payload["duration_minutes"])
     end = start + duration
     windows = payload["windows"]

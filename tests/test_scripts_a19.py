@@ -402,3 +402,17 @@ def test_script_findings_never_echo_secret_shaped_values(repo):
     text = json.dumps(result)
     for secret in SECRETS:
         assert secret not in text, secret
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+def test_fifo_named_like_a_json_descriptor_is_skipped_and_the_valid_file_is_still_scanned(tmp_path, repo):
+    (repo / "e").mkdir()
+    os.mkfifo(repo / "e" / "a.json")  # opening a pipe would block forever
+    put(repo, "e/b.json", EVENT)
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / "state")}
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--json", "--root", str(repo), "--path", "e"], capture_output=True, text=True,
+                          env=env, cwd=str(repo.parent), check=False, timeout=60)
+    assert "Traceback" not in proc.stderr, proc.stderr
+    result = json.loads(proc.stdout)
+    assert proc.returncode == 0 and result["findings"] == []
+    assert result["scanned"]["cloudevents"] == 1 and result["scanned"]["skipped_binary"] == 1

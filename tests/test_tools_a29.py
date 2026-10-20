@@ -1887,3 +1887,12 @@ def test_userop_calldata_floor_is_four_per_zero_byte_and_sixteen_per_nonzero_byt
                  for key in ("call_data", "signature")}
         result = ok("dapp_userop_check", uop(call_data="0x" + blobs["call_data"].hex(), signature="0x" + blobs["signature"].hex(), pre_verification_gas="0x" + "ff" * 8))
         assert result["calldata_gas_floor"] == sum(4 if b == 0 else 16 for blob in blobs.values() for b in blob)
+
+
+def test_known_transaction_fragment_does_not_match_inside_unknown_transaction():
+    def refine(code, message):
+        return ok("dapp_provider_error_map", {"code": code, "message": message})
+    unrelated = refine(-32000, "unknown transaction")
+    assert (unrelated["category"], unrelated["message_class"], unrelated["show_error_toast"], unrelated["matched_by"]) == ("server_error", "error", True, "code")
+    assert refine(-32000, "already known")["category"] == "already_known"
+    assert refine(-32000, "known transaction: 0xabc")["category"] == "already_known"

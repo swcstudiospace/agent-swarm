@@ -465,3 +465,22 @@ def test_env_file_finding_does_not_claim_the_file_is_tracked(tmp_path):
     finding = next(f for f in scan(tmp_path)["findings"] if f["id"] == "cloud.env-file-committed")
     assert finding["severity"] == "major" and finding["location"] == ".env"
     assert "committed unless version control ignores it" in finding["summary"]
+
+
+def test_tab_separated_healthcheck_and_exec_form_are_read_like_the_space_form():
+    module = load_script()
+    assert module._dockerfile_facts("FROM a\nHEALTHCHECK\tCMD true\n")["healthcheck"] is True
+    assert module._dockerfile_facts("FROM a\nHEALTHCHECK\tNONE\n")["healthcheck"] is False
+    assert module._dockerfile_facts("FROM a\nCMD\tnode app.js\n") == {"healthcheck": False, "shell_form": True, "launcher": "CMD"}
+
+
+def test_string_typed_workload_metadata_is_skipped_and_counted_and_the_scan_completes(tmp_path):
+    pytest.importorskip("yaml")
+    repo = tmp_path / "repo"
+    write(repo, "k8s/broken.json", json.dumps({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": "a", "spec": {"replicas": 2}}))
+    write(repo, "k8s/deploy.yaml", DEPLOYMENT_GOOD)
+    result = cli("--json", "--root", str(repo), tmp_path=tmp_path)
+    assert result.returncode in (0, 1), result.stderr  # the scan completes; 2 would mean it aborted
+    data = json.loads(result.stdout)
+    assert data["signals"]["kubernetes_workloads"] == 1
+    assert [f for f in brief(data) if f[0] == "cloud.workload-malformed"] == [("cloud.workload-malformed", "info", "k8s/broken.json")]

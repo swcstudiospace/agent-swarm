@@ -353,3 +353,27 @@ def test_boolean_valued_build_arg_names_are_not_secrets():
     assert module.workflow_build_arg_findings("      - run: docker build --build-arg ALLOW_EMPTY_PASSWORD=yes .\n", "w.yml") == []
     flagged = module.workflow_build_arg_findings("      - run: docker build --build-arg DB_PASSWORD=hunter2 .\n", "w.yml")
     assert [f["id"] for f in flagged] == ["workflow.secret-in-build-arg"] and "hunter2" not in json.dumps(flagged)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+def test_fifo_named_dockerfile_is_skipped_and_the_valid_dockerfile_is_still_linted(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "img").mkdir(parents=True)
+    os.mkfifo(repo / "img" / "Dockerfile")  # opening a pipe would block forever
+    put(repo, "img/Dockerfile.app", CLEAN_DOCKERFILE)
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / "swarm-state")}
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--json", "--root", str(repo), "--path", "img"], capture_output=True, text=True,
+                          env=env, cwd=ROOT, check=False, timeout=60)
+    out = json.loads(proc.stdout)
+    assert proc.returncode == 0 and out["status"] == "ok" and out["findings"] == []
+    assert out["files_scanned"] == {"dockerfiles": 1, "workflows": 0}
+    assert out["skipped"] == ["img/Dockerfile: unreadable"]
+
+
+def test_inline_build_args_secret_gives_the_same_finding_as_the_block_form():
+    module = load_script()
+    inline = module.workflow_build_arg_findings("          build-args: NPM_TOKEN=${{ secrets.NPM_TOKEN }}\n", "w.yml")
+    block = module.workflow_build_arg_findings("          build-args: |\n            NPM_TOKEN=${{ secrets.NPM_TOKEN }}\n", "w.yml")
+    assert [(f["id"], f["severity"], f["summary"]) for f in inline] == [(f["id"], f["severity"], f["summary"]) for f in block]
+    assert [(f["id"], f["severity"], f["location"]) for f in inline] == [("workflow.secret-in-build-arg", "blocker", "w.yml:1")]
+    assert module.workflow_build_arg_findings("          build-args: VERSION=1\n", "w.yml") == []

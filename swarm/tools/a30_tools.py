@@ -237,7 +237,7 @@ _XPRV_VERSIONS = frozenset(bytes.fromhex(v) for v in (
     "0295b005", "02aa7a99", "024285b5", "02575048",  # Yprv Zprv Uprv Vprv (SLIP-132 multisig)
 ))
 _WIF_VERSIONS = frozenset((0x80, 0xEF))  # Bitcoin mainnet / testnet private-key prefix
-_PEM_RE = re.compile(r"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY(?: BLOCK)?-----")
+_PEM_RE = re.compile(r"-----BEGIN[ \t]+((?:[A-Z0-9]+[ \t]+)*)PRIVATE[ \t]+KEY(?:[ \t]+BLOCK)?[ \t]*-----")
 _XPRV_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[xyztuvYZUV]prv[1-9A-HJ-NP-Za-km-z]{100,120}(?![1-9A-HJ-NP-Za-km-z])")
 _WIF_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[5KLc9][1-9A-HJ-NP-Za-km-z]{50,51}(?![1-9A-HJ-NP-Za-km-z])")
 # a 64-digit hex value assigned to a key-like name; the short names (pk, secret, seed) must stand alone between delimiters
@@ -246,11 +246,14 @@ _HEX_KEY_RE = re.compile(
     r"[\w.-]{0,40}[\"'`]?\s*(?:=>|[:=])\s*[\"'`]?(?:0x)?([0-9a-f]{64})\b"
 )
 _HEX64_RE = re.compile(r"(?<![0-9A-Fa-f])(?:0[xX])?[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
-# a 12/15/18/21/24-word phrase assigned (quoted, backticked or bare to the end of the line) to a mnemonic-like name
+# a 12/15/18/21/24-word phrase assigned (quoted, backticked, bracketed or bare) to a mnemonic-like name. Its words may be
+# split over lines or joined by commas and quotes (JSON, YAML, JS lists); the look-ahead refuses a phrase followed by more
+# words on the same line. Bounded joins and a single-class look-ahead keep the scan linear.
 _MNEMONIC_RE = re.compile(
-    r"(?i)(?:mnemonic|seed[_ -]?phrase|seed[_ -]?words|recovery[_ -]?phrase)[\w.-]{0,40}[\"'`]?\s*[:=]\s*[\"'`]?"
-    r"([a-z]+(?:[ \t]+[a-z]+){11,23})(?![ \t]*[a-z])"
+    r"(?i)(?:mnemonic|seed[_ -]?phrase|seed[_ -]?words|recovery[_ -]?phrase)[\w.-]{0,40}[\"'`]?\s*[:=][\s\[\"'`]{0,32}"
+    r"([a-z]+(?:[ \t\r\n,\"'`]{1,32}[a-z]+){11,23})(?![ \t,\"'`]*[a-z])"
 )
+_MNEMONIC_WORD_RE = re.compile(r"[a-z]+", re.IGNORECASE)
 _MNEMONIC_SHAPE_RE = re.compile(r"[a-z]{3,8}(?: [a-z]{3,8}){11,23}")
 _MNEMONIC_WORDS = frozenset((12, 15, 18, 21, 24))
 # credentials that are not keys but must never be echoed or stored either (cloud keys, API tokens, URLs with a password)
@@ -294,11 +297,16 @@ def _is_wif(token: str) -> bool:
 
 
 def _mnemonic_matches(text: str):
-    """Mnemonic assignments in `text` with a valid BIP-39 word count and word shapes (3-8 letters)."""
+    """(start, length) of each mnemonic assignment in `text` whose phrase has a valid BIP-39 word count and word shapes
+    (3-8 letters). A run that swallowed the words of the next line is cut back to a line break that gives a valid count."""
     for match in _MNEMONIC_RE.finditer(text):
-        words = match.group(1).split()
-        if len(words) in _MNEMONIC_WORDS and all(3 <= len(w) <= 8 for w in words):
-            yield match
+        phrase = match.group(1)
+        cuts = [len(phrase)] + [m.start() for m in re.finditer("\n", phrase)][::-1]
+        for cut in cuts:
+            words = list(_MNEMONIC_WORD_RE.finditer(phrase, 0, cut))
+            if len(words) in _MNEMONIC_WORDS and all(3 <= len(w.group()) <= 8 for w in words):
+                yield match.start(1), words[-1].end()
+                break
 
 
 def _secret_kind(text: str, strict: bool = True) -> str:
@@ -1075,8 +1083,8 @@ def _scan_content(path: str, content: str) -> list[dict]:
         digits = match.group(1)
         if len(set(digits.lower())) > 1:  # 000..0 and fff..f are placeholders, not keys
             hits.append(("hex-private-key", "blocker", match.start(1), len(digits)))
-    for match in _mnemonic_matches(content):
-        hits.append(("mnemonic-phrase", "blocker", match.start(1), len(match.group(1))))
+    for start, length in _mnemonic_matches(content):
+        hits.append(("mnemonic-phrase", "blocker", start, length))
     if re.search(r'"ciphertext"\s*:', content) and re.search(r'"kdf"\s*:', content):
         hits.append(("encrypted-keystore", "major", content.index('"ciphertext"'), len(content)))
     if not hits:

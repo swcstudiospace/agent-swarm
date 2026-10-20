@@ -1333,12 +1333,16 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash('printf "%s\\n" "$x"; hardhat test'), insideAs(A26))).toBeUndefined();
   });
 
-  test("a loop whose body is a local test writes nothing to HARDHAT_NETWORK: the bare test run with no environment network passes", () => {
-    expect(guardToolCall(bash("for i in 1 2; do hardhat test; done"), insideAs(A26))).toBeUndefined();
+  test("fail-closed: a for loop is a non-plain writer, so a bare test run in its body needs approval with no environment network", () => {
+    expect(guardToolCall(bash("for i in 1 2; do hardhat test; done"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
   });
 
-  test("unset of another name is not a writer token: a bare test run with no environment network passes", () => {
-    expect(guardToolCall(bash("unset OTHER; hardhat test"), insideAs(A26))).toBeUndefined();
+  test("fail-closed: unset of another name is a non-plain writer, so a bare test run needs approval with no environment network", () => {
+    expect(guardToolCall(bash("unset OTHER; hardhat test"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
   });
 
   test("a single-quoted dollar is literal, not an expansion: a bare test run with no environment network passes", () => {
@@ -1353,6 +1357,39 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash('opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat test'), insideAs(A26))?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
     );
+  });
+
+  test("round-12 regression: a nameref and a loop variable cannot alias HARDHAT_NETWORK past a later plain export, no inherited network", () => {
+    const line = "declare -n target=HARDHAT_NETWORK; export HARDHAT_NETWORK=localhost; for target in HARDHAT_NETWORK; do target=mainnet; hardhat run scripts/deploy.ts; done";
+    expect(guardToolCall(bash(line), insideAs(A26))?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+  });
+
+  test("round-12 regression: the same line with an inherited mainnet also needs approval", () => {
+    const line = "declare -n target=HARDHAT_NETWORK; export HARDHAT_NETWORK=localhost; for target in HARDHAT_NETWORK; do target=mainnet; hardhat run scripts/deploy.ts; done";
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash(line), inherited)?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+  });
+
+  test("a plain assignment after a compound keyword is still a write: an if body that sets mainnet needs approval", () => {
+    expect(guardToolCall(bash("if true; then HARDHAT_NETWORK=mainnet; fi; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("an assignment expansion in an argument is a writer: ${HARDHAT_NETWORK:=mainnet} needs approval with no environment network", () => {
+    expect(guardToolCall(bash(": ${HARDHAT_NETWORK:=mainnet}; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("an arithmetic assignment in an argument is a writer: $((HARDHAT_NETWORK=1)) needs approval with no environment network", () => {
+    expect(guardToolCall(bash("echo $((HARDHAT_NETWORK=1)); hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("a quoted x=$PWD is a reader: a bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash("printf '%s' \"x=$PWD\"; hardhat test"), insideAs(A26))).toBeUndefined();
   });
 });
 

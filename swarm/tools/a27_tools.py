@@ -286,6 +286,8 @@ def score_severity(payload: dict) -> dict:
         loss, tvl = _dec(payload["loss_usd"]), _dec(payload["tvl_usd"])
         if loss > tvl:
             return _invalid("loss_usd", "loss_usd must not exceed tvl_usd")
+        if tvl <= 0:
+            return _invalid("tvl_usd", "tvl_usd must be above zero to size a loss fraction")
         fraction = loss / tvl
         impact_index = 2 if fraction >= IMPACT_HIGH_FRACTION else 1 if fraction >= IMPACT_MEDIUM_FRACTION else 0
         if payload["irrecoverable"]:

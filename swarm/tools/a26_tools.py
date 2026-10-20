@@ -105,7 +105,7 @@ def _keccak_hex(text: str) -> str:
 _SECRET_SHAPES = re.compile(
     r"(?:AKIA|ASIA)[0-9A-Z]{12,}|\bgh[pousr]_[A-Za-z0-9]{16,}|\bgithub_pat_\w{16,}|\bxox[abprs]-[\w-]{8,}|\bsk-[A-Za-z0-9_-]{16,}"
     r"|\bAIza[\w-]{20,}|\beyJ[\w-]{8,}\.[\w-]{8,}|(?:0x)?[0-9a-fA-F]{40,}|://[^\s/?#]*@"
-    r"|(?=[A-Za-z0-9+/=_-]*\d)[A-Za-z0-9+/=_-]{32,}|(['\"])(?:[a-z]{3,8} ){11,}[a-z]{3,8}\1")
+    r"|(?<![A-Za-z0-9+/=_-])(?=[A-Za-z0-9+/=_-]*\d)[A-Za-z0-9+/=_-]{32,}|(['\"])(?:[a-z]{3,8} ){11,}[a-z]{3,8}\1")
 
 
 def _text(text: str) -> str:

@@ -1437,3 +1437,45 @@ def test_secret_scan_finds_published_key_vectors_and_ignores_the_public_extended
     assert kinds(ok("custody_secret_scan", scan(("k", f"value = {token}\n")))) == [(kind, "k:1", len(token), "blocker")]
     xpub = "xpub661MyMwAqRbcEZVB4dScxMAdx6d4nFc9nvyvH3v4gJL378CSRZiYmhRoP7mBy6gSPSCYk6SzXPTf3ND1cZAceL7SfJ1Z3GC8vBgp2epUt13"
     assert ok("custody_secret_scan", scan(("k", xpub)))["findings"] == []
+
+
+def test_secret_scan_pem_header_tolerates_repeated_and_tab_separators():
+    body = "-----BEGIN  RSA PRIVATE KEY-----\nMIIE\n-----END  RSA PRIVATE KEY-----"
+    tabbed = "-----BEGIN\tEC PRIVATE KEY -----\nMIIE\n-----END\tEC PRIVATE KEY -----"
+    result = ok("custody_secret_scan", scan(("k.pem", body + "\n"), ("t.pem", tabbed + "\n")))
+    assert sorted(kinds(result)) == sorted([
+        ("pem-private-key", "k.pem:1", len(body), "blocker"), ("pem-private-key", "t.pem:1", len(tabbed), "blocker"),
+    ])
+
+
+def test_secret_scan_mnemonic_phrase_split_over_lines_commas_or_a_json_array_is_found():
+    words = ["abandon"] * 11 + ["about"]
+    phrase = " ".join(words)
+    split = " ".join(words[:6]) + "\n" + " ".join(words[6:])
+    comma = ", ".join(words)
+    array = '{"mnemonic": ["' + '", "'.join(words) + '"]}'
+    result = ok("custody_secret_scan", scan(
+        ("s.env", f"MNEMONIC={split}\n"), ("c.txt", f"mnemonic: {comma}\n"), ("k.json", array),
+        ("p.txt", f"mnemonic: {phrase}\nthe quick brown fox jumps\n"),
+    ))
+    assert sorted(kinds(result)) == sorted([
+        ("mnemonic-phrase", "s.env:1", len(split), "blocker"),
+        ("mnemonic-phrase", "c.txt:1", len(comma), "blocker"),
+        ("mnemonic-phrase", "k.json:1", len('", "'.join(words)), "blocker"),
+        ("mnemonic-phrase", "p.txt:1", len(phrase), "blocker"),
+    ])
+    assert "abandon" not in json.dumps(result)
+
+
+def test_secret_scan_mnemonic_search_is_bounded_on_long_word_runs():
+    import time
+
+    words = ["abandon"] * 5000
+    same_line = [" ".join(words), "mnemonic: " + " ".join(words), "mnemonic: abandon" + " " * 100_000 + "abandon",
+                 "mnemonic: " + ("abandon" + " " * 31) * 500]
+    started = time.monotonic()
+    for text in same_line:
+        assert ok("custody_secret_scan", scan(("w.txt", text)))["findings"] == []
+    # one word per line: the first 24 words are a valid run and are reported; the scan must still finish promptly
+    assert ok("custody_secret_scan", scan(("w.txt", "mnemonic:\n" + "\n".join(words))))["files_scanned"] == 1
+    assert time.monotonic() - started < 2, "mnemonic search backtracks on long word runs"

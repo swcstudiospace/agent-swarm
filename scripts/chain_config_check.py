@@ -77,6 +77,19 @@ def _norm_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
+CANONICAL_NAME_TO_ID: dict[str, int] = {_norm_name(name): _id for _id, (name, _cls, _aliases) in CHAINS.items()}
+
+
+def _ambiguous_name(norm: str) -> bool:
+    """True for a name that is also the leading word(s) of another chain's full name ("base" of "base-sepolia")."""
+    return any(other.startswith(norm + "-") for other in CANONICAL_NAME_TO_ID)
+
+
+def _tokens(text: str) -> set[str]:
+    """Whole words of a name or host: a testnet word must match a whole token, never a piece of another word."""
+    return {part for part in re.split(r"[^a-z0-9]+", text.lower()) if part}
+
+
 def _parse_chain_id(value) -> int | None:
     if isinstance(value, bool):
         return None
@@ -207,9 +220,12 @@ class _Scan:
         shown = _safe_name(name)
         expected = NAME_TO_ID.get(norm)
         if expected is not None and expected != chain_id:
-            self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} belongs to chain id {expected}, the file says {chain_id}")
+            if CANONICAL_NAME_TO_ID.get(norm) == expected and not _ambiguous_name(norm):
+                self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} belongs to chain id {expected}, the file says {chain_id}")
+            else:
+                self.add(rel, "chain-id-name-mismatch", "minor", where, f"the network name {shown!r} is not the full name of chain id {expected} and may mean another network; the file says {chain_id}")
         elif expected is None:
-            says_test = any(token in norm for token in TESTNET_NAME_TOKENS)
+            says_test = not _tokens(norm).isdisjoint(TESTNET_NAME_TOKENS)
             if says_test and cls == "mainnet":
                 self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} says test network but chain id {chain_id} is a mainnet")
             elif "mainnet" in norm and cls in ("testnet", "local"):
@@ -228,10 +244,10 @@ class _Scan:
         if chain_id is None:
             return
         cls = _chain_class(chain_id)
-        tokens = _host_tokens(url)
-        if any(token in tokens for token in TESTNET_NAME_TOKENS) and cls == "mainnet":
+        host = _host_tokens(url)
+        if not _tokens(host).isdisjoint(TESTNET_NAME_TOKENS) and cls == "mainnet":
             self.add(rel, "rpc-host-chain-mismatch", "major", where, f"the endpoint host names a test network but the chain id {chain_id} is a mainnet")
-        elif "mainnet" in tokens and cls in ("testnet", "local"):
+        elif "mainnet" in host and cls in ("testnet", "local"):
             self.add(rel, "rpc-host-chain-mismatch", "major", where, f"the endpoint host names a mainnet but the chain id {chain_id} is a {cls} chain")
 
 

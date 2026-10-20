@@ -10,11 +10,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
-from conftest import ROOT, run_script
+from conftest import ROOT, _scrubbed_base_env, run_script
 
 needs_yaml = pytest.mark.skipif(importlib.util.find_spec("yaml") is None, reason="the fixture trees are YAML (PyYAML is an optional dependency)")
 
@@ -552,3 +554,42 @@ def test_review_credentials_in_non_object_documents_are_found_and_never_echoed(t
     assert code == 1 and {f["id"].split(":")[1] for f in result["findings"] if f["check"] == "secrets"} == {"secret-pattern", "credentials-in-url"}
     text = json.dumps(result)
     assert token not in text and "S3cr3tPassw0rd" not in text
+
+
+# --- bounded parsing and special files ----------------------------------------------------------------------------------
+
+
+def alias_bomb() -> str:
+    """Five anchors, each a list of nine aliases of the one before: about 9**5 nodes once the aliases are expanded."""
+    lines = ["- &a0 [1, 2, 3, 4, 5, 6, 7, 8, 9]"]
+    lines += [f"- &a{level} [" + ", ".join([f"*a{level - 1}"] * 9) + "]" for level in range(1, 5)]
+    return "\n".join(lines) + "\n"
+
+
+@needs_yaml
+def test_one_node_budget_covers_every_document_of_a_file_so_alias_bombs_are_too_complex_quickly():
+    module = load_module()
+    started = time.monotonic()
+    documents, problem = module._parse("\n---\n".join([alias_bomb()] * 300), "bombs.yaml", module._load_yaml())
+    assert (documents, problem) == ([], "too-complex") and time.monotonic() - started < 30
+
+
+@needs_yaml
+def test_deeply_nested_valid_yaml_is_too_complex_not_invalid(tmp_path):
+    put(tmp_path, "deep.yaml", "[" * 5000 + "]" * 5000 + "\n")
+    put(tmp_path, "ok.yaml", DEPLOYMENT)
+    code, result = scan(tmp_path)
+    assert code == 0 and result["files_skipped"]["too-complex"] == 1 and result["checks"]["parse"] == 0 and result["files_scanned"] == 1
+
+
+@needs_yaml
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
+def test_fifos_named_like_config_files_are_skipped_and_never_opened(tmp_path):
+    os.mkfifo(tmp_path / "x.yaml")
+    put(tmp_path, "ok.yaml", DEPLOYMENT)
+    # open() on a FIFO blocks until a writer appears, so a regression surfaces as the timeout
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--json"], capture_output=True, text=True,
+                          env=_scrubbed_base_env(), cwd=ROOT, timeout=60)
+    assert "Traceback" not in proc.stderr, proc.stderr
+    result = json.loads(proc.stdout)
+    assert proc.returncode == 0 and result["files_scanned"] == 1 and result["files_skipped"]["unreadable"] == 1 and result["findings"] == []

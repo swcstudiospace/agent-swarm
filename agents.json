@@ -39342,7 +39342,7 @@
                 "type": "string",
                 "description": "Dockerfile text.",
                 "minLength": 1,
-                "maxLength": 100000
+                "maxLength": 1000000
               },
               "require_healthcheck": {
                 "type": "boolean",

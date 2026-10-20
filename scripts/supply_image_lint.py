@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -33,7 +34,9 @@ MAX_FINDINGS_LISTED = 500
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".swarm", ".tox", "vendor"}
 RANK = {"blocker": 0, "major": 1, "minor": 2, "info": 3}
 _BUILD_ARG_FLAG = re.compile(r"--build-arg(?:=|\s+)([A-Za-z_][A-Za-z0-9_]*)(?:=(\$\{\{.*?\}\}|\S*))?")
-_BUILD_ARGS_KEY = re.compile(r"^(\s*)(?:-\s+)?build-args:\s*[|>]?[-+]?\s*$")
+_BUILD_ARGS_KEY = re.compile(r"^(\s*)(?:-\s+)?build-args:[ \t]*(.*?)\s*$")
+_BLOCK_SCALAR = re.compile(r"[|>][-+]?(?:\s+#.*)?")
+_INLINE_BUILD_ARG = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\$\{\{.*?\}\}|\S*)")
 _USER_OPTION = re.compile(r"(?:^|\s)(?:--user|-u)(?:=|\s+)(root|0)(?::\S*)?(?=\s|$)")
 _PRIVILEGED_OPTION = re.compile(r"(?:^|\s)--privileged(?:=true)?(?=\s|$)")
 
@@ -72,7 +75,14 @@ def workflow_build_arg_findings(text: str, rel: str) -> list[dict]:
             continue
         match = _BUILD_ARGS_KEY.match(line)
         if match:
-            block_indent = len(match.group(1)) + (2 if line.lstrip().startswith("- ") else 0)
+            inline = match.group(2)
+            if inline and not _BLOCK_SCALAR.fullmatch(inline):  # `build-args: NAME=value` on the key line itself
+                for name, value in _INLINE_BUILD_ARG.findall(inline):
+                    finding = _secret_build_arg(name, value, at)
+                    if finding:
+                        findings.append(finding)
+            else:
+                block_indent = len(match.group(1)) + (2 if line.lstrip().startswith("- ") else 0)
             continue
         for name, value in _BUILD_ARG_FLAG.findall(line):
             finding = _secret_build_arg(name, value or "", at)
@@ -180,11 +190,14 @@ def scan(root: Path, target: Path) -> dict:
                 truncated = True
                 break
             try:
-                size = path.stat().st_size
+                info = path.stat()
             except OSError:
                 skipped.append(f"{rel}: unreadable")
                 continue
-            if size > MAX_FILE_BYTES:
+            if not stat.S_ISREG(info.st_mode):  # a FIFO or device named Dockerfile would block the read forever
+                skipped.append(f"{rel}: unreadable")
+                continue
+            if info.st_size > MAX_FILE_BYTES:
                 skipped.append(f"{rel}: over-1MiB")
                 continue
             text, reason = _read_text(path)

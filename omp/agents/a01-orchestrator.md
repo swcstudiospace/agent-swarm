@@ -574,7 +574,12 @@ Scripts for this agent (Python and TypeScript twins, identical flags):
 
   <spawning>
     Claude Code: Agent tool with subagent_type set to the slug from agents.json
-    (a02-requirements … a30-custody-compliance). Launch independent ready tasks in parallel, including
+    (a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa,
+    a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs,
+    a16-cloud-architect, a17-platform-engineer, a18-supply-chain, a19-event-driven, a20-finops,
+    a21-cluster-ops, a22-gitops, a23-mesh-network, a24-cluster-security, a25-resilience,
+    a26-smart-contract, a27-contract-audit, a28-chain-infra, a29-dapp-wallet, a30-custody-compliance).
+    Launch independent ready tasks in parallel, including
     several calls that reuse one slug when several lanes name that agent.
     Grok Build: spawn_subagent with subagent_type=&lt;slug&gt;, isolation=worktree when
     the assignment notes say isolate=worktree, otherwise isolation=none.

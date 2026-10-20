@@ -1407,3 +1407,33 @@ def test_review_out_of_range_dates_are_invalid_input_not_a_handler_failure():
     base = {"duration_minutes": 60, "windows": [SAT_NIGHT]}
     for start in ("0001-01-01T00:00:00+05:00", "9999-12-31T23:59:00Z", "9999-12-31T23:59:00-12:00"):
         invalid("k8s_maintenance_window", {**base, "proposed_start": start}, "proposed_start")
+
+
+def test_review_an_empty_certificate_list_is_invalid_input_not_a_false_ok():
+    # the input schema has minItems 1: an empty inventory would otherwise report verdict ok, a false green
+    result = _handlers().cert_expiry({"now": NOW, "certs": []})
+    assert (result["state"], result["field"]) == ("INVALID_INPUT", "certs")
+
+
+def test_review_addon_candidate_switch_after_the_installed_range_ends_is_upgrade_required():
+    # add-on supports 1.28-1.29; the control plane moves 1.29 -> 1.30 and the candidate covers 1.30-1.31: swap at 1.30
+    result = ok("k8s_addon_compatibility", {"current_version": "1.29", "target_version": "1.30", "addons": [addon(lo="1.28", hi="1.29", cand=("1.30", "1.31"))]})
+    assert result["addons"][0] == {"name": "calico", "kind": "cni", "status": "upgrade_required", "upgrade_at": "1.30", "first_incompatible": "1.30"}
+    assert (result["upgrade_required_count"], result["blocked_count"], result["verdict"]) == (1, 0, "upgrades_needed")
+
+
+def test_review_a_non_positive_duration_is_invalid_input_not_an_allowed_change():
+    base = {"proposed_start": "2026-10-24T02:00:00Z", "windows": [SAT_NIGHT]}
+    for minutes in (-60, 0):
+        result = _handlers().maintenance_window({**base, "duration_minutes": minutes})
+        assert (result["state"], result["field"]) == ("INVALID_INPUT", "duration_minutes")
+
+
+def test_review_an_unknown_fleet_environment_is_invalid_input_naming_clusters():
+    result = _handlers().fleet_drift({"latest_version": "1.31", "clusters": [cluster("c", "qa", "1.31.0")]})
+    assert (result["state"], result["field"]) == ("INVALID_INPUT", "clusters")
+
+
+def test_review_a_zero_etcd_quota_is_invalid_input_not_a_division_error():
+    result = _handlers().etcd_health({"db_size_bytes": 1, "quota_bytes": 0, "leader_changes_15m": 0, "wal_fsync_p99_ms": 1, "members": members(True)})
+    assert (result["state"], result["field"]) == ("INVALID_INPUT", "quota_bytes")

@@ -1268,6 +1268,11 @@ def _decode_revert(data: bytes) -> tuple[str, str]:
     return "malformed", f"revert data of {len(data)} bytes has no selector"
 
 
+def _has_fragment(text: str, fragment: str) -> bool:
+    """True when fragment starts at a word boundary in text, so 'known transaction' does not match inside 'unknown transaction'."""
+    return re.search(r"(?<![a-z0-9])" + re.escape(fragment), text) is not None
+
+
 def provider_error_map(payload: dict) -> dict:
     """Map an EIP-1193 / JSON-RPC provider error to a UX category, message class and action; decode Solidity revert data."""
 
@@ -1288,7 +1293,7 @@ def provider_error_map(payload: dict) -> dict:
         if (row is None or code in GENERIC_CODES or row[0] == "server_error") and message:
             lowered = message.lower()
             for fragment, (cat, cls, retry, act) in MESSAGE_PATTERNS:
-                if fragment in lowered:
+                if _has_fragment(lowered, fragment):
                     if cat != category:
                         matched = "message"
                     category, klass, retryable, action = cat, cls, retry, act

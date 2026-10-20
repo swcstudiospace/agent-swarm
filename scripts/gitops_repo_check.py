@@ -25,6 +25,7 @@ import json
 import os
 import posixpath
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -115,6 +116,7 @@ class Repo:
 
 def _parse(text: str, name: str, yaml_mod):
     """(documents, problem) of a file; problem is None, "yaml-missing", "templated", "error" or "too-complex"."""
+    budget = [0]  # one node budget per file: an alias bomb is bounded across all its documents, not per document
     try:
         if name.endswith(".json"):
             loaded = json.loads(text)
@@ -123,12 +125,14 @@ def _parse(text: str, name: str, yaml_mod):
             return [], "yaml-missing"
         else:
             loaded = list(yaml_mod.safe_load_all(text))
-        return [_normalise(item, [0]) for item in loaded if item is not None], None
+        return [_normalise(item, budget) for item in loaded if item is not None], None
     except ValueError as exc:
         if "too complex" in str(exc):
             return [], "too-complex"
         return [], "templated" if "{{" in text else "error"
-    except (RecursionError, getattr(yaml_mod, "YAMLError", ValueError)):
+    except RecursionError:  # valid but nested beyond the interpreter's stack: too complex, not invalid
+        return [], "too-complex"
+    except getattr(yaml_mod, "YAMLError", ValueError):
         return [], "templated" if "{{" in text else "error"
 
 
@@ -157,10 +161,19 @@ def _scan(repo: Repo, base: Path, yaml_mod) -> None:
                 break
             rel = Path(path).relative_to(repo.root).as_posix()
             try:
-                if os.path.getsize(path) > MAX_FILE_BYTES:
+                info = os.stat(path)
+                if not stat.S_ISREG(info.st_mode):  # FIFOs, sockets and devices are never opened: open() on a FIFO blocks forever
+                    repo.skipped["unreadable"] += 1
+                    continue
+                if info.st_size > MAX_FILE_BYTES:
                     repo.skipped["too-large"] += 1
                     continue
-                with open(path, "rb") as handle:
+                # O_NONBLOCK stops a FIFO swapped in after the stat from blocking the open; the fstat below rejects it
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb") as handle:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        repo.skipped["unreadable"] += 1
+                        continue
                     data = handle.read(MAX_FILE_BYTES + 1)
             except OSError:
                 repo.skipped["unreadable"] += 1

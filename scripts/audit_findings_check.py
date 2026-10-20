@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -52,6 +53,14 @@ def _yaml_module():
     return yaml
 
 
+def _regular(path: Path) -> bool:
+    """A regular file only: a FIFO, socket or device named like a findings file would block or misbehave in read_bytes()."""
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def _discover(root: Path, target: Path) -> tuple[list[Path], bool]:
     """Candidate findings files: the target itself, or `*findings*` json/yaml files below it. (files, truncated)"""
     if target.is_file():
@@ -65,7 +74,7 @@ def _discover(root: Path, target: Path) -> tuple[list[Path], bool]:
             if visited > MAX_FILES:
                 return found, True
             path = Path(current) / name
-            if path.suffix.lower() in SUFFIXES and "findings" in name.lower() and not path.is_symlink():
+            if path.suffix.lower() in SUFFIXES and "findings" in name.lower() and not path.is_symlink() and _regular(path):
                 found.append(path)
     return found, False
 

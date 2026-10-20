@@ -19,6 +19,7 @@ import bisect
 import os
 import re
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -129,7 +130,8 @@ def split_top(text: str, sep: str = ",") -> list[str]:
 # Declarations
 # --------------------------------------------------------------------------------------------------------------------
 
-_CONTRACT = re.compile(r"\b(abstract\s+)?(contract|interface|library)\s+([A-Za-z_$][\w$]*)([^{;]*)\{")
+_CONTRACT = re.compile(r"\b(abstract\s+)?(contract|interface|library)\s+([A-Za-z_$][\w$]*)([^{;]{0,512})\{")
+_DECL_HEAD = re.compile(r"\b(abstract\s+)?(contract|interface|library)\s+[A-Za-z_$][\w$]*")
 _VISIBILITY = frozenset({"public", "external", "internal", "private"})
 _MUTABILITY = frozenset({"pure", "view", "payable"})
 _LOCATIONS = frozenset({"memory", "calldata", "storage"})
@@ -548,7 +550,7 @@ def quoted(text: str) -> str:
 SECRET_SHAPES = re.compile(
     r"(?:AKIA|ASIA)[0-9A-Z]{12,}|\bgh[pousr]_[A-Za-z0-9]{16,}|\bgithub_pat_\w{16,}|\bxox[abprs]-[\w-]{8,}|\bsk-[A-Za-z0-9_-]{16,}"
     r"|\bAIza[\w-]{20,}|\beyJ[\w-]{8,}\.[\w-]{8,}|(?:0x)?[0-9a-fA-F]{40,}|://[^\s/?#]*@"
-    r"|(?=[A-Za-z0-9+/=_-]*\d)[A-Za-z0-9+/=_-]{32,}|(['\"])(?:[a-z]{3,8} ){11,}[a-z]{3,8}\1")
+    r"|(?<![A-Za-z0-9+/=_-])(?=[A-Za-z0-9+/=_-]*\d)[A-Za-z0-9+/=_-]{32,}|(['\"])(?:[a-z]{3,8} ){11,}[a-z]{3,8}\1")
 
 
 def redact(text: str) -> str:
@@ -705,9 +707,36 @@ _LOW_LEVEL = re.compile(r"\.(call|delegatecall|staticcall|send)\s*(?:\{[^}]{0,40
 _LAYOUT_AT = re.compile(r"\blayout\s+at\b")
 
 
+_CONTROL_HEAD = re.compile(r"\s*(?:else\b|(?:if|for|while)\s*\()")
+
+
+def _matching_close(text: str, open_at: int) -> int:
+    """Index of the ')' that closes the '(' at `open_at`, or -1 when `text` ends first."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 def _statement_prefix(clean: str, pos: int) -> str:
+    """Source of the statement holding offset `pos`, up to `pos`, minus leading if/else/for/while headers: a bare body
+    (`if (c) a.call(...)`) is not checked, while a call inside a condition (`if (a.call(...))`) still is."""
     start = max(clean.rfind(";", 0, pos), clean.rfind("{", 0, pos), clean.rfind("}", 0, pos)) + 1
-    return clean[start:pos]
+    prefix = clean[start:pos]
+    while head := _CONTROL_HEAD.match(prefix):
+        if not head.group(0).endswith("("):
+            prefix = prefix[head.end():]
+            continue
+        close = _matching_close(prefix, head.end() - 1)
+        if close < 0:
+            break
+        prefix = prefix[close + 1:]
+    return prefix
 
 
 def _enclosing_function(contracts: list[dict], pos: int) -> dict | None:
@@ -729,7 +758,7 @@ def lint_source(rel: str, raw: str) -> list[dict]:
 
     pragmas = list(_PRAGMA.finditer(clean))
     uses_layout_at = bool(_LAYOUT_AT.search(clean))
-    if not pragmas and re.search(_CONTRACT, clean):
+    if not pragmas and (_DECL_HEAD.search(clean) or re.search(_CONTRACT, clean)):
         add("SOL-PRAGMA-MISSING", "minor", "no `pragma solidity` directive: the compiler version is unconstrained", 0)
     for m in pragmas:
         try:
@@ -798,7 +827,11 @@ def _collect(root: Path, start: Path) -> tuple[list[tuple[str, str]], dict]:
             skipped["limit_reached"] = True
             break
         try:
-            if path.stat().st_size > MAX_FILE_BYTES:
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode):  # a FIFO or device blocks the read (or never ends): not a source file
+                skipped["unreadable"] += 1
+                continue
+            if info.st_size > MAX_FILE_BYTES:
                 skipped["too_large"] += 1
                 continue
             data = path.read_bytes()

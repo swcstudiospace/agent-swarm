@@ -1812,3 +1812,21 @@ def test_base_image_policy_eol_date_must_be_a_date_optionally_followed_by_a_real
         assert ids(policy([{"ref": f"alpine:3@{DIGEST}", "eol_date": good}])) == ["image.eol-soon"], good
     for bad in ("2026-03-02 garbage", "2026-03-02T", "2026-02-30", "2026-3-2", "20260302", "2026-03-02Tnoon"):
         invalid("supply_base_image_policy", {"images": [{"ref": f"alpine:3@{DIGEST}", "eol_date": bad}], "allowed_registries": ["docker.io"], "require_digest": False, "as_of": AS_OF}, "images")
+
+
+def test_dockerfile_lint_tab_after_a_keyword_separates_it_like_a_space():
+    tabbed = f"FROM\talpine:3@{DIGEST}\nUSER\troot\nHEALTHCHECK\tCMD true\n"
+    assert ids(lint(tabbed)) == ids(lint(tabbed.replace("\t", " "))) == ["docker.final-user-root"]
+    assert at(lint(tabbed), "docker.final-user-root") == ["line 2"]
+    app = f"FROM\talpine:3@{DIGEST}\nUSER\tapp\nHEALTHCHECK\tCMD true\n"
+    assert ids(lint(app)) == ids(lint(app.replace("\t", " ")))
+
+
+def test_dockerfile_lint_heredoc_terminators_are_bisected_not_rescanned_per_marker():
+    import time
+
+    content = f"FROM alpine:3@{DIGEST}\nUSER app\nHEALTHCHECK CMD true\n" + "".join(f"RUN echo $((1<<N{i}))\n" for i in range(20000))
+    started = time.perf_counter()
+    result = lint(content)
+    assert time.perf_counter() - started < 5.0  # was quadratic: about 10 s just to parse 20000 RUN lines
+    assert result["instructions"] == 20003 and ids(result) == []

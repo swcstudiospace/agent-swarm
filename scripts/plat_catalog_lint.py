@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -82,13 +83,17 @@ def _rel(root: Path, path: Path) -> str:
 
 
 def _read(root: Path, path: Path, skipped: list[str]) -> str | None:
-    """File text, or None (with a skipped note) for symlinks leaving the root, oversized files, binaries and unreadable files."""
+    """File text, or None (with a skipped note) for symlinks leaving the root, FIFOs and devices, oversized files, binaries and unreadable files."""
     rel = _rel(root, path)
     if path.is_symlink() and not path.resolve().is_relative_to(root):
         skipped.append(f"skipped:symlink-outside-root:{rel}")
         return None
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):  # a FIFO or device named catalog-info*.yaml would block the read forever
+            skipped.append(f"skipped:unreadable:{rel}: NotRegularFile")
+            return None
+        if info.st_size > MAX_FILE_BYTES:
             skipped.append(f"skipped:too-large:{rel}")
             return None
         data = path.read_bytes()

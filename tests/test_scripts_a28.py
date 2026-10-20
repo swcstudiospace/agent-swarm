@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "chain_config_check.py"
 TWIN = ROOT / "scripts" / "ts" / "chain_config_check.ts"
+BUN = shutil.which("bun") or "/root/.local/share/reflex/bun/bin/bun"
 KEYS = {"status", "files_scanned", "skipped", "checks", "truncated", "counts", "findings", "summary", "agent", "script"}
 
 
@@ -72,6 +74,20 @@ def test_dry_run_is_canned_json_and_reads_nothing(tmp_path):
 def test_ts_twin_passes_through_to_the_python_script():
     text = TWIN.read_text(encoding="utf-8")
     assert 'passthrough("chain_config_check")' in text
+
+
+@pytest.mark.skipif(not Path(BUN).exists(), reason="bun not installed")
+def test_ts_twin_resolves_a_relative_root_against_the_callers_cwd(tmp_path):
+    """passthrough runs Python in the caller's directory, so a relative --root names the same tree for both."""
+    work = tmp_path / "work"
+    write(work, "qa/chains.json", net(1, "http://user:pw@x.example/"))
+    argv = ["--json", "--root", "qa"]
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / "state")}  # event log stays outside the scanned tree
+    py = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, env=env, cwd=work)
+    ts = subprocess.run([BUN, str(TWIN), *argv], capture_output=True, text=True, env=env, cwd=work)
+    assert py.returncode == 1 and ts.returncode == py.returncode, ts.stderr[-400:]
+    assert json.loads(ts.stdout) == json.loads(py.stdout)
+    assert json.loads(ts.stdout)["files_scanned"] == 1
 
 
 def test_real_mode_output_shape_on_an_empty_tree(tmp_path):
@@ -243,6 +259,24 @@ def test_network_name_must_agree_with_the_chain_id(tmp_path, name, chain_id, rul
     write(tmp_path, "n.json", net(chain_id, name=name, allowMainnet=True))
     found = rules(tmp_path)
     assert found.get("chain-id-name-mismatch") == severity and (rule is None) == ("chain-id-name-mismatch" not in found)
+
+
+def test_a_name_that_only_contains_a_testnet_word_is_not_a_testnet(tmp_path):
+    write(tmp_path, "fujitsu.json", net(1, name="Fujitsu Gateway", allowMainnet=True))
+    code, out = cli(tmp_path)
+    assert (code, out["status"], out["findings"]) == (0, "ok", [])
+
+
+def test_a_host_that_only_contains_a_testnet_word_is_not_a_testnet(tmp_path):
+    write(tmp_path, "host.json", net(1, "https://fujitsu-rpc.example.com/", allowMainnet=True))
+    code, out = cli(tmp_path)
+    assert (code, out["status"], out["findings"]) == (0, "ok", [])
+
+
+def test_a_bare_alias_of_another_chain_is_a_minor_note_not_a_blocker(tmp_path):
+    write(tmp_path, "base.json", net(84532, name="base"))
+    _, out = cli(tmp_path)
+    assert out["status"] == "ok" and [(f["rule"], f["severity"]) for f in out["findings"]] == [("chain-id-name-mismatch", "minor")]
 
 
 def test_endpoint_host_must_agree_with_the_chain_id_class(tmp_path):

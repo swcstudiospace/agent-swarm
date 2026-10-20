@@ -2334,8 +2334,20 @@ interface NetworkWrite {
 const UNREAD_NETWORK = "<unread>";
 /** A shell assignment word, `NAME=` or `NAME+=`. */
 const ASSIGNMENT_WORD = /^[A-Za-z_]\w*\+?=/;
-/** Builtins that write shell variables from their operands (the names they are given), and `eval`/`source`/`.`, which run code. */
-const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|read|mapfile|readarray|getopts|let|eval|source|\.|\(\()$/;
+/**
+ * Commands that may write a shell variable under a name their operands give, or run code that may: never a plain write,
+ * whatever their words (`((` is arithmetic, which assigns).
+ */
+const WRITER_COMMAND = /^(?:declare|typeset|local|readonly|export|unset|read|mapfile|readarray|getopts|let|for|select|eval|source|\.|enable|coproc|trap|alias|wait)$|^\(\(/;
+/** Compound keywords a prefix strips before a command (`then X=v`, `do export X=v`): the command stays a plain statement. */
+const COMPOUND_KEYWORD = /^(?:if|then|else|elif|do|while|until|!)$/;
+/** Prefix words that run the rest of the line as code: `eval` (its joined words) and `coproc` (it names an array). */
+const CODE_PREFIX = /^(?:eval|coproc)$/;
+/**
+ * An expansion that may assign, in any word: arithmetic (`$((`, `$[`, `((`) and a parameter expansion whose body has `=`
+ * (`${X:=v}`, `${X=v}`, `${X:-a=b}`). Matched on the whole line, since splitTopLevel cuts `$((` apart at its parentheses.
+ */
+const ASSIGNING_EXPANSION = /\(\(|\$\[|\$\{[^}]*=/;
 /** The wrappers that run their operand as the command (`command`, `builtin`, `exec`): what they wrap is classified instead. */
 const WRAPPER_COMMAND = /^(?:command|builtin|exec)$/;
 /**
@@ -2380,26 +2392,20 @@ function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
 }
 
 /**
- * What one top-level item writes to HARDHAT_NETWORK. Plain static writes: a statement of assignments, `export NAME=v` and
- * `unset NAME`, with nothing in front of them; a plain write of another name changes nothing. Any other writer token
- * (writerToken) may write a name the guard cannot read, so it adds the non-local value and keeps the old ones. An
- * assignment ahead of a command (`env X=v cmd`) is that command's alone and never persists.
+ * The HARDHAT_NETWORK writes of a plain statement: `NAME=v` words, `export NAME=v` and `unset HARDHAT_NETWORK`, each with
+ * nothing in front of it but compound keywords. A plain write of another name changes nothing. A prefix assignment
+ * (`NAME=v cmd`) is that command's alone and never persists. Every other writer is nonPlainWriter's.
  */
 function networkWrites(item: Normalized): NetworkWrite[] {
-  const prefix = shellWords(item.prefix).map(unquote);
-  const raw = shellWords(item.text);
-  const words = raw.map(unquote);
-  const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w));
-  if (at === -1) {
-    if (prefix.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites([...prefix, ...words], true);
-    return prefix.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
-  }
+  const { prefix, words, at } = itemWords(item);
+  const prefixWords = prefix.filter((w) => !COMPOUND_KEYWORD.test(w));
+  if (at === -1) return prefixWords.every((w) => ASSIGNMENT_WORD.test(w)) ? assignmentWrites([...prefixWords, ...words], true) : [];
   const rest = unwrapCommand(words.slice(at));
-  const plainShape = prefix.length === 0 && rest.length === words.length - at;
+  if (prefixWords.length > 0 || rest.length !== words.length - at) return [];
   const [name = "", ...args] = rest;
-  if (plainShape && name === "export" && args.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites(args, true);
-  if (plainShape && name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
-  return writerToken(raw.slice(raw.length - rest.length)) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+  if (name === "export") return assignmentWrites(args, true);
+  if (name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
+  return [];
 }
 
 /** The command a wrapper (`command`, `builtin`, `exec`) runs, with the wrapper's own flags dropped. */
@@ -2414,18 +2420,52 @@ function unwrapCommand(cmd: string[]): string[] {
 
 /**
  * A writer token, over the raw words of a command after its wrappers: a dynamic command name; `printf` that may take `-v`
- * (printfWrites); `for`/`select` whose loop name or `unset` whose operands expand or name HARDHAT_NETWORK; a writer
- * builtin or `((`; or any option word holding an expansion. Readers (printenv, echo, printf with a static leading format,
- * test, ls, grep, cat) are not writer tokens, whatever they name or expand.
+ * (printfWrites); a WRITER_COMMAND; or any option word holding an expansion. Readers (printenv, echo, printf with a static
+ * leading format, test, ls, grep, cat) are not writer tokens, whatever they name or expand.
  */
 function writerToken(raw: string[]): boolean {
   const [head = "", ...args] = raw;
-  const name = unquote(head);
   if (expandsWord(head)) return true;
+  const name = unquote(head);
   if (name === "printf") return printfWrites(args);
-  if (name === "for" || name === "select") return args.slice(0, 1).some((w) => expandsWord(w) || unquote(w).includes("HARDHAT_NETWORK"));
-  if (name === "unset") return args.some((w) => expandsWord(w) || unquote(w).includes("HARDHAT_NETWORK"));
   return WRITER_COMMAND.test(name) || args.some((w) => unquote(w).startsWith("-") && expandsWord(w));
+}
+
+/** An item's prefix words, its command words (raw and unquoted), and the index of its first non-assignment word (-1: none). */
+function itemWords(item: Normalized): { prefix: string[]; raw: string[]; words: string[]; at: number } {
+  const raw = shellWords(item.text);
+  const words = raw.map(unquote);
+  return { prefix: shellWords(item.prefix).map(unquote), raw, words, at: words.findIndex((w) => !ASSIGNMENT_WORD.test(w)) };
+}
+
+/**
+ * Whether an item runs a non-plain writer: an opaque command word, a prefix that runs code (`eval`, `coproc`), a writer
+ * command, or an export or unset that is not in its plain form. The plain forms are a statement with nothing in front of it
+ * but compound keywords (`then`, `do`, `!`): `export` with no flag and no dynamic word, and `unset HARDHAT_NETWORK`.
+ */
+function nonPlainWriter(item: Normalized): boolean {
+  if (item.opaque) return true;
+  const { prefix, raw, words, at } = itemWords(item);
+  if (prefix.some((w) => CODE_PREFIX.test(w))) return true;
+  const prefixWords = prefix.filter((w) => !COMPOUND_KEYWORD.test(w));
+  if (at === -1) {
+    return !prefixWords.every((w) => ASSIGNMENT_WORD.test(w)) && prefixWords.some((w) => w.includes("HARDHAT_NETWORK"));
+  }
+  const rest = unwrapCommand(words.slice(at));
+  const cmd = raw.slice(raw.length - rest.length);
+  if (prefixWords.length === 0 && rest.length === words.length - at) {
+    const [head = "", ...args] = cmd;
+    if (unquote(head) === "export") {
+      return args.some((w) => unquote(w).startsWith("-") || (!ASSIGNMENT_WORD.test(unquote(w)) && expandsWord(w)));
+    }
+    if (unquote(head) === "unset") return !(args.length === 1 && unquote(args[0]) === "HARDHAT_NETWORK");
+  }
+  return writerToken(cmd);
+}
+
+/** Whether any item on the line, a payload or a substitution included, runs a non-plain writer. */
+function hasNonPlainWriter(items: Normalized[]): boolean {
+  return items.some((item) => nonPlainWriter(item) || hasNonPlainWriter(item.payload));
 }
 
 /**
@@ -2470,10 +2510,15 @@ function compoundEnd(items: Normalized[], start: number): number {
 /**
  * Walk the items of a command line in order, carrying every HARDHAT_NETWORK value that may be in effect. A plain write
  * that is not inside any group, loop, pipeline, background job or `&&`/`||` replaces the set; every other write adds to it.
- * A loop body may run again, so every value written under it is added before the loop starts. A bare run whose possible
- * values include a non-local one is recorded by its marked text.
+ * A loop body may run again, so every value written under it is added before the loop starts. A bare run is recorded by
+ * its marked text when its possible values include a non-local one, or when a non-plain writer runs on the line.
  */
-function scanNetwork(items: Normalized[], state: { possible: NetworkValue[] }, out: Set<string>, inGroup: boolean): void {
+function scanNetwork(
+  items: Normalized[],
+  state: { possible: NetworkValue[]; unknownWriter: boolean },
+  out: Set<string>,
+  inGroup: boolean,
+): void {
   const groups: string[] = inGroup ? ["payload"] : [];
   let prev: Op = "";
   for (let i = 0; i < items.length; i++) {
@@ -2483,7 +2528,8 @@ function scanNetwork(items: Normalized[], state: { possible: NetworkValue[] }, o
     }
     scanNetwork(item.payload, state, out, true);
     const marked = `${item.prefix} ${item.text}`;
-    if (state.possible.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network))) out.add(marked);
+    const nonLocal = state.possible.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));
+    if (state.unknownWriter || nonLocal) out.add(marked);
     const may = groups.length > 0 || prev === "&&" || prev === "||" || prev === "|" || prev === "&" || item.end === "|" || item.end === "&";
     for (const write of networkWrites(item)) {
       state.possible = write.plain && !may ? [write.value] : [...new Set([...state.possible, write.value])];
@@ -2495,11 +2541,15 @@ function scanNetwork(items: Normalized[], state: { possible: NetworkValue[] }, o
 
 /**
  * The bare runs of `command` (by marked text) that may see a non-local HARDHAT_NETWORK: the value the line starts from is
- * the environment it inherits (facts.env, bash's own env override included), and scanNetwork follows the writes in order.
+ * the environment it inherits (facts.env, bash's own env override included), and scanNetwork follows the plain writes in
+ * order. A non-plain writer anywhere on the line (payloads and substitutions included), or an assigning expansion in any
+ * word, makes every bare run non-local.
  */
 function unnamedNetworkRuns(command: string, facts: GuardFacts): Set<string> {
+  const items = normalizeSegments(command, 0, []);
   const out = new Set<string>();
-  scanNetwork(normalizeSegments(command, 0, []), { possible: [facts.env.HARDHAT_NETWORK || undefined] }, out, false);
+  const unknownWriter = ASSIGNING_EXPANSION.test(command) || hasNonPlainWriter(items);
+  scanNetwork(items, { possible: [facts.env.HARDHAT_NETWORK || undefined], unknownWriter }, out, false);
   return out;
 }
 

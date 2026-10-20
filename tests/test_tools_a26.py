@@ -1938,3 +1938,14 @@ def test_eip712_domain_text_that_is_not_unicode_is_invalid_input_not_a_handler_c
         invalid("sol_eip712_typehash", {"encode_type": PERMIT, field: "\ud800"}, field)
     unicode_name = ok("sol_eip712_typehash", {"encode_type": PERMIT, "domain_name": "T\u00f8ken \u4ee4\u724c", "domain_version": "1"})
     assert unicode_name["domain_type_string"] == "EIP712Domain(string name,string version)"
+
+
+def test_redaction_of_a_long_unbroken_run_is_linear_and_normal_tokens_are_unchanged():
+    import time
+    tools = tools_module()
+    started = time.perf_counter()
+    clipped = tools._text("g" * 40000)
+    assert time.perf_counter() - started < 2
+    assert clipped == "g" * 72 + "..." and tools._text("g" * 40000 + "1") == "<redacted 40001 chars>"
+    assert tools._text("a" * 200 + "1") == "<redacted 201 chars>"
+    assert tools._text("ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8") == "<redacted 40 chars>"

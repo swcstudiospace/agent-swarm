@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from datetime import date
 from pathlib import Path
@@ -63,9 +64,12 @@ def _bounded_dumps(document, limit: int = MAX_TEXT_CHARS) -> str | None:
 
 
 def _read_text(path: Path) -> tuple[str | None, str]:
-    """(text, reason): reason is '' on success, else large|binary|unreadable."""
+    """(text, reason): reason is '' on success, else large|binary|unreadable. A FIFO or device is unreadable, never opened."""
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):  # a FIFO or device named *.json would block the read forever
+            return None, "unreadable"
+        if info.st_size > MAX_FILE_BYTES:
             return None, "large"
         raw = path.read_bytes()
     except OSError:

@@ -528,3 +528,16 @@ def test_values_shared_through_many_aliases_stop_at_the_budget_and_findings_stay
     assert len(report["findings"]) == 500 and report["counts"]["blocker"] > 500
     assert report["counts"]["info"] == 1  # the DAPP-CONFIG-PARSE that stopped the walk
     assert "abcdef0123456789" not in proc.stdout
+
+
+# --- one-number IPv4 hosts ---------------------------------------------------------------------------------------------
+
+
+def test_decimal_and_hex_ipv4_hosts_are_classed_as_addresses_not_single_label_names():
+    inspect = module().rpc_url_inspect
+    assert [i["code"] for i in inspect("http://134744072/rpc")["issues"]] == ["insecure-scheme"]  # decimal 8.8.8.8 is public
+    assert [i["code"] for i in inspect("https://134744072/rpc")["issues"]] == []
+    assert [i["code"] for i in inspect("http://0x08080808/rpc")["issues"]] == ["insecure-scheme"]  # hex 8.8.8.8
+    assert [i["code"] for i in inspect("http://127.0.0.1:8545")["issues"]] == ["local-endpoint"]
+    assert [i["code"] for i in inspect("http://2130706433:8545")["issues"]] == ["local-endpoint"]  # decimal 127.0.0.1
+    assert [i["code"] for i in inspect("http://4294967296/rpc")["issues"]] == ["insecure-scheme"]  # beyond 32 bits: not a local address

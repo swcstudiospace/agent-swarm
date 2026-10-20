@@ -488,3 +488,21 @@ def test_secret_safety_yaml_parse_errors_do_not_echo_file_content(tmp_path, repo
     _, report = run_script(tmp_path)
     assert by_rule(report, "parse-error")
     assert secret not in json.dumps(report) and secret[:8] not in json.dumps(report)
+
+
+# --- named pipes ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+def test_fifo_named_like_a_descriptor_is_skipped_and_the_valid_file_is_still_linted(tmp_path, repo):
+    (repo / "c").mkdir()
+    os.mkfifo(repo / "c" / "catalog-info.yaml")  # opening a pipe would block forever
+    write_json(repo, "c/catalog-info.json", descriptor())
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / "swarm-state"), "PYTHONDONTWRITEBYTECODE": "1"}
+    done = subprocess.run([sys.executable, str(SCRIPT), "--root", str(repo), "--path", "c", "--json"], capture_output=True, text=True,
+                          env=env, check=False, timeout=60)
+    assert "Traceback" not in done.stderr, done.stderr
+    report = json.loads(done.stdout)
+    assert done.returncode == 0 and report["status"] == "ok"
+    assert report["scanned_files"] == 1 and report["entity_count"] == 1
+    assert report["skipped"] == ["skipped:unreadable:c/catalog-info.yaml: NotRegularFile"]

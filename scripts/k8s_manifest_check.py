@@ -110,7 +110,7 @@ def _documents(path: Path, yaml_module, counters: dict, skipped: dict):
         return None
     try:
         return list(yaml_module.safe_load_all(text))
-    except (yaml_module.YAMLError, RecursionError):
+    except (yaml_module.YAMLError, ValueError, RecursionError):
         counters["unparsable"] += 1
         return None
 
@@ -223,9 +223,9 @@ def run(args, ctx) -> dict:
         findings.append({"id": "scan/file-limit", "rule": "scan-bound", "severity": "info", "location": target.relative_to(ctx.root).as_posix() or ".",
                          "summary": f"stopped after {MAX_FILES} files; narrow --path to scan the rest"})
     findings.sort(key=lambda f: (-SEVERITY_RANK[f["severity"]], f["location"], f["id"]))
-    failing = any(SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"] for f in findings)
+    policy_fail = any(SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"] for f in findings)
     return {
-        "status": "fail" if failing else "ok",
+        "status": "fail" if policy_fail and counters["unparsable"] == 0 else "ok",
         "target_version": target_label,
         "files_scanned": counters["parsed"],
         "manifests_scanned": manifests,

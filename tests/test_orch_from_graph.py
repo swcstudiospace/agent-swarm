@@ -457,7 +457,7 @@ def _event_count(log: Path) -> int:
 
 @pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
 def test_bun_logs_events_in_the_caller_workspace(tmp_path):
-    """passthrough runs Python in the checkout. State paths must still be the caller's."""
+    """passthrough runs Python in the caller's cwd; state paths must still be the caller's."""
     work = tmp_path / "work"
     work.mkdir()
     env = _caller_env()

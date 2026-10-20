@@ -1928,13 +1928,13 @@ _SEMVER_MAX_GROUPS = 32
 _UINT64 = 1 << 64
 _LOOSE_VERSION = re.compile(r"v?([0-9]+)(\.[0-9]+)?(\.[0-9]+)?(-([0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*))?(\+([0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*))?", re.ASCII)
 _CV = (r"v?([0-9|xX*]+)(\.[0-9|xX*]+)?(\.[0-9|xX*]+)?(-([0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*))?(\+([0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*))?")
-_OPS = r"=||!=|>|<|>=|=>|<=|=<|~|~>|\^"
-_CONSTRAINT = re.compile(rf"{_WS}*({_OPS}){_WS}*({_CV}){_WS}*", re.ASCII)
-_FIND_CONSTRAINT = re.compile(rf"({_OPS}){_WS}*({_CV})", re.ASCII)
+_OPS = r"=|!=|>|<|>=|=>|<=|=<|~|~>|\^"
+_CONSTRAINT = re.compile(rf"{_WS}*((?:{_OPS})?){_WS}*({_CV}){_WS}*", re.ASCII)
+_FIND_CONSTRAINT = re.compile(rf"((?:{_OPS})?){_WS}*({_CV})", re.ASCII)
 _RANGE = re.compile(rf"{_WS}*({_CV}){_WS}+-{_WS}+({_CV}){_WS}*", re.ASCII)
-# Masterminds validates a group as `token (sep token)*`; the equivalent form below has no ambiguity between a token's trailing
-# whitespace and the next separator, so it cannot backtrack exponentially.
-_TOKEN = rf"(?:{_OPS}){_WS}*{_CV}"
+# Masterminds validates a group as `token (sep token)*`. A token is an optional operator and its version, and whitespace may
+# follow an operator only: a whitespace run between two tokens can then be read in one way, so the match cannot backtrack exponentially.
+_TOKEN = rf"(?:(?:{_OPS}){_WS}*)?{_CV}"
 _VALID_GROUP = re.compile(rf"{_WS}*{_TOKEN}(?:(?:{_WS}+|{_WS}*,{_WS}*){_TOKEN})*{_WS}*", re.ASCII)
 
 
@@ -2274,11 +2274,15 @@ def _echo(value) -> str:
     return repr(value) if value is None or isinstance(value, (bool, int, float)) else f"<{type(value).__name__}>"
 
 
+_NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")  # words of a name: split on _ . - and camelCase boundaries
+_WHOLE_WORD_SECRETS = frozenset({"pass"})  # matched as a whole word only: DB_PASS and dbPass are secrets, passport is not
+
+
 def _secret_like_name(name: str) -> bool:
     lowered = name.lower()
     if lowered.startswith("existing") or lowered.endswith(_NOT_A_SECRET_SUFFIX):
         return False
-    return any(word in lowered for word in _SECRET_WORDS)
+    return any(word in lowered for word in _SECRET_WORDS) or not _WHOLE_WORD_SECRETS.isdisjoint(found.lower() for found in _NAME_WORD.findall(name))
 
 
 _PLACEHOLDER_WORD = re.compile(r"^\s*(?:CHANGE_?ME|REPLACE_?ME|xxx+|dummy)\s*$", re.IGNORECASE)

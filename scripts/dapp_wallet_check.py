@@ -67,6 +67,9 @@ def _segment_is_key(segment: str) -> bool:
     return False
 
 
+_INTEGER_HOST = re.compile(r"0x[0-9a-f]{1,8}|[0-9]{1,10}")
+
+
 def _is_local_host(host: str) -> bool:
     """Loopback, private-network, link-local and unspecified addresses, `localhost`, `*.localhost`, `*.local` and single-label names:
     hosts a user's browser cannot reach on the public internet."""
@@ -75,7 +78,12 @@ def _is_local_host(host: str) -> bool:
     try:
         return not ipaddress.ip_address(host).is_global
     except ValueError:
-        return "." not in host
+        pass
+    if _INTEGER_HOST.fullmatch(host):
+        # a one-number IPv4 host (`134744072` is 8.8.8.8): classify the address it denotes, never as a single-label name
+        value = int(host, 16) if host.startswith("0x") else int(host)
+        return value <= 0xFFFFFFFF and not ipaddress.IPv4Address(value).is_global
+    return "." not in host
 
 
 def rpc_url_inspect(url: str) -> dict:

@@ -756,7 +756,7 @@ def dora_bands(payload: dict) -> dict:
                 raise _Bad("deployments", f"deployments[{index}]: committed_at is after deployed_at")
             deploys[did] = (committed, deployed)
         in_window = {k: v for k, v in deploys.items() if start <= v[1] < end}
-        failed: dict[str, list[datetime | None]] = {}
+        failed: dict[str, list[tuple[datetime, datetime | None]]] = {}
         for index, item in enumerate(payload["incidents"]):
             started = _ts(item["started_at"], "incidents", f"incidents[{index}].started_at")
             resolved = _ts(item["resolved_at"], "incidents", f"incidents[{index}].resolved_at") if _s(item.get("resolved_at")) else None
@@ -770,7 +770,7 @@ def dora_bands(payload: dict) -> dict:
             if started < deploys[dep][1]:
                 raise _Bad("incidents", f"incidents[{index}]: started before its deployment")
             if dep in in_window:
-                failed.setdefault(dep, []).append(resolved)
+                failed.setdefault(dep, []).append((started, resolved))
         count = len(in_window)
         found: list[dict] = []
         if count == 0:
@@ -790,11 +790,14 @@ def dora_bands(payload: dict) -> dict:
         failure_band = _band_ascending(failure_rate, DORA_FAILURE_RATE, inclusive=True)
         recoveries: list[int] = []
         unresolved = 0
-        for dep, resolutions in failed.items():
-            if any(r is None for r in resolutions):
+        for dep, incidents in failed.items():
+            if any(done is None for _started, done in incidents):
                 unresolved += 1
             else:
-                recoveries.append(_micro(in_window[dep][1], max(r for r in resolutions if r is not None)))
+                started, resolved = max(incidents, key=lambda pair: pair[1])  # latest resolution wins; one incident measures deploy→resolve, several measure that incident's start→resolve
+                deployed_at = deploys[dep][1]
+                origin = deployed_at if len(incidents) == 1 else started
+                recoveries.append(_micro(origin, resolved))
         recovery_hours = _median(recoveries) / HOUR_US if recoveries else None
         if not failed:
             recovery_band = "none"

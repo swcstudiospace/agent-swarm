@@ -1287,3 +1287,9 @@ def test_clean_redacts_secret_shapes_but_keeps_identifiers_readable():
     assert clean("act add age ago aim air all and any arm art ask") == "[REDACTED]"
     assert clean("act add age ago aim air all and any arm art") == "act add age ago aim air all and any arm art"  # 11 words: not a mnemonic
     assert clean("privateKey = 0x1234") == "privateKey = [REDACTED]" and clean("https://u:pw@h/x") == "https://[REDACTED]@h/x"
+
+
+# --- audit_score_severity: a zero TVL cannot size a loss fraction ----------------------------------------------------------
+def test_score_zero_tvl_is_invalid_input_not_a_crash():
+    # loss 0 and TVL 0: the loss fraction is undefined, so the handler refuses it as an input error instead of dividing by zero
+    invalid("audit_score_severity", {"loss_usd": 0, "tvl_usd": 0, "attacker_privilege": "permissionless", "preconditions": 0, "irrecoverable": False}, "tvl_usd")

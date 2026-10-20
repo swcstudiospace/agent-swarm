@@ -80,7 +80,7 @@ class FakeSubstrate:
     def __init__(self):
         self._now = 1_700_000_000.0
         self.clock = None  # a callable that replaces the stepped clock (a test's simulated clock that runs on its own)
-        self.latency = 0.0  # real seconds every call takes, slept outside the lock so concurrent calls overlap
+        self.gate = None  # a callable each call waits in before it is served; the many-leases test drives time with it
         self.lock = threading.Lock()
         self.nodes: dict[tuple[str, str], dict] = {}
         self.trail: list[dict] = []  # what the server writes to the ledger: claim / warning / note
@@ -128,8 +128,8 @@ class FakeSubstrate:
         name, args = body["params"]["name"], body["params"]["arguments"]
         token = {k.lower(): v for k, v in req.header_items()}.get("authorization", "").removeprefix("Bearer ")
         caller = TOKENS.get(token)
-        if self.latency:
-            time.sleep(self.latency)
+        if self.gate is not None:
+            self.gate()  # the simulated latency: a round of concurrent calls returns together (see the many-leases test)
         with self.lock:
             self.calls.append({"tool": name, "args": args, "caller": caller, "at": self.now})
             out = self.forced[name] if name in self.forced else getattr(self, "tool_" + name)(args, caller)
@@ -820,10 +820,13 @@ def test_many_held_leases_are_all_renewed_within_a_third_of_the_ttl(tmp_path, fa
         assert bridge.acquire(_plan(store, tid), "A05").status == "held"
     interval = lease_mod.heartbeat_interval(30)
     due = fake.now + interval  # every lease falls due at once
-    scale = 0.1  # real seconds per simulated second; every call takes one simulated second
-    t0 = time.monotonic()
-    fake.clock = lambda: due + (time.monotonic() - t0) / scale
-    fake.latency = scale
+    # Simulated time moves only at the round barrier: a call takes one simulated second, and the HEARTBEAT_WORKERS calls
+    # of a round overlap. The last of n / HEARTBEAT_WORKERS rounds therefore ends that many seconds after `due`, however
+    # the host schedules threads.
+    tick = {"t": due}
+    fake.clock = lambda: tick["t"]
+    rounds = threading.Barrier(lease_mod.HEARTBEAT_WORKERS, timeout=5, action=lambda: tick.update(t=tick["t"] + 1))
+    fake.gate = rounds.wait
     bridge.start()
     try:
         deadline = time.monotonic() + 30
@@ -831,7 +834,7 @@ def test_many_held_leases_are_all_renewed_within_a_third_of_the_ttl(tmp_path, fa
             time.sleep(0.01)
     finally:
         bridge.close()
-        fake.latency = 0.0
+        fake.gate = None
     first: dict[str, float] = {}
     for c in fake.at("graph_heartbeat"):
         first.setdefault(c["args"]["node_id"], c["at"])

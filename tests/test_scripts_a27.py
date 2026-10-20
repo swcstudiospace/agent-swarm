@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -446,3 +447,17 @@ def test_secret_values_in_a_malformed_findings_file_are_never_echoed(repo, kind)
     assert rc == 1 and {f["kind"] for f in data["findings"]} == {"unparseable"} and len(data["findings"]) == 2
     assert _leaks(data, secret) == [] and _leaks({"stderr": result.stderr}, secret) == []
     assert any("line" in f["summary"] for f in data["findings"])
+
+
+# --- discovery: a named pipe named like a findings file is never opened ----------------------------------------------------
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+def test_a_named_pipe_named_like_a_findings_file_is_skipped_and_the_valid_file_is_still_read(repo):
+    (repo.root / "audit").mkdir()
+    os.mkfifo(repo.root / "audit" / "audit-findings.json")  # an open() on this blocks forever with no writer
+    repo.write("audit/findings.json", {"findings": [good()]})
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / SCRIPT), "--root", str(repo.root), "--json", "--path", "audit"],
+        capture_output=True, text=True, timeout=60, cwd=ROOT, env={**os.environ, "SWARM_DIR": str(repo.state)},
+    )
+    data = json.loads(result.stdout)
+    assert result.returncode == 0 and data["files_checked"] == 1 and data["findings_total"] == 1 and data["findings"] == []
