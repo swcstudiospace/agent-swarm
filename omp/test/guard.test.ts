@@ -1226,6 +1226,44 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
     expect(guardToolCall(bash("unset HARDHAT_NETWORK && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
   });
+
+  test("unset -n is a write the guard cannot read: the inherited mainnet stays possible, so the bare run needs approval", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("unset -n HARDHAT_NETWORK; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("env HARDHAT_NETWORK=x never persists past its command: the inherited mainnet still needs approval", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("env HARDHAT_NETWORK=localhost true; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("a write inside a loop may run on any iteration: the mainnet export within the body needs approval after it", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(
+      guardToolCall(
+        bash("for i in 1 2; do export HARDHAT_NETWORK=localhost; export HARDHAT_NETWORK=mainnet; done; hardhat run scripts/deploy.ts"),
+        inherited,
+      )?.reason,
+    ).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+  });
+
+  test("a loop body may run zero times: a local export inside it leaves the inherited mainnet possible", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("for i in 1; do export HARDHAT_NETWORK=localhost; done; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("source and . are unreadable writes: a local export before them keeps a non-local value possible, and a bare run with no writes still passes", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; source ./env.sh; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; . ./env.sh; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

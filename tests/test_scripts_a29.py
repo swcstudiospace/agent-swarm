@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -511,3 +512,19 @@ def test_alias_reached_under_two_keys_is_checked_under_each_key(tmp_path):
     _, report, text = scan(tmp_path)
     assert ("DAPP-RPC-KEY", "major", "config.yaml#rpc.ethereum.primary") in found(report)
     assert "abcdef123456" not in text
+
+
+def test_values_shared_through_many_aliases_stop_at_the_budget_and_findings_stay_capped(tmp_path):
+    pytest.importorskip("yaml")
+    shared = "".join(f'  privateKey{i}: "abcdef0123456789"\n' for i in range(10_000))
+    fanout = "".join("- *shared\n" for _ in range(2_000))
+    write(tmp_path, "config.yaml", f"shared: &shared\n{shared}items:\n{fanout}")
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / "swarm-state")}
+    # Unbounded work would stall here; the timeout turns that regression into a failure instead of a hung suite.
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts" / SCRIPT), "--root", str(tmp_path), "--json"], capture_output=True, text=True,
+                          env=env, cwd=tmp_path, timeout=60)
+    report = json.loads(proc.stdout)
+    assert proc.returncode == 1 and report["status"] == "fail" and report["truncated"] is True
+    assert len(report["findings"]) == 500 and report["counts"]["blocker"] > 500
+    assert report["counts"]["info"] == 1  # the DAPP-CONFIG-PARSE that stopped the walk
+    assert "abcdef0123456789" not in proc.stdout

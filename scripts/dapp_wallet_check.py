@@ -310,23 +310,57 @@ def _path_key(key) -> str:
     return f"<key {len(text)} chars>" if len(text) > 64 or _segment_is_key(text) else text
 
 
-MAX_WALK_VISITS = 100_000  # container visits per document: bounds the work an alias-heavy file can cause
+MAX_WALK_VISITS = 1_000_000  # values per file, containers and scalars; a file within the 1 MiB bound has fewer unless it aliases
 
 
 class _WalkLimit(Exception):
-    """A document has more container visits than MAX_WALK_VISITS (aliases shared across many keys)."""
+    """A file has more value visits than MAX_WALK_VISITS (aliases shared across many keys)."""
 
 
-def _walk_structure(node, path: str, rel: str, findings: list[dict], ancestors: set[int], budget: list[int]) -> None:
+def _order(finding: dict) -> tuple[str, str]:
+    return (finding["location"], finding["id"])
+
+
+class _Findings:
+    """Findings of one scan: exact counts per severity, and only the MAX_FINDINGS most severe kept while collecting, so a file that
+    matches on every value cannot grow the store without limit. Within a severity, findings are ordered by location and id."""
+
+    def __init__(self) -> None:
+        self.counts = {name: 0 for name in SEVERITIES}
+        self._kept: dict[str, list[dict]] = {name: [] for name in SEVERITIES}
+
+    def append(self, finding: dict) -> None:
+        severity = finding["severity"]
+        self.counts[severity] += 1
+        kept = self._kept[severity]
+        kept.append(finding)
+        if len(kept) > 2 * MAX_FINDINGS:
+            kept.sort(key=_order)
+            del kept[MAX_FINDINGS:]
+
+    def extend(self, findings) -> None:
+        for finding in findings:
+            self.append(finding)
+
+    def listed(self) -> list[dict]:
+        """The MAX_FINDINGS most severe findings: blocker first, then by location and id."""
+        out: list[dict] = []
+        for name in reversed(SEVERITIES):
+            out.extend(sorted(self._kept[name], key=_order)[:MAX_FINDINGS - len(out)])
+        return out
+
+
+def _walk_structure(node, path: str, rel: str, findings: _Findings, ancestors: set[int], budget: list[int]) -> None:
     """Walk one parsed document. A YAML alias (`*anchor`) is the same object as its anchor, so a shared node is walked under every
     key that reaches it and each path is checked. Cycles are cut on the current path only (`ancestors`): a self-referencing anchor
-    (`&x {again: *x}`) stops where it closes its own path. `budget` holds the remaining container visits of the document."""
+    (`&x {again: *x}`) stops where it closes its own path. Every value visited, container or scalar, is charged to `budget`, the
+    remaining visits of the file, so alias fan-out is bounded however much work each shared value causes."""
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise _WalkLimit()
     if isinstance(node, (dict, list)):
         if id(node) in ancestors:
             return
-        budget[0] -= 1
-        if budget[0] < 0:
-            raise _WalkLimit()
         ancestors.add(id(node))
         try:
             if isinstance(node, dict):
@@ -354,8 +388,7 @@ def _load_yaml():
     return yaml
 
 
-def _scan_data(rel: str, text: str, suffix: str, yaml_module) -> list[dict]:
-    findings: list[dict] = []
+def _scan_data(rel: str, text: str, suffix: str, yaml_module, findings: _Findings) -> None:
     try:
         if suffix in JSON_EXTS:
             documents = [json.loads(text)]
@@ -363,14 +396,14 @@ def _scan_data(rel: str, text: str, suffix: str, yaml_module) -> list[dict]:
             documents = list(yaml_module.safe_load_all(text))
     except Exception as exc:  # a config that does not parse is a finding, not a crash
         findings.append(_finding("DAPP-CONFIG-PARSE", "info", f"{type(exc).__name__}: file is not valid {suffix.lstrip('.')} and was not checked", rel))
-        return findings
+        return
+    budget = [MAX_WALK_VISITS]  # one budget for the whole file: many documents cannot multiply the work either
     for document in documents:
         try:
-            _walk_structure(document, "", rel, findings, set(), [MAX_WALK_VISITS])
+            _walk_structure(document, "", rel, findings, set(), budget)
         except (RecursionError, _WalkLimit):  # too deep or too aliased to walk completely: keep what was found, scan the other files
             findings.append(_finding("DAPP-CONFIG-PARSE", "info", "configuration is nested or aliased too deeply to check completely", rel))
             break
-    return findings
 
 
 # ---- traversal -------------------------------------------------------------------------------------------------------
@@ -405,7 +438,7 @@ def _kind(path: Path) -> str:
 
 def scan_tree(base: Path, root: Path) -> dict:
     """Scan `base` (a file or directory inside `root`). Returns the result body without `status`/`agent`/`script`."""
-    findings: list[dict] = []
+    findings = _Findings()
     skipped: list[str] = []
     scanned = skipped_files = 0
     truncated = False
@@ -447,20 +480,17 @@ def scan_tree(base: Path, root: Path) -> dict:
         elif kind == "env":
             findings.extend(_scan_env(rel, text))
         else:
-            findings.extend(_scan_data(rel, text, path.suffix.lower(), yaml_module))
+            _scan_data(rel, text, path.suffix.lower(), yaml_module, findings)
     if saw_yaml:
         skipped.append("yaml-config-structure: skipped:tool-missing (PyYAML is not installed)")
-    rank = {name: index for index, name in enumerate(SEVERITIES)}
-    findings.sort(key=lambda f: (-rank[f["severity"]], f["location"], f["id"]))
-    counts = {name: sum(1 for f in findings if f["severity"] == name) for name in SEVERITIES}
+    counts = dict(findings.counts)
     failing = sum(counts[name] for name in FAIL_SEVERITIES)
-    total = len(findings)
+    total = sum(counts.values())
     capped = total > MAX_FINDINGS
     if capped:
-        findings = findings[:MAX_FINDINGS]
         skipped.append(f"findings: output capped at {MAX_FINDINGS} of {total} (counts are complete)")
     return {
-        "findings": findings,
+        "findings": findings.listed(),
         "counts": counts,
         "files_scanned": scanned,
         "files_skipped": skipped_files,

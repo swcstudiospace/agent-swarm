@@ -2325,16 +2325,19 @@ const HARDHAT_ENV = /(?:^|[\s;&|(])HARDHAT_NETWORK=([^\s;&|)]+)/g;
 
 /** A HARDHAT_NETWORK value a bare run may see; undefined is unnamed, the in-process chain (local). */
 type NetworkValue = string | undefined;
-/** What a HARDHAT_NETWORK write the guard cannot read leaves in effect: a name no local pattern matches. */
+/** One write to HARDHAT_NETWORK. `plain`: a top-level statement that surely runs, so it replaces what was possible. */
+interface NetworkWrite {
+  value: NetworkValue;
+  plain: boolean;
+}
+/** A value the guard cannot read: no local pattern matches it, so the run it reaches needs approval. */
 const UNREAD_NETWORK = "<unread>";
 /** A shell assignment word, `NAME=` or `NAME+=`. */
 const ASSIGNMENT_WORD = /^[A-Za-z_]\w*\+?=/;
-/** The builtins that set a variable from their operands. */
-const SHELL_DECLARE = /^(?:export|declare|typeset|local|readonly)$/;
-/** Commands that assign a variable named by one of their words (`read HARDHAT_NETWORK`, `printf -v`, `for`, `((`). */
-const NAMING_COMMAND = /^(?:read|mapfile|readarray|getopts|printf|let|for|select|\(\()$/;
-/** A word that names HARDHAT_NETWORK: the bare name, or an assignment to it. */
-const NETWORK_NAME = /^HARDHAT_NETWORK(?:\+?=|$)/;
+/** Words that run a builtin or code which may write variables or take a name to write (`eval`, `source`, `read`, `printf -v`, `for`, `((`). */
+const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|unset|read|mapfile|readarray|getopts|printf|let|for|select|eval|source|\.|command|builtin|\(\()$/;
+/** A word that expands at run time, or a cut substitution. */
+const DYNAMIC_WORD = /[$\u0001]/;
 
 /** The value of an unquoted `HARDHAT_NETWORK=v` word: empty is unnamed, a value the guard cannot read is UNREAD_NETWORK. */
 function networkValue(word: string): NetworkValue {
@@ -2343,50 +2346,89 @@ function networkValue(word: string): NetworkValue {
   return value === "" ? undefined : value;
 }
 
-/**
- * What one top-level item writes to HARDHAT_NETWORK, in order. A command's leading assignments are its own and write
- * nothing; a statement's assignments (prefix or text) persist; `export|declare|typeset|local|readonly NAME=v` persists;
- * `unset NAME` clears it (`unset -f` names functions and writes nothing); a naming command given the name writes a
- * value the guard cannot read.
- */
-function networkWrites(item: Normalized): NetworkValue[] {
-  const words = shellWords(item.text).map(unquote);
-  const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w));
-  if (at === -1) {
-    return [...shellWords(item.prefix).map(unquote), ...words].flatMap((w) =>
-      /^HARDHAT_NETWORK\+=/.test(w) ? [UNREAD_NETWORK] : /^HARDHAT_NETWORK=/.test(w) ? [networkValue(w)] : [],
-    );
+/** The writes of the `HARDHAT_NETWORK=v` words among `words`; `NAME+=v` writes a value the guard cannot read. */
+function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
+  const writes: NetworkWrite[] = [];
+  for (const word of words) {
+    if (/^HARDHAT_NETWORK=/.test(word)) writes.push({ value: networkValue(word), plain });
+    else if (/^HARDHAT_NETWORK\+=/.test(word)) writes.push({ value: UNREAD_NETWORK, plain: false });
   }
-  const [name, ...args] = words.slice(at);
-  if (name === "unset") {
-    if (args.some((w) => /^-\w*f/.test(w))) return [];
-    return args.includes("HARDHAT_NETWORK") ? [undefined] : [];
-  }
-  if (SHELL_DECLARE.test(name)) {
-    return args.flatMap((w) => (/^HARDHAT_NETWORK\+=/.test(w) ? [UNREAD_NETWORK] : /^HARDHAT_NETWORK=/.test(w) ? [networkValue(w)] : []));
-  }
-  return NAMING_COMMAND.test(name) && args.some((w) => NETWORK_NAME.test(w)) ? [UNREAD_NETWORK] : [];
+  return writes;
 }
 
 /**
- * Walk the items of a command line in order, carrying the HARDHAT_NETWORK values that may be in effect. A write that
- * surely runs replaces them; one that may not (after `&&`/`||`, in a pipeline or background job, a group, a compound, or
- * a payload such as `eval`, which shares the shell) adds to them. A bare run whose value may be non-local is recorded by
- * its marked text. A payload's writes are kept for the rest of the line, the conservative side.
+ * What one top-level item writes to HARDHAT_NETWORK. Plain: a statement of assignments, or `export NAME=v` / `unset NAME`
+ * with nothing in front of them (no wrapper, no flag, no expansion). Any other form that names HARDHAT_NETWORK, or runs a
+ * writer with an expansion, writes a value the guard cannot read. An assignment ahead of a command (`env X=v cmd`) is that
+ * command's alone and never persists.
+ */
+function networkWrites(item: Normalized): NetworkWrite[] {
+  const prefix = shellWords(item.prefix).map(unquote);
+  const words = shellWords(item.text).map(unquote);
+  const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w));
+  if (at === -1) {
+    if (prefix.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites([...prefix, ...words], true);
+    return prefix.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+  }
+  const cmd = words.slice(at);
+  const [name, ...args] = cmd;
+  // a sourced file runs code this guard cannot read: it may set HARDHAT_NETWORK, in any form and with or without expansion
+  if (name === "source" || name === ".") return [{ value: UNREAD_NETWORK, plain: false }];
+  const dynamic =
+    DYNAMIC_WORD.test(name) || (WRITER_COMMAND.test(name) && args.some((w) => DYNAMIC_WORD.test(w) && !ASSIGNMENT_WORD.test(w)));
+  if (prefix.length === 0 && !dynamic) {
+    if (name === "export" && args.every((w) => !w.startsWith("-"))) return assignmentWrites(args, true);
+    if (name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
+  }
+  return dynamic || cmd.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+}
+
+/** Every value any write under `items` (payloads included) may leave, as if all of them ran. */
+function collectWrites(items: Normalized[]): NetworkValue[] {
+  return items.flatMap((item) => [...networkWrites(item).map((write) => write.value), ...collectWrites(item.payload)]);
+}
+
+/** Track the groups an item opens or closes: compounds, `(`/`{` subshells and groups; a case pattern's `)` opens nothing. */
+function enterLeave(groups: string[], item: Normalized): void {
+  if (item.compound === "close") groups.pop();
+  else if (item.compound !== undefined) groups.push(item.compound);
+  const top = groups[groups.length - 1];
+  if (item.end === "(" || item.end === "{") groups.push(item.end);
+  else if ((item.end === ")" || item.end === "}") && top !== undefined && !(item.end === ")" && top === "case")) groups.pop();
+}
+
+/** The index of the item that closes the compound opened at `start`, its groups counted as enterLeave counts them. */
+function compoundEnd(items: Normalized[], start: number): number {
+  const groups: string[] = [];
+  for (let k = start; k < items.length; k++) {
+    enterLeave(groups, items[k]);
+    if (groups.length === 0) return k;
+  }
+  return items.length - 1;
+}
+
+/**
+ * Walk the items of a command line in order, carrying every HARDHAT_NETWORK value that may be in effect. A plain write
+ * that is not inside any group, loop, pipeline, background job or `&&`/`||` replaces the set; every other write adds to it.
+ * A loop body may run again, so every value written under it is added before the loop starts. A bare run whose possible
+ * values include a non-local one is recorded by its marked text.
  */
 function scanNetwork(items: Normalized[], state: { possible: NetworkValue[] }, out: Set<string>, inGroup: boolean): void {
   const groups: string[] = inGroup ? ["payload"] : [];
   let prev: Op = "";
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.compound === "loop") {
+      state.possible = [...new Set([...state.possible, ...collectWrites(items.slice(i, compoundEnd(items, i) + 1))])];
+    }
     scanNetwork(item.payload, state, out, true);
     const marked = `${item.prefix} ${item.text}`;
     if (state.possible.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network))) out.add(marked);
     const may = groups.length > 0 || prev === "&&" || prev === "||" || prev === "|" || prev === "&" || item.end === "|" || item.end === "&";
-    for (const network of networkWrites(item)) state.possible = may ? [...new Set([...state.possible, network])] : [network];
-    if (item.compound === "close") groups.pop();
-    else if (item.compound !== undefined) groups.push(item.compound);
-    if (item.end === "(" || item.end === "{") groups.push(item.end);
-    else if ((item.end === ")" || item.end === "}") && groups.length > 0 && !(item.end === ")" && groups[groups.length - 1] === "case")) groups.pop();
+    for (const write of networkWrites(item)) {
+      state.possible = write.plain && !may ? [write.value] : [...new Set([...state.possible, write.value])];
+    }
+    enterLeave(groups, item);
     prev = item.end;
   }
 }
