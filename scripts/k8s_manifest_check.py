@@ -6,7 +6,7 @@ read, symlinks are never followed, binary files are skipped) and reports, per ma
 - removed-api: the apiVersion/kind is not served by --target-version (blocker) or is removed in the next minor (minor);
   the removal table and its rules are those of swarm.tools.a21_tools (the k8s_deprecated_api_scan tool);
 - missing-request: a container or init container of a Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet,
-  ReplicationController, Job or CronJob has no cpu or memory request (major);
+  ReplicationController, Job or CronJob has no cpu or memory request (major; Kubernetes copies an omitted request from its limit);
 - missing-limit: no cpu or memory limit (minor).
 --target-version defaults to the newest removal in the table, so every API the table knows counts as removed.
 JSON is parsed natively. YAML needs PyYAML; without it YAML files are not read and the result carries
@@ -146,10 +146,13 @@ def _resource_findings(kind: str, name: str, spec) -> list[tuple[str, str, str, 
                 continue
             cname = str(container.get("name", "?"))
             resources = container.get("resources") if isinstance(container.get("resources"), dict) else {}
+            limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
             for bucket, rule, severity in (("requests", "missing-request", "major"), ("limits", "missing-limit", "minor")):
                 values = resources.get(bucket) if isinstance(resources.get(bucket), dict) else {}
                 for resource in ("cpu", "memory"):
-                    if not _present(values.get(resource)):
+                    # Kubernetes copies an omitted (or null) request from the limit of the same resource; an empty quantity is still a gap
+                    copied = bucket == "requests" and values.get(resource) is None and _present(limits.get(resource))
+                    if not _present(values.get(resource)) and not copied:
                         what = "container" if group == "containers" else "init container"
                         out.append((f"{rule}/{kind}/{name}/{cname}/{resource}", rule, severity, f"{kind} {name}: {what} {cname} has no {resource} {bucket[:-1]}"))
     return out

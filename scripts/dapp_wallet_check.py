@@ -310,13 +310,19 @@ def _path_key(key) -> str:
     return f"<key {len(text)} chars>" if len(text) > 64 or _segment_is_key(text) else text
 
 
-def _walk_structure(node, path: str, rel: str, findings: list[dict]) -> None:
+def _walk_structure(node, path: str, rel: str, findings: list[dict], seen: set[int]) -> None:
+    """Walk one parsed document. A YAML alias (`*anchor`) is the same Python object as its anchor, so every container is walked
+    once: a second visit adds nothing, and a self-referencing anchor (`&x {again: *x}`) would otherwise recurse without end."""
+    if isinstance(node, (dict, list)):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
     if isinstance(node, dict):
         for key, value in node.items():
-            _walk_structure(value, f"{path}.{_path_key(key)}" if path else _path_key(key), rel, findings)
+            _walk_structure(value, f"{path}.{_path_key(key)}" if path else _path_key(key), rel, findings, seen)
     elif isinstance(node, list):
         for index, value in enumerate(node):
-            _walk_structure(value, f"{path}[{index}]", rel, findings)
+            _walk_structure(value, f"{path}[{index}]", rel, findings, seen)
     elif isinstance(node, str):
         leaf = path.rsplit(".", 1)[-1]
         if _SECRET_KEY_NAME.search(leaf) and node and not _ENV_REFERENCE.match(node):
@@ -345,7 +351,11 @@ def _scan_data(rel: str, text: str, suffix: str, yaml_module) -> list[dict]:
         findings.append(_finding("DAPP-CONFIG-PARSE", "info", f"{type(exc).__name__}: file is not valid {suffix.lstrip('.')} and was not checked", rel))
         return findings
     for document in documents:
-        _walk_structure(document, "", rel, findings)
+        try:
+            _walk_structure(document, "", rel, findings, set())
+        except RecursionError:  # nesting deeper than the walk can follow: keep what was found and scan the other files
+            findings.append(_finding("DAPP-CONFIG-PARSE", "info", "configuration is nested too deeply to check completely", rel))
+            break
     return findings
 
 
@@ -397,6 +407,9 @@ def scan_tree(base: Path, root: Path) -> dict:
         rel = path.relative_to(root).as_posix()
         try:
             if path.is_symlink() and not path.resolve().is_relative_to(root):
+                skipped_files += 1
+                continue
+            if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the whole scan
                 skipped_files += 1
                 continue
             if path.stat().st_size > MAX_FILE_BYTES:

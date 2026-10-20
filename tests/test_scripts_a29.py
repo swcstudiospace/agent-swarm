@@ -494,3 +494,12 @@ def test_secret_looking_mapping_keys_are_never_echoed_in_finding_locations(tmp_p
     for secret in (token_key, hex_key, INFURA_KEY, "abcdef0123456789"):
         assert secret not in text
     assert "keys.<key 20 chars>.privateKey" in text
+
+
+def test_yaml_alias_cycle_does_not_stop_the_scan(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "config.yaml", "loop: &x {again: *x}\nrpc_url: https://rpc.example.com/?apikey=abcdef123456\n")
+    code, report, text = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail"
+    assert found(report) == {("DAPP-RPC-KEY", "major", "config.yaml#rpc_url")}
+    assert "abcdef123456" not in text

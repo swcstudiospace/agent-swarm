@@ -423,6 +423,17 @@ def test_storage_layout_ignores_ast_ids_but_not_array_lengths():
     assert severity_of(arrays, "STORAGE-TYPE-CHANGED") == "blocker"
 
 
+def test_storage_layout_same_type_with_changed_size_is_a_blocker():
+    # a struct member added to Config keeps the type string but changes the bytes every later element is laid out by
+    grown = layout([var("cfg", 0, 0, "t_struct(Config)12_storage", 64)], [var("cfg", 0, 0, "t_struct(Config)931_storage", 96)])
+    assert ids(grown) == ["STORAGE-TYPE-CHANGED"] and severity_of(grown, "STORAGE-TYPE-CHANGED") == "blocker"
+    assert grown["verdict"] == "incompatible" and "changed size (64 -> 96 bytes)" in grown["findings"][0]["summary"]
+    renamed = layout([var("cfg", 0, 0, "t_struct(Config)12_storage", 64)], [var("settings", 0, 0, "t_struct(Config)12_storage", 96)])
+    assert ids(renamed) == ["STORAGE-REPLACED"] and severity_of(renamed, "STORAGE-REPLACED") == "blocker"
+    assert layout([OWNER, FLAG], [OWNER, FLAG])["findings"] == []
+    assert layout([OWNER], [OWNER, var("late", 1, 0, "t_uint256", 32)])["verdict"] == "compatible"
+
+
 def test_storage_layout_shadowed_labels_are_told_apart_by_contract():
     old = [var("x", 0, 0, "t_uint256", 32, contract="Base"), var("x", 1, 0, "t_uint256", 32, contract="Child")]
     assert layout(old, old)["findings"] == []

@@ -126,6 +126,15 @@ def test_missing_requests_are_major_and_fail_missing_limits_are_minor_and_pass(t
     assert code == 0 and result["findings"] == []
 
 
+def test_a_limit_without_a_request_counts_as_the_request_because_kubernetes_copies_it(tmp_path):
+    put(tmp_path, "limits.json", deployment("l", {"limits": {"cpu": "500m", "memory": "1Gi"}}))
+    put(tmp_path, "cpu-only.json", deployment("c", {"limits": {"cpu": "500m"}}))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and sorted(rules(result)) == [
+        ("missing-limit/Deployment/c/app/memory", "minor", "cpu-only.json"),
+        ("missing-request/Deployment/c/app/memory", "major", "cpu-only.json")]
+
+
 def test_empty_quantities_count_as_missing_and_partial_resources_report_only_the_gap(tmp_path):
     put(tmp_path, "d.json", deployment("d", {"requests": {"cpu": "100m", "memory": ""}, "limits": {"cpu": "200m", "memory": "128Mi"}}))
     _, result = scan(tmp_path, "--target-version", "1.30")

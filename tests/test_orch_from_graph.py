@@ -333,6 +333,17 @@ def test_existing_routes_still_win_where_they_always_did(tmp_path, step, owner):
     assert [task["agent"] for task in tasks] == [owner]
 
 
+@pytest.mark.parametrize("step,owner", [
+    ("Edit contracts/openapi.yaml", "A05"),
+    ("Edit contracts/Vault.sol", "A26"),
+    ("Edit contracts/abi/Vault.json", "A26"),
+])
+def test_contracts_dir_routes_only_smart_contracts_to_a26(tmp_path, step, owner):
+    """An API descriptor under contracts/ keeps its code owner; Solidity and JSON ABIs go to A26."""
+    tasks = _plan(tmp_path, _write_summary(tmp_path, [_node("n1", "generate", [step])]))["tasks"]
+    assert [task["agent"] for task in tasks] == [owner]
+
+
 def test_node_id_leaves_room_for_prefix_and_owner_suffix(tmp_path):
     """orch_plan's default prefix is six characters ("T" + 4 hex + "-") and a split adds "-aNN"."""
     legal = "n" + "x" * 117  # 118: 128 - 6 - 4

@@ -336,6 +336,14 @@ def test_provider_default_tags_skip_the_terraform_tag_check_and_say_so(tmp_path)
     assert [(s["check"], s["status"]) for s in result["skipped"]] == [("iac-untagged-resource", "skipped:provider-default-tags")]
 
 
+def test_provider_default_tags_in_one_terraform_root_do_not_hide_untagged_resources_in_another(tmp_path):
+    put(tmp_path, "dev/main.tf", 'provider "aws" {\n  default_tags {\n    tags = { owner = "x" }\n  }\n}\nresource "aws_instance" "a" {\n  instance_type = "m5.large"\n}\n')
+    put(tmp_path, "prod/main.tf", 'resource "aws_instance" "b" {\n  instance_type = "m5.large"\n}\n')
+    result = scan(tmp_path, required=["owner"])
+    untagged = [(f["file"], f["summary"].split(":")[0]) for f in result["findings"] if f["rule"] == "iac-untagged-resource"]
+    assert untagged == [("prod/main.tf", "aws_instance.b")]
+
+
 def test_empty_required_tags_disable_the_tag_check_and_say_so(tmp_path):
     put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  instance_type = "m5.large"\n}\n')
     result = scan(tmp_path, required=NO_TAGS)

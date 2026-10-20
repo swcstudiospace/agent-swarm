@@ -158,6 +158,7 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   const cdpath = env.get("CDPATH");
   const keyFile = env.get("SWARM_ED25519_KEY_FILE");
   const xdg = env.get("XDG_CONFIG_HOME");
+  const hardhatNetwork = env.get("HARDHAT_NETWORK");
   const shellFacts: GuardFacts = {
     ...facts,
     signerReadPaths: signerSources(facts),
@@ -167,6 +168,7 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
       ...(typeof cdpath === "string" ? { CDPATH: cdpath } : {}),
       ...(typeof keyFile === "string" ? { SWARM_ED25519_KEY_FILE: keyFile } : {}),
       ...(typeof xdg === "string" ? { XDG_CONFIG_HOME: xdg } : {}),
+      ...(typeof hardhatNetwork === "string" ? { HARDHAT_NETWORK: hardhatNetwork } : {}),
     },
   };
   // the bash tool's `cwd` is where the command starts; an internal URL (`local://…`) is a directory the guard cannot place
@@ -2318,24 +2320,29 @@ const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
   brownie: /^(?:run|console|test)(?: |$)/,
 };
 
-/** `HARDHAT_NETWORK=name`, assigned on the segment or exported earlier on the same command line. */
-const HARDHAT_ENV = /(?:^|[\s;&|(])HARDHAT_NETWORK=([^\s;&|)]+)/;
+/** `HARDHAT_NETWORK=name` assigned on a segment or earlier on the same command line (every assignment is listed). */
+const HARDHAT_ENV = /(?:^|[\s;&|(])HARDHAT_NETWORK=([^\s;&|)]+)/g;
 
 /**
  * `hardhat run|deploy|ignition deploy|console|test`, `truffle migrate|deploy|exec|console|test`, `brownie
  * run|console|test` against a `--network` that is not a local one: any of several `--network` flags that is not local
- * counts, and `HARDHAT_NETWORK` is the network of a hardhat command that gives no flag (a run without either is the
- * in-process chain). compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
+ * counts. A hardhat command that gives no flag runs on its own `HARDHAT_NETWORK` prefix when it has one; otherwise a
+ * non-local `HARDHAT_NETWORK` assigned anywhere earlier on the line, or inherited from the environment (bash's `env`
+ * included), counts. A run with none of these is the in-process chain. compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
  */
-function frameworkDeploy({ words, marked }: Segment, command: string): boolean {
+function frameworkDeploy({ words, marked }: Segment, facts: GuardFacts, command: string): boolean {
   return eachTool(words, /^(?:hardhat|truffle|brownie)$/, (at) => {
     const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
     const { positional, flags } = argsAfter(words, at, FRAMEWORK_VALUE_FLAG);
     if (helpOnly(flags) || !verbStarts(positional, at).some((p) => FRAMEWORK_NETWORK_VERB[tool].test(p.slice(0, 2).join(" ")))) return false;
     const named = flags.filter((f) => f.flag === "--network");
     if (named.length > 0) return named.some((f) => f.value !== undefined && !LOCAL_CHAIN_NETWORK.test(f.value));
-    const env = tool === "hardhat" ? (HARDHAT_ENV.exec(marked) ?? HARDHAT_ENV.exec(command))?.[1] : undefined;
-    return env !== undefined && !LOCAL_CHAIN_NETWORK.test(unquote(env));
+    if (tool !== "hardhat") return false;
+    const own = [...marked.matchAll(HARDHAT_ENV)][0]?.[1];
+    if (own !== undefined) return !LOCAL_CHAIN_NETWORK.test(unquote(own));
+    const inherited = facts.env.HARDHAT_NETWORK;
+    const networks = [...command.matchAll(HARDHAT_ENV)].map((m) => unquote(m[1]));
+    return [...networks, ...(inherited ? [inherited] : [])].some((network) => !LOCAL_CHAIN_NETWORK.test(network));
   });
 }
 
@@ -2911,7 +2918,7 @@ export const RULES: readonly Rule[] = [
     id: "chain-broadcast",
     capability: "chain_broadcast",
     agents: ["a26-smart-contract", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance"],
-    pattern: (seg, _facts, command) => castBroadcast(seg) || forgeBroadcast(seg) || frameworkDeploy(seg, command) || otherChainBroadcast(seg),
+    pattern: (seg, facts, command) => castBroadcast(seg) || forgeBroadcast(seg) || frameworkDeploy(seg, facts, command) || otherChainBroadcast(seg),
     samples: [
       "cast send 0xabc 'transfer(address,uint256)' 0xdef 1",
       "cast publish 0x02f8",

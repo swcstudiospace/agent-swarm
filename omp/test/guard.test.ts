@@ -1193,6 +1193,23 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("cd contracts && sudo -E cast send 0xabc 'f()'"), insideAs(A28))?.reason).toEndWith(": chain-broadcast)");
     expect(guardToolCall(bash("forge build && forge test"), insideAs(A28))).toBeUndefined();
   });
+
+  test("a bare hardhat run on an inherited non-local HARDHAT_NETWORK needs approval, the bash tool's env included", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+    expect(guardToolCall(call("bash", { command: "npx hardhat run scripts/deploy.ts", env: { HARDHAT_NETWORK: "sepolia" } }), insideAs(A26))?.reason).toBe(CHAIN);
+    // the run's own prefix is its network; a bare run after a local one still inherits mainnet
+    expect(guardToolCall(bash("HARDHAT_NETWORK=localhost npx hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+    expect(guardToolCall(bash("HARDHAT_NETWORK=localhost npx hardhat test; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+  });
+
+  test("a bare hardhat run with a local or no environment network behaves as before", () => {
+    expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), { ...insideAs(A26), env: { HARDHAT_NETWORK: "localhost" } })).toBeUndefined();
+    expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), { ...insideAs(A26), env: { HARDHAT_NETWORK: "" } })).toBeUndefined();
+    expect(guardToolCall(call("bash", { command: "hardhat run scripts/deploy.ts", env: { HARDHAT_NETWORK: "hardhat" } }), { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } })).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

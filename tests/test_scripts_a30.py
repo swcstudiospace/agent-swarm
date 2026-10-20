@@ -368,3 +368,18 @@ def test_many_key_hits_in_one_file_do_not_time_out_the_scan(tree):
     put(tree, "dump/keys.env", ("PRIVATE_KEY=0x" + HEX_KEY + "\n") * 12000)
     code, report, _ = run_script(tree)
     assert code == 1 and report["secret_findings"] == 12000 and len(report["findings"]) == 100
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need os.mkfifo")
+def test_named_pipe_in_the_tree_is_skipped_and_never_opened(tree):
+    os.mkfifo(tree / "custody-policy.json")
+    put(tree, "notes.md", "nothing sensitive here\n")
+    env = {**os.environ, "SWARM_DIR": str(tree.parent / "swarm-state")}
+    env.pop("SWARM_TASK_ID", None)
+    # A read of the FIFO would block forever; the timeout turns that regression into a failure instead of a hang.
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tree), "--json"], capture_output=True, text=True, env=env,
+                          cwd=tree.parent, timeout=60)
+    report = json.loads(proc.stdout)
+    assert proc.returncode == 0 and report["status"] == "ok"
+    assert report["files_scanned"] == 1 and report["policy_files"] == 0
+    assert report["files_skipped"] == {"binary": 0, "symlink": 0, "too_large": 0, "unreadable": 1}

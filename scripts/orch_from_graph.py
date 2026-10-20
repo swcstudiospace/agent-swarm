@@ -23,8 +23,8 @@ Owned-file rules, first match:
 
 - ``*.md`` → A15 docs
 - ``*.sql`` or a ``migrations/`` path → A07 data
-- ``*.sol``, ``*.vy``, ``foundry.toml``, ``hardhat.config.*``, or a ``.json``/``.yaml``/``.yml`` file under ``contracts/`` → A26
-  smart contracts (a ``.ts`` or ``.py`` file under ``contracts/`` is an API or pact contract and keeps its code owner)
+- ``*.sol``, ``*.vy``, ``foundry.toml``, ``hardhat.config.*``, or a JSON ABI (``*.abi.json``, or a ``.json`` under an ``abi/`` directory) inside ``contracts/`` → A26
+  smart contracts (API descriptors such as ``contracts/openapi.yaml`` and ``.ts``/``.py`` files under ``contracts/`` keep their code owner)
 - anything under a ``web3/`` or ``wagmi/`` directory, or a script (``.ts`` ``.tsx`` ``.js`` ``.jsx``) under ``wallet/`` → A29 dapp and wallet
 - ``kustomization.yaml``, or a ``.json``/``.yaml``/``.yml`` file under ``charts/``, ``helm/``, ``k8s/``, ``kubernetes/``,
   ``manifests/`` or ``overlays/`` that is not under a components, frontend or ui directory → A22 GitOps
@@ -119,7 +119,7 @@ def _owner(path: str) -> str | None:
     if base.endswith(".sql") or "migrations" in dirs:
         return "A07"
     if (base.endswith((".sol", ".vy")) or base == "foundry.toml" or base.startswith("hardhat.config.")
-            or ("contracts" in dirs and base.endswith(_DATA_EXT))):
+            or ("contracts" in dirs and base.endswith(".json") and (base.endswith(".abi.json") or "abi" in dirs))):
         return "A26"
     if any(part in _WEB3_DIRS for part in dirs) or ("wallet" in dirs and base.endswith(_SCRIPT_EXT)):
         return "A29"

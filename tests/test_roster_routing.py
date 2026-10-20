@@ -233,7 +233,7 @@ ROUTES = [
     ("src/dockerfile-parser.ts", "A05", "code.backend"),
     ("src/contracts/user.ts", "A05", "code.backend"),
     ("tests/contracts/test_pact.py", "A05", "code.backend"),
-    ("contracts/openapi.yaml", "A26", "web3.contract"),
+    ("contracts/openapi.yaml", "A05", "code.backend"),
     ("contracts/abi/Vault.json", "A26", "web3.contract"),
     ("wallet/balance.py", "A05", "code.backend"),
     ("src/wallet/service.go", "A05", "code.backend"),

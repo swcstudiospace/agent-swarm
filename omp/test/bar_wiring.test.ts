@@ -2088,3 +2088,43 @@ describe("stack order with a rank-20 peer bar (restack protocol)", () => {
     expect(h.host.widgetCalls()).toHaveLength(before + 1);
   });
 });
+
+describe("footer status stays absent", () => {
+  test("no footer status with a `swarm:` prefix is ever written, across idle, running, completed and telemetry-error bars", () => {
+    const errorDir = join(tmpDir("swarm-footer-"), ".swarm");
+    mkdirSync(errorDir, { recursive: true });
+    writeFileSync(join(errorDir, "live.json"), "{ not json");
+    const states: Record<string, { swarmDir?: string; setup: (h: Harness) => void; rows: (lines: string[]) => boolean }> = {
+      idle: { setup: () => {}, rows: (lines) => lines.join("\n") === IDLE.join("\n") },
+      running: {
+        setup: (h) => {
+          h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "running", 1000));
+          h.bus.emit(LIFECYCLE_CHANNEL, { id: "a", agent: "a05-backend", status: "started", index: 0 });
+        },
+        rows: (lines) => lines.join("\n").includes("a05-backend"),
+      },
+      completed: {
+        setup: (h) => {
+          h.bus.emit(LIFECYCLE_CHANNEL, { id: "a", agent: "a05-backend", status: "started", index: 0 });
+          h.bus.emit(LIFECYCLE_CHANNEL, { id: "a", agent: "a05-backend", status: "completed", index: 0 });
+        },
+        rows: (lines) => lines.length > 0,
+      },
+      error: { swarmDir: errorDir, setup: () => {}, rows: (lines) => lines.join("\n") === TELEMETRY.join("\n") },
+    };
+    for (const [name, state] of Object.entries(states)) {
+      // a recording footer next to the widget host: every `setStatus` the bar makes lands here
+      const statuses: Array<{ key: string; text: string | undefined }> = [];
+      const h = harness({ swarmDir: state.swarmDir });
+      const ui: NonNullable<ExtensionContext["ui"]> & { setStatus(key: string, text: string | undefined): void } = {
+        ...h.host.ui,
+        setStatus: (key, text) => void statuses.push({ key, text }),
+      };
+      h.ctx.ui = ui;
+      h.fire("session_start");
+      state.setup(h);
+      expect({ state: name, mounted: h.host.order(), rows: state.rows(h.host.lines()) }).toEqual({ state: name, mounted: [SWARM_BAR_KEY], rows: true });
+      expect({ state: name, footer: statuses.filter((status) => status.text?.startsWith("swarm:")) }).toEqual({ state: name, footer: [] });
+    }
+  });
+});

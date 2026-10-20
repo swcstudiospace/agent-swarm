@@ -523,6 +523,19 @@ def test_review_images_pinned_by_a_kustomize_images_entry_are_not_floating_in_th
 
 
 @needs_yaml
+def test_an_overlay_pin_does_not_hide_the_same_image_in_an_unrelated_kustomize_tree(tmp_path):
+    deployment = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/acme/web:latest\n"
+    put(tmp_path, "base/kustomization.yaml", "resources:\n  - d.yaml\n")
+    put(tmp_path, "base/d.yaml", deployment)
+    put(tmp_path, "overlays/prod/kustomization.yaml", "resources:\n  - ../../base\nimages:\n  - name: r.io/acme/web\n    newTag: 1.4.2\n")
+    put(tmp_path, "unrelated/kustomization.yaml", "resources:\n  - d.yaml\n")
+    put(tmp_path, "unrelated/d.yaml", deployment)
+    _, result = scan(tmp_path)
+    floating = [(f["id"], f["file"]) for f in result["findings"] if f["check"] == "images" and "latest" in f["id"]]
+    assert floating == [("images:floating-tag:r.io/acme/web:latest", "unrelated/d.yaml")]
+
+
+@needs_yaml
 def test_review_credentials_in_non_object_documents_are_found_and_never_echoed(tmp_path):
     token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     put(tmp_path, "chart/values-prod.yaml", f"registry:\n  url: https://svc:S3cr3tPassw0rd@git.example.com/x.git\n  token: {token}\n")

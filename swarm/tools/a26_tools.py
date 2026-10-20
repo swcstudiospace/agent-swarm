@@ -472,7 +472,7 @@ def _where(v: dict) -> str:
 
 def storage_layout(payload: dict) -> dict:
     """Upgrade compatibility of two solc storage layouts (`solc --storage-layout`): a variable must keep its slot,
-    offset and type; deleting, moving, retyping or inserting before existing variables corrupts proxy state; new
+    offset, type and size; deleting, moving, retyping or inserting before existing variables corrupts proxy state; new
     variables go after the old end or into a `__gap` (an array labelled `__gap`/`__gap_*`; its end may not grow). Struct,
     contract and enum AST ids are ignored and a contract type equals `address` (as in OpenZeppelin Upgrades). Heuristic over
     top-level variables: struct members are not compared."""
@@ -499,20 +499,22 @@ def storage_layout(payload: dict) -> dict:
                 if n["start"] != o["start"]:
                     findings.append(_finding("STORAGE-MOVED", "blocker",
                                              f"{o['label']} moved from {_where(o)} to {_where(n)}: every later read returns another variable's data"))
-                elif n["type"] != o["type"]:
+                elif n["type"] != o["type"] or n["bytes"] != o["bytes"]:
                     same_size = n["bytes"] == o["bytes"]
+                    change = f"changed type {o['type']} -> {n['type']}" if n["type"] != o["type"] else "changed size"
                     findings.append(_finding("STORAGE-TYPE-CHANGED", "major" if same_size else "blocker",
-                                             f"{o['label']} changed type {o['type']} -> {n['type']} ({o['bytes']} -> {n['bytes']} bytes): "
+                                             f"{o['label']} {change} ({o['bytes']} -> {n['bytes']} bytes): "
                                              + ("stored bits are reinterpreted" if same_size else "the variable no longer fits its old footprint")))
                 continue
             at = new_by_start.get(o["start"])
             if at is not None and at["key"] not in old_keys:
                 matched.add(at["key"])
-                if at["type"] == o["type"]:
+                if at["type"] == o["type"] and at["bytes"] == o["bytes"]:
                     findings.append(_finding("STORAGE-RENAMED", "minor", f"{o['label']} at {_where(o)} is now called {at['label']} with the same type"))
                 else:
+                    detail = at["type"] if at["type"] != o["type"] else f"same type, {o['bytes']} -> {at['bytes']} bytes"
                     findings.append(_finding("STORAGE-REPLACED", "blocker",
-                                             f"{o['label']} ({o['type']}) at {_where(o)} was replaced by {at['label']} ({at['type']})"))
+                                             f"{o['label']} ({o['type']}) at {_where(o)} was replaced by {at['label']} ({detail})"))
                 continue
             hit_vars = [v for v in new if not v["gap"] and v["start"] < o["end"] and o["start"] < v["end"]]
             if hit_vars:

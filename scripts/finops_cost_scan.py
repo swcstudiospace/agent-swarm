@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import stat
 import sys
@@ -246,8 +247,36 @@ def _hcl_tags(masked: str, skeleton: str) -> dict | None:
     return tags
 
 
-def _hcl_facts(path: str, text: str) -> tuple[list[dict], bool, int]:
-    """Resource facts of one .tf file, whether it declares provider default_tags, and how many resource blocks could
+def _dir_key(rel: str) -> str:
+    """Terraform directory (root or module) that a repository-relative file belongs to."""
+    return posixpath.normpath(posixpath.dirname(rel) or ".")
+
+
+def _blocks(masked: str, skeleton: str, kind: str) -> list[tuple[str, str]]:
+    """(masked, skeleton) bodies of every `kind "label" { ... }` block whose braces balance."""
+    bodies = []
+    for head in re.finditer(rf'^[ \t]*{kind}[ \t]+"[^"]*"[ \t]*\{{', masked, re.M):
+        open_index = head.end() - 1
+        close = _close_index(skeleton, open_index)
+        if close >= 0:
+            bodies.append((masked[open_index + 1:close], skeleton[open_index + 1:close]))
+    return bodies
+
+
+def _hcl_scope(directory: str, masked: str, skeleton: str) -> tuple[bool, bool, list[str]]:
+    """Whether the file declares provider default_tags, whether it declares an unaliased provider of its own (Terraform
+    does not pass the default provider down to such a module), and the local child modules it calls, as directories."""
+    own_provider = any(_top_level_attr(bm, bs, "alias") is None for bm, bs in _blocks(masked, skeleton, "provider"))
+    calls = []
+    for bm, bs in _blocks(masked, skeleton, "module"):
+        local = re.fullmatch(r'"(\.\.?/[^"$]*)"', _top_level_attr(bm, bs, "source") or "")
+        if local:
+            calls.append(posixpath.normpath(posixpath.join(directory, local.group(1))))
+    return "default_tags" in masked, own_provider, calls
+
+
+def _hcl_facts(path: str, text: str) -> tuple[list[dict], tuple[bool, bool, list[str]], int]:
+    """Resource facts of one .tf file, its provider and module scope (see _hcl_scope), and how many resource blocks could
     not be delimited (unbalanced braces) and were therefore not evaluated."""
     masked, skeleton = _mask_hcl(text)
     facts = []
@@ -278,7 +307,7 @@ def _hcl_facts(path: str, text: str) -> tuple[list[dict], bool, int]:
             "lifecycle": _hcl_lifecycle(rtype, body_m, body_s, retention),
             "body": body_m,
         })
-    return facts, "default_tags" in masked, unclosed
+    return facts, _hcl_scope(_dir_key(path), masked, skeleton), unclosed
 
 
 def _hcl_lifecycle(rtype: str, body_m: str, body_s: str, retention: str | None) -> bool | None:
@@ -526,7 +555,20 @@ def _lifecycle_findings(facts: list[dict]) -> list[dict]:
     return out
 
 
-def _tag_findings(facts: list[dict], required: list[str], default_tags: bool) -> tuple[list[dict], list[dict]]:
+def _tag_inheriting_dirs(default_dirs: set[str], provider_dirs: set[str], module_calls: dict[str, set[str]]) -> set[str]:
+    """Terraform directories whose resources inherit provider default_tags: those that declare it, and the local child
+    modules they call, unless the child declares an unaliased provider of its own (Terraform passes the default down)."""
+    covered = set(default_dirs)
+    frontier = list(covered)
+    while frontier:
+        for child in module_calls.get(frontier.pop(), ()):
+            if child not in covered and child not in provider_dirs:
+                covered.add(child)
+                frontier.append(child)
+    return covered
+
+
+def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str]) -> tuple[list[dict], list[dict]]:
     skipped, out = [], []
     if not required:
         return out, [{"check": "iac-untagged-resource", "status": "skipped:no-required-tags"}]
@@ -535,12 +577,12 @@ def _tag_findings(facts: list[dict], required: list[str], default_tags: bool) ->
     for fact in facts:
         if fact["tags"] is None:
             continue
-        if default_tags and fact["source"] == "terraform":
+        if fact["source"] == "terraform" and _dir_key(fact["file"]) in inheriting:
             continue
         numbered += 1
         rid = f"{fact['file']}::{fact['ref']}#{numbered}"
         candidates.append((rid, fact))
-    if default_tags and any(f["source"] == "terraform" and f["tags"] is not None for f in facts):
+    if any(f["source"] == "terraform" and f["tags"] is not None and _dir_key(f["file"]) in inheriting for f in facts):
         skipped.append({"check": "iac-untagged-resource", "status": "skipped:provider-default-tags", "detail": "Terraform tags are inherited from provider default_tags and are not evaluated"})
     for start in range(0, len(candidates), TAG_CHUNK):
         chunk = candidates[start:start + TAG_CHUNK]
@@ -582,7 +624,9 @@ def _candidates(root: Path, base: Path, counters: dict):
 def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> dict:
     counters = {"too_large": 0, "binary": 0, "parse_error": 0, "symlink": 0, "yaml_skipped": 0, "truncated": False}
     facts: list[dict] = []
-    default_tags = False
+    default_dirs: set[str] = set()  # directories that declare provider default_tags
+    provider_dirs: set[str] = set()  # directories that declare an unaliased provider of their own
+    module_calls: dict[str, set[str]] = {}  # directory -> the local child module directories it calls
     unclosed: dict[str, int] = {}
     scanned = 0
     for path in _candidates(root, base, counters):
@@ -613,9 +657,14 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
             continue
         try:
             if lower.endswith(".tf"):
-                tf_facts, has_default_tags, not_delimited = _hcl_facts(rel, text)
+                tf_facts, (has_default_tags, own_provider, calls), not_delimited = _hcl_facts(rel, text)
                 facts.extend(tf_facts)
-                default_tags = default_tags or has_default_tags
+                directory = _dir_key(rel)
+                if has_default_tags:
+                    default_dirs.add(directory)
+                if own_provider:
+                    provider_dirs.add(directory)
+                module_calls.setdefault(directory, set()).update(calls)
                 if not_delimited:
                     unclosed[rel] = not_delimited
                 scanned += 1
@@ -640,7 +689,7 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
         findings.extend(_instance_findings(fact, max_xlarge))
         findings.extend(_volume_findings(fact))
     findings.extend(_lifecycle_findings(facts))
-    tag_findings, tag_skipped = _tag_findings([f for f in facts if f["source"] != "kubernetes"], required_tags, default_tags)
+    tag_findings, tag_skipped = _tag_findings([f for f in facts if f["source"] != "kubernetes"], required_tags, _tag_inheriting_dirs(default_dirs, provider_dirs, module_calls))
     findings.extend(tag_findings)
     skipped = list(tag_skipped)
     if unclosed:

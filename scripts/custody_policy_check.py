@@ -97,10 +97,13 @@ def walk(base: Path):
 
 
 def read_text(path: Path) -> tuple[str | None, str]:
-    """(text, "") for a readable text file within the size bound, else (None, reason)."""
+    """(text, "") for a readable regular file within the size bound, else (None, reason). Named pipes, sockets and devices are
+    "unreadable": opening a FIFO with no writer blocks the scan, so they are never opened."""
     try:
         if path.is_symlink():
             return None, "symlink"
+        if not path.is_file():
+            return None, "unreadable"
         if path.stat().st_size > MAX_BYTES:
             return None, "too_large"
         data = path.read_bytes()

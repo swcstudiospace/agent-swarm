@@ -500,16 +500,19 @@ def _image_name(image: str) -> str:
 
 def _check_images(repo: Repo, kusts: dict) -> None:
     where: dict[str, list[str]] = {}
-    pinned_by_overlay: set[str] = set()  # images a kustomization `images:` entry re-tags or pins: the base reference is rewritten at build time
+    # per file: the image names of each Kustomize tree that renders it and re-tags or pins them (the base reference is rewritten at build time there)
+    pins_of: dict[str, list[set[str]]] = {}
     for directory, (rel, kust) in sorted(kusts.items()):
-        for entry in kust.get("images") or []:
-            if isinstance(entry, dict) and isinstance(entry.get("name"), str) and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float))):
-                pinned_by_overlay.add(entry["name"])
+        pinned = {entry["name"] for entry in kust.get("images") or []
+                  if isinstance(entry, dict) and isinstance(entry.get("name"), str) and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float)))}
+        for file in set(_tree_files(repo, kusts, directory, set())):
+            pins_of.setdefault(file, []).append(pinned)
     for rel in sorted(repo.docs):
         for doc in repo.docs[rel]:
             for image in _images(doc, [0]):
-                if _image_name(image) not in pinned_by_overlay:
-                    where.setdefault(image, []).append(rel)
+                if any(_image_name(image) in pinned for pinned in pins_of.get(rel, [])):
+                    continue
+                where.setdefault(image, []).append(rel)
     for directory, (rel, kust) in sorted(kusts.items()):
         for entry in kust.get("images") or []:
             if not isinstance(entry, dict):
