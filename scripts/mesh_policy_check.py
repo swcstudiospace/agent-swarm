@@ -80,14 +80,22 @@ def _walk(root: Path, start: Path) -> tuple[list[Path], dict]:
     return files, stats
 
 
-def _expand(value) -> list[dict]:
-    """Documents of one parsed file; a `kind: List` wrapper contributes its items."""
+def _expand(value, ancestors: set[int] | None = None) -> list[dict]:
+    """Documents of one parsed file; a `kind: List` wrapper contributes its items. Lists are cycle-checked on the current path only,
+    so a self-referencing list (`&x [*x]`) contributes nothing past the point where it closes its own path."""
+    ancestors = set() if ancestors is None else ancestors
     if isinstance(value, list):
-        return [d for item in value for d in _expand(item)]
+        if id(value) in ancestors:
+            return []
+        ancestors.add(id(value))
+        try:
+            return [d for item in value for d in _expand(item, ancestors)]
+        finally:
+            ancestors.discard(id(value))
     if not isinstance(value, dict):
         return []
     if value.get("kind") == "List" and isinstance(value.get("items"), list):
-        return _expand(value["items"])
+        return _expand(value["items"], ancestors)
     return [value]
 
 
@@ -99,6 +107,9 @@ def _load(root: Path, files: list[Path], yaml_module) -> tuple[list[tuple[str, d
     for path in files:
         rel = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
         try:
+            if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the scan
+                stats["unparsable"] += 1
+                continue
             if path.stat().st_size > MAX_FILE_BYTES:
                 stats["too_large"] += 1
                 continue

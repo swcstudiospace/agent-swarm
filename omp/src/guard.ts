@@ -2323,12 +2323,90 @@ const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
 /** `HARDHAT_NETWORK=name` assigned on a segment or earlier on the same command line (every assignment is listed). */
 const HARDHAT_ENV = /(?:^|[\s;&|(])HARDHAT_NETWORK=([^\s;&|)]+)/g;
 
+/** A HARDHAT_NETWORK value a bare run may see; undefined is unnamed, the in-process chain (local). */
+type NetworkValue = string | undefined;
+/** What a HARDHAT_NETWORK write the guard cannot read leaves in effect: a name no local pattern matches. */
+const UNREAD_NETWORK = "<unread>";
+/** A shell assignment word, `NAME=` or `NAME+=`. */
+const ASSIGNMENT_WORD = /^[A-Za-z_]\w*\+?=/;
+/** The builtins that set a variable from their operands. */
+const SHELL_DECLARE = /^(?:export|declare|typeset|local|readonly)$/;
+/** Commands that assign a variable named by one of their words (`read HARDHAT_NETWORK`, `printf -v`, `for`, `((`). */
+const NAMING_COMMAND = /^(?:read|mapfile|readarray|getopts|printf|let|for|select|\(\()$/;
+/** A word that names HARDHAT_NETWORK: the bare name, or an assignment to it. */
+const NETWORK_NAME = /^HARDHAT_NETWORK(?:\+?=|$)/;
+
+/** The value of an unquoted `HARDHAT_NETWORK=v` word: empty is unnamed, a value the guard cannot read is UNREAD_NETWORK. */
+function networkValue(word: string): NetworkValue {
+  const value = word.slice(word.indexOf("=") + 1);
+  if (value.includes(CUT)) return UNREAD_NETWORK;
+  return value === "" ? undefined : value;
+}
+
+/**
+ * What one top-level item writes to HARDHAT_NETWORK, in order. A command's leading assignments are its own and write
+ * nothing; a statement's assignments (prefix or text) persist; `export|declare|typeset|local|readonly NAME=v` persists;
+ * `unset NAME` clears it (`unset -f` names functions and writes nothing); a naming command given the name writes a
+ * value the guard cannot read.
+ */
+function networkWrites(item: Normalized): NetworkValue[] {
+  const words = shellWords(item.text).map(unquote);
+  const at = words.findIndex((w) => !ASSIGNMENT_WORD.test(w));
+  if (at === -1) {
+    return [...shellWords(item.prefix).map(unquote), ...words].flatMap((w) =>
+      /^HARDHAT_NETWORK\+=/.test(w) ? [UNREAD_NETWORK] : /^HARDHAT_NETWORK=/.test(w) ? [networkValue(w)] : [],
+    );
+  }
+  const [name, ...args] = words.slice(at);
+  if (name === "unset") {
+    if (args.some((w) => /^-\w*f/.test(w))) return [];
+    return args.includes("HARDHAT_NETWORK") ? [undefined] : [];
+  }
+  if (SHELL_DECLARE.test(name)) {
+    return args.flatMap((w) => (/^HARDHAT_NETWORK\+=/.test(w) ? [UNREAD_NETWORK] : /^HARDHAT_NETWORK=/.test(w) ? [networkValue(w)] : []));
+  }
+  return NAMING_COMMAND.test(name) && args.some((w) => NETWORK_NAME.test(w)) ? [UNREAD_NETWORK] : [];
+}
+
+/**
+ * Walk the items of a command line in order, carrying the HARDHAT_NETWORK values that may be in effect. A write that
+ * surely runs replaces them; one that may not (after `&&`/`||`, in a pipeline or background job, a group, a compound, or
+ * a payload such as `eval`, which shares the shell) adds to them. A bare run whose value may be non-local is recorded by
+ * its marked text. A payload's writes are kept for the rest of the line, the conservative side.
+ */
+function scanNetwork(items: Normalized[], state: { possible: NetworkValue[] }, out: Set<string>, inGroup: boolean): void {
+  const groups: string[] = inGroup ? ["payload"] : [];
+  let prev: Op = "";
+  for (const item of items) {
+    scanNetwork(item.payload, state, out, true);
+    const marked = `${item.prefix} ${item.text}`;
+    if (state.possible.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network))) out.add(marked);
+    const may = groups.length > 0 || prev === "&&" || prev === "||" || prev === "|" || prev === "&" || item.end === "|" || item.end === "&";
+    for (const network of networkWrites(item)) state.possible = may ? [...new Set([...state.possible, network])] : [network];
+    if (item.compound === "close") groups.pop();
+    else if (item.compound !== undefined) groups.push(item.compound);
+    if (item.end === "(" || item.end === "{") groups.push(item.end);
+    else if ((item.end === ")" || item.end === "}") && groups.length > 0 && !(item.end === ")" && groups[groups.length - 1] === "case")) groups.pop();
+    prev = item.end;
+  }
+}
+
+/**
+ * The bare runs of `command` (by marked text) that may see a non-local HARDHAT_NETWORK: the value the line starts from is
+ * the environment it inherits (facts.env, bash's own env override included), and scanNetwork follows the writes in order.
+ */
+function unnamedNetworkRuns(command: string, facts: GuardFacts): Set<string> {
+  const out = new Set<string>();
+  scanNetwork(normalizeSegments(command, 0, []), { possible: [facts.env.HARDHAT_NETWORK || undefined] }, out, false);
+  return out;
+}
+
 /**
  * `hardhat run|deploy|ignition deploy|console|test`, `truffle migrate|deploy|exec|console|test`, `brownie
  * run|console|test` against a `--network` that is not a local one: any of several `--network` flags that is not local
- * counts. A hardhat command that gives no flag runs on its own `HARDHAT_NETWORK` prefix when it has one; otherwise a
- * non-local `HARDHAT_NETWORK` assigned anywhere earlier on the line, or inherited from the environment (bash's `env`
- * included), counts. A run with none of these is the in-process chain. compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
+ * counts. A hardhat command that gives no flag runs on its own `HARDHAT_NETWORK` prefix when it has one; otherwise on
+ * the value the line leaves HARDHAT_NETWORK at (unnamedNetworkRuns). A run with none of these is the in-process chain.
+ * compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
  */
 function frameworkDeploy({ words, marked }: Segment, facts: GuardFacts, command: string): boolean {
   return eachTool(words, /^(?:hardhat|truffle|brownie)$/, (at) => {
@@ -2340,9 +2418,7 @@ function frameworkDeploy({ words, marked }: Segment, facts: GuardFacts, command:
     if (tool !== "hardhat") return false;
     const own = [...marked.matchAll(HARDHAT_ENV)][0]?.[1];
     if (own !== undefined) return !LOCAL_CHAIN_NETWORK.test(unquote(own));
-    const inherited = facts.env.HARDHAT_NETWORK;
-    const networks = [...command.matchAll(HARDHAT_ENV)].map((m) => unquote(m[1]));
-    return [...networks, ...(inherited ? [inherited] : [])].some((network) => !LOCAL_CHAIN_NETWORK.test(network));
+    return unnamedNetworkRuns(command, facts).has(marked);
   });
 }
 

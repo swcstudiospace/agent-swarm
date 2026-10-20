@@ -54,6 +54,8 @@ def registry_data() -> dict | None:
     if tool_registry.find_tool(document, "custody_secret_scan") is not None:
         return document
     try:
+        if not FRAGMENT.is_file():  # repo-owned, but a FIFO here would block the lookup just as it would a scan input
+            return None
         entries = json.loads(FRAGMENT.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None

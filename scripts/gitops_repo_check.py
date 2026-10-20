@@ -434,18 +434,18 @@ def _check_apps(repo: Repo) -> None:
                 repo.from_tool("apps", rel, rules.app_sync_policy({"resource": doc, "environment": environment}))
 
 
-def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set) -> list[str]:
+def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set, fields: tuple = ("resources", "bases")) -> list[str]:
     """Files whose objects belong to the Kustomize tree rooted at directory."""
     if directory in seen:
         return []
     seen.add(directory)
     rel, kust = kusts[directory]
     files = [rel]
-    for field in ("resources", "bases"):
+    for field in fields:
         for entry in _strings(kust.get(field)):
             target = None if _remote(entry) else _join(directory, entry)
             if target in kusts:
-                files += _tree_files(repo, kusts, target, seen)
+                files += _tree_files(repo, kusts, target, seen, fields)
             elif target in repo.docs:
                 files.append(target)
     return files
@@ -505,7 +505,7 @@ def _check_images(repo: Repo, kusts: dict) -> None:
     for directory, (rel, kust) in sorted(kusts.items()):
         pinned = {entry["name"] for entry in kust.get("images") or []
                   if isinstance(entry, dict) and isinstance(entry.get("name"), str) and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float)))}
-        for file in set(_tree_files(repo, kusts, directory, set())):
+        for file in set(_tree_files(repo, kusts, directory, set(), ("resources", "bases", "components"))):
             pins_of.setdefault(file, []).append(pinned)
     for rel in sorted(repo.docs):
         for doc in repo.docs[rel]:

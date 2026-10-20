@@ -76,6 +76,9 @@ def _candidates(base: Path, counters: dict) -> list[Path]:
 
 def _documents(path: Path, yaml_module, counters: dict, skipped: dict):
     """Parsed documents of one file, or None when it was skipped or unreadable."""
+    if not path.is_file():  # a FIFO or device named like a manifest would block the read
+        counters["unreadable"] += 1
+        return None
     try:
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:

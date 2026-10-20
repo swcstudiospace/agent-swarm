@@ -536,6 +536,15 @@ def test_an_overlay_pin_does_not_hide_the_same_image_in_an_unrelated_kustomize_t
 
 
 @needs_yaml
+def test_a_pin_in_an_overlay_covers_the_images_of_the_components_it_includes(tmp_path):
+    put(tmp_path, "comp/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\nresources:\n  - d.yaml\n")
+    put(tmp_path, "comp/d.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/acme/web:latest\n")
+    put(tmp_path, "overlay/kustomization.yaml", "components:\n  - ../comp\nimages:\n  - name: r.io/acme/web\n    newTag: 1.4.2\n")
+    _, result = scan(tmp_path)
+    assert not any("floating-tag" in i for i in ids(result, "images"))
+
+
+@needs_yaml
 def test_review_credentials_in_non_object_documents_are_found_and_never_echoed(tmp_path):
     token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
     put(tmp_path, "chart/values-prod.yaml", f"registry:\n  url: https://svc:S3cr3tPassw0rd@git.example.com/x.git\n  token: {token}\n")

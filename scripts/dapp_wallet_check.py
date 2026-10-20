@@ -310,19 +310,33 @@ def _path_key(key) -> str:
     return f"<key {len(text)} chars>" if len(text) > 64 or _segment_is_key(text) else text
 
 
-def _walk_structure(node, path: str, rel: str, findings: list[dict], seen: set[int]) -> None:
-    """Walk one parsed document. A YAML alias (`*anchor`) is the same Python object as its anchor, so every container is walked
-    once: a second visit adds nothing, and a self-referencing anchor (`&x {again: *x}`) would otherwise recurse without end."""
+MAX_WALK_VISITS = 100_000  # container visits per document: bounds the work an alias-heavy file can cause
+
+
+class _WalkLimit(Exception):
+    """A document has more container visits than MAX_WALK_VISITS (aliases shared across many keys)."""
+
+
+def _walk_structure(node, path: str, rel: str, findings: list[dict], ancestors: set[int], budget: list[int]) -> None:
+    """Walk one parsed document. A YAML alias (`*anchor`) is the same object as its anchor, so a shared node is walked under every
+    key that reaches it and each path is checked. Cycles are cut on the current path only (`ancestors`): a self-referencing anchor
+    (`&x {again: *x}`) stops where it closes its own path. `budget` holds the remaining container visits of the document."""
     if isinstance(node, (dict, list)):
-        if id(node) in seen:
+        if id(node) in ancestors:
             return
-        seen.add(id(node))
-    if isinstance(node, dict):
-        for key, value in node.items():
-            _walk_structure(value, f"{path}.{_path_key(key)}" if path else _path_key(key), rel, findings, seen)
-    elif isinstance(node, list):
-        for index, value in enumerate(node):
-            _walk_structure(value, f"{path}[{index}]", rel, findings, seen)
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise _WalkLimit()
+        ancestors.add(id(node))
+        try:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    _walk_structure(value, f"{path}.{_path_key(key)}" if path else _path_key(key), rel, findings, ancestors, budget)
+            else:
+                for index, value in enumerate(node):
+                    _walk_structure(value, f"{path}[{index}]", rel, findings, ancestors, budget)
+        finally:
+            ancestors.discard(id(node))
     elif isinstance(node, str):
         leaf = path.rsplit(".", 1)[-1]
         if _SECRET_KEY_NAME.search(leaf) and node and not _ENV_REFERENCE.match(node):
@@ -352,9 +366,9 @@ def _scan_data(rel: str, text: str, suffix: str, yaml_module) -> list[dict]:
         return findings
     for document in documents:
         try:
-            _walk_structure(document, "", rel, findings, set())
-        except RecursionError:  # nesting deeper than the walk can follow: keep what was found and scan the other files
-            findings.append(_finding("DAPP-CONFIG-PARSE", "info", "configuration is nested too deeply to check completely", rel))
+            _walk_structure(document, "", rel, findings, set(), [MAX_WALK_VISITS])
+        except (RecursionError, _WalkLimit):  # too deep or too aliased to walk completely: keep what was found, scan the other files
+            findings.append(_finding("DAPP-CONFIG-PARSE", "info", "configuration is nested or aliased too deeply to check completely", rel))
             break
     return findings
 

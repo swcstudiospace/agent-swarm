@@ -1210,6 +1210,22 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), { ...insideAs(A26), env: { HARDHAT_NETWORK: "" } })).toBeUndefined();
     expect(guardToolCall(call("bash", { command: "hardhat run scripts/deploy.ts", env: { HARDHAT_NETWORK: "hardhat" } }), { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } })).toBeUndefined();
   });
+
+  test("an inherited mainnet is overridden by a local export earlier on the line, so the bare run passes", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+  });
+
+  test("the last export on the line decides: a mainnet export after a local one still needs approval", () => {
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; export HARDHAT_NETWORK=mainnet; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("unset clears an inherited mainnet to the unnamed chain, so the bare run passes", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("unset HARDHAT_NETWORK && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

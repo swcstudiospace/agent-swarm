@@ -428,3 +428,16 @@ def test_scan_never_echoes_credential_shaped_names(repo, canary):
     assert rc == 1 and data["finding_count"] > 0
     assert secret not in json.dumps(data), json.dumps(data)[:600]
     assert any(c["status"] == "error" for c in data["checks"])  # the malformed PeerAuthentication mode went through the error path too
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need os.mkfifo")
+def test_named_pipe_manifest_is_never_opened_and_the_scan_completes(repo):
+    os.mkfifo(repo / "gateway.yaml")
+    put(repo, "deploy.json", deployment())
+    env = {**os.environ, "SWARM_DIR": str(repo.parent / "swarm-state")}
+    # A read of the FIFO would block forever; the timeout turns that regression into a failure instead of a hang.
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--json", "--root", str(repo)], capture_output=True, text=True, env=env,
+                          cwd=repo, timeout=60)
+    assert not proc.stderr.strip().startswith("Traceback"), proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["counts"]["documents"] == 1 and report["counts"]["workloads"] == 1

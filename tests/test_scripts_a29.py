@@ -503,3 +503,11 @@ def test_yaml_alias_cycle_does_not_stop_the_scan(tmp_path):
     assert code == 1 and report["status"] == "fail"
     assert found(report) == {("DAPP-RPC-KEY", "major", "config.yaml#rpc_url")}
     assert "abcdef123456" not in text
+
+
+def test_alias_reached_under_two_keys_is_checked_under_each_key(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "config.yaml", "shared: &cfg {primary: 'https://rpc.example.com/?apikey=abcdef123456'}\nrpc: {ethereum: *cfg}\n")
+    _, report, text = scan(tmp_path)
+    assert ("DAPP-RPC-KEY", "major", "config.yaml#rpc.ethereum.primary") in found(report)
+    assert "abcdef123456" not in text

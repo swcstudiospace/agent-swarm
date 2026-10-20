@@ -8,11 +8,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from conftest import ROOT, run_script
+from conftest import ROOT, _scrubbed_base_env, run_script
 
 SCRIPT = ROOT / "scripts" / "k8s_manifest_check.py"
 FULL_RESOURCES = {"requests": {"cpu": "100m", "memory": "64Mi"}, "limits": {"cpu": "200m", "memory": "128Mi"}}
@@ -226,6 +227,17 @@ def test_symlinks_are_never_followed_out_of_the_root(tmp_path):
     os.symlink(outside, root / "linked-dir")
     code, result = scan(root, "--target-version", "1.30")
     assert code == 0 and result["findings"] == [] and result["files_scanned"] == 1 and result["files_skipped"]["symlink"] == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_a_named_pipe_named_like_a_manifest_is_not_opened_and_the_scan_completes(tmp_path):
+    put(tmp_path, "real.json", deployment("inside", FULL_RESOURCES))
+    os.mkfifo(tmp_path / "pipe.json")
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--json", "--target-version", "1.30"],
+                          capture_output=True, text=True, env=_scrubbed_base_env(), cwd=ROOT, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["status"] == "ok" and result["files_scanned"] == 1 and result["files_skipped"]["unreadable"] == 1
 
 
 def test_scan_stops_at_the_file_limit_and_says_so(tmp_path, capsys):
