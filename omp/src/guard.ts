@@ -2334,8 +2334,10 @@ interface NetworkWrite {
 const UNREAD_NETWORK = "<unread>";
 /** A shell assignment word, `NAME=` or `NAME+=`. */
 const ASSIGNMENT_WORD = /^[A-Za-z_]\w*\+?=/;
-/** Words that run a builtin or code which may write variables or take a name to write (`eval`, `source`, `read`, `printf -v`, `for`, `((`). */
-const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|unset|read|mapfile|readarray|getopts|printf|let|for|select|eval|source|\.|command|builtin|\(\()$/;
+/** Builtins that write shell variables from their operands (the names they are given), and `eval`/`source`/`.`, which run code. */
+const WRITER_COMMAND = /^(?:export|declare|typeset|local|readonly|unset|read|mapfile|readarray|getopts|let|for|select|eval|source|\.|\(\()$/;
+/** The wrappers that run their operand as the command (`command`, `builtin`, `exec`): what they wrap is classified instead. */
+const WRAPPER_COMMAND = /^(?:command|builtin|exec)$/;
 /** A word that expands at run time, or a cut substitution. */
 const DYNAMIC_WORD = /[$\u0001]/;
 
@@ -2370,17 +2372,39 @@ function networkWrites(item: Normalized): NetworkWrite[] {
     if (prefix.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites([...prefix, ...words], true);
     return prefix.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
   }
-  const cmd = words.slice(at);
-  const [name, ...args] = cmd;
+  const rest = unwrapCommand(words.slice(at));
+  const wrapped = rest.length !== words.length - at;
+  const [name = "", ...args] = rest;
   // a sourced file runs code this guard cannot read: it may set HARDHAT_NETWORK, in any form and with or without expansion
   if (name === "source" || name === ".") return [{ value: UNREAD_NETWORK, plain: false }];
-  const dynamic =
-    DYNAMIC_WORD.test(name) || (WRITER_COMMAND.test(name) && args.some((w) => DYNAMIC_WORD.test(w) && !ASSIGNMENT_WORD.test(w)));
-  if (prefix.length === 0 && !dynamic) {
+  // a reader (printenv, printf without -v, echo, test, ...) never writes a variable, whatever it names or expands
+  if (!writesVariables(name, args)) return [];
+  // the names a writer assigns: every operand, or for `printf -v NAME` only the word after `-v`
+  const v = args.findIndex((w) => w.startsWith("-v"));
+  const targets = name === "printf" ? args.slice(v + 1, v + 2) : args;
+  const dynamic = DYNAMIC_WORD.test(name) || targets.some((w) => DYNAMIC_WORD.test(w) && !ASSIGNMENT_WORD.test(w));
+  if (prefix.length === 0 && !dynamic && !wrapped) {
     if (name === "export" && args.every((w) => !w.startsWith("-"))) return assignmentWrites(args, true);
     if (name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
   }
-  return dynamic || cmd.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+  return dynamic || rest.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+}
+
+/** The command a wrapper (`command`, `builtin`, `exec`) runs, with the wrapper's own flags dropped. */
+function unwrapCommand(cmd: string[]): string[] {
+  let i = 0;
+  while (i < cmd.length && WRAPPER_COMMAND.test(cmd[i])) {
+    i++;
+    while (i < cmd.length && cmd[i].startsWith("-")) i++;
+  }
+  return cmd.slice(i);
+}
+
+/** Whether a command can write a shell variable: a writer builtin, `printf -v`, or a name only known at run time. */
+function writesVariables(name: string, args: string[]): boolean {
+  if (DYNAMIC_WORD.test(name)) return true;
+  if (name === "printf") return args.some((w) => w.startsWith("-v"));
+  return WRITER_COMMAND.test(name);
 }
 
 /** Every value any write under `items` (payloads included) may leave, as if all of them ran. */

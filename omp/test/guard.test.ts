@@ -1264,6 +1264,18 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; . ./env.sh; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(CHAIN);
     expect(guardToolCall(bash("hardhat run scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
   });
+
+  test("a reader that names or expands HARDHAT_NETWORK is not a write: local tests with no environment network still pass", () => {
+    expect(guardToolCall(bash("printenv HARDHAT_NETWORK; hardhat test"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("printf '%s' \"$PWD\"; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("a reader that names HARDHAT_NETWORK does not hide an inherited mainnet: the bare run still needs approval", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("printenv HARDHAT_NETWORK; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {
