@@ -1299,6 +1299,22 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
   test("readers that name or expand HARDHAT_NETWORK stay readers: printenv and a printf format do not hide a local test run", () => {
     expect(guardToolCall(bash("printenv HARDHAT_NETWORK; printf '%s' \"$PWD\"; hardhat test"), insideAs(A26))).toBeUndefined();
   });
+
+  test("getopts after -- is a writer token: it may write HARDHAT_NETWORK, so the run needs approval", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; getopts -- m HARDHAT_NETWORK -m; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("a plain export of a local network still passes: the inherited mainnet is overridden on the line", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+  });
+
+  test("a plain static export of another name changes nothing: a bare test run with no environment network passes", () => {
+    expect(guardToolCall(bash("export OTHER=1; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

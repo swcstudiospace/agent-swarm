@@ -2359,10 +2359,10 @@ function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
 }
 
 /**
- * What one top-level item writes to HARDHAT_NETWORK. Plain: a statement of assignments, or `export NAME=v` / `unset NAME`
- * with nothing in front of them (no wrapper, no flag, no expansion). Any other form that names HARDHAT_NETWORK, or runs a
- * writer with an expansion, writes a value the guard cannot read. An assignment ahead of a command (`env X=v cmd`) is that
- * command's alone and never persists.
+ * What one top-level item writes to HARDHAT_NETWORK. Plain static writes: a statement of assignments, `export NAME=v` and
+ * `unset NAME`, with nothing in front of them; a plain write of another name changes nothing. Any other writer token
+ * (writerToken) may write a name the guard cannot read, so it adds the non-local value and keeps the old ones. An
+ * assignment ahead of a command (`env X=v cmd`) is that command's alone and never persists.
  */
 function networkWrites(item: Normalized): NetworkWrite[] {
   const prefix = shellWords(item.prefix).map(unquote);
@@ -2373,19 +2373,11 @@ function networkWrites(item: Normalized): NetworkWrite[] {
     return prefix.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
   }
   const rest = unwrapCommand(words.slice(at));
-  const wrapped = rest.length !== words.length - at;
+  const plainShape = prefix.length === 0 && rest.length === words.length - at;
   const [name = "", ...args] = rest;
-  // a sourced file runs code this guard cannot read: it may set HARDHAT_NETWORK, in any form and with or without expansion
-  if (name === "source" || name === ".") return [{ value: UNREAD_NETWORK, plain: false }];
-  // a reader (printenv, printf without -v, echo, test, ...) writes no variable, whatever it names or expands
-  const targets = variableTargets(name, args);
-  if (targets === undefined) return [];
-  if (!targets.unknown && prefix.length === 0 && !wrapped) {
-    if (name === "export" && args.every((w) => !w.startsWith("-"))) return assignmentWrites(args, true);
-    if (name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
-  }
-  // a name or option the guard cannot read may be HARDHAT_NETWORK: it adds the non-local value, keeping the old ones
-  return targets.unknown || targets.words.some((w) => w.includes("HARDHAT_NETWORK")) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
+  if (plainShape && name === "export" && args.every((w) => ASSIGNMENT_WORD.test(w))) return assignmentWrites(args, true);
+  if (plainShape && name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
+  return writerToken(name, args) ? [{ value: UNREAD_NETWORK, plain: false }] : [];
 }
 
 /** The command a wrapper (`command`, `builtin`, `exec`) runs, with the wrapper's own flags dropped. */
@@ -2399,45 +2391,17 @@ function unwrapCommand(cmd: string[]): string[] {
 }
 
 /**
- * The words a command names as variables, and whether one of them is unknown until run time; undefined when it writes no
- * variable. A generic writer names every operand (an assignment `NAME=v` names NAME, so its value may hold anything);
- * `for`/`select` name their first operand and `getopts` its second; printf names only through `-v` (printfTargets).
+ * A writer token: after the wrappers, a writer builtin or `((`, `printf` with a word starting with `-v`, a dynamic command
+ * name, or an option word holding an expansion. Readers (printenv, echo, printf with a static format, test, ls, grep, cat)
+ * are not writer tokens, whatever they name or expand.
  */
-function variableTargets(name: string, args: string[]): { words: string[]; unknown: boolean } | undefined {
-  if (DYNAMIC_WORD.test(name)) return { words: [name], unknown: true };
-  if (name === "printf") return printfTargets(args);
-  if (name === "for" || name === "select" || name === "getopts") {
-    const named = name === "getopts" ? args.slice(1, 2) : args.slice(0, 1);
-    return { words: named, unknown: named.some((w) => DYNAMIC_WORD.test(w)) };
-  }
-  if (!WRITER_COMMAND.test(name)) return undefined;
-  return { words: args, unknown: args.some((w) => DYNAMIC_WORD.test(w) && !ASSIGNMENT_WORD.test(w)) };
-}
-
-/**
- * printf writes only through `-v NAME`, attached (`-vNAME`) or separate, as getopt reads its leading option words. A
- * leading word that holds an expansion may expand to an option, so it is unknown; the format and the values after it are
- * never names. Undefined when printf has no `-v` and no unknown option word.
- */
-function printfTargets(args: string[]): { words: string[]; unknown: boolean } | undefined {
-  const words: string[] = [];
-  let named = false;
-  for (let i = 0; i < args.length; i++) {
-    const w = args[i];
-    if (DYNAMIC_WORD.test(w)) return { words: [...words, w], unknown: true };
-    if (w === "--" || !w.startsWith("-")) break;
-    words.push(w);
-    if (w === "-v") {
-      named = true;
-      const target = args[i + 1] ?? "";
-      words.push(target);
-      if (DYNAMIC_WORD.test(target)) return { words, unknown: true };
-      i++;
-    } else if (w.startsWith("-v")) {
-      named = true;
-    }
-  }
-  return named ? { words, unknown: false } : undefined;
+function writerToken(name: string, args: string[]): boolean {
+  return (
+    WRITER_COMMAND.test(name) ||
+    DYNAMIC_WORD.test(name) ||
+    (name === "printf" && args.some((w) => w.startsWith("-v"))) ||
+    args.some((w) => w.startsWith("-") && DYNAMIC_WORD.test(w))
+  );
 }
 
 /** Every value any write under `items` (payloads included) may leave, as if all of them ran. */
