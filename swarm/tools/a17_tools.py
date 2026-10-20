@@ -497,7 +497,7 @@ def composition_diff(payload: dict) -> dict:
         for path in sorted(set(old) | set(new)):
             before, after = old.get(path), new.get(path)
             if before is None:
-                if after["required"]:
+                if after is not None and after["required"]:
                     parent = _optional_new_parent(path, old, new)
                     if parent is not None:
                         found.append(_finding("field-added-under-optional-parent", path, "info", f"new required field binds only when the new optional parent {_ident(parent, 200)} is set: existing claims do not set it"))
@@ -791,12 +791,18 @@ def dora_bands(payload: dict) -> dict:
         recoveries: list[int] = []
         unresolved = 0
         for dep, incidents in failed.items():
-            if any(done is None for _started, done in incidents):
+            if any(done is None for _, done in incidents):
                 unresolved += 1
             else:
-                started, resolved = max(incidents, key=lambda pair: pair[1])  # latest resolution wins; one incident measures deploy→resolve, several measure that incident's start→resolve
+                resolved_incidents = [(started, done) for started, done in incidents if done is not None]
+                started, resolved = max(resolved_incidents, key=lambda pair: pair[1])  # latest resolution wins
                 deployed_at = deploys[dep][1]
-                origin = deployed_at if len(incidents) == 1 else started
+                if len(incidents) == 1:
+                    downtime = resolved - started
+                    gap = started - deployed_at
+                    origin = started if gap > downtime else deployed_at  # deploy→resolve for immediate failures; start→resolve when the incident begins long after deploy
+                else:
+                    origin = started
                 recoveries.append(_micro(origin, resolved))
         recovery_hours = _median(recoveries) / HOUR_US if recoveries else None
         if not failed:
@@ -886,8 +892,11 @@ def _loop(cycle: list[str], adjacency: dict[str, list[str]]) -> list[str]:
                 continue
             if nxt == start:
                 path = [node]
-                while parent[path[-1]] is not None:
-                    path.append(parent[path[-1]])
+                while True:
+                    prev = parent[path[-1]]
+                    if prev is None:
+                        break
+                    path.append(prev)
                 return [*reversed(path), start]
             if nxt not in parent:
                 parent[nxt] = node
@@ -1115,8 +1124,8 @@ def quota_fit(payload: dict) -> dict:
         for resource in sorted(capacity):
             total = capacity[resource]
             allocatable = total * (1 - reserve / 100) * overcommit
-            quotas = sum((q for (t, r), (q, _) in grants.items() if r == resource), Fraction(0))
-            used = sum((u for (t, r), (_, u) in grants.items() if r == resource), Fraction(0))
+            quotas = sum((q for (_, r), (q, _) in grants.items() if r == resource), Fraction(0))
+            used = sum((u for (_, r), (_, u) in grants.items() if r == resource), Fraction(0))
             fits = quotas <= allocatable
             if not fits:
                 oversubscribed += 1

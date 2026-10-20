@@ -148,10 +148,13 @@ def _resource_findings(kind: str, name: str, spec) -> list[tuple[str, str, str, 
             if not isinstance(container, dict):
                 continue
             cname = str(container.get("name", "?"))
-            resources = container.get("resources") if isinstance(container.get("resources"), dict) else {}
-            limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
+            raw_resources = container.get("resources")
+            resources = raw_resources if isinstance(raw_resources, dict) else {}
+            raw_limits = resources.get("limits")
+            limits = raw_limits if isinstance(raw_limits, dict) else {}
             for bucket, rule, severity in (("requests", "missing-request", "major"), ("limits", "missing-limit", "minor")):
-                values = resources.get(bucket) if isinstance(resources.get(bucket), dict) else {}
+                raw_values = resources.get(bucket)
+                values = raw_values if isinstance(raw_values, dict) else {}
                 for resource in ("cpu", "memory"):
                     # Kubernetes copies an omitted (or null) request from the limit of the same resource; an empty quantity is still a gap
                     copied = bucket == "requests" and values.get(resource) is None and _present(limits.get(resource))
@@ -163,7 +166,8 @@ def _resource_findings(kind: str, name: str, spec) -> list[tuple[str, str, str, 
 
 def _scan_object(obj: dict, target_label: str, location: str) -> list[dict]:
     api_version, kind = obj["apiVersion"], obj["kind"]
-    metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+    raw_metadata = obj.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     name = str(metadata.get("name", "?"))[:63] or "?"
     findings: list[dict] = []
     removed = a21_tools.deprecated_api_scan({
@@ -210,12 +214,13 @@ def run(args, ctx) -> dict:
         relative = path.relative_to(ctx.root).as_posix()
         documents = _documents(path, yaml_module, counters, skipped_yaml)
         counters["parsed"] += documents is not None
-        for index, document in enumerate(documents or []):
+        doc_list = documents or []
+        for index, document in enumerate(doc_list):
             for obj in _expand(document):
                 if not (isinstance(obj.get("apiVersion"), str) and isinstance(obj.get("kind"), str)):
                     continue
                 manifests += 1
-                findings.extend(_scan_object(obj, target_label, f"{relative}#{index}" if len(documents) > 1 else relative))
+                findings.extend(_scan_object(obj, target_label, f"{relative}#{index}" if len(doc_list) > 1 else relative))
     skipped = []
     if skipped_yaml["yaml_files"]:
         skipped.append({"check": "yaml-manifests", "reason": "skipped:tool-missing", "tool": "PyYAML", "files": skipped_yaml["yaml_files"]})
@@ -243,4 +248,4 @@ def add_args(p) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(AgentScript("A21", "k8s_manifest_check", run, description=__doc__, add_args=add_args).main())
+    sys.exit(AgentScript("A21", "k8s_manifest_check", run, description=__doc__ or "", add_args=add_args).main())

@@ -323,8 +323,13 @@ def parse_source(raw: str) -> list[dict]:
             em = re.match(r"event\s+(" + _IDENT + r")\s*\(", header)
             rm = re.match(r"error\s+(" + _IDENT + r")\s*\(", header)
             if fm or sm:
-                kind, name = ("function", fm.group(1)) if fm else (sm.group(1), sm.group(1))
-                open_paren = (fm or sm).end() - 1
+                if fm:
+                    kind, name = "function", fm.group(1)
+                    open_paren = fm.end() - 1
+                else:
+                    assert sm is not None
+                    kind, name = sm.group(1), sm.group(1)
+                    open_paren = sm.end() - 1
                 parsed = _parse_function_header(kind, name, header, open_paren)
                 body = clean[body_range[0]:body_range[1]] if body_range else ""
                 if contract["kind"] == "interface" and not parsed["visibility"]:
@@ -342,12 +347,14 @@ def parse_source(raw: str) -> list[dict]:
                                               "body": clean[body_range[0]:body_range[1]] if body_range else "",
                                               "has_body": body_range is not None, "body_span": body_range or (0, 0),
                                               "line": line_no, "doc": doc, "signature": mm.group(1)})
-            elif em or rm:
-                match = em or rm
-                params = _parse_params(header[match.end() - 1 + 1:header.rfind(")")]) if ")" in header else []
-                bucket = contract["events"] if em else contract["errors"]
-                bucket.append({"name": match.group(1), "params": params, "line": line_no, "doc": doc,
-                               "signature": f"{match.group(1)}({','.join(_norm_type(t) for t, _ in params)})"})
+            elif em:
+                params = _parse_params(header[em.end() - 1 + 1:header.rfind(")")]) if ")" in header else []
+                contract["events"].append({"name": em.group(1), "params": params, "line": line_no, "doc": doc,
+                                           "signature": f"{em.group(1)}({','.join(_norm_type(t) for t, _ in params)})"})
+            elif rm:
+                params = _parse_params(header[rm.end() - 1 + 1:header.rfind(")")]) if ")" in header else []
+                contract["errors"].append({"name": rm.group(1), "params": params, "line": line_no, "doc": doc,
+                                           "signature": f"{rm.group(1)}({','.join(_norm_type(t) for t, _ in params)})"})
             elif body_range is None and header and not _SKIP_MEMBERS.match(header):
                 assign = re.search(r"(?<![=!<>])=(?![=>])", header)
                 decl, init = (header[:assign.start()], header[assign.end():]) if assign else (header, "")
@@ -880,4 +887,4 @@ def add_args(p) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(AgentScript("A26", "sol_contract_lint", run, description=__doc__, add_args=add_args).main())
+    sys.exit(AgentScript("A26", "sol_contract_lint", run, description=__doc__ or "", add_args=add_args).main())
