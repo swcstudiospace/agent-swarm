@@ -1,6 +1,6 @@
 # The swarm bar
 
-The swarm bar is the topmost of the bars above the omp editor (widget key `agent-swarm`). It shows, live, what every subagent of a swarm run is doing and for how long, and the measured token savings of the session. It is display-only: it never changes a tool decision, never writes a file and never calls a model. It is always there: from the first event of an interactive session until the session ends it is one row when nothing runs and two rows while agents run, always the full width of the terminal, and when there is nothing to show it says so (state `idle`) instead of going away. Stack, top to bottom: the swarm bar, Ultrathink's bar, omp's own bar.
+The swarm bar is the topmost of the bars above the omp editor (widget key `agent-swarm`). It shows, live, what every subagent of a swarm run is doing and for how long, and the measured token savings of the session. It is display-only: it never changes a tool decision, never writes a file and never calls a model. It is always there: from the first event of an interactive session until the session ends it is exactly two rows, always the full width of the terminal, and when there is nothing to show it says so (state `idle`) instead of going away. Stack, top to bottom: the swarm bar, Ultrathink's bar, omp's own bar.
 
 - Source: `omp/src/swarm_bar.ts` (state reducer, renderer, controller), the row composer of `omp/src/swarm_dock.ts` (`composeBar`), the token chips of `omp/src/token_savings.ts` and the stack protocol of `omp/src/bar_stack.ts`.
 - Contract: `.planning/research/v2.2-DESIGN.md` section 6 and section 7.
@@ -9,7 +9,7 @@ The swarm bar is the topmost of the bars above the omp editor (widget key `agent
 
 ## 1. Reading the bar
 
-The bar is one row when nothing runs (idle, or the telemetry error with no rows) and two rows while agents run. Every row is exactly as wide as the terminal: omp hands a widget the full terminal width, and the bar fills it with its own background, so its left and right caps sit in the same columns whatever the swarm is doing.
+The bar is exactly two rows, in every state, and each row is exactly as wide as the terminal: omp hands a widget the full terminal width, and the bar fills it with its own background, so its left and right caps sit in the same columns whatever the swarm is doing.
 
 ```
 row 1  ◖ ● swarm 5m00s │ 3 run │ 1 queued │ slots 3/4        …gap…        cache 87% │ saved 48.2k ◗   summary left, token chips right
@@ -18,7 +18,7 @@ row 2  ◖ ● a05-backend  4m12s │ ● a06-frontend  1m35s │ ○ queued a08
 
 ### Its place in the stack
 
-From the top: the swarm bar (2 rows while agents run, 1 row when idle), Ultrathink's bar (1 row), omp's own bar. omp stacks `aboveEditor` widgets in insertion order and re-setting a widget key moves that widget to the bottom, so a bar that remounts would drop below the bars that were meant to be under it. The bars keep their order with the `bars:restack` protocol on omp's event bus (`pi.events`, whose handlers run synchronously inside `emit`):
+From the top: the swarm bar (2 rows), Ultrathink's bar (1 row), omp's own bar. omp stacks `aboveEditor` widgets in insertion order and re-setting a widget key moves that widget to the bottom, so a bar that remounts would drop below the bars that were meant to be under it. The bars keep their order with the `bars:restack` protocol on omp's event bus (`pi.events`, whose handlers run synchronously inside `emit`):
 
 - Every time a bar (re)sets its widget (first mount, the remount one tick after events that move other bars, a restack-triggered remount) it emits `bars:restack` with `{ v: 1, after: <its rank> }`. Ranks: swarm bar 10, Ultrathink bar 20.
 - A mounted bar whose rank is greater than `after` re-sets its own widget, which puts it below the announcer, and announces itself in turn. Payloads with another version, a bad shape or `after` greater than or equal to the bar's own rank are ignored. Ranks only increase along the chain, so it ends after at most one step per bar.
@@ -97,6 +97,7 @@ Idle, width 120:
 <!-- capture:tokens-idle@120 -->
 ```text
 ◖ ○ swarm idle    rtk +4.1k │ cost 12c │ turn 3200ms │ before 61.4k · now 13.2k │ ttft 640ms │ cache 87% │ saved 48.2k ◗
+◖ no subagents running                                                                                                 ◗
 ```
 <!-- /capture -->
 
@@ -105,6 +106,7 @@ Idle, width 200:
 <!-- capture:tokens-idle@200 -->
 ```text
 ◖ ○ swarm idle  graph ready │ bill 9.4k · out 2.1k │ idle 1200ms │ payload 156523c │ query 85ms │ rtk +4.1k │ cost 12c │ turn 3200ms │ before 61.4k · now 13.2k │ ttft 640ms │ cache 87% │ saved 48.2k ◗
+◖ no subagents running                                                                                                                                                                                 ◗
 ```
 <!-- /capture -->
 
@@ -113,6 +115,7 @@ A snapshot with only the required counts shows only those chips, no zeros for wh
 <!-- capture:tokens-minimal@80 -->
 ```text
 ◖ ○ swarm idle                          before 61.4k · now 13.2k │ saved 48.2k ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -157,17 +160,18 @@ State is never colour alone: every state has a distinct glyph, and every state t
 
 ## 2. The states
 
-The bar is one of seven states (`BarState`). Each is shown below at widths 40, 80 and 120: one row when nothing runs (states `idle` and `error`), two rows while agents run, each row exactly as wide as the width. The captures use reduced motion (`●`) so they are stable; section 4 shows the animated spinner. Row 1's right-hand side is empty in them because no token snapshot exists; the token captures are in section 1.
+The bar is one of seven states (`BarState`). Each is shown below at widths 40, 80 and 120: always two rows, each exactly as wide as the width. The captures use reduced motion (`●`) so they are stable; section 4 shows the animated spinner. Row 1's right-hand side is empty in them because no token snapshot exists; the token captures are in section 1.
 
 ### State `idle`
 
-Nothing is live, nothing lingers and there is no telemetry error. The bar stays mounted and says so: it is one row, the dim `○ swarm idle` (with the token chips on its right when a snapshot exists). There is no placeholder row under it.
+Nothing is live, nothing lingers and there is no telemetry error. The bar stays mounted and says so: row 1 is the dim `○ swarm idle` (with the token chips on its right when a snapshot exists), row 2 the dim `no subagents running`.
 
 Width 40:
 
 <!-- capture:idle@40 -->
 ```text
 ◖ ○ swarm idle                         ◗
+◖ no subagents running                 ◗
 ```
 <!-- /capture -->
 
@@ -176,6 +180,7 @@ Width 80:
 <!-- capture:idle@80 -->
 ```text
 ◖ ○ swarm idle                                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -184,6 +189,7 @@ Width 120:
 <!-- capture:idle@120 -->
 ```text
 ◖ ○ swarm idle                                                                                                         ◗
+◖ no subagents running                                                                                                 ◗
 ```
 <!-- /capture -->
 
@@ -437,13 +443,14 @@ Width 120:
 
 ### State `error`
 
-`live.json` is stale, malformed or unreadable and there are no rows to show: the bar says so instead of lying with old rows. The bar is one row, `swarm: telemetry unavailable` in the warning colour (with the token chips when a snapshot exists). There is no placeholder row under it, the same as idle.
+`live.json` is stale, malformed or unreadable and there are no rows to show: the bar says so instead of lying with old rows. Row 1 is `swarm: telemetry unavailable` in the warning colour (with the token chips when a snapshot exists), row 2 the same placeholder as idle.
 
 Width 40:
 
 <!-- capture:error@40 -->
 ```text
 ◖ swarm: telemetry unavailable         ◗
+◖ no subagents running                 ◗
 ```
 <!-- /capture -->
 
@@ -452,6 +459,7 @@ Width 80:
 <!-- capture:error@80 -->
 ```text
 ◖ swarm: telemetry unavailable                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -460,6 +468,7 @@ Width 120:
 <!-- capture:error@120 -->
 ```text
 ◖ swarm: telemetry unavailable                                                                                         ◗
+◖ no subagents running                                                                                                 ◗
 ```
 <!-- /capture -->
 
@@ -516,6 +525,7 @@ Edges of both windows, drawn at width 80. The 19 s capture still shows the done 
 <!-- capture:linger:done+20s@80 -->
 ```text
 ◖ ○ swarm idle                                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 <!-- capture:linger:failed+599s@80 -->
@@ -527,6 +537,7 @@ Edges of both windows, drawn at width 80. The 19 s capture still shows the done 
 <!-- capture:linger:failed+600s@80 -->
 ```text
 ◖ ○ swarm idle                                                                 ◗
+◖ no subagents running                                                         ◗
 ```
 <!-- /capture -->
 
@@ -703,7 +714,7 @@ Checked against the installed omp (`omp --version` prints `omp/18.12.2`, Nerd Fo
 | 50 | `swarm 18s │ 1 run` | `cache 87% │ saved 16.8k` |
 | 40 | `swarm 20s │ 1 run` | `saved 16.8k` |
 
-While the swarm was idle, at 170 columns, the bar was one row: `○ swarm idle` and ten chips (`idle 3000ms` first, `saved 16.8k` last; `bill`/`out` and `graph ready` did not fit).
+While the swarm was idle, at 170 columns, row 1 read `○ swarm idle` and ten chips (`idle 3000ms` first, `saved 16.8k` last; `bill`/`out` and `graph ready` did not fit), row 2 `no subagents running`.
 
 **Another session's snapshot is ignored.** The snapshot of the other session at t+46 s changed nothing: row 1 kept `saved 16.8k` and `cache 87%`. The newer snapshot of this session at t+50 s moved them to `saved 21.4k` and `cache 91%`.
 

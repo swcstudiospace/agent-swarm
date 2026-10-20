@@ -1,9 +1,8 @@
 /**
  * Agent Swarm bar: an aboveEditor widget (key `agent-swarm`, rank 10: above Ultrathink).
  * Display-only (v2.2 DESIGN section 6, D4); nothing here may throw into the host. Three parts:
- *   1. pure text: `formatElapsed`, `sanitizeText`, the fixed-width `renderSwarmBar` (exactly `width` columns per row: while
- *      agents run, 2 rows, row 1 the swarm summary on the left and the measured token savings on the right, row 2 the agents; idle
- *      and telemetry error, 1 row, the head with the token savings);
+ *   1. pure text: `formatElapsed`, `sanitizeText`, the fixed-width `renderSwarmBar` (always exactly 2 rows of exactly `width`
+ *      columns: row 1 the swarm summary on the left and the measured token savings on the right, row 2 the agents or the idle placeholder);
  *   2. a model reducer merging three sources by run id: the omp bus (`task:subagent:progress|lifecycle`), `<swarmDir>/live.json`
  *      (`swarm.live.v1`) and the parent's own `task` tool_call/tool_result rows (last resort). Elapsed is extrapolated with the
  *      consumer's monotonic clock (`performance.now()`), never `Date.now()`;
@@ -2391,10 +2390,11 @@ function tokenSegments(model: SwarmBarModel, theme: BarTheme | undefined): BarSe
   return tokenChips(snapshot).map((chip) => ({ plain: chip.text, painted: chip.color === "text" ? chip.text : paint(theme, chip.color, chip.text), priority: chip.priority }));
 }
 
+const IDLE_ROW = "no subagents running";
+
 /**
- * The bar's rows, each exactly `width` columns (none for `width <= 0`), plus the state it is in. Busy is two rows: the swarm
- * summary and the agents. Idle and telemetry error are one row: the head with the token chips, no placeholder. Pure: the same
- * inputs give the same output.
+ * The bar as exactly 2 rows of exactly `width` columns (none for `width <= 0`) plus the state it is in. Idle and error keep the
+ * two rows: a placeholder instead of the agents. Pure: the same inputs give the same output.
  */
 export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: BarTheme | undefined, nowMono: number): BarFrame {
   const base = barState(model, nowMono);
@@ -2403,7 +2403,7 @@ export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: 
   const rows = visibleRuns(model, nowMono);
   if (rows.length === 0) {
     const head = base === "error" ? seg(theme, "warning", "swarm: telemetry unavailable") : seg(theme, "dim", "○ swarm idle");
-    const lines = [composeBar(theme, [prio(0, head)], chips, width)];
+    const lines = [composeBar(theme, [prio(0, head)], chips, width), composeBar(theme, [prio(0, seg(theme, "dim", IDLE_ROW))], [], width)];
     return { lines, state: base, shown: 0, hidden: 0 };
   }
   const spin = spinner(model, theme, nowMono);
@@ -2448,7 +2448,7 @@ export function renderSwarmBarFrame(model: SwarmBarModel, width: number, theme: 
   return { lines: [line1, line2], state: hidden > 0 ? "overflow" : base, shown, hidden };
 }
 
-/** The bar's rows, each exactly `width` columns wide: two while agents run, one when idle or in telemetry error (none for `width <= 0`). */
+/** The bar as exactly 2 rows, each exactly `width` columns wide (no rows for `width <= 0`). */
 export function renderSwarmBar(model: SwarmBarModel, width: number, theme: BarTheme | undefined, nowMono: number): string[] {
   return renderSwarmBarFrame(model, width, theme, nowMono).lines;
 }
@@ -2551,7 +2551,7 @@ export function createSwarmBar(pi: { events?: EventBus }, options: SwarmBarOptio
   const announced = new Set<string>();
   /** Set by `stop()`; only a new session (`session_start`/`session_switch`) clears it. */
   let closed = false;
-  /** The widget is mounted: from the first eligible event until stop. An idle bar stays, drawn as its one idle head row. */
+  /** The widget is mounted: from the first eligible event until stop. An idle bar stays, drawn as the idle placeholder. */
   let mounted = false;
   let restack: Restack | undefined;
 

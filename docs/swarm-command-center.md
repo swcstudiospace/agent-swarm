@@ -462,11 +462,10 @@ passed.
 
 ### 9.4 Read the bar
 
-The bar is the topmost widget above the editor (above Ultrathink's bar and omp's own), always mounted, at the full terminal
-width. Row 1: `swarm <elapsed> | N run | N queued | N done | N fail | slots R/L` on the left, the session's token savings chips on
-the right. While agents run, row 2: one row per run, worst state first, `<glyph> <agent> <elapsed> <activity>`. When nothing runs
-(idle, or telemetry unavailable with no rows) the bar is the single row 1, with no placeholder under it. Every state has a glyph
-and a word. The full legend, states, colors,
+The bar is the topmost widget above the editor (above Ultrathink's bar and omp's own), always mounted, exactly two rows at
+the full terminal width. Row 1: `swarm <elapsed> | N run | N queued | N done | N fail | slots R/L` on the left, the
+session's token savings chips on the right; row 2: one row per run, worst state first, `<glyph> <agent> <elapsed>
+<activity>`, or `no subagents running` when idle. Every state has a glyph and a word. The full legend, states, colors,
 token chips and degraded markers are in [docs/swarm-bar.md](swarm-bar.md).
 
 ## 10. Configuration

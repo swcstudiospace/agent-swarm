@@ -1471,10 +1471,10 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     expect(renderSwarmBarFrame(states.overflow, 40, undefined, T0).state).toBe("overflow");
   });
 
-  test("at 160 columns every state draws its rows: the summary, then the agents when some run; idle and telemetry error draw the summary alone", () => {
+  test("at 160 columns every state draws its two rows: the summary, then the agents or the placeholder", () => {
     const rows = Object.fromEntries(Object.entries(sample()).map(([name, model]) => [name, plain(model, 160, at[name] ?? T0).map(visible)]));
     expect(rows).toEqual({
-      idle: ["○ swarm idle"],
+      idle: ["○ swarm idle", "no subagents running"],
       loading: ["● swarm 0s │ 1 run │ 0 queued │ 0 done │ 0 fail", "● start a05-backend     0s"],
       active: [
         "● swarm 4m12s │ 1 run │ 1 wait │ 1 queued │ 0 done │ 0 fail │ slots 1/4",
@@ -1486,7 +1486,7 @@ describe("render: states at widths 20, 40, 80, 160", () => {
       ],
       completed: ["✓ swarm 1m01s │ 0 run │ 0 queued │ 1 done │ 0 fail", "✓ a05-backend  1m01s"],
       failed: ["✕ swarm 1h01m │ 0 run │ 0 queued │ 0 done │ 1 fail", "✕ FAIL a05-backend  1h01m"],
-      error: ["swarm: telemetry unavailable"],
+      error: ["swarm: telemetry unavailable", "no subagents running"],
     });
   });
 
@@ -1500,38 +1500,32 @@ describe("render: states at widths 20, 40, 80, 160", () => {
       failed: "✕ swarm 1h01m",
       error: "swarm: telemetry unavailable",
     };
-    const firstRows: Record<string, string | undefined> = {
-      idle: undefined,
+    const firstRows: Record<string, string> = {
+      idle: "no subagents running",
       loading: "● start a05-backend",
       active: "● a05-backend",
       overflow: "✕ FAIL a09-reviewer",
       completed: "✓ a05-backend",
       failed: "✕ FAIL a05-backend",
-      error: undefined,
+      error: "no subagents running",
     };
     for (const width of [40, 80, 160]) {
       for (const [name, model] of Object.entries(sample())) {
-        const rows = plain(model, width, at[name] ?? T0).map(visible);
-        expect(rows[0].startsWith(heads[name]), `${name}@${width} row 1: ${rows[0]}`).toBe(true);
-        const agentRow = firstRows[name];
-        if (agentRow === undefined) {
-          expect(rows, `${name}@${width} has no agent row`).toHaveLength(1);
-        } else {
-          expect(rows, `${name}@${width} two rows`).toHaveLength(2);
-          expect(rows[1].startsWith(agentRow), `${name}@${width} row 2: ${rows[1]}`).toBe(true);
-        }
+        const [row1, row2] = plain(model, width, at[name] ?? T0).map(visible);
+        expect(row1.startsWith(heads[name]), `${name}@${width} row 1: ${row1}`).toBe(true);
+        expect(row2.startsWith(firstRows[name]), `${name}@${width} row 2: ${row2}`).toBe(true);
       }
     }
   });
 
-  test("every state, theme and width 1..300: one row for idle and telemetry error, two for agents, each exactly the width and no cut escape, with and without token chips (I1, I2, I5)", () => {
+  test("every state, theme and width 1..300: exactly 2 rows of exactly the width and no cut escape, with and without token chips (I1, I2, I5)", () => {
     for (const [themeName, theme] of themeVariants) {
       for (const [name, base] of Object.entries(sample())) {
         for (const tokens of [undefined, FULL_SAVINGS]) {
           const model: SwarmBarModel = tokens ? { ...base, tokens } : base;
           for (let width = 1; width <= 300; width++) {
             const lines = renderSwarmBar(model, width, theme, at[name] ?? T0);
-            if (lines.length !== (name === "idle" || name === "error" ? 1 : 2) || lines.some((line) => displayWidth(line) !== width || hasStrayEscape(line))) {
+            if (lines.length !== 2 || lines.some((line) => displayWidth(line) !== width || hasStrayEscape(line))) {
               throw new Error(`${name}@${width} (${themeName}, ${tokens ? "tokens" : "no tokens"}): ${JSON.stringify(lines)}`);
             }
           }
@@ -1575,39 +1569,39 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     }
   });
 
-  test("idle is one row: the idle marker, with the token chips when a snapshot exists and no placeholder", () => {
+  test("idle keeps both rows: the idle marker and the placeholder, with the token chips when a snapshot exists", () => {
     const idle = sample().idle;
     for (const width of [40, 160]) {
       const frame = renderSwarmBarFrame(idle, width, undefined, T0);
       expect(frame, `idle@${width}`).toMatchObject({ state: "idle", shown: 0, hidden: 0 });
-      expect(frame.lines.map(visible)).toEqual(["○ swarm idle"]);
+      expect(frame.lines.map(visible)).toEqual(["○ swarm idle", "no subagents running"]);
     }
     const measured: SwarmBarModel = { ...idle, tokens: savings() };
-    const lines = plain(measured, 160, T0);
-    expect(lines).toHaveLength(1);
-    expect(visible(lines[0])).toMatch(/^○ swarm idle +before 10k · now 4k │ saved 6k$/);
-    const themed = renderSwarmBar(measured, 160, powerlineTheme, T0);
-    expect(themed).toHaveLength(1);
-    expect(stripAnsi(themed[0])).toContain("saved 6k");
+    const [row1, row2] = plain(measured, 160, T0);
+    expect(visible(row1)).toMatch(/^○ swarm idle +before 10k · now 4k │ saved 6k$/);
+    expect(visible(row2)).toBe("no subagents running");
+    const [themed1, themed2] = renderSwarmBar(measured, 160, powerlineTheme, T0);
+    expect(stripAnsi(themed1)).toContain("saved 6k");
+    expect(stripAnsi(themed2)).toContain("no subagents running");
   });
 
-  test("a telemetry error without rows is one row: the warning, and the chips when a snapshot exists", () => {
+  test("a telemetry error without rows keeps both rows: the warning, the idle placeholder, and the chips when a snapshot exists", () => {
     const error = sample().error;
     for (const width of [40, 160]) {
       const frame = renderSwarmBarFrame(error, width, undefined, T0);
       expect(frame, `error@${width}`).toMatchObject({ state: "error", shown: 0, hidden: 0 });
-      expect(frame.lines.map(visible)).toEqual(["swarm: telemetry unavailable"]);
+      expect(frame.lines.map(visible)).toEqual(["swarm: telemetry unavailable", "no subagents running"]);
     }
     const measured: SwarmBarModel = { ...error, tokens: savings() };
-    const lines = plain(measured, 160, T0);
-    expect(lines).toHaveLength(1);
-    expect(visible(lines[0])).toMatch(/^swarm: telemetry unavailable +before 10k · now 4k │ saved 6k$/);
-    // narrower: the warning is still the identity of the only row
-    expect(plain(measured, 40, T0)).toHaveLength(1);
+    const [row1, row2] = plain(measured, 160, T0);
+    expect(visible(row1)).toMatch(/^swarm: telemetry unavailable +before 10k · now 4k │ saved 6k$/);
+    expect(visible(row2)).toBe("no subagents running");
+    // narrower: the warning is the identity of the row and the placeholder row is unchanged
     expect(visible(plain(measured, 40, T0)[0])).toMatch(/^swarm: telemetry unavailable/);
+    expect(visible(plain(measured, 40, T0)[1])).toBe("no subagents running");
   });
 
-  test("rows linger, then the bar goes back to the idle row instead of disappearing", () => {
+  test("rows linger, then the bar goes back to the idle placeholder instead of disappearing", () => {
     const model = createModel();
     progress(model, { id: "ok", agent: "good", durationMs: 0 }, T0);
     progress(model, { id: "ok", agent: "good", status: "completed", durationMs: 1000 }, T0 + SEC);
@@ -1616,14 +1610,14 @@ describe("render: states at widths 20, 40, 80, 160", () => {
     expect(visible(lingering.lines[1])).toContain("good");
     const after = renderSwarmBarFrame(model, 80, undefined, T0 + 22 * SEC);
     expect(after.state).toBe("idle");
-    expect(after.lines.map(visible)).toEqual(["○ swarm idle"]);
+    expect(after.lines.map(visible)).toEqual(["○ swarm idle", "no subagents running"]);
   });
 
   test("telemetry marker: alone when there are no rows, as a segment next to rows otherwise", () => {
     const model = createModel();
     model.error = "live.json stale";
     const alone = renderSwarmBar(model, 80, undefined, T0);
-    expect(alone).toHaveLength(1);
+    expect(alone).toHaveLength(2);
     expect(visible(alone[0])).toBe("swarm: telemetry unavailable");
     progress(model, { id: "r", agent: "a05" }, T0);
     const withRows = renderSwarmBar(model, 160, undefined, T0);

@@ -210,9 +210,9 @@ function frame(id: string, agent: string, status: string, durationMs = 0, extra:
   };
 }
 
-/** The one row of the bar when nothing runs, and when only the telemetry marker is up (no token snapshot). No placeholder row. */
-const IDLE = ["○ swarm idle"];
-const TELEMETRY = ["swarm: telemetry unavailable"];
+/** The two rows of the bar when nothing runs, and when only the telemetry marker is up (no token snapshot). */
+const IDLE = ["○ swarm idle", "no subagents running"];
+const TELEMETRY = ["swarm: telemetry unavailable", "no subagents running"];
 
 /** Zero-delay timeouts: the deferred remount. */
 const pendingRemounts = (h: Harness): number => [...h.timers.timeouts.values()].filter((t) => t.ms === 0).length;
@@ -809,7 +809,7 @@ describe("failure isolation", () => {
     expect(h.host.lines()).toEqual(IDLE); // the blocked call got no row
   });
 
-  test("idle and telemetry error give exactly one row, busy gives exactly two, every row exactly that width, for a themed, a powerline, a throwing and an empty theme", () => {
+  test("every width gives exactly two rows of exactly that width, for a themed, a powerline, a throwing and an empty theme, idle, telemetry error or busy", () => {
     const hostile: BarTheme = {
       fg() {
         throw new Error("no such color");
@@ -837,11 +837,10 @@ describe("failure isolation", () => {
     const errorDir = join(tmpDir("swarm-width-"), ".swarm");
     mkdirSync(errorDir, { recursive: true });
     writeFileSync(join(errorDir, "live.json"), "{ not json");
-    const states: Record<string, { swarmDir?: string; rows: number; setup: (h: Harness) => void }> = {
-      idle: { rows: 1, setup: () => {} },
-      error: { rows: 1, swarmDir: errorDir, setup: () => {} },
+    const states: Record<string, { swarmDir?: string; setup: (h: Harness) => void }> = {
+      idle: { setup: () => {} },
+      error: { swarmDir: errorDir, setup: () => {} },
       busy: {
-        rows: 2,
         setup: (h) => {
           h.bus.emit(PROGRESS_CHANNEL, frame("a", "日本語".repeat(20), "running", 0, { currentToolIntent: "🚀".repeat(80) }));
           h.bus.emit(PROGRESS_CHANNEL, frame("b", "a06-frontend", "running", 4000));
@@ -849,7 +848,6 @@ describe("failure isolation", () => {
         },
       },
       failed: {
-        rows: 2,
         setup: (h) => {
           h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "failed", 5000));
           h.bus.emit(TOKEN_CHANNEL, tokens);
@@ -864,7 +862,7 @@ describe("failure isolation", () => {
         const bad: string[] = [];
         for (let width = 1; width <= 300; width++) {
           const widths = h.host.rows(width).map((row) => displayWidth(row));
-          if (widths.length !== state.rows || widths.some((columns) => columns !== width)) bad.push(`${themeName}/${stateName}@${width}: rows ${JSON.stringify(widths)}`);
+          if (widths.length !== 2 || widths.some((columns) => columns !== width)) bad.push(`${themeName}/${stateName}@${width}: rows ${JSON.stringify(widths)}`);
         }
         expect(bad.slice(0, 5)).toEqual([]);
         expect(h.host.rows(0)).toEqual([]);
