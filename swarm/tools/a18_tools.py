@@ -472,11 +472,16 @@ def _expand(text: str, variables: dict) -> tuple[str, bool]:
     return _VAR.sub(replace, text), resolved
 
 
-def _bind(variables: dict, name: str, value: str) -> None:
-    """Bind one ARG or ENV value in instruction order. `$NAME` and `${NAME}` in it expand through the variables bound so far, as Docker
-    expands them at build time. A value that stays unresolved binds empty, so a later use of it is unresolved too, never a literal `$X`."""
+def _resolved(value: str, variables: dict) -> str:
+    """`value` with its `$NAME` and `${NAME}` read from `variables`, as Docker expands them at build time. A value that stays unresolved
+    becomes empty, so a later use of it is unresolved too, never a literal `$X`."""
     expanded, resolved = _expand(value, variables)
-    variables[name] = expanded if resolved else ""
+    return expanded if resolved else ""
+
+
+def _bind(variables: dict, name: str, value: str) -> None:
+    """Bind one ARG value in instruction order, expanded through the variables bound so far."""
+    variables[name] = _resolved(value, variables)
 
 
 def _stages(instructions: list[dict]) -> tuple[list[dict], dict]:
@@ -546,9 +551,11 @@ def _run_stage(stage: dict, global_args: dict, inherited: dict, before: int) -> 
                 else:
                     variables.setdefault(key, "")
         elif ins["kw"] == "ENV":
-            for name, value in _env_pairs(ins["args"]):
-                _bind(variables, name, value)
-                env[name] = variables[name]
+            # Docker expands every pair of one ENV instruction against the variables from before it, then binds the values
+            pairs = [(name, _resolved(value, variables)) for name, value in _env_pairs(ins["args"])]
+            for name, value in pairs:
+                variables[name] = value
+                env[name] = value
     return variables, env
 
 

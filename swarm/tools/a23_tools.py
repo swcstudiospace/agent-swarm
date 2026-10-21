@@ -398,6 +398,21 @@ def _matches_everything(rule: dict, field: str, where: str) -> bool:
     return free("from", source_free) and free("to", operation_free) and free("when", condition_free)
 
 
+def _without_negations(rule: dict) -> dict:
+    """The rule with its negative matches removed (source not*, to.operation not*, when notValues): what its positive matches still
+    constrain. Its from, to and when items are validated objects by the time the caller uses it."""
+    part = dict(rule)
+    if isinstance(rule.get("from"), list):
+        part["from"] = [{**item, "source": {k: v for k, v in (item.get("source") or {}).items() if k not in AUTHZ_NEGATIVE_SOURCE}}
+                        for item in rule["from"]]
+    if isinstance(rule.get("to"), list):
+        part["to"] = [{**item, "operation": {k: v for k, v in (item.get("operation") or {}).items() if k not in AUTHZ_NEGATIVE_OPERATION}}
+                      for item in rule["to"]]
+    if isinstance(rule.get("when"), list):
+        part["when"] = [{k: v for k, v in item.items() if k != "notValues"} for item in rule["when"]]
+    return part
+
+
 def _authz_lint(payload: dict) -> dict:
     root = payload.get("root_namespace", DEFAULT_ROOT_NAMESPACE)
     policies = _list(payload["policies"], "policies", "policies")
@@ -491,7 +506,9 @@ def _authz_lint(payload: dict) -> dict:
             for condition in _list(rule.get("when"), "policies", f"policies[{index}].spec.rules[{rule_index}].when"):
                 if _list(_dict(condition, "policies", "when item").get("notValues"), "policies", "when.notValues"):
                     negated.append("when.notValues")
-            if negated:  # an ALLOW rule admitting all but some values is not a default-deny, like the empty rule {}
+            if negated and _matches_everything(_without_negations(rule), "policies", rule_where):
+                # only the negative matches constrain this rule, so it admits every value but the listed ones; positive matches (principals,
+                # paths, methods, values) that also constrain it leave a narrower rule, which is not an open one
                 findings.append(_finding("AUTHZ-NEGATIVE-MATCH", "major", f"{subject}: rules[{rule_index}] has a negative match "
                                          f"({', '.join(sorted(set(negated)))}): it admits every value except the listed ones"))
                 allows_everything = True
@@ -532,8 +549,8 @@ def authz_lint(payload: dict) -> dict:
     allow-nothing idiom, or specific rules) or a namespace-wide DENY policy has the rule `{}`; an ALLOW rule `{}` (matches
     everything) cancels the ALLOW-based form, a DENY `{}` cannot be cancelled. An ALLOW rule with a negative match (source
     notPrincipals, notRequestPrincipals, notNamespaces, notIpBlocks, notRemoteIpBlocks; to.operation notHosts, notPorts, notPaths,
-    notMethods; when notValues) admits every value but the listed ones: AUTHZ-NEGATIVE-MATCH (major), and it cancels the
-    ALLOW-based form like `{}`. Wildcards are only a risk in ALLOW rules: principals/requestPrincipals/namespaces "*" (any
+    notMethods; when notValues) admits every value but the listed ones, when no positive match narrows the rule further:
+    AUTHZ-NEGATIVE-MATCH (major), and then it cancels the ALLOW-based form like `{}`. Wildcards are only a risk in ALLOW rules: principals/requestPrincipals/namespaces "*" (any
     authenticated identity, issuer or namespace), prefix/suffix patterns, 0.0.0.0/0 ip blocks, and rules without `from` (admit
     unauthenticated plaintext clients). A selector key other than matchLabels is AUTHZ-SELECTOR-UNSUPPORTED and scopes the policy
     to workloads. Without `namespaces`, only namespaces that hold a policy are checked: list every namespace to catch one with none."""
@@ -551,9 +568,32 @@ def _contenders(candidates: list[dict]) -> tuple[dict, list[dict]]:
     return top, [c for c in ordered if c["created"] is None or c["created"] == top["created"]]
 
 
-def _ambiguous(contenders: list[dict]) -> bool:
-    """True when the contenders differ in mode or port rules, so the effective posture depends on which one Istio picks."""
-    return len({(c["mode"], tuple(sorted(c["ports"].items()))) for c in contenders}) > 1
+def _conflicting(contenders: list[dict], inherited: str | None) -> bool:
+    """True when the contenders would give different effective postures (mode and per-port modes), so the outcome depends on which
+    one Istio picks. An UNSET mode takes `inherited`, the mode the levels below decide; None (they conflict) leaves it unknown."""
+    ports = sorted({port for c in contenders for port in c["ports"]})
+    postures = set()
+    for c in contenders:
+        mode = inherited if c["mode"] == "UNSET" else c["mode"]
+        if mode is None:
+            return True
+        per_port = tuple(mode if c["ports"].get(port, "UNSET") == "UNSET" else c["ports"][port] for port in ports)
+        postures.add((mode, per_port))
+    return len(postures) > 1
+
+
+def _decided(levels: tuple, start: int) -> str | None:
+    """The mode the levels from `start` on decide for a workload (PERMISSIVE when none does), or None when a level is in conflict."""
+    for index in range(start, len(levels)):
+        candidates = levels[index][1]
+        if not candidates:
+            continue
+        pick, contenders = _contenders(candidates)
+        below = _decided(levels, index + 1)
+        if _conflicting(contenders, below):
+            return None
+        return pick["mode"] if pick["mode"] != "UNSET" else below
+    return "PERMISSIVE"
 
 
 def _parse_peer_auth(doc, index: int) -> dict:
@@ -611,14 +651,14 @@ def _mtls_coverage(payload: dict) -> dict:
             ("mesh-wide policy", [p for p in policies if p["namespace"] == root and not p["labels"]]),
         )
         mode, source, chosen = "PERMISSIVE", "default (no PeerAuthentication)", None
-        for level, candidates in levels:
+        for index, (level, candidates) in enumerate(levels):
             if not candidates:
                 continue
             pick, contenders = _contenders(candidates)
-            if _ambiguous(contenders):
+            if _conflicting(contenders, _decided(levels, index + 1)):
                 names = ", ".join(sorted(f"{c['namespace']}/{c['name']}" for c in contenders)[:5])
-                findings.append(_finding("MTLS-CONFLICT", "major", f"{subject}: {len(contenders)} {level}(s) tie or are undated with different "
-                                         f"modes or port rules ({names}); the effective mode is unknown, so the workload is not counted strict"))
+                findings.append(_finding("MTLS-CONFLICT", "major", f"{subject}: {len(contenders)} {level}(s) tie or are undated and resolve "
+                                         f"to different modes or port rules ({names}); the effective mode is unknown, so the workload is not counted strict"))
                 mode = "DISABLE" if any(c["mode"] == "DISABLE" for c in contenders) else "PERMISSIVE"
                 source, chosen = f"{level} conflict", None
                 break
@@ -690,7 +730,7 @@ def mtls_coverage(payload: dict) -> dict:
     the pod labels, else the oldest namespace-wide policy, else the mesh-wide policy in the root namespace, else PERMISSIVE;
     mode UNSET at a level defers to the parent. portLevelMtls (selector policies only) can weaken a STRICT workload on single
     ports. A workload counts as strict only when its mode is STRICT and no port is weaker. Same-level policies that tie on
-    creationTimestamp (or are undated) with different modes or port rules are MTLS-CONFLICT (major) and the workload is not
+    creationTimestamp (or are undated) whose effective postures differ, an UNSET mode taking the level below, are MTLS-CONFLICT (major) and the workload is not
     counted strict. `non_strict_workloads` lists the first 100 names; at most 200 namespaces are analysed."""
     return respond(payload, _guarded(_mtls_coverage, payload))
 

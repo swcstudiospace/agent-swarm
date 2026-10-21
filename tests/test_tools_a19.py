@@ -1549,6 +1549,24 @@ def test_schema_compat_tuple_form_items_are_compared_position_by_position():
     assert _backward(base, {"type": "array", "items": STR})["backward_compatible"] is False  # tuple to single form
 
 
+def test_schema_compat_ref_siblings_follow_the_declared_draft():
+    # drafts 3 to 7 ignore the keywords beside a $ref, 2019-09 and later apply them, and an unrecognised draft is refused
+    draft7 = "http://json-schema.org/draft-07/schema#"
+    base = {"$schema": draft7, "$ref": "#/definitions/n", "minimum": 10, "definitions": {"n": {"type": "number"}}}
+    assert _backward(base, {"$schema": draft7, "type": "number", "minimum": 10})["backward_compatible"] is False
+    modern = {"$schema": "https://json-schema.org/draft/2020-12/schema", "$ref": "#/$defs/n", "minimum": 10, "$defs": {"n": {"type": "number"}}}
+    assert _backward(modern, {"type": "number", "minimum": 10})["backward_compatible"] is True
+    unknown = {"$schema": "urn:example:draft", "$ref": "#/$defs/n", "minimum": 10, "$defs": {"n": {"type": "number"}}}
+    invalid("event_schema_compat", {"format": "json-schema", "mode": "backward", "base_schema": json.dumps(unknown), "head_schema": "{}"}, "base_schema")
+
+
+def test_schema_compat_tuple_positions_past_the_source_maxitems_never_occur():
+    # maxItems 1 means no array has a second item, so the second tuple entry may change; a reachable position still fails
+    short = lambda second: {"type": "array", "items": [STR, second], "maxItems": 1}  # noqa: E731
+    assert compat(short(INT), short(STR), "full")["compatible"] is True
+    assert _backward(_tuple_items(STR, INT), _tuple_items(STR, STR))["backward_compatible"] is False
+
+
 def test_schema_compat_pointer_array_index_takes_ascii_digits_without_leading_zero():
     base = {"allOf": [STR], "properties": {"a": {"$ref": "#/allOf/0"}}}
     assert compat(base, copy.deepcopy(base), "full")["compatible"] is True  # index 0 resolves

@@ -316,7 +316,7 @@ class _JsonCompare:
     """Does every instance valid under `sub` stay valid under `sup`? Sound for the supported keyword set: where it cannot
     decide (a keyword in `_UNANALYSED` that differs, a oneOf whose alternatives it cannot prove exclusive, an unresolvable
     pattern) it reports a major finding rather than a pass. Keywords of `sub` that are ignored only make it stricter.
-    Siblings of a `$ref` apply in addition to its target on both sides (Draft 2019-09 and later)."""
+    Siblings of a `$ref` apply in addition to its target on both sides in Draft 2019-09 and later; drafts 3 to 7 ignore them (see _draft)."""
 
     def __init__(self, base, head):
         self.roots = {"base": base, "head": head}
@@ -331,14 +331,18 @@ class _JsonCompare:
 
     def _conjuncts(self, schema, side: str, depth: int = 0) -> list:
         """The schemas whose conjunction `schema` denotes. A `$ref` contributes its target, and its sibling keywords apply
-        in addition (Draft 2019-09 and later, on both sides). Booleans may appear in the list."""
+        in addition (Draft 2019-09 and later; drafts 3 to 7 ignore them, and an unrecognised draft refuses them). Booleans may appear in the list."""
         if depth > _MAX_REF_HOPS:
             raise _Bad(self._field(side), f"$ref chain exceeds {_MAX_REF_HOPS} hops: too long or cyclic")
         if isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
             target = _pointer(self.roots[side], schema["$ref"])
             if target is None:
                 raise _Bad(self._field(side), f"$ref {_safe(schema['$ref'], 60)!r} does not resolve inside the document")
+            if self._draft(side) == "legacy":
+                return self._conjuncts(target, side, depth + 1)
             siblings = self._siblings(schema)
+            if siblings and self._draft(side) == "unknown":
+                raise _Bad(self._field(side), "$schema is not a recognised JSON Schema draft, so the keywords beside a $ref cannot be applied with certainty")
             return [*self._conjuncts(target, side, depth + 1), *([siblings] if siblings else [])]
         if not isinstance(schema, (dict, bool)):
             raise _Bad(self._field(side), "every schema must be an object or a boolean")
@@ -350,6 +354,19 @@ class _JsonCompare:
         if key not in self.cache:
             self.cache[key] = ({k: v for k, v in schema.items() if k != "$ref" and k not in _ANNOTATIONS}, schema)
         return self.cache[key][0]
+
+    def _draft(self, side: str) -> str:
+        """The draft the root `$schema` declares: "legacy" (draft 3 to 7, where a $ref ignores its siblings), "modern" (2019-09 or
+        2020-12, where they apply; also the default when no `$schema` is declared) or "unknown"."""
+        root = self.roots[side]
+        declared = root.get("$schema") if isinstance(root, dict) else None
+        if declared is None:
+            return "modern"
+        if not isinstance(declared, str):
+            return "unknown"
+        if any(f"draft-0{number}" in declared for number in "3467"):
+            return "legacy"
+        return "modern" if "draft/2019-09" in declared or "draft/2020-12" in declared else "unknown"
 
     def _merged(self, parts: list):
         """A schema at least as weak as the conjunction of `parts`, so a proof for it proves the conjunction. None when
@@ -623,11 +640,15 @@ class _JsonCompare:
             # tuple form: position by position, then the schema past the tuples (additionalItems, or items in single form)
             sub_extra, sup_extra = sub.get("additionalItems", True), sup.get("additionalItems", True)
             width = max(len(items) for items in (sub_items, sup_items) if isinstance(items, list))
+            # the source's maxItems bounds the lengths its instances can have: a position past that length never occurs
+            longest = sub.get("maxItems") if _is_num(sub.get("maxItems")) and sub["maxItems"] >= 0 else None
             for index in range(width):
-                self.compare(_position(sub_items, sub_extra, index), ss, _position(sup_items, sup_extra, index), ps,
-                             f"{path}[{index}]", out)
-            self.compare(_position(sub_items, sub_extra, width), ss, _position(sup_items, sup_extra, width), ps,
-                         f"{path}[]", out)
+                if longest is None or index + 1 <= longest:
+                    self.compare(_position(sub_items, sub_extra, index), ss, _position(sup_items, sup_extra, index), ps,
+                                 f"{path}[{index}]", out)
+            if longest is None or width + 1 <= longest:
+                self.compare(_position(sub_items, sub_extra, width), ss, _position(sup_items, sup_extra, width), ps,
+                             f"{path}[]", out)
             return
         self.compare(sub_items, ss, sup_items, ps, f"{path}[]", out)
 

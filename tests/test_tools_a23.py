@@ -213,6 +213,13 @@ def test_authz_negative_matches_in_an_allow_rule_are_not_a_default_deny():
     assert "AUTHZ-NEGATIVE-MATCH" not in ids(ok("mesh_authz_lint", {"policies": [deny], "namespaces": ["a"]}))
 
 
+def test_authz_negative_match_narrowed_by_a_positive_match_is_not_an_open_rule():
+    # only notPaths is negative: the principal still restricts the rule, so it is not allow-everything and the namespace stays default-deny
+    narrowed = {"from": [{"source": {"principals": ["cluster.local/ns/web/sa/frontend"]}}], "to": [{"operation": {"notPaths": ["/admin"]}}]}
+    result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [narrowed]})], "namespaces": ["a"]})
+    assert result["namespaces_without_default_deny"] == [] and "AUTHZ-NEGATIVE-MATCH" not in ids(result)
+
+
 def test_authz_selector_keys_other_than_match_labels_scope_the_policy_and_are_reported():
     expressions = res("api-only", "a", {"selector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["api"]}]}, "rules": []})
     alone = ok("mesh_authz_lint", {"policies": [expressions], "namespaces": ["a"]})
@@ -371,6 +378,15 @@ def test_mtls_conflicts_never_count_strict_whatever_the_names_or_timestamps():
                pa("new", "a", "PERMISSIVE", {"app": "x"}, created="2026-02-01T00:00:00Z")]
     result = ok("mesh_mtls_coverage", {"peer_authentications": decided, "workloads": [wl("a", "x", app="x")]})
     assert result["strict_count"] == 1 and "MTLS-CONFLICT" not in ids(result)
+
+
+def test_mtls_unset_policy_tied_with_a_strict_one_inherits_the_level_below():
+    # undated namespace policies STRICT and UNSET tie; under a STRICT mesh policy UNSET is STRICT too, so they agree and nothing conflicts
+    tied = [pa("strict", "a", "STRICT"), pa("unset", "a")]
+    under_mesh = ok("mesh_mtls_coverage", {"peer_authentications": [pa("mesh", "istio-system", "STRICT")] + tied, "workloads": [wl("a", "x", app="x")]})
+    assert under_mesh["strict_count"] == 1 and "MTLS-CONFLICT" not in ids(under_mesh)
+    alone = ok("mesh_mtls_coverage", {"peer_authentications": tied, "workloads": [wl("a", "x", app="x")]})
+    assert alone["strict_count"] == 0 and severity(alone, "MTLS-CONFLICT") == "major"
 
 
 def test_mtls_selector_keys_other_than_match_labels_and_empty_workloads_are_refused():

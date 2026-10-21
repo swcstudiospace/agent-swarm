@@ -1927,6 +1927,12 @@ def test_dockerfile_lint_env_values_expand_in_order_before_user():
     assert ids(unresolved) == ["docker.final-user-unresolved"] and unresolved["verdict"] == "fail"
 
 
+def test_dockerfile_lint_env_pairs_of_one_instruction_expand_against_the_earlier_environment():
+    # Docker expands every pair of one ENV against the environment from before it: V takes the earlier U=app, not this instruction's root
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV U=app\nENV U=root V=$U\nUSER $V\nHEALTHCHECK CMD true\n")) == []
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV U=root\nENV U=app V=$U\nUSER $V\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+
+
 def test_signature_policy_never_echoes_a_credential_without_a_scheme():
     result = ok("supply_signature_policy", {"signatures": [
         {"signer": "u:hunter2@host/x", "issuer": "https://issuer.example", "verified": False, "in_transparency_log": True},
