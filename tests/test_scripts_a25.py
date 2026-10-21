@@ -206,7 +206,7 @@ def test_statefulset_and_daemonset_handling(tmp_path):
 
 @pytest.mark.parametrize(("spread", "anti", "expected"), [
     (None, None, {"spread-missing": "major"}),
-    ([{"maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule"}], None, {"zone-spread-missing": "minor"}),
+    ([{"maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule"}], None, {"zone-spread-missing": "major"}),
     ([{"maxSkew": 1, "topologyKey": ZONE, "whenUnsatisfiable": "ScheduleAnyway"}], None, {"zone-spread-soft-only": "minor"}),
     ([{"maxSkew": 1, "topologyKey": ZONE, "whenUnsatisfiable": "DoNotSchedule"}], None, {}),
     (None, {"requiredDuringSchedulingIgnoredDuringExecution": [{"topologyKey": ZONE, "labelSelector": {}}]}, {}),
@@ -265,13 +265,15 @@ def test_exec_probe_commands_with_credentials_never_reach_the_output(tmp_path, c
     assert canary not in json.dumps(data) and "Sup3rS3cret" not in json.dumps(data)
 
 
-def test_rejected_manifest_values_are_echoed_truncated(tmp_path):
-    long = "x" * 5000
-    write(tmp_path, "web.json", workload(spread=OK_SPREAD, lifecycle=PRESTOP, grace=long, probes={"readinessProbe": {"httpGet": {"path": "/r", "port": 80}, "periodSeconds": long}}),
+# the first literal is split so no source line has a provider-key shape; the test checks that its first 12 characters are never echoed
+@pytest.mark.parametrize("secret", ["sk" "_live_" "4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a", "x" * 5000])
+def test_rejected_manifest_values_are_never_echoed(tmp_path, secret):
+    write(tmp_path, "web.json", workload(spread=OK_SPREAD, lifecycle=PRESTOP, grace=secret,
+                                         probes={"readinessProbe": {"httpGet": {"path": "/r", "port": 80}, "periodSeconds": secret}}),
           pdb(minAvailable=2))
     data = run_cli(tmp_path)[1]
     assert {f["id"] for f in data["findings"]} == {"shutdown-invalid", "probe-invalid"}
-    assert all(len(f["summary"]) <= 200 for f in data["findings"]), [len(f["summary"]) for f in data["findings"]]
+    assert secret[:12] not in json.dumps(data) and all(len(f["summary"]) <= 200 for f in data["findings"])
 
 
 @pytest.mark.parametrize("probe", [
@@ -295,6 +297,10 @@ def test_probe_values_the_api_would_refuse_are_findings_not_crashes(tmp_path, pr
     (0, PRESTOP, {"grace-zero": "blocker"}),
     (None, PRESTOP, {}),                                        # default 30 s
     (30, None, {"no-prestop": "minor"}),
+    (20, {"preStop": {"exec": {"command": ["sh", "-c", "sleep 30s"]}}}, {"sigkill-before-drain": "blocker"}),
+    (20, {"preStop": {"exec": {"command": ["sh", "-c", "sleep 1m"]}}}, {"sigkill-before-drain": "blocker"}),
+    (20, {"preStop": {"exec": {"command": ["sh", "-c", "sleep 19.5"]}}}, {"thin-margin": "minor"}),
+    (100, {"preStop": {"exec": {"command": ["sh", "-c", "sleep 1m 30s"]}}}, {}),
 ])
 def test_graceful_shutdown_rules(tmp_path, grace, lifecycle, expected):
     write(tmp_path, "web.json", workload(spread=OK_SPREAD, lifecycle=lifecycle, grace=grace), pdb(minAvailable=2))
@@ -346,7 +352,7 @@ def test_yaml_is_reported_as_skipped_when_pyyaml_is_missing_and_json_still_works
     module.yaml = None
     result = module._scan(tmp_path, tmp_path)
     assert result["skipped"] == ["yaml:skipped:tool-missing (1 files)"]
-    assert {f["workload"] for f in result["findings"]} == {"shop/Deployment/jsononly"} and result["status"] == "fail"
+    assert {f["workload"] for f in result["findings"] if f["id"] != "scan/incomplete"} == {"shop/Deployment/jsononly"} and result["status"] == "fail"
     assert result["files_scanned"] == 2
 
 
@@ -355,7 +361,8 @@ def test_template_syntax_and_non_manifests_are_skipped_without_crashing(tmp_path
     (tmp_path / "config.json").write_text('{"name": "not a manifest"}', encoding="utf-8")
     (tmp_path / "broken.json").write_text('{"kind": ', encoding="utf-8")
     code, data = run_cli(tmp_path)
-    assert code == 0 and data["findings"] == [] and data["workloads_checked"] == 0
+    assert code == 1 and data["status"] == "fail" and data["workloads_checked"] == 0
+    assert [f["id"] for f in data["findings"]] == ["scan/incomplete"] and "unparseable:chart.yaml" in data["findings"][0]["summary"]
     assert sorted(s.split(":")[0] + ":" + s.split(":")[1] for s in data["skipped"]) == ["unparseable:broken.json", "unparseable:chart.yaml"]
 
 
@@ -374,8 +381,9 @@ def test_large_binary_and_symlinked_files_are_skipped(tmp_path):
     (root / "linkdir").symlink_to(outside, target_is_directory=True)
     write(root, "ok.json", workload(spread=OK_SPREAD, lifecycle=PRESTOP), pdb(minAvailable=2))
     code, data = run_cli(root)
-    assert code == 0 and data["findings"] == [] and data["workloads_checked"] == 1
-    assert data["files_scanned"] == 3 and data["skipped"] == ["binary:bin.yaml", "too-large:big.json"]
+    assert code == 1 and data["workloads_checked"] == 1 and [f["id"] for f in data["findings"]] == ["scan/incomplete"]
+    assert data["files_scanned"] == 3
+    assert data["skipped"] == ["binary:bin.yaml", "symlink:linkdir", "symlink:linked.json", "too-large:big.json"]
 
 
 def test_a_file_of_exactly_one_mebibyte_is_still_read(tmp_path):
@@ -390,7 +398,8 @@ def test_scan_stops_at_two_thousand_files(tmp_path):
     for index in range(2001):
         (tmp_path / f"f{index:04d}.json").write_text("{}", encoding="utf-8")
     code, data = run_cli(tmp_path)
-    assert code == 0 and data["files_scanned"] == 2000 and data["skipped"] == ["limit:2000-files"]
+    assert code == 1 and data["files_scanned"] == 2000 and data["skipped"] == ["limit:2000-files"]
+    assert data["status"] == "fail" and [f["id"] for f in data["findings"]] == ["scan/incomplete"]
 
 
 def test_exactly_two_thousand_files_are_not_a_truncation(tmp_path):
@@ -430,6 +439,19 @@ def test_path_that_is_a_symlink_to_outside_the_root_is_refused(tmp_path):
     assert code == 2 and "leaves the repository root" in data["error"]["message"]
 
 
-def test_empty_tree_is_ok(tmp_path):
+def test_empty_tree_is_incomplete(tmp_path):
     code, data = run_cli(tmp_path)
-    assert code == 0 and data["status"] == "ok" and data["files_scanned"] == 0 and data["summary"].startswith("0 finding(s) in 0 workload(s)")
+    assert code == 1 and data["status"] == "fail" and data["files_scanned"] == 0
+    assert [f["id"] for f in data["findings"]] == ["scan/incomplete"] and data["summary"].startswith("1 finding(s) in 0 workload(s)")
+
+
+def test_a_budget_with_no_field_is_reported_once_at_the_budget_file(tmp_path):
+    write(tmp_path, "web.json", workload(spread=OK_SPREAD, lifecycle=PRESTOP))
+    write(tmp_path, "pdb.json", pdb())
+    assert [(f["id"], f["location"]) for f in run_cli(tmp_path)[1]["findings"]] == [("pdb-invalid", "pdb.json")]
+
+
+def test_http_probes_on_different_ports_are_different_targets(tmp_path):
+    probes = {"readinessProbe": {"httpGet": {"path": "/healthz", "port": 8080}}, "livenessProbe": {"httpGet": {"path": "/healthz", "port": 9090}}}
+    write(tmp_path, "web.json", workload(spread=OK_SPREAD, lifecycle=PRESTOP, probes=probes), pdb(minAvailable=2))
+    assert run_cli(tmp_path)[1]["findings"] == []

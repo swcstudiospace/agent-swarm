@@ -1059,7 +1059,8 @@ def test_quorum_without_a_budget_is_a_major_finding_and_reports_minus_one():
     ({"max_unavailable": "2"}, 2, {("pdb-allows-quorum-loss", "etcd"): "blocker"}),
     ({"min_available": "2"}, 1, {}),
     ({"min_available": "1"}, 2, {("pdb-allows-quorum-loss", "etcd"): "blocker"}),
-    ({"min_available": "3"}, 0, {("pdb-blocks-drains", "etcd"): "minor"}),
+    ({"min_available": "3"}, 0, {("pdb-blocks-eviction", "etcd"): "major"}),
+    ({"min_available": "5"}, 0, {("pdb-unsatisfiable", "etcd"): "blocker"}),
     ({"max_unavailable": "33%"}, 1, {}),
 ])
 def test_quorum_budget_is_compared_with_the_fault_tolerance(budget, allowed, expected):
@@ -1081,8 +1082,35 @@ def test_quorum_zone_loss_breaks_a_lopsided_placement_and_zone_requirements_are_
 def test_quorum_even_member_counts_add_no_tolerance_unless_the_quorum_is_overridden():
     result = quorum(replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1")
     assert found(result) == {("even-member-count", "etcd"): "minor"} and result["fault_tolerance"] == 1
-    custom = quorum(replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1", quorum_size=2)
-    assert custom["fault_tolerance"] == 2 and "even-member-count" not in rules(custom)
+    custom = quorum(replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1", quorum_size=3)
+    assert custom["fault_tolerance"] == 1 and found(custom) == {}                 # a majority override is allowed
+
+
+def test_sub_majority_quorum_blocks_consensus_stores_and_is_allowed_when_consensus_is_false():
+    sub = quorum(replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1", quorum_size=2)
+    assert sub["fault_tolerance"] == 2 and found(sub) == {("quorum-below-majority", "etcd"): "blocker"} and sub["status"] == "fail"
+    kafka = quorum(workload="kafka", replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1", quorum_size=2, consensus=False)
+    assert kafka["fault_tolerance"] == 2 and found(kafka) == {}                   # min.insync.replicas: non-consensus, no finding
+
+
+def test_kafka_in_the_workload_name_does_not_exempt_a_consensus_quorum():
+    named = quorum(workload="kafka-metadata-etcd", replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1", quorum_size=2)
+    assert found(named) == {("quorum-below-majority", "kafka-metadata-etcd"): "blocker"} and named["status"] == "fail"
+
+
+def test_etcd_named_quorum_is_allowed_only_when_consensus_is_explicitly_false():
+    off = quorum(workload="etcd", replicas=4, members_per_zone=[1, 1, 1, 1], max_unavailable="1", quorum_size=2, consensus=False)
+    assert found(off) == {} and off["fault_tolerance"] == 2
+
+
+def test_member_counts_are_singular_for_one_member_in_findings():
+    one = quorum(replicas=3, members_per_zone=[1, 1, 1], unavailable_members=1, max_unavailable="1")
+    assert found(one) == {("no-failure-headroom", "etcd"): "major"}
+    assert "1 member down: one more loss breaks quorum" in {f["summary"] for f in one["findings"]}
+    solo = quorum(replicas=1, members_per_zone=[1], max_unavailable="1")
+    summaries = {f["summary"] for f in solo["findings"]}
+    assert "1 member with quorum 1 tolerates no failure" in summaries
+    assert "the fullest zone holds 1 of 1 member; losing it leaves 0 < quorum 1" in summaries
 
 
 def test_quorum_no_tolerance_cases():

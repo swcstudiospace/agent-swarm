@@ -155,6 +155,10 @@ def _fmt(value) -> str:
     return f"{number:.6f}".rstrip("0").rstrip(".")
 
 
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
 # --- PodDisruptionBudget arithmetic (shared by resil_pdb_check and resil_quorum_safety) ---------------------------
 
 
@@ -967,10 +971,14 @@ def quorum_safety(payload: dict) -> dict:
     quorum = floor(n / 2) + 1 unless quorum_size overrides it; fault tolerance = n - quorum. A zone may hold at most
     fault-tolerance members to survive its loss, so min_zones_required = ceil(n / tolerance) (-1 when tolerance is 0).
     pdb_disruptions_allowed is the budget with all members ready (-1 without a PodDisruptionBudget).
-    Rules: quorum-lost (blocker, unavailable members > tolerance), no-failure-headroom (major, unavailable ==
-    tolerance > 0), no-fault-tolerance (major, tolerance 0), even-member-count (minor, default quorum and even n),
-    zone-loss-breaks-quorum (major), pdb-missing (major, n >= 2), pdb-allows-quorum-loss (blocker, the budget
-    permits more simultaneous evictions than the tolerance), pdb-blocks-drains (minor, 0 allowed with tolerance >= 1),
+    Rules: quorum-lost (blocker, unavailable members > tolerance), quorum-below-majority (blocker, a quorum_size under the
+    majority when consensus is true, the default: a consensus store can split brain; consensus false is a non-consensus
+    replica set such as Kafka min.insync.replicas, where a quorum below majority is allowed and reports no finding),
+    no-failure-headroom (major, unavailable == tolerance > 0), no-fault-tolerance (major, tolerance 0),
+    even-member-count (minor, default quorum and even n), zone-loss-breaks-quorum (major), pdb-missing (major,
+    n >= 2), pdb-unsatisfiable (blocker, desired healthy above n: the rule of resil_pdb_check), pdb-allows-quorum-loss
+    (blocker, the budget permits more simultaneous evictions than the tolerance), pdb-blocks-eviction (major, 0 allowed with
+    tolerance >= 1: the rule of resil_pdb_check),
     zone-loss-while-degraded (major, some but fewer than tolerance members down, and losing the fullest zone on top
     would drop below quorum; down members assumed outside that zone; at tolerance no-failure-headroom already applies),
     survives_zone_loss describes the healthy cluster. Only majority arithmetic: learners,
@@ -983,6 +991,7 @@ def quorum_safety(payload: dict) -> dict:
         if sum(zones) != n:
             raise _Invalid("members_per_zone", f"members_per_zone sums to {sum(zones)} but replicas is {n}")
         custom = payload.get("quorum_size")
+        consensus = payload.get("consensus", True)
         if custom is not None and custom > n:
             raise _Invalid("quorum_size", "quorum_size cannot exceed replicas")
         unavailable = payload["unavailable_members"]
@@ -995,22 +1004,30 @@ def quorum_safety(payload: dict) -> dict:
         worst = max(zones)
         survives = n - worst >= quorum
         findings: list[dict] = []
+        majority = n // 2 + 1
+        if custom is not None and custom < majority and consensus:
+            findings.append(_finding("quorum-below-majority", "blocker", workload,
+                                     f"quorum {custom} is below the majority {majority} of {n} members: two partitions can each reach "
+                                     "quorum and diverge; set consensus false only for a non-consensus replica set such as Kafka"))
         if unavailable > tolerance:
-            findings.append(_finding("quorum-lost", "blocker", workload, f"{unavailable} unavailable members exceed the tolerance of {tolerance}: no quorum"))
+            findings.append(_finding("quorum-lost", "blocker", workload,
+                                     f"{_count(unavailable, 'member')} down, more than the tolerance of {tolerance}: no quorum"))
         elif unavailable == tolerance and unavailable > 0:
-            findings.append(_finding("no-failure-headroom", "major", workload, f"{unavailable} members are down: one more loss breaks quorum"))
+            findings.append(_finding("no-failure-headroom", "major", workload,
+                                     f"{_count(unavailable, 'member')} down: one more loss breaks quorum"))
         if tolerance == 0:
-            findings.append(_finding("no-fault-tolerance", "major", workload, f"{n} members with quorum {quorum} tolerate no failure"))
+            verb = "tolerates" if n == 1 else "tolerate"
+            findings.append(_finding("no-fault-tolerance", "major", workload, f"{_count(n, 'member')} with quorum {quorum} {verb} no failure"))
         if custom is None and n % 2 == 0:
             findings.append(_finding("even-member-count", "minor", workload,
                                      f"{n} members tolerate {tolerance} failures, the same as {n - 1}: the extra member adds cost, not safety"))
         if not survives:
             findings.append(_finding("zone-loss-breaks-quorum", "major", workload,
-                                     f"the fullest zone holds {worst} of {n} members; losing it leaves {n - worst} < quorum {quorum}"))
+                                     f"the fullest zone holds {worst} of {_count(n, 'member')}; losing it leaves {n - worst} < quorum {quorum}"))
         elif 0 < unavailable < tolerance and n - worst - unavailable < quorum:
             # survives_zone_loss describes a healthy cluster; members already down (assumed outside the lost zone) shrink it
             findings.append(_finding("zone-loss-while-degraded", "major", workload,
-                                     f"{unavailable} members are already down: losing the fullest zone ({worst} members) as well can leave "
+                                     f"{_count(unavailable, 'member')} already down: losing the fullest zone ({worst} members) as well can leave "
                                      f"{n - worst - unavailable} < quorum {quorum}"))
         allowed = -1
         if desired is None:
@@ -1018,11 +1035,14 @@ def quorum_safety(payload: dict) -> dict:
                 findings.append(_finding("pdb-missing", "major", workload, "no PodDisruptionBudget: parallel node drains can evict beyond the quorum tolerance"))
         else:
             allowed = max(0, n - desired)
-            if allowed > tolerance:
+            if desired > n:
+                findings.append(_finding("pdb-unsatisfiable", "blocker", workload,
+                                         f"budget demands {desired} healthy members of {n}: every eviction is refused"))
+            elif allowed > tolerance:
                 findings.append(_finding("pdb-allows-quorum-loss", "blocker", workload,
                                          f"budget allows {allowed} simultaneous evictions but quorum tolerates {tolerance}"))
             elif allowed == 0 and tolerance >= 1:
-                findings.append(_finding("pdb-blocks-drains", "minor", workload, "budget allows 0 evictions: node drains and upgrades stall"))
+                findings.append(_finding("pdb-blocks-eviction", "major", workload, "budget allows 0 evictions: node drains and upgrades stall"))
         findings = _ordered(findings)
         return {"state": "SUCCESS", "quorum": quorum, "fault_tolerance": tolerance, "zones_occupied": sum(count > 0 for count in zones),
                 "worst_zone_members": worst, "survives_zone_loss": survives, "max_members_per_zone": tolerance,

@@ -10,25 +10,31 @@ Rules, shared with the A25 tools where one exists (swarm/tools/a25_tools.py):
     minReplicas when an HPA targets the workload, else spec.replicas, default 1), plus pdb-multiple (blocker: the
     eviction API refuses pods covered by more than one PDB) and pdb-invalid.
   * topology spread (replicas >= 2): spread-missing (major, no spread or anti-affinity at all), zone-spread-missing
-    (minor, none keyed on the zone label), zone-spread-soft-only (minor), deprecated-zone-label (minor).
+    (major, none keyed on the zone label), zone-spread-soft-only (minor), deprecated-zone-label (minor).
   * probes: resil_probe_check per container (liveness-missing is not reported, liveness is optional); a container with
     ports counts as serving traffic; probe-invalid (major) for values the API would refuse.
   * graceful shutdown: resil_shutdown_check with the grace period (default 30 s) and the longest preStop hook (sleep
-    action or `sleep N` command); no-prestop (minor, serving pod without a preStop hook); shutdown-invalid.
-Bounded: files over 1 MiB, binary files and symlinks are skipped, at most 2000 candidate files are read. Without
-PyYAML, YAML files are not read and `skipped` carries "yaml:skipped:tool-missing (N files)". No external binary
-is required. Read-only: it writes nothing. `--dry-run` prints deterministic canned output and touches nothing.
+    action, or `sleep N` commands whose N may carry an s, m, h or d suffix and add up); no-prestop (minor, serving pod
+    without a preStop hook); shutdown-invalid.
+Bounded: files over 1 MiB are skipped, at most 2000 candidate files are read, and symlinks are never followed. Every skip,
+a truncated walk and each YAML file read without PyYAML (`skipped` carries "yaml:skipped:tool-missing (N files)") adds a
+major scan-incomplete finding; an empty scan is incomplete too, so `status` is "fail" until every in-scope input is
+analysed (swarm/scan_status.py). No external binary is required. Read-only: it writes nothing. `--dry-run` prints
+deterministic canned output and touches nothing.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a25_tools  # noqa: E402
 
@@ -44,7 +50,10 @@ EXTENSIONS = {".yaml", ".yml", ".json"}
 POD_WORKLOADS = ("Deployment", "StatefulSet", "DaemonSet")
 SCALED_WORKLOADS = ("Deployment", "StatefulSet")
 ZONE_KEYS = {a25_tools.ZONE_KEY, a25_tools.LEGACY_ZONE_KEY}
-SLEEP = re.compile(r"(?:^|[\s;&|(])sleep\s+(\d+)\b")
+DURATION = r"\d+(?:\.\d+)?[smhd]?"
+SLEEP = re.compile(rf"(?:^|[\s;&|(])sleep\s+((?:{DURATION}(?=[\s;&|)]|$)\s*)+)")
+SLEEP_TOKEN = re.compile(r"(\d+(?:\.\d+)?)([smhd]?)")
+SLEEP_UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 PROBE_FIELDS = {"initialDelaySeconds": "initial_delay_seconds", "periodSeconds": "period_seconds", "timeoutSeconds": "timeout_seconds",
                 "successThreshold": "success_threshold", "failureThreshold": "failure_threshold"}
 PROBE_LIMITS = {"initial_delay_seconds": (0, 86400), "period_seconds": (1, 86400), "timeout_seconds": (1, 86400),
@@ -66,21 +75,40 @@ def _int(value, default: int | None = None) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
-def _candidates(target: Path) -> tuple[list[Path], bool]:
-    """Sorted candidate manifest files below target (never following symlinks), and whether the cap cut the walk short."""
+def _candidates(target: Path) -> tuple[list[Path], list[str], bool]:
+    """Sorted candidate manifest files below target, the skip reasons of symlinks, and whether the cap cut the walk short.
+
+    Symlinks are never followed: a symlinked file or directory is a reason, not a silent skip.
+    """
     if target.is_file():
-        return ([target] if target.suffix in EXTENSIONS and not target.is_symlink() else []), False
+        if target.suffix not in EXTENSIONS:
+            return [], [], False
+        if target.is_symlink():
+            return [], [f"symlink:{target.name}"], False
+        return [target], [], False
     found: list[Path] = []
+    reasons: list[str] = []
     for directory, dirnames, filenames in os.walk(target, followlinks=False):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not (Path(directory) / d).is_symlink())
+        kept = []
+        for name in sorted(dirnames):
+            if name in SKIP_DIRS:
+                continue
+            if (Path(directory) / name).is_symlink():
+                reasons.append(f"symlink:{name}")
+                continue
+            kept.append(name)
+        dirnames[:] = kept
         for filename in sorted(filenames):
             path = Path(directory) / filename
-            if path.suffix not in EXTENSIONS or path.is_symlink():
+            if path.suffix not in EXTENSIONS:
+                continue
+            if path.is_symlink():
+                reasons.append(f"symlink:{filename}")
                 continue
             if len(found) >= MAX_FILES:
-                return found, True
+                return found, reasons, True
             found.append(path)
-    return found, False
+    return found, reasons, False
 
 
 def _documents(path: Path, skipped: list[str], yaml_skipped: list[int]) -> list[dict]:
@@ -154,7 +182,10 @@ def _probe(raw, name: str) -> dict | None:
         return None
     raw = _d(raw)
     if "httpGet" in raw:
-        kind, endpoint = "http", str(_d(raw["httpGet"]).get("path", "/"))
+        http = _d(raw["httpGet"])
+        # the target is scheme, host, port and path: the same path on two ports is two targets
+        parts = (http.get("scheme", "HTTP"), http.get("host", ""), http.get("port", ""), http.get("path", "/"))
+        kind, endpoint = "http", "|".join(str(part) for part in parts)
     elif "tcpSocket" in raw:
         kind, endpoint = "tcp", str(_d(raw["tcpSocket"]).get("port", ""))
     elif "grpc" in raw:
@@ -169,9 +200,18 @@ def _probe(raw, name: str) -> dict | None:
             low, high = PROBE_LIMITS[target]
             value = _int(raw[source])
             if value is None or not low <= value <= high:
-                raise ValueError(f"{name} probe {source}={str(raw[source])[:40]!r} is outside {low}..{high}")
+                raise ValueError(f"{name}.{source} must be an integer in {low}..{high}")
             probe[target] = value
     return probe
+
+
+def _sleep_seconds(command: str) -> int:
+    """Seconds of every `sleep` in a shell command, rounded up. Sequential sleeps add up: never under-count a drain."""
+    total = Decimal(0)
+    for match in SLEEP.finditer(command):
+        for number, unit in SLEEP_TOKEN.findall(match.group(1)):
+            total += Decimal(number) * SLEEP_UNIT_S[unit]
+    return math.ceil(total)
 
 
 def _prestop_seconds(containers: list) -> int:
@@ -180,10 +220,7 @@ def _prestop_seconds(containers: list) -> int:
         handler = _d(_d(_d(container).get("lifecycle")).get("preStop"))
         seconds = _int(_d(handler.get("sleep")).get("seconds"), 0) or 0
         command = " ".join(str(part) for part in _l(_d(handler.get("exec")).get("command")))
-        match = SLEEP.search(command)
-        if match:
-            seconds = max(seconds, int(match.group(1)))
-        longest = max(longest, seconds)
+        longest = max(longest, seconds, _sleep_seconds(command))
     return longest
 
 
@@ -207,7 +244,7 @@ def _spread(podspec: dict, replicas: int) -> list[tuple[str, str, str]]:
     if not keys:
         out.append(("spread-missing", "major", f"{replicas} replicas with no topologySpreadConstraints or podAntiAffinity: they may share one node or zone"))
     elif not zone_hard and not zone_soft:
-        out.append(("zone-spread-missing", "minor", f"spread rules exist but none use {a25_tools.ZONE_KEY}: a zone outage can take every replica"))
+        out.append(("zone-spread-missing", "major", f"spread rules exist but none use {a25_tools.ZONE_KEY}: a zone outage can take every replica"))
     elif not zone_hard:
         out.append(("zone-spread-soft-only", "minor", "zone spread is only preferred (ScheduleAnyway or preferred anti-affinity)"))
     if a25_tools.LEGACY_ZONE_KEY in keys:
@@ -218,13 +255,18 @@ def _spread(podspec: dict, replicas: int) -> list[tuple[str, str, str]]:
 def _scan(root: Path, target: Path) -> dict:
     skipped: list[str] = []
     yaml_skipped = [0]
-    files, truncated = _candidates(target)
+    files, reasons, truncated = _candidates(target)
+    skipped.extend(reasons)
     if truncated:
         skipped.append(f"limit:{MAX_FILES}-files")
+    analysed = 0
     objects: list[tuple[str, dict]] = []
     for path in files:
         rel = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
+        before = (len(skipped), yaml_skipped[0])
         objects.extend((rel, obj) for obj in _documents(path, skipped, yaml_skipped))
+        if (len(skipped), yaml_skipped[0]) == before:
+            analysed += 1
     if yaml_skipped[0]:
         skipped.append(f"yaml:skipped:tool-missing ({yaml_skipped[0]} files)")
 
@@ -263,8 +305,12 @@ def _scan(root: Path, target: Path) -> dict:
                 add("pdb-multiple", "blocker", f"{len(matching)} PodDisruptionBudgets select these pods ({', '.join(meta(p)[1] for _, p in matching)}): "
                     "the eviction API refuses pods covered by more than one budget", rel, ref)
             payload = {"workloads": [{"name": name, "kind": kind, "replicas": replicas}]}
-            if matching:
-                pspec = _d(matching[0][1].get("spec"))
+            pspec = _d(matching[0][1].get("spec")) if matching else {}
+            if matching and not any(key in pspec for key in ("minAvailable", "maxUnavailable")):
+                # the budget is reported once, as invalid: an empty budget is not also reported as a missing one
+                add("pdb-invalid", "major", f"PodDisruptionBudget {meta(matching[0][1])[1]} sets neither minAvailable nor maxUnavailable",
+                    matching[0][0], ref)
+            else:
                 entry = payload["workloads"][0]
                 for source, target_key in (("minAvailable", "min_available"), ("maxUnavailable", "max_unavailable")):
                     if source in pspec:
@@ -272,15 +318,12 @@ def _scan(root: Path, target: Path) -> dict:
                 policy = pspec.get("unhealthyPodEvictionPolicy")
                 if policy in ("IfHealthyBudget", "AlwaysAllow"):
                     entry["unhealthy_pod_eviction_policy"] = policy
-            if matching and not any(key in _d(matching[0][1].get("spec")) for key in ("minAvailable", "maxUnavailable")):
-                add("pdb-invalid", "major", f"PodDisruptionBudget {meta(matching[0][1])[1]} sets neither minAvailable nor maxUnavailable",
-                    matching[0][0], ref)
-            result = a25_tools.pdb_check(payload)
-            if result["state"] == "INVALID_INPUT":
-                add("pdb-invalid", "major", result["message"], matching[0][0] if matching else rel, ref)
-            else:
-                for f in result["findings"]:
-                    add(f["id"], f["severity"], f["summary"], matching[0][0] if matching and f["id"] != "pdb-missing" else rel, ref)
+                result = a25_tools.pdb_check(payload)
+                if result["state"] == "INVALID_INPUT":
+                    add("pdb-invalid", "major", result["message"], matching[0][0] if matching else rel, ref)
+                else:
+                    for f in result["findings"]:
+                        add(f["id"], f["severity"], f["summary"], matching[0][0] if matching and f["id"] != "pdb-missing" else rel, ref)
             # --- topology spread ---
             for rule, severity, summary in _spread(podspec, replicas):
                 add(rule, severity, summary, rel, ref)
@@ -312,7 +355,7 @@ def _scan(root: Path, target: Path) -> dict:
         # --- graceful shutdown ---
         grace = podspec.get("terminationGracePeriodSeconds", 30)
         if _int(grace) is None or not 0 <= grace <= 86400:
-            add("shutdown-invalid", "major", f"terminationGracePeriodSeconds={str(grace)[:40]!r} is not an integer in 0..86400", rel, ref)
+            add("shutdown-invalid", "major", "terminationGracePeriodSeconds must be an integer in 0..86400", rel, ref)
         else:
             prestop = _prestop_seconds(containers)
             result = a25_tools.shutdown_check({
@@ -323,10 +366,11 @@ def _scan(root: Path, target: Path) -> dict:
             if serves and not _has_prestop(containers):
                 add("no-prestop", "minor", "serving pod without a preStop hook: endpoint removal races SIGTERM; add a short preStop sleep "
                     "or confirm the app keeps serving while it drains", rel, ref)
+    for incomplete in incomplete_findings(skipped, analysed):
+        findings.append({**incomplete, "location": ".", "workload": ""})
     findings.sort(key=lambda f: (a25_tools.SEVERITIES.index(f["severity"]), f["location"], f["workload"], f["id"], f["summary"]))
     counts = {severity: sum(f["severity"] == severity for f in findings) for severity in a25_tools.SEVERITIES}
-    failed = counts["blocker"] + counts["major"] > 0
-    return {"status": "fail" if failed else "ok", "findings": findings, "files_scanned": len(files), "workloads_checked": workloads,
+    return {"status": scan_status(findings), "findings": findings, "files_scanned": len(files), "workloads_checked": workloads,
             "pdbs_found": len(pdbs), "counts": counts, "skipped": sorted(skipped),
             "summary": f"{len(findings)} finding(s) in {workloads} workload(s) across {len(files)} file(s): "
                        f"{counts['blocker']} blocker, {counts['major']} major, {counts['minor']} minor, {counts['info']} info"}
