@@ -2,7 +2,7 @@
 
 # A07 DATA — Data Engineer — skills
 
-Owner: `a07-data`. 12 skill(s), 39871 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a07-data`. 12 skill(s), 39859 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

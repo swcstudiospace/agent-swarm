@@ -19,7 +19,7 @@ disable-model-invocation: true
 8. Call `shared_artifact_digest` for the forward and rollback files, then build the handover (see Handover).
 
 ## Outputs
-- schema.migration JSON per 03-agents/A07-data.md section 3 with `kind: "additive"`, `destructive: false`, `approval_required: "none"`, `requires_lock_timeout_s` set.
+- schema.migration JSON per agents/A07-data.md section 3 with `kind: "additive"`, `destructive: false`, `approval_required: "none"`, `requires_lock_timeout_s` set.
 - Lint evidence: script findings, `unsafe_count`, `violation_count`, `risk_count`, `ok`.
 - `shadow_tested` stays false until rehearsal runs (this skill does not run it).
 

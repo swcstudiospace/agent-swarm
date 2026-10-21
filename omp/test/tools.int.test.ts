@@ -73,10 +73,10 @@ const RESULT = {
   summary_md: "patched",
 };
 
-test("plan dry: every advertised pattern plans (feature 13, hotfix 8, dependency 8, parallel 5)", async () => {
+test("plan dry: every advertised pattern plans (feature 13, hotfix 8, dependency 8, cloud-native 16, cluster 12, web3 14, parallel 5)", async () => {
   const { ctx } = tmpStore();
   const { tool } = swarm();
-  const expected: Record<string, number> = { feature: 13, hotfix: 8, dependency: 8, parallel: 5 };
+  const expected: Record<string, number> = { feature: 13, hotfix: 8, dependency: 8, "cloud-native": 16, cluster: 12, web3: 14, parallel: 5 };
   // the schema must not advertise a pattern (e.g. `custom`) that python always rejects through this tool
   const props = tool("swarm_plan").parameters.properties;
   const pattern = props && typeof props === "object" && "pattern" in props ? props.pattern : undefined;

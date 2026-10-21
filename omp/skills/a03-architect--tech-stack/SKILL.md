@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 ## When to Use
 - Producing or revising `tech.stack.selection` for a blueprint, or when a task needs a library, datastore or service not yet selected.
-- Rule (03-agents/A03 section 4.1): choose from the approved catalog's golden path first; a catalog miss is proposed through an ADR, L3 when it brings new infrastructure or a new first-party dependency.
+- Rule (agents/A03 section 4.1): choose from the approved catalog's golden path first; a catalog miss is proposed through an ADR, L3 when it brings new infrastructure or a new first-party dependency.
 - The ADR mechanics are in `skill://a03-architect--adr-record`; this skill decides what to pick and which supply-chain evidence to require.
 
 ## Procedure

@@ -33,7 +33,7 @@ Don't use for: Do not add unrelated features.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: incident.alert, vulnerability.report, release.record, test.results.
+2. Read upstream artifacts in consumes: incident.alert, vulnerability.report, release.record, test.results, platform.scorecard, vex.statements, policy.exception.register, sbom.bundle.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only patch.task, debt.register, rca.report, dependency.bump.
 5. Finish with markdown summary + one fenced json `task.result`.

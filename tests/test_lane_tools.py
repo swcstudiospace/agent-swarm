@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_every_agent_has_lane_tools_within_the_capability_policy():
     data = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
     ceiling = data["capability_policy"]["tools"]["max"]
-    assert len(data["agents"]) == 15
+    assert len(data["agents"]) == 30
     for agent in data["agents"]:
         tools = agent["registered_tools"]
         assert 1 <= len(tools) <= ceiling, agent["id"]

@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- Pulling or pushing to the registry or CDN fails, or the credential provider is unreachable (03-agents/A11-devops.md section 5, prompt error_handling).
+- Pulling or pushing to the registry or CDN fails, or the credential provider is unreachable (agents/A11-devops.md section 5, prompt error_handling).
 - The failure is an outage, not a failed apply (`skill://a11-devops--apply-recovery`).
 
 ## Procedure

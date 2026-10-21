@@ -76,8 +76,6 @@ export type WidgetFactory = (tui: WidgetHost, theme: Theme) => WidgetComponent;
 /** The `ctx.ui` members used here. `string[]` widgets are capped at 10 lines and are RPC-compatible; factories are TUI-only. */
 export interface ExtensionUIContext {
   notify(message: string, level?: "info" | "warning" | "error"): void;
-  /** Footer status text keyed per extension; `undefined` clears it. Rendered key-sorted inside the shared status segment. */
-  setStatus?(key: string, text: string | undefined): void;
   /** Custom card above (`aboveEditor`) or below the composer. Not a transcript toast. `undefined` removes the key. */
   setWidget?(key: string, content: string[] | WidgetFactory | undefined, options?: { placement?: WidgetPlacement }): void;
 }

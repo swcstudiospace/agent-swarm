@@ -5,7 +5,7 @@ disable-model-invocation: true
 ---
 
 ## When to Use
-- The upstream artifact (`api.contract`, `adr.set`, `release.record`) is missing, empty or unreadable (03-agents/A15-docs.md section 5: stub with `auto-extracted` signatures and `stale: true`).
+- The upstream artifact (`api.contract`, `adr.set`, `release.record`) is missing, empty or unreadable (agents/A15-docs.md section 5: stub with `auto-extracted` signatures and `stale: true`).
 - Not when the artifact exists: render it with `a15-docs--api-reference` or `a15-docs--adr-render`. The sweep that only flags stale docs is `a15-docs--staleness-sweep`.
 
 ## Procedure

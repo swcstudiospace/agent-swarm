@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from conftest import ROOT, run_script
 
 from swarm.blast_radius import merge_branches, normalize_slices, parallel_rows, prepare_slice_worktree
@@ -109,6 +110,32 @@ def test_high_risk_adds_security_and_release_once():
         {"id": "api", "paths": ["swarm"], "agent": "a05-backend"},
         {"id": "docs", "paths": ["docs"], "agent": "A15"},
     ]), "low")[3][0] == "rev"
+
+
+def test_every_agent_but_the_controller_and_gate_agents_can_own_a_lane_with_its_default_capability():
+    from swarm.manifest import load_manifest
+
+    for agent in load_manifest():
+        raw = [{"id": "one", "paths": ["a"], "agent": agent["id"]}, {"id": "two", "paths": ["b"], "agent": "A05"}]
+        if agent["id"] in {"A01", "A08", "A09", "A10", "A12"}:
+            with pytest.raises(SwarmError, match="control or gate agent"):
+                normalize_slices(raw)
+            continue
+        lane = normalize_slices(raw)[0]
+        assert lane["agent"] == agent["id"] and lane["capability"] in agent["capabilities"], agent["id"]
+
+
+def test_a_new_domain_lane_names_its_capability_or_takes_the_default():
+    lanes = normalize_slices([
+        {"id": "ctr", "paths": ["contracts"], "agent": "A26"},
+        {"id": "gas", "paths": ["gas"], "agent": "A26", "capability": "web3.gas"},
+        {"id": "gitops", "paths": ["k8s"], "capability": "gitops.manifest"},
+    ])
+    assert [(lane["agent"], lane["capability"]) for lane in lanes] == [
+        ("A26", "web3.contract"), ("A26", "web3.gas"), ("A22", "gitops.manifest")]
+    with pytest.raises(SwarmError, match="A26 does not offer ux.spec"):
+        normalize_slices([{"id": "x", "paths": ["a"], "agent": "A26", "capability": "ux.spec"},
+                          {"id": "y", "paths": ["b"], "agent": "A05"}])
 
 
 def test_overlapping_and_single_radii_are_refused(tmp_path):

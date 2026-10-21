@@ -147,8 +147,8 @@ A snapshot of another session (here `another-session`, while this one is `demo-s
 
 State is never colour alone: every state has a distinct glyph, and every state that is not self-evident also has a word. With colour off the bar still reads the same (`●` is used for every spinner in the plain fallback).
 
-- `agent` is clipped to 18 columns, `elapsed` is right-aligned in 6 columns.
-- `~` after the elapsed (`1m07s~`) marks a **detached** specialist: A01 started it as a background job and its `task` call has returned, so no frame and no `live.json` row vouches for it any more. It is still running (the glyph, the state and the ticking elapsed are those of a running row); the `~` says "last known running, not confirmed". It goes when a `live.json` row for the same task lists the specialist, and the row ends by one of the three rules in section 9.
+- `agent` is clipped to 22 columns (the longest agent slug in the roster), `elapsed` is right-aligned in 6 columns.
+- `~` after the elapsed (`1m07s~`) marks a **detached** specialist: A01 started it as a background job and its `task` call has returned, so no frame and no `live.json` row vouches for it any more. It is still running (the glyph, the state and the ticking elapsed are those of a running row); the `~` says "last known running, not confirmed". It goes when a `live.json` row for the same task lists the specialist, and the row ends by one of the three rules in section 8.
 - `activity` is the current tool or intent (`edit swarm/handover.py`), the error of a failed run, `retry 2/3` while the model retries, or `blocked: …` when retries ran out. It is redacted by a port of `swarm/redact.py` (tokens, keys, `Authorization:` and `Cookie:` headers, URL credentials, `NAME=value` and `--password hunter2` style flags, quoted `"password": "x"` / `'password': 'x'` fields and PEM blocks become `[REDACTED]`; both implementations run the shared vectors in `tests/fixtures/redact_cases.json`). A benign assignment or flag never hides a later one (`user=alice,password=x`, `--mode a;--password x`: the scan steps past the benign separator and keeps looking), while a credential name masks its whole value, commas included (`SECRET=a,b,c`), and a credential name swallowed inside that value keeps its own value masked too (`password=a,token: b`). Every detector (names, flags, headers, pairs, userinfo, PEM, token shapes, command lines) reads the ORIGINAL text and only reports the spans it hides; one union step (`redactSpans` / `redact_spans` expose the ranges) replaces each merged span by a single `[REDACTED]`. A token shape, a header, a flag and a name therefore cannot shorten each other's value, the order of detectors is irrelevant, and no value is cut by a length cap: `Cookie: session=<JWT of any length>` goes whole and `SECRET=ghp_<token>,second` masks all of it. `tests/fixtures/redact_generated.json` pins, for both implementations, 6000 seeded option lists, planted-secret cases (secrets of 1 to 5000 characters in about 70 carriers: every byte must be covered), the union property (carriers joined in any order give the union of their spans) and 50 000 seeded random strings whose output and spans must be identical in Python and TypeScript. A name is a credential by its tokens (split on `_ - .` and camelCase): `token`, `secret`, `password`, `credential`, ..., and `key` or `seed` after `api`, `access`, `secret`, `private`, `signing`, `ssh`, `encryption`, `master`, `auth`, `session`, `license`, `client`, `ed25519`, `hmac`, `jwt`, `handoff` or `signer` (so `SWARM_ED25519_KEY`, `SWARM_SIGNING_KEY` and `SUBSTRATE_HANDOFF_KEY` are masked, while `KEYBOARD`, `--key-length`, `sort_key`, `random_seed` and `SWARM_ED25519_PUBLIC_KEY` are not); a name ending in `file` or `path` (`SWARM_ED25519_KEY_FILE`) is a location and stays visible. An unquoted value runs to whitespace, `&` or `;`, so a comma-joined credential list is masked whole; a `Cookie:` / `Authorization:` header value runs to the end of the line (a quote right after `=` opens a quoted cookie value, any other quote ends it). The text is then stripped of control and ANSI characters and clipped. Its budget is 40 columns for up to 2 rows, 24 for up to 4 and 16 beyond that; if the row would not fit it drops to 12 and then to none before a whole row is dropped.
 - Redaction is best effort, not a guarantee. Beyond the carriers above, both implementations mask vendor tokens (GitHub, Stripe, Google, SendGrid, Slack, npm, GitLab, DigitalOcean, Hugging Face, AWS key ids), `<vendor>_KEY=` values that look like credentials (`STRIPE_KEY=`, Azure `AccountKey=`), `NAME    = value` aligned with up to 32 blanks, command-line credentials (`curl -u user:pass`, `mysql -pSECRET`, `sshpass -p`, `docker login -p`, `redis-cli -a`, `sqlcmd -P`, `-passin pass:`; `docker run -u 1000:1000` and `-p 8080:80` are left alone). A command line is read word by word, so no argument is skipped by length or count (`docker login -u admin:<300 characters> -p pw` and a password after twenty options are both masked) and the option may sit in Markdown or prose delimiters (`` `--user admin:x` ``, `(-u a:x)`, `**sshpass -p x**`, `"--user a:x"`: a closing bracket, backtick or emphasis that touches the value goes with it, a closing quote stays); a newline or `;&|` ends the command whose flags are checked, re-serialised JSON pairs (`{\"password\":\"x\"}`), Kubernetes `- name: DB_PASSWORD` / `value:` pairs and YAML block scalars (`password: |`). `sanitizeText` removes bidi marks, zero-width characters and controls before redacting, so a secret split by them cannot re-join after the strip. On the Python side `runlog.emit` keeps `run_id`, `handover_id`, `task_id`, `parent_id` and `correlation_id` as written (identifiers are not free text), so a task id such as `sk-onboarding-flow-v2` keeps its activity and timeout state. Not covered: JSON `{"name": "DB_PASSWORD", "value": "x"}` pairs, a quote inside a quoted value, and any secret without a recognisable name or shape.
 - Order: failed, timed out, stalled, running (starting, handoff), waiting, queued, cancelled, done; ties by longest elapsed, then by creation order. At most 12 rows compete for the line.
@@ -164,7 +164,7 @@ The bar is one of seven states (`BarState`). Each is shown below at widths 40, 8
 
 ### State `idle`
 
-Nothing is live, nothing lingers and there is no telemetry error. The bar stays mounted and says so: row 1 is the dim `○ swarm idle` (with the token chips on its right when a snapshot exists), row 2 the dim `no subagents running`. The status text is cleared.
+Nothing is live, nothing lingers and there is no telemetry error. The bar stays mounted and says so: row 1 is the dim `○ swarm idle` (with the token chips on its right when a snapshot exists), row 2 the dim `no subagents running`.
 
 Width 40:
 
@@ -319,7 +319,7 @@ Width 120:
 
 ### State `active, background specialists`
 
-Most specialists are not blocking: omp runs them as background jobs (`async.enabled`, on by default). A01's `task` call sends one update with `details.async` (`state: "running"`) and returns; A01 then works on with its own tools, and its next frame carries no in-flight details although the specialists keep running. The bar does not call a row `cancelled` for that. It keeps the row running, the elapsed keeps ticking from the bar's own clock, and the row carries a `~` after the elapsed (detached). Here A01 spawned a05-backend and a06-frontend, its call returned, and it is now running bash. How a detached row ends is in section 9.
+Most specialists are not blocking: omp runs them as background jobs (`async.enabled`, on by default). A01's `task` call sends one update with `details.async` (`state: "running"`) and returns; A01 then works on with its own tools, and its next frame carries no in-flight details although the specialists keep running. The bar does not call a row `cancelled` for that. It keeps the row running, the elapsed keeps ticking from the bar's own clock, and the row carries a `~` after the elapsed (detached). Here A01 spawned a05-backend and a06-frontend, its call returned, and it is now running bash. How a detached row ends is in section 8.
 
 Width 40:
 
@@ -506,7 +506,7 @@ Width 120:
 
 ## 3. Settled rows linger
 
-A settled row stays visible for `SWARM_BAR_LINGER_S` (default 20 s) after it settled; failed and timed-out rows stay for `SWARM_BAR_FAIL_LINGER_S` (default 600 s) so a failure is not missed. When the last row goes, the bar returns to its idle rows (it is not unmounted) and the status text is cleared. A new wave (a live run appears while nothing else is live) drops the previous wave's settled rows, failed ones included.
+A settled row stays visible for `SWARM_BAR_LINGER_S` (default 20 s) after it settled; failed and timed-out rows stay for `SWARM_BAR_FAIL_LINGER_S` (default 600 s) so a failure is not missed. When the last row goes, the bar returns to its idle rows (it is not unmounted). A new wave (a live run appears while nothing else is live) drops the previous wave's settled rows, failed ones included.
 
 Edges of both windows, drawn at width 80. The 19 s capture still shows the done rows; at 20 s the bar is idle. Likewise the failed rows at 599 s and 600 s.
 
@@ -595,29 +595,9 @@ Reduced motion:
 ```
 <!-- /capture -->
 
-The bar itself ticks (polls `live.json`, prunes, redraws) once a second only while something is live or a turn or tool call is in flight; otherwise it wakes once, at the moment the first settled row expires, and keeps only the idle watcher of section 7 (one `stat` of `live.json` every `SWARM_BAR_IDLE_POLL_MS`, 2 s by default, no redraw unless the file changed).
+The bar itself ticks (polls `live.json`, prunes, redraws) once a second only while something is live or a turn or tool call is in flight; otherwise it wakes once, at the moment the first settled row expires, and keeps only the idle watcher of section 6 (one `stat` of `live.json` every `SWARM_BAR_IDLE_POLL_MS`, 2 s by default, no redraw unless the file changed).
 
-## 5. The secondary `swarm` status segment
-
-Besides the bar, the extension sets `setStatus("swarm", …)`, which omp renders key-sorted inside the shared status segment (bottom of the screen, see the verified capture below). It is a count of what needs attention: running, waiting, queued and failed (failed includes timed out). It is cleared when none of these is non-zero, so a bar that shows only settled-ok rows has no status text. Text per scenario of section 2:
-
-<!-- capture:status -->
-```text
-idle         (status cleared)
-loading      swarm: 3 run
-active       swarm: 3 run, 1 queued
-every-state  swarm: 3 run, 1 wait, 1 queued, 2 fail
-overflow     swarm: 6 run, 2 queued, 1 fail
-completed    (status cleared)
-failed       swarm: 2 fail
-error        (status cleared)
-error-rows   swarm: 1 run
-in-session   swarm: 3 run, 1 wait
-detached     swarm: 3 run
-```
-<!-- /capture -->
-
-## 6. Headless `-p` and `--mode json`
+## 5. Headless `-p` and `--mode json`
 
 There is no widget without a TUI. The extension prints one stderr line per event, never to stdout, so piped output stays clean: one when a run is first seen (its state then) and one when it settles. A run first seen already settled prints once, as its settle. Agent text on the line is sanitized (one line, no control characters, secrets redacted). From the real controller, for one scripted swarm (one agent completes, one fails):
 
@@ -632,7 +612,7 @@ There is no widget without a TUI. The extension prints one stderr line per event
 
 Format: `[swarm] <agent> <state> <elapsed>` with `<state>` one of `waiting`, `queued`, `starting`, `running`, `handing_off`, `completed`, `failed`, `cancelled`, `timed_out`.
 
-## 7. What feeds the bar
+## 6. What feeds the bar
 
 Three sources, merged per run (a terminal state from any source beats everything; otherwise the richest and freshest wins; the parent's own `task` row speaks only when nothing richer has):
 
@@ -652,11 +632,11 @@ Three sources, merged per run (a terminal state from any source beats everything
 
 The bar renders only in the top-level interactive session (`ctx.hasUI`, `ctx.mode === "tui"`, no subagent identity); subagents themselves never draw it. The token chips are fed separately from the rows (section 1, "Row 1, right: token savings").
 
-## 8. Switches
+## 7. Switches
 
 | Name | Default | Effect |
 |------|---------|--------|
-| `SWARM_BAR=off` | on | The bar (no widget at all), its token chips (no `token-opt:savings` subscription, no `live.json` restore), the status segment and the headless lines are all off (read once, at the first event of the session). |
+| `SWARM_BAR=off` | on | The bar (no widget at all), its token chips (no `token-opt:savings` subscription, no `live.json` restore) and the headless lines are all off (read once, at the first event of the session). |
 | `SWARM_BAR_LINGER_S` | 20 | Seconds a done or cancelled row stays. |
 | `SWARM_BAR_FAIL_LINGER_S` | 600 | Seconds a failed or timed-out row stays. |
 | `SWARM_BAR_REDUCED_MOTION=1` | unset | Freezes the spinner on `●`. |
@@ -666,7 +646,7 @@ The bar renders only in the top-level interactive session (`ctx.hasUI`, `ctx.mod
 | `SWARM_STALL_AFTER_S` | 180 | Scheduler threshold for `! STALL`. |
 | `SWARM_DIR` | `<repo>/.swarm` | Where `live.json` is read. |
 
-## 9. Known behaviour worth knowing
+## 8. Known behaviour worth knowing
 
 - While idle the bar does not poll `live.json`; it `stat`s it every `SWARM_BAR_IDLE_POLL_MS` (2 s) and only a change in mtime or size, or the file appearing or disappearing, wakes the full poll. So a swarm started from another process (a detached `hooks/autonomous_run.py`, a second terminal) is drawn within about two seconds, and a `telemetry unavailable` marker goes when the file is deleted. A file that is already stale or ancient at first sight keeps the old rule: history shows nothing, a swarm that died moments ago shows its single marker. A swarm run through omp's own bash tool is covered as before: a tool call in flight keeps the ticker running, and live rows keep it running after the call returns.
 - Rows show the *scheduler's* view. If `live.json` says `running` and the bus says `completed`, the terminal state wins.
@@ -675,7 +655,7 @@ The bar renders only in the top-level interactive session (`ctx.hasUI`, `ctx.mod
 - A row seen settled never goes back to running: if `live.json` is deleted, goes stale or stops listing a row that it had settled, the row keeps its state and its frozen elapsed until its linger ends.
 - When an agent has unjoinable rows on both sides (several lanes, no task id in the assignment text), the summary counts the larger side, so two genuinely distinct specialists of one agent, one known only to `live.json` and one only to A01's frame, are counted once.
 
-## 10. Verified on omp 18.12.1
+## 9. Verified on omp 18.12.1
 
 Checked against the installed omp (`omp --version` prints `omp/18.12.1`) with the extension loaded from this checkout, no model call made. Method: a scratch git workspace under `/tmp` with a hand-written `.swarm/live.json` (valid `swarm.live.v1`: three running agents with different elapsed, one queued, one stalled, one failed); interactive omp started in a detached tmux session (140×40) as
 
@@ -689,14 +669,13 @@ An isolated profile was used so nothing from the user's own configuration (crede
 
 **Loads cleanly.** The TUI came up with the bar mounted; stderr of the omp process was empty (0 bytes) and the profile's log has no extension, load or swarm entry (only provider-discovery warnings for local model servers that are not running).
 
-**Mounted with real data, elapsed ticking** (the file was written once, never rewritten: the values below are the bar's own extrapolation). The bar sits directly above the editor; the `swarm:` status segment is the text on the status row. First capture 3 s after the TUI was up, second 5 s later; the elapsed of every live row, the swarm clock and the spinner frame advanced by 5 s. The rows were drawn by the content-width layout that the full-width bar replaced; what the recording covers is the ticking, not the width:
+**Mounted with real data, elapsed ticking** (the file was written once, never rewritten: the values below are the bar's own extrapolation). The bar sits directly above the editor. First capture 3 s after the TUI was up, second 5 s later; the elapsed of every live row, the swarm clock and the spinner frame advanced by 5 s. The rows were drawn by the content-width layout that the full-width bar replaced; what the recording covers is the ticking, not the width:
 
 t+3 s
 ```text
 ◖ ⠋ swarm 5m09s │ 4 run │ 1 queued │ 0 done │ 1 fail │ 1 stall │ slots 4/4 ◗
 ◖ ✕ FAIL a10-security  1m11s │ ! STALL a09-reviewer  3m19s │ ⠋ a05-backend  4m21s │ ⠋ a06-frontend  1m44s │ ⠋ a07-data    23s │ +1 more ◗
    … editor …
-   swarm: 4 run, 1 queued, 1 fail      <- status segment
 ```
 
 t+8 s
@@ -704,7 +683,6 @@ t+8 s
 ◖ ⠴ swarm 5m14s │ 4 run │ 1 queued │ 0 done │ 1 fail │ 1 stall │ slots 4/4 ◗
 ◖ ✕ FAIL a10-security  1m11s │ ! STALL a09-reviewer  3m24s │ ⠴ a05-backend  4m26s │ ⠴ a06-frontend  1m49s │ ⠴ a07-data    28s │ +1 more ◗
    … editor …
-   swarm: 4 run, 1 queued, 1 fail      <- status segment
 ```
 
 The failed row (`a10-security`, 1m11s) did not move (settled rows are frozen); the `+1 more` row is the queued `a08-qa`.
@@ -721,7 +699,6 @@ Checked against the installed omp (`omp --version` prints `omp/18.12.2`, Nerd Fo
 ◖ ⠼ swarm 6s │ 3 run │ 0 queued │ 0 done │ 0 fail       query 120ms │ rtk +2.3k │ cost 12c │ turn 1830ms │ before 64.8k · now 48k │ ttft 420ms │ cache 87% │ saved 16.8k ◗
 ◖ ⠼ a05-backend     6s edit swarm/handover.py │ ⠼ a06-frontend     6s bash bun test │ ⠼ a08-qa     6s read docs/swarm-bar.md                                             ◗
    … Ultrathink's bar, omp's own bar, editor …
-   swarm: 3 run      <- status segment
 ```
 
 **The chips narrow by priority and `saved` never moves.** Row 1 at each width, left side and right-hand chips (the swarm itself moved on while the window was resized: an agent completed at t+18 s and one failed at t+24 s, so the counts differ between rows):
@@ -741,15 +718,13 @@ While the swarm was idle, at 170 columns, row 1 read `○ swarm idle` and ten ch
 
 **Another session's snapshot is ignored.** The snapshot of the other session at t+46 s changed nothing: row 1 kept `saved 16.8k` and `cache 87%`. The newer snapshot of this session at t+50 s moved them to `saved 21.4k` and `cache 91%`.
 
-**The status segment.** The status row under the editor read `swarm: 3 run` while three agents ran, `swarm: 1 run, 1 fail` after the failure, and was empty while the swarm was idle.
-
 **After settling.** The bar stayed mounted. Rows lingered as in section 3: with everything settled, row 1 read `✕ swarm 24s │ 0 run │ 0 queued │ 2 done │ 1 fail` and the failed `a08-qa` row stayed after the completed rows had lingered out.
 
 **Next to Ultrathink's bar.** One prompt planned by Ultrathink on the session's own model (the only model call of the recording) while the same feed ran: both bars kept their rows and their full width while the window was resized during planning, to 120, 90, 70 and back to 170 columns. Ultrathink's Graph-of-Thought panel belongs to Ultrathink's widget, so while its graph stage ran it was drawn between the swarm bar and Ultrathink's bar.
 
 **Not covered:** one host version, one theme and one font preset; the swarm's own `live.json` source was not used in this recording (the first recording covers it).
 
-## 11. Refreshing the captures
+## 10. Refreshing the captures
 
 After any change to the renderer, from the repository root:
 
@@ -758,4 +733,4 @@ bun omp/test/fixtures/bar_states.ts --write      # rewrites bar_states.ansi and 
 cd omp && bun test test/render_states.test.ts test/swarm_bar.test.ts
 ```
 
-The script needs omp's own `@oh-my-pi/pi-tui` theme sources (looked up under `$HOME/.local/share/reflex/bun/install/global/` and `$HOME/.bun/install/global/` in `node_modules/@oh-my-pi/pi-tui/src/theme/`; override with `OMP_PI_TUI_THEME_DIR`). The test works without them: it then checks the doc against `bar_states.ansi`, and the colour fixture against the renderer only where the theme package is present. The two recordings in section 10 ("Verified on omp 18.12.1" and the second one on 18.12.2) are recorded observations, not asserted.
+The script needs omp's own `@oh-my-pi/pi-tui` theme sources (looked up under `$HOME/.local/share/reflex/bun/install/global/` and `$HOME/.bun/install/global/` in `node_modules/@oh-my-pi/pi-tui/src/theme/`; override with `OMP_PI_TUI_THEME_DIR`). The test works without them: it then checks the doc against `bar_states.ansi`, and the colour fixture against the renderer only where the theme package is present. The two recordings in section 9 ("Verified on omp 18.12.1" and the second one on 18.12.2) are recorded observations, not asserted.

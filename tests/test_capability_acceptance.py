@@ -14,7 +14,6 @@ from swarm.tool_registry import tool_tier
 
 ROOT = Path(__file__).resolve().parent.parent
 OMP_AGENT_MAX_BYTES = 64 * 1024
-MAX_VISIBLE_OMP_SKILLS = 16
 EXPECTED_SHARED_WRITE = frozenset({
     "shared_handover_write",
     "shared_handover_receipt",
@@ -32,6 +31,8 @@ DOC = json.loads((ROOT / "agents.json").read_text(encoding="utf-8"))
 AGENTS = DOC["agents"]
 SKILLS = sr.load_skills(ROOT)
 AGENT_IDS = [a["slug"] for a in AGENTS]
+# One index skill per agent plus the swarm-orchestrate driver skill; every other omp skill is hidden.
+MAX_VISIBLE_OMP_SKILLS = len(AGENTS) + 1
 
 
 def _frontmatter(path: Path) -> dict[str, str]:
@@ -50,8 +51,8 @@ def _all_tools() -> list[tuple[str, dict]]:
     return out
 
 
-def test_there_are_fifteen_agents():
-    assert len(AGENTS) == 15, f"expected 15 agents, found {len(AGENTS)}"
+def test_there_are_thirty_agents():
+    assert len(AGENTS) == 30, f"expected 30 agents, found {len(AGENTS)}"
 
 
 @pytest.mark.parametrize("slug", AGENT_IDS)

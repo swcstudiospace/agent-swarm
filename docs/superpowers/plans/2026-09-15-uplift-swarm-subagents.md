@@ -14,7 +14,7 @@
 
 - Work only under `agent-swarm/` plus workspace install targets `.claude/agents/a*.md`, `.claude/skills/agent-swarm/`, `.claude/settings.json` (preserve `enabledPlugins`), `.grok/agents/`, `.grok/hooks/agent-swarm.json`. Do not add or commit unrelated repos (`pumpgrok/`, zips, other untracked trees).
 - Every `prompts/A??-*.md` keeps root `<agent id="A\d\d"` and existing tags: `role`, `inputs`, `outputs`, `output_format`, `tools`, `decision_logic`, `autonomy`, `error_handling`, `metrics`, `security`, `constraints`. Add required uplift tags: `system_role`, `scope`, `out_of_scope`, `workflow`, `acceptance_criteria`, `states`, `graph_of_thought`, `graceful_degradation`, `security_and_validation`.
-- Do not invent repository-specific facts (paths, libraries, APIs) that are not in `03-agents/`, `prompts/`, `agents.json`, or `scripts/`.
+- Do not invent repository-specific facts (paths, libraries, APIs) that are not in `agents/`, `prompts/`, `agents.json`, or `scripts/`.
 - Python scripts stay stdlib-only. TypeScript scripts depend only on Bun (no npm packages). Optional binaries degrade to `skipped:tool-missing`.
 - Shared CLI on every agent script (py and ts): `--task-id`, `--correlation-id`, `--root`, `--json`, `--dry-run`. Exit 0 ok / 1 finding-fail / 2 taxonomy error.
 - Claude agent `model:` is `inherit` (never `opus`/`sonnet`/`haiku`). Grok agents use `prompt_mode: full`, `model: inherit`, `permission_mode: default`, `agents_md: true`.
@@ -159,7 +159,7 @@ git commit -m "feat(swarm): dual Claude/Grok agent generator and TS script_base"
 - Test: `agent-swarm/tests/test_swarm.py`
 
 **Interfaces:**
-- Consumes: `03-agents/A??-*.md` (7-section specs), current prompts, `agents.json` scripts lists, Task 1 generator
+- Consumes: `agents/A??-*.md` (7-section specs), current prompts, `agents.json` scripts lists, Task 1 generator
 - Produces: uplifted `<agent>` documents; regenerated dual agent files
 
 - [ ] **Step 1: Expand `test_prompts_are_xml_tagged`**
@@ -184,9 +184,9 @@ Expected: FAIL missing new tags
 
 - [ ] **Step 3: Uplift every prompt**
 
-For each `prompts/A??-*.md`, keep the existing content and **append** (inside `</agent>`) the new tags. Expand from the matching `03-agents/` spec. Density bar: each prompt 250–450 lines. Do not delete existing `<script>` blocks; add a sibling TS invocation.
+For each `prompts/A??-*.md`, keep the existing content and **append** (inside `</agent>`) the new tags. Expand from the matching `agents/` spec. Density bar: each prompt 250–450 lines. Do not delete existing `<script>` blocks; add a sibling TS invocation.
 
-Template to fill per agent (replace AGENT-SPECIFIC with facts from `03-agents/` and the current prompt only):
+Template to fill per agent (replace AGENT-SPECIFIC with facts from `agents/` and the current prompt only):
 
 ```xml
 <system_role>Senior AGENT-NAME. Execute the assignment using repository evidence. Never invent paths or APIs. Fail closed. Single-writer for your artifact class.</system_role>

@@ -7,13 +7,13 @@ tools: [shared_handover_read, data_pii_tag_coverage, shared_escalate, shared_art
 
 ## When to Use
 - A migration or contract adds or retypes a field that could store personal data (email, name, address, identifiers).
-- Rules: a PII field needs classification, masking rule and retention entry before merge; with the classifier down, migrations touching unknown columns are blocked fail-closed with E-POLICY (prompts/A07-data.md decision_logic 4, error_handling; 03-agents section 7).
+- Rules: a PII field needs classification, masking rule and retention entry before merge; with the classifier down, migrations touching unknown columns are blocked fail-closed with E-POLICY (prompts/A07-data.md decision_logic 4, error_handling; agents section 7).
 - This tags schema fields; data-subject requests are `a07-data--privacy-request-plan`.
 
 ## Procedure
 1. Call `shared_handover_read` with `task_id` to get the new columns and the classifier output or A10 `security.policy` that decides `pii`.
 2. If neither a classifier result nor an A10 policy covers a column, call `shared_escalate` with `task_id`, `reason_code` policy, `summary` "classification unavailable for <columns>" and `needs` naming the classifier or A10; do not guess the flag.
-3. With `write`, for each PII column assign a tag from the allowed set (named by the A10 policy or the task inputs; `PII-direct` is only the example in 03-agents/A07-data.md), a masking rule for every non-prod environment, and a retention period.
+3. With `write`, for each PII column assign a tag from the allowed set (named by the A10 policy or the task inputs; `PII-direct` is only the example in agents/A07-data.md), a masking rule for every non-prod environment, and a retention period.
 4. Call `data_pii_tag_coverage` with `columns` (`name` as unique `table.column`, `pii`, `tag`) for every column of the touched tables and `allowed_tags`; the tool checks tags only on columns whose `pii` is true, so a wrong `pii: false` is invisible to it. `coverage` must be 1 and `untagged` empty.
 5. Write the classification catalog entry per field: tag, masking rule, retention, access note (grants are generated, never hand-written).
 6. With `edit` on the draft JSON, fill `pii_touched` in the schema.migration (`table.column` form) and `fields_classified` in any data.contract.

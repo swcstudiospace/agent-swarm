@@ -6,7 +6,7 @@ tools: [shared_handover_bundle, docs_flesch_grade, docs_heading_order, docs_anch
 ---
 
 ## When to Use
-- A user doc changed, or the coverage report shows median grade above 9 (03-agents/A15-docs.md section 6: median grade at most 9 for user docs).
+- A user doc changed, or the coverage report shows median grade above 9 (agents/A15-docs.md section 6: median grade at most 9 for user docs).
 - Sentence length and word difficulty only. Vocabulary consistency is `a15-docs--terminology-align`.
 
 ## Procedure

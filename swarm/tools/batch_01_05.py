@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from swarm.errors import SwarmError
+from swarm.blast_radius import parallel_rows
 from swarm.paths import latest_correlation
 from swarm.runlog import emit as log_emit
 from swarm.tools.support import respond, script, target_root
@@ -107,11 +108,24 @@ def plan(payload: dict) -> dict:
         pattern = payload.get("pattern", "feature")
         risk = payload.get("risk_class", "medium")
         gates = GATES_BY_RISK.get(risk, [])
+        stored = script("orch_plan").PATTERNS
+        if pattern in stored:
+            tasks = len(stored[pattern])
+            # a row that pins its own risk class (the cluster and web3 implementers) can need more gates than the plan's
+            pinned = [row[6] for row in stored[pattern] if len(row) > 6 and row[6] in GATES_BY_RISK]
+            gates = max([gates, *(GATES_BY_RISK[pin] for pin in pinned)], key=len)
+        elif pattern == "parallel":
+            # The preview has no blast radii; a parallel plan is at least two lanes, a join and the risk-class gates.
+            lanes = [{"id": lane, "capability": "code.backend", "agent": "A05", "title": lane, "acceptance": [], "paths": [lane]}
+                     for lane in ("a", "b")]
+            tasks = len(parallel_rows(lanes, risk if risk in GATES_BY_RISK else "medium"))
+        else:
+            return {"state": "INVALID_INPUT", "field": "pattern", "message": f"unknown pattern {pattern!r}"}
         # DAG via patterns (see orch_plan); exercise prior units
         dag = {
             "correlation_id": "T" + "demo",
             "pattern": pattern,
-            "tasks": 13 if pattern == "feature" else 8,
+            "tasks": tasks,
             "risk": risk,
             "gates": list(gates),
         }

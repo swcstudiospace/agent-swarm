@@ -138,7 +138,7 @@ def test_apply_is_deterministic(reg, tmp_path):
 def test_an_empty_tool_list_is_filled_in_place(tmp_path):
     document = _doc(ROOT / "agents.json")
     clone = _clone(document, "docs_heading_order", "docs_intake_probe", "A15")
-    document["agents"][-1]["registered_tools"] = []
+    next(a for a in document["agents"] if a["id"] == "A15")["registered_tools"] = []
     document["capability_policy"]["tools"]["enforce"] = False  # this test is about the in-place fill, not the count floor
     agents = tmp_path / "agents.json"
     agents.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
@@ -146,7 +146,7 @@ def test_an_empty_tool_list_is_filled_in_place(tmp_path):
     folder.mkdir()
     _write(folder, "a15-docs.tools.json", [clone])
     assert _apply(agents, folder).errors == []
-    assert [t["name"] for t in _doc(agents)["agents"][-1]["registered_tools"]] == ["docs_intake_probe"]
+    assert [t["name"] for t in next(a for a in _doc(agents)["agents"] if a["id"] == "A15")["registered_tools"]] == ["docs_intake_probe"]
 
 
 def test_any_error_refuses_everything(reg):

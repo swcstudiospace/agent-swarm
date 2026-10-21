@@ -26,7 +26,6 @@ import {
   runElapsedS,
   settleOrphanedSpawns,
   shownTokens,
-  statusText,
   type SwarmBarModel,
   visibleRuns,
 } from "../src/swarm_bar.ts";
@@ -1291,7 +1290,6 @@ describe("reducer: sources", () => {
         expect(summary).toContain("2 run");
         expect(summary).toContain("1 done");
         expect(summary).toContain("0 fail");
-        expect(statusText(model, T0)).toBe("swarm: 2 run");
       }
     });
 
@@ -1882,10 +1880,10 @@ describe("render: overflow ordering and labels", () => {
       const failed = createModel();
       progress(failed, { id: "f", agent: "bad", status: "failed", durationMs: 1000 }, T0);
       for (const [name, model] of Object.entries({ idle: createModel(), running, error, failed, mixed: mixed() })) {
-        const [row1, row2] = plain({ ...model, tokens: FULL_SAVINGS }, 300, T0);
+        const [row1, ...below] = plain({ ...model, tokens: FULL_SAVINGS }, 300, T0);
         expect(row1, name).toContain("cache 62%");
         expect(row1, name).toContain("saved 6k");
-        expect(row2, `${name} row 2 carries no chips`).not.toContain("saved");
+        expect(below.join("\n"), `${name} rows below the first carry no chips`).not.toContain("saved");
       }
     });
 
@@ -1928,22 +1926,25 @@ describe("render: overflow ordering and labels", () => {
   });
 });
 
-describe("status text", () => {
-  test("compact counts while work is live or failing, nothing otherwise", () => {
+describe("header counts", () => {
+  test("counts of live and failing work, and nothing once the failure ages out", () => {
     const model = createModel();
-    expect(statusText(model, T0)).toBeUndefined();
     progress(model, { id: "a", agent: "a" }, T0);
     progress(model, { id: "q", agent: "q", status: "pending", index: 1 }, T0);
-    expect(statusText(model, T0)).toBe("swarm: 1 run, 1 queued");
+    const live = renderSwarmBar(model, 200, undefined, T0)[0];
+    expect(live).toContain("1 run");
+    expect(live).toContain("1 queued");
     progress(model, { id: "a", agent: "a", status: "failed", durationMs: 1000 }, T0 + SEC);
     progress(model, { id: "q", agent: "q", status: "completed", durationMs: 1000, index: 1 }, T0 + SEC);
-    expect(statusText(model, T0 + SEC)).toBe("swarm: 1 fail");
-    expect(statusText(model, T0 + 700 * SEC)).toBeUndefined();
+    const failed = renderSwarmBar(model, 200, undefined, T0 + SEC)[0];
+    expect(failed).toContain("1 fail");
+    expect(failed).toContain("0 run");
+    expect(renderSwarmBar(model, 200, undefined, T0 + 700 * SEC)[0]).toContain("○ swarm idle");
   });
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// In-session specialists: rows read from the parent's `progress.inflightTaskDetails` (the A01 -> a02..a15 flow)
+// In-session specialists: rows read from the parent's `progress.inflightTaskDetails` (the A01 -> a02..a30 flow)
 // ---------------------------------------------------------------------------------------------------------------------
 
 /** One `AgentProgress` entry of `TaskToolDetails.progress`, shaped like omp's executor (pi-tui tools/task.ts). */
@@ -2303,7 +2304,6 @@ describe("in-session specialists: joined with live.json", () => {
     expect(visibleRuns(model, t).filter((run) => run.agent === "a05-backend")).toHaveLength(3);
     // ...yet the swarm counts the agent's larger side once: A01 + 2 lanes
     expect(renderSwarmBar(model, 200, undefined, t)[0]).toContain("3 run");
-    expect(statusText(model, t)).toBe("swarm: 3 run");
     // a second store row (two lanes each side): still two specialists, not four
     ingestLive(model, live([liveRun("T1111-be", "a05-backend", "running"), liveRun("T2222-be", "a05-backend", "running")]), t + SEC);
     expect(renderSwarmBar(model, 200, undefined, t + SEC)[0]).toContain("3 run");
@@ -2482,7 +2482,6 @@ describe("agent identity across sources", () => {
       expect(keyRows(model, t, "a02")[0].state).toBe("completed");
       expect(keyRows(model, t, "a03")[0].state).toBe("running");
       expect(visibleRuns(model, t)).toHaveLength(14); // A01 + the store's 13 rows
-      expect(statusText(model, t)).toBe("swarm: 2 run, 10 wait, 1 queued");
       const header = renderSwarmBar(model, 240, undefined, t)[0];
       for (const part of ["2 run", "10 wait", "1 queued", "1 done"]) expect(header).toContain(part);
     }
@@ -2496,7 +2495,7 @@ describe("agent identity across sources", () => {
     expect(keyRows(model, t, "a03")).toHaveLength(1);
     expect(keyRows(model, t, "a03")[0].parentKey).toBeDefined();
     expect(keyRows(model, t, "a03")[0].parts.live?.taskId).toBe("T38a7-arch");
-    expect(statusText(model, t)).toBe("swarm: 2 run, 10 wait, 1 queued");
+    expect(renderSwarmBar(model, 240, undefined, t)[0]).toContain("2 run");
   });
 
   test("a nested text naming another task of the same agent still blocks the slug join", () => {
@@ -2506,7 +2505,7 @@ describe("agent identity across sources", () => {
     a01Spawn(model, t, [lane("T38a7-other", "a03-architect", "Other", 3000)]);
     expect(keyRows(model, t, "a03")).toHaveLength(2);
     // the summary still counts the agent once: the store knows one A03 row
-    expect(statusText(model, t)).toBe("swarm: 2 run, 10 wait, 1 queued");
+    expect(renderSwarmBar(model, 240, undefined, t)[0]).toContain("2 run");
   });
 
   test("a top-level bus row and the derived row of the same agent are one row (the twin check compares keys)", () => {
@@ -2554,7 +2553,7 @@ describe("background specialists (details.async)", () => {
     expect(rowsLine).toMatch(/a05-backend\s+\d+m?\d*s~/);
     expect(rowsLine).toMatch(/a06-frontend\s+\d+m?\d*s~/);
     expect(rowsLine).toMatch(/a01-orchestrator\s+\d+m?\d*s(?!~)/);
-    expect(statusText(model, T0 + 60 * SEC)).toBe("swarm: 3 run");
+    expect(renderSwarmBar(model, 220, undefined, T0 + 60 * SEC)[0]).toContain("3 run");
   });
 
   test("a frame without `async` names its rows as ordinary (blocking) specialists: not detached while the call is in flight", () => {

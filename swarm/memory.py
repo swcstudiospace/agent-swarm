@@ -26,11 +26,13 @@ from .errors import ErrorCode, SwarmError
 KIND_MAP: dict[str, str] = {"decision": "decision", "retro": "fact", "pattern": "fact"}
 SCOPES: tuple[str, ...] = ("graph", "repo", "agent", "global")
 
-# The 15 swarm surfaces (substrate `SWARM_SURFACES`); cross-checked against swarm.substrate_tee.AGENT_SURFACES in the tests.
+# The 30 swarm surfaces (substrate `SWARM_SURFACES`); cross-checked against swarm.substrate_tee.AGENT_SURFACES in the tests.
 SWARM_SURFACES: tuple[str, ...] = (
     "swarm-a01-orch", "swarm-a02-req", "swarm-a03-arch", "swarm-a04-uxd", "swarm-a05-be", "swarm-a06-fe", "swarm-a07-data",
     "swarm-a08-qa", "swarm-a09-rev", "swarm-a10-sec", "swarm-a11-devops", "swarm-a12-rel", "swarm-a13-obs", "swarm-a14-maint",
-    "swarm-a15-doc",
+    "swarm-a15-doc", "swarm-a16-cloud", "swarm-a17-plat", "swarm-a18-supply", "swarm-a19-event", "swarm-a20-finops",
+    "swarm-a21-k8s", "swarm-a22-gitops", "swarm-a23-mesh", "swarm-a24-ksec", "swarm-a25-resil", "swarm-a26-sol",
+    "swarm-a27-audit", "swarm-a28-chain", "swarm-a29-dapp", "swarm-a30-custody",
 )
 ORCH_SURFACE = "swarm-a01-orch"
 
@@ -118,7 +120,7 @@ def resolve_scope(scope: str, *, graph_id: str | None = None, repo: str | None =
     if not isinstance(ident, str) or not ident.strip() or any(c.isspace() for c in ident):
         raise SwarmError(ErrorCode.E_INPUT, f"memory scope {scope!r} needs {name}", field=name)
     if scope == "agent" and ident not in SWARM_SURFACES:
-        raise SwarmError(ErrorCode.E_INPUT, f"memory scope 'agent' needs one of the 15 swarm surfaces, got {ident!r}", field="surface")
+        raise SwarmError(ErrorCode.E_INPUT, f"memory scope 'agent' needs one of the 30 swarm surfaces, got {ident!r}", field="surface")
     return f"{scope}:{ident}"
 
 

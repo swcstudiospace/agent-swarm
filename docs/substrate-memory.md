@@ -41,7 +41,7 @@ Any other kind is `SwarmError(E-INPUT)`; the substrate's `MEMORY_KINDS` is not w
 |---|---|---|
 | `graph` | `graph_id` | `graph:<graph_id>` |
 | `repo` | `repo` (`owner/name`) | `repo:<owner/name>` |
-| `agent` | `surface` — one of the 15 swarm surfaces (`swarm-a01-orch` … `swarm-a15-doc`) | `agent:<surface>` (the server's `self` grant refuses any surface other than the token's) |
+| `agent` | `surface` — one of the 30 swarm surfaces (`swarm-a01-orch` … `swarm-a30-custody`) | `agent:<surface>` (the server's `self` grant refuses any surface other than the token's) |
 | `global` | — | `global` (**require-review**: a proposal until a reviewer token releases it) |
 
 An unknown scope, or a scope whose id was not supplied, is `SwarmError(E-INPUT)` and nothing is sent. The body never carries a

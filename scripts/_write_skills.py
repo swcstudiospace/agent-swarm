@@ -26,6 +26,21 @@ DONT = {
     "A13": "Do not ship features; you observe.",
     "A14": "Do not add unrelated features.",
     "A15": "Do not rewrite product code to match docs.",
+    "A16": "Do not edit A03 contracts or write IaC; file a change request.",
+    "A17": "Do not apply infrastructure or edit CI pipelines.",
+    "A18": "Do not hold signing keys, accept risk or sign a gate verdict.",
+    "A19": "Do not edit system API contracts, persistence or unrelated backend code.",
+    "A20": "Do not buy commitments, resize production or delete resources.",
+    "A21": "Do not mutate production clusters or delete a cluster without approval.",
+    "A22": "Do not merge PRs or prune production without approval.",
+    "A23": "Do not flip strict mTLS or change production mesh without approval.",
+    "A24": "Do not accept risk, waive findings or sign a gate verdict.",
+    "A25": "Do not run production experiments outside the error budget or fail over DR.",
+    "A26": "Do not deploy to mainnet, upgrade live proxies, move funds or touch key material.",
+    "A27": "Do not edit contract source, accept risk or change a severity unapproved.",
+    "A28": "Do not run mainnet node changes or validator key operations.",
+    "A29": "Do not request, store or log keys, or ship a flow without simulation and confirmation.",
+    "A30": "Do not read, generate, store, sign or broadcast with key material.",
 }
 
 
@@ -100,8 +115,8 @@ def orch_skill() -> str:
     return f"""---
 name: agent-swarm-orchestrate
 description: >
-  Run the AgentSwarm of 15 SDLC subagents (a01-orchestrator through a15-docs).
-  Use when the user says run the swarm, AgentSwarm, implement a feature with the 15 agents,
+  Run the AgentSwarm of 30 subagents (a01-orchestrator through a30-custody-compliance).
+  Use when the user says run the swarm, AgentSwarm, implement a feature with the 30 agents,
   a01-orchestrator, SDLC swarm, or /swarm. UserPromptSubmit hook injects this skill for SDLC-shaped prompts.
 disable-model-invocation: false
 ---
@@ -128,7 +143,7 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency|cloud-native|cluster|web3|parallel --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: {slugs}.

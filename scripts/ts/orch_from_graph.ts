@@ -1,19 +1,16 @@
 #!/usr/bin/env bun
 /** Pass-through to scripts/orch_from_graph.py — the plan is built in Python.
 
-Relative --summary and --out are prefixed with this process's cwd. passthrough
-then runs Python with cwd at the runtime checkout, so a relative path would
-otherwise name a different file than a direct python3 invocation.
-
-Absolute paths and empty values are left unchanged. The join does not call
+passthrough runs Python in this process's cwd, as a direct python3 call would, so a relative
+path already names the same file. The join below keeps that explicit. It does not call
 path.resolve: that collapses ".." before Python follows a symlink, so
-`/ws/link/../summary.json` (link → /other/child) would read /ws/summary.json
-instead of /other/summary.json, and `--out=` would become the cwd.
+`/ws/link/../summary.json` (link → /other/child) would read /ws/summary.json instead of
+/other/summary.json, and `--out=` would become the cwd.
 
-passthrough also runs Python with cwd at the checkout, and AgentScript resolves
-`--root` and a relative `SWARM_DIR` from that cwd. Both are pinned to the
-caller first (a missing `--root` becomes the caller cwd) so events land in the
-caller's workspace.
+Absolute paths and empty values are left unchanged.
+
+AgentScript resolves `--root` and a relative `SWARM_DIR` from the cwd. A missing `--root`
+becomes the caller cwd, so events land in the caller's workspace.
 */
 import { passthrough } from "./passthrough.ts";
 

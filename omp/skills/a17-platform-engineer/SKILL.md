@@ -1,0 +1,53 @@
+---
+name: "a17-platform-engineer"
+description: "A17 PLAT Platform Engineer — Owns the internal developer platform: golden paths, service-catalog entries, composition and claim APIs, self-service guardrails and maturity scorecards. Use to onboard a service to the platform or change a platform API. Use when the swarm assigns capability platform.catalog, platform.golden_path, platform.composition."
+---
+
+# Platform Engineer (A17 PLAT) — omp
+
+## When to Use
+
+- The assignment capability is one of: platform.catalog, platform.golden_path, platform.composition, platform.scorecard.
+- The user names this agent, slug `a17-platform-engineer`, or code `PLAT`.
+
+Don't use for: Do not apply infrastructure or edit CI pipelines.
+
+## Procedure
+
+1. Dispatch via the omp `task` tool with `agent: a17-platform-engineer` (definition: `omp/agents/a17-platform-engineer.md`), passing the signed `task.assign` payload.
+2. The agent finishes by calling `yield` with a `task.result` object; read it from the task result.
+3. Don't use it for: Do not apply infrastructure or edit CI pipelines.
+
+## Registered tools
+
+Discover with `swarm_catalog`, call with `swarm_tool_call` (the caller is your own identity).
+
+- `plat_catalog_lint` (READ): Lint catalog entities for owner, lifecycle, system, tier, dependsOn, docs and runbook metadata.
+- `plat_template_params_check` (READ): Compare scaffolder template parameters with the golden-path required inputs, types and allowed values.
+- `plat_composition_diff` (READ): Diff two versions of a composition (XRD-style) schema and classify each change as breaking or additive.
+- `plat_claim_validate` (READ): Validate a claim's fields against a composition schema: required, types, enums, bounds and string lengths.
+- `plat_maturity_scorecard` (READ): Score service maturity (none, bronze, silver, gold) from ownership, runbook, SLO, on-call, tests and security…
+- `plat_dora_bands` (READ): Compute the DORA four keys from deployment and change-caused incident events and band them elite to low.
+- `plat_catalog_graph` (READ): Analyse the catalog dependsOn graph for cycles, dangling targets, orphans, unowned entities, lifecycle confli…
+- `plat_ephemeral_env_policy` (READ): Check ephemeral environments for TTL, idleness and cost against policy and name which to reclaim.
+- `plat_quota_fit` (READ): Check whether team quotas fit capacity after platform reserve and overcommit, and flag over-quota, hot and id…
+- `plat_golden_path_coverage` (READ): Measure golden-path adoption across services: on path, current, outdated, unsupported and off path.
+- `plat_api_deprecation` (READ): Check platform API deprecations: notice window by stability, sunset dates and consumers still active.
+- `plat_request_guardrails` (READ): Decide allow, needs_approval or deny for self-service requests against region, class, size, resource cap and…
+
+## Skills
+
+Read the one that fits with its link; they are hidden from the skill listing.
+
+- `skill://a17-platform-engineer--catalog-hygiene-sweep`: Use when a sweep must find unowned, orphaned, cyclic or stale catalog entities across a repository and fix the descriptors that a…
+- `skill://a17-platform-engineer--deprecation-communication`: Use when an approved deprecation of a platform API or template version needs consumers notified and the sunset tracked until remo…
+- `skill://a17-platform-engineer--dora-baseline`: Use when a platform.scorecard task needs DORA four-key metrics banded elite to low over a window, with failure and recovery event…
+- `skill://a17-platform-engineer--environment-request-intake`: Use when a self-service environment or resource request arrives and needs an allow, needs_approval or deny decision with a valida…
+- `skill://a17-platform-engineer--golden-path-authoring`: Use when a platform.golden_path task needs a new or revised scaffolder template as a golden.path.template matching the golden-pat…
+- `skill://a17-platform-engineer--platform-api-versioning`: Use when a breaking platform API or template change needs a new version name, a deprecation timetable and an L3 approval packet b…
+- `skill://a17-platform-engineer--scorecard-rollout`: Use when a platform.scorecard task rolls the bronze, silver, gold maturity scorecard out to catalogued services and needs a cross…
+- `skill://a17-platform-engineer--self-service-guardrail-review`: Use when a self-service policy change (regions, classes, sizes, caps, prod replicas) must be tested on boundary requests and capa…
+- `skill://a17-platform-engineer--service-onboarding`: Use when a platform.catalog task onboards one new service and needs a linted service.catalog.entry with owner, tier, dependencies…
+- `skill://a17-platform-engineer--techdocs-coverage`: Use when catalog entities lack TechDocs or runbook wiring and the job is to rank the gaps and fix annotations so A15 can write th…
+- `skill://a17-platform-engineer--tenant-quota-allocation`: Use when team quotas must be sized or changed against cluster or account capacity and the answer is a simulated before and after…
+- `skill://a17-platform-engineer--xrd-composition-change`: Use when a platform.composition task edits a composite resource schema (XRD) and needs the breaking or additive verdict plus clai…

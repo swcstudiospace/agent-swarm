@@ -7,7 +7,7 @@ tools: [shared_handover_read, arch_nfr_allocation, arch_nfr_budget, shared_escal
 
 ## When to Use
 - A13 delivers a `capacity.forecast` (load and growth numbers), or a forecast changes enough to move a budget.
-- Output is `capacity.model` (03-agents/A03 section 3). It maps load to component budgets; `skill://a03-architect--nfr-allocation` maps NFRs to clauses. Do not mix the two.
+- Output is `capacity.model` (agents/A03 section 3). It maps load to component budgets; `skill://a03-architect--nfr-allocation` maps NFRs to clauses. Do not mix the two.
 - A03 never changes infrastructure: sizing goes to A11 as a proposal.
 
 ## Procedure

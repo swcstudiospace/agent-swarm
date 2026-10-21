@@ -73,16 +73,23 @@ the token's, it never re-attributes. The tee drops such an event (and releases i
 
 | Agent | Surface | Agent | Surface |
 |---|---|---|---|
-| A01 | `swarm-a01-orch` | A09 | `swarm-a09-rev` |
-| A02 | `swarm-a02-req` | A10 | `swarm-a10-sec` |
-| A03 | `swarm-a03-arch` | A11 | `swarm-a11-devops` |
-| A04 | `swarm-a04-uxd` | A12 | `swarm-a12-rel` |
-| A05 | `swarm-a05-be` | A13 | `swarm-a13-obs` |
-| A06 | `swarm-a06-fe` | A14 | `swarm-a14-maint` |
-| A07 | `swarm-a07-data` | A15 | `swarm-a15-doc` |
-| A08 | `swarm-a08-qa` | | |
+| A01 | `swarm-a01-orch` | A16 | `swarm-a16-cloud` |
+| A02 | `swarm-a02-req` | A17 | `swarm-a17-plat` |
+| A03 | `swarm-a03-arch` | A18 | `swarm-a18-supply` |
+| A04 | `swarm-a04-uxd` | A19 | `swarm-a19-event` |
+| A05 | `swarm-a05-be` | A20 | `swarm-a20-finops` |
+| A06 | `swarm-a06-fe` | A21 | `swarm-a21-k8s` |
+| A07 | `swarm-a07-data` | A22 | `swarm-a22-gitops` |
+| A08 | `swarm-a08-qa` | A23 | `swarm-a23-mesh` |
+| A09 | `swarm-a09-rev` | A24 | `swarm-a24-ksec` |
+| A10 | `swarm-a10-sec` | A25 | `swarm-a25-resil` |
+| A11 | `swarm-a11-devops` | A26 | `swarm-a26-sol` |
+| A12 | `swarm-a12-rel` | A27 | `swarm-a27-audit` |
+| A13 | `swarm-a13-obs` | A28 | `swarm-a28-chain` |
+| A14 | `swarm-a14-maint` | A29 | `swarm-a29-dapp` |
+| A15 | `swarm-a15-doc` | A30 | `swarm-a30-custody` |
 
-`AGENT_SURFACES` in `substrate_tee.py` is this table; a test checks it against `agents.json` (`swarm-<id>-<code>`, lower case).
+`AGENT_SURFACES` in `substrate_tee.py` is this table (30 surfaces); a test checks it against `agents.json` (`swarm-<id>-<code>`, lower case). The closed set of surfaces lives on the agent-substrate server, not in this repository: A16 to A30 must exist there before their tokens work (see [substrate-workspace.md](substrate-workspace.md)).
 
 **Which agent emitted a record.** `Ctx.emit` already stamps `source = "<agent id>@<script>"` (the id the script was constructed
 with, e.g. `AgentScript("A05", "code_checks", …)`), so no change to `script_base.py` was needed: the agent id is the

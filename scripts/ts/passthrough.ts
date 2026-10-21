@@ -10,7 +10,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 export function passthrough(stem: string, argv: string[] = process.argv.slice(2)): number {
   const py = resolve(ROOT, "scripts", `${stem}.py`);
-  const r = spawnSync("python3", [py, ...argv], { cwd: ROOT, stdio: "inherit", env: process.env });
+  // The caller's cwd, not the checkout: relative --root/--path must resolve as they do when the Python script runs directly.
+  const r = spawnSync("python3", [py, ...argv], { cwd: process.cwd(), stdio: "inherit", env: process.env });
   if (r.error) {
     console.error(JSON.stringify({ status: "error", error: { code: "E-DEP", message: String(r.error) } }));
     return 2;

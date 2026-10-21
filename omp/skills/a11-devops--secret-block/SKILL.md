@@ -9,7 +9,7 @@ disable-model-invocation: true
 ## When to Use
 
 - `scripts/devops_ci_check.py` or another scan reports a finding with `kind` `secret` in CI, Dockerfile, compose, Terraform or Kubernetes files.
-- Rule (03-agents/A11-devops.md section 4.5): a static credential in infra code is an immediate block under A10 policy. There are no static keys anywhere (section 2).
+- Rule (agents/A11-devops.md section 4.5): a static credential in infra code is an immediate block under A10 policy. There are no static keys anywhere (section 2).
 - Reactive only; general lint is `skill://a11-devops--pipeline-lint`.
 
 ## Procedure

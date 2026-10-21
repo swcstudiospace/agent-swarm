@@ -33,7 +33,7 @@ Don't use for: Do not ship features; you observe.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: architecture.blueprint, release.record, build.artifact, docs.bundle.
+2. Read upstream artifacts in consumes: architecture.blueprint, release.record, build.artifact, docs.bundle, resilience.design, platform.scorecard, cluster.fleet.status, drift.report.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only slo.manifest, incident.alert, deploy.telemetry, monitoring.degraded.
 5. Finish with markdown summary + one fenced json `task.result`.

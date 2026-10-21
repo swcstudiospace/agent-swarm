@@ -16,7 +16,7 @@ AgentSwarm already has 15 XML-tagged prompts (~90 lines each), Python tools, and
 
 ## Goals
 
-1. **Uplifted prompts.** Every file in `prompts/A??-*.md` remains a single `<agent>` root (existing tests) and gains Prompt-Uplift children listed under Required XML. Each prompt is an operational spec a senior would hand a teammate: procedures, states, failure modes, exact script invocations, spawn contracts. Target 250–450 lines per prompt, sourced from `03-agents/` plus the existing prompt — do not invent repo paths, package names, or APIs that are not in those files or `agents.json`.
+1. **Uplifted prompts.** Every file in `prompts/A??-*.md` remains a single `<agent>` root (existing tests) and gains Prompt-Uplift children listed under Required XML. Each prompt is an operational spec a senior would hand a teammate: procedures, states, failure modes, exact script invocations, spawn contracts. Target 250–450 lines per prompt, sourced from `agents/` plus the existing prompt — do not invent repo paths, package names, or APIs that are not in those files or `agents.json`.
 2. **Dual subagents.** `scripts/build_agents.py` (and a TypeScript twin) generate:
    - Claude Code: YAML `name`, `description`, `tools`, `model` → `agent-swarm/.claude/agents/<slug>.md` and workspace `.claude/agents/<slug>.md`
    - Grok Build: YAML `name`, `description`, `prompt_mode: full`, `model: inherit`, `permission_mode: default`, `agents_md: true` → `agent-swarm/.grok/agents/<slug>.md` and workspace `.grok/agents/<slug>.md`

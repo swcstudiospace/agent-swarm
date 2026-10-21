@@ -17,7 +17,7 @@ NAMES = [
 ]
 WRITE_TOOLS = {"shared_handover_write", "shared_handover_receipt"}
 SECRET = "LEASE-SECRET-9f2c41d7"
-ALL_AGENTS = [f"A{n:02d}" for n in range(1, 16)]
+ALL_AGENTS = [f"A{n:02d}" for n in range(1, 31)]
 
 
 @pytest.fixture()

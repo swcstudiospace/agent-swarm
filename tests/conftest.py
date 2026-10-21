@@ -52,6 +52,19 @@ def _repo_swarm_state_is_untouched(monkeypatch, tmp_path_factory):
         monkeypatch.setenv("SWARM_DIR", str(tmp_path_factory.mktemp("swarm") / ".swarm"))
 
 
+@pytest.fixture(autouse=True)
+def _repo_state_mirrors_are_untouched(monkeypatch, tmp_path):
+    """Keep the STATE.md mirror and the .claude projection out of the checkout.
+
+    SwarmStateStore and write_claude_state otherwise write <root>/.planning/STATE.md and
+    <root>/.claude/swarm-state.json, which are tracked files. The STATE mirror is disabled (empty
+    override) and the .claude projection goes to a per-test directory. A test that needs another
+    location sets the variables itself.
+    """
+    monkeypatch.setenv("SWARM_GSD_STATE_FILE", "")
+    monkeypatch.setenv("SWARM_CLAUDE_STATE_DIR", str(tmp_path / "claude-state"))
+
+
 @pytest.fixture()
 def swarm_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SWARM_DIR", str(tmp_path / ".swarm"))
@@ -108,7 +121,7 @@ def tree(tmp_path):
 
 # Inheritable env for run_script children: platform vars the interpreter and
 # tools need (PATH, HOME, tmp dirs, SYSTEMROOT-class Windows vars, locale and
-# codec vars), plus SWARM_DIR routing and the fixture-managed signing-key vars.
+# codec vars), plus SWARM_DIR and state-mirror routing and the fixture-managed signing-key vars.
 # Every other parent var — SWARM_* session vars (AGENT_SESSION, TASK_ID,
 # CORRELATION_ID, ...), SUBSTRATE_* tokens, ANTHROPIC_API_KEY, *_PROXY and any
 # other host contamination — is scrubbed. Callers pass what the child needs
@@ -124,7 +137,7 @@ _BASE_ENV_ALLOW = frozenset({
     "LC_MESSAGES", "LC_CTYPE", "LC_NUMERIC", "LC_TIME",
     "LC_COLLATE", "LC_MONETARY",
     "PYTHONIOENCODING", "PYTHONUTF8", "TZ",
-    "SWARM_DIR",
+    "SWARM_DIR", "SWARM_GSD_STATE_FILE", "SWARM_CLAUDE_STATE_DIR",
     "SWARM_SIGNING_KEY", "SWARM_ED25519_KEY", "SWARM_ED25519_KEY_FILE", "SWARM_REQUIRE_KEY",
     "SWARM_ALLOW_INSECURE_DEV_KEY",
 })

@@ -427,6 +427,448 @@ def test_arch_semver_bump_partial():
     assert isinstance(result["completed_fraction"], (int, float))
 
 
+def test_audit_classify_vulnerability_success():
+    result = call_tool('audit_classify_vulnerability', 'A27', {'observations': [{'id': 'F-1', 'signal': 'reentrant-external-call', 'location': 'Vault.sol:88'}, {'id': 'F-2', 'signal': 'floating-pragma'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_classify_vulnerability_invalid_input():
+    result = call_tool('audit_classify_vulnerability', 'A27', {'observations': []})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_classify_vulnerability_unauthorized():
+    result = call_tool('audit_classify_vulnerability', 'A01', {'observations': [{'id': 'F-1', 'signal': 'reentrant-external-call', 'location': 'Vault.sol:88'}, {'id': 'F-2', 'signal': 'floating-pragma'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_classify_vulnerability'
+
+
+def test_audit_classify_vulnerability_dependency():
+    result = call_tool('audit_classify_vulnerability', 'A27', {'observations': [{'id': 'F-1', 'signal': 'reentrant-external-call', 'location': 'Vault.sol:88'}, {'id': 'F-2', 'signal': 'floating-pragma'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_classify_vulnerability_timeout():
+    result = call_tool('audit_classify_vulnerability', 'A27', {'observations': [{'id': 'F-1', 'signal': 'reentrant-external-call', 'location': 'Vault.sol:88'}, {'id': 'F-2', 'signal': 'floating-pragma'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_classify_vulnerability_partial():
+    result = call_tool('audit_classify_vulnerability', 'A27', {'observations': [{'id': 'F-1', 'signal': 'reentrant-external-call', 'location': 'Vault.sol:88'}, {'id': 'F-2', 'signal': 'floating-pragma'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_dedupe_findings_success():
+    result = call_tool('audit_dedupe_findings', 'A27', {'findings': [{'id': 'A-1', 'title': 'Reentrancy in withdraw', 'category': 'SWC-107', 'file': 'src/Vault.sol', 'severity': 'high', 'function': 'withdraw'}, {'id': 'A-2', 'title': 'Withdraw can be reentered', 'category': 'SWC-107', 'file': './src/Vault.sol', 'severity': 'medium', 'function': 'withdraw'}, {'id': 'A-3', 'title': 'Floating pragma', 'category': 'SWC-103', 'file': 'src/Vault.sol', 'severity': 'info'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_dedupe_findings_invalid_input():
+    result = call_tool('audit_dedupe_findings', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_dedupe_findings_unauthorized():
+    result = call_tool('audit_dedupe_findings', 'A01', {'findings': [{'id': 'A-1', 'title': 'Reentrancy in withdraw', 'category': 'SWC-107', 'file': 'src/Vault.sol', 'severity': 'high', 'function': 'withdraw'}, {'id': 'A-2', 'title': 'Withdraw can be reentered', 'category': 'SWC-107', 'file': './src/Vault.sol', 'severity': 'medium', 'function': 'withdraw'}, {'id': 'A-3', 'title': 'Floating pragma', 'category': 'SWC-103', 'file': 'src/Vault.sol', 'severity': 'info'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_dedupe_findings'
+
+
+def test_audit_dedupe_findings_dependency():
+    result = call_tool('audit_dedupe_findings', 'A27', {'findings': [{'id': 'A-1', 'title': 'Reentrancy in withdraw', 'category': 'SWC-107', 'file': 'src/Vault.sol', 'severity': 'high', 'function': 'withdraw'}, {'id': 'A-2', 'title': 'Withdraw can be reentered', 'category': 'SWC-107', 'file': './src/Vault.sol', 'severity': 'medium', 'function': 'withdraw'}, {'id': 'A-3', 'title': 'Floating pragma', 'category': 'SWC-103', 'file': 'src/Vault.sol', 'severity': 'info'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_dedupe_findings_timeout():
+    result = call_tool('audit_dedupe_findings', 'A27', {'findings': [{'id': 'A-1', 'title': 'Reentrancy in withdraw', 'category': 'SWC-107', 'file': 'src/Vault.sol', 'severity': 'high', 'function': 'withdraw'}, {'id': 'A-2', 'title': 'Withdraw can be reentered', 'category': 'SWC-107', 'file': './src/Vault.sol', 'severity': 'medium', 'function': 'withdraw'}, {'id': 'A-3', 'title': 'Floating pragma', 'category': 'SWC-103', 'file': 'src/Vault.sol', 'severity': 'info'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_dedupe_findings_partial():
+    result = call_tool('audit_dedupe_findings', 'A27', {'findings': [{'id': 'A-1', 'title': 'Reentrancy in withdraw', 'category': 'SWC-107', 'file': 'src/Vault.sol', 'severity': 'high', 'function': 'withdraw'}, {'id': 'A-2', 'title': 'Withdraw can be reentered', 'category': 'SWC-107', 'file': './src/Vault.sol', 'severity': 'medium', 'function': 'withdraw'}, {'id': 'A-3', 'title': 'Floating pragma', 'category': 'SWC-103', 'file': 'src/Vault.sol', 'severity': 'info'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_fix_verification_success():
+    result = call_tool('audit_fix_verification', 'A27', {'findings': [{'id': 'A-1', 'severity': 'high', 'fix_status': 'fixed', 'fix_commit': 'abc1234', 'regression_test': True, 'reaudited': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_fix_verification_invalid_input():
+    result = call_tool('audit_fix_verification', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_fix_verification_unauthorized():
+    result = call_tool('audit_fix_verification', 'A01', {'findings': [{'id': 'A-1', 'severity': 'high', 'fix_status': 'fixed', 'fix_commit': 'abc1234', 'regression_test': True, 'reaudited': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_fix_verification'
+
+
+def test_audit_fix_verification_dependency():
+    result = call_tool('audit_fix_verification', 'A27', {'findings': [{'id': 'A-1', 'severity': 'high', 'fix_status': 'fixed', 'fix_commit': 'abc1234', 'regression_test': True, 'reaudited': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_fix_verification_timeout():
+    result = call_tool('audit_fix_verification', 'A27', {'findings': [{'id': 'A-1', 'severity': 'high', 'fix_status': 'fixed', 'fix_commit': 'abc1234', 'regression_test': True, 'reaudited': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_fix_verification_partial():
+    result = call_tool('audit_fix_verification', 'A27', {'findings': [{'id': 'A-1', 'severity': 'high', 'fix_status': 'fixed', 'fix_commit': 'abc1234', 'regression_test': True, 'reaudited': True}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_flashloan_profit_success():
+    result = call_tool('audit_flashloan_profit', 'A27', {'reserve_in': 1000000, 'reserve_out': 500, 'borrow_amount': 500000, 'fee_bps': 30, 'flashloan_fee_bps': 5, 'in_token_price_usd': 1, 'exploit_gain_usd': 400000, 'fixed_cost_usd': 200})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_flashloan_profit_invalid_input():
+    result = call_tool('audit_flashloan_profit', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_flashloan_profit_unauthorized():
+    result = call_tool('audit_flashloan_profit', 'A01', {'reserve_in': 1000000, 'reserve_out': 500, 'borrow_amount': 500000, 'fee_bps': 30, 'flashloan_fee_bps': 5, 'in_token_price_usd': 1, 'exploit_gain_usd': 400000, 'fixed_cost_usd': 200})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_flashloan_profit'
+
+
+def test_audit_flashloan_profit_dependency():
+    result = call_tool('audit_flashloan_profit', 'A27', {'reserve_in': 1000000, 'reserve_out': 500, 'borrow_amount': 500000, 'fee_bps': 30, 'flashloan_fee_bps': 5, 'in_token_price_usd': 1, 'exploit_gain_usd': 400000, 'fixed_cost_usd': 200, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_flashloan_profit_timeout():
+    result = call_tool('audit_flashloan_profit', 'A27', {'reserve_in': 1000000, 'reserve_out': 500, 'borrow_amount': 500000, 'fee_bps': 30, 'flashloan_fee_bps': 5, 'in_token_price_usd': 1, 'exploit_gain_usd': 400000, 'fixed_cost_usd': 200, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_flashloan_profit_partial():
+    result = call_tool('audit_flashloan_profit', 'A27', {'reserve_in': 1000000, 'reserve_out': 500, 'borrow_amount': 500000, 'fee_bps': 30, 'flashloan_fee_bps': 5, 'in_token_price_usd': 1, 'exploit_gain_usd': 400000, 'fixed_cost_usd': 200, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_fuzz_adequacy_success():
+    result = call_tool('audit_fuzz_adequacy', 'A27', {'mode': 'invariant', 'runs': 1000, 'depth': 100, 'distinct_seeds': 3, 'line_coverage_pct': 96, 'branch_coverage_pct': 91, 'revert_ratio_pct': 20, 'functions_total': 12, 'functions_exercised': 12})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_fuzz_adequacy_invalid_input():
+    result = call_tool('audit_fuzz_adequacy', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_fuzz_adequacy_unauthorized():
+    result = call_tool('audit_fuzz_adequacy', 'A01', {'mode': 'invariant', 'runs': 1000, 'depth': 100, 'distinct_seeds': 3, 'line_coverage_pct': 96, 'branch_coverage_pct': 91, 'revert_ratio_pct': 20, 'functions_total': 12, 'functions_exercised': 12})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_fuzz_adequacy'
+
+
+def test_audit_fuzz_adequacy_dependency():
+    result = call_tool('audit_fuzz_adequacy', 'A27', {'mode': 'invariant', 'runs': 1000, 'depth': 100, 'distinct_seeds': 3, 'line_coverage_pct': 96, 'branch_coverage_pct': 91, 'revert_ratio_pct': 20, 'functions_total': 12, 'functions_exercised': 12, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_fuzz_adequacy_timeout():
+    result = call_tool('audit_fuzz_adequacy', 'A27', {'mode': 'invariant', 'runs': 1000, 'depth': 100, 'distinct_seeds': 3, 'line_coverage_pct': 96, 'branch_coverage_pct': 91, 'revert_ratio_pct': 20, 'functions_total': 12, 'functions_exercised': 12, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_fuzz_adequacy_partial():
+    result = call_tool('audit_fuzz_adequacy', 'A27', {'mode': 'invariant', 'runs': 1000, 'depth': 100, 'distinct_seeds': 3, 'line_coverage_pct': 96, 'branch_coverage_pct': 91, 'revert_ratio_pct': 20, 'functions_total': 12, 'functions_exercised': 12, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_invariant_coverage_success():
+    result = call_tool('audit_invariant_coverage', 'A27', {'state_variables': ['totalSupply', 'balances', 'owner'], 'functions': [{'name': 'deposit', 'writes': ['totalSupply', 'balances']}, {'name': 'setOwner', 'writes': ['owner']}], 'invariants': [{'id': 'INV-1', 'kind': 'conservation', 'variables': ['totalSupply', 'balances'], 'functions': ['deposit']}], 'holds_funds': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_invariant_coverage_invalid_input():
+    result = call_tool('audit_invariant_coverage', 'A27', {'state_variables': []})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_invariant_coverage_unauthorized():
+    result = call_tool('audit_invariant_coverage', 'A01', {'state_variables': ['totalSupply', 'balances', 'owner'], 'functions': [{'name': 'deposit', 'writes': ['totalSupply', 'balances']}, {'name': 'setOwner', 'writes': ['owner']}], 'invariants': [{'id': 'INV-1', 'kind': 'conservation', 'variables': ['totalSupply', 'balances'], 'functions': ['deposit']}], 'holds_funds': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_invariant_coverage'
+
+
+def test_audit_invariant_coverage_dependency():
+    result = call_tool('audit_invariant_coverage', 'A27', {'state_variables': ['totalSupply', 'balances', 'owner'], 'functions': [{'name': 'deposit', 'writes': ['totalSupply', 'balances']}, {'name': 'setOwner', 'writes': ['owner']}], 'invariants': [{'id': 'INV-1', 'kind': 'conservation', 'variables': ['totalSupply', 'balances'], 'functions': ['deposit']}], 'holds_funds': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_invariant_coverage_timeout():
+    result = call_tool('audit_invariant_coverage', 'A27', {'state_variables': ['totalSupply', 'balances', 'owner'], 'functions': [{'name': 'deposit', 'writes': ['totalSupply', 'balances']}, {'name': 'setOwner', 'writes': ['owner']}], 'invariants': [{'id': 'INV-1', 'kind': 'conservation', 'variables': ['totalSupply', 'balances'], 'functions': ['deposit']}], 'holds_funds': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_invariant_coverage_partial():
+    result = call_tool('audit_invariant_coverage', 'A27', {'state_variables': ['totalSupply', 'balances', 'owner'], 'functions': [{'name': 'deposit', 'writes': ['totalSupply', 'balances']}, {'name': 'setOwner', 'writes': ['owner']}], 'invariants': [{'id': 'INV-1', 'kind': 'conservation', 'variables': ['totalSupply', 'balances'], 'functions': ['deposit']}], 'holds_funds': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_oracle_risk_success():
+    result = call_tool('audit_oracle_risk', 'A27', {'oracle_type': 'spot_amm', 'pool_liquidity_usd': 2000000, 'target_deviation_pct': 20, 'extractable_profit_usd': 500000, 'flashloan_liquidity_usd': 50000000})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_oracle_risk_invalid_input():
+    result = call_tool('audit_oracle_risk', 'A27', {'oracle_type': 'median'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_oracle_risk_unauthorized():
+    result = call_tool('audit_oracle_risk', 'A01', {'oracle_type': 'spot_amm', 'pool_liquidity_usd': 2000000, 'target_deviation_pct': 20, 'extractable_profit_usd': 500000, 'flashloan_liquidity_usd': 50000000})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_oracle_risk'
+
+
+def test_audit_oracle_risk_dependency():
+    result = call_tool('audit_oracle_risk', 'A27', {'oracle_type': 'spot_amm', 'pool_liquidity_usd': 2000000, 'target_deviation_pct': 20, 'extractable_profit_usd': 500000, 'flashloan_liquidity_usd': 50000000, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_oracle_risk_timeout():
+    result = call_tool('audit_oracle_risk', 'A27', {'oracle_type': 'spot_amm', 'pool_liquidity_usd': 2000000, 'target_deviation_pct': 20, 'extractable_profit_usd': 500000, 'flashloan_liquidity_usd': 50000000, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_oracle_risk_partial():
+    result = call_tool('audit_oracle_risk', 'A27', {'oracle_type': 'spot_amm', 'pool_liquidity_usd': 2000000, 'target_deviation_pct': 20, 'extractable_profit_usd': 500000, 'flashloan_liquidity_usd': 50000000, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_reentrancy_order_success():
+    result = call_tool('audit_reentrancy_order', 'A27', {'functions': [{'name': 'withdraw', 'non_reentrant': False, 'steps': [{'kind': 'check', 'target': 'balances'}, {'kind': 'interaction', 'target': 'msg.sender.call'}, {'kind': 'effect', 'target': 'balances'}]}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_reentrancy_order_invalid_input():
+    result = call_tool('audit_reentrancy_order', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_reentrancy_order_unauthorized():
+    result = call_tool('audit_reentrancy_order', 'A01', {'functions': [{'name': 'withdraw', 'non_reentrant': False, 'steps': [{'kind': 'check', 'target': 'balances'}, {'kind': 'interaction', 'target': 'msg.sender.call'}, {'kind': 'effect', 'target': 'balances'}]}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_reentrancy_order'
+
+
+def test_audit_reentrancy_order_dependency():
+    result = call_tool('audit_reentrancy_order', 'A27', {'functions': [{'name': 'withdraw', 'non_reentrant': False, 'steps': [{'kind': 'check', 'target': 'balances'}, {'kind': 'interaction', 'target': 'msg.sender.call'}, {'kind': 'effect', 'target': 'balances'}]}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_reentrancy_order_timeout():
+    result = call_tool('audit_reentrancy_order', 'A27', {'functions': [{'name': 'withdraw', 'non_reentrant': False, 'steps': [{'kind': 'check', 'target': 'balances'}, {'kind': 'interaction', 'target': 'msg.sender.call'}, {'kind': 'effect', 'target': 'balances'}]}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_reentrancy_order_partial():
+    result = call_tool('audit_reentrancy_order', 'A27', {'functions': [{'name': 'withdraw', 'non_reentrant': False, 'steps': [{'kind': 'check', 'target': 'balances'}, {'kind': 'interaction', 'target': 'msg.sender.call'}, {'kind': 'effect', 'target': 'balances'}]}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_report_completeness_success():
+    result = call_tool('audit_report_completeness', 'A27', {'stage': 'final', 'scope_commit': '0123456789abcdef0123456789abcdef01234567', 'sections': ['executive_summary', 'scope', 'methodology', 'severity_definitions', 'findings_summary', 'findings_detail', 'disclaimer'], 'findings': [{'id': 'A-1', 'severity': 'high', 'has_location': True, 'has_recommendation': True, 'has_poc': True, 'fix_status': 'fixed'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_report_completeness_invalid_input():
+    result = call_tool('audit_report_completeness', 'A27', {'stage': 'final'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_report_completeness_unauthorized():
+    result = call_tool('audit_report_completeness', 'A01', {'stage': 'final', 'scope_commit': '0123456789abcdef0123456789abcdef01234567', 'sections': ['executive_summary', 'scope', 'methodology', 'severity_definitions', 'findings_summary', 'findings_detail', 'disclaimer'], 'findings': [{'id': 'A-1', 'severity': 'high', 'has_location': True, 'has_recommendation': True, 'has_poc': True, 'fix_status': 'fixed'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_report_completeness'
+
+
+def test_audit_report_completeness_dependency():
+    result = call_tool('audit_report_completeness', 'A27', {'stage': 'final', 'scope_commit': '0123456789abcdef0123456789abcdef01234567', 'sections': ['executive_summary', 'scope', 'methodology', 'severity_definitions', 'findings_summary', 'findings_detail', 'disclaimer'], 'findings': [{'id': 'A-1', 'severity': 'high', 'has_location': True, 'has_recommendation': True, 'has_poc': True, 'fix_status': 'fixed'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_report_completeness_timeout():
+    result = call_tool('audit_report_completeness', 'A27', {'stage': 'final', 'scope_commit': '0123456789abcdef0123456789abcdef01234567', 'sections': ['executive_summary', 'scope', 'methodology', 'severity_definitions', 'findings_summary', 'findings_detail', 'disclaimer'], 'findings': [{'id': 'A-1', 'severity': 'high', 'has_location': True, 'has_recommendation': True, 'has_poc': True, 'fix_status': 'fixed'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_report_completeness_partial():
+    result = call_tool('audit_report_completeness', 'A27', {'stage': 'final', 'scope_commit': '0123456789abcdef0123456789abcdef01234567', 'sections': ['executive_summary', 'scope', 'methodology', 'severity_definitions', 'findings_summary', 'findings_detail', 'disclaimer'], 'findings': [{'id': 'A-1', 'severity': 'high', 'has_location': True, 'has_recommendation': True, 'has_poc': True, 'fix_status': 'fixed'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_role_centralization_success():
+    result = call_tool('audit_role_centralization', 'A27', {'roles': [{'name': 'owner', 'holder': 'multisig', 'powers': ['upgrade_implementation', 'set_oracle'], 'multisig_threshold': 3, 'multisig_signers': 5, 'timelock_delay_s': 172800}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_role_centralization_invalid_input():
+    result = call_tool('audit_role_centralization', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_role_centralization_unauthorized():
+    result = call_tool('audit_role_centralization', 'A01', {'roles': [{'name': 'owner', 'holder': 'multisig', 'powers': ['upgrade_implementation', 'set_oracle'], 'multisig_threshold': 3, 'multisig_signers': 5, 'timelock_delay_s': 172800}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_role_centralization'
+
+
+def test_audit_role_centralization_dependency():
+    result = call_tool('audit_role_centralization', 'A27', {'roles': [{'name': 'owner', 'holder': 'multisig', 'powers': ['upgrade_implementation', 'set_oracle'], 'multisig_threshold': 3, 'multisig_signers': 5, 'timelock_delay_s': 172800}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_role_centralization_timeout():
+    result = call_tool('audit_role_centralization', 'A27', {'roles': [{'name': 'owner', 'holder': 'multisig', 'powers': ['upgrade_implementation', 'set_oracle'], 'multisig_threshold': 3, 'multisig_signers': 5, 'timelock_delay_s': 172800}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_role_centralization_partial():
+    result = call_tool('audit_role_centralization', 'A27', {'roles': [{'name': 'owner', 'holder': 'multisig', 'powers': ['upgrade_implementation', 'set_oracle'], 'multisig_threshold': 3, 'multisig_signers': 5, 'timelock_delay_s': 172800}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_score_severity_success():
+    result = call_tool('audit_score_severity', 'A27', {'loss_usd': 120000, 'tvl_usd': 1000000, 'attacker_privilege': 'permissionless', 'preconditions': 1, 'irrecoverable': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_score_severity_invalid_input():
+    result = call_tool('audit_score_severity', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_score_severity_unauthorized():
+    result = call_tool('audit_score_severity', 'A01', {'loss_usd': 120000, 'tvl_usd': 1000000, 'attacker_privilege': 'permissionless', 'preconditions': 1, 'irrecoverable': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_score_severity'
+
+
+def test_audit_score_severity_dependency():
+    result = call_tool('audit_score_severity', 'A27', {'loss_usd': 120000, 'tvl_usd': 1000000, 'attacker_privilege': 'permissionless', 'preconditions': 1, 'irrecoverable': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_score_severity_timeout():
+    result = call_tool('audit_score_severity', 'A27', {'loss_usd': 120000, 'tvl_usd': 1000000, 'attacker_privilege': 'permissionless', 'preconditions': 1, 'irrecoverable': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_score_severity_partial():
+    result = call_tool('audit_score_severity', 'A27', {'loss_usd': 120000, 'tvl_usd': 1000000, 'attacker_privilege': 'permissionless', 'preconditions': 1, 'irrecoverable': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_signature_replay_success():
+    result = call_tool('audit_signature_replay', 'A27', {'scheme': 'eip712_typed', 'nonce_consumed': True, 'chain_id_bound': True, 'contract_bound': True, 'deadline_in_message': True, 'deadline_enforced': True, 'zero_address_check': True, 'malleability_protected': True, 'domain_separator_cached': False, 'chainid_recomputed': False, 'multichain_deployment': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_signature_replay_invalid_input():
+    result = call_tool('audit_signature_replay', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_signature_replay_unauthorized():
+    result = call_tool('audit_signature_replay', 'A01', {'scheme': 'eip712_typed', 'nonce_consumed': True, 'chain_id_bound': True, 'contract_bound': True, 'deadline_in_message': True, 'deadline_enforced': True, 'zero_address_check': True, 'malleability_protected': True, 'domain_separator_cached': False, 'chainid_recomputed': False, 'multichain_deployment': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_signature_replay'
+
+
+def test_audit_signature_replay_dependency():
+    result = call_tool('audit_signature_replay', 'A27', {'scheme': 'eip712_typed', 'nonce_consumed': True, 'chain_id_bound': True, 'contract_bound': True, 'deadline_in_message': True, 'deadline_enforced': True, 'zero_address_check': True, 'malleability_protected': True, 'domain_separator_cached': False, 'chainid_recomputed': False, 'multichain_deployment': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_signature_replay_timeout():
+    result = call_tool('audit_signature_replay', 'A27', {'scheme': 'eip712_typed', 'nonce_consumed': True, 'chain_id_bound': True, 'contract_bound': True, 'deadline_in_message': True, 'deadline_enforced': True, 'zero_address_check': True, 'malleability_protected': True, 'domain_separator_cached': False, 'chainid_recomputed': False, 'multichain_deployment': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_signature_replay_partial():
+    result = call_tool('audit_signature_replay', 'A27', {'scheme': 'eip712_typed', 'nonce_consumed': True, 'chain_id_bound': True, 'contract_bound': True, 'deadline_in_message': True, 'deadline_enforced': True, 'zero_address_check': True, 'malleability_protected': True, 'domain_separator_cached': False, 'chainid_recomputed': False, 'multichain_deployment': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_audit_vault_inflation_success():
+    result = call_tool('audit_vault_inflation', 'A27', {'mode': 'legacy', 'attacker_deposit': 1, 'donation': 1000000000000000000, 'victim_deposit': 1000000000000000000})
+    assert result["state"] == "SUCCESS"
+
+
+def test_audit_vault_inflation_invalid_input():
+    result = call_tool('audit_vault_inflation', 'A27', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_audit_vault_inflation_unauthorized():
+    result = call_tool('audit_vault_inflation', 'A01', {'mode': 'legacy', 'attacker_deposit': 1, 'donation': 1000000000000000000, 'victim_deposit': 1000000000000000000})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'audit_vault_inflation'
+
+
+def test_audit_vault_inflation_dependency():
+    result = call_tool('audit_vault_inflation', 'A27', {'mode': 'legacy', 'attacker_deposit': 1, 'donation': 1000000000000000000, 'victim_deposit': 1000000000000000000, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_audit_vault_inflation_timeout():
+    result = call_tool('audit_vault_inflation', 'A27', {'mode': 'legacy', 'attacker_deposit': 1, 'donation': 1000000000000000000, 'victim_deposit': 1000000000000000000, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_audit_vault_inflation_partial():
+    result = call_tool('audit_vault_inflation', 'A27', {'mode': 'legacy', 'attacker_deposit': 1, 'donation': 1000000000000000000, 'victim_deposit': 1000000000000000000, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
 def test_be_acceptance_coverage_success():
     result = call_tool('be_acceptance_coverage', 'A05', {'criteria': ['AC-1', 'AC-2', 'AC-3', 'AC-4'], 'covered': ['AC-1', 'AC-3', 'AC-9']})
     assert result["state"] == "SUCCESS"
@@ -831,6 +1273,1740 @@ def test_be_semver_range_class_timeout():
 
 def test_be_semver_range_class_partial():
     result = call_tool('be_semver_range_class', 'A05', {'range': '^1.4.2', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_backfill_plan_success():
+    result = call_tool('chain_backfill_plan', 'A28', {'from_block': 18000000, 'to_block': 18100000, 'max_block_range': 10000, 'max_logs_per_response': 10000, 'est_logs_per_block': 0.5, 'requests_per_chunk': 1, 'workers': 8, 'request_latency_ms': 200, 'provider_rate_limit_rps': 25, 'block_time_s': 12})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_backfill_plan_invalid_input():
+    result = call_tool('chain_backfill_plan', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_backfill_plan_unauthorized():
+    result = call_tool('chain_backfill_plan', 'A01', {'from_block': 18000000, 'to_block': 18100000, 'max_block_range': 10000, 'max_logs_per_response': 10000, 'est_logs_per_block': 0.5, 'requests_per_chunk': 1, 'workers': 8, 'request_latency_ms': 200, 'provider_rate_limit_rps': 25, 'block_time_s': 12})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_backfill_plan'
+
+
+def test_chain_backfill_plan_dependency():
+    result = call_tool('chain_backfill_plan', 'A28', {'from_block': 18000000, 'to_block': 18100000, 'max_block_range': 10000, 'max_logs_per_response': 10000, 'est_logs_per_block': 0.5, 'requests_per_chunk': 1, 'workers': 8, 'request_latency_ms': 200, 'provider_rate_limit_rps': 25, 'block_time_s': 12, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_backfill_plan_timeout():
+    result = call_tool('chain_backfill_plan', 'A28', {'from_block': 18000000, 'to_block': 18100000, 'max_block_range': 10000, 'max_logs_per_response': 10000, 'est_logs_per_block': 0.5, 'requests_per_chunk': 1, 'workers': 8, 'request_latency_ms': 200, 'provider_rate_limit_rps': 25, 'block_time_s': 12, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_backfill_plan_partial():
+    result = call_tool('chain_backfill_plan', 'A28', {'from_block': 18000000, 'to_block': 18100000, 'max_block_range': 10000, 'max_logs_per_response': 10000, 'est_logs_per_block': 0.5, 'requests_per_chunk': 1, 'workers': 8, 'request_latency_ms': 200, 'provider_rate_limit_rps': 25, 'block_time_s': 12, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_bridge_monitor_success():
+    result = call_tool('chain_bridge_monitor', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'max_lag_minutes': 30, 'pause_overdue_ratio': 0.2, 'paused': False, 'locked_amount': '1000.5', 'minted_amount': '900', 'messages': [{'id': 'm-1', 'sent_at': '2026-10-20T11:00:00Z', 'delivered_at': '2026-10-20T11:10:00Z'}, {'id': 'm-2', 'sent_at': '2026-10-20T11:55:00Z'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_bridge_monitor_invalid_input():
+    result = call_tool('chain_bridge_monitor', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_bridge_monitor_unauthorized():
+    result = call_tool('chain_bridge_monitor', 'A01', {'as_of': '2026-10-20T12:00:00Z', 'max_lag_minutes': 30, 'pause_overdue_ratio': 0.2, 'paused': False, 'locked_amount': '1000.5', 'minted_amount': '900', 'messages': [{'id': 'm-1', 'sent_at': '2026-10-20T11:00:00Z', 'delivered_at': '2026-10-20T11:10:00Z'}, {'id': 'm-2', 'sent_at': '2026-10-20T11:55:00Z'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_bridge_monitor'
+
+
+def test_chain_bridge_monitor_dependency():
+    result = call_tool('chain_bridge_monitor', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'max_lag_minutes': 30, 'pause_overdue_ratio': 0.2, 'paused': False, 'locked_amount': '1000.5', 'minted_amount': '900', 'messages': [{'id': 'm-1', 'sent_at': '2026-10-20T11:00:00Z', 'delivered_at': '2026-10-20T11:10:00Z'}, {'id': 'm-2', 'sent_at': '2026-10-20T11:55:00Z'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_bridge_monitor_timeout():
+    result = call_tool('chain_bridge_monitor', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'max_lag_minutes': 30, 'pause_overdue_ratio': 0.2, 'paused': False, 'locked_amount': '1000.5', 'minted_amount': '900', 'messages': [{'id': 'm-1', 'sent_at': '2026-10-20T11:00:00Z', 'delivered_at': '2026-10-20T11:10:00Z'}, {'id': 'm-2', 'sent_at': '2026-10-20T11:55:00Z'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_bridge_monitor_partial():
+    result = call_tool('chain_bridge_monitor', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'max_lag_minutes': 30, 'pause_overdue_ratio': 0.2, 'paused': False, 'locked_amount': '1000.5', 'minted_amount': '900', 'messages': [{'id': 'm-1', 'sent_at': '2026-10-20T11:00:00Z', 'delivered_at': '2026-10-20T11:10:00Z'}, {'id': 'm-2', 'sent_at': '2026-10-20T11:55:00Z'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_client_diversity_success():
+    result = call_tool('chain_client_diversity', 'A28', {'layer': 'execution', 'clients': [{'name': 'geth', 'nodes': 600}, {'name': 'nethermind', 'nodes': 250}, {'name': 'besu', 'nodes': 100}, {'name': 'reth', 'nodes': 50}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_client_diversity_invalid_input():
+    result = call_tool('chain_client_diversity', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_client_diversity_unauthorized():
+    result = call_tool('chain_client_diversity', 'A01', {'layer': 'execution', 'clients': [{'name': 'geth', 'nodes': 600}, {'name': 'nethermind', 'nodes': 250}, {'name': 'besu', 'nodes': 100}, {'name': 'reth', 'nodes': 50}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_client_diversity'
+
+
+def test_chain_client_diversity_dependency():
+    result = call_tool('chain_client_diversity', 'A28', {'layer': 'execution', 'clients': [{'name': 'geth', 'nodes': 600}, {'name': 'nethermind', 'nodes': 250}, {'name': 'besu', 'nodes': 100}, {'name': 'reth', 'nodes': 50}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_client_diversity_timeout():
+    result = call_tool('chain_client_diversity', 'A28', {'layer': 'execution', 'clients': [{'name': 'geth', 'nodes': 600}, {'name': 'nethermind', 'nodes': 250}, {'name': 'besu', 'nodes': 100}, {'name': 'reth', 'nodes': 50}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_client_diversity_partial():
+    result = call_tool('chain_client_diversity', 'A28', {'layer': 'execution', 'clients': [{'name': 'geth', 'nodes': 600}, {'name': 'nethermind', 'nodes': 250}, {'name': 'besu', 'nodes': 100}, {'name': 'reth', 'nodes': 50}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_confirmation_depth_success():
+    result = call_tool('chain_confirmation_depth', 'A28', {'finality_model': 'probabilistic', 'value_at_risk_usd': 50000, 'loss_tolerance_usd': 50, 'block_time_s': 12, 'attacker_share': 0.1, 'observed_max_reorg_blocks': 1})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_confirmation_depth_invalid_input():
+    result = call_tool('chain_confirmation_depth', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_confirmation_depth_unauthorized():
+    result = call_tool('chain_confirmation_depth', 'A01', {'finality_model': 'probabilistic', 'value_at_risk_usd': 50000, 'loss_tolerance_usd': 50, 'block_time_s': 12, 'attacker_share': 0.1, 'observed_max_reorg_blocks': 1})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_confirmation_depth'
+
+
+def test_chain_confirmation_depth_dependency():
+    result = call_tool('chain_confirmation_depth', 'A28', {'finality_model': 'probabilistic', 'value_at_risk_usd': 50000, 'loss_tolerance_usd': 50, 'block_time_s': 12, 'attacker_share': 0.1, 'observed_max_reorg_blocks': 1, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_confirmation_depth_timeout():
+    result = call_tool('chain_confirmation_depth', 'A28', {'finality_model': 'probabilistic', 'value_at_risk_usd': 50000, 'loss_tolerance_usd': 50, 'block_time_s': 12, 'attacker_share': 0.1, 'observed_max_reorg_blocks': 1, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_confirmation_depth_partial():
+    result = call_tool('chain_confirmation_depth', 'A28', {'finality_model': 'probabilistic', 'value_at_risk_usd': 50000, 'loss_tolerance_usd': 50, 'block_time_s': 12, 'attacker_share': 0.1, 'observed_max_reorg_blocks': 1, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_fee_policy_success():
+    result = call_tool('chain_fee_policy', 'A28', {'latest_base_fee_gwei': 20, 'latest_gas_used': 20000000, 'gas_limit': 30000000, 'elasticity_multiplier': 2, 'base_fee_change_denominator': 8, 'horizon_blocks': 6, 'assumed_fullness': 0.5, 'priority_fee_gwei': 1.5, 'priority_cap_gwei': 5, 'max_fee_cap_gwei': 200})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_fee_policy_invalid_input():
+    result = call_tool('chain_fee_policy', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_fee_policy_unauthorized():
+    result = call_tool('chain_fee_policy', 'A01', {'latest_base_fee_gwei': 20, 'latest_gas_used': 20000000, 'gas_limit': 30000000, 'elasticity_multiplier': 2, 'base_fee_change_denominator': 8, 'horizon_blocks': 6, 'assumed_fullness': 0.5, 'priority_fee_gwei': 1.5, 'priority_cap_gwei': 5, 'max_fee_cap_gwei': 200})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_fee_policy'
+
+
+def test_chain_fee_policy_dependency():
+    result = call_tool('chain_fee_policy', 'A28', {'latest_base_fee_gwei': 20, 'latest_gas_used': 20000000, 'gas_limit': 30000000, 'elasticity_multiplier': 2, 'base_fee_change_denominator': 8, 'horizon_blocks': 6, 'assumed_fullness': 0.5, 'priority_fee_gwei': 1.5, 'priority_cap_gwei': 5, 'max_fee_cap_gwei': 200, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_fee_policy_timeout():
+    result = call_tool('chain_fee_policy', 'A28', {'latest_base_fee_gwei': 20, 'latest_gas_used': 20000000, 'gas_limit': 30000000, 'elasticity_multiplier': 2, 'base_fee_change_denominator': 8, 'horizon_blocks': 6, 'assumed_fullness': 0.5, 'priority_fee_gwei': 1.5, 'priority_cap_gwei': 5, 'max_fee_cap_gwei': 200, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_fee_policy_partial():
+    result = call_tool('chain_fee_policy', 'A28', {'latest_base_fee_gwei': 20, 'latest_gas_used': 20000000, 'gas_limit': 30000000, 'elasticity_multiplier': 2, 'base_fee_change_denominator': 8, 'horizon_blocks': 6, 'assumed_fullness': 0.5, 'priority_fee_gwei': 1.5, 'priority_cap_gwei': 5, 'max_fee_cap_gwei': 200, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_indexer_lag_success():
+    result = call_tool('chain_indexer_lag', 'A28', {'samples': [{'observed_at': '2026-10-20T10:00:00Z', 'head_block': 1000, 'indexed_block': 900}, {'observed_at': '2026-10-20T10:01:00Z', 'head_block': 1005, 'indexed_block': 960}], 'block_time_s': 12, 'freshness_slo_s': 120})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_indexer_lag_invalid_input():
+    result = call_tool('chain_indexer_lag', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_indexer_lag_unauthorized():
+    result = call_tool('chain_indexer_lag', 'A01', {'samples': [{'observed_at': '2026-10-20T10:00:00Z', 'head_block': 1000, 'indexed_block': 900}, {'observed_at': '2026-10-20T10:01:00Z', 'head_block': 1005, 'indexed_block': 960}], 'block_time_s': 12, 'freshness_slo_s': 120})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_indexer_lag'
+
+
+def test_chain_indexer_lag_dependency():
+    result = call_tool('chain_indexer_lag', 'A28', {'samples': [{'observed_at': '2026-10-20T10:00:00Z', 'head_block': 1000, 'indexed_block': 900}, {'observed_at': '2026-10-20T10:01:00Z', 'head_block': 1005, 'indexed_block': 960}], 'block_time_s': 12, 'freshness_slo_s': 120, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_indexer_lag_timeout():
+    result = call_tool('chain_indexer_lag', 'A28', {'samples': [{'observed_at': '2026-10-20T10:00:00Z', 'head_block': 1000, 'indexed_block': 900}, {'observed_at': '2026-10-20T10:01:00Z', 'head_block': 1005, 'indexed_block': 960}], 'block_time_s': 12, 'freshness_slo_s': 120, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_indexer_lag_partial():
+    result = call_tool('chain_indexer_lag', 'A28', {'samples': [{'observed_at': '2026-10-20T10:00:00Z', 'head_block': 1000, 'indexed_block': 900}, {'observed_at': '2026-10-20T10:01:00Z', 'head_block': 1005, 'indexed_block': 960}], 'block_time_s': 12, 'freshness_slo_s': 120, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_l2_withdrawal_window_success():
+    result = call_tool('chain_l2_withdrawal_window', 'A28', {'rollup_type': 'optimistic', 'initiated_at': '2026-10-01T00:00:00Z', 'as_of': '2026-10-03T00:00:00Z', 'batch_post_delay_min': 30, 'proof_delay_hours': 1, 'challenge_window_hours': 168, 'l1_finality_min': 15, 'max_wait_hours': 200})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_l2_withdrawal_window_invalid_input():
+    result = call_tool('chain_l2_withdrawal_window', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_l2_withdrawal_window_unauthorized():
+    result = call_tool('chain_l2_withdrawal_window', 'A01', {'rollup_type': 'optimistic', 'initiated_at': '2026-10-01T00:00:00Z', 'as_of': '2026-10-03T00:00:00Z', 'batch_post_delay_min': 30, 'proof_delay_hours': 1, 'challenge_window_hours': 168, 'l1_finality_min': 15, 'max_wait_hours': 200})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_l2_withdrawal_window'
+
+
+def test_chain_l2_withdrawal_window_dependency():
+    result = call_tool('chain_l2_withdrawal_window', 'A28', {'rollup_type': 'optimistic', 'initiated_at': '2026-10-01T00:00:00Z', 'as_of': '2026-10-03T00:00:00Z', 'batch_post_delay_min': 30, 'proof_delay_hours': 1, 'challenge_window_hours': 168, 'l1_finality_min': 15, 'max_wait_hours': 200, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_l2_withdrawal_window_timeout():
+    result = call_tool('chain_l2_withdrawal_window', 'A28', {'rollup_type': 'optimistic', 'initiated_at': '2026-10-01T00:00:00Z', 'as_of': '2026-10-03T00:00:00Z', 'batch_post_delay_min': 30, 'proof_delay_hours': 1, 'challenge_window_hours': 168, 'l1_finality_min': 15, 'max_wait_hours': 200, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_l2_withdrawal_window_partial():
+    result = call_tool('chain_l2_withdrawal_window', 'A28', {'rollup_type': 'optimistic', 'initiated_at': '2026-10-01T00:00:00Z', 'as_of': '2026-10-03T00:00:00Z', 'batch_post_delay_min': 30, 'proof_delay_hours': 1, 'challenge_window_hours': 168, 'l1_finality_min': 15, 'max_wait_hours': 200, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_mempool_privacy_success():
+    result = call_tool('chain_mempool_privacy', 'A28', {'network_kind': 'l1_public_mempool', 'tx_kind': 'swap', 'value_usd': 100000, 'slippage_bps': 50, 'max_acceptable_loss_usd': 100, 'private_route_available': True, 'revert_protection': True, 'has_deadline': True, 'submitted_route': 'public'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_mempool_privacy_invalid_input():
+    result = call_tool('chain_mempool_privacy', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_mempool_privacy_unauthorized():
+    result = call_tool('chain_mempool_privacy', 'A01', {'network_kind': 'l1_public_mempool', 'tx_kind': 'swap', 'value_usd': 100000, 'slippage_bps': 50, 'max_acceptable_loss_usd': 100, 'private_route_available': True, 'revert_protection': True, 'has_deadline': True, 'submitted_route': 'public'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_mempool_privacy'
+
+
+def test_chain_mempool_privacy_dependency():
+    result = call_tool('chain_mempool_privacy', 'A28', {'network_kind': 'l1_public_mempool', 'tx_kind': 'swap', 'value_usd': 100000, 'slippage_bps': 50, 'max_acceptable_loss_usd': 100, 'private_route_available': True, 'revert_protection': True, 'has_deadline': True, 'submitted_route': 'public', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_mempool_privacy_timeout():
+    result = call_tool('chain_mempool_privacy', 'A28', {'network_kind': 'l1_public_mempool', 'tx_kind': 'swap', 'value_usd': 100000, 'slippage_bps': 50, 'max_acceptable_loss_usd': 100, 'private_route_available': True, 'revert_protection': True, 'has_deadline': True, 'submitted_route': 'public', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_mempool_privacy_partial():
+    result = call_tool('chain_mempool_privacy', 'A28', {'network_kind': 'l1_public_mempool', 'tx_kind': 'swap', 'value_usd': 100000, 'slippage_bps': 50, 'max_acceptable_loss_usd': 100, 'private_route_available': True, 'revert_protection': True, 'has_deadline': True, 'submitted_route': 'public', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_network_guard_success():
+    result = call_tool('chain_network_guard', 'A28', {'environment': 'testnet', 'operation': 'node_change', 'target_chain_id': 11155111, 'rpc_chain_id': 11155111, 'mainnet_approved': False, 'approved_level': 'L2'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_network_guard_invalid_input():
+    result = call_tool('chain_network_guard', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_network_guard_unauthorized():
+    result = call_tool('chain_network_guard', 'A01', {'environment': 'testnet', 'operation': 'node_change', 'target_chain_id': 11155111, 'rpc_chain_id': 11155111, 'mainnet_approved': False, 'approved_level': 'L2'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_network_guard'
+
+
+def test_chain_network_guard_dependency():
+    result = call_tool('chain_network_guard', 'A28', {'environment': 'testnet', 'operation': 'node_change', 'target_chain_id': 11155111, 'rpc_chain_id': 11155111, 'mainnet_approved': False, 'approved_level': 'L2', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_network_guard_timeout():
+    result = call_tool('chain_network_guard', 'A28', {'environment': 'testnet', 'operation': 'node_change', 'target_chain_id': 11155111, 'rpc_chain_id': 11155111, 'mainnet_approved': False, 'approved_level': 'L2', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_network_guard_partial():
+    result = call_tool('chain_network_guard', 'A28', {'environment': 'testnet', 'operation': 'node_change', 'target_chain_id': 11155111, 'rpc_chain_id': 11155111, 'mainnet_approved': False, 'approved_level': 'L2', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_node_sizing_success():
+    result = call_tool('chain_node_sizing', 'A28', {'node_type': 'full', 'sync_mode': 'snap', 'validating': False, 'disk_kind': 'nvme', 'disk_used_gb': 1200, 'disk_provisioned_gb': 4000, 'growth_gb_per_day': 2, 'horizon_days': 180, 'memory_gb': 32, 'cpu_cores': 8, 'uplink_mbps': 100, 'peak_iops': 8000, 'provisioned_iops': 16000})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_node_sizing_invalid_input():
+    result = call_tool('chain_node_sizing', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_node_sizing_unauthorized():
+    result = call_tool('chain_node_sizing', 'A01', {'node_type': 'full', 'sync_mode': 'snap', 'validating': False, 'disk_kind': 'nvme', 'disk_used_gb': 1200, 'disk_provisioned_gb': 4000, 'growth_gb_per_day': 2, 'horizon_days': 180, 'memory_gb': 32, 'cpu_cores': 8, 'uplink_mbps': 100, 'peak_iops': 8000, 'provisioned_iops': 16000})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_node_sizing'
+
+
+def test_chain_node_sizing_dependency():
+    result = call_tool('chain_node_sizing', 'A28', {'node_type': 'full', 'sync_mode': 'snap', 'validating': False, 'disk_kind': 'nvme', 'disk_used_gb': 1200, 'disk_provisioned_gb': 4000, 'growth_gb_per_day': 2, 'horizon_days': 180, 'memory_gb': 32, 'cpu_cores': 8, 'uplink_mbps': 100, 'peak_iops': 8000, 'provisioned_iops': 16000, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_node_sizing_timeout():
+    result = call_tool('chain_node_sizing', 'A28', {'node_type': 'full', 'sync_mode': 'snap', 'validating': False, 'disk_kind': 'nvme', 'disk_used_gb': 1200, 'disk_provisioned_gb': 4000, 'growth_gb_per_day': 2, 'horizon_days': 180, 'memory_gb': 32, 'cpu_cores': 8, 'uplink_mbps': 100, 'peak_iops': 8000, 'provisioned_iops': 16000, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_node_sizing_partial():
+    result = call_tool('chain_node_sizing', 'A28', {'node_type': 'full', 'sync_mode': 'snap', 'validating': False, 'disk_kind': 'nvme', 'disk_used_gb': 1200, 'disk_provisioned_gb': 4000, 'growth_gb_per_day': 2, 'horizon_days': 180, 'memory_gb': 32, 'cpu_cores': 8, 'uplink_mbps': 100, 'peak_iops': 8000, 'provisioned_iops': 16000, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_rpc_failover_plan_success():
+    result = call_tool('chain_rpc_failover_plan', 'A28', {'providers': [{'name': 'alpha', 'p95_latency_ms': 120, 'error_rate_pct': 0.2, 'rate_limit_rps': 200, 'lag_blocks': 0, 'archive': True}, {'name': 'beta', 'p95_latency_ms': 90, 'error_rate_pct': 0.5, 'rate_limit_rps': 150, 'lag_blocks': 1, 'archive': False}, {'name': 'gamma', 'p95_latency_ms': 60, 'error_rate_pct': 4.0, 'rate_limit_rps': 300, 'lag_blocks': 0, 'archive': True}], 'demand_rps': 100, 'max_error_rate_pct': 1, 'max_lag_blocks': 2, 'need_archive': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_rpc_failover_plan_invalid_input():
+    result = call_tool('chain_rpc_failover_plan', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_rpc_failover_plan_unauthorized():
+    result = call_tool('chain_rpc_failover_plan', 'A01', {'providers': [{'name': 'alpha', 'p95_latency_ms': 120, 'error_rate_pct': 0.2, 'rate_limit_rps': 200, 'lag_blocks': 0, 'archive': True}, {'name': 'beta', 'p95_latency_ms': 90, 'error_rate_pct': 0.5, 'rate_limit_rps': 150, 'lag_blocks': 1, 'archive': False}, {'name': 'gamma', 'p95_latency_ms': 60, 'error_rate_pct': 4.0, 'rate_limit_rps': 300, 'lag_blocks': 0, 'archive': True}], 'demand_rps': 100, 'max_error_rate_pct': 1, 'max_lag_blocks': 2, 'need_archive': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_rpc_failover_plan'
+
+
+def test_chain_rpc_failover_plan_dependency():
+    result = call_tool('chain_rpc_failover_plan', 'A28', {'providers': [{'name': 'alpha', 'p95_latency_ms': 120, 'error_rate_pct': 0.2, 'rate_limit_rps': 200, 'lag_blocks': 0, 'archive': True}, {'name': 'beta', 'p95_latency_ms': 90, 'error_rate_pct': 0.5, 'rate_limit_rps': 150, 'lag_blocks': 1, 'archive': False}, {'name': 'gamma', 'p95_latency_ms': 60, 'error_rate_pct': 4.0, 'rate_limit_rps': 300, 'lag_blocks': 0, 'archive': True}], 'demand_rps': 100, 'max_error_rate_pct': 1, 'max_lag_blocks': 2, 'need_archive': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_rpc_failover_plan_timeout():
+    result = call_tool('chain_rpc_failover_plan', 'A28', {'providers': [{'name': 'alpha', 'p95_latency_ms': 120, 'error_rate_pct': 0.2, 'rate_limit_rps': 200, 'lag_blocks': 0, 'archive': True}, {'name': 'beta', 'p95_latency_ms': 90, 'error_rate_pct': 0.5, 'rate_limit_rps': 150, 'lag_blocks': 1, 'archive': False}, {'name': 'gamma', 'p95_latency_ms': 60, 'error_rate_pct': 4.0, 'rate_limit_rps': 300, 'lag_blocks': 0, 'archive': True}], 'demand_rps': 100, 'max_error_rate_pct': 1, 'max_lag_blocks': 2, 'need_archive': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_rpc_failover_plan_partial():
+    result = call_tool('chain_rpc_failover_plan', 'A28', {'providers': [{'name': 'alpha', 'p95_latency_ms': 120, 'error_rate_pct': 0.2, 'rate_limit_rps': 200, 'lag_blocks': 0, 'archive': True}, {'name': 'beta', 'p95_latency_ms': 90, 'error_rate_pct': 0.5, 'rate_limit_rps': 150, 'lag_blocks': 1, 'archive': False}, {'name': 'gamma', 'p95_latency_ms': 60, 'error_rate_pct': 4.0, 'rate_limit_rps': 300, 'lag_blocks': 0, 'archive': True}], 'demand_rps': 100, 'max_error_rate_pct': 1, 'max_lag_blocks': 2, 'need_archive': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_stuck_transactions_success():
+    result = call_tool('chain_stuck_transactions', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'base_fee_gwei': 30, 'stuck_after_minutes': 30, 'accounts': [{'account': 'treasury-hot', 'confirmed_nonce': 7, 'pending': [{'nonce': 7, 'max_fee_gwei': 20, 'max_priority_fee_gwei': 1, 'first_seen_at': '2026-10-20T11:00:00Z'}, {'nonce': 9, 'max_fee_gwei': 50, 'max_priority_fee_gwei': 2, 'first_seen_at': '2026-10-20T11:59:00Z'}]}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_stuck_transactions_invalid_input():
+    result = call_tool('chain_stuck_transactions', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_stuck_transactions_unauthorized():
+    result = call_tool('chain_stuck_transactions', 'A01', {'as_of': '2026-10-20T12:00:00Z', 'base_fee_gwei': 30, 'stuck_after_minutes': 30, 'accounts': [{'account': 'treasury-hot', 'confirmed_nonce': 7, 'pending': [{'nonce': 7, 'max_fee_gwei': 20, 'max_priority_fee_gwei': 1, 'first_seen_at': '2026-10-20T11:00:00Z'}, {'nonce': 9, 'max_fee_gwei': 50, 'max_priority_fee_gwei': 2, 'first_seen_at': '2026-10-20T11:59:00Z'}]}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_stuck_transactions'
+
+
+def test_chain_stuck_transactions_dependency():
+    result = call_tool('chain_stuck_transactions', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'base_fee_gwei': 30, 'stuck_after_minutes': 30, 'accounts': [{'account': 'treasury-hot', 'confirmed_nonce': 7, 'pending': [{'nonce': 7, 'max_fee_gwei': 20, 'max_priority_fee_gwei': 1, 'first_seen_at': '2026-10-20T11:00:00Z'}, {'nonce': 9, 'max_fee_gwei': 50, 'max_priority_fee_gwei': 2, 'first_seen_at': '2026-10-20T11:59:00Z'}]}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_stuck_transactions_timeout():
+    result = call_tool('chain_stuck_transactions', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'base_fee_gwei': 30, 'stuck_after_minutes': 30, 'accounts': [{'account': 'treasury-hot', 'confirmed_nonce': 7, 'pending': [{'nonce': 7, 'max_fee_gwei': 20, 'max_priority_fee_gwei': 1, 'first_seen_at': '2026-10-20T11:00:00Z'}, {'nonce': 9, 'max_fee_gwei': 50, 'max_priority_fee_gwei': 2, 'first_seen_at': '2026-10-20T11:59:00Z'}]}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_stuck_transactions_partial():
+    result = call_tool('chain_stuck_transactions', 'A28', {'as_of': '2026-10-20T12:00:00Z', 'base_fee_gwei': 30, 'stuck_after_minutes': 30, 'accounts': [{'account': 'treasury-hot', 'confirmed_nonce': 7, 'pending': [{'nonce': 7, 'max_fee_gwei': 20, 'max_priority_fee_gwei': 1, 'first_seen_at': '2026-10-20T11:00:00Z'}, {'nonce': 9, 'max_fee_gwei': 50, 'max_priority_fee_gwei': 2, 'first_seen_at': '2026-10-20T11:59:00Z'}]}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_chain_validator_slashing_risk_success():
+    result = call_tool('chain_validator_slashing_risk', 'A28', {'instances': [{'key_ref': 'val-001', 'host': 'node-a', 'role': 'active', 'slashing_protection': 'local_db', 'doppelganger_check': True, 'failover_wait_epochs': 0}, {'key_ref': 'val-001', 'host': 'node-b', 'role': 'standby', 'slashing_protection': 'interchange_imported', 'doppelganger_check': True, 'failover_wait_epochs': 3}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_chain_validator_slashing_risk_invalid_input():
+    result = call_tool('chain_validator_slashing_risk', 'A28', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_chain_validator_slashing_risk_unauthorized():
+    result = call_tool('chain_validator_slashing_risk', 'A01', {'instances': [{'key_ref': 'val-001', 'host': 'node-a', 'role': 'active', 'slashing_protection': 'local_db', 'doppelganger_check': True, 'failover_wait_epochs': 0}, {'key_ref': 'val-001', 'host': 'node-b', 'role': 'standby', 'slashing_protection': 'interchange_imported', 'doppelganger_check': True, 'failover_wait_epochs': 3}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'chain_validator_slashing_risk'
+
+
+def test_chain_validator_slashing_risk_dependency():
+    result = call_tool('chain_validator_slashing_risk', 'A28', {'instances': [{'key_ref': 'val-001', 'host': 'node-a', 'role': 'active', 'slashing_protection': 'local_db', 'doppelganger_check': True, 'failover_wait_epochs': 0}, {'key_ref': 'val-001', 'host': 'node-b', 'role': 'standby', 'slashing_protection': 'interchange_imported', 'doppelganger_check': True, 'failover_wait_epochs': 3}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_chain_validator_slashing_risk_timeout():
+    result = call_tool('chain_validator_slashing_risk', 'A28', {'instances': [{'key_ref': 'val-001', 'host': 'node-a', 'role': 'active', 'slashing_protection': 'local_db', 'doppelganger_check': True, 'failover_wait_epochs': 0}, {'key_ref': 'val-001', 'host': 'node-b', 'role': 'standby', 'slashing_protection': 'interchange_imported', 'doppelganger_check': True, 'failover_wait_epochs': 3}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_chain_validator_slashing_risk_partial():
+    result = call_tool('chain_validator_slashing_risk', 'A28', {'instances': [{'key_ref': 'val-001', 'host': 'node-a', 'role': 'active', 'slashing_protection': 'local_db', 'doppelganger_check': True, 'failover_wait_epochs': 0}, {'key_ref': 'val-001', 'host': 'node-b', 'role': 'standby', 'slashing_protection': 'interchange_imported', 'doppelganger_check': True, 'failover_wait_epochs': 3}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_blast_radius_success():
+    result = call_tool('cloud_blast_radius', 'A16', {'services': [{'id': 'api', 'criticality': 8, 'instances': [{'region': 'r1', 'az': 'a'}, {'region': 'r1', 'az': 'b'}], 'depends_on': ['db']}, {'id': 'db', 'criticality': 9, 'instances': [{'region': 'r1', 'az': 'a'}], 'depends_on': []}], 'max_az_blast_pct': 50})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_blast_radius_invalid_input():
+    result = call_tool('cloud_blast_radius', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_blast_radius_unauthorized():
+    result = call_tool('cloud_blast_radius', 'A01', {'services': [{'id': 'api', 'criticality': 8, 'instances': [{'region': 'r1', 'az': 'a'}, {'region': 'r1', 'az': 'b'}], 'depends_on': ['db']}, {'id': 'db', 'criticality': 9, 'instances': [{'region': 'r1', 'az': 'a'}], 'depends_on': []}], 'max_az_blast_pct': 50})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_blast_radius'
+
+
+def test_cloud_blast_radius_dependency():
+    result = call_tool('cloud_blast_radius', 'A16', {'services': [{'id': 'api', 'criticality': 8, 'instances': [{'region': 'r1', 'az': 'a'}, {'region': 'r1', 'az': 'b'}], 'depends_on': ['db']}, {'id': 'db', 'criticality': 9, 'instances': [{'region': 'r1', 'az': 'a'}], 'depends_on': []}], 'max_az_blast_pct': 50, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_blast_radius_timeout():
+    result = call_tool('cloud_blast_radius', 'A16', {'services': [{'id': 'api', 'criticality': 8, 'instances': [{'region': 'r1', 'az': 'a'}, {'region': 'r1', 'az': 'b'}], 'depends_on': ['db']}, {'id': 'db', 'criticality': 9, 'instances': [{'region': 'r1', 'az': 'a'}], 'depends_on': []}], 'max_az_blast_pct': 50, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_blast_radius_partial():
+    result = call_tool('cloud_blast_radius', 'A16', {'services': [{'id': 'api', 'criticality': 8, 'instances': [{'region': 'r1', 'az': 'a'}, {'region': 'r1', 'az': 'b'}], 'depends_on': ['db']}, {'id': 'db', 'criticality': 9, 'instances': [{'region': 'r1', 'az': 'a'}], 'depends_on': []}], 'max_az_blast_pct': 50, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_cell_capacity_success():
+    result = call_tool('cloud_cell_capacity', 'A16', {'load_rps': 900, 'cell_max_rps': 300, 'target_utilisation_pct': 70, 'growth_pct': 0, 'spare_cells': 1, 'current_cells': 6})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_cell_capacity_invalid_input():
+    result = call_tool('cloud_cell_capacity', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_cell_capacity_unauthorized():
+    result = call_tool('cloud_cell_capacity', 'A01', {'load_rps': 900, 'cell_max_rps': 300, 'target_utilisation_pct': 70, 'growth_pct': 0, 'spare_cells': 1, 'current_cells': 6})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_cell_capacity'
+
+
+def test_cloud_cell_capacity_dependency():
+    result = call_tool('cloud_cell_capacity', 'A16', {'load_rps': 900, 'cell_max_rps': 300, 'target_utilisation_pct': 70, 'growth_pct': 0, 'spare_cells': 1, 'current_cells': 6, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_cell_capacity_timeout():
+    result = call_tool('cloud_cell_capacity', 'A16', {'load_rps': 900, 'cell_max_rps': 300, 'target_utilisation_pct': 70, 'growth_pct': 0, 'spare_cells': 1, 'current_cells': 6, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_cell_capacity_partial():
+    result = call_tool('cloud_cell_capacity', 'A16', {'load_rps': 900, 'cell_max_rps': 300, 'target_utilisation_pct': 70, 'growth_pct': 0, 'spare_cells': 1, 'current_cells': 6, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_cidr_plan_success():
+    result = call_tool('cloud_cidr_plan', 'A16', {'networks': [{'name': 'vpc-a', 'cidr': '10.0.0.0/16', 'routable': True, 'required_addresses': 1000}, {'name': 'vpc-b', 'cidr': '10.1.0.0/16', 'routable': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_cidr_plan_invalid_input():
+    result = call_tool('cloud_cidr_plan', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_cidr_plan_unauthorized():
+    result = call_tool('cloud_cidr_plan', 'A01', {'networks': [{'name': 'vpc-a', 'cidr': '10.0.0.0/16', 'routable': True, 'required_addresses': 1000}, {'name': 'vpc-b', 'cidr': '10.1.0.0/16', 'routable': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_cidr_plan'
+
+
+def test_cloud_cidr_plan_dependency():
+    result = call_tool('cloud_cidr_plan', 'A16', {'networks': [{'name': 'vpc-a', 'cidr': '10.0.0.0/16', 'routable': True, 'required_addresses': 1000}, {'name': 'vpc-b', 'cidr': '10.1.0.0/16', 'routable': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_cidr_plan_timeout():
+    result = call_tool('cloud_cidr_plan', 'A16', {'networks': [{'name': 'vpc-a', 'cidr': '10.0.0.0/16', 'routable': True, 'required_addresses': 1000}, {'name': 'vpc-b', 'cidr': '10.1.0.0/16', 'routable': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_cidr_plan_partial():
+    result = call_tool('cloud_cidr_plan', 'A16', {'networks': [{'name': 'vpc-a', 'cidr': '10.0.0.0/16', 'routable': True, 'required_addresses': 1000}, {'name': 'vpc-b', 'cidr': '10.1.0.0/16', 'routable': True}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_composite_availability_success():
+    result = call_tool('cloud_composite_availability', 'A16', {'target_pct': 99.9, 'tiers': [{'id': 'edge', 'availability_pct': 99.5, 'replicas': 3, 'min_required': 2, 'shared_failure_domain': False}, {'id': 'db', 'availability_pct': 99.95, 'replicas': 1, 'min_required': 1, 'shared_failure_domain': False}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_composite_availability_invalid_input():
+    result = call_tool('cloud_composite_availability', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_composite_availability_unauthorized():
+    result = call_tool('cloud_composite_availability', 'A01', {'target_pct': 99.9, 'tiers': [{'id': 'edge', 'availability_pct': 99.5, 'replicas': 3, 'min_required': 2, 'shared_failure_domain': False}, {'id': 'db', 'availability_pct': 99.95, 'replicas': 1, 'min_required': 1, 'shared_failure_domain': False}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_composite_availability'
+
+
+def test_cloud_composite_availability_dependency():
+    result = call_tool('cloud_composite_availability', 'A16', {'target_pct': 99.9, 'tiers': [{'id': 'edge', 'availability_pct': 99.5, 'replicas': 3, 'min_required': 2, 'shared_failure_domain': False}, {'id': 'db', 'availability_pct': 99.95, 'replicas': 1, 'min_required': 1, 'shared_failure_domain': False}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_composite_availability_timeout():
+    result = call_tool('cloud_composite_availability', 'A16', {'target_pct': 99.9, 'tiers': [{'id': 'edge', 'availability_pct': 99.5, 'replicas': 3, 'min_required': 2, 'shared_failure_domain': False}, {'id': 'db', 'availability_pct': 99.95, 'replicas': 1, 'min_required': 1, 'shared_failure_domain': False}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_composite_availability_partial():
+    result = call_tool('cloud_composite_availability', 'A16', {'target_pct': 99.9, 'tiers': [{'id': 'edge', 'availability_pct': 99.5, 'replicas': 3, 'min_required': 2, 'shared_failure_domain': False}, {'id': 'db', 'availability_pct': 99.95, 'replicas': 1, 'min_required': 1, 'shared_failure_domain': False}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_data_residency_success():
+    result = call_tool('cloud_data_residency', 'A16', {'regions': [{'region': 'eu-west-1', 'jurisdiction': 'EU'}, {'region': 'us-east-1', 'jurisdiction': 'US'}], 'rules': [{'data_class': 'pii', 'allowed_jurisdictions': ['EU']}], 'placements': [{'resource': 'orders-db', 'data_class': 'pii', 'region': 'eu-west-1', 'kind': 'primary'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_data_residency_invalid_input():
+    result = call_tool('cloud_data_residency', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_data_residency_unauthorized():
+    result = call_tool('cloud_data_residency', 'A01', {'regions': [{'region': 'eu-west-1', 'jurisdiction': 'EU'}, {'region': 'us-east-1', 'jurisdiction': 'US'}], 'rules': [{'data_class': 'pii', 'allowed_jurisdictions': ['EU']}], 'placements': [{'resource': 'orders-db', 'data_class': 'pii', 'region': 'eu-west-1', 'kind': 'primary'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_data_residency'
+
+
+def test_cloud_data_residency_dependency():
+    result = call_tool('cloud_data_residency', 'A16', {'regions': [{'region': 'eu-west-1', 'jurisdiction': 'EU'}, {'region': 'us-east-1', 'jurisdiction': 'US'}], 'rules': [{'data_class': 'pii', 'allowed_jurisdictions': ['EU']}], 'placements': [{'resource': 'orders-db', 'data_class': 'pii', 'region': 'eu-west-1', 'kind': 'primary'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_data_residency_timeout():
+    result = call_tool('cloud_data_residency', 'A16', {'regions': [{'region': 'eu-west-1', 'jurisdiction': 'EU'}, {'region': 'us-east-1', 'jurisdiction': 'US'}], 'rules': [{'data_class': 'pii', 'allowed_jurisdictions': ['EU']}], 'placements': [{'resource': 'orders-db', 'data_class': 'pii', 'region': 'eu-west-1', 'kind': 'primary'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_data_residency_partial():
+    result = call_tool('cloud_data_residency', 'A16', {'regions': [{'region': 'eu-west-1', 'jurisdiction': 'EU'}, {'region': 'us-east-1', 'jurisdiction': 'US'}], 'rules': [{'data_class': 'pii', 'allowed_jurisdictions': ['EU']}], 'placements': [{'resource': 'orders-db', 'data_class': 'pii', 'region': 'eu-west-1', 'kind': 'primary'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_dr_feasibility_success():
+    result = call_tool('cloud_dr_feasibility', 'A16', {'strategy': 'active_active', 'rto_target_min': 30, 'rpo_target_min': 5, 'detect_decide_min': 10, 'traffic_cutover_min': 5, 'validation_min': 0, 'replication_lag_s': 30})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_dr_feasibility_invalid_input():
+    result = call_tool('cloud_dr_feasibility', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_dr_feasibility_unauthorized():
+    result = call_tool('cloud_dr_feasibility', 'A01', {'strategy': 'active_active', 'rto_target_min': 30, 'rpo_target_min': 5, 'detect_decide_min': 10, 'traffic_cutover_min': 5, 'validation_min': 0, 'replication_lag_s': 30})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_dr_feasibility'
+
+
+def test_cloud_dr_feasibility_dependency():
+    result = call_tool('cloud_dr_feasibility', 'A16', {'strategy': 'active_active', 'rto_target_min': 30, 'rpo_target_min': 5, 'detect_decide_min': 10, 'traffic_cutover_min': 5, 'validation_min': 0, 'replication_lag_s': 30, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_dr_feasibility_timeout():
+    result = call_tool('cloud_dr_feasibility', 'A16', {'strategy': 'active_active', 'rto_target_min': 30, 'rpo_target_min': 5, 'detect_decide_min': 10, 'traffic_cutover_min': 5, 'validation_min': 0, 'replication_lag_s': 30, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_dr_feasibility_partial():
+    result = call_tool('cloud_dr_feasibility', 'A16', {'strategy': 'active_active', 'rto_target_min': 30, 'rpo_target_min': 5, 'detect_decide_min': 10, 'traffic_cutover_min': 5, 'validation_min': 0, 'replication_lag_s': 30, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_landing_zone_lint_success():
+    result = call_tool('cloud_landing_zone_lint', 'A16', {'accounts': [{'id': '1', 'role': 'management', 'ou': '', 'root_mfa': True, 'iam_users': 0, 'guardrails': []}], 'break_glass': {'configured': True, 'hardware_mfa': True, 'alert_on_use': True, 'last_tested_days_ago': 30}})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_landing_zone_lint_invalid_input():
+    result = call_tool('cloud_landing_zone_lint', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_landing_zone_lint_unauthorized():
+    result = call_tool('cloud_landing_zone_lint', 'A01', {'accounts': [{'id': '1', 'role': 'management', 'ou': '', 'root_mfa': True, 'iam_users': 0, 'guardrails': []}], 'break_glass': {'configured': True, 'hardware_mfa': True, 'alert_on_use': True, 'last_tested_days_ago': 30}})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_landing_zone_lint'
+
+
+def test_cloud_landing_zone_lint_dependency():
+    result = call_tool('cloud_landing_zone_lint', 'A16', {'accounts': [{'id': '1', 'role': 'management', 'ou': '', 'root_mfa': True, 'iam_users': 0, 'guardrails': []}], 'break_glass': {'configured': True, 'hardware_mfa': True, 'alert_on_use': True, 'last_tested_days_ago': 30}, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_landing_zone_lint_timeout():
+    result = call_tool('cloud_landing_zone_lint', 'A16', {'accounts': [{'id': '1', 'role': 'management', 'ou': '', 'root_mfa': True, 'iam_users': 0, 'guardrails': []}], 'break_glass': {'configured': True, 'hardware_mfa': True, 'alert_on_use': True, 'last_tested_days_ago': 30}, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_landing_zone_lint_partial():
+    result = call_tool('cloud_landing_zone_lint', 'A16', {'accounts': [{'id': '1', 'role': 'management', 'ou': '', 'root_mfa': True, 'iam_users': 0, 'guardrails': []}], 'break_glass': {'configured': True, 'hardware_mfa': True, 'alert_on_use': True, 'last_tested_days_ago': 30}, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_latency_budget_success():
+    result = call_tool('cloud_latency_budget', 'A16', {'p99_target_ms': 300, 'hops': [{'name': 'edge', 'p50_ms': 5, 'p99_ms': 20, 'calls': 1}, {'name': 'api', 'p50_ms': 30, 'p99_ms': 120, 'calls': 1}, {'name': 'db', 'p50_ms': 3, 'p99_ms': 25, 'calls': 2}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_latency_budget_invalid_input():
+    result = call_tool('cloud_latency_budget', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_latency_budget_unauthorized():
+    result = call_tool('cloud_latency_budget', 'A01', {'p99_target_ms': 300, 'hops': [{'name': 'edge', 'p50_ms': 5, 'p99_ms': 20, 'calls': 1}, {'name': 'api', 'p50_ms': 30, 'p99_ms': 120, 'calls': 1}, {'name': 'db', 'p50_ms': 3, 'p99_ms': 25, 'calls': 2}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_latency_budget'
+
+
+def test_cloud_latency_budget_dependency():
+    result = call_tool('cloud_latency_budget', 'A16', {'p99_target_ms': 300, 'hops': [{'name': 'edge', 'p50_ms': 5, 'p99_ms': 20, 'calls': 1}, {'name': 'api', 'p50_ms': 30, 'p99_ms': 120, 'calls': 1}, {'name': 'db', 'p50_ms': 3, 'p99_ms': 25, 'calls': 2}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_latency_budget_timeout():
+    result = call_tool('cloud_latency_budget', 'A16', {'p99_target_ms': 300, 'hops': [{'name': 'edge', 'p50_ms': 5, 'p99_ms': 20, 'calls': 1}, {'name': 'api', 'p50_ms': 30, 'p99_ms': 120, 'calls': 1}, {'name': 'db', 'p50_ms': 3, 'p99_ms': 25, 'calls': 2}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_latency_budget_partial():
+    result = call_tool('cloud_latency_budget', 'A16', {'p99_target_ms': 300, 'hops': [{'name': 'edge', 'p50_ms': 5, 'p99_ms': 20, 'calls': 1}, {'name': 'api', 'p50_ms': 30, 'p99_ms': 120, 'calls': 1}, {'name': 'db', 'p50_ms': 3, 'p99_ms': 25, 'calls': 2}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_managed_vs_self_hosted_success():
+    result = call_tool('cloud_managed_vs_self_hosted', 'A16', {'criteria': [{'id': 'ops-burden', 'weight': 8, 'managed_score': 5, 'self_hosted_score': 2, 'critical': False}, {'id': 'cost', 'weight': 5, 'managed_score': 2, 'self_hosted_score': 4, 'critical': False}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_managed_vs_self_hosted_invalid_input():
+    result = call_tool('cloud_managed_vs_self_hosted', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_managed_vs_self_hosted_unauthorized():
+    result = call_tool('cloud_managed_vs_self_hosted', 'A01', {'criteria': [{'id': 'ops-burden', 'weight': 8, 'managed_score': 5, 'self_hosted_score': 2, 'critical': False}, {'id': 'cost', 'weight': 5, 'managed_score': 2, 'self_hosted_score': 4, 'critical': False}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_managed_vs_self_hosted'
+
+
+def test_cloud_managed_vs_self_hosted_dependency():
+    result = call_tool('cloud_managed_vs_self_hosted', 'A16', {'criteria': [{'id': 'ops-burden', 'weight': 8, 'managed_score': 5, 'self_hosted_score': 2, 'critical': False}, {'id': 'cost', 'weight': 5, 'managed_score': 2, 'self_hosted_score': 4, 'critical': False}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_managed_vs_self_hosted_timeout():
+    result = call_tool('cloud_managed_vs_self_hosted', 'A16', {'criteria': [{'id': 'ops-burden', 'weight': 8, 'managed_score': 5, 'self_hosted_score': 2, 'critical': False}, {'id': 'cost', 'weight': 5, 'managed_score': 2, 'self_hosted_score': 4, 'critical': False}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_managed_vs_self_hosted_partial():
+    result = call_tool('cloud_managed_vs_self_hosted', 'A16', {'criteria': [{'id': 'ops-burden', 'weight': 8, 'managed_score': 5, 'self_hosted_score': 2, 'critical': False}, {'id': 'cost', 'weight': 5, 'managed_score': 2, 'self_hosted_score': 4, 'critical': False}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_replica_placement_success():
+    result = call_tool('cloud_replica_placement', 'A16', {'placements': [{'az': 'a', 'replicas': 1}, {'az': 'b', 'replicas': 1}, {'az': 'c', 'replicas': 1}], 'quorum_mode': 'majority', 'tolerate_az_failures': 1})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_replica_placement_invalid_input():
+    result = call_tool('cloud_replica_placement', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_replica_placement_unauthorized():
+    result = call_tool('cloud_replica_placement', 'A01', {'placements': [{'az': 'a', 'replicas': 1}, {'az': 'b', 'replicas': 1}, {'az': 'c', 'replicas': 1}], 'quorum_mode': 'majority', 'tolerate_az_failures': 1})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_replica_placement'
+
+
+def test_cloud_replica_placement_dependency():
+    result = call_tool('cloud_replica_placement', 'A16', {'placements': [{'az': 'a', 'replicas': 1}, {'az': 'b', 'replicas': 1}, {'az': 'c', 'replicas': 1}], 'quorum_mode': 'majority', 'tolerate_az_failures': 1, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_replica_placement_timeout():
+    result = call_tool('cloud_replica_placement', 'A16', {'placements': [{'az': 'a', 'replicas': 1}, {'az': 'b', 'replicas': 1}, {'az': 'c', 'replicas': 1}], 'quorum_mode': 'majority', 'tolerate_az_failures': 1, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_replica_placement_partial():
+    result = call_tool('cloud_replica_placement', 'A16', {'placements': [{'az': 'a', 'replicas': 1}, {'az': 'b', 'replicas': 1}, {'az': 'c', 'replicas': 1}], 'quorum_mode': 'majority', 'tolerate_az_failures': 1, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_twelve_factor_audit_success():
+    result = call_tool('cloud_twelve_factor_audit', 'A16', {'service': {'codebase_in_vcs': True, 'repos_per_app': 1, 'config_from_environment': True, 'logs_to_stdout': True}})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_twelve_factor_audit_invalid_input():
+    result = call_tool('cloud_twelve_factor_audit', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_twelve_factor_audit_unauthorized():
+    result = call_tool('cloud_twelve_factor_audit', 'A01', {'service': {'codebase_in_vcs': True, 'repos_per_app': 1, 'config_from_environment': True, 'logs_to_stdout': True}})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_twelve_factor_audit'
+
+
+def test_cloud_twelve_factor_audit_dependency():
+    result = call_tool('cloud_twelve_factor_audit', 'A16', {'service': {'codebase_in_vcs': True, 'repos_per_app': 1, 'config_from_environment': True, 'logs_to_stdout': True}, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_twelve_factor_audit_timeout():
+    result = call_tool('cloud_twelve_factor_audit', 'A16', {'service': {'codebase_in_vcs': True, 'repos_per_app': 1, 'config_from_environment': True, 'logs_to_stdout': True}, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_twelve_factor_audit_partial():
+    result = call_tool('cloud_twelve_factor_audit', 'A16', {'service': {'codebase_in_vcs': True, 'repos_per_app': 1, 'config_from_environment': True, 'logs_to_stdout': True}, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_cloud_wellarch_scorecard_success():
+    result = call_tool('cloud_wellarch_scorecard', 'A16', {'answers': [{'pillar': 'operational_excellence', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'security', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'reliability', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'performance_efficiency', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'cost_optimization', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'sustainability', 'question': 'q', 'weight': 3, 'risk': 'none'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_cloud_wellarch_scorecard_invalid_input():
+    result = call_tool('cloud_wellarch_scorecard', 'A16', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_cloud_wellarch_scorecard_unauthorized():
+    result = call_tool('cloud_wellarch_scorecard', 'A01', {'answers': [{'pillar': 'operational_excellence', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'security', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'reliability', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'performance_efficiency', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'cost_optimization', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'sustainability', 'question': 'q', 'weight': 3, 'risk': 'none'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'cloud_wellarch_scorecard'
+
+
+def test_cloud_wellarch_scorecard_dependency():
+    result = call_tool('cloud_wellarch_scorecard', 'A16', {'answers': [{'pillar': 'operational_excellence', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'security', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'reliability', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'performance_efficiency', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'cost_optimization', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'sustainability', 'question': 'q', 'weight': 3, 'risk': 'none'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_cloud_wellarch_scorecard_timeout():
+    result = call_tool('cloud_wellarch_scorecard', 'A16', {'answers': [{'pillar': 'operational_excellence', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'security', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'reliability', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'performance_efficiency', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'cost_optimization', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'sustainability', 'question': 'q', 'weight': 3, 'risk': 'none'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_cloud_wellarch_scorecard_partial():
+    result = call_tool('cloud_wellarch_scorecard', 'A16', {'answers': [{'pillar': 'operational_excellence', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'security', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'reliability', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'performance_efficiency', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'cost_optimization', 'question': 'q', 'weight': 3, 'risk': 'none'}, {'pillar': 'sustainability', 'question': 'q', 'weight': 3, 'risk': 'none'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_audit_trail_success():
+    result = call_tool('custody_audit_trail', 'A30', {'events': [{'seq': 1, 'at': '2026-10-19T09:00:00Z', 'actor': 'alice', 'action': 'limit.update', 'approvers': ['bob', 'carol'], 'prev_hash': '0000000000000000000000000000000000000000000000000000000000000000', 'hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b'}, {'seq': 2, 'at': '2026-10-19T10:00:00Z', 'actor': 'bob', 'action': 'signer.add', 'approvers': ['alice', 'carol'], 'prev_hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b', 'hash': '11ee45653fbc7a4b0195cd3c634e5ccfbcf1ce4d2db4cfd1733c1759e5c5fa4b'}], 'approval_required_actions': ['limit.update', 'signer.add'], 'min_approvals': 2})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_audit_trail_invalid_input():
+    result = call_tool('custody_audit_trail', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_audit_trail_unauthorized():
+    result = call_tool('custody_audit_trail', 'A01', {'events': [{'seq': 1, 'at': '2026-10-19T09:00:00Z', 'actor': 'alice', 'action': 'limit.update', 'approvers': ['bob', 'carol'], 'prev_hash': '0000000000000000000000000000000000000000000000000000000000000000', 'hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b'}, {'seq': 2, 'at': '2026-10-19T10:00:00Z', 'actor': 'bob', 'action': 'signer.add', 'approvers': ['alice', 'carol'], 'prev_hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b', 'hash': '11ee45653fbc7a4b0195cd3c634e5ccfbcf1ce4d2db4cfd1733c1759e5c5fa4b'}], 'approval_required_actions': ['limit.update', 'signer.add'], 'min_approvals': 2})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_audit_trail'
+
+
+def test_custody_audit_trail_dependency():
+    result = call_tool('custody_audit_trail', 'A30', {'events': [{'seq': 1, 'at': '2026-10-19T09:00:00Z', 'actor': 'alice', 'action': 'limit.update', 'approvers': ['bob', 'carol'], 'prev_hash': '0000000000000000000000000000000000000000000000000000000000000000', 'hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b'}, {'seq': 2, 'at': '2026-10-19T10:00:00Z', 'actor': 'bob', 'action': 'signer.add', 'approvers': ['alice', 'carol'], 'prev_hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b', 'hash': '11ee45653fbc7a4b0195cd3c634e5ccfbcf1ce4d2db4cfd1733c1759e5c5fa4b'}], 'approval_required_actions': ['limit.update', 'signer.add'], 'min_approvals': 2, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_audit_trail_timeout():
+    result = call_tool('custody_audit_trail', 'A30', {'events': [{'seq': 1, 'at': '2026-10-19T09:00:00Z', 'actor': 'alice', 'action': 'limit.update', 'approvers': ['bob', 'carol'], 'prev_hash': '0000000000000000000000000000000000000000000000000000000000000000', 'hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b'}, {'seq': 2, 'at': '2026-10-19T10:00:00Z', 'actor': 'bob', 'action': 'signer.add', 'approvers': ['alice', 'carol'], 'prev_hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b', 'hash': '11ee45653fbc7a4b0195cd3c634e5ccfbcf1ce4d2db4cfd1733c1759e5c5fa4b'}], 'approval_required_actions': ['limit.update', 'signer.add'], 'min_approvals': 2, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_audit_trail_partial():
+    result = call_tool('custody_audit_trail', 'A30', {'events': [{'seq': 1, 'at': '2026-10-19T09:00:00Z', 'actor': 'alice', 'action': 'limit.update', 'approvers': ['bob', 'carol'], 'prev_hash': '0000000000000000000000000000000000000000000000000000000000000000', 'hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b'}, {'seq': 2, 'at': '2026-10-19T10:00:00Z', 'actor': 'bob', 'action': 'signer.add', 'approvers': ['alice', 'carol'], 'prev_hash': '6040c281b93cd56c53b55e8ccb989525599c449cb6e2dc309f18dc59b471485b', 'hash': '11ee45653fbc7a4b0195cd3c634e5ccfbcf1ce4d2db4cfd1733c1759e5c5fa4b'}], 'approval_required_actions': ['limit.update', 'signer.add'], 'min_approvals': 2, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_ceremony_checklist_success():
+    result = call_tool('custody_ceremony_checklist', 'A30', {'ceremony_type': 'key_generation', 'min_witnesses': 2, 'items': [{'item': 'participants-identified', 'done': True, 'evidence_ref': 'rec-001', 'witness_count': 2}, {'item': 'procedure-reviewed', 'done': True, 'evidence_ref': 'rec-002', 'witness_count': 0}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_ceremony_checklist_invalid_input():
+    result = call_tool('custody_ceremony_checklist', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_ceremony_checklist_unauthorized():
+    result = call_tool('custody_ceremony_checklist', 'A01', {'ceremony_type': 'key_generation', 'min_witnesses': 2, 'items': [{'item': 'participants-identified', 'done': True, 'evidence_ref': 'rec-001', 'witness_count': 2}, {'item': 'procedure-reviewed', 'done': True, 'evidence_ref': 'rec-002', 'witness_count': 0}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_ceremony_checklist'
+
+
+def test_custody_ceremony_checklist_dependency():
+    result = call_tool('custody_ceremony_checklist', 'A30', {'ceremony_type': 'key_generation', 'min_witnesses': 2, 'items': [{'item': 'participants-identified', 'done': True, 'evidence_ref': 'rec-001', 'witness_count': 2}, {'item': 'procedure-reviewed', 'done': True, 'evidence_ref': 'rec-002', 'witness_count': 0}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_ceremony_checklist_timeout():
+    result = call_tool('custody_ceremony_checklist', 'A30', {'ceremony_type': 'key_generation', 'min_witnesses': 2, 'items': [{'item': 'participants-identified', 'done': True, 'evidence_ref': 'rec-001', 'witness_count': 2}, {'item': 'procedure-reviewed', 'done': True, 'evidence_ref': 'rec-002', 'witness_count': 0}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_ceremony_checklist_partial():
+    result = call_tool('custody_ceremony_checklist', 'A30', {'ceremony_type': 'key_generation', 'min_witnesses': 2, 'items': [{'item': 'participants-identified', 'done': True, 'evidence_ref': 'rec-001', 'witness_count': 2}, {'item': 'procedure-reviewed', 'done': True, 'evidence_ref': 'rec-002', 'witness_count': 0}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_key_rotation_success():
+    result = call_tool('custody_key_rotation', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'warn_days': 30, 'keys': [{'key_id': 'signer-1', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '', 'max_age_days': 365}, {'key_id': 'signer-2', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '2026-09-01T00:00:00Z', 'max_age_days': 365}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_key_rotation_invalid_input():
+    result = call_tool('custody_key_rotation', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_key_rotation_unauthorized():
+    result = call_tool('custody_key_rotation', 'A01', {'as_of': '2026-10-20T00:00:00Z', 'warn_days': 30, 'keys': [{'key_id': 'signer-1', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '', 'max_age_days': 365}, {'key_id': 'signer-2', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '2026-09-01T00:00:00Z', 'max_age_days': 365}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_key_rotation'
+
+
+def test_custody_key_rotation_dependency():
+    result = call_tool('custody_key_rotation', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'warn_days': 30, 'keys': [{'key_id': 'signer-1', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '', 'max_age_days': 365}, {'key_id': 'signer-2', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '2026-09-01T00:00:00Z', 'max_age_days': 365}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_key_rotation_timeout():
+    result = call_tool('custody_key_rotation', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'warn_days': 30, 'keys': [{'key_id': 'signer-1', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '', 'max_age_days': 365}, {'key_id': 'signer-2', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '2026-09-01T00:00:00Z', 'max_age_days': 365}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_key_rotation_partial():
+    result = call_tool('custody_key_rotation', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'warn_days': 30, 'keys': [{'key_id': 'signer-1', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '', 'max_age_days': 365}, {'key_id': 'signer-2', 'created_at': '2025-01-01T00:00:00Z', 'last_rotated_at': '2026-09-01T00:00:00Z', 'max_age_days': 365}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_multisig_policy_success():
+    result = call_tool('custody_multisig_policy', 'A30', {'threshold': 2, 'signers': [{'signer_id': 's1', 'entity': 'treasury-ops', 'region': 'DE', 'device': 'hardware'}, {'signer_id': 's2', 'entity': 'security-team', 'region': 'US', 'device': 'hardware'}, {'signer_id': 's3', 'entity': 'cfo', 'region': 'SG', 'device': 'hsm'}], 'tiers': [{'min_value_usd': 0, 'required_signatures': 2}, {'min_value_usd': 1000000, 'required_signatures': 3}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_multisig_policy_invalid_input():
+    result = call_tool('custody_multisig_policy', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_multisig_policy_unauthorized():
+    result = call_tool('custody_multisig_policy', 'A01', {'threshold': 2, 'signers': [{'signer_id': 's1', 'entity': 'treasury-ops', 'region': 'DE', 'device': 'hardware'}, {'signer_id': 's2', 'entity': 'security-team', 'region': 'US', 'device': 'hardware'}, {'signer_id': 's3', 'entity': 'cfo', 'region': 'SG', 'device': 'hsm'}], 'tiers': [{'min_value_usd': 0, 'required_signatures': 2}, {'min_value_usd': 1000000, 'required_signatures': 3}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_multisig_policy'
+
+
+def test_custody_multisig_policy_dependency():
+    result = call_tool('custody_multisig_policy', 'A30', {'threshold': 2, 'signers': [{'signer_id': 's1', 'entity': 'treasury-ops', 'region': 'DE', 'device': 'hardware'}, {'signer_id': 's2', 'entity': 'security-team', 'region': 'US', 'device': 'hardware'}, {'signer_id': 's3', 'entity': 'cfo', 'region': 'SG', 'device': 'hsm'}], 'tiers': [{'min_value_usd': 0, 'required_signatures': 2}, {'min_value_usd': 1000000, 'required_signatures': 3}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_multisig_policy_timeout():
+    result = call_tool('custody_multisig_policy', 'A30', {'threshold': 2, 'signers': [{'signer_id': 's1', 'entity': 'treasury-ops', 'region': 'DE', 'device': 'hardware'}, {'signer_id': 's2', 'entity': 'security-team', 'region': 'US', 'device': 'hardware'}, {'signer_id': 's3', 'entity': 'cfo', 'region': 'SG', 'device': 'hsm'}], 'tiers': [{'min_value_usd': 0, 'required_signatures': 2}, {'min_value_usd': 1000000, 'required_signatures': 3}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_multisig_policy_partial():
+    result = call_tool('custody_multisig_policy', 'A30', {'threshold': 2, 'signers': [{'signer_id': 's1', 'entity': 'treasury-ops', 'region': 'DE', 'device': 'hardware'}, {'signer_id': 's2', 'entity': 'security-team', 'region': 'US', 'device': 'hardware'}, {'signer_id': 's3', 'entity': 'cfo', 'region': 'SG', 'device': 'hsm'}], 'tiers': [{'min_value_usd': 0, 'required_signatures': 2}, {'min_value_usd': 1000000, 'required_signatures': 3}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_recovery_drill_success():
+    result = call_tool('custody_recovery_drill', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'max_age_days': 180, 'target_rto_minutes': 240, 'required_scenarios': ['signer_key_loss', 'full_restore'], 'drills': [{'scenario': 'signer_key_loss', 'last_drill_at': '2026-08-01T00:00:00Z', 'passed': True, 'measured_rto_minutes': 90}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_recovery_drill_invalid_input():
+    result = call_tool('custody_recovery_drill', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_recovery_drill_unauthorized():
+    result = call_tool('custody_recovery_drill', 'A01', {'as_of': '2026-10-20T00:00:00Z', 'max_age_days': 180, 'target_rto_minutes': 240, 'required_scenarios': ['signer_key_loss', 'full_restore'], 'drills': [{'scenario': 'signer_key_loss', 'last_drill_at': '2026-08-01T00:00:00Z', 'passed': True, 'measured_rto_minutes': 90}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_recovery_drill'
+
+
+def test_custody_recovery_drill_dependency():
+    result = call_tool('custody_recovery_drill', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'max_age_days': 180, 'target_rto_minutes': 240, 'required_scenarios': ['signer_key_loss', 'full_restore'], 'drills': [{'scenario': 'signer_key_loss', 'last_drill_at': '2026-08-01T00:00:00Z', 'passed': True, 'measured_rto_minutes': 90}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_recovery_drill_timeout():
+    result = call_tool('custody_recovery_drill', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'max_age_days': 180, 'target_rto_minutes': 240, 'required_scenarios': ['signer_key_loss', 'full_restore'], 'drills': [{'scenario': 'signer_key_loss', 'last_drill_at': '2026-08-01T00:00:00Z', 'passed': True, 'measured_rto_minutes': 90}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_recovery_drill_partial():
+    result = call_tool('custody_recovery_drill', 'A30', {'as_of': '2026-10-20T00:00:00Z', 'max_age_days': 180, 'target_rto_minutes': 240, 'required_scenarios': ['signer_key_loss', 'full_restore'], 'drills': [{'scenario': 'signer_key_loss', 'last_drill_at': '2026-08-01T00:00:00Z', 'passed': True, 'measured_rto_minutes': 90}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_sanctions_screening_success():
+    result = call_tool('custody_sanctions_screening', 'A30', {'as_of': '2026-10-20T12:00:00Z', 'max_list_age_hours': 24, 'max_screening_age_hours': 24, 'screenings': [{'subject_id': 'cp-001', 'list_name': 'ofac-sdn', 'list_updated_at': '2026-10-20T06:00:00Z', 'screened_at': '2026-10-20T08:00:00Z', 'result': 'clear', 'action': 'released'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_sanctions_screening_invalid_input():
+    result = call_tool('custody_sanctions_screening', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_sanctions_screening_unauthorized():
+    result = call_tool('custody_sanctions_screening', 'A01', {'as_of': '2026-10-20T12:00:00Z', 'max_list_age_hours': 24, 'max_screening_age_hours': 24, 'screenings': [{'subject_id': 'cp-001', 'list_name': 'ofac-sdn', 'list_updated_at': '2026-10-20T06:00:00Z', 'screened_at': '2026-10-20T08:00:00Z', 'result': 'clear', 'action': 'released'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_sanctions_screening'
+
+
+def test_custody_sanctions_screening_dependency():
+    result = call_tool('custody_sanctions_screening', 'A30', {'as_of': '2026-10-20T12:00:00Z', 'max_list_age_hours': 24, 'max_screening_age_hours': 24, 'screenings': [{'subject_id': 'cp-001', 'list_name': 'ofac-sdn', 'list_updated_at': '2026-10-20T06:00:00Z', 'screened_at': '2026-10-20T08:00:00Z', 'result': 'clear', 'action': 'released'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_sanctions_screening_timeout():
+    result = call_tool('custody_sanctions_screening', 'A30', {'as_of': '2026-10-20T12:00:00Z', 'max_list_age_hours': 24, 'max_screening_age_hours': 24, 'screenings': [{'subject_id': 'cp-001', 'list_name': 'ofac-sdn', 'list_updated_at': '2026-10-20T06:00:00Z', 'screened_at': '2026-10-20T08:00:00Z', 'result': 'clear', 'action': 'released'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_sanctions_screening_partial():
+    result = call_tool('custody_sanctions_screening', 'A30', {'as_of': '2026-10-20T12:00:00Z', 'max_list_age_hours': 24, 'max_screening_age_hours': 24, 'screenings': [{'subject_id': 'cp-001', 'list_name': 'ofac-sdn', 'list_updated_at': '2026-10-20T06:00:00Z', 'screened_at': '2026-10-20T08:00:00Z', 'result': 'clear', 'action': 'released'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_secret_scan_success():
+    result = call_tool('custody_secret_scan', 'A30', {'files': [{'path': 'config/app.env', 'content': 'RPC_URL=https://rpc.example.org\nLOG_LEVEL=info\n'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_secret_scan_invalid_input():
+    result = call_tool('custody_secret_scan', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_secret_scan_unauthorized():
+    result = call_tool('custody_secret_scan', 'A01', {'files': [{'path': 'config/app.env', 'content': 'RPC_URL=https://rpc.example.org\nLOG_LEVEL=info\n'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_secret_scan'
+
+
+def test_custody_secret_scan_dependency():
+    result = call_tool('custody_secret_scan', 'A30', {'files': [{'path': 'config/app.env', 'content': 'RPC_URL=https://rpc.example.org\nLOG_LEVEL=info\n'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_secret_scan_timeout():
+    result = call_tool('custody_secret_scan', 'A30', {'files': [{'path': 'config/app.env', 'content': 'RPC_URL=https://rpc.example.org\nLOG_LEVEL=info\n'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_secret_scan_partial():
+    result = call_tool('custody_secret_scan', 'A30', {'files': [{'path': 'config/app.env', 'content': 'RPC_URL=https://rpc.example.org\nLOG_LEVEL=info\n'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_shard_distribution_success():
+    result = call_tool('custody_shard_distribution', 'A30', {'threshold': 3, 'shards': [{'shard_id': 'sh1', 'custodian': 'alice', 'organization': 'acme', 'country': 'DE'}, {'shard_id': 'sh2', 'custodian': 'bob', 'organization': 'bank-a', 'country': 'CH'}, {'shard_id': 'sh3', 'custodian': 'carol', 'organization': 'law-firm', 'country': 'US'}, {'shard_id': 'sh4', 'custodian': 'dave', 'organization': 'trust-co', 'country': 'SG'}, {'shard_id': 'sh5', 'custodian': 'erin', 'organization': 'auditor', 'country': 'GB'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_shard_distribution_invalid_input():
+    result = call_tool('custody_shard_distribution', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_shard_distribution_unauthorized():
+    result = call_tool('custody_shard_distribution', 'A01', {'threshold': 3, 'shards': [{'shard_id': 'sh1', 'custodian': 'alice', 'organization': 'acme', 'country': 'DE'}, {'shard_id': 'sh2', 'custodian': 'bob', 'organization': 'bank-a', 'country': 'CH'}, {'shard_id': 'sh3', 'custodian': 'carol', 'organization': 'law-firm', 'country': 'US'}, {'shard_id': 'sh4', 'custodian': 'dave', 'organization': 'trust-co', 'country': 'SG'}, {'shard_id': 'sh5', 'custodian': 'erin', 'organization': 'auditor', 'country': 'GB'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_shard_distribution'
+
+
+def test_custody_shard_distribution_dependency():
+    result = call_tool('custody_shard_distribution', 'A30', {'threshold': 3, 'shards': [{'shard_id': 'sh1', 'custodian': 'alice', 'organization': 'acme', 'country': 'DE'}, {'shard_id': 'sh2', 'custodian': 'bob', 'organization': 'bank-a', 'country': 'CH'}, {'shard_id': 'sh3', 'custodian': 'carol', 'organization': 'law-firm', 'country': 'US'}, {'shard_id': 'sh4', 'custodian': 'dave', 'organization': 'trust-co', 'country': 'SG'}, {'shard_id': 'sh5', 'custodian': 'erin', 'organization': 'auditor', 'country': 'GB'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_shard_distribution_timeout():
+    result = call_tool('custody_shard_distribution', 'A30', {'threshold': 3, 'shards': [{'shard_id': 'sh1', 'custodian': 'alice', 'organization': 'acme', 'country': 'DE'}, {'shard_id': 'sh2', 'custodian': 'bob', 'organization': 'bank-a', 'country': 'CH'}, {'shard_id': 'sh3', 'custodian': 'carol', 'organization': 'law-firm', 'country': 'US'}, {'shard_id': 'sh4', 'custodian': 'dave', 'organization': 'trust-co', 'country': 'SG'}, {'shard_id': 'sh5', 'custodian': 'erin', 'organization': 'auditor', 'country': 'GB'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_shard_distribution_partial():
+    result = call_tool('custody_shard_distribution', 'A30', {'threshold': 3, 'shards': [{'shard_id': 'sh1', 'custodian': 'alice', 'organization': 'acme', 'country': 'DE'}, {'shard_id': 'sh2', 'custodian': 'bob', 'organization': 'bank-a', 'country': 'CH'}, {'shard_id': 'sh3', 'custodian': 'carol', 'organization': 'law-firm', 'country': 'US'}, {'shard_id': 'sh4', 'custodian': 'dave', 'organization': 'trust-co', 'country': 'SG'}, {'shard_id': 'sh5', 'custodian': 'erin', 'organization': 'auditor', 'country': 'GB'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_signer_policy_lint_success():
+    result = call_tool('custody_signer_policy_lint', 'A30', {'per_tx_limit_usd': 250000, 'daily_limit_usd': 1000000, 'balance_usd': 20000000, 'velocity_max_tx_per_hour': 10, 'allowlist_enforced': True, 'allowlist_cooloff_seconds': 172800, 'allowlist_reattest_days': 90, 'signing_threshold': 3, 'policy_change_approvals': 4, 'approval_expiry_seconds': 3600})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_signer_policy_lint_invalid_input():
+    result = call_tool('custody_signer_policy_lint', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_signer_policy_lint_unauthorized():
+    result = call_tool('custody_signer_policy_lint', 'A01', {'per_tx_limit_usd': 250000, 'daily_limit_usd': 1000000, 'balance_usd': 20000000, 'velocity_max_tx_per_hour': 10, 'allowlist_enforced': True, 'allowlist_cooloff_seconds': 172800, 'allowlist_reattest_days': 90, 'signing_threshold': 3, 'policy_change_approvals': 4, 'approval_expiry_seconds': 3600})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_signer_policy_lint'
+
+
+def test_custody_signer_policy_lint_dependency():
+    result = call_tool('custody_signer_policy_lint', 'A30', {'per_tx_limit_usd': 250000, 'daily_limit_usd': 1000000, 'balance_usd': 20000000, 'velocity_max_tx_per_hour': 10, 'allowlist_enforced': True, 'allowlist_cooloff_seconds': 172800, 'allowlist_reattest_days': 90, 'signing_threshold': 3, 'policy_change_approvals': 4, 'approval_expiry_seconds': 3600, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_signer_policy_lint_timeout():
+    result = call_tool('custody_signer_policy_lint', 'A30', {'per_tx_limit_usd': 250000, 'daily_limit_usd': 1000000, 'balance_usd': 20000000, 'velocity_max_tx_per_hour': 10, 'allowlist_enforced': True, 'allowlist_cooloff_seconds': 172800, 'allowlist_reattest_days': 90, 'signing_threshold': 3, 'policy_change_approvals': 4, 'approval_expiry_seconds': 3600, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_signer_policy_lint_partial():
+    result = call_tool('custody_signer_policy_lint', 'A30', {'per_tx_limit_usd': 250000, 'daily_limit_usd': 1000000, 'balance_usd': 20000000, 'velocity_max_tx_per_hour': 10, 'allowlist_enforced': True, 'allowlist_cooloff_seconds': 172800, 'allowlist_reattest_days': 90, 'signing_threshold': 3, 'policy_change_approvals': 4, 'approval_expiry_seconds': 3600, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_timelock_check_success():
+    result = call_tool('custody_timelock_check', 'A30', {'delay_seconds': 172800, 'value_at_risk_usd': 5000000, 'delay_bands': [{'min_value_usd': 0, 'min_delay_seconds': 3600}, {'min_value_usd': 1000000, 'min_delay_seconds': 172800}], 'response_seconds': 7200, 'canceller_count': 2, 'guardian_can_cancel': True, 'admin_renounced': True, 'execution_window_seconds': 1209600})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_timelock_check_invalid_input():
+    result = call_tool('custody_timelock_check', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_timelock_check_unauthorized():
+    result = call_tool('custody_timelock_check', 'A01', {'delay_seconds': 172800, 'value_at_risk_usd': 5000000, 'delay_bands': [{'min_value_usd': 0, 'min_delay_seconds': 3600}, {'min_value_usd': 1000000, 'min_delay_seconds': 172800}], 'response_seconds': 7200, 'canceller_count': 2, 'guardian_can_cancel': True, 'admin_renounced': True, 'execution_window_seconds': 1209600})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_timelock_check'
+
+
+def test_custody_timelock_check_dependency():
+    result = call_tool('custody_timelock_check', 'A30', {'delay_seconds': 172800, 'value_at_risk_usd': 5000000, 'delay_bands': [{'min_value_usd': 0, 'min_delay_seconds': 3600}, {'min_value_usd': 1000000, 'min_delay_seconds': 172800}], 'response_seconds': 7200, 'canceller_count': 2, 'guardian_can_cancel': True, 'admin_renounced': True, 'execution_window_seconds': 1209600, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_timelock_check_timeout():
+    result = call_tool('custody_timelock_check', 'A30', {'delay_seconds': 172800, 'value_at_risk_usd': 5000000, 'delay_bands': [{'min_value_usd': 0, 'min_delay_seconds': 3600}, {'min_value_usd': 1000000, 'min_delay_seconds': 172800}], 'response_seconds': 7200, 'canceller_count': 2, 'guardian_can_cancel': True, 'admin_renounced': True, 'execution_window_seconds': 1209600, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_timelock_check_partial():
+    result = call_tool('custody_timelock_check', 'A30', {'delay_seconds': 172800, 'value_at_risk_usd': 5000000, 'delay_bands': [{'min_value_usd': 0, 'min_delay_seconds': 3600}, {'min_value_usd': 1000000, 'min_delay_seconds': 172800}], 'response_seconds': 7200, 'canceller_count': 2, 'guardian_can_cancel': True, 'admin_renounced': True, 'execution_window_seconds': 1209600, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_travel_rule_success():
+    result = call_tool('custody_travel_rule', 'A30', {'amount': 5000, 'threshold': 1000, 'comparison': 'at_or_above', 'originator_name': 'Acme Treasury Ltd', 'originator_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'originator_identifier_kind': 'customer_id', 'originator_identifier': 'CUST-1001', 'beneficiary_name': 'Globex GmbH', 'beneficiary_account': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_travel_rule_invalid_input():
+    result = call_tool('custody_travel_rule', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_travel_rule_unauthorized():
+    result = call_tool('custody_travel_rule', 'A01', {'amount': 5000, 'threshold': 1000, 'comparison': 'at_or_above', 'originator_name': 'Acme Treasury Ltd', 'originator_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'originator_identifier_kind': 'customer_id', 'originator_identifier': 'CUST-1001', 'beneficiary_name': 'Globex GmbH', 'beneficiary_account': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_travel_rule'
+
+
+def test_custody_travel_rule_dependency():
+    result = call_tool('custody_travel_rule', 'A30', {'amount': 5000, 'threshold': 1000, 'comparison': 'at_or_above', 'originator_name': 'Acme Treasury Ltd', 'originator_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'originator_identifier_kind': 'customer_id', 'originator_identifier': 'CUST-1001', 'beneficiary_name': 'Globex GmbH', 'beneficiary_account': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_travel_rule_timeout():
+    result = call_tool('custody_travel_rule', 'A30', {'amount': 5000, 'threshold': 1000, 'comparison': 'at_or_above', 'originator_name': 'Acme Treasury Ltd', 'originator_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'originator_identifier_kind': 'customer_id', 'originator_identifier': 'CUST-1001', 'beneficiary_name': 'Globex GmbH', 'beneficiary_account': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_travel_rule_partial():
+    result = call_tool('custody_travel_rule', 'A30', {'amount': 5000, 'threshold': 1000, 'comparison': 'at_or_above', 'originator_name': 'Acme Treasury Ltd', 'originator_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'originator_identifier_kind': 'customer_id', 'originator_identifier': 'CUST-1001', 'beneficiary_name': 'Globex GmbH', 'beneficiary_account': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_tx_policy_eval_success():
+    result = call_tool('custody_tx_policy_eval', 'A30', {'chain_id': 1, 'to': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'value_usd': 25000, 'operation': 'call', 'selector': '0xa9059cbb', 'approvals': 3, 'destination_listed_seconds': 604800, 'spent_24h_usd': 10000, 'tx_count_1h': 1, 'policy': {'allowed_chain_ids': [1, 10, 8453], 'allowlist': ['0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'denylist': [], 'per_tx_limit_usd': 500000, 'daily_limit_usd': 1000000, 'hold_above_usd': 100000, 'required_approvals': 3, 'cooloff_seconds': 172800, 'max_tx_per_hour': 10, 'allow_delegatecall': False}})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_tx_policy_eval_invalid_input():
+    result = call_tool('custody_tx_policy_eval', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_tx_policy_eval_unauthorized():
+    result = call_tool('custody_tx_policy_eval', 'A01', {'chain_id': 1, 'to': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'value_usd': 25000, 'operation': 'call', 'selector': '0xa9059cbb', 'approvals': 3, 'destination_listed_seconds': 604800, 'spent_24h_usd': 10000, 'tx_count_1h': 1, 'policy': {'allowed_chain_ids': [1, 10, 8453], 'allowlist': ['0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'denylist': [], 'per_tx_limit_usd': 500000, 'daily_limit_usd': 1000000, 'hold_above_usd': 100000, 'required_approvals': 3, 'cooloff_seconds': 172800, 'max_tx_per_hour': 10, 'allow_delegatecall': False}})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_tx_policy_eval'
+
+
+def test_custody_tx_policy_eval_dependency():
+    result = call_tool('custody_tx_policy_eval', 'A30', {'chain_id': 1, 'to': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'value_usd': 25000, 'operation': 'call', 'selector': '0xa9059cbb', 'approvals': 3, 'destination_listed_seconds': 604800, 'spent_24h_usd': 10000, 'tx_count_1h': 1, 'policy': {'allowed_chain_ids': [1, 10, 8453], 'allowlist': ['0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'denylist': [], 'per_tx_limit_usd': 500000, 'daily_limit_usd': 1000000, 'hold_above_usd': 100000, 'required_approvals': 3, 'cooloff_seconds': 172800, 'max_tx_per_hour': 10, 'allow_delegatecall': False}, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_tx_policy_eval_timeout():
+    result = call_tool('custody_tx_policy_eval', 'A30', {'chain_id': 1, 'to': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'value_usd': 25000, 'operation': 'call', 'selector': '0xa9059cbb', 'approvals': 3, 'destination_listed_seconds': 604800, 'spent_24h_usd': 10000, 'tx_count_1h': 1, 'policy': {'allowed_chain_ids': [1, 10, 8453], 'allowlist': ['0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'denylist': [], 'per_tx_limit_usd': 500000, 'daily_limit_usd': 1000000, 'hold_above_usd': 100000, 'required_approvals': 3, 'cooloff_seconds': 172800, 'max_tx_per_hour': 10, 'allow_delegatecall': False}, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_tx_policy_eval_partial():
+    result = call_tool('custody_tx_policy_eval', 'A30', {'chain_id': 1, 'to': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'value_usd': 25000, 'operation': 'call', 'selector': '0xa9059cbb', 'approvals': 3, 'destination_listed_seconds': 604800, 'spent_24h_usd': 10000, 'tx_count_1h': 1, 'policy': {'allowed_chain_ids': [1, 10, 8453], 'allowlist': ['0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'denylist': [], 'per_tx_limit_usd': 500000, 'daily_limit_usd': 1000000, 'hold_above_usd': 100000, 'required_approvals': 3, 'cooloff_seconds': 172800, 'max_tx_per_hour': 10, 'allow_delegatecall': False}, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_custody_wallet_tier_caps_success():
+    result = call_tool('custody_wallet_tier_caps', 'A30', {'tiers': [{'tier': 'hot', 'balance_usd': 50000, 'max_pct_of_total': 5, 'max_balance_usd': 100000}, {'tier': 'warm', 'balance_usd': 450000, 'max_pct_of_total': 20}, {'tier': 'cold', 'balance_usd': 9500000, 'max_pct_of_total': 100}], 'min_cold_pct': 70})
+    assert result["state"] == "SUCCESS"
+
+
+def test_custody_wallet_tier_caps_invalid_input():
+    result = call_tool('custody_wallet_tier_caps', 'A30', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_custody_wallet_tier_caps_unauthorized():
+    result = call_tool('custody_wallet_tier_caps', 'A01', {'tiers': [{'tier': 'hot', 'balance_usd': 50000, 'max_pct_of_total': 5, 'max_balance_usd': 100000}, {'tier': 'warm', 'balance_usd': 450000, 'max_pct_of_total': 20}, {'tier': 'cold', 'balance_usd': 9500000, 'max_pct_of_total': 100}], 'min_cold_pct': 70})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'custody_wallet_tier_caps'
+
+
+def test_custody_wallet_tier_caps_dependency():
+    result = call_tool('custody_wallet_tier_caps', 'A30', {'tiers': [{'tier': 'hot', 'balance_usd': 50000, 'max_pct_of_total': 5, 'max_balance_usd': 100000}, {'tier': 'warm', 'balance_usd': 450000, 'max_pct_of_total': 20}, {'tier': 'cold', 'balance_usd': 9500000, 'max_pct_of_total': 100}], 'min_cold_pct': 70, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_custody_wallet_tier_caps_timeout():
+    result = call_tool('custody_wallet_tier_caps', 'A30', {'tiers': [{'tier': 'hot', 'balance_usd': 50000, 'max_pct_of_total': 5, 'max_balance_usd': 100000}, {'tier': 'warm', 'balance_usd': 450000, 'max_pct_of_total': 20}, {'tier': 'cold', 'balance_usd': 9500000, 'max_pct_of_total': 100}], 'min_cold_pct': 70, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_custody_wallet_tier_caps_partial():
+    result = call_tool('custody_wallet_tier_caps', 'A30', {'tiers': [{'tier': 'hot', 'balance_usd': 50000, 'max_pct_of_total': 5, 'max_balance_usd': 100000}, {'tier': 'warm', 'balance_usd': 450000, 'max_pct_of_total': 20}, {'tier': 'cold', 'balance_usd': 9500000, 'max_pct_of_total': 100}], 'min_cold_pct': 70, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_approval_risk_success():
+    result = call_tool('dapp_approval_risk', 'A29', {'approvals': [{'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'kind': 'erc20_approve', 'amount': '1000000', 'requested_amount': '1000000'}], 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_approval_risk_invalid_input():
+    result = call_tool('dapp_approval_risk', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_approval_risk_unauthorized():
+    result = call_tool('dapp_approval_risk', 'A01', {'approvals': [{'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'kind': 'erc20_approve', 'amount': '1000000', 'requested_amount': '1000000'}], 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_approval_risk'
+
+
+def test_dapp_approval_risk_dependency():
+    result = call_tool('dapp_approval_risk', 'A29', {'approvals': [{'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'kind': 'erc20_approve', 'amount': '1000000', 'requested_amount': '1000000'}], 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_approval_risk_timeout():
+    result = call_tool('dapp_approval_risk', 'A29', {'approvals': [{'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'kind': 'erc20_approve', 'amount': '1000000', 'requested_amount': '1000000'}], 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_approval_risk_partial():
+    result = call_tool('dapp_approval_risk', 'A29', {'approvals': [{'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'kind': 'erc20_approve', 'amount': '1000000', 'requested_amount': '1000000'}], 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_chain_config_check_success():
+    result = call_tool('dapp_chain_config_check', 'A29', {'chain_id': '0xaa36a7', 'chain_name': 'Sepolia', 'native_name': 'Sepolia Ether', 'native_symbol': 'ETH', 'native_decimals': 18, 'rpc_urls': ['https://rpc.sepolia.org'], 'explorer_urls': ['https://sepolia.etherscan.io']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_chain_config_check_invalid_input():
+    result = call_tool('dapp_chain_config_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_chain_config_check_unauthorized():
+    result = call_tool('dapp_chain_config_check', 'A01', {'chain_id': '0xaa36a7', 'chain_name': 'Sepolia', 'native_name': 'Sepolia Ether', 'native_symbol': 'ETH', 'native_decimals': 18, 'rpc_urls': ['https://rpc.sepolia.org'], 'explorer_urls': ['https://sepolia.etherscan.io']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_chain_config_check'
+
+
+def test_dapp_chain_config_check_dependency():
+    result = call_tool('dapp_chain_config_check', 'A29', {'chain_id': '0xaa36a7', 'chain_name': 'Sepolia', 'native_name': 'Sepolia Ether', 'native_symbol': 'ETH', 'native_decimals': 18, 'rpc_urls': ['https://rpc.sepolia.org'], 'explorer_urls': ['https://sepolia.etherscan.io'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_chain_config_check_timeout():
+    result = call_tool('dapp_chain_config_check', 'A29', {'chain_id': '0xaa36a7', 'chain_name': 'Sepolia', 'native_name': 'Sepolia Ether', 'native_symbol': 'ETH', 'native_decimals': 18, 'rpc_urls': ['https://rpc.sepolia.org'], 'explorer_urls': ['https://sepolia.etherscan.io'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_chain_config_check_partial():
+    result = call_tool('dapp_chain_config_check', 'A29', {'chain_id': '0xaa36a7', 'chain_name': 'Sepolia', 'native_name': 'Sepolia Ether', 'native_symbol': 'ETH', 'native_decimals': 18, 'rpc_urls': ['https://rpc.sepolia.org'], 'explorer_urls': ['https://sepolia.etherscan.io'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_ens_name_check_success():
+    result = call_tool('dapp_ens_name_check', 'A29', {'name': 'vitalik.eth', 'address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'forward_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_ens_name_check_invalid_input():
+    result = call_tool('dapp_ens_name_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_ens_name_check_unauthorized():
+    result = call_tool('dapp_ens_name_check', 'A01', {'name': 'vitalik.eth', 'address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'forward_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_ens_name_check'
+
+
+def test_dapp_ens_name_check_dependency():
+    result = call_tool('dapp_ens_name_check', 'A29', {'name': 'vitalik.eth', 'address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'forward_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_ens_name_check_timeout():
+    result = call_tool('dapp_ens_name_check', 'A29', {'name': 'vitalik.eth', 'address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'forward_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_ens_name_check_partial():
+    result = call_tool('dapp_ens_name_check', 'A29', {'name': 'vitalik.eth', 'address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'forward_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_gas_buffer_check_success():
+    result = call_tool('dapp_gas_buffer_check', 'A29', {'estimated_gas': 100000, 'gas_limit': 120000, 'block_gas_limit': 30000000, 'contract_call': True, 'max_fee_per_gas_wei': 30000000000, 'value_wei': 0, 'balance_wei': 1000000000000000000, 'estimate_age_seconds': 5})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_gas_buffer_check_invalid_input():
+    result = call_tool('dapp_gas_buffer_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_gas_buffer_check_unauthorized():
+    result = call_tool('dapp_gas_buffer_check', 'A01', {'estimated_gas': 100000, 'gas_limit': 120000, 'block_gas_limit': 30000000, 'contract_call': True, 'max_fee_per_gas_wei': 30000000000, 'value_wei': 0, 'balance_wei': 1000000000000000000, 'estimate_age_seconds': 5})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_gas_buffer_check'
+
+
+def test_dapp_gas_buffer_check_dependency():
+    result = call_tool('dapp_gas_buffer_check', 'A29', {'estimated_gas': 100000, 'gas_limit': 120000, 'block_gas_limit': 30000000, 'contract_call': True, 'max_fee_per_gas_wei': 30000000000, 'value_wei': 0, 'balance_wei': 1000000000000000000, 'estimate_age_seconds': 5, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_gas_buffer_check_timeout():
+    result = call_tool('dapp_gas_buffer_check', 'A29', {'estimated_gas': 100000, 'gas_limit': 120000, 'block_gas_limit': 30000000, 'contract_call': True, 'max_fee_per_gas_wei': 30000000000, 'value_wei': 0, 'balance_wei': 1000000000000000000, 'estimate_age_seconds': 5, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_gas_buffer_check_partial():
+    result = call_tool('dapp_gas_buffer_check', 'A29', {'estimated_gas': 100000, 'gas_limit': 120000, 'block_gas_limit': 30000000, 'contract_call': True, 'max_fee_per_gas_wei': 30000000000, 'value_wei': 0, 'balance_wei': 1000000000000000000, 'estimate_age_seconds': 5, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_permit_check_success():
+    result = call_tool('dapp_permit_check', 'A29', {'kind': 'erc2612', 'owner': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'connected_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'domain_verifying_contract': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'value': '1000000', 'nonce': '0', 'current_nonce': '0', 'deadline': '1792499400', 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'domain_chain_id': 1, 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_permit_check_invalid_input():
+    result = call_tool('dapp_permit_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_permit_check_unauthorized():
+    result = call_tool('dapp_permit_check', 'A01', {'kind': 'erc2612', 'owner': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'connected_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'domain_verifying_contract': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'value': '1000000', 'nonce': '0', 'current_nonce': '0', 'deadline': '1792499400', 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'domain_chain_id': 1, 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_permit_check'
+
+
+def test_dapp_permit_check_dependency():
+    result = call_tool('dapp_permit_check', 'A29', {'kind': 'erc2612', 'owner': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'connected_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'domain_verifying_contract': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'value': '1000000', 'nonce': '0', 'current_nonce': '0', 'deadline': '1792499400', 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'domain_chain_id': 1, 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_permit_check_timeout():
+    result = call_tool('dapp_permit_check', 'A29', {'kind': 'erc2612', 'owner': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'connected_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'domain_verifying_contract': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'value': '1000000', 'nonce': '0', 'current_nonce': '0', 'deadline': '1792499400', 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'domain_chain_id': 1, 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_permit_check_partial():
+    result = call_tool('dapp_permit_check', 'A29', {'kind': 'erc2612', 'owner': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'spender': '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359', 'token': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'connected_account': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'domain_verifying_contract': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'value': '1000000', 'nonce': '0', 'current_nonce': '0', 'deadline': '1792499400', 'known_spenders': ['0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'domain_chain_id': 1, 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_provider_error_map_success():
+    result = call_tool('dapp_provider_error_map', 'A29', {'code': 4001, 'message': 'User rejected the request.'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_provider_error_map_invalid_input():
+    result = call_tool('dapp_provider_error_map', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_provider_error_map_unauthorized():
+    result = call_tool('dapp_provider_error_map', 'A01', {'code': 4001, 'message': 'User rejected the request.'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_provider_error_map'
+
+
+def test_dapp_provider_error_map_dependency():
+    result = call_tool('dapp_provider_error_map', 'A29', {'code': 4001, 'message': 'User rejected the request.', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_provider_error_map_timeout():
+    result = call_tool('dapp_provider_error_map', 'A29', {'code': 4001, 'message': 'User rejected the request.', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_provider_error_map_partial():
+    result = call_tool('dapp_provider_error_map', 'A29', {'code': 4001, 'message': 'User rejected the request.', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_rpc_fallback_check_success():
+    result = call_tool('dapp_rpc_fallback_check', 'A29', {'providers': [{'url': 'https://eth.llamarpc.com', 'timeout_ms': 3000, 'retries': 1}, {'url': 'https://rpc.ankr.com/eth', 'timeout_ms': 3000, 'retries': 1}], 'quorum': 1, 'backoff_ms': 200, 'ui_budget_ms': 20000})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_rpc_fallback_check_invalid_input():
+    result = call_tool('dapp_rpc_fallback_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_rpc_fallback_check_unauthorized():
+    result = call_tool('dapp_rpc_fallback_check', 'A01', {'providers': [{'url': 'https://eth.llamarpc.com', 'timeout_ms': 3000, 'retries': 1}, {'url': 'https://rpc.ankr.com/eth', 'timeout_ms': 3000, 'retries': 1}], 'quorum': 1, 'backoff_ms': 200, 'ui_budget_ms': 20000})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_rpc_fallback_check'
+
+
+def test_dapp_rpc_fallback_check_dependency():
+    result = call_tool('dapp_rpc_fallback_check', 'A29', {'providers': [{'url': 'https://eth.llamarpc.com', 'timeout_ms': 3000, 'retries': 1}, {'url': 'https://rpc.ankr.com/eth', 'timeout_ms': 3000, 'retries': 1}], 'quorum': 1, 'backoff_ms': 200, 'ui_budget_ms': 20000, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_rpc_fallback_check_timeout():
+    result = call_tool('dapp_rpc_fallback_check', 'A29', {'providers': [{'url': 'https://eth.llamarpc.com', 'timeout_ms': 3000, 'retries': 1}, {'url': 'https://rpc.ankr.com/eth', 'timeout_ms': 3000, 'retries': 1}], 'quorum': 1, 'backoff_ms': 200, 'ui_budget_ms': 20000, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_rpc_fallback_check_partial():
+    result = call_tool('dapp_rpc_fallback_check', 'A29', {'providers': [{'url': 'https://eth.llamarpc.com', 'timeout_ms': 3000, 'retries': 1}, {'url': 'https://rpc.ankr.com/eth', 'timeout_ms': 3000, 'retries': 1}], 'quorum': 1, 'backoff_ms': 200, 'ui_budget_ms': 20000, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_signing_request_scan_success():
+    result = call_tool('dapp_signing_request_scan', 'A29', {'requests': [{'method': 'eth_sendTransaction', 'to': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'origin': 'https://app.example.com', 'data': '0x095ea7b3000000000000000000000000fb6916095ca1df60bb79ce92ce3ea74c37c5d3590000000000000000000000000000000000000000000000000000000000000001'}], 'known_contracts': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'expected_domains': ['example.com'], 'link_urls': ['https://docs.example.com'], 'hardcoded_addresses': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_signing_request_scan_invalid_input():
+    result = call_tool('dapp_signing_request_scan', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_signing_request_scan_unauthorized():
+    result = call_tool('dapp_signing_request_scan', 'A01', {'requests': [{'method': 'eth_sendTransaction', 'to': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'origin': 'https://app.example.com', 'data': '0x095ea7b3000000000000000000000000fb6916095ca1df60bb79ce92ce3ea74c37c5d3590000000000000000000000000000000000000000000000000000000000000001'}], 'known_contracts': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'expected_domains': ['example.com'], 'link_urls': ['https://docs.example.com'], 'hardcoded_addresses': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_signing_request_scan'
+
+
+def test_dapp_signing_request_scan_dependency():
+    result = call_tool('dapp_signing_request_scan', 'A29', {'requests': [{'method': 'eth_sendTransaction', 'to': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'origin': 'https://app.example.com', 'data': '0x095ea7b3000000000000000000000000fb6916095ca1df60bb79ce92ce3ea74c37c5d3590000000000000000000000000000000000000000000000000000000000000001'}], 'known_contracts': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'expected_domains': ['example.com'], 'link_urls': ['https://docs.example.com'], 'hardcoded_addresses': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_signing_request_scan_timeout():
+    result = call_tool('dapp_signing_request_scan', 'A29', {'requests': [{'method': 'eth_sendTransaction', 'to': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'origin': 'https://app.example.com', 'data': '0x095ea7b3000000000000000000000000fb6916095ca1df60bb79ce92ce3ea74c37c5d3590000000000000000000000000000000000000000000000000000000000000001'}], 'known_contracts': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'expected_domains': ['example.com'], 'link_urls': ['https://docs.example.com'], 'hardcoded_addresses': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_signing_request_scan_partial():
+    result = call_tool('dapp_signing_request_scan', 'A29', {'requests': [{'method': 'eth_sendTransaction', 'to': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', 'origin': 'https://app.example.com', 'data': '0x095ea7b3000000000000000000000000fb6916095ca1df60bb79ce92ce3ea74c37c5d3590000000000000000000000000000000000000000000000000000000000000001'}], 'known_contracts': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359'], 'expected_domains': ['example.com'], 'link_urls': ['https://docs.example.com'], 'hardcoded_addresses': ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_siwe_check_success():
+    result = call_tool('dapp_siwe_check', 'A29', {'message': 'app.example.com wants you to sign in with your Ethereum account:\n0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed\n\nSign in to Example.\n\nURI: https://app.example.com/login\nVersion: 1\nChain ID: 1\nNonce: k3fP9sQ2xW\nIssued At: 2026-10-20T11:58:00Z\nExpiration Time: 2026-10-20T12:08:00Z', 'expected_domain': 'app.example.com', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'expected_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'expected_nonce': 'k3fP9sQ2xW'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_siwe_check_invalid_input():
+    result = call_tool('dapp_siwe_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_siwe_check_unauthorized():
+    result = call_tool('dapp_siwe_check', 'A01', {'message': 'app.example.com wants you to sign in with your Ethereum account:\n0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed\n\nSign in to Example.\n\nURI: https://app.example.com/login\nVersion: 1\nChain ID: 1\nNonce: k3fP9sQ2xW\nIssued At: 2026-10-20T11:58:00Z\nExpiration Time: 2026-10-20T12:08:00Z', 'expected_domain': 'app.example.com', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'expected_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'expected_nonce': 'k3fP9sQ2xW'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_siwe_check'
+
+
+def test_dapp_siwe_check_dependency():
+    result = call_tool('dapp_siwe_check', 'A29', {'message': 'app.example.com wants you to sign in with your Ethereum account:\n0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed\n\nSign in to Example.\n\nURI: https://app.example.com/login\nVersion: 1\nChain ID: 1\nNonce: k3fP9sQ2xW\nIssued At: 2026-10-20T11:58:00Z\nExpiration Time: 2026-10-20T12:08:00Z', 'expected_domain': 'app.example.com', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'expected_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'expected_nonce': 'k3fP9sQ2xW', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_siwe_check_timeout():
+    result = call_tool('dapp_siwe_check', 'A29', {'message': 'app.example.com wants you to sign in with your Ethereum account:\n0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed\n\nSign in to Example.\n\nURI: https://app.example.com/login\nVersion: 1\nChain ID: 1\nNonce: k3fP9sQ2xW\nIssued At: 2026-10-20T11:58:00Z\nExpiration Time: 2026-10-20T12:08:00Z', 'expected_domain': 'app.example.com', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'expected_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'expected_nonce': 'k3fP9sQ2xW', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_siwe_check_partial():
+    result = call_tool('dapp_siwe_check', 'A29', {'message': 'app.example.com wants you to sign in with your Ethereum account:\n0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed\n\nSign in to Example.\n\nURI: https://app.example.com/login\nVersion: 1\nChain ID: 1\nNonce: k3fP9sQ2xW\nIssued At: 2026-10-20T11:58:00Z\nExpiration Time: 2026-10-20T12:08:00Z', 'expected_domain': 'app.example.com', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'expected_address': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'expected_nonce': 'k3fP9sQ2xW', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_tx_state_machine_success():
+    result = call_tool('dapp_tx_state_machine', 'A29', {'events': [{'state': 'draft', 'at': '2026-10-20T11:55:00Z'}, {'state': 'simulating', 'at': '2026-10-20T11:55:01Z'}, {'state': 'simulated', 'at': '2026-10-20T11:55:02Z'}, {'state': 'awaiting_confirmation', 'at': '2026-10-20T11:55:03Z'}, {'state': 'user_confirmed', 'at': '2026-10-20T11:55:20Z'}, {'state': 'awaiting_signature', 'at': '2026-10-20T11:55:21Z'}], 'now': '2026-10-20T12:00:00Z'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_tx_state_machine_invalid_input():
+    result = call_tool('dapp_tx_state_machine', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_tx_state_machine_unauthorized():
+    result = call_tool('dapp_tx_state_machine', 'A01', {'events': [{'state': 'draft', 'at': '2026-10-20T11:55:00Z'}, {'state': 'simulating', 'at': '2026-10-20T11:55:01Z'}, {'state': 'simulated', 'at': '2026-10-20T11:55:02Z'}, {'state': 'awaiting_confirmation', 'at': '2026-10-20T11:55:03Z'}, {'state': 'user_confirmed', 'at': '2026-10-20T11:55:20Z'}, {'state': 'awaiting_signature', 'at': '2026-10-20T11:55:21Z'}], 'now': '2026-10-20T12:00:00Z'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_tx_state_machine'
+
+
+def test_dapp_tx_state_machine_dependency():
+    result = call_tool('dapp_tx_state_machine', 'A29', {'events': [{'state': 'draft', 'at': '2026-10-20T11:55:00Z'}, {'state': 'simulating', 'at': '2026-10-20T11:55:01Z'}, {'state': 'simulated', 'at': '2026-10-20T11:55:02Z'}, {'state': 'awaiting_confirmation', 'at': '2026-10-20T11:55:03Z'}, {'state': 'user_confirmed', 'at': '2026-10-20T11:55:20Z'}, {'state': 'awaiting_signature', 'at': '2026-10-20T11:55:21Z'}], 'now': '2026-10-20T12:00:00Z', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_tx_state_machine_timeout():
+    result = call_tool('dapp_tx_state_machine', 'A29', {'events': [{'state': 'draft', 'at': '2026-10-20T11:55:00Z'}, {'state': 'simulating', 'at': '2026-10-20T11:55:01Z'}, {'state': 'simulated', 'at': '2026-10-20T11:55:02Z'}, {'state': 'awaiting_confirmation', 'at': '2026-10-20T11:55:03Z'}, {'state': 'user_confirmed', 'at': '2026-10-20T11:55:20Z'}, {'state': 'awaiting_signature', 'at': '2026-10-20T11:55:21Z'}], 'now': '2026-10-20T12:00:00Z', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_tx_state_machine_partial():
+    result = call_tool('dapp_tx_state_machine', 'A29', {'events': [{'state': 'draft', 'at': '2026-10-20T11:55:00Z'}, {'state': 'simulating', 'at': '2026-10-20T11:55:01Z'}, {'state': 'simulated', 'at': '2026-10-20T11:55:02Z'}, {'state': 'awaiting_confirmation', 'at': '2026-10-20T11:55:03Z'}, {'state': 'user_confirmed', 'at': '2026-10-20T11:55:20Z'}, {'state': 'awaiting_signature', 'at': '2026-10-20T11:55:21Z'}], 'now': '2026-10-20T12:00:00Z', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_typed_data_check_success():
+    result = call_tool('dapp_typed_data_check', 'A29', {'typed_data_json': '{"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Permit": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}, {"name": "nonce", "type": "uint256"}, {"name": "deadline", "type": "uint256"}]}, "primaryType": "Permit", "domain": {"name": "USD Coin", "version": "2", "chainId": 1, "verifyingContract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}, "message": {"owner": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "spender": "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "value": "1000000", "nonce": "0", "deadline": "1792499400"}}', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_typed_data_check_invalid_input():
+    result = call_tool('dapp_typed_data_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_typed_data_check_unauthorized():
+    result = call_tool('dapp_typed_data_check', 'A01', {'typed_data_json': '{"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Permit": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}, {"name": "nonce", "type": "uint256"}, {"name": "deadline", "type": "uint256"}]}, "primaryType": "Permit", "domain": {"name": "USD Coin", "version": "2", "chainId": 1, "verifyingContract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}, "message": {"owner": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "spender": "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "value": "1000000", "nonce": "0", "deadline": "1792499400"}}', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_typed_data_check'
+
+
+def test_dapp_typed_data_check_dependency():
+    result = call_tool('dapp_typed_data_check', 'A29', {'typed_data_json': '{"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Permit": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}, {"name": "nonce", "type": "uint256"}, {"name": "deadline", "type": "uint256"}]}, "primaryType": "Permit", "domain": {"name": "USD Coin", "version": "2", "chainId": 1, "verifyingContract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}, "message": {"owner": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "spender": "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "value": "1000000", "nonce": "0", "deadline": "1792499400"}}', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_typed_data_check_timeout():
+    result = call_tool('dapp_typed_data_check', 'A29', {'typed_data_json': '{"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Permit": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}, {"name": "nonce", "type": "uint256"}, {"name": "deadline", "type": "uint256"}]}, "primaryType": "Permit", "domain": {"name": "USD Coin", "version": "2", "chainId": 1, "verifyingContract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}, "message": {"owner": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "spender": "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "value": "1000000", "nonce": "0", "deadline": "1792499400"}}', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_typed_data_check_partial():
+    result = call_tool('dapp_typed_data_check', 'A29', {'typed_data_json': '{"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Permit": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}, {"name": "nonce", "type": "uint256"}, {"name": "deadline", "type": "uint256"}]}, "primaryType": "Permit", "domain": {"name": "USD Coin", "version": "2", "chainId": 1, "verifyingContract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}, "message": {"owner": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "spender": "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "value": "1000000", "nonce": "0", "deadline": "1792499400"}}', 'expected_chain_id': 1, 'now': '2026-10-20T12:00:00Z', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_userop_check_success():
+    result = call_tool('dapp_userop_check', 'A29', {'entry_point_version': '0.6', 'sender': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'nonce': '0x0', 'call_gas_limit': '0x30d40', 'verification_gas_limit': '0x186a0', 'pre_verification_gas': '0xc350', 'max_fee_per_gas': '0x77359400', 'max_priority_fee_per_gas': '0x3b9aca00', 'init_code': '0x', 'call_data': '0xb61d27f6', 'paymaster_and_data': '0x', 'signature': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'prefund_available_wei': '1000000000000000'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_userop_check_invalid_input():
+    result = call_tool('dapp_userop_check', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_userop_check_unauthorized():
+    result = call_tool('dapp_userop_check', 'A01', {'entry_point_version': '0.6', 'sender': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'nonce': '0x0', 'call_gas_limit': '0x30d40', 'verification_gas_limit': '0x186a0', 'pre_verification_gas': '0xc350', 'max_fee_per_gas': '0x77359400', 'max_priority_fee_per_gas': '0x3b9aca00', 'init_code': '0x', 'call_data': '0xb61d27f6', 'paymaster_and_data': '0x', 'signature': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'prefund_available_wei': '1000000000000000'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_userop_check'
+
+
+def test_dapp_userop_check_dependency():
+    result = call_tool('dapp_userop_check', 'A29', {'entry_point_version': '0.6', 'sender': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'nonce': '0x0', 'call_gas_limit': '0x30d40', 'verification_gas_limit': '0x186a0', 'pre_verification_gas': '0xc350', 'max_fee_per_gas': '0x77359400', 'max_priority_fee_per_gas': '0x3b9aca00', 'init_code': '0x', 'call_data': '0xb61d27f6', 'paymaster_and_data': '0x', 'signature': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'prefund_available_wei': '1000000000000000', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_userop_check_timeout():
+    result = call_tool('dapp_userop_check', 'A29', {'entry_point_version': '0.6', 'sender': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'nonce': '0x0', 'call_gas_limit': '0x30d40', 'verification_gas_limit': '0x186a0', 'pre_verification_gas': '0xc350', 'max_fee_per_gas': '0x77359400', 'max_priority_fee_per_gas': '0x3b9aca00', 'init_code': '0x', 'call_data': '0xb61d27f6', 'paymaster_and_data': '0x', 'signature': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'prefund_available_wei': '1000000000000000', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_userop_check_partial():
+    result = call_tool('dapp_userop_check', 'A29', {'entry_point_version': '0.6', 'sender': '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed', 'nonce': '0x0', 'call_gas_limit': '0x30d40', 'verification_gas_limit': '0x186a0', 'pre_verification_gas': '0xc350', 'max_fee_per_gas': '0x77359400', 'max_priority_fee_per_gas': '0x3b9aca00', 'init_code': '0x', 'call_data': '0xb61d27f6', 'paymaster_and_data': '0x', 'signature': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'prefund_available_wei': '1000000000000000', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_dapp_wallet_matrix_success():
+    result = call_tool('dapp_wallet_matrix', 'A29', {'wallets': [{'name': 'Example Wallet', 'eip1193': True, 'walletconnect': 'v2', 'announced_6963': True, 'rdns': 'com.example.wallet', 'uuid': '350670db-19fa-4704-a166-e52e178b59d2', 'icon': 'data:image/svg+xml;base64,PHN2Zy8+', 'methods': ['eth_requestAccounts', 'personal_sign', 'eth_signTypedData_v4'], 'chain_ids': [1, 10]}], 'required_methods': ['personal_sign', 'eth_signTypedData_v4'], 'required_chain_ids': [1]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_dapp_wallet_matrix_invalid_input():
+    result = call_tool('dapp_wallet_matrix', 'A29', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_dapp_wallet_matrix_unauthorized():
+    result = call_tool('dapp_wallet_matrix', 'A01', {'wallets': [{'name': 'Example Wallet', 'eip1193': True, 'walletconnect': 'v2', 'announced_6963': True, 'rdns': 'com.example.wallet', 'uuid': '350670db-19fa-4704-a166-e52e178b59d2', 'icon': 'data:image/svg+xml;base64,PHN2Zy8+', 'methods': ['eth_requestAccounts', 'personal_sign', 'eth_signTypedData_v4'], 'chain_ids': [1, 10]}], 'required_methods': ['personal_sign', 'eth_signTypedData_v4'], 'required_chain_ids': [1]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'dapp_wallet_matrix'
+
+
+def test_dapp_wallet_matrix_dependency():
+    result = call_tool('dapp_wallet_matrix', 'A29', {'wallets': [{'name': 'Example Wallet', 'eip1193': True, 'walletconnect': 'v2', 'announced_6963': True, 'rdns': 'com.example.wallet', 'uuid': '350670db-19fa-4704-a166-e52e178b59d2', 'icon': 'data:image/svg+xml;base64,PHN2Zy8+', 'methods': ['eth_requestAccounts', 'personal_sign', 'eth_signTypedData_v4'], 'chain_ids': [1, 10]}], 'required_methods': ['personal_sign', 'eth_signTypedData_v4'], 'required_chain_ids': [1], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_dapp_wallet_matrix_timeout():
+    result = call_tool('dapp_wallet_matrix', 'A29', {'wallets': [{'name': 'Example Wallet', 'eip1193': True, 'walletconnect': 'v2', 'announced_6963': True, 'rdns': 'com.example.wallet', 'uuid': '350670db-19fa-4704-a166-e52e178b59d2', 'icon': 'data:image/svg+xml;base64,PHN2Zy8+', 'methods': ['eth_requestAccounts', 'personal_sign', 'eth_signTypedData_v4'], 'chain_ids': [1, 10]}], 'required_methods': ['personal_sign', 'eth_signTypedData_v4'], 'required_chain_ids': [1], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_dapp_wallet_matrix_partial():
+    result = call_tool('dapp_wallet_matrix', 'A29', {'wallets': [{'name': 'Example Wallet', 'eip1193': True, 'walletconnect': 'v2', 'announced_6963': True, 'rdns': 'com.example.wallet', 'uuid': '350670db-19fa-4704-a166-e52e178b59d2', 'icon': 'data:image/svg+xml;base64,PHN2Zy8+', 'methods': ['eth_requestAccounts', 'personal_sign', 'eth_signTypedData_v4'], 'chain_ids': [1, 10]}], 'required_methods': ['personal_sign', 'eth_signTypedData_v4'], 'required_chain_ids': [1], 'probe': 'partial'})
     assert result["state"] == "PARTIAL_SUCCESS"
     assert isinstance(result["completed_fraction"], (int, float))
 
@@ -2093,6 +4269,448 @@ def test_docs_terminology_drift_partial():
     assert isinstance(result["completed_fraction"], (int, float))
 
 
+def test_event_asyncapi_lint_success():
+    result = call_tool('event_asyncapi_lint', 'A19', {'document': '{"asyncapi":"3.0.0","info":{"title":"Orders","version":"1.0.0"},"channels":{"orders":{"address":"orders","messages":{"created":{"payload":{"type":"object"},"contentType":"application/json"}}}},"operations":{"publishOrder":{"action":"send","channel":{"$ref":"#/channels/orders"}}}}'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_asyncapi_lint_invalid_input():
+    result = call_tool('event_asyncapi_lint', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_asyncapi_lint_unauthorized():
+    result = call_tool('event_asyncapi_lint', 'A01', {'document': '{"asyncapi":"3.0.0","info":{"title":"Orders","version":"1.0.0"},"channels":{"orders":{"address":"orders","messages":{"created":{"payload":{"type":"object"},"contentType":"application/json"}}}},"operations":{"publishOrder":{"action":"send","channel":{"$ref":"#/channels/orders"}}}}'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_asyncapi_lint'
+
+
+def test_event_asyncapi_lint_dependency():
+    result = call_tool('event_asyncapi_lint', 'A19', {'document': '{"asyncapi":"3.0.0","info":{"title":"Orders","version":"1.0.0"},"channels":{"orders":{"address":"orders","messages":{"created":{"payload":{"type":"object"},"contentType":"application/json"}}}},"operations":{"publishOrder":{"action":"send","channel":{"$ref":"#/channels/orders"}}}}', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_asyncapi_lint_timeout():
+    result = call_tool('event_asyncapi_lint', 'A19', {'document': '{"asyncapi":"3.0.0","info":{"title":"Orders","version":"1.0.0"},"channels":{"orders":{"address":"orders","messages":{"created":{"payload":{"type":"object"},"contentType":"application/json"}}}},"operations":{"publishOrder":{"action":"send","channel":{"$ref":"#/channels/orders"}}}}', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_asyncapi_lint_partial():
+    result = call_tool('event_asyncapi_lint', 'A19', {'document': '{"asyncapi":"3.0.0","info":{"title":"Orders","version":"1.0.0"},"channels":{"orders":{"address":"orders","messages":{"created":{"payload":{"type":"object"},"contentType":"application/json"}}}},"operations":{"publishOrder":{"action":"send","channel":{"$ref":"#/channels/orders"}}}}', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_cloudevents_check_success():
+    result = call_tool('event_cloudevents_check', 'A19', {'attributes': [{'name': 'specversion', 'value': '1.0'}, {'name': 'id', 'value': 'evt-1'}, {'name': 'source', 'value': '/orders'}, {'name': 'type', 'value': 'com.example.order.created'}], 'has_data': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_cloudevents_check_invalid_input():
+    result = call_tool('event_cloudevents_check', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_cloudevents_check_unauthorized():
+    result = call_tool('event_cloudevents_check', 'A01', {'attributes': [{'name': 'specversion', 'value': '1.0'}, {'name': 'id', 'value': 'evt-1'}, {'name': 'source', 'value': '/orders'}, {'name': 'type', 'value': 'com.example.order.created'}], 'has_data': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_cloudevents_check'
+
+
+def test_event_cloudevents_check_dependency():
+    result = call_tool('event_cloudevents_check', 'A19', {'attributes': [{'name': 'specversion', 'value': '1.0'}, {'name': 'id', 'value': 'evt-1'}, {'name': 'source', 'value': '/orders'}, {'name': 'type', 'value': 'com.example.order.created'}], 'has_data': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_cloudevents_check_timeout():
+    result = call_tool('event_cloudevents_check', 'A19', {'attributes': [{'name': 'specversion', 'value': '1.0'}, {'name': 'id', 'value': 'evt-1'}, {'name': 'source', 'value': '/orders'}, {'name': 'type', 'value': 'com.example.order.created'}], 'has_data': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_cloudevents_check_partial():
+    result = call_tool('event_cloudevents_check', 'A19', {'attributes': [{'name': 'specversion', 'value': '1.0'}, {'name': 'id', 'value': 'evt-1'}, {'name': 'source', 'value': '/orders'}, {'name': 'type', 'value': 'com.example.order.created'}], 'has_data': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_dlq_coverage_success():
+    result = call_tool('event_dlq_coverage', 'A19', {'consumers': [{'name': 'billing', 'queue': 'billing-q', 'dlq': 'billing-dlq', 'max_receive_count': 5, 'redrive_runbook': True, 'dlq_alarm': True, 'fifo': False, 'dlq_fifo': False, 'source_retention_days': 4, 'dlq_retention_days': 14}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_dlq_coverage_invalid_input():
+    result = call_tool('event_dlq_coverage', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_dlq_coverage_unauthorized():
+    result = call_tool('event_dlq_coverage', 'A01', {'consumers': [{'name': 'billing', 'queue': 'billing-q', 'dlq': 'billing-dlq', 'max_receive_count': 5, 'redrive_runbook': True, 'dlq_alarm': True, 'fifo': False, 'dlq_fifo': False, 'source_retention_days': 4, 'dlq_retention_days': 14}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_dlq_coverage'
+
+
+def test_event_dlq_coverage_dependency():
+    result = call_tool('event_dlq_coverage', 'A19', {'consumers': [{'name': 'billing', 'queue': 'billing-q', 'dlq': 'billing-dlq', 'max_receive_count': 5, 'redrive_runbook': True, 'dlq_alarm': True, 'fifo': False, 'dlq_fifo': False, 'source_retention_days': 4, 'dlq_retention_days': 14}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_dlq_coverage_timeout():
+    result = call_tool('event_dlq_coverage', 'A19', {'consumers': [{'name': 'billing', 'queue': 'billing-q', 'dlq': 'billing-dlq', 'max_receive_count': 5, 'redrive_runbook': True, 'dlq_alarm': True, 'fifo': False, 'dlq_fifo': False, 'source_retention_days': 4, 'dlq_retention_days': 14}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_dlq_coverage_partial():
+    result = call_tool('event_dlq_coverage', 'A19', {'consumers': [{'name': 'billing', 'queue': 'billing-q', 'dlq': 'billing-dlq', 'max_receive_count': 5, 'redrive_runbook': True, 'dlq_alarm': True, 'fifo': False, 'dlq_fifo': False, 'source_retention_days': 4, 'dlq_retention_days': 14}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_function_sizing_success():
+    result = call_tool('event_function_sizing', 'A19', {'platform': 'aws-lambda', 'memory_mb': 1024, 'timeout_s': 30, 'peak_events_per_s': 200, 'batch_size': 10, 'p95_duration_ms': 800, 'p99_duration_ms': 1500, 'headroom_pct': 20, 'cold_start_ms': 600, 'cold_start_budget_ms': 1000, 'reserved_concurrency': 50, 'downstream_max_connections': 200, 'connections_per_instance': 2, 'source_visibility_timeout_s': 180})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_function_sizing_invalid_input():
+    result = call_tool('event_function_sizing', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_function_sizing_unauthorized():
+    result = call_tool('event_function_sizing', 'A01', {'platform': 'aws-lambda', 'memory_mb': 1024, 'timeout_s': 30, 'peak_events_per_s': 200, 'batch_size': 10, 'p95_duration_ms': 800, 'p99_duration_ms': 1500, 'headroom_pct': 20, 'cold_start_ms': 600, 'cold_start_budget_ms': 1000, 'reserved_concurrency': 50, 'downstream_max_connections': 200, 'connections_per_instance': 2, 'source_visibility_timeout_s': 180})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_function_sizing'
+
+
+def test_event_function_sizing_dependency():
+    result = call_tool('event_function_sizing', 'A19', {'platform': 'aws-lambda', 'memory_mb': 1024, 'timeout_s': 30, 'peak_events_per_s': 200, 'batch_size': 10, 'p95_duration_ms': 800, 'p99_duration_ms': 1500, 'headroom_pct': 20, 'cold_start_ms': 600, 'cold_start_budget_ms': 1000, 'reserved_concurrency': 50, 'downstream_max_connections': 200, 'connections_per_instance': 2, 'source_visibility_timeout_s': 180, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_function_sizing_timeout():
+    result = call_tool('event_function_sizing', 'A19', {'platform': 'aws-lambda', 'memory_mb': 1024, 'timeout_s': 30, 'peak_events_per_s': 200, 'batch_size': 10, 'p95_duration_ms': 800, 'p99_duration_ms': 1500, 'headroom_pct': 20, 'cold_start_ms': 600, 'cold_start_budget_ms': 1000, 'reserved_concurrency': 50, 'downstream_max_connections': 200, 'connections_per_instance': 2, 'source_visibility_timeout_s': 180, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_function_sizing_partial():
+    result = call_tool('event_function_sizing', 'A19', {'platform': 'aws-lambda', 'memory_mb': 1024, 'timeout_s': 30, 'peak_events_per_s': 200, 'batch_size': 10, 'p95_duration_ms': 800, 'p99_duration_ms': 1500, 'headroom_pct': 20, 'cold_start_ms': 600, 'cold_start_budget_ms': 1000, 'reserved_concurrency': 50, 'downstream_max_connections': 200, 'connections_per_instance': 2, 'source_visibility_timeout_s': 180, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_idempotency_window_success():
+    result = call_tool('event_idempotency_window', 'A19', {'key_source': 'producer-event-id', 'dedup_window_s': 86400, 'retry_window_s': 3600, 'redelivery_window_s': 345600, 'replay_window_s': 0, 'atomic_claim': True, 'naturally_idempotent': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_idempotency_window_invalid_input():
+    result = call_tool('event_idempotency_window', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_idempotency_window_unauthorized():
+    result = call_tool('event_idempotency_window', 'A01', {'key_source': 'producer-event-id', 'dedup_window_s': 86400, 'retry_window_s': 3600, 'redelivery_window_s': 345600, 'replay_window_s': 0, 'atomic_claim': True, 'naturally_idempotent': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_idempotency_window'
+
+
+def test_event_idempotency_window_dependency():
+    result = call_tool('event_idempotency_window', 'A19', {'key_source': 'producer-event-id', 'dedup_window_s': 86400, 'retry_window_s': 3600, 'redelivery_window_s': 345600, 'replay_window_s': 0, 'atomic_claim': True, 'naturally_idempotent': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_idempotency_window_timeout():
+    result = call_tool('event_idempotency_window', 'A19', {'key_source': 'producer-event-id', 'dedup_window_s': 86400, 'retry_window_s': 3600, 'redelivery_window_s': 345600, 'replay_window_s': 0, 'atomic_claim': True, 'naturally_idempotent': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_idempotency_window_partial():
+    result = call_tool('event_idempotency_window', 'A19', {'key_source': 'producer-event-id', 'dedup_window_s': 86400, 'retry_window_s': 3600, 'redelivery_window_s': 345600, 'replay_window_s': 0, 'atomic_claim': True, 'naturally_idempotent': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_lag_assessment_success():
+    result = call_tool('event_lag_assessment', 'A19', {'lag_msgs': 120000, 'arrival_msgs_per_s': 400, 'consumer_count': 4, 'per_consumer_msgs_per_s': 200, 'slo_s': 300})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_lag_assessment_invalid_input():
+    result = call_tool('event_lag_assessment', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_lag_assessment_unauthorized():
+    result = call_tool('event_lag_assessment', 'A01', {'lag_msgs': 120000, 'arrival_msgs_per_s': 400, 'consumer_count': 4, 'per_consumer_msgs_per_s': 200, 'slo_s': 300})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_lag_assessment'
+
+
+def test_event_lag_assessment_dependency():
+    result = call_tool('event_lag_assessment', 'A19', {'lag_msgs': 120000, 'arrival_msgs_per_s': 400, 'consumer_count': 4, 'per_consumer_msgs_per_s': 200, 'slo_s': 300, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_lag_assessment_timeout():
+    result = call_tool('event_lag_assessment', 'A19', {'lag_msgs': 120000, 'arrival_msgs_per_s': 400, 'consumer_count': 4, 'per_consumer_msgs_per_s': 200, 'slo_s': 300, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_lag_assessment_partial():
+    result = call_tool('event_lag_assessment', 'A19', {'lag_msgs': 120000, 'arrival_msgs_per_s': 400, 'consumer_count': 4, 'per_consumer_msgs_per_s': 200, 'slo_s': 300, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_ordering_check_success():
+    result = call_tool('event_ordering_check', 'A19', {'broker': 'kafka', 'order_required': True, 'entity_key_fields': ['order_id'], 'partition_key_fields': ['order_id'], 'handler_concurrency_per_unit': 1, 'retry_mode': 'in-place', 'producer_in_flight': 5, 'idempotent_producer': True, 'partitions_will_change': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_ordering_check_invalid_input():
+    result = call_tool('event_ordering_check', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_ordering_check_unauthorized():
+    result = call_tool('event_ordering_check', 'A01', {'broker': 'kafka', 'order_required': True, 'entity_key_fields': ['order_id'], 'partition_key_fields': ['order_id'], 'handler_concurrency_per_unit': 1, 'retry_mode': 'in-place', 'producer_in_flight': 5, 'idempotent_producer': True, 'partitions_will_change': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_ordering_check'
+
+
+def test_event_ordering_check_dependency():
+    result = call_tool('event_ordering_check', 'A19', {'broker': 'kafka', 'order_required': True, 'entity_key_fields': ['order_id'], 'partition_key_fields': ['order_id'], 'handler_concurrency_per_unit': 1, 'retry_mode': 'in-place', 'producer_in_flight': 5, 'idempotent_producer': True, 'partitions_will_change': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_ordering_check_timeout():
+    result = call_tool('event_ordering_check', 'A19', {'broker': 'kafka', 'order_required': True, 'entity_key_fields': ['order_id'], 'partition_key_fields': ['order_id'], 'handler_concurrency_per_unit': 1, 'retry_mode': 'in-place', 'producer_in_flight': 5, 'idempotent_producer': True, 'partitions_will_change': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_ordering_check_partial():
+    result = call_tool('event_ordering_check', 'A19', {'broker': 'kafka', 'order_required': True, 'entity_key_fields': ['order_id'], 'partition_key_fields': ['order_id'], 'handler_concurrency_per_unit': 1, 'retry_mode': 'in-place', 'producer_in_flight': 5, 'idempotent_producer': True, 'partitions_will_change': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_partition_plan_success():
+    result = call_tool('event_partition_plan', 'A19', {'peak_msgs_per_s': 5000, 'avg_msg_bytes': 1024, 'partition_max_mib_per_s': 10, 'consumer_max_msgs_per_s': 500, 'headroom_pct': 20, 'hot_key_share_pct': 5})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_partition_plan_invalid_input():
+    result = call_tool('event_partition_plan', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_partition_plan_unauthorized():
+    result = call_tool('event_partition_plan', 'A01', {'peak_msgs_per_s': 5000, 'avg_msg_bytes': 1024, 'partition_max_mib_per_s': 10, 'consumer_max_msgs_per_s': 500, 'headroom_pct': 20, 'hot_key_share_pct': 5})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_partition_plan'
+
+
+def test_event_partition_plan_dependency():
+    result = call_tool('event_partition_plan', 'A19', {'peak_msgs_per_s': 5000, 'avg_msg_bytes': 1024, 'partition_max_mib_per_s': 10, 'consumer_max_msgs_per_s': 500, 'headroom_pct': 20, 'hot_key_share_pct': 5, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_partition_plan_timeout():
+    result = call_tool('event_partition_plan', 'A19', {'peak_msgs_per_s': 5000, 'avg_msg_bytes': 1024, 'partition_max_mib_per_s': 10, 'consumer_max_msgs_per_s': 500, 'headroom_pct': 20, 'hot_key_share_pct': 5, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_partition_plan_partial():
+    result = call_tool('event_partition_plan', 'A19', {'peak_msgs_per_s': 5000, 'avg_msg_bytes': 1024, 'partition_max_mib_per_s': 10, 'consumer_max_msgs_per_s': 500, 'headroom_pct': 20, 'hot_key_share_pct': 5, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_retention_replay_success():
+    result = call_tool('event_retention_replay', 'A19', {'retention_s': 604800, 'replay_from_age_s': 86400, 'replay_events': 5000000, 'replay_rate_per_s': 2000, 'live_rate_per_s': 500, 'consumers_idempotent': True, 'compacted': False, 'environment': 'non-prod'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_retention_replay_invalid_input():
+    result = call_tool('event_retention_replay', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_retention_replay_unauthorized():
+    result = call_tool('event_retention_replay', 'A01', {'retention_s': 604800, 'replay_from_age_s': 86400, 'replay_events': 5000000, 'replay_rate_per_s': 2000, 'live_rate_per_s': 500, 'consumers_idempotent': True, 'compacted': False, 'environment': 'non-prod'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_retention_replay'
+
+
+def test_event_retention_replay_dependency():
+    result = call_tool('event_retention_replay', 'A19', {'retention_s': 604800, 'replay_from_age_s': 86400, 'replay_events': 5000000, 'replay_rate_per_s': 2000, 'live_rate_per_s': 500, 'consumers_idempotent': True, 'compacted': False, 'environment': 'non-prod', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_retention_replay_timeout():
+    result = call_tool('event_retention_replay', 'A19', {'retention_s': 604800, 'replay_from_age_s': 86400, 'replay_events': 5000000, 'replay_rate_per_s': 2000, 'live_rate_per_s': 500, 'consumers_idempotent': True, 'compacted': False, 'environment': 'non-prod', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_retention_replay_partial():
+    result = call_tool('event_retention_replay', 'A19', {'retention_s': 604800, 'replay_from_age_s': 86400, 'replay_events': 5000000, 'replay_rate_per_s': 2000, 'live_rate_per_s': 500, 'consumers_idempotent': True, 'compacted': False, 'environment': 'non-prod', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_retry_schedule_success():
+    result = call_tool('event_retry_schedule', 'A19', {'base_delay_s': 2, 'multiplier': 2, 'max_delay_s': 60, 'max_attempts': 5, 'jitter': 'full', 'retry_mode': 'queue-redelivery', 'processing_timeout_s': 30, 'visibility_timeout_s': 180, 'budget_s': 900})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_retry_schedule_invalid_input():
+    result = call_tool('event_retry_schedule', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_retry_schedule_unauthorized():
+    result = call_tool('event_retry_schedule', 'A01', {'base_delay_s': 2, 'multiplier': 2, 'max_delay_s': 60, 'max_attempts': 5, 'jitter': 'full', 'retry_mode': 'queue-redelivery', 'processing_timeout_s': 30, 'visibility_timeout_s': 180, 'budget_s': 900})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_retry_schedule'
+
+
+def test_event_retry_schedule_dependency():
+    result = call_tool('event_retry_schedule', 'A19', {'base_delay_s': 2, 'multiplier': 2, 'max_delay_s': 60, 'max_attempts': 5, 'jitter': 'full', 'retry_mode': 'queue-redelivery', 'processing_timeout_s': 30, 'visibility_timeout_s': 180, 'budget_s': 900, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_retry_schedule_timeout():
+    result = call_tool('event_retry_schedule', 'A19', {'base_delay_s': 2, 'multiplier': 2, 'max_delay_s': 60, 'max_attempts': 5, 'jitter': 'full', 'retry_mode': 'queue-redelivery', 'processing_timeout_s': 30, 'visibility_timeout_s': 180, 'budget_s': 900, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_retry_schedule_partial():
+    result = call_tool('event_retry_schedule', 'A19', {'base_delay_s': 2, 'multiplier': 2, 'max_delay_s': 60, 'max_attempts': 5, 'jitter': 'full', 'retry_mode': 'queue-redelivery', 'processing_timeout_s': 30, 'visibility_timeout_s': 180, 'budget_s': 900, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_saga_coverage_success():
+    result = call_tool('event_saga_coverage', 'A19', {'steps': [{'name': 'reserve-stock', 'kind': 'compensable', 'compensation': 'release-stock', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'charge-card', 'kind': 'pivot', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'ship', 'kind': 'retriable', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}], 'outbox': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_saga_coverage_invalid_input():
+    result = call_tool('event_saga_coverage', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_saga_coverage_unauthorized():
+    result = call_tool('event_saga_coverage', 'A01', {'steps': [{'name': 'reserve-stock', 'kind': 'compensable', 'compensation': 'release-stock', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'charge-card', 'kind': 'pivot', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'ship', 'kind': 'retriable', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}], 'outbox': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_saga_coverage'
+
+
+def test_event_saga_coverage_dependency():
+    result = call_tool('event_saga_coverage', 'A19', {'steps': [{'name': 'reserve-stock', 'kind': 'compensable', 'compensation': 'release-stock', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'charge-card', 'kind': 'pivot', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'ship', 'kind': 'retriable', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}], 'outbox': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_saga_coverage_timeout():
+    result = call_tool('event_saga_coverage', 'A19', {'steps': [{'name': 'reserve-stock', 'kind': 'compensable', 'compensation': 'release-stock', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'charge-card', 'kind': 'pivot', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'ship', 'kind': 'retriable', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}], 'outbox': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_saga_coverage_partial():
+    result = call_tool('event_saga_coverage', 'A19', {'steps': [{'name': 'reserve-stock', 'kind': 'compensable', 'compensation': 'release-stock', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'charge-card', 'kind': 'pivot', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}, {'name': 'ship', 'kind': 'retriable', 'compensation': '', 'idempotent': True, 'compensation_idempotent': True}], 'outbox': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_scaler_sanity_success():
+    result = call_tool('event_scaler_sanity', 'A19', {'min_replicas': 1, 'max_replicas': 20, 'polling_interval_s': 15, 'cooldown_period_s': 300, 'replica_startup_s': 20, 'max_reaction_s': 60, 'target_backlog_per_replica': 100, 'peak_backlog': 1500, 'termination_grace_period_s': 60, 'max_processing_s': 30, 'partitions': 24})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_scaler_sanity_invalid_input():
+    result = call_tool('event_scaler_sanity', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_scaler_sanity_unauthorized():
+    result = call_tool('event_scaler_sanity', 'A01', {'min_replicas': 1, 'max_replicas': 20, 'polling_interval_s': 15, 'cooldown_period_s': 300, 'replica_startup_s': 20, 'max_reaction_s': 60, 'target_backlog_per_replica': 100, 'peak_backlog': 1500, 'termination_grace_period_s': 60, 'max_processing_s': 30, 'partitions': 24})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_scaler_sanity'
+
+
+def test_event_scaler_sanity_dependency():
+    result = call_tool('event_scaler_sanity', 'A19', {'min_replicas': 1, 'max_replicas': 20, 'polling_interval_s': 15, 'cooldown_period_s': 300, 'replica_startup_s': 20, 'max_reaction_s': 60, 'target_backlog_per_replica': 100, 'peak_backlog': 1500, 'termination_grace_period_s': 60, 'max_processing_s': 30, 'partitions': 24, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_scaler_sanity_timeout():
+    result = call_tool('event_scaler_sanity', 'A19', {'min_replicas': 1, 'max_replicas': 20, 'polling_interval_s': 15, 'cooldown_period_s': 300, 'replica_startup_s': 20, 'max_reaction_s': 60, 'target_backlog_per_replica': 100, 'peak_backlog': 1500, 'termination_grace_period_s': 60, 'max_processing_s': 30, 'partitions': 24, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_scaler_sanity_partial():
+    result = call_tool('event_scaler_sanity', 'A19', {'min_replicas': 1, 'max_replicas': 20, 'polling_interval_s': 15, 'cooldown_period_s': 300, 'replica_startup_s': 20, 'max_reaction_s': 60, 'target_backlog_per_replica': 100, 'peak_backlog': 1500, 'termination_grace_period_s': 60, 'max_processing_s': 30, 'partitions': 24, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_event_schema_compat_success():
+    result = call_tool('event_schema_compat', 'A19', {'format': 'json-schema', 'mode': 'backward', 'base_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"}},"additionalProperties":false}', 'head_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_event_schema_compat_invalid_input():
+    result = call_tool('event_schema_compat', 'A19', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_event_schema_compat_unauthorized():
+    result = call_tool('event_schema_compat', 'A01', {'format': 'json-schema', 'mode': 'backward', 'base_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"}},"additionalProperties":false}', 'head_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'event_schema_compat'
+
+
+def test_event_schema_compat_dependency():
+    result = call_tool('event_schema_compat', 'A19', {'format': 'json-schema', 'mode': 'backward', 'base_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"}},"additionalProperties":false}', 'head_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_event_schema_compat_timeout():
+    result = call_tool('event_schema_compat', 'A19', {'format': 'json-schema', 'mode': 'backward', 'base_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"}},"additionalProperties":false}', 'head_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_event_schema_compat_partial():
+    result = call_tool('event_schema_compat', 'A19', {'format': 'json-schema', 'mode': 'backward', 'base_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"}},"additionalProperties":false}', 'head_schema': '{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"qty":{"type":"integer"},"note":{"type":"string"}},"additionalProperties":false}', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
 def test_fe_a11y_scan_success():
     result = call_tool('fe_a11y_scan', 'A06', {'html': '<button>Save</button>'})
     assert result["state"] == "SUCCESS"
@@ -2501,6 +5119,1672 @@ def test_fe_token_literal_scan_partial():
     assert isinstance(result["completed_fraction"], (int, float))
 
 
+def test_finops_budget_burn_success():
+    result = call_tool('finops_budget_burn', 'A20', {'budget': 10000, 'spend_to_date': 6000, 'period_start': '2026-10-01T00:00:00Z', 'period_end': '2026-11-01T00:00:00Z', 'as_of': '2026-10-11T00:00:00Z'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_budget_burn_invalid_input():
+    result = call_tool('finops_budget_burn', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_budget_burn_unauthorized():
+    result = call_tool('finops_budget_burn', 'A01', {'budget': 10000, 'spend_to_date': 6000, 'period_start': '2026-10-01T00:00:00Z', 'period_end': '2026-11-01T00:00:00Z', 'as_of': '2026-10-11T00:00:00Z'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_budget_burn'
+
+
+def test_finops_budget_burn_dependency():
+    result = call_tool('finops_budget_burn', 'A20', {'budget': 10000, 'spend_to_date': 6000, 'period_start': '2026-10-01T00:00:00Z', 'period_end': '2026-11-01T00:00:00Z', 'as_of': '2026-10-11T00:00:00Z', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_budget_burn_timeout():
+    result = call_tool('finops_budget_burn', 'A20', {'budget': 10000, 'spend_to_date': 6000, 'period_start': '2026-10-01T00:00:00Z', 'period_end': '2026-11-01T00:00:00Z', 'as_of': '2026-10-11T00:00:00Z', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_budget_burn_partial():
+    result = call_tool('finops_budget_burn', 'A20', {'budget': 10000, 'spend_to_date': 6000, 'period_start': '2026-10-01T00:00:00Z', 'period_end': '2026-11-01T00:00:00Z', 'as_of': '2026-10-11T00:00:00Z', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_carbon_estimate_success():
+    result = call_tool('finops_carbon_estimate', 'A20', {'workloads': [{'name': 'etl', 'region': 'region-a', 'avg_power_w': 200, 'hours': 720}], 'pue': 1.2, 'grid_intensity': [{'region': 'region-a', 'g_co2e_per_kwh': 400, 'eligible': True}, {'region': 'region-b', 'g_co2e_per_kwh': 50, 'eligible': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_carbon_estimate_invalid_input():
+    result = call_tool('finops_carbon_estimate', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_carbon_estimate_unauthorized():
+    result = call_tool('finops_carbon_estimate', 'A01', {'workloads': [{'name': 'etl', 'region': 'region-a', 'avg_power_w': 200, 'hours': 720}], 'pue': 1.2, 'grid_intensity': [{'region': 'region-a', 'g_co2e_per_kwh': 400, 'eligible': True}, {'region': 'region-b', 'g_co2e_per_kwh': 50, 'eligible': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_carbon_estimate'
+
+
+def test_finops_carbon_estimate_dependency():
+    result = call_tool('finops_carbon_estimate', 'A20', {'workloads': [{'name': 'etl', 'region': 'region-a', 'avg_power_w': 200, 'hours': 720}], 'pue': 1.2, 'grid_intensity': [{'region': 'region-a', 'g_co2e_per_kwh': 400, 'eligible': True}, {'region': 'region-b', 'g_co2e_per_kwh': 50, 'eligible': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_carbon_estimate_timeout():
+    result = call_tool('finops_carbon_estimate', 'A20', {'workloads': [{'name': 'etl', 'region': 'region-a', 'avg_power_w': 200, 'hours': 720}], 'pue': 1.2, 'grid_intensity': [{'region': 'region-a', 'g_co2e_per_kwh': 400, 'eligible': True}, {'region': 'region-b', 'g_co2e_per_kwh': 50, 'eligible': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_carbon_estimate_partial():
+    result = call_tool('finops_carbon_estimate', 'A20', {'workloads': [{'name': 'etl', 'region': 'region-a', 'avg_power_w': 200, 'hours': 720}], 'pue': 1.2, 'grid_intensity': [{'region': 'region-a', 'g_co2e_per_kwh': 400, 'eligible': True}, {'region': 'region-b', 'g_co2e_per_kwh': 50, 'eligible': True}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_commitment_coverage_success():
+    result = call_tool('finops_commitment_coverage', 'A20', {'usage': [10, 12, 11, 15, 10, 9, 14, 13], 'commitment': 6, 'discount_pct': 30})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_commitment_coverage_invalid_input():
+    result = call_tool('finops_commitment_coverage', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_commitment_coverage_unauthorized():
+    result = call_tool('finops_commitment_coverage', 'A01', {'usage': [10, 12, 11, 15, 10, 9, 14, 13], 'commitment': 6, 'discount_pct': 30})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_commitment_coverage'
+
+
+def test_finops_commitment_coverage_dependency():
+    result = call_tool('finops_commitment_coverage', 'A20', {'usage': [10, 12, 11, 15, 10, 9, 14, 13], 'commitment': 6, 'discount_pct': 30, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_commitment_coverage_timeout():
+    result = call_tool('finops_commitment_coverage', 'A20', {'usage': [10, 12, 11, 15, 10, 9, 14, 13], 'commitment': 6, 'discount_pct': 30, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_commitment_coverage_partial():
+    result = call_tool('finops_commitment_coverage', 'A20', {'usage': [10, 12, 11, 15, 10, 9, 14, 13], 'commitment': 6, 'discount_pct': 30, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_egress_cost_success():
+    result = call_tool('finops_egress_cost', 'A20', {'flows': [{'name': 'api-to-db', 'kind': 'cross_az', 'monthly_gb': 20000, 'via_nat': False}, {'name': 'downloads', 'kind': 'internet', 'monthly_gb': 5000, 'via_nat': True}], 'rates': {'cross_az_per_gb': 0.02, 'cross_region_per_gb': 0.02, 'nat_processing_per_gb': 0.045}, 'internet_tiers': [{'starts_at_gb': 0, 'per_gb': 0}, {'starts_at_gb': 100, 'per_gb': 0.09}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_egress_cost_invalid_input():
+    result = call_tool('finops_egress_cost', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_egress_cost_unauthorized():
+    result = call_tool('finops_egress_cost', 'A01', {'flows': [{'name': 'api-to-db', 'kind': 'cross_az', 'monthly_gb': 20000, 'via_nat': False}, {'name': 'downloads', 'kind': 'internet', 'monthly_gb': 5000, 'via_nat': True}], 'rates': {'cross_az_per_gb': 0.02, 'cross_region_per_gb': 0.02, 'nat_processing_per_gb': 0.045}, 'internet_tiers': [{'starts_at_gb': 0, 'per_gb': 0}, {'starts_at_gb': 100, 'per_gb': 0.09}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_egress_cost'
+
+
+def test_finops_egress_cost_dependency():
+    result = call_tool('finops_egress_cost', 'A20', {'flows': [{'name': 'api-to-db', 'kind': 'cross_az', 'monthly_gb': 20000, 'via_nat': False}, {'name': 'downloads', 'kind': 'internet', 'monthly_gb': 5000, 'via_nat': True}], 'rates': {'cross_az_per_gb': 0.02, 'cross_region_per_gb': 0.02, 'nat_processing_per_gb': 0.045}, 'internet_tiers': [{'starts_at_gb': 0, 'per_gb': 0}, {'starts_at_gb': 100, 'per_gb': 0.09}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_egress_cost_timeout():
+    result = call_tool('finops_egress_cost', 'A20', {'flows': [{'name': 'api-to-db', 'kind': 'cross_az', 'monthly_gb': 20000, 'via_nat': False}, {'name': 'downloads', 'kind': 'internet', 'monthly_gb': 5000, 'via_nat': True}], 'rates': {'cross_az_per_gb': 0.02, 'cross_region_per_gb': 0.02, 'nat_processing_per_gb': 0.045}, 'internet_tiers': [{'starts_at_gb': 0, 'per_gb': 0}, {'starts_at_gb': 100, 'per_gb': 0.09}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_egress_cost_partial():
+    result = call_tool('finops_egress_cost', 'A20', {'flows': [{'name': 'api-to-db', 'kind': 'cross_az', 'monthly_gb': 20000, 'via_nat': False}, {'name': 'downloads', 'kind': 'internet', 'monthly_gb': 5000, 'via_nat': True}], 'rates': {'cross_az_per_gb': 0.02, 'cross_region_per_gb': 0.02, 'nat_processing_per_gb': 0.045}, 'internet_tiers': [{'starts_at_gb': 0, 'per_gb': 0}, {'starts_at_gb': 100, 'per_gb': 0.09}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_idle_resources_success():
+    result = call_tool('finops_idle_resources', 'A20', {'resources': [{'id': 'vm-1', 'kind': 'vm', 'daily_utilization_pct': [1, 2, 1, 3, 2, 1, 1], 'monthly_cost': 120}, {'id': 'vm-2', 'kind': 'vm', 'daily_utilization_pct': [40, 50, 3, 2, 60, 55, 45], 'monthly_cost': 80}], 'threshold_pct': 5, 'min_idle_days': 7})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_idle_resources_invalid_input():
+    result = call_tool('finops_idle_resources', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_idle_resources_unauthorized():
+    result = call_tool('finops_idle_resources', 'A01', {'resources': [{'id': 'vm-1', 'kind': 'vm', 'daily_utilization_pct': [1, 2, 1, 3, 2, 1, 1], 'monthly_cost': 120}, {'id': 'vm-2', 'kind': 'vm', 'daily_utilization_pct': [40, 50, 3, 2, 60, 55, 45], 'monthly_cost': 80}], 'threshold_pct': 5, 'min_idle_days': 7})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_idle_resources'
+
+
+def test_finops_idle_resources_dependency():
+    result = call_tool('finops_idle_resources', 'A20', {'resources': [{'id': 'vm-1', 'kind': 'vm', 'daily_utilization_pct': [1, 2, 1, 3, 2, 1, 1], 'monthly_cost': 120}, {'id': 'vm-2', 'kind': 'vm', 'daily_utilization_pct': [40, 50, 3, 2, 60, 55, 45], 'monthly_cost': 80}], 'threshold_pct': 5, 'min_idle_days': 7, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_idle_resources_timeout():
+    result = call_tool('finops_idle_resources', 'A20', {'resources': [{'id': 'vm-1', 'kind': 'vm', 'daily_utilization_pct': [1, 2, 1, 3, 2, 1, 1], 'monthly_cost': 120}, {'id': 'vm-2', 'kind': 'vm', 'daily_utilization_pct': [40, 50, 3, 2, 60, 55, 45], 'monthly_cost': 80}], 'threshold_pct': 5, 'min_idle_days': 7, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_idle_resources_partial():
+    result = call_tool('finops_idle_resources', 'A20', {'resources': [{'id': 'vm-1', 'kind': 'vm', 'daily_utilization_pct': [1, 2, 1, 3, 2, 1, 1], 'monthly_cost': 120}, {'id': 'vm-2', 'kind': 'vm', 'daily_utilization_pct': [40, 50, 3, 2, 60, 55, 45], 'monthly_cost': 80}], 'threshold_pct': 5, 'min_idle_days': 7, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_rightsize_success():
+    result = call_tool('finops_rightsize', 'A20', {'workloads': [{'name': 'api', 'replicas': 3, 'cpu_request_m': 1000, 'cpu_p95_m': 200, 'cpu_p99_m': 300, 'mem_request_mib': 2048, 'mem_p95_mib': 500, 'mem_p99_mib': 600}], 'cpu_basis': 'p95', 'cpu_price_per_core_hour': 0.04, 'mem_price_per_gib_hour': 0.005})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_rightsize_invalid_input():
+    result = call_tool('finops_rightsize', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_rightsize_unauthorized():
+    result = call_tool('finops_rightsize', 'A01', {'workloads': [{'name': 'api', 'replicas': 3, 'cpu_request_m': 1000, 'cpu_p95_m': 200, 'cpu_p99_m': 300, 'mem_request_mib': 2048, 'mem_p95_mib': 500, 'mem_p99_mib': 600}], 'cpu_basis': 'p95', 'cpu_price_per_core_hour': 0.04, 'mem_price_per_gib_hour': 0.005})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_rightsize'
+
+
+def test_finops_rightsize_dependency():
+    result = call_tool('finops_rightsize', 'A20', {'workloads': [{'name': 'api', 'replicas': 3, 'cpu_request_m': 1000, 'cpu_p95_m': 200, 'cpu_p99_m': 300, 'mem_request_mib': 2048, 'mem_p95_mib': 500, 'mem_p99_mib': 600}], 'cpu_basis': 'p95', 'cpu_price_per_core_hour': 0.04, 'mem_price_per_gib_hour': 0.005, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_rightsize_timeout():
+    result = call_tool('finops_rightsize', 'A20', {'workloads': [{'name': 'api', 'replicas': 3, 'cpu_request_m': 1000, 'cpu_p95_m': 200, 'cpu_p99_m': 300, 'mem_request_mib': 2048, 'mem_p95_mib': 500, 'mem_p99_mib': 600}], 'cpu_basis': 'p95', 'cpu_price_per_core_hour': 0.04, 'mem_price_per_gib_hour': 0.005, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_rightsize_partial():
+    result = call_tool('finops_rightsize', 'A20', {'workloads': [{'name': 'api', 'replicas': 3, 'cpu_request_m': 1000, 'cpu_p95_m': 200, 'cpu_p99_m': 300, 'mem_request_mib': 2048, 'mem_p95_mib': 500, 'mem_p99_mib': 600}], 'cpu_basis': 'p95', 'cpu_price_per_core_hour': 0.04, 'mem_price_per_gib_hour': 0.005, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_showback_success():
+    result = call_tool('finops_showback', 'A20', {'shared_cost': 1000, 'method': 'proportional', 'consumers': [{'team': 'alpha', 'direct_cost': 300, 'usage': 10}, {'team': 'beta', 'direct_cost': 100, 'usage': 30}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_showback_invalid_input():
+    result = call_tool('finops_showback', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_showback_unauthorized():
+    result = call_tool('finops_showback', 'A01', {'shared_cost': 1000, 'method': 'proportional', 'consumers': [{'team': 'alpha', 'direct_cost': 300, 'usage': 10}, {'team': 'beta', 'direct_cost': 100, 'usage': 30}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_showback'
+
+
+def test_finops_showback_dependency():
+    result = call_tool('finops_showback', 'A20', {'shared_cost': 1000, 'method': 'proportional', 'consumers': [{'team': 'alpha', 'direct_cost': 300, 'usage': 10}, {'team': 'beta', 'direct_cost': 100, 'usage': 30}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_showback_timeout():
+    result = call_tool('finops_showback', 'A20', {'shared_cost': 1000, 'method': 'proportional', 'consumers': [{'team': 'alpha', 'direct_cost': 300, 'usage': 10}, {'team': 'beta', 'direct_cost': 100, 'usage': 30}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_showback_partial():
+    result = call_tool('finops_showback', 'A20', {'shared_cost': 1000, 'method': 'proportional', 'consumers': [{'team': 'alpha', 'direct_cost': 300, 'usage': 10}, {'team': 'beta', 'direct_cost': 100, 'usage': 30}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_spend_anomaly_success():
+    result = call_tool('finops_spend_anomaly', 'A20', {'daily_spend': [100, 102, 98, 101, 99, 100, 103, 500, 100, 101], 'start_date': '2026-10-01'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_spend_anomaly_invalid_input():
+    result = call_tool('finops_spend_anomaly', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_spend_anomaly_unauthorized():
+    result = call_tool('finops_spend_anomaly', 'A01', {'daily_spend': [100, 102, 98, 101, 99, 100, 103, 500, 100, 101], 'start_date': '2026-10-01'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_spend_anomaly'
+
+
+def test_finops_spend_anomaly_dependency():
+    result = call_tool('finops_spend_anomaly', 'A20', {'daily_spend': [100, 102, 98, 101, 99, 100, 103, 500, 100, 101], 'start_date': '2026-10-01', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_spend_anomaly_timeout():
+    result = call_tool('finops_spend_anomaly', 'A20', {'daily_spend': [100, 102, 98, 101, 99, 100, 103, 500, 100, 101], 'start_date': '2026-10-01', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_spend_anomaly_partial():
+    result = call_tool('finops_spend_anomaly', 'A20', {'daily_spend': [100, 102, 98, 101, 99, 100, 103, 500, 100, 101], 'start_date': '2026-10-01', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_spot_suitability_success():
+    result = call_tool('finops_spot_suitability', 'A20', {'workloads': [{'name': 'batch', 'replicas': 10, 'on_demand_hourly': 0.1, 'spot_hourly': 0.03, 'interruption_pct_month': 8, 'fault_tolerance': 'checkpointed', 'recovery_minutes': 5, 'checkpoint_interval_minutes': 10}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_spot_suitability_invalid_input():
+    result = call_tool('finops_spot_suitability', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_spot_suitability_unauthorized():
+    result = call_tool('finops_spot_suitability', 'A01', {'workloads': [{'name': 'batch', 'replicas': 10, 'on_demand_hourly': 0.1, 'spot_hourly': 0.03, 'interruption_pct_month': 8, 'fault_tolerance': 'checkpointed', 'recovery_minutes': 5, 'checkpoint_interval_minutes': 10}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_spot_suitability'
+
+
+def test_finops_spot_suitability_dependency():
+    result = call_tool('finops_spot_suitability', 'A20', {'workloads': [{'name': 'batch', 'replicas': 10, 'on_demand_hourly': 0.1, 'spot_hourly': 0.03, 'interruption_pct_month': 8, 'fault_tolerance': 'checkpointed', 'recovery_minutes': 5, 'checkpoint_interval_minutes': 10}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_spot_suitability_timeout():
+    result = call_tool('finops_spot_suitability', 'A20', {'workloads': [{'name': 'batch', 'replicas': 10, 'on_demand_hourly': 0.1, 'spot_hourly': 0.03, 'interruption_pct_month': 8, 'fault_tolerance': 'checkpointed', 'recovery_minutes': 5, 'checkpoint_interval_minutes': 10}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_spot_suitability_partial():
+    result = call_tool('finops_spot_suitability', 'A20', {'workloads': [{'name': 'batch', 'replicas': 10, 'on_demand_hourly': 0.1, 'spot_hourly': 0.03, 'interruption_pct_month': 8, 'fault_tolerance': 'checkpointed', 'recovery_minutes': 5, 'checkpoint_interval_minutes': 10}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_storage_tiering_success():
+    result = call_tool('finops_storage_tiering', 'A20', {'tiers': [{'name': 'standard', 'storage_per_gb_month': 0.023, 'retrieval_per_gb': 0, 'min_storage_days': 0, 'transition_in_per_gb': 0}, {'name': 'infrequent', 'storage_per_gb_month': 0.0125, 'retrieval_per_gb': 0.01, 'min_storage_days': 30, 'transition_in_per_gb': 0.01}], 'datasets': [{'name': 'logs', 'size_gb': 10000, 'monthly_read_gb': 100, 'retention_days': 365, 'current_tier': 'standard'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_storage_tiering_invalid_input():
+    result = call_tool('finops_storage_tiering', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_storage_tiering_unauthorized():
+    result = call_tool('finops_storage_tiering', 'A01', {'tiers': [{'name': 'standard', 'storage_per_gb_month': 0.023, 'retrieval_per_gb': 0, 'min_storage_days': 0, 'transition_in_per_gb': 0}, {'name': 'infrequent', 'storage_per_gb_month': 0.0125, 'retrieval_per_gb': 0.01, 'min_storage_days': 30, 'transition_in_per_gb': 0.01}], 'datasets': [{'name': 'logs', 'size_gb': 10000, 'monthly_read_gb': 100, 'retention_days': 365, 'current_tier': 'standard'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_storage_tiering'
+
+
+def test_finops_storage_tiering_dependency():
+    result = call_tool('finops_storage_tiering', 'A20', {'tiers': [{'name': 'standard', 'storage_per_gb_month': 0.023, 'retrieval_per_gb': 0, 'min_storage_days': 0, 'transition_in_per_gb': 0}, {'name': 'infrequent', 'storage_per_gb_month': 0.0125, 'retrieval_per_gb': 0.01, 'min_storage_days': 30, 'transition_in_per_gb': 0.01}], 'datasets': [{'name': 'logs', 'size_gb': 10000, 'monthly_read_gb': 100, 'retention_days': 365, 'current_tier': 'standard'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_storage_tiering_timeout():
+    result = call_tool('finops_storage_tiering', 'A20', {'tiers': [{'name': 'standard', 'storage_per_gb_month': 0.023, 'retrieval_per_gb': 0, 'min_storage_days': 0, 'transition_in_per_gb': 0}, {'name': 'infrequent', 'storage_per_gb_month': 0.0125, 'retrieval_per_gb': 0.01, 'min_storage_days': 30, 'transition_in_per_gb': 0.01}], 'datasets': [{'name': 'logs', 'size_gb': 10000, 'monthly_read_gb': 100, 'retention_days': 365, 'current_tier': 'standard'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_storage_tiering_partial():
+    result = call_tool('finops_storage_tiering', 'A20', {'tiers': [{'name': 'standard', 'storage_per_gb_month': 0.023, 'retrieval_per_gb': 0, 'min_storage_days': 0, 'transition_in_per_gb': 0}, {'name': 'infrequent', 'storage_per_gb_month': 0.0125, 'retrieval_per_gb': 0.01, 'min_storage_days': 30, 'transition_in_per_gb': 0.01}], 'datasets': [{'name': 'logs', 'size_gb': 10000, 'monthly_read_gb': 100, 'retention_days': 365, 'current_tier': 'standard'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_tag_coverage_success():
+    result = call_tool('finops_tag_coverage', 'A20', {'resources': [{'id': 'vm-1', 'monthly_cost': 100, 'tags': [{'key': 'owner', 'value': 'team-a'}, {'key': 'env', 'value': 'prod'}]}, {'id': 'vm-2', 'monthly_cost': 50, 'tags': [{'key': 'Owner', 'value': 'team-b'}]}], 'required_keys': ['owner', 'env']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_tag_coverage_invalid_input():
+    result = call_tool('finops_tag_coverage', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_tag_coverage_unauthorized():
+    result = call_tool('finops_tag_coverage', 'A01', {'resources': [{'id': 'vm-1', 'monthly_cost': 100, 'tags': [{'key': 'owner', 'value': 'team-a'}, {'key': 'env', 'value': 'prod'}]}, {'id': 'vm-2', 'monthly_cost': 50, 'tags': [{'key': 'Owner', 'value': 'team-b'}]}], 'required_keys': ['owner', 'env']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_tag_coverage'
+
+
+def test_finops_tag_coverage_dependency():
+    result = call_tool('finops_tag_coverage', 'A20', {'resources': [{'id': 'vm-1', 'monthly_cost': 100, 'tags': [{'key': 'owner', 'value': 'team-a'}, {'key': 'env', 'value': 'prod'}]}, {'id': 'vm-2', 'monthly_cost': 50, 'tags': [{'key': 'Owner', 'value': 'team-b'}]}], 'required_keys': ['owner', 'env'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_tag_coverage_timeout():
+    result = call_tool('finops_tag_coverage', 'A20', {'resources': [{'id': 'vm-1', 'monthly_cost': 100, 'tags': [{'key': 'owner', 'value': 'team-a'}, {'key': 'env', 'value': 'prod'}]}, {'id': 'vm-2', 'monthly_cost': 50, 'tags': [{'key': 'Owner', 'value': 'team-b'}]}], 'required_keys': ['owner', 'env'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_tag_coverage_partial():
+    result = call_tool('finops_tag_coverage', 'A20', {'resources': [{'id': 'vm-1', 'monthly_cost': 100, 'tags': [{'key': 'owner', 'value': 'team-a'}, {'key': 'env', 'value': 'prod'}]}, {'id': 'vm-2', 'monthly_cost': 50, 'tags': [{'key': 'Owner', 'value': 'team-b'}]}], 'required_keys': ['owner', 'env'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_finops_unit_cost_success():
+    result = call_tool('finops_unit_cost', 'A20', {'costs': [{'category': 'compute', 'amount': 6000}, {'category': 'storage', 'amount': 3000}, {'category': 'network', 'amount': 1000}], 'volume': 2000000, 'unit': 'request', 'target_unit_cost': 0.01, 'revenue_per_unit': 0.02})
+    assert result["state"] == "SUCCESS"
+
+
+def test_finops_unit_cost_invalid_input():
+    result = call_tool('finops_unit_cost', 'A20', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_finops_unit_cost_unauthorized():
+    result = call_tool('finops_unit_cost', 'A01', {'costs': [{'category': 'compute', 'amount': 6000}, {'category': 'storage', 'amount': 3000}, {'category': 'network', 'amount': 1000}], 'volume': 2000000, 'unit': 'request', 'target_unit_cost': 0.01, 'revenue_per_unit': 0.02})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'finops_unit_cost'
+
+
+def test_finops_unit_cost_dependency():
+    result = call_tool('finops_unit_cost', 'A20', {'costs': [{'category': 'compute', 'amount': 6000}, {'category': 'storage', 'amount': 3000}, {'category': 'network', 'amount': 1000}], 'volume': 2000000, 'unit': 'request', 'target_unit_cost': 0.01, 'revenue_per_unit': 0.02, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_finops_unit_cost_timeout():
+    result = call_tool('finops_unit_cost', 'A20', {'costs': [{'category': 'compute', 'amount': 6000}, {'category': 'storage', 'amount': 3000}, {'category': 'network', 'amount': 1000}], 'volume': 2000000, 'unit': 'request', 'target_unit_cost': 0.01, 'revenue_per_unit': 0.02, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_finops_unit_cost_partial():
+    result = call_tool('finops_unit_cost', 'A20', {'costs': [{'category': 'compute', 'amount': 6000}, {'category': 'storage', 'amount': 3000}, {'category': 'network', 'amount': 1000}], 'volume': 2000000, 'unit': 'request', 'target_unit_cost': 0.01, 'revenue_per_unit': 0.02, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_app_sync_policy_success():
+    result = call_tool('gitops_app_sync_policy', 'A22', {'resource': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application', 'metadata': {'name': 'web'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': 'https://kubernetes.default.svc', 'namespace': 'shop'}}}, 'environment': 'nonprod'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_app_sync_policy_invalid_input():
+    result = call_tool('gitops_app_sync_policy', 'A22', {'resource': {'apiVersion': 'v1'}, 'environment': 'staging'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_app_sync_policy_unauthorized():
+    result = call_tool('gitops_app_sync_policy', 'A01', {'resource': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application', 'metadata': {'name': 'web'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': 'https://kubernetes.default.svc', 'namespace': 'shop'}}}, 'environment': 'nonprod'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_app_sync_policy'
+
+
+def test_gitops_app_sync_policy_dependency():
+    result = call_tool('gitops_app_sync_policy', 'A22', {'resource': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application', 'metadata': {'name': 'web'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': 'https://kubernetes.default.svc', 'namespace': 'shop'}}}, 'environment': 'nonprod', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_app_sync_policy_timeout():
+    result = call_tool('gitops_app_sync_policy', 'A22', {'resource': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application', 'metadata': {'name': 'web'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': 'https://kubernetes.default.svc', 'namespace': 'shop'}}}, 'environment': 'nonprod', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_app_sync_policy_partial():
+    result = call_tool('gitops_app_sync_policy', 'A22', {'resource': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application', 'metadata': {'name': 'web'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': 'https://kubernetes.default.svc', 'namespace': 'shop'}}}, 'environment': 'nonprod', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_appset_check_success():
+    result = call_tool('gitops_appset_check', 'A22', {'applicationset': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'ApplicationSet', 'metadata': {'name': 'web'}, 'spec': {'generators': [{'clusters': {'selector': {'matchLabels': {'env': 'staging'}}}}], 'template': {'metadata': {'name': 'web-{{name}}'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': '{{server}}', 'namespace': 'shop'}}}}}, 'clusters': [{'name': 'stg-1', 'labels': {'env': 'staging'}}, {'name': 'prd-1', 'labels': {'env': 'prod'}}], 'environment': 'nonprod'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_appset_check_invalid_input():
+    result = call_tool('gitops_appset_check', 'A22', {'applicationset': {}, 'clusters': [], 'environment': 'nope'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_appset_check_unauthorized():
+    result = call_tool('gitops_appset_check', 'A01', {'applicationset': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'ApplicationSet', 'metadata': {'name': 'web'}, 'spec': {'generators': [{'clusters': {'selector': {'matchLabels': {'env': 'staging'}}}}], 'template': {'metadata': {'name': 'web-{{name}}'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': '{{server}}', 'namespace': 'shop'}}}}}, 'clusters': [{'name': 'stg-1', 'labels': {'env': 'staging'}}, {'name': 'prd-1', 'labels': {'env': 'prod'}}], 'environment': 'nonprod'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_appset_check'
+
+
+def test_gitops_appset_check_dependency():
+    result = call_tool('gitops_appset_check', 'A22', {'applicationset': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'ApplicationSet', 'metadata': {'name': 'web'}, 'spec': {'generators': [{'clusters': {'selector': {'matchLabels': {'env': 'staging'}}}}], 'template': {'metadata': {'name': 'web-{{name}}'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': '{{server}}', 'namespace': 'shop'}}}}}, 'clusters': [{'name': 'stg-1', 'labels': {'env': 'staging'}}, {'name': 'prd-1', 'labels': {'env': 'prod'}}], 'environment': 'nonprod', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_appset_check_timeout():
+    result = call_tool('gitops_appset_check', 'A22', {'applicationset': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'ApplicationSet', 'metadata': {'name': 'web'}, 'spec': {'generators': [{'clusters': {'selector': {'matchLabels': {'env': 'staging'}}}}], 'template': {'metadata': {'name': 'web-{{name}}'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': '{{server}}', 'namespace': 'shop'}}}}}, 'clusters': [{'name': 'stg-1', 'labels': {'env': 'staging'}}, {'name': 'prd-1', 'labels': {'env': 'prod'}}], 'environment': 'nonprod', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_appset_check_partial():
+    result = call_tool('gitops_appset_check', 'A22', {'applicationset': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'ApplicationSet', 'metadata': {'name': 'web'}, 'spec': {'generators': [{'clusters': {'selector': {'matchLabels': {'env': 'staging'}}}}], 'template': {'metadata': {'name': 'web-{{name}}'}, 'spec': {'project': 'shop', 'source': {'repoURL': 'https://git.example.com/acme/deploy.git', 'path': 'apps/web', 'targetRevision': 'v1.4.0'}, 'destination': {'server': '{{server}}', 'namespace': 'shop'}}}}}, 'clusters': [{'name': 'stg-1', 'labels': {'env': 'staging'}}, {'name': 'prd-1', 'labels': {'env': 'prod'}}], 'environment': 'nonprod', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_canary_verdict_success():
+    result = call_tool('gitops_canary_verdict', 'A22', {'metrics': [{'name': 'error-rate', 'direction': 'lower-is-better', 'aggregation': 'mean', 'threshold': 0.02, 'failure_limit': 1, 'canary_samples': [0.004, 0.006, 0.005]}], 'min_samples': 3})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_canary_verdict_invalid_input():
+    result = call_tool('gitops_canary_verdict', 'A22', {'metrics': [], 'min_samples': 3})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_canary_verdict_unauthorized():
+    result = call_tool('gitops_canary_verdict', 'A01', {'metrics': [{'name': 'error-rate', 'direction': 'lower-is-better', 'aggregation': 'mean', 'threshold': 0.02, 'failure_limit': 1, 'canary_samples': [0.004, 0.006, 0.005]}], 'min_samples': 3})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_canary_verdict'
+
+
+def test_gitops_canary_verdict_dependency():
+    result = call_tool('gitops_canary_verdict', 'A22', {'metrics': [{'name': 'error-rate', 'direction': 'lower-is-better', 'aggregation': 'mean', 'threshold': 0.02, 'failure_limit': 1, 'canary_samples': [0.004, 0.006, 0.005]}], 'min_samples': 3, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_canary_verdict_timeout():
+    result = call_tool('gitops_canary_verdict', 'A22', {'metrics': [{'name': 'error-rate', 'direction': 'lower-is-better', 'aggregation': 'mean', 'threshold': 0.02, 'failure_limit': 1, 'canary_samples': [0.004, 0.006, 0.005]}], 'min_samples': 3, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_canary_verdict_partial():
+    result = call_tool('gitops_canary_verdict', 'A22', {'metrics': [{'name': 'error-rate', 'direction': 'lower-is-better', 'aggregation': 'mean', 'threshold': 0.02, 'failure_limit': 1, 'canary_samples': [0.004, 0.006, 0.005]}], 'min_samples': 3, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_drift_classify_success():
+    result = call_tool('gitops_drift_classify', 'A22', {'diffs': [{'kind': 'Deployment', 'name': 'web', 'namespace': 'shop', 'path': 'spec.replicas', 'change': 'changed', 'field_manager': 'kubectl-edit'}], 'ignore_differences': []})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_drift_classify_invalid_input():
+    result = call_tool('gitops_drift_classify', 'A22', {'diffs': 'none', 'ignore_differences': []})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_drift_classify_unauthorized():
+    result = call_tool('gitops_drift_classify', 'A01', {'diffs': [{'kind': 'Deployment', 'name': 'web', 'namespace': 'shop', 'path': 'spec.replicas', 'change': 'changed', 'field_manager': 'kubectl-edit'}], 'ignore_differences': []})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_drift_classify'
+
+
+def test_gitops_drift_classify_dependency():
+    result = call_tool('gitops_drift_classify', 'A22', {'diffs': [{'kind': 'Deployment', 'name': 'web', 'namespace': 'shop', 'path': 'spec.replicas', 'change': 'changed', 'field_manager': 'kubectl-edit'}], 'ignore_differences': [], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_drift_classify_timeout():
+    result = call_tool('gitops_drift_classify', 'A22', {'diffs': [{'kind': 'Deployment', 'name': 'web', 'namespace': 'shop', 'path': 'spec.replicas', 'change': 'changed', 'field_manager': 'kubectl-edit'}], 'ignore_differences': [], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_drift_classify_partial():
+    result = call_tool('gitops_drift_classify', 'A22', {'diffs': [{'kind': 'Deployment', 'name': 'web', 'namespace': 'shop', 'path': 'spec.replicas', 'change': 'changed', 'field_manager': 'kubectl-edit'}], 'ignore_differences': [], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_helm_values_drift_success():
+    result = call_tool('gitops_helm_values_drift', 'A22', {'environments': [{'name': 'staging', 'values': {'replicaCount': 2, 'image': {'repository': 'ghcr.io/acme/web'}}}, {'name': 'prod', 'values': {'replicaCount': 4, 'image': {'repository': 'ghcr.io/acme/web'}}}], 'required_keys': ['replicaCount'], 'invariant_keys': ['image.repository']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_helm_values_drift_invalid_input():
+    result = call_tool('gitops_helm_values_drift', 'A22', {'environments': [{'name': 'staging', 'values': {}}], 'required_keys': [], 'invariant_keys': []})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_helm_values_drift_unauthorized():
+    result = call_tool('gitops_helm_values_drift', 'A01', {'environments': [{'name': 'staging', 'values': {'replicaCount': 2, 'image': {'repository': 'ghcr.io/acme/web'}}}, {'name': 'prod', 'values': {'replicaCount': 4, 'image': {'repository': 'ghcr.io/acme/web'}}}], 'required_keys': ['replicaCount'], 'invariant_keys': ['image.repository']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_helm_values_drift'
+
+
+def test_gitops_helm_values_drift_dependency():
+    result = call_tool('gitops_helm_values_drift', 'A22', {'environments': [{'name': 'staging', 'values': {'replicaCount': 2, 'image': {'repository': 'ghcr.io/acme/web'}}}, {'name': 'prod', 'values': {'replicaCount': 4, 'image': {'repository': 'ghcr.io/acme/web'}}}], 'required_keys': ['replicaCount'], 'invariant_keys': ['image.repository'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_helm_values_drift_timeout():
+    result = call_tool('gitops_helm_values_drift', 'A22', {'environments': [{'name': 'staging', 'values': {'replicaCount': 2, 'image': {'repository': 'ghcr.io/acme/web'}}}, {'name': 'prod', 'values': {'replicaCount': 4, 'image': {'repository': 'ghcr.io/acme/web'}}}], 'required_keys': ['replicaCount'], 'invariant_keys': ['image.repository'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_helm_values_drift_partial():
+    result = call_tool('gitops_helm_values_drift', 'A22', {'environments': [{'name': 'staging', 'values': {'replicaCount': 2, 'image': {'repository': 'ghcr.io/acme/web'}}}, {'name': 'prod', 'values': {'replicaCount': 4, 'image': {'repository': 'ghcr.io/acme/web'}}}], 'required_keys': ['replicaCount'], 'invariant_keys': ['image.repository'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_image_policy_success():
+    result = call_tool('gitops_image_policy', 'A22', {'image': 'ghcr.io/acme/web:1.4.2', 'candidate_tags': ['1.4.2', '1.5.0', '2.0.0'], 'policy': {'type': 'semver', 'range': '^1.4.0'}, 'require_digest': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_image_policy_invalid_input():
+    result = call_tool('gitops_image_policy', 'A22', {'image': 'x', 'require_digest': False})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_image_policy_unauthorized():
+    result = call_tool('gitops_image_policy', 'A01', {'image': 'ghcr.io/acme/web:1.4.2', 'candidate_tags': ['1.4.2', '1.5.0', '2.0.0'], 'policy': {'type': 'semver', 'range': '^1.4.0'}, 'require_digest': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_image_policy'
+
+
+def test_gitops_image_policy_dependency():
+    result = call_tool('gitops_image_policy', 'A22', {'image': 'ghcr.io/acme/web:1.4.2', 'candidate_tags': ['1.4.2', '1.5.0', '2.0.0'], 'policy': {'type': 'semver', 'range': '^1.4.0'}, 'require_digest': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_image_policy_timeout():
+    result = call_tool('gitops_image_policy', 'A22', {'image': 'ghcr.io/acme/web:1.4.2', 'candidate_tags': ['1.4.2', '1.5.0', '2.0.0'], 'policy': {'type': 'semver', 'range': '^1.4.0'}, 'require_digest': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_image_policy_partial():
+    result = call_tool('gitops_image_policy', 'A22', {'image': 'ghcr.io/acme/web:1.4.2', 'candidate_tags': ['1.4.2', '1.5.0', '2.0.0'], 'policy': {'type': 'semver', 'range': '^1.4.0'}, 'require_digest': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_kustomize_check_success():
+    result = call_tool('gitops_kustomize_check', 'A22', {'kustomization': {'namespace': 'shop', 'patches': [{'target': {'kind': 'Deployment', 'name': 'web'}, 'patch': [{'op': 'replace', 'path': '/spec/replicas', 'value': 3}]}]}, 'resources': [{'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_kustomize_check_invalid_input():
+    result = call_tool('gitops_kustomize_check', 'A22', {'kustomization': 'not-an-object', 'resources': []})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_kustomize_check_unauthorized():
+    result = call_tool('gitops_kustomize_check', 'A01', {'kustomization': {'namespace': 'shop', 'patches': [{'target': {'kind': 'Deployment', 'name': 'web'}, 'patch': [{'op': 'replace', 'path': '/spec/replicas', 'value': 3}]}]}, 'resources': [{'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_kustomize_check'
+
+
+def test_gitops_kustomize_check_dependency():
+    result = call_tool('gitops_kustomize_check', 'A22', {'kustomization': {'namespace': 'shop', 'patches': [{'target': {'kind': 'Deployment', 'name': 'web'}, 'patch': [{'op': 'replace', 'path': '/spec/replicas', 'value': 3}]}]}, 'resources': [{'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_kustomize_check_timeout():
+    result = call_tool('gitops_kustomize_check', 'A22', {'kustomization': {'namespace': 'shop', 'patches': [{'target': {'kind': 'Deployment', 'name': 'web'}, 'patch': [{'op': 'replace', 'path': '/spec/replicas', 'value': 3}]}]}, 'resources': [{'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_kustomize_check_partial():
+    result = call_tool('gitops_kustomize_check', 'A22', {'kustomization': {'namespace': 'shop', 'patches': [{'target': {'kind': 'Deployment', 'name': 'web'}, 'patch': [{'op': 'replace', 'path': '/spec/replicas', 'value': 3}]}]}, 'resources': [{'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_promotion_gate_success():
+    result = call_tool('gitops_promotion_gate', 'A22', {'now': '2026-03-10T12:00:00+00:00', 'env_order': ['dev', 'staging', 'prod'], 'source_env': 'staging', 'target_env': 'prod', 'deployed_at': '2026-03-10T08:00:00+00:00', 'min_soak_minutes': 120, 'checks': [{'name': 'e2e', 'status': 'success'}], 'required_checks': ['e2e'], 'approvals': [{'user': 'alice', 'state': 'approved', 'commit_sha': 'abcdef1234567', 'at': '2026-03-10T09:00:00+00:00'}], 'required_approvals': 1, 'pr_author': 'bob', 'head_sha': 'abcdef1234567', 'target_is_production': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_promotion_gate_invalid_input():
+    result = call_tool('gitops_promotion_gate', 'A22', {'now': '2026-03-10T12:00:00+00:00'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_promotion_gate_unauthorized():
+    result = call_tool('gitops_promotion_gate', 'A01', {'now': '2026-03-10T12:00:00+00:00', 'env_order': ['dev', 'staging', 'prod'], 'source_env': 'staging', 'target_env': 'prod', 'deployed_at': '2026-03-10T08:00:00+00:00', 'min_soak_minutes': 120, 'checks': [{'name': 'e2e', 'status': 'success'}], 'required_checks': ['e2e'], 'approvals': [{'user': 'alice', 'state': 'approved', 'commit_sha': 'abcdef1234567', 'at': '2026-03-10T09:00:00+00:00'}], 'required_approvals': 1, 'pr_author': 'bob', 'head_sha': 'abcdef1234567', 'target_is_production': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_promotion_gate'
+
+
+def test_gitops_promotion_gate_dependency():
+    result = call_tool('gitops_promotion_gate', 'A22', {'now': '2026-03-10T12:00:00+00:00', 'env_order': ['dev', 'staging', 'prod'], 'source_env': 'staging', 'target_env': 'prod', 'deployed_at': '2026-03-10T08:00:00+00:00', 'min_soak_minutes': 120, 'checks': [{'name': 'e2e', 'status': 'success'}], 'required_checks': ['e2e'], 'approvals': [{'user': 'alice', 'state': 'approved', 'commit_sha': 'abcdef1234567', 'at': '2026-03-10T09:00:00+00:00'}], 'required_approvals': 1, 'pr_author': 'bob', 'head_sha': 'abcdef1234567', 'target_is_production': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_promotion_gate_timeout():
+    result = call_tool('gitops_promotion_gate', 'A22', {'now': '2026-03-10T12:00:00+00:00', 'env_order': ['dev', 'staging', 'prod'], 'source_env': 'staging', 'target_env': 'prod', 'deployed_at': '2026-03-10T08:00:00+00:00', 'min_soak_minutes': 120, 'checks': [{'name': 'e2e', 'status': 'success'}], 'required_checks': ['e2e'], 'approvals': [{'user': 'alice', 'state': 'approved', 'commit_sha': 'abcdef1234567', 'at': '2026-03-10T09:00:00+00:00'}], 'required_approvals': 1, 'pr_author': 'bob', 'head_sha': 'abcdef1234567', 'target_is_production': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_promotion_gate_partial():
+    result = call_tool('gitops_promotion_gate', 'A22', {'now': '2026-03-10T12:00:00+00:00', 'env_order': ['dev', 'staging', 'prod'], 'source_env': 'staging', 'target_env': 'prod', 'deployed_at': '2026-03-10T08:00:00+00:00', 'min_soak_minutes': 120, 'checks': [{'name': 'e2e', 'status': 'success'}], 'required_checks': ['e2e'], 'approvals': [{'user': 'alice', 'state': 'approved', 'commit_sha': 'abcdef1234567', 'at': '2026-03-10T09:00:00+00:00'}], 'required_approvals': 1, 'pr_author': 'bob', 'head_sha': 'abcdef1234567', 'target_is_production': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_prune_risk_success():
+    result = call_tool('gitops_prune_risk', 'A22', {'pruned': [{'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'old', 'namespace': 'shop'}}], 'environment': 'nonprod', 'automated': True, 'desired_count': 12, 'allow_empty': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_prune_risk_invalid_input():
+    result = call_tool('gitops_prune_risk', 'A22', {'pruned': [], 'environment': 'prod', 'automated': 'yes', 'desired_count': 1, 'allow_empty': False})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_prune_risk_unauthorized():
+    result = call_tool('gitops_prune_risk', 'A01', {'pruned': [{'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'old', 'namespace': 'shop'}}], 'environment': 'nonprod', 'automated': True, 'desired_count': 12, 'allow_empty': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_prune_risk'
+
+
+def test_gitops_prune_risk_dependency():
+    result = call_tool('gitops_prune_risk', 'A22', {'pruned': [{'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'old', 'namespace': 'shop'}}], 'environment': 'nonprod', 'automated': True, 'desired_count': 12, 'allow_empty': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_prune_risk_timeout():
+    result = call_tool('gitops_prune_risk', 'A22', {'pruned': [{'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'old', 'namespace': 'shop'}}], 'environment': 'nonprod', 'automated': True, 'desired_count': 12, 'allow_empty': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_prune_risk_partial():
+    result = call_tool('gitops_prune_risk', 'A22', {'pruned': [{'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'old', 'namespace': 'shop'}}], 'environment': 'nonprod', 'automated': True, 'desired_count': 12, 'allow_empty': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_repo_layout_success():
+    result = call_tool('gitops_repo_layout', 'A22', {'paths': ['apps/web/base/kustomization.yaml', 'apps/web/overlays/staging/kustomization.yaml', 'apps/web/overlays/prod/kustomization.yaml', '.github/CODEOWNERS'], 'expected_envs': ['staging', 'prod'], 'production_envs': ['prod'], 'clusters': [], 'engine': 'none', 'codeowners': 'apps/ @acme/platform\n'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_repo_layout_invalid_input():
+    result = call_tool('gitops_repo_layout', 'A22', {'paths': [], 'expected_envs': [], 'production_envs': [], 'clusters': [], 'engine': 'none'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_repo_layout_unauthorized():
+    result = call_tool('gitops_repo_layout', 'A01', {'paths': ['apps/web/base/kustomization.yaml', 'apps/web/overlays/staging/kustomization.yaml', 'apps/web/overlays/prod/kustomization.yaml', '.github/CODEOWNERS'], 'expected_envs': ['staging', 'prod'], 'production_envs': ['prod'], 'clusters': [], 'engine': 'none', 'codeowners': 'apps/ @acme/platform\n'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_repo_layout'
+
+
+def test_gitops_repo_layout_dependency():
+    result = call_tool('gitops_repo_layout', 'A22', {'paths': ['apps/web/base/kustomization.yaml', 'apps/web/overlays/staging/kustomization.yaml', 'apps/web/overlays/prod/kustomization.yaml', '.github/CODEOWNERS'], 'expected_envs': ['staging', 'prod'], 'production_envs': ['prod'], 'clusters': [], 'engine': 'none', 'codeowners': 'apps/ @acme/platform\n', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_repo_layout_timeout():
+    result = call_tool('gitops_repo_layout', 'A22', {'paths': ['apps/web/base/kustomization.yaml', 'apps/web/overlays/staging/kustomization.yaml', 'apps/web/overlays/prod/kustomization.yaml', '.github/CODEOWNERS'], 'expected_envs': ['staging', 'prod'], 'production_envs': ['prod'], 'clusters': [], 'engine': 'none', 'codeowners': 'apps/ @acme/platform\n', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_repo_layout_partial():
+    result = call_tool('gitops_repo_layout', 'A22', {'paths': ['apps/web/base/kustomization.yaml', 'apps/web/overlays/staging/kustomization.yaml', 'apps/web/overlays/prod/kustomization.yaml', '.github/CODEOWNERS'], 'expected_envs': ['staging', 'prod'], 'production_envs': ['prod'], 'clusters': [], 'engine': 'none', 'codeowners': 'apps/ @acme/platform\n', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_rollout_check_success():
+    result = call_tool('gitops_rollout_check', 'A22', {'rollout': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Rollout', 'metadata': {'name': 'web'}, 'spec': {'replicas': 4, 'selector': {'matchLabels': {'app': 'web'}}, 'template': {'spec': {'containers': [{'name': 'web', 'image': 'web:1'}]}}, 'strategy': {'canary': {'steps': [{'setWeight': 25}, {'analysis': {'templates': [{'templateName': 'success-rate'}]}}, {'setWeight': 50}, {'pause': {'duration': '5m'}}]}}}}, 'analysis_templates': ['success-rate']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_rollout_check_invalid_input():
+    result = call_tool('gitops_rollout_check', 'A22', {'rollout': [], 'analysis_templates': []})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_rollout_check_unauthorized():
+    result = call_tool('gitops_rollout_check', 'A01', {'rollout': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Rollout', 'metadata': {'name': 'web'}, 'spec': {'replicas': 4, 'selector': {'matchLabels': {'app': 'web'}}, 'template': {'spec': {'containers': [{'name': 'web', 'image': 'web:1'}]}}, 'strategy': {'canary': {'steps': [{'setWeight': 25}, {'analysis': {'templates': [{'templateName': 'success-rate'}]}}, {'setWeight': 50}, {'pause': {'duration': '5m'}}]}}}}, 'analysis_templates': ['success-rate']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_rollout_check'
+
+
+def test_gitops_rollout_check_dependency():
+    result = call_tool('gitops_rollout_check', 'A22', {'rollout': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Rollout', 'metadata': {'name': 'web'}, 'spec': {'replicas': 4, 'selector': {'matchLabels': {'app': 'web'}}, 'template': {'spec': {'containers': [{'name': 'web', 'image': 'web:1'}]}}, 'strategy': {'canary': {'steps': [{'setWeight': 25}, {'analysis': {'templates': [{'templateName': 'success-rate'}]}}, {'setWeight': 50}, {'pause': {'duration': '5m'}}]}}}}, 'analysis_templates': ['success-rate'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_rollout_check_timeout():
+    result = call_tool('gitops_rollout_check', 'A22', {'rollout': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Rollout', 'metadata': {'name': 'web'}, 'spec': {'replicas': 4, 'selector': {'matchLabels': {'app': 'web'}}, 'template': {'spec': {'containers': [{'name': 'web', 'image': 'web:1'}]}}, 'strategy': {'canary': {'steps': [{'setWeight': 25}, {'analysis': {'templates': [{'templateName': 'success-rate'}]}}, {'setWeight': 50}, {'pause': {'duration': '5m'}}]}}}}, 'analysis_templates': ['success-rate'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_rollout_check_partial():
+    result = call_tool('gitops_rollout_check', 'A22', {'rollout': {'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Rollout', 'metadata': {'name': 'web'}, 'spec': {'replicas': 4, 'selector': {'matchLabels': {'app': 'web'}}, 'template': {'spec': {'containers': [{'name': 'web', 'image': 'web:1'}]}}, 'strategy': {'canary': {'steps': [{'setWeight': 25}, {'analysis': {'templates': [{'templateName': 'success-rate'}]}}, {'setWeight': 50}, {'pause': {'duration': '5m'}}]}}}}, 'analysis_templates': ['success-rate'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_secret_scan_success():
+    result = call_tool('gitops_secret_scan', 'A22', {'manifests': [{'apiVersion': 'external-secrets.io/v1beta1', 'kind': 'ExternalSecret', 'metadata': {'name': 'db', 'namespace': 'shop'}, 'spec': {'secretStoreRef': {'name': 'vault'}, 'data': [{'secretKey': 'password', 'remoteRef': {'key': 'db/password'}}]}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_secret_scan_invalid_input():
+    result = call_tool('gitops_secret_scan', 'A22', {'manifests': 'none'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_secret_scan_unauthorized():
+    result = call_tool('gitops_secret_scan', 'A01', {'manifests': [{'apiVersion': 'external-secrets.io/v1beta1', 'kind': 'ExternalSecret', 'metadata': {'name': 'db', 'namespace': 'shop'}, 'spec': {'secretStoreRef': {'name': 'vault'}, 'data': [{'secretKey': 'password', 'remoteRef': {'key': 'db/password'}}]}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_secret_scan'
+
+
+def test_gitops_secret_scan_dependency():
+    result = call_tool('gitops_secret_scan', 'A22', {'manifests': [{'apiVersion': 'external-secrets.io/v1beta1', 'kind': 'ExternalSecret', 'metadata': {'name': 'db', 'namespace': 'shop'}, 'spec': {'secretStoreRef': {'name': 'vault'}, 'data': [{'secretKey': 'password', 'remoteRef': {'key': 'db/password'}}]}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_secret_scan_timeout():
+    result = call_tool('gitops_secret_scan', 'A22', {'manifests': [{'apiVersion': 'external-secrets.io/v1beta1', 'kind': 'ExternalSecret', 'metadata': {'name': 'db', 'namespace': 'shop'}, 'spec': {'secretStoreRef': {'name': 'vault'}, 'data': [{'secretKey': 'password', 'remoteRef': {'key': 'db/password'}}]}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_secret_scan_partial():
+    result = call_tool('gitops_secret_scan', 'A22', {'manifests': [{'apiVersion': 'external-secrets.io/v1beta1', 'kind': 'ExternalSecret', 'metadata': {'name': 'db', 'namespace': 'shop'}, 'spec': {'secretStoreRef': {'name': 'vault'}, 'data': [{'secretKey': 'password', 'remoteRef': {'key': 'db/password'}}]}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_gitops_sync_wave_check_success():
+    result = call_tool('gitops_sync_wave_check', 'A22', {'manifests': [{'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': 'shop', 'annotations': {'argocd.argoproj.io/sync-wave': '-1'}}}, {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_gitops_sync_wave_check_invalid_input():
+    result = call_tool('gitops_sync_wave_check', 'A22', {'manifests': 'none'})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_gitops_sync_wave_check_unauthorized():
+    result = call_tool('gitops_sync_wave_check', 'A01', {'manifests': [{'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': 'shop', 'annotations': {'argocd.argoproj.io/sync-wave': '-1'}}}, {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'gitops_sync_wave_check'
+
+
+def test_gitops_sync_wave_check_dependency():
+    result = call_tool('gitops_sync_wave_check', 'A22', {'manifests': [{'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': 'shop', 'annotations': {'argocd.argoproj.io/sync-wave': '-1'}}}, {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_gitops_sync_wave_check_timeout():
+    result = call_tool('gitops_sync_wave_check', 'A22', {'manifests': [{'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': 'shop', 'annotations': {'argocd.argoproj.io/sync-wave': '-1'}}}, {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_gitops_sync_wave_check_partial():
+    result = call_tool('gitops_sync_wave_check', 'A22', {'manifests': [{'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': 'shop', 'annotations': {'argocd.argoproj.io/sync-wave': '-1'}}}, {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'web', 'namespace': 'shop'}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_addon_compatibility_success():
+    result = call_tool('k8s_addon_compatibility', 'A21', {'current_version': '1.29', 'target_version': '1.31', 'addons': [{'name': 'calico', 'kind': 'cni', 'version': '3.27.0', 'min_k8s': '1.27', 'max_k8s': '1.29', 'candidate_version': '3.28.1', 'candidate_min_k8s': '1.28', 'candidate_max_k8s': '1.31'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_addon_compatibility_invalid_input():
+    result = call_tool('k8s_addon_compatibility', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_addon_compatibility_unauthorized():
+    result = call_tool('k8s_addon_compatibility', 'A01', {'current_version': '1.29', 'target_version': '1.31', 'addons': [{'name': 'calico', 'kind': 'cni', 'version': '3.27.0', 'min_k8s': '1.27', 'max_k8s': '1.29', 'candidate_version': '3.28.1', 'candidate_min_k8s': '1.28', 'candidate_max_k8s': '1.31'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_addon_compatibility'
+
+
+def test_k8s_addon_compatibility_dependency():
+    result = call_tool('k8s_addon_compatibility', 'A21', {'current_version': '1.29', 'target_version': '1.31', 'addons': [{'name': 'calico', 'kind': 'cni', 'version': '3.27.0', 'min_k8s': '1.27', 'max_k8s': '1.29', 'candidate_version': '3.28.1', 'candidate_min_k8s': '1.28', 'candidate_max_k8s': '1.31'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_addon_compatibility_timeout():
+    result = call_tool('k8s_addon_compatibility', 'A21', {'current_version': '1.29', 'target_version': '1.31', 'addons': [{'name': 'calico', 'kind': 'cni', 'version': '3.27.0', 'min_k8s': '1.27', 'max_k8s': '1.29', 'candidate_version': '3.28.1', 'candidate_min_k8s': '1.28', 'candidate_max_k8s': '1.31'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_addon_compatibility_partial():
+    result = call_tool('k8s_addon_compatibility', 'A21', {'current_version': '1.29', 'target_version': '1.31', 'addons': [{'name': 'calico', 'kind': 'cni', 'version': '3.27.0', 'min_k8s': '1.27', 'max_k8s': '1.29', 'candidate_version': '3.28.1', 'candidate_min_k8s': '1.28', 'candidate_max_k8s': '1.31'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_autoscaler_sanity_success():
+    result = call_tool('k8s_autoscaler_sanity', 'A21', {'hpas': [{'name': 'web', 'min_replicas': 2, 'max_replicas': 10, 'current_replicas': 3, 'metric': 'cpu_utilization', 'target_pct': 70, 'cpu_request_m': 250, 'memory_request_mib': 256}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_autoscaler_sanity_invalid_input():
+    result = call_tool('k8s_autoscaler_sanity', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_autoscaler_sanity_unauthorized():
+    result = call_tool('k8s_autoscaler_sanity', 'A01', {'hpas': [{'name': 'web', 'min_replicas': 2, 'max_replicas': 10, 'current_replicas': 3, 'metric': 'cpu_utilization', 'target_pct': 70, 'cpu_request_m': 250, 'memory_request_mib': 256}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_autoscaler_sanity'
+
+
+def test_k8s_autoscaler_sanity_dependency():
+    result = call_tool('k8s_autoscaler_sanity', 'A21', {'hpas': [{'name': 'web', 'min_replicas': 2, 'max_replicas': 10, 'current_replicas': 3, 'metric': 'cpu_utilization', 'target_pct': 70, 'cpu_request_m': 250, 'memory_request_mib': 256}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_autoscaler_sanity_timeout():
+    result = call_tool('k8s_autoscaler_sanity', 'A21', {'hpas': [{'name': 'web', 'min_replicas': 2, 'max_replicas': 10, 'current_replicas': 3, 'metric': 'cpu_utilization', 'target_pct': 70, 'cpu_request_m': 250, 'memory_request_mib': 256}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_autoscaler_sanity_partial():
+    result = call_tool('k8s_autoscaler_sanity', 'A21', {'hpas': [{'name': 'web', 'min_replicas': 2, 'max_replicas': 10, 'current_replicas': 3, 'metric': 'cpu_utilization', 'target_pct': 70, 'cpu_request_m': 250, 'memory_request_mib': 256}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_cert_expiry_success():
+    result = call_tool('k8s_cert_expiry', 'A21', {'now': '2026-10-20T00:00:00Z', 'certs': [{'name': 'apiserver', 'not_after': '2027-03-01T00:00:00Z'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_cert_expiry_invalid_input():
+    result = call_tool('k8s_cert_expiry', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_cert_expiry_unauthorized():
+    result = call_tool('k8s_cert_expiry', 'A01', {'now': '2026-10-20T00:00:00Z', 'certs': [{'name': 'apiserver', 'not_after': '2027-03-01T00:00:00Z'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_cert_expiry'
+
+
+def test_k8s_cert_expiry_dependency():
+    result = call_tool('k8s_cert_expiry', 'A21', {'now': '2026-10-20T00:00:00Z', 'certs': [{'name': 'apiserver', 'not_after': '2027-03-01T00:00:00Z'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_cert_expiry_timeout():
+    result = call_tool('k8s_cert_expiry', 'A21', {'now': '2026-10-20T00:00:00Z', 'certs': [{'name': 'apiserver', 'not_after': '2027-03-01T00:00:00Z'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_cert_expiry_partial():
+    result = call_tool('k8s_cert_expiry', 'A21', {'now': '2026-10-20T00:00:00Z', 'certs': [{'name': 'apiserver', 'not_after': '2027-03-01T00:00:00Z'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_deprecated_api_scan_success():
+    result = call_tool('k8s_deprecated_api_scan', 'A21', {'target_version': '1.25', 'resources': [{'api_version': 'batch/v1beta1', 'kind': 'CronJob', 'name': 'nightly'}, {'api_version': 'apps/v1', 'kind': 'Deployment', 'name': 'web'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_deprecated_api_scan_invalid_input():
+    result = call_tool('k8s_deprecated_api_scan', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_deprecated_api_scan_unauthorized():
+    result = call_tool('k8s_deprecated_api_scan', 'A01', {'target_version': '1.25', 'resources': [{'api_version': 'batch/v1beta1', 'kind': 'CronJob', 'name': 'nightly'}, {'api_version': 'apps/v1', 'kind': 'Deployment', 'name': 'web'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_deprecated_api_scan'
+
+
+def test_k8s_deprecated_api_scan_dependency():
+    result = call_tool('k8s_deprecated_api_scan', 'A21', {'target_version': '1.25', 'resources': [{'api_version': 'batch/v1beta1', 'kind': 'CronJob', 'name': 'nightly'}, {'api_version': 'apps/v1', 'kind': 'Deployment', 'name': 'web'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_deprecated_api_scan_timeout():
+    result = call_tool('k8s_deprecated_api_scan', 'A21', {'target_version': '1.25', 'resources': [{'api_version': 'batch/v1beta1', 'kind': 'CronJob', 'name': 'nightly'}, {'api_version': 'apps/v1', 'kind': 'Deployment', 'name': 'web'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_deprecated_api_scan_partial():
+    result = call_tool('k8s_deprecated_api_scan', 'A21', {'target_version': '1.25', 'resources': [{'api_version': 'batch/v1beta1', 'kind': 'CronJob', 'name': 'nightly'}, {'api_version': 'apps/v1', 'kind': 'Deployment', 'name': 'web'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_drain_feasibility_success():
+    result = call_tool('k8s_drain_feasibility', 'A21', {'pdbs': [{'name': 'web', 'namespace': 'shop', 'expected_pods': 5, 'current_healthy': 5, 'min_available': 4, 'pods_on_drained_nodes': 1}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_drain_feasibility_invalid_input():
+    result = call_tool('k8s_drain_feasibility', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_drain_feasibility_unauthorized():
+    result = call_tool('k8s_drain_feasibility', 'A01', {'pdbs': [{'name': 'web', 'namespace': 'shop', 'expected_pods': 5, 'current_healthy': 5, 'min_available': 4, 'pods_on_drained_nodes': 1}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_drain_feasibility'
+
+
+def test_k8s_drain_feasibility_dependency():
+    result = call_tool('k8s_drain_feasibility', 'A21', {'pdbs': [{'name': 'web', 'namespace': 'shop', 'expected_pods': 5, 'current_healthy': 5, 'min_available': 4, 'pods_on_drained_nodes': 1}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_drain_feasibility_timeout():
+    result = call_tool('k8s_drain_feasibility', 'A21', {'pdbs': [{'name': 'web', 'namespace': 'shop', 'expected_pods': 5, 'current_healthy': 5, 'min_available': 4, 'pods_on_drained_nodes': 1}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_drain_feasibility_partial():
+    result = call_tool('k8s_drain_feasibility', 'A21', {'pdbs': [{'name': 'web', 'namespace': 'shop', 'expected_pods': 5, 'current_healthy': 5, 'min_available': 4, 'pods_on_drained_nodes': 1}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_etcd_health_success():
+    result = call_tool('k8s_etcd_health', 'A21', {'db_size_bytes': 536870912, 'leader_changes_15m': 0, 'wal_fsync_p99_ms': 6.5, 'members': [{'name': 'etcd-0', 'healthy': True}, {'name': 'etcd-1', 'healthy': True}, {'name': 'etcd-2', 'healthy': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_etcd_health_invalid_input():
+    result = call_tool('k8s_etcd_health', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_etcd_health_unauthorized():
+    result = call_tool('k8s_etcd_health', 'A01', {'db_size_bytes': 536870912, 'leader_changes_15m': 0, 'wal_fsync_p99_ms': 6.5, 'members': [{'name': 'etcd-0', 'healthy': True}, {'name': 'etcd-1', 'healthy': True}, {'name': 'etcd-2', 'healthy': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_etcd_health'
+
+
+def test_k8s_etcd_health_dependency():
+    result = call_tool('k8s_etcd_health', 'A21', {'db_size_bytes': 536870912, 'leader_changes_15m': 0, 'wal_fsync_p99_ms': 6.5, 'members': [{'name': 'etcd-0', 'healthy': True}, {'name': 'etcd-1', 'healthy': True}, {'name': 'etcd-2', 'healthy': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_etcd_health_timeout():
+    result = call_tool('k8s_etcd_health', 'A21', {'db_size_bytes': 536870912, 'leader_changes_15m': 0, 'wal_fsync_p99_ms': 6.5, 'members': [{'name': 'etcd-0', 'healthy': True}, {'name': 'etcd-1', 'healthy': True}, {'name': 'etcd-2', 'healthy': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_etcd_health_partial():
+    result = call_tool('k8s_etcd_health', 'A21', {'db_size_bytes': 536870912, 'leader_changes_15m': 0, 'wal_fsync_p99_ms': 6.5, 'members': [{'name': 'etcd-0', 'healthy': True}, {'name': 'etcd-1', 'healthy': True}, {'name': 'etcd-2', 'healthy': True}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_fleet_drift_success():
+    result = call_tool('k8s_fleet_drift', 'A21', {'latest_version': '1.31.1', 'clusters': [{'name': 'prod-eu', 'environment': 'prod', 'version': '1.30.4'}, {'name': 'dev-eu', 'environment': 'dev', 'version': '1.31.1'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_fleet_drift_invalid_input():
+    result = call_tool('k8s_fleet_drift', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_fleet_drift_unauthorized():
+    result = call_tool('k8s_fleet_drift', 'A01', {'latest_version': '1.31.1', 'clusters': [{'name': 'prod-eu', 'environment': 'prod', 'version': '1.30.4'}, {'name': 'dev-eu', 'environment': 'dev', 'version': '1.31.1'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_fleet_drift'
+
+
+def test_k8s_fleet_drift_dependency():
+    result = call_tool('k8s_fleet_drift', 'A21', {'latest_version': '1.31.1', 'clusters': [{'name': 'prod-eu', 'environment': 'prod', 'version': '1.30.4'}, {'name': 'dev-eu', 'environment': 'dev', 'version': '1.31.1'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_fleet_drift_timeout():
+    result = call_tool('k8s_fleet_drift', 'A21', {'latest_version': '1.31.1', 'clusters': [{'name': 'prod-eu', 'environment': 'prod', 'version': '1.30.4'}, {'name': 'dev-eu', 'environment': 'dev', 'version': '1.31.1'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_fleet_drift_partial():
+    result = call_tool('k8s_fleet_drift', 'A21', {'latest_version': '1.31.1', 'clusters': [{'name': 'prod-eu', 'environment': 'prod', 'version': '1.30.4'}, {'name': 'dev-eu', 'environment': 'dev', 'version': '1.31.1'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_maintenance_window_success():
+    result = call_tool('k8s_maintenance_window', 'A21', {'proposed_start': '2026-10-24T02:00:00+00:00', 'duration_minutes': 120, 'windows': [{'name': 'weekend-night', 'weekdays': ['sat'], 'start': '01:00', 'end': '05:00', 'utc_offset_minutes': 0}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_maintenance_window_invalid_input():
+    result = call_tool('k8s_maintenance_window', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_maintenance_window_unauthorized():
+    result = call_tool('k8s_maintenance_window', 'A01', {'proposed_start': '2026-10-24T02:00:00+00:00', 'duration_minutes': 120, 'windows': [{'name': 'weekend-night', 'weekdays': ['sat'], 'start': '01:00', 'end': '05:00', 'utc_offset_minutes': 0}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_maintenance_window'
+
+
+def test_k8s_maintenance_window_dependency():
+    result = call_tool('k8s_maintenance_window', 'A21', {'proposed_start': '2026-10-24T02:00:00+00:00', 'duration_minutes': 120, 'windows': [{'name': 'weekend-night', 'weekdays': ['sat'], 'start': '01:00', 'end': '05:00', 'utc_offset_minutes': 0}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_maintenance_window_timeout():
+    result = call_tool('k8s_maintenance_window', 'A21', {'proposed_start': '2026-10-24T02:00:00+00:00', 'duration_minutes': 120, 'windows': [{'name': 'weekend-night', 'weekdays': ['sat'], 'start': '01:00', 'end': '05:00', 'utc_offset_minutes': 0}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_maintenance_window_partial():
+    result = call_tool('k8s_maintenance_window', 'A21', {'proposed_start': '2026-10-24T02:00:00+00:00', 'duration_minutes': 120, 'windows': [{'name': 'weekend-night', 'weekdays': ['sat'], 'start': '01:00', 'end': '05:00', 'utc_offset_minutes': 0}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_nodepool_capacity_success():
+    result = call_tool('k8s_nodepool_capacity', 'A21', {'pools': [{'name': 'general', 'nodes': 4, 'allocatable_cpu_m': 3900, 'allocatable_memory_mib': 14000}], 'workloads': [{'name': 'api', 'pool': 'general', 'replicas': 6, 'cpu_request_m': 500, 'memory_request_mib': 1024}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_nodepool_capacity_invalid_input():
+    result = call_tool('k8s_nodepool_capacity', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_nodepool_capacity_unauthorized():
+    result = call_tool('k8s_nodepool_capacity', 'A01', {'pools': [{'name': 'general', 'nodes': 4, 'allocatable_cpu_m': 3900, 'allocatable_memory_mib': 14000}], 'workloads': [{'name': 'api', 'pool': 'general', 'replicas': 6, 'cpu_request_m': 500, 'memory_request_mib': 1024}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_nodepool_capacity'
+
+
+def test_k8s_nodepool_capacity_dependency():
+    result = call_tool('k8s_nodepool_capacity', 'A21', {'pools': [{'name': 'general', 'nodes': 4, 'allocatable_cpu_m': 3900, 'allocatable_memory_mib': 14000}], 'workloads': [{'name': 'api', 'pool': 'general', 'replicas': 6, 'cpu_request_m': 500, 'memory_request_mib': 1024}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_nodepool_capacity_timeout():
+    result = call_tool('k8s_nodepool_capacity', 'A21', {'pools': [{'name': 'general', 'nodes': 4, 'allocatable_cpu_m': 3900, 'allocatable_memory_mib': 14000}], 'workloads': [{'name': 'api', 'pool': 'general', 'replicas': 6, 'cpu_request_m': 500, 'memory_request_mib': 1024}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_nodepool_capacity_partial():
+    result = call_tool('k8s_nodepool_capacity', 'A21', {'pools': [{'name': 'general', 'nodes': 4, 'allocatable_cpu_m': 3900, 'allocatable_memory_mib': 14000}], 'workloads': [{'name': 'api', 'pool': 'general', 'replicas': 6, 'cpu_request_m': 500, 'memory_request_mib': 1024}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_quota_fit_success():
+    result = call_tool('k8s_quota_fit', 'A21', {'replicas': 3, 'containers': [{'name': 'app', 'cpu_request_m': 250, 'memory_request_mib': 256, 'cpu_limit_m': 500, 'memory_limit_mib': 512}], 'quota_hard': {'requests_cpu_m': 4000, 'pods': 10}, 'quota_used': {'requests_cpu_m': 1000, 'pods': 2}})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_quota_fit_invalid_input():
+    result = call_tool('k8s_quota_fit', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_quota_fit_unauthorized():
+    result = call_tool('k8s_quota_fit', 'A01', {'replicas': 3, 'containers': [{'name': 'app', 'cpu_request_m': 250, 'memory_request_mib': 256, 'cpu_limit_m': 500, 'memory_limit_mib': 512}], 'quota_hard': {'requests_cpu_m': 4000, 'pods': 10}, 'quota_used': {'requests_cpu_m': 1000, 'pods': 2}})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_quota_fit'
+
+
+def test_k8s_quota_fit_dependency():
+    result = call_tool('k8s_quota_fit', 'A21', {'replicas': 3, 'containers': [{'name': 'app', 'cpu_request_m': 250, 'memory_request_mib': 256, 'cpu_limit_m': 500, 'memory_limit_mib': 512}], 'quota_hard': {'requests_cpu_m': 4000, 'pods': 10}, 'quota_used': {'requests_cpu_m': 1000, 'pods': 2}, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_quota_fit_timeout():
+    result = call_tool('k8s_quota_fit', 'A21', {'replicas': 3, 'containers': [{'name': 'app', 'cpu_request_m': 250, 'memory_request_mib': 256, 'cpu_limit_m': 500, 'memory_limit_mib': 512}], 'quota_hard': {'requests_cpu_m': 4000, 'pods': 10}, 'quota_used': {'requests_cpu_m': 1000, 'pods': 2}, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_quota_fit_partial():
+    result = call_tool('k8s_quota_fit', 'A21', {'replicas': 3, 'containers': [{'name': 'app', 'cpu_request_m': 250, 'memory_request_mib': 256, 'cpu_limit_m': 500, 'memory_limit_mib': 512}], 'quota_hard': {'requests_cpu_m': 4000, 'pods': 10}, 'quota_used': {'requests_cpu_m': 1000, 'pods': 2}, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_upgrade_plan_success():
+    result = call_tool('k8s_upgrade_plan', 'A21', {'current_version': '1.29.3', 'target_version': '1.30.1', 'node_pools': [{'name': 'workers', 'version': '1.29.3', 'nodes': 6, 'max_surge': 1, 'max_unavailable': 0}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_upgrade_plan_invalid_input():
+    result = call_tool('k8s_upgrade_plan', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_upgrade_plan_unauthorized():
+    result = call_tool('k8s_upgrade_plan', 'A01', {'current_version': '1.29.3', 'target_version': '1.30.1', 'node_pools': [{'name': 'workers', 'version': '1.29.3', 'nodes': 6, 'max_surge': 1, 'max_unavailable': 0}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_upgrade_plan'
+
+
+def test_k8s_upgrade_plan_dependency():
+    result = call_tool('k8s_upgrade_plan', 'A21', {'current_version': '1.29.3', 'target_version': '1.30.1', 'node_pools': [{'name': 'workers', 'version': '1.29.3', 'nodes': 6, 'max_surge': 1, 'max_unavailable': 0}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_upgrade_plan_timeout():
+    result = call_tool('k8s_upgrade_plan', 'A21', {'current_version': '1.29.3', 'target_version': '1.30.1', 'node_pools': [{'name': 'workers', 'version': '1.29.3', 'nodes': 6, 'max_surge': 1, 'max_unavailable': 0}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_upgrade_plan_partial():
+    result = call_tool('k8s_upgrade_plan', 'A21', {'current_version': '1.29.3', 'target_version': '1.30.1', 'node_pools': [{'name': 'workers', 'version': '1.29.3', 'nodes': 6, 'max_surge': 1, 'max_unavailable': 0}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_k8s_version_skew_success():
+    result = call_tool('k8s_version_skew', 'A21', {'apiserver_versions': ['1.30.2'], 'components': [{'name': 'node-1', 'kind': 'kubelet', 'version': 'v1.29.4', 'node': 'node-1'}, {'name': 'kubectl-ci', 'kind': 'kubectl', 'version': '1.30.1'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_k8s_version_skew_invalid_input():
+    result = call_tool('k8s_version_skew', 'A21', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_k8s_version_skew_unauthorized():
+    result = call_tool('k8s_version_skew', 'A01', {'apiserver_versions': ['1.30.2'], 'components': [{'name': 'node-1', 'kind': 'kubelet', 'version': 'v1.29.4', 'node': 'node-1'}, {'name': 'kubectl-ci', 'kind': 'kubectl', 'version': '1.30.1'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'k8s_version_skew'
+
+
+def test_k8s_version_skew_dependency():
+    result = call_tool('k8s_version_skew', 'A21', {'apiserver_versions': ['1.30.2'], 'components': [{'name': 'node-1', 'kind': 'kubelet', 'version': 'v1.29.4', 'node': 'node-1'}, {'name': 'kubectl-ci', 'kind': 'kubectl', 'version': '1.30.1'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_k8s_version_skew_timeout():
+    result = call_tool('k8s_version_skew', 'A21', {'apiserver_versions': ['1.30.2'], 'components': [{'name': 'node-1', 'kind': 'kubelet', 'version': 'v1.29.4', 'node': 'node-1'}, {'name': 'kubectl-ci', 'kind': 'kubectl', 'version': '1.30.1'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_k8s_version_skew_partial():
+    result = call_tool('k8s_version_skew', 'A21', {'apiserver_versions': ['1.30.2'], 'components': [{'name': 'node-1', 'kind': 'kubelet', 'version': 'v1.29.4', 'node': 'node-1'}, {'name': 'kubectl-ci', 'kind': 'kubectl', 'version': '1.30.1'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_admission_policy_lint_success():
+    result = call_tool('kpol_admission_policy_lint', 'A24', {'policies': [{'apiVersion': 'admissionregistration.k8s.io/v1', 'kind': 'ValidatingWebhookConfiguration', 'metadata': {'name': 'w'}, 'webhooks': [{'name': 'a.example.com', 'failurePolicy': 'Fail', 'sideEffects': 'None', 'admissionReviewVersions': ['v1']}]}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_admission_policy_lint_invalid_input():
+    result = call_tool('kpol_admission_policy_lint', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_admission_policy_lint_unauthorized():
+    result = call_tool('kpol_admission_policy_lint', 'A01', {'policies': [{'apiVersion': 'admissionregistration.k8s.io/v1', 'kind': 'ValidatingWebhookConfiguration', 'metadata': {'name': 'w'}, 'webhooks': [{'name': 'a.example.com', 'failurePolicy': 'Fail', 'sideEffects': 'None', 'admissionReviewVersions': ['v1']}]}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_admission_policy_lint'
+
+
+def test_kpol_admission_policy_lint_dependency():
+    result = call_tool('kpol_admission_policy_lint', 'A24', {'policies': [{'apiVersion': 'admissionregistration.k8s.io/v1', 'kind': 'ValidatingWebhookConfiguration', 'metadata': {'name': 'w'}, 'webhooks': [{'name': 'a.example.com', 'failurePolicy': 'Fail', 'sideEffects': 'None', 'admissionReviewVersions': ['v1']}]}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_admission_policy_lint_timeout():
+    result = call_tool('kpol_admission_policy_lint', 'A24', {'policies': [{'apiVersion': 'admissionregistration.k8s.io/v1', 'kind': 'ValidatingWebhookConfiguration', 'metadata': {'name': 'w'}, 'webhooks': [{'name': 'a.example.com', 'failurePolicy': 'Fail', 'sideEffects': 'None', 'admissionReviewVersions': ['v1']}]}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_admission_policy_lint_partial():
+    result = call_tool('kpol_admission_policy_lint', 'A24', {'policies': [{'apiVersion': 'admissionregistration.k8s.io/v1', 'kind': 'ValidatingWebhookConfiguration', 'metadata': {'name': 'w'}, 'webhooks': [{'name': 'a.example.com', 'failurePolicy': 'Fail', 'sideEffects': 'None', 'admissionReviewVersions': ['v1']}]}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_audit_policy_check_success():
+    result = call_tool('kpol_audit_policy_check', 'A24', {'policy': {'apiVersion': 'audit.k8s.io/v1', 'kind': 'Policy', 'rules': [{'level': 'Metadata'}]}})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_audit_policy_check_invalid_input():
+    result = call_tool('kpol_audit_policy_check', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_audit_policy_check_unauthorized():
+    result = call_tool('kpol_audit_policy_check', 'A01', {'policy': {'apiVersion': 'audit.k8s.io/v1', 'kind': 'Policy', 'rules': [{'level': 'Metadata'}]}})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_audit_policy_check'
+
+
+def test_kpol_audit_policy_check_dependency():
+    result = call_tool('kpol_audit_policy_check', 'A24', {'policy': {'apiVersion': 'audit.k8s.io/v1', 'kind': 'Policy', 'rules': [{'level': 'Metadata'}]}, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_audit_policy_check_timeout():
+    result = call_tool('kpol_audit_policy_check', 'A24', {'policy': {'apiVersion': 'audit.k8s.io/v1', 'kind': 'Policy', 'rules': [{'level': 'Metadata'}]}, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_audit_policy_check_partial():
+    result = call_tool('kpol_audit_policy_check', 'A24', {'policy': {'apiVersion': 'audit.k8s.io/v1', 'kind': 'Policy', 'rules': [{'level': 'Metadata'}]}, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_cis_score_success():
+    result = call_tool('kpol_cis_score', 'A24', {'results': [{'id': '1.1.1', 'status': 'PASS', 'scored': True, 'level': 1}], 'min_score_pct': 90})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_cis_score_invalid_input():
+    result = call_tool('kpol_cis_score', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_cis_score_unauthorized():
+    result = call_tool('kpol_cis_score', 'A01', {'results': [{'id': '1.1.1', 'status': 'PASS', 'scored': True, 'level': 1}], 'min_score_pct': 90})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_cis_score'
+
+
+def test_kpol_cis_score_dependency():
+    result = call_tool('kpol_cis_score', 'A24', {'results': [{'id': '1.1.1', 'status': 'PASS', 'scored': True, 'level': 1}], 'min_score_pct': 90, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_cis_score_timeout():
+    result = call_tool('kpol_cis_score', 'A24', {'results': [{'id': '1.1.1', 'status': 'PASS', 'scored': True, 'level': 1}], 'min_score_pct': 90, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_cis_score_partial():
+    result = call_tool('kpol_cis_score', 'A24', {'results': [{'id': '1.1.1', 'status': 'PASS', 'scored': True, 'level': 1}], 'min_score_pct': 90, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_exception_register_check_success():
+    result = call_tool('kpol_exception_register_check', 'A24', {'exceptions': [{'id': 'EXC-1', 'policy': 'pss-restricted', 'scope': 'ns/legacy', 'owner': 'team-a', 'approved_by': 'sec-lead', 'granted_at': '2026-10-01T00:00:00Z', 'expires_at': '2026-12-01T00:00:00Z'}], 'now': '2026-10-20T00:00:00Z', 'warn_days': 14, 'max_duration_days': 90, 'review_interval_days': 30})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_exception_register_check_invalid_input():
+    result = call_tool('kpol_exception_register_check', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_exception_register_check_unauthorized():
+    result = call_tool('kpol_exception_register_check', 'A01', {'exceptions': [{'id': 'EXC-1', 'policy': 'pss-restricted', 'scope': 'ns/legacy', 'owner': 'team-a', 'approved_by': 'sec-lead', 'granted_at': '2026-10-01T00:00:00Z', 'expires_at': '2026-12-01T00:00:00Z'}], 'now': '2026-10-20T00:00:00Z', 'warn_days': 14, 'max_duration_days': 90, 'review_interval_days': 30})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_exception_register_check'
+
+
+def test_kpol_exception_register_check_dependency():
+    result = call_tool('kpol_exception_register_check', 'A24', {'exceptions': [{'id': 'EXC-1', 'policy': 'pss-restricted', 'scope': 'ns/legacy', 'owner': 'team-a', 'approved_by': 'sec-lead', 'granted_at': '2026-10-01T00:00:00Z', 'expires_at': '2026-12-01T00:00:00Z'}], 'now': '2026-10-20T00:00:00Z', 'warn_days': 14, 'max_duration_days': 90, 'review_interval_days': 30, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_exception_register_check_timeout():
+    result = call_tool('kpol_exception_register_check', 'A24', {'exceptions': [{'id': 'EXC-1', 'policy': 'pss-restricted', 'scope': 'ns/legacy', 'owner': 'team-a', 'approved_by': 'sec-lead', 'granted_at': '2026-10-01T00:00:00Z', 'expires_at': '2026-12-01T00:00:00Z'}], 'now': '2026-10-20T00:00:00Z', 'warn_days': 14, 'max_duration_days': 90, 'review_interval_days': 30, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_exception_register_check_partial():
+    result = call_tool('kpol_exception_register_check', 'A24', {'exceptions': [{'id': 'EXC-1', 'policy': 'pss-restricted', 'scope': 'ns/legacy', 'owner': 'team-a', 'approved_by': 'sec-lead', 'granted_at': '2026-10-01T00:00:00Z', 'expires_at': '2026-12-01T00:00:00Z'}], 'now': '2026-10-20T00:00:00Z', 'warn_days': 14, 'max_duration_days': 90, 'review_interval_days': 30, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_image_admission_check_success():
+    result = call_tool('kpol_image_admission_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'require_signature': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_image_admission_check_invalid_input():
+    result = call_tool('kpol_image_admission_check', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_image_admission_check_unauthorized():
+    result = call_tool('kpol_image_admission_check', 'A01', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'require_signature': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_image_admission_check'
+
+
+def test_kpol_image_admission_check_dependency():
+    result = call_tool('kpol_image_admission_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'require_signature': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_image_admission_check_timeout():
+    result = call_tool('kpol_image_admission_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'require_signature': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_image_admission_check_partial():
+    result = call_tool('kpol_image_admission_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'require_signature': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_pss_check_success():
+    result = call_tool('kpol_pss_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'level': 'restricted'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_pss_check_invalid_input():
+    result = call_tool('kpol_pss_check', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_pss_check_unauthorized():
+    result = call_tool('kpol_pss_check', 'A01', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'level': 'restricted'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_pss_check'
+
+
+def test_kpol_pss_check_dependency():
+    result = call_tool('kpol_pss_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'level': 'restricted', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_pss_check_timeout():
+    result = call_tool('kpol_pss_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'level': 'restricted', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_pss_check_partial():
+    result = call_tool('kpol_pss_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'level': 'restricted', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_rbac_effective_access_success():
+    result = call_tool('kpol_rbac_effective_access', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [{'kind': 'ClusterRoleBinding', 'metadata': {'name': 'rb'}, 'roleRef': {'kind': 'ClusterRole', 'name': 'reader'}, 'subjects': [{'kind': 'User', 'name': 'alice'}]}], 'subject': {'kind': 'User', 'name': 'alice'}, 'checks': [{'verb': 'get', 'resource': 'pods', 'namespace': 'prod'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_rbac_effective_access_invalid_input():
+    result = call_tool('kpol_rbac_effective_access', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_rbac_effective_access_unauthorized():
+    result = call_tool('kpol_rbac_effective_access', 'A01', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [{'kind': 'ClusterRoleBinding', 'metadata': {'name': 'rb'}, 'roleRef': {'kind': 'ClusterRole', 'name': 'reader'}, 'subjects': [{'kind': 'User', 'name': 'alice'}]}], 'subject': {'kind': 'User', 'name': 'alice'}, 'checks': [{'verb': 'get', 'resource': 'pods', 'namespace': 'prod'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_rbac_effective_access'
+
+
+def test_kpol_rbac_effective_access_dependency():
+    result = call_tool('kpol_rbac_effective_access', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [{'kind': 'ClusterRoleBinding', 'metadata': {'name': 'rb'}, 'roleRef': {'kind': 'ClusterRole', 'name': 'reader'}, 'subjects': [{'kind': 'User', 'name': 'alice'}]}], 'subject': {'kind': 'User', 'name': 'alice'}, 'checks': [{'verb': 'get', 'resource': 'pods', 'namespace': 'prod'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_rbac_effective_access_timeout():
+    result = call_tool('kpol_rbac_effective_access', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [{'kind': 'ClusterRoleBinding', 'metadata': {'name': 'rb'}, 'roleRef': {'kind': 'ClusterRole', 'name': 'reader'}, 'subjects': [{'kind': 'User', 'name': 'alice'}]}], 'subject': {'kind': 'User', 'name': 'alice'}, 'checks': [{'verb': 'get', 'resource': 'pods', 'namespace': 'prod'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_rbac_effective_access_partial():
+    result = call_tool('kpol_rbac_effective_access', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [{'kind': 'ClusterRoleBinding', 'metadata': {'name': 'rb'}, 'roleRef': {'kind': 'ClusterRole', 'name': 'reader'}, 'subjects': [{'kind': 'User', 'name': 'alice'}]}], 'subject': {'kind': 'User', 'name': 'alice'}, 'checks': [{'verb': 'get', 'resource': 'pods', 'namespace': 'prod'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_rbac_risk_scan_success():
+    result = call_tool('kpol_rbac_risk_scan', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': []})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_rbac_risk_scan_invalid_input():
+    result = call_tool('kpol_rbac_risk_scan', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_rbac_risk_scan_unauthorized():
+    result = call_tool('kpol_rbac_risk_scan', 'A01', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': []})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_rbac_risk_scan'
+
+
+def test_kpol_rbac_risk_scan_dependency():
+    result = call_tool('kpol_rbac_risk_scan', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_rbac_risk_scan_timeout():
+    result = call_tool('kpol_rbac_risk_scan', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_rbac_risk_scan_partial():
+    result = call_tool('kpol_rbac_risk_scan', 'A24', {'roles': [{'kind': 'ClusterRole', 'metadata': {'name': 'reader'}, 'rules': [{'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]}], 'bindings': [], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_runtime_rule_lint_success():
+    result = call_tool('kpol_runtime_rule_lint', 'A24', {'rules': [{'rule': 'Shell in container', 'desc': 'shell', 'condition': 'evt.type = execve and proc.name = bash', 'output': 'shell %proc.name', 'priority': 'NOTICE'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_runtime_rule_lint_invalid_input():
+    result = call_tool('kpol_runtime_rule_lint', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_runtime_rule_lint_unauthorized():
+    result = call_tool('kpol_runtime_rule_lint', 'A01', {'rules': [{'rule': 'Shell in container', 'desc': 'shell', 'condition': 'evt.type = execve and proc.name = bash', 'output': 'shell %proc.name', 'priority': 'NOTICE'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_runtime_rule_lint'
+
+
+def test_kpol_runtime_rule_lint_dependency():
+    result = call_tool('kpol_runtime_rule_lint', 'A24', {'rules': [{'rule': 'Shell in container', 'desc': 'shell', 'condition': 'evt.type = execve and proc.name = bash', 'output': 'shell %proc.name', 'priority': 'NOTICE'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_runtime_rule_lint_timeout():
+    result = call_tool('kpol_runtime_rule_lint', 'A24', {'rules': [{'rule': 'Shell in container', 'desc': 'shell', 'condition': 'evt.type = execve and proc.name = bash', 'output': 'shell %proc.name', 'priority': 'NOTICE'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_runtime_rule_lint_partial():
+    result = call_tool('kpol_runtime_rule_lint', 'A24', {'rules': [{'rule': 'Shell in container', 'desc': 'shell', 'condition': 'evt.type = execve and proc.name = bash', 'output': 'shell %proc.name', 'priority': 'NOTICE'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_sa_token_audit_success():
+    result = call_tool('kpol_sa_token_audit', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_sa_token_audit_invalid_input():
+    result = call_tool('kpol_sa_token_audit', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_sa_token_audit_unauthorized():
+    result = call_tool('kpol_sa_token_audit', 'A01', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_sa_token_audit'
+
+
+def test_kpol_sa_token_audit_dependency():
+    result = call_tool('kpol_sa_token_audit', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_sa_token_audit_timeout():
+    result = call_tool('kpol_sa_token_audit', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_sa_token_audit_partial():
+    result = call_tool('kpol_sa_token_audit', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_secret_exposure_check_success():
+    result = call_tool('kpol_secret_exposure_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_secret_exposure_check_invalid_input():
+    result = call_tool('kpol_secret_exposure_check', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_secret_exposure_check_unauthorized():
+    result = call_tool('kpol_secret_exposure_check', 'A01', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_secret_exposure_check'
+
+
+def test_kpol_secret_exposure_check_dependency():
+    result = call_tool('kpol_secret_exposure_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_secret_exposure_check_timeout():
+    result = call_tool('kpol_secret_exposure_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_secret_exposure_check_partial():
+    result = call_tool('kpol_secret_exposure_check', 'A24', {'workloads': [{'kind': 'Pod', 'apiVersion': 'v1', 'metadata': {'name': 'web', 'namespace': 'prod'}, 'spec': {'containers': [{'name': 'app', 'image': 'ghcr.io/acme/web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}]}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_kpol_tenant_isolation_check_success():
+    result = call_tool('kpol_tenant_isolation_check', 'A24', {'tenant_namespaces': ['team-a'], 'manifests': [], 'required_psa_level': 'baseline'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_kpol_tenant_isolation_check_invalid_input():
+    result = call_tool('kpol_tenant_isolation_check', 'A24', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_kpol_tenant_isolation_check_unauthorized():
+    result = call_tool('kpol_tenant_isolation_check', 'A01', {'tenant_namespaces': ['team-a'], 'manifests': [], 'required_psa_level': 'baseline'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'kpol_tenant_isolation_check'
+
+
+def test_kpol_tenant_isolation_check_dependency():
+    result = call_tool('kpol_tenant_isolation_check', 'A24', {'tenant_namespaces': ['team-a'], 'manifests': [], 'required_psa_level': 'baseline', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_kpol_tenant_isolation_check_timeout():
+    result = call_tool('kpol_tenant_isolation_check', 'A24', {'tenant_namespaces': ['team-a'], 'manifests': [], 'required_psa_level': 'baseline', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_kpol_tenant_isolation_check_partial():
+    result = call_tool('kpol_tenant_isolation_check', 'A24', {'tenant_namespaces': ['team-a'], 'manifests': [], 'required_psa_level': 'baseline', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
 def test_maint_changelog_check_success():
     result = call_tool('maint_changelog_check', 'A14', {'entry': '## [1.5.0] - 2026-10-15\n\n### Added\n- Patch deadline tool.\n\n### Fixed\n- EOL window off-by-one.', 'version': '1.5.0'})
     assert result["state"] == "SUCCESS"
@@ -2905,6 +7189,448 @@ def test_maint_version_affected_timeout():
 
 def test_maint_version_affected_partial():
     result = call_tool('maint_version_affected', 'A14', {'version': '1.4.2', 'affected': '>=1.0.0,<1.4.5', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_authz_lint_success():
+    result = call_tool('mesh_authz_lint', 'A23', {'policies': [{'metadata': {'name': 'deny-all', 'namespace': 'payments'}, 'spec': {}}, {'metadata': {'name': 'allow-api', 'namespace': 'payments'}, 'spec': {'selector': {'matchLabels': {'app': 'api'}}, 'action': 'ALLOW', 'rules': [{'from': [{'source': {'principals': ['cluster.local/ns/web/sa/frontend']}}], 'to': [{'operation': {'methods': ['GET']}}]}]}}], 'namespaces': ['payments']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_authz_lint_invalid_input():
+    result = call_tool('mesh_authz_lint', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_authz_lint_unauthorized():
+    result = call_tool('mesh_authz_lint', 'A01', {'policies': [{'metadata': {'name': 'deny-all', 'namespace': 'payments'}, 'spec': {}}, {'metadata': {'name': 'allow-api', 'namespace': 'payments'}, 'spec': {'selector': {'matchLabels': {'app': 'api'}}, 'action': 'ALLOW', 'rules': [{'from': [{'source': {'principals': ['cluster.local/ns/web/sa/frontend']}}], 'to': [{'operation': {'methods': ['GET']}}]}]}}], 'namespaces': ['payments']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_authz_lint'
+
+
+def test_mesh_authz_lint_dependency():
+    result = call_tool('mesh_authz_lint', 'A23', {'policies': [{'metadata': {'name': 'deny-all', 'namespace': 'payments'}, 'spec': {}}, {'metadata': {'name': 'allow-api', 'namespace': 'payments'}, 'spec': {'selector': {'matchLabels': {'app': 'api'}}, 'action': 'ALLOW', 'rules': [{'from': [{'source': {'principals': ['cluster.local/ns/web/sa/frontend']}}], 'to': [{'operation': {'methods': ['GET']}}]}]}}], 'namespaces': ['payments'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_authz_lint_timeout():
+    result = call_tool('mesh_authz_lint', 'A23', {'policies': [{'metadata': {'name': 'deny-all', 'namespace': 'payments'}, 'spec': {}}, {'metadata': {'name': 'allow-api', 'namespace': 'payments'}, 'spec': {'selector': {'matchLabels': {'app': 'api'}}, 'action': 'ALLOW', 'rules': [{'from': [{'source': {'principals': ['cluster.local/ns/web/sa/frontend']}}], 'to': [{'operation': {'methods': ['GET']}}]}]}}], 'namespaces': ['payments'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_authz_lint_partial():
+    result = call_tool('mesh_authz_lint', 'A23', {'policies': [{'metadata': {'name': 'deny-all', 'namespace': 'payments'}, 'spec': {}}, {'metadata': {'name': 'allow-api', 'namespace': 'payments'}, 'spec': {'selector': {'matchLabels': {'app': 'api'}}, 'action': 'ALLOW', 'rules': [{'from': [{'source': {'principals': ['cluster.local/ns/web/sa/frontend']}}], 'to': [{'operation': {'methods': ['GET']}}]}]}}], 'namespaces': ['payments'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_cidr_overlap_success():
+    result = call_tool('mesh_cidr_overlap', 'A23', {'clusters': [{'name': 'east', 'pod_cidrs': ['10.0.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}, {'name': 'west', 'pod_cidrs': ['10.1.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}], 'connectivity': 'routed'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_cidr_overlap_invalid_input():
+    result = call_tool('mesh_cidr_overlap', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_cidr_overlap_unauthorized():
+    result = call_tool('mesh_cidr_overlap', 'A01', {'clusters': [{'name': 'east', 'pod_cidrs': ['10.0.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}, {'name': 'west', 'pod_cidrs': ['10.1.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}], 'connectivity': 'routed'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_cidr_overlap'
+
+
+def test_mesh_cidr_overlap_dependency():
+    result = call_tool('mesh_cidr_overlap', 'A23', {'clusters': [{'name': 'east', 'pod_cidrs': ['10.0.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}, {'name': 'west', 'pod_cidrs': ['10.1.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}], 'connectivity': 'routed', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_cidr_overlap_timeout():
+    result = call_tool('mesh_cidr_overlap', 'A23', {'clusters': [{'name': 'east', 'pod_cidrs': ['10.0.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}, {'name': 'west', 'pod_cidrs': ['10.1.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}], 'connectivity': 'routed', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_cidr_overlap_partial():
+    result = call_tool('mesh_cidr_overlap', 'A23', {'clusters': [{'name': 'east', 'pod_cidrs': ['10.0.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}, {'name': 'west', 'pod_cidrs': ['10.1.0.0/16'], 'service_cidrs': ['10.96.0.0/12']}], 'connectivity': 'routed', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_destination_policy_success():
+    result = call_tool('mesh_destination_policy', 'A23', {'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'trafficPolicy': {'outlierDetection': {'consecutive5xxErrors': 5, 'interval': '10s', 'baseEjectionTime': '30s', 'maxEjectionPercent': 50}, 'connectionPool': {'http': {'http2MaxRequests': 1000, 'maxRetries': 3}}}, 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}]}}], 'workloads': [{'namespace': 'default', 'service': 'reviews', 'labels': {'app': 'reviews', 'version': 'v1'}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_destination_policy_invalid_input():
+    result = call_tool('mesh_destination_policy', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_destination_policy_unauthorized():
+    result = call_tool('mesh_destination_policy', 'A01', {'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'trafficPolicy': {'outlierDetection': {'consecutive5xxErrors': 5, 'interval': '10s', 'baseEjectionTime': '30s', 'maxEjectionPercent': 50}, 'connectionPool': {'http': {'http2MaxRequests': 1000, 'maxRetries': 3}}}, 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}]}}], 'workloads': [{'namespace': 'default', 'service': 'reviews', 'labels': {'app': 'reviews', 'version': 'v1'}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_destination_policy'
+
+
+def test_mesh_destination_policy_dependency():
+    result = call_tool('mesh_destination_policy', 'A23', {'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'trafficPolicy': {'outlierDetection': {'consecutive5xxErrors': 5, 'interval': '10s', 'baseEjectionTime': '30s', 'maxEjectionPercent': 50}, 'connectionPool': {'http': {'http2MaxRequests': 1000, 'maxRetries': 3}}}, 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}]}}], 'workloads': [{'namespace': 'default', 'service': 'reviews', 'labels': {'app': 'reviews', 'version': 'v1'}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_destination_policy_timeout():
+    result = call_tool('mesh_destination_policy', 'A23', {'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'trafficPolicy': {'outlierDetection': {'consecutive5xxErrors': 5, 'interval': '10s', 'baseEjectionTime': '30s', 'maxEjectionPercent': 50}, 'connectionPool': {'http': {'http2MaxRequests': 1000, 'maxRetries': 3}}}, 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}]}}], 'workloads': [{'namespace': 'default', 'service': 'reviews', 'labels': {'app': 'reviews', 'version': 'v1'}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_destination_policy_partial():
+    result = call_tool('mesh_destination_policy', 'A23', {'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'trafficPolicy': {'outlierDetection': {'consecutive5xxErrors': 5, 'interval': '10s', 'baseEjectionTime': '30s', 'maxEjectionPercent': 50}, 'connectionPool': {'http': {'http2MaxRequests': 1000, 'maxRetries': 3}}}, 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}]}}], 'workloads': [{'namespace': 'default', 'service': 'reviews', 'labels': {'app': 'reviews', 'version': 'v1'}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_dns_ndots_success():
+    result = call_tool('mesh_dns_ndots', 'A23', {'ndots': 5, 'namespace': 'shop', 'search_domains': ['shop.svc.cluster.local', 'svc.cluster.local', 'cluster.local'], 'names': [{'name': 'api', 'target': 'cluster'}, {'name': 'api.example.com', 'target': 'external'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_dns_ndots_invalid_input():
+    result = call_tool('mesh_dns_ndots', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_dns_ndots_unauthorized():
+    result = call_tool('mesh_dns_ndots', 'A01', {'ndots': 5, 'namespace': 'shop', 'search_domains': ['shop.svc.cluster.local', 'svc.cluster.local', 'cluster.local'], 'names': [{'name': 'api', 'target': 'cluster'}, {'name': 'api.example.com', 'target': 'external'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_dns_ndots'
+
+
+def test_mesh_dns_ndots_dependency():
+    result = call_tool('mesh_dns_ndots', 'A23', {'ndots': 5, 'namespace': 'shop', 'search_domains': ['shop.svc.cluster.local', 'svc.cluster.local', 'cluster.local'], 'names': [{'name': 'api', 'target': 'cluster'}, {'name': 'api.example.com', 'target': 'external'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_dns_ndots_timeout():
+    result = call_tool('mesh_dns_ndots', 'A23', {'ndots': 5, 'namespace': 'shop', 'search_domains': ['shop.svc.cluster.local', 'svc.cluster.local', 'cluster.local'], 'names': [{'name': 'api', 'target': 'cluster'}, {'name': 'api.example.com', 'target': 'external'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_dns_ndots_partial():
+    result = call_tool('mesh_dns_ndots', 'A23', {'ndots': 5, 'namespace': 'shop', 'search_domains': ['shop.svc.cluster.local', 'svc.cluster.local', 'cluster.local'], 'names': [{'name': 'api', 'target': 'cluster'}, {'name': 'api.example.com', 'target': 'external'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_egress_coverage_success():
+    result = call_tool('mesh_egress_coverage', 'A23', {'destinations': [{'host': 'api.stripe.com', 'port': 443, 'protocol': 'TLS'}], 'service_entries': [{'metadata': {'name': 'stripe', 'namespace': 'payments'}, 'spec': {'hosts': ['api.stripe.com'], 'ports': [{'number': 443, 'name': 'tls', 'protocol': 'TLS'}], 'resolution': 'DNS', 'location': 'MESH_EXTERNAL'}}], 'outbound_policy': 'REGISTRY_ONLY'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_egress_coverage_invalid_input():
+    result = call_tool('mesh_egress_coverage', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_egress_coverage_unauthorized():
+    result = call_tool('mesh_egress_coverage', 'A01', {'destinations': [{'host': 'api.stripe.com', 'port': 443, 'protocol': 'TLS'}], 'service_entries': [{'metadata': {'name': 'stripe', 'namespace': 'payments'}, 'spec': {'hosts': ['api.stripe.com'], 'ports': [{'number': 443, 'name': 'tls', 'protocol': 'TLS'}], 'resolution': 'DNS', 'location': 'MESH_EXTERNAL'}}], 'outbound_policy': 'REGISTRY_ONLY'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_egress_coverage'
+
+
+def test_mesh_egress_coverage_dependency():
+    result = call_tool('mesh_egress_coverage', 'A23', {'destinations': [{'host': 'api.stripe.com', 'port': 443, 'protocol': 'TLS'}], 'service_entries': [{'metadata': {'name': 'stripe', 'namespace': 'payments'}, 'spec': {'hosts': ['api.stripe.com'], 'ports': [{'number': 443, 'name': 'tls', 'protocol': 'TLS'}], 'resolution': 'DNS', 'location': 'MESH_EXTERNAL'}}], 'outbound_policy': 'REGISTRY_ONLY', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_egress_coverage_timeout():
+    result = call_tool('mesh_egress_coverage', 'A23', {'destinations': [{'host': 'api.stripe.com', 'port': 443, 'protocol': 'TLS'}], 'service_entries': [{'metadata': {'name': 'stripe', 'namespace': 'payments'}, 'spec': {'hosts': ['api.stripe.com'], 'ports': [{'number': 443, 'name': 'tls', 'protocol': 'TLS'}], 'resolution': 'DNS', 'location': 'MESH_EXTERNAL'}}], 'outbound_policy': 'REGISTRY_ONLY', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_egress_coverage_partial():
+    result = call_tool('mesh_egress_coverage', 'A23', {'destinations': [{'host': 'api.stripe.com', 'port': 443, 'protocol': 'TLS'}], 'service_entries': [{'metadata': {'name': 'stripe', 'namespace': 'payments'}, 'spec': {'hosts': ['api.stripe.com'], 'ports': [{'number': 443, 'name': 'tls', 'protocol': 'TLS'}], 'resolution': 'DNS', 'location': 'MESH_EXTERNAL'}}], 'outbound_policy': 'REGISTRY_ONLY', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_gateway_api_check_success():
+    result = call_tool('mesh_gateway_api_check', 'A23', {'gateways': [{'metadata': {'name': 'edge', 'namespace': 'infra'}, 'spec': {'gatewayClassName': 'istio', 'listeners': [{'name': 'http', 'port': 80, 'protocol': 'HTTP', 'allowedRoutes': {'namespaces': {'from': 'All'}}}]}}], 'routes': [{'metadata': {'name': 'web', 'namespace': 'shop'}, 'spec': {'parentRefs': [{'name': 'edge', 'namespace': 'infra'}], 'hostnames': ['shop.example.com'], 'rules': [{'backendRefs': [{'name': 'web', 'port': 8080}]}]}}], 'reference_grants': []})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_gateway_api_check_invalid_input():
+    result = call_tool('mesh_gateway_api_check', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_gateway_api_check_unauthorized():
+    result = call_tool('mesh_gateway_api_check', 'A01', {'gateways': [{'metadata': {'name': 'edge', 'namespace': 'infra'}, 'spec': {'gatewayClassName': 'istio', 'listeners': [{'name': 'http', 'port': 80, 'protocol': 'HTTP', 'allowedRoutes': {'namespaces': {'from': 'All'}}}]}}], 'routes': [{'metadata': {'name': 'web', 'namespace': 'shop'}, 'spec': {'parentRefs': [{'name': 'edge', 'namespace': 'infra'}], 'hostnames': ['shop.example.com'], 'rules': [{'backendRefs': [{'name': 'web', 'port': 8080}]}]}}], 'reference_grants': []})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_gateway_api_check'
+
+
+def test_mesh_gateway_api_check_dependency():
+    result = call_tool('mesh_gateway_api_check', 'A23', {'gateways': [{'metadata': {'name': 'edge', 'namespace': 'infra'}, 'spec': {'gatewayClassName': 'istio', 'listeners': [{'name': 'http', 'port': 80, 'protocol': 'HTTP', 'allowedRoutes': {'namespaces': {'from': 'All'}}}]}}], 'routes': [{'metadata': {'name': 'web', 'namespace': 'shop'}, 'spec': {'parentRefs': [{'name': 'edge', 'namespace': 'infra'}], 'hostnames': ['shop.example.com'], 'rules': [{'backendRefs': [{'name': 'web', 'port': 8080}]}]}}], 'reference_grants': [], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_gateway_api_check_timeout():
+    result = call_tool('mesh_gateway_api_check', 'A23', {'gateways': [{'metadata': {'name': 'edge', 'namespace': 'infra'}, 'spec': {'gatewayClassName': 'istio', 'listeners': [{'name': 'http', 'port': 80, 'protocol': 'HTTP', 'allowedRoutes': {'namespaces': {'from': 'All'}}}]}}], 'routes': [{'metadata': {'name': 'web', 'namespace': 'shop'}, 'spec': {'parentRefs': [{'name': 'edge', 'namespace': 'infra'}], 'hostnames': ['shop.example.com'], 'rules': [{'backendRefs': [{'name': 'web', 'port': 8080}]}]}}], 'reference_grants': [], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_gateway_api_check_partial():
+    result = call_tool('mesh_gateway_api_check', 'A23', {'gateways': [{'metadata': {'name': 'edge', 'namespace': 'infra'}, 'spec': {'gatewayClassName': 'istio', 'listeners': [{'name': 'http', 'port': 80, 'protocol': 'HTTP', 'allowedRoutes': {'namespaces': {'from': 'All'}}}]}}], 'routes': [{'metadata': {'name': 'web', 'namespace': 'shop'}, 'spec': {'parentRefs': [{'name': 'edge', 'namespace': 'infra'}], 'hostnames': ['shop.example.com'], 'rules': [{'backendRefs': [{'name': 'web', 'port': 8080}]}]}}], 'reference_grants': [], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_ingress_tls_success():
+    result = call_tool('mesh_ingress_tls', 'A23', {'listeners': [{'name': 'public', 'terminates_tls': True, 'hostnames': ['shop.example.com'], 'min_tls_version': 'TLSv1.2', 'cipher_suites': ['ECDHE-RSA-AES128-GCM-SHA256'], 'certificate_name': 'shop-tls', 'certificate_sans': ['*.example.com'], 'hsts_max_age_s': 31536000, 'hsts_include_subdomains': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_ingress_tls_invalid_input():
+    result = call_tool('mesh_ingress_tls', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_ingress_tls_unauthorized():
+    result = call_tool('mesh_ingress_tls', 'A01', {'listeners': [{'name': 'public', 'terminates_tls': True, 'hostnames': ['shop.example.com'], 'min_tls_version': 'TLSv1.2', 'cipher_suites': ['ECDHE-RSA-AES128-GCM-SHA256'], 'certificate_name': 'shop-tls', 'certificate_sans': ['*.example.com'], 'hsts_max_age_s': 31536000, 'hsts_include_subdomains': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_ingress_tls'
+
+
+def test_mesh_ingress_tls_dependency():
+    result = call_tool('mesh_ingress_tls', 'A23', {'listeners': [{'name': 'public', 'terminates_tls': True, 'hostnames': ['shop.example.com'], 'min_tls_version': 'TLSv1.2', 'cipher_suites': ['ECDHE-RSA-AES128-GCM-SHA256'], 'certificate_name': 'shop-tls', 'certificate_sans': ['*.example.com'], 'hsts_max_age_s': 31536000, 'hsts_include_subdomains': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_ingress_tls_timeout():
+    result = call_tool('mesh_ingress_tls', 'A23', {'listeners': [{'name': 'public', 'terminates_tls': True, 'hostnames': ['shop.example.com'], 'min_tls_version': 'TLSv1.2', 'cipher_suites': ['ECDHE-RSA-AES128-GCM-SHA256'], 'certificate_name': 'shop-tls', 'certificate_sans': ['*.example.com'], 'hsts_max_age_s': 31536000, 'hsts_include_subdomains': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_ingress_tls_partial():
+    result = call_tool('mesh_ingress_tls', 'A23', {'listeners': [{'name': 'public', 'terminates_tls': True, 'hostnames': ['shop.example.com'], 'min_tls_version': 'TLSv1.2', 'cipher_suites': ['ECDHE-RSA-AES128-GCM-SHA256'], 'certificate_name': 'shop-tls', 'certificate_sans': ['*.example.com'], 'hsts_max_age_s': 31536000, 'hsts_include_subdomains': True}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_mtls_coverage_success():
+    result = call_tool('mesh_mtls_coverage', 'A23', {'peer_authentications': [{'metadata': {'name': 'default', 'namespace': 'istio-system'}, 'spec': {'mtls': {'mode': 'STRICT'}}}], 'workloads': [{'namespace': 'payments', 'name': 'api', 'labels': {'app': 'api'}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_mtls_coverage_invalid_input():
+    result = call_tool('mesh_mtls_coverage', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_mtls_coverage_unauthorized():
+    result = call_tool('mesh_mtls_coverage', 'A01', {'peer_authentications': [{'metadata': {'name': 'default', 'namespace': 'istio-system'}, 'spec': {'mtls': {'mode': 'STRICT'}}}], 'workloads': [{'namespace': 'payments', 'name': 'api', 'labels': {'app': 'api'}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_mtls_coverage'
+
+
+def test_mesh_mtls_coverage_dependency():
+    result = call_tool('mesh_mtls_coverage', 'A23', {'peer_authentications': [{'metadata': {'name': 'default', 'namespace': 'istio-system'}, 'spec': {'mtls': {'mode': 'STRICT'}}}], 'workloads': [{'namespace': 'payments', 'name': 'api', 'labels': {'app': 'api'}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_mtls_coverage_timeout():
+    result = call_tool('mesh_mtls_coverage', 'A23', {'peer_authentications': [{'metadata': {'name': 'default', 'namespace': 'istio-system'}, 'spec': {'mtls': {'mode': 'STRICT'}}}], 'workloads': [{'namespace': 'payments', 'name': 'api', 'labels': {'app': 'api'}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_mtls_coverage_partial():
+    result = call_tool('mesh_mtls_coverage', 'A23', {'peer_authentications': [{'metadata': {'name': 'default', 'namespace': 'istio-system'}, 'spec': {'mtls': {'mode': 'STRICT'}}}], 'workloads': [{'namespace': 'payments', 'name': 'api', 'labels': {'app': 'api'}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_netpol_coverage_success():
+    result = call_tool('mesh_netpol_coverage', 'A23', {'network_policies': [{'metadata': {'name': 'default-deny', 'namespace': 'payments'}, 'spec': {'podSelector': {}, 'policyTypes': ['Ingress', 'Egress']}}], 'pods': [{'namespace': 'payments', 'name': 'api-0', 'labels': {'app': 'api'}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_netpol_coverage_invalid_input():
+    result = call_tool('mesh_netpol_coverage', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_netpol_coverage_unauthorized():
+    result = call_tool('mesh_netpol_coverage', 'A01', {'network_policies': [{'metadata': {'name': 'default-deny', 'namespace': 'payments'}, 'spec': {'podSelector': {}, 'policyTypes': ['Ingress', 'Egress']}}], 'pods': [{'namespace': 'payments', 'name': 'api-0', 'labels': {'app': 'api'}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_netpol_coverage'
+
+
+def test_mesh_netpol_coverage_dependency():
+    result = call_tool('mesh_netpol_coverage', 'A23', {'network_policies': [{'metadata': {'name': 'default-deny', 'namespace': 'payments'}, 'spec': {'podSelector': {}, 'policyTypes': ['Ingress', 'Egress']}}], 'pods': [{'namespace': 'payments', 'name': 'api-0', 'labels': {'app': 'api'}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_netpol_coverage_timeout():
+    result = call_tool('mesh_netpol_coverage', 'A23', {'network_policies': [{'metadata': {'name': 'default-deny', 'namespace': 'payments'}, 'spec': {'podSelector': {}, 'policyTypes': ['Ingress', 'Egress']}}], 'pods': [{'namespace': 'payments', 'name': 'api-0', 'labels': {'app': 'api'}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_netpol_coverage_partial():
+    result = call_tool('mesh_netpol_coverage', 'A23', {'network_policies': [{'metadata': {'name': 'default-deny', 'namespace': 'payments'}, 'spec': {'podSelector': {}, 'policyTypes': ['Ingress', 'Egress']}}], 'pods': [{'namespace': 'payments', 'name': 'api-0', 'labels': {'app': 'api'}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_netpol_reachability_success():
+    result = call_tool('mesh_netpol_reachability', 'A23', {'network_policies': [{'metadata': {'name': 'allow-web', 'namespace': 'shop'}, 'spec': {'podSelector': {'matchLabels': {'app': 'api'}}, 'policyTypes': ['Ingress'], 'ingress': [{'from': [{'podSelector': {'matchLabels': {'app': 'web'}}}], 'ports': [{'port': 8080}]}]}}], 'pods': [{'namespace': 'shop', 'name': 'web-0', 'labels': {'app': 'web'}}, {'namespace': 'shop', 'name': 'api-0', 'labels': {'app': 'api'}}], 'source': {'namespace': 'shop', 'name': 'web-0'}, 'destination': {'namespace': 'shop', 'name': 'api-0'}, 'port': 8080})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_netpol_reachability_invalid_input():
+    result = call_tool('mesh_netpol_reachability', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_netpol_reachability_unauthorized():
+    result = call_tool('mesh_netpol_reachability', 'A01', {'network_policies': [{'metadata': {'name': 'allow-web', 'namespace': 'shop'}, 'spec': {'podSelector': {'matchLabels': {'app': 'api'}}, 'policyTypes': ['Ingress'], 'ingress': [{'from': [{'podSelector': {'matchLabels': {'app': 'web'}}}], 'ports': [{'port': 8080}]}]}}], 'pods': [{'namespace': 'shop', 'name': 'web-0', 'labels': {'app': 'web'}}, {'namespace': 'shop', 'name': 'api-0', 'labels': {'app': 'api'}}], 'source': {'namespace': 'shop', 'name': 'web-0'}, 'destination': {'namespace': 'shop', 'name': 'api-0'}, 'port': 8080})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_netpol_reachability'
+
+
+def test_mesh_netpol_reachability_dependency():
+    result = call_tool('mesh_netpol_reachability', 'A23', {'network_policies': [{'metadata': {'name': 'allow-web', 'namespace': 'shop'}, 'spec': {'podSelector': {'matchLabels': {'app': 'api'}}, 'policyTypes': ['Ingress'], 'ingress': [{'from': [{'podSelector': {'matchLabels': {'app': 'web'}}}], 'ports': [{'port': 8080}]}]}}], 'pods': [{'namespace': 'shop', 'name': 'web-0', 'labels': {'app': 'web'}}, {'namespace': 'shop', 'name': 'api-0', 'labels': {'app': 'api'}}], 'source': {'namespace': 'shop', 'name': 'web-0'}, 'destination': {'namespace': 'shop', 'name': 'api-0'}, 'port': 8080, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_netpol_reachability_timeout():
+    result = call_tool('mesh_netpol_reachability', 'A23', {'network_policies': [{'metadata': {'name': 'allow-web', 'namespace': 'shop'}, 'spec': {'podSelector': {'matchLabels': {'app': 'api'}}, 'policyTypes': ['Ingress'], 'ingress': [{'from': [{'podSelector': {'matchLabels': {'app': 'web'}}}], 'ports': [{'port': 8080}]}]}}], 'pods': [{'namespace': 'shop', 'name': 'web-0', 'labels': {'app': 'web'}}, {'namespace': 'shop', 'name': 'api-0', 'labels': {'app': 'api'}}], 'source': {'namespace': 'shop', 'name': 'web-0'}, 'destination': {'namespace': 'shop', 'name': 'api-0'}, 'port': 8080, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_netpol_reachability_partial():
+    result = call_tool('mesh_netpol_reachability', 'A23', {'network_policies': [{'metadata': {'name': 'allow-web', 'namespace': 'shop'}, 'spec': {'podSelector': {'matchLabels': {'app': 'api'}}, 'policyTypes': ['Ingress'], 'ingress': [{'from': [{'podSelector': {'matchLabels': {'app': 'web'}}}], 'ports': [{'port': 8080}]}]}}], 'pods': [{'namespace': 'shop', 'name': 'web-0', 'labels': {'app': 'web'}}, {'namespace': 'shop', 'name': 'api-0', 'labels': {'app': 'api'}}], 'source': {'namespace': 'shop', 'name': 'web-0'}, 'destination': {'namespace': 'shop', 'name': 'api-0'}, 'port': 8080, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_retry_amplification_success():
+    result = call_tool('mesh_retry_amplification', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'retries': 2}, {'caller': 'api', 'callee': 'db-proxy', 'retries': 1}], 'max_multiplier': 4})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_retry_amplification_invalid_input():
+    result = call_tool('mesh_retry_amplification', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_retry_amplification_unauthorized():
+    result = call_tool('mesh_retry_amplification', 'A01', {'calls': [{'caller': 'gateway', 'callee': 'api', 'retries': 2}, {'caller': 'api', 'callee': 'db-proxy', 'retries': 1}], 'max_multiplier': 4})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_retry_amplification'
+
+
+def test_mesh_retry_amplification_dependency():
+    result = call_tool('mesh_retry_amplification', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'retries': 2}, {'caller': 'api', 'callee': 'db-proxy', 'retries': 1}], 'max_multiplier': 4, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_retry_amplification_timeout():
+    result = call_tool('mesh_retry_amplification', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'retries': 2}, {'caller': 'api', 'callee': 'db-proxy', 'retries': 1}], 'max_multiplier': 4, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_retry_amplification_partial():
+    result = call_tool('mesh_retry_amplification', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'retries': 2}, {'caller': 'api', 'callee': 'db-proxy', 'retries': 1}], 'max_multiplier': 4, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_timeout_hierarchy_success():
+    result = call_tool('mesh_timeout_hierarchy', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'timeout_ms': 5000}, {'caller': 'api', 'callee': 'db-proxy', 'timeout_ms': 2000}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_timeout_hierarchy_invalid_input():
+    result = call_tool('mesh_timeout_hierarchy', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_timeout_hierarchy_unauthorized():
+    result = call_tool('mesh_timeout_hierarchy', 'A01', {'calls': [{'caller': 'gateway', 'callee': 'api', 'timeout_ms': 5000}, {'caller': 'api', 'callee': 'db-proxy', 'timeout_ms': 2000}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_timeout_hierarchy'
+
+
+def test_mesh_timeout_hierarchy_dependency():
+    result = call_tool('mesh_timeout_hierarchy', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'timeout_ms': 5000}, {'caller': 'api', 'callee': 'db-proxy', 'timeout_ms': 2000}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_timeout_hierarchy_timeout():
+    result = call_tool('mesh_timeout_hierarchy', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'timeout_ms': 5000}, {'caller': 'api', 'callee': 'db-proxy', 'timeout_ms': 2000}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_timeout_hierarchy_partial():
+    result = call_tool('mesh_timeout_hierarchy', 'A23', {'calls': [{'caller': 'gateway', 'callee': 'api', 'timeout_ms': 5000}, {'caller': 'api', 'callee': 'db-proxy', 'timeout_ms': 2000}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_mesh_traffic_split_success():
+    result = call_tool('mesh_traffic_split', 'A23', {'virtual_services': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'hosts': ['reviews'], 'http': [{'route': [{'destination': {'host': 'reviews', 'subset': 'v1'}, 'weight': 90}, {'destination': {'host': 'reviews', 'subset': 'v2'}, 'weight': 10}], 'timeout': '10s', 'retries': {'attempts': 2, 'perTryTimeout': '3s'}}]}}], 'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}, {'name': 'v2', 'labels': {'version': 'v2'}}]}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_mesh_traffic_split_invalid_input():
+    result = call_tool('mesh_traffic_split', 'A23', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_mesh_traffic_split_unauthorized():
+    result = call_tool('mesh_traffic_split', 'A01', {'virtual_services': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'hosts': ['reviews'], 'http': [{'route': [{'destination': {'host': 'reviews', 'subset': 'v1'}, 'weight': 90}, {'destination': {'host': 'reviews', 'subset': 'v2'}, 'weight': 10}], 'timeout': '10s', 'retries': {'attempts': 2, 'perTryTimeout': '3s'}}]}}], 'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}, {'name': 'v2', 'labels': {'version': 'v2'}}]}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'mesh_traffic_split'
+
+
+def test_mesh_traffic_split_dependency():
+    result = call_tool('mesh_traffic_split', 'A23', {'virtual_services': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'hosts': ['reviews'], 'http': [{'route': [{'destination': {'host': 'reviews', 'subset': 'v1'}, 'weight': 90}, {'destination': {'host': 'reviews', 'subset': 'v2'}, 'weight': 10}], 'timeout': '10s', 'retries': {'attempts': 2, 'perTryTimeout': '3s'}}]}}], 'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}, {'name': 'v2', 'labels': {'version': 'v2'}}]}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_mesh_traffic_split_timeout():
+    result = call_tool('mesh_traffic_split', 'A23', {'virtual_services': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'hosts': ['reviews'], 'http': [{'route': [{'destination': {'host': 'reviews', 'subset': 'v1'}, 'weight': 90}, {'destination': {'host': 'reviews', 'subset': 'v2'}, 'weight': 10}], 'timeout': '10s', 'retries': {'attempts': 2, 'perTryTimeout': '3s'}}]}}], 'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}, {'name': 'v2', 'labels': {'version': 'v2'}}]}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_mesh_traffic_split_partial():
+    result = call_tool('mesh_traffic_split', 'A23', {'virtual_services': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'hosts': ['reviews'], 'http': [{'route': [{'destination': {'host': 'reviews', 'subset': 'v1'}, 'weight': 90}, {'destination': {'host': 'reviews', 'subset': 'v2'}, 'weight': 10}], 'timeout': '10s', 'retries': {'attempts': 2, 'perTryTimeout': '3s'}}]}}], 'destination_rules': [{'metadata': {'name': 'reviews', 'namespace': 'default'}, 'spec': {'host': 'reviews', 'subsets': [{'name': 'v1', 'labels': {'version': 'v1'}}, {'name': 'v2', 'labels': {'version': 'v2'}}]}}], 'probe': 'partial'})
     assert result["state"] == "PARTIAL_SUCCESS"
     assert isinstance(result["completed_fraction"], (int, float))
 
@@ -3721,6 +8447,414 @@ def test_orch_run_timeout():
 
 def test_orch_run_partial():
     result = call_tool('orch_run', 'A01', {'correlation_id': 'Tdemo', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_api_deprecation_success():
+    result = call_tool('plat_api_deprecation', 'A17', {'checked_at': '2026-10-20T00:00:00Z', 'apis': [{'name': 'catalog-api', 'version': 'v1', 'stability': 'ga', 'state': 'deprecated', 'active_consumers': 2, 'deprecated_at': '2025-06-01T00:00:00Z', 'sunset_at': '2027-01-01T00:00:00Z'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_api_deprecation_invalid_input():
+    result = call_tool('plat_api_deprecation', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_api_deprecation_unauthorized():
+    result = call_tool('plat_api_deprecation', 'A01', {'checked_at': '2026-10-20T00:00:00Z', 'apis': [{'name': 'catalog-api', 'version': 'v1', 'stability': 'ga', 'state': 'deprecated', 'active_consumers': 2, 'deprecated_at': '2025-06-01T00:00:00Z', 'sunset_at': '2027-01-01T00:00:00Z'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_api_deprecation'
+
+
+def test_plat_api_deprecation_dependency():
+    result = call_tool('plat_api_deprecation', 'A17', {'checked_at': '2026-10-20T00:00:00Z', 'apis': [{'name': 'catalog-api', 'version': 'v1', 'stability': 'ga', 'state': 'deprecated', 'active_consumers': 2, 'deprecated_at': '2025-06-01T00:00:00Z', 'sunset_at': '2027-01-01T00:00:00Z'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_api_deprecation_timeout():
+    result = call_tool('plat_api_deprecation', 'A17', {'checked_at': '2026-10-20T00:00:00Z', 'apis': [{'name': 'catalog-api', 'version': 'v1', 'stability': 'ga', 'state': 'deprecated', 'active_consumers': 2, 'deprecated_at': '2025-06-01T00:00:00Z', 'sunset_at': '2027-01-01T00:00:00Z'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_api_deprecation_partial():
+    result = call_tool('plat_api_deprecation', 'A17', {'checked_at': '2026-10-20T00:00:00Z', 'apis': [{'name': 'catalog-api', 'version': 'v1', 'stability': 'ga', 'state': 'deprecated', 'active_consumers': 2, 'deprecated_at': '2025-06-01T00:00:00Z', 'sunset_at': '2027-01-01T00:00:00Z'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_catalog_graph_success():
+    result = call_tool('plat_catalog_graph', 'A17', {'entries': [{'ref': 'component:default/web', 'lifecycle': 'production', 'owner': 'group:default/web', 'depends_on': ['component:default/api']}, {'ref': 'component:default/api', 'lifecycle': 'production', 'owner': 'group:default/api', 'depends_on': ['resource:default/db']}, {'ref': 'resource:default/db', 'lifecycle': 'production', 'owner': 'group:default/data'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_catalog_graph_invalid_input():
+    result = call_tool('plat_catalog_graph', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_catalog_graph_unauthorized():
+    result = call_tool('plat_catalog_graph', 'A01', {'entries': [{'ref': 'component:default/web', 'lifecycle': 'production', 'owner': 'group:default/web', 'depends_on': ['component:default/api']}, {'ref': 'component:default/api', 'lifecycle': 'production', 'owner': 'group:default/api', 'depends_on': ['resource:default/db']}, {'ref': 'resource:default/db', 'lifecycle': 'production', 'owner': 'group:default/data'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_catalog_graph'
+
+
+def test_plat_catalog_graph_dependency():
+    result = call_tool('plat_catalog_graph', 'A17', {'entries': [{'ref': 'component:default/web', 'lifecycle': 'production', 'owner': 'group:default/web', 'depends_on': ['component:default/api']}, {'ref': 'component:default/api', 'lifecycle': 'production', 'owner': 'group:default/api', 'depends_on': ['resource:default/db']}, {'ref': 'resource:default/db', 'lifecycle': 'production', 'owner': 'group:default/data'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_catalog_graph_timeout():
+    result = call_tool('plat_catalog_graph', 'A17', {'entries': [{'ref': 'component:default/web', 'lifecycle': 'production', 'owner': 'group:default/web', 'depends_on': ['component:default/api']}, {'ref': 'component:default/api', 'lifecycle': 'production', 'owner': 'group:default/api', 'depends_on': ['resource:default/db']}, {'ref': 'resource:default/db', 'lifecycle': 'production', 'owner': 'group:default/data'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_catalog_graph_partial():
+    result = call_tool('plat_catalog_graph', 'A17', {'entries': [{'ref': 'component:default/web', 'lifecycle': 'production', 'owner': 'group:default/web', 'depends_on': ['component:default/api']}, {'ref': 'component:default/api', 'lifecycle': 'production', 'owner': 'group:default/api', 'depends_on': ['resource:default/db']}, {'ref': 'resource:default/db', 'lifecycle': 'production', 'owner': 'group:default/data'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_catalog_lint_success():
+    result = call_tool('plat_catalog_lint', 'A17', {'entries': [{'kind': 'Component', 'name': 'payments-api', 'type': 'service', 'lifecycle': 'production', 'owner': 'group:default/payments', 'system': 'checkout', 'tier': 'tier-1', 'description': 'Payments API', 'annotations': ['backstage.io/techdocs-ref', 'backstage.io/source-location', 'example.com/runbook']}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_catalog_lint_invalid_input():
+    result = call_tool('plat_catalog_lint', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_catalog_lint_unauthorized():
+    result = call_tool('plat_catalog_lint', 'A01', {'entries': [{'kind': 'Component', 'name': 'payments-api', 'type': 'service', 'lifecycle': 'production', 'owner': 'group:default/payments', 'system': 'checkout', 'tier': 'tier-1', 'description': 'Payments API', 'annotations': ['backstage.io/techdocs-ref', 'backstage.io/source-location', 'example.com/runbook']}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_catalog_lint'
+
+
+def test_plat_catalog_lint_dependency():
+    result = call_tool('plat_catalog_lint', 'A17', {'entries': [{'kind': 'Component', 'name': 'payments-api', 'type': 'service', 'lifecycle': 'production', 'owner': 'group:default/payments', 'system': 'checkout', 'tier': 'tier-1', 'description': 'Payments API', 'annotations': ['backstage.io/techdocs-ref', 'backstage.io/source-location', 'example.com/runbook']}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_catalog_lint_timeout():
+    result = call_tool('plat_catalog_lint', 'A17', {'entries': [{'kind': 'Component', 'name': 'payments-api', 'type': 'service', 'lifecycle': 'production', 'owner': 'group:default/payments', 'system': 'checkout', 'tier': 'tier-1', 'description': 'Payments API', 'annotations': ['backstage.io/techdocs-ref', 'backstage.io/source-location', 'example.com/runbook']}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_catalog_lint_partial():
+    result = call_tool('plat_catalog_lint', 'A17', {'entries': [{'kind': 'Component', 'name': 'payments-api', 'type': 'service', 'lifecycle': 'production', 'owner': 'group:default/payments', 'system': 'checkout', 'tier': 'tier-1', 'description': 'Payments API', 'annotations': ['backstage.io/techdocs-ref', 'backstage.io/source-location', 'example.com/runbook']}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_claim_validate_success():
+    result = call_tool('plat_claim_validate', 'A17', {'schema': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}, {'path': 'parameters.replicas', 'type': 'integer', 'required': False, 'minimum': 1, 'maximum': 5}], 'claim': [{'path': 'parameters.size', 'type': 'string', 'value': 'small'}, {'path': 'parameters.replicas', 'type': 'integer', 'value': '3'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_claim_validate_invalid_input():
+    result = call_tool('plat_claim_validate', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_claim_validate_unauthorized():
+    result = call_tool('plat_claim_validate', 'A01', {'schema': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}, {'path': 'parameters.replicas', 'type': 'integer', 'required': False, 'minimum': 1, 'maximum': 5}], 'claim': [{'path': 'parameters.size', 'type': 'string', 'value': 'small'}, {'path': 'parameters.replicas', 'type': 'integer', 'value': '3'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_claim_validate'
+
+
+def test_plat_claim_validate_dependency():
+    result = call_tool('plat_claim_validate', 'A17', {'schema': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}, {'path': 'parameters.replicas', 'type': 'integer', 'required': False, 'minimum': 1, 'maximum': 5}], 'claim': [{'path': 'parameters.size', 'type': 'string', 'value': 'small'}, {'path': 'parameters.replicas', 'type': 'integer', 'value': '3'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_claim_validate_timeout():
+    result = call_tool('plat_claim_validate', 'A17', {'schema': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}, {'path': 'parameters.replicas', 'type': 'integer', 'required': False, 'minimum': 1, 'maximum': 5}], 'claim': [{'path': 'parameters.size', 'type': 'string', 'value': 'small'}, {'path': 'parameters.replicas', 'type': 'integer', 'value': '3'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_claim_validate_partial():
+    result = call_tool('plat_claim_validate', 'A17', {'schema': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}, {'path': 'parameters.replicas', 'type': 'integer', 'required': False, 'minimum': 1, 'maximum': 5}], 'claim': [{'path': 'parameters.size', 'type': 'string', 'value': 'small'}, {'path': 'parameters.replicas', 'type': 'integer', 'value': '3'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_composition_diff_success():
+    result = call_tool('plat_composition_diff', 'A17', {'old_version': 'v1alpha1', 'new_version': 'v1alpha1', 'old_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}], 'new_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large', 'xlarge']}, {'path': 'parameters.backup', 'type': 'boolean', 'required': False}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_composition_diff_invalid_input():
+    result = call_tool('plat_composition_diff', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_composition_diff_unauthorized():
+    result = call_tool('plat_composition_diff', 'A01', {'old_version': 'v1alpha1', 'new_version': 'v1alpha1', 'old_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}], 'new_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large', 'xlarge']}, {'path': 'parameters.backup', 'type': 'boolean', 'required': False}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_composition_diff'
+
+
+def test_plat_composition_diff_dependency():
+    result = call_tool('plat_composition_diff', 'A17', {'old_version': 'v1alpha1', 'new_version': 'v1alpha1', 'old_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}], 'new_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large', 'xlarge']}, {'path': 'parameters.backup', 'type': 'boolean', 'required': False}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_composition_diff_timeout():
+    result = call_tool('plat_composition_diff', 'A17', {'old_version': 'v1alpha1', 'new_version': 'v1alpha1', 'old_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}], 'new_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large', 'xlarge']}, {'path': 'parameters.backup', 'type': 'boolean', 'required': False}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_composition_diff_partial():
+    result = call_tool('plat_composition_diff', 'A17', {'old_version': 'v1alpha1', 'new_version': 'v1alpha1', 'old_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large']}], 'new_fields': [{'path': 'parameters.size', 'type': 'string', 'required': True, 'enum_values': ['small', 'large', 'xlarge']}, {'path': 'parameters.backup', 'type': 'boolean', 'required': False}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_dora_bands_success():
+    result = call_tool('plat_dora_bands', 'A17', {'window_start': '2026-09-01T00:00:00Z', 'window_end': '2026-09-08T00:00:00Z', 'deployments': [{'id': 'd1', 'committed_at': '2026-09-01T08:00:00Z', 'deployed_at': '2026-09-01T10:00:00Z'}, {'id': 'd2', 'committed_at': '2026-09-02T08:00:00Z', 'deployed_at': '2026-09-02T09:00:00Z'}], 'incidents': [{'started_at': '2026-09-02T09:10:00Z', 'resolved_at': '2026-09-02T09:40:00Z', 'deployment_id': 'd2'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_dora_bands_invalid_input():
+    result = call_tool('plat_dora_bands', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_dora_bands_unauthorized():
+    result = call_tool('plat_dora_bands', 'A01', {'window_start': '2026-09-01T00:00:00Z', 'window_end': '2026-09-08T00:00:00Z', 'deployments': [{'id': 'd1', 'committed_at': '2026-09-01T08:00:00Z', 'deployed_at': '2026-09-01T10:00:00Z'}, {'id': 'd2', 'committed_at': '2026-09-02T08:00:00Z', 'deployed_at': '2026-09-02T09:00:00Z'}], 'incidents': [{'started_at': '2026-09-02T09:10:00Z', 'resolved_at': '2026-09-02T09:40:00Z', 'deployment_id': 'd2'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_dora_bands'
+
+
+def test_plat_dora_bands_dependency():
+    result = call_tool('plat_dora_bands', 'A17', {'window_start': '2026-09-01T00:00:00Z', 'window_end': '2026-09-08T00:00:00Z', 'deployments': [{'id': 'd1', 'committed_at': '2026-09-01T08:00:00Z', 'deployed_at': '2026-09-01T10:00:00Z'}, {'id': 'd2', 'committed_at': '2026-09-02T08:00:00Z', 'deployed_at': '2026-09-02T09:00:00Z'}], 'incidents': [{'started_at': '2026-09-02T09:10:00Z', 'resolved_at': '2026-09-02T09:40:00Z', 'deployment_id': 'd2'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_dora_bands_timeout():
+    result = call_tool('plat_dora_bands', 'A17', {'window_start': '2026-09-01T00:00:00Z', 'window_end': '2026-09-08T00:00:00Z', 'deployments': [{'id': 'd1', 'committed_at': '2026-09-01T08:00:00Z', 'deployed_at': '2026-09-01T10:00:00Z'}, {'id': 'd2', 'committed_at': '2026-09-02T08:00:00Z', 'deployed_at': '2026-09-02T09:00:00Z'}], 'incidents': [{'started_at': '2026-09-02T09:10:00Z', 'resolved_at': '2026-09-02T09:40:00Z', 'deployment_id': 'd2'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_dora_bands_partial():
+    result = call_tool('plat_dora_bands', 'A17', {'window_start': '2026-09-01T00:00:00Z', 'window_end': '2026-09-08T00:00:00Z', 'deployments': [{'id': 'd1', 'committed_at': '2026-09-01T08:00:00Z', 'deployed_at': '2026-09-01T10:00:00Z'}, {'id': 'd2', 'committed_at': '2026-09-02T08:00:00Z', 'deployed_at': '2026-09-02T09:00:00Z'}], 'incidents': [{'started_at': '2026-09-02T09:10:00Z', 'resolved_at': '2026-09-02T09:40:00Z', 'deployment_id': 'd2'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_ephemeral_env_policy_success():
+    result = call_tool('plat_ephemeral_env_policy', 'A17', {'checked_at': '2026-10-20T12:00:00Z', 'max_ttl_hours': 72, 'idle_after_hours': 24, 'max_cost_usd': 100, 'environments': [{'name': 'pr-1234', 'created_at': '2026-10-20T00:00:00Z', 'ttl_hours': 48, 'hourly_cost_usd': 0.5, 'last_active_at': '2026-10-20T11:00:00Z', 'owner': 'group:default/web'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_ephemeral_env_policy_invalid_input():
+    result = call_tool('plat_ephemeral_env_policy', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_ephemeral_env_policy_unauthorized():
+    result = call_tool('plat_ephemeral_env_policy', 'A01', {'checked_at': '2026-10-20T12:00:00Z', 'max_ttl_hours': 72, 'idle_after_hours': 24, 'max_cost_usd': 100, 'environments': [{'name': 'pr-1234', 'created_at': '2026-10-20T00:00:00Z', 'ttl_hours': 48, 'hourly_cost_usd': 0.5, 'last_active_at': '2026-10-20T11:00:00Z', 'owner': 'group:default/web'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_ephemeral_env_policy'
+
+
+def test_plat_ephemeral_env_policy_dependency():
+    result = call_tool('plat_ephemeral_env_policy', 'A17', {'checked_at': '2026-10-20T12:00:00Z', 'max_ttl_hours': 72, 'idle_after_hours': 24, 'max_cost_usd': 100, 'environments': [{'name': 'pr-1234', 'created_at': '2026-10-20T00:00:00Z', 'ttl_hours': 48, 'hourly_cost_usd': 0.5, 'last_active_at': '2026-10-20T11:00:00Z', 'owner': 'group:default/web'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_ephemeral_env_policy_timeout():
+    result = call_tool('plat_ephemeral_env_policy', 'A17', {'checked_at': '2026-10-20T12:00:00Z', 'max_ttl_hours': 72, 'idle_after_hours': 24, 'max_cost_usd': 100, 'environments': [{'name': 'pr-1234', 'created_at': '2026-10-20T00:00:00Z', 'ttl_hours': 48, 'hourly_cost_usd': 0.5, 'last_active_at': '2026-10-20T11:00:00Z', 'owner': 'group:default/web'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_ephemeral_env_policy_partial():
+    result = call_tool('plat_ephemeral_env_policy', 'A17', {'checked_at': '2026-10-20T12:00:00Z', 'max_ttl_hours': 72, 'idle_after_hours': 24, 'max_cost_usd': 100, 'environments': [{'name': 'pr-1234', 'created_at': '2026-10-20T00:00:00Z', 'ttl_hours': 48, 'hourly_cost_usd': 0.5, 'last_active_at': '2026-10-20T11:00:00Z', 'owner': 'group:default/web'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_golden_path_coverage_success():
+    result = call_tool('plat_golden_path_coverage', 'A17', {'target_ratio': 0.5, 'golden_paths': [{'id': 'python-service', 'latest_version': '2.1.0', 'min_supported_version': '1.4.0'}], 'services': [{'name': 'payments-api', 'tier': 'tier-1', 'template': 'python-service', 'template_version': '2.1.0'}, {'name': 'legacy-batch', 'tier': 'tier-3'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_golden_path_coverage_invalid_input():
+    result = call_tool('plat_golden_path_coverage', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_golden_path_coverage_unauthorized():
+    result = call_tool('plat_golden_path_coverage', 'A01', {'target_ratio': 0.5, 'golden_paths': [{'id': 'python-service', 'latest_version': '2.1.0', 'min_supported_version': '1.4.0'}], 'services': [{'name': 'payments-api', 'tier': 'tier-1', 'template': 'python-service', 'template_version': '2.1.0'}, {'name': 'legacy-batch', 'tier': 'tier-3'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_golden_path_coverage'
+
+
+def test_plat_golden_path_coverage_dependency():
+    result = call_tool('plat_golden_path_coverage', 'A17', {'target_ratio': 0.5, 'golden_paths': [{'id': 'python-service', 'latest_version': '2.1.0', 'min_supported_version': '1.4.0'}], 'services': [{'name': 'payments-api', 'tier': 'tier-1', 'template': 'python-service', 'template_version': '2.1.0'}, {'name': 'legacy-batch', 'tier': 'tier-3'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_golden_path_coverage_timeout():
+    result = call_tool('plat_golden_path_coverage', 'A17', {'target_ratio': 0.5, 'golden_paths': [{'id': 'python-service', 'latest_version': '2.1.0', 'min_supported_version': '1.4.0'}], 'services': [{'name': 'payments-api', 'tier': 'tier-1', 'template': 'python-service', 'template_version': '2.1.0'}, {'name': 'legacy-batch', 'tier': 'tier-3'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_golden_path_coverage_partial():
+    result = call_tool('plat_golden_path_coverage', 'A17', {'target_ratio': 0.5, 'golden_paths': [{'id': 'python-service', 'latest_version': '2.1.0', 'min_supported_version': '1.4.0'}], 'services': [{'name': 'payments-api', 'tier': 'tier-1', 'template': 'python-service', 'template_version': '2.1.0'}, {'name': 'legacy-batch', 'tier': 'tier-3'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_maturity_scorecard_success():
+    result = call_tool('plat_maturity_scorecard', 'A17', {'services': [{'name': 'payments-api', 'tier': 'tier-1', 'has_owner': True, 'has_runbook': True, 'has_slo': True, 'has_on_call': True, 'test_coverage_pct': 82.5, 'sast': True, 'dependency_scan': True, 'secret_scan': False}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_maturity_scorecard_invalid_input():
+    result = call_tool('plat_maturity_scorecard', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_maturity_scorecard_unauthorized():
+    result = call_tool('plat_maturity_scorecard', 'A01', {'services': [{'name': 'payments-api', 'tier': 'tier-1', 'has_owner': True, 'has_runbook': True, 'has_slo': True, 'has_on_call': True, 'test_coverage_pct': 82.5, 'sast': True, 'dependency_scan': True, 'secret_scan': False}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_maturity_scorecard'
+
+
+def test_plat_maturity_scorecard_dependency():
+    result = call_tool('plat_maturity_scorecard', 'A17', {'services': [{'name': 'payments-api', 'tier': 'tier-1', 'has_owner': True, 'has_runbook': True, 'has_slo': True, 'has_on_call': True, 'test_coverage_pct': 82.5, 'sast': True, 'dependency_scan': True, 'secret_scan': False}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_maturity_scorecard_timeout():
+    result = call_tool('plat_maturity_scorecard', 'A17', {'services': [{'name': 'payments-api', 'tier': 'tier-1', 'has_owner': True, 'has_runbook': True, 'has_slo': True, 'has_on_call': True, 'test_coverage_pct': 82.5, 'sast': True, 'dependency_scan': True, 'secret_scan': False}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_maturity_scorecard_partial():
+    result = call_tool('plat_maturity_scorecard', 'A17', {'services': [{'name': 'payments-api', 'tier': 'tier-1', 'has_owner': True, 'has_runbook': True, 'has_slo': True, 'has_on_call': True, 'test_coverage_pct': 82.5, 'sast': True, 'dependency_scan': True, 'secret_scan': False}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_quota_fit_success():
+    result = call_tool('plat_quota_fit', 'A17', {'capacity': [{'resource': 'cpu', 'total': 100}], 'allocations': [{'team': 'payments', 'resource': 'cpu', 'quota': 40, 'used': 30}, {'team': 'search', 'resource': 'cpu', 'quota': 50, 'used': 20}], 'reserve_pct': 10})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_quota_fit_invalid_input():
+    result = call_tool('plat_quota_fit', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_quota_fit_unauthorized():
+    result = call_tool('plat_quota_fit', 'A01', {'capacity': [{'resource': 'cpu', 'total': 100}], 'allocations': [{'team': 'payments', 'resource': 'cpu', 'quota': 40, 'used': 30}, {'team': 'search', 'resource': 'cpu', 'quota': 50, 'used': 20}], 'reserve_pct': 10})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_quota_fit'
+
+
+def test_plat_quota_fit_dependency():
+    result = call_tool('plat_quota_fit', 'A17', {'capacity': [{'resource': 'cpu', 'total': 100}], 'allocations': [{'team': 'payments', 'resource': 'cpu', 'quota': 40, 'used': 30}, {'team': 'search', 'resource': 'cpu', 'quota': 50, 'used': 20}], 'reserve_pct': 10, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_quota_fit_timeout():
+    result = call_tool('plat_quota_fit', 'A17', {'capacity': [{'resource': 'cpu', 'total': 100}], 'allocations': [{'team': 'payments', 'resource': 'cpu', 'quota': 40, 'used': 30}, {'team': 'search', 'resource': 'cpu', 'quota': 50, 'used': 20}], 'reserve_pct': 10, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_quota_fit_partial():
+    result = call_tool('plat_quota_fit', 'A17', {'capacity': [{'resource': 'cpu', 'total': 100}], 'allocations': [{'team': 'payments', 'resource': 'cpu', 'quota': 40, 'used': 30}, {'team': 'search', 'resource': 'cpu', 'quota': 50, 'used': 20}], 'reserve_pct': 10, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_request_guardrails_success():
+    result = call_tool('plat_request_guardrails', 'A17', {'allowed_regions': ['eu-west-1', 'us-east-1'], 'allowed_classes': ['standard', 'premium'], 'size_order': ['small', 'medium', 'large'], 'auto_approve_size': 'medium', 'max_size': 'large', 'max_cpu_cores': 16, 'max_memory_gib': 64, 'max_storage_gib': 1000, 'min_prod_replicas': 2, 'requests': [{'id': 'req-1', 'environment': 'prod', 'region': 'eu-west-1', 'size': 'medium', 'service_class': 'standard', 'replicas': 3, 'cpu_cores': 4, 'memory_gib': 16, 'storage_gib': 100}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_request_guardrails_invalid_input():
+    result = call_tool('plat_request_guardrails', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_request_guardrails_unauthorized():
+    result = call_tool('plat_request_guardrails', 'A01', {'allowed_regions': ['eu-west-1', 'us-east-1'], 'allowed_classes': ['standard', 'premium'], 'size_order': ['small', 'medium', 'large'], 'auto_approve_size': 'medium', 'max_size': 'large', 'max_cpu_cores': 16, 'max_memory_gib': 64, 'max_storage_gib': 1000, 'min_prod_replicas': 2, 'requests': [{'id': 'req-1', 'environment': 'prod', 'region': 'eu-west-1', 'size': 'medium', 'service_class': 'standard', 'replicas': 3, 'cpu_cores': 4, 'memory_gib': 16, 'storage_gib': 100}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_request_guardrails'
+
+
+def test_plat_request_guardrails_dependency():
+    result = call_tool('plat_request_guardrails', 'A17', {'allowed_regions': ['eu-west-1', 'us-east-1'], 'allowed_classes': ['standard', 'premium'], 'size_order': ['small', 'medium', 'large'], 'auto_approve_size': 'medium', 'max_size': 'large', 'max_cpu_cores': 16, 'max_memory_gib': 64, 'max_storage_gib': 1000, 'min_prod_replicas': 2, 'requests': [{'id': 'req-1', 'environment': 'prod', 'region': 'eu-west-1', 'size': 'medium', 'service_class': 'standard', 'replicas': 3, 'cpu_cores': 4, 'memory_gib': 16, 'storage_gib': 100}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_request_guardrails_timeout():
+    result = call_tool('plat_request_guardrails', 'A17', {'allowed_regions': ['eu-west-1', 'us-east-1'], 'allowed_classes': ['standard', 'premium'], 'size_order': ['small', 'medium', 'large'], 'auto_approve_size': 'medium', 'max_size': 'large', 'max_cpu_cores': 16, 'max_memory_gib': 64, 'max_storage_gib': 1000, 'min_prod_replicas': 2, 'requests': [{'id': 'req-1', 'environment': 'prod', 'region': 'eu-west-1', 'size': 'medium', 'service_class': 'standard', 'replicas': 3, 'cpu_cores': 4, 'memory_gib': 16, 'storage_gib': 100}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_request_guardrails_partial():
+    result = call_tool('plat_request_guardrails', 'A17', {'allowed_regions': ['eu-west-1', 'us-east-1'], 'allowed_classes': ['standard', 'premium'], 'size_order': ['small', 'medium', 'large'], 'auto_approve_size': 'medium', 'max_size': 'large', 'max_cpu_cores': 16, 'max_memory_gib': 64, 'max_storage_gib': 1000, 'min_prod_replicas': 2, 'requests': [{'id': 'req-1', 'environment': 'prod', 'region': 'eu-west-1', 'size': 'medium', 'service_class': 'standard', 'replicas': 3, 'cpu_cores': 4, 'memory_gib': 16, 'storage_gib': 100}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_plat_template_params_check_success():
+    result = call_tool('plat_template_params_check', 'A17', {'template_parameters': [{'name': 'region', 'type': 'string', 'required': True, 'enum_values': ['eu-west-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'golden_inputs': [{'name': 'region', 'type': 'string', 'required': True, 'allowed_values': ['eu-west-1', 'us-east-1']}, {'name': 'owner', 'type': 'string', 'required': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_plat_template_params_check_invalid_input():
+    result = call_tool('plat_template_params_check', 'A17', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_plat_template_params_check_unauthorized():
+    result = call_tool('plat_template_params_check', 'A01', {'template_parameters': [{'name': 'region', 'type': 'string', 'required': True, 'enum_values': ['eu-west-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'golden_inputs': [{'name': 'region', 'type': 'string', 'required': True, 'allowed_values': ['eu-west-1', 'us-east-1']}, {'name': 'owner', 'type': 'string', 'required': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'plat_template_params_check'
+
+
+def test_plat_template_params_check_dependency():
+    result = call_tool('plat_template_params_check', 'A17', {'template_parameters': [{'name': 'region', 'type': 'string', 'required': True, 'enum_values': ['eu-west-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'golden_inputs': [{'name': 'region', 'type': 'string', 'required': True, 'allowed_values': ['eu-west-1', 'us-east-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_plat_template_params_check_timeout():
+    result = call_tool('plat_template_params_check', 'A17', {'template_parameters': [{'name': 'region', 'type': 'string', 'required': True, 'enum_values': ['eu-west-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'golden_inputs': [{'name': 'region', 'type': 'string', 'required': True, 'allowed_values': ['eu-west-1', 'us-east-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_plat_template_params_check_partial():
+    result = call_tool('plat_template_params_check', 'A17', {'template_parameters': [{'name': 'region', 'type': 'string', 'required': True, 'enum_values': ['eu-west-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'golden_inputs': [{'name': 'region', 'type': 'string', 'required': True, 'allowed_values': ['eu-west-1', 'us-east-1']}, {'name': 'owner', 'type': 'string', 'required': True}], 'probe': 'partial'})
     assert result["state"] == "PARTIAL_SUCCESS"
     assert isinstance(result["completed_fraction"], (int, float))
 
@@ -4945,6 +10079,414 @@ def test_req_wsjf_rank_timeout():
 
 def test_req_wsjf_rank_partial():
     result = call_tool('req_wsjf_rank', 'A02', {'items': [{'id': 'US-1', 'business_value': 8, 'time_criticality': 5, 'risk_reduction': 3, 'job_size': 4}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_backup_coverage_success():
+    result = call_tool('resil_backup_coverage', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'min_retention_days': 30, 'restore_test_max_age_days': 90, 'assets': [{'name': 'etcd', 'kind': 'etcd', 'criticality': 'critical', 'rpo_hours': 1}, {'name': 'orders-db', 'kind': 'database', 'criticality': 'critical', 'rpo_hours': 24}], 'jobs': [{'asset': 'etcd', 'interval_hours': 0.5, 'retention_days': 30, 'last_success': '2026-10-20T11:45:00+00:00', 'offsite': True, 'last_restore_test': '2026-09-30T08:00:00+00:00'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_backup_coverage_invalid_input():
+    result = call_tool('resil_backup_coverage', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_backup_coverage_unauthorized():
+    result = call_tool('resil_backup_coverage', 'A01', {'as_of': '2026-10-20T12:00:00+00:00', 'min_retention_days': 30, 'restore_test_max_age_days': 90, 'assets': [{'name': 'etcd', 'kind': 'etcd', 'criticality': 'critical', 'rpo_hours': 1}, {'name': 'orders-db', 'kind': 'database', 'criticality': 'critical', 'rpo_hours': 24}], 'jobs': [{'asset': 'etcd', 'interval_hours': 0.5, 'retention_days': 30, 'last_success': '2026-10-20T11:45:00+00:00', 'offsite': True, 'last_restore_test': '2026-09-30T08:00:00+00:00'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_backup_coverage'
+
+
+def test_resil_backup_coverage_dependency():
+    result = call_tool('resil_backup_coverage', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'min_retention_days': 30, 'restore_test_max_age_days': 90, 'assets': [{'name': 'etcd', 'kind': 'etcd', 'criticality': 'critical', 'rpo_hours': 1}, {'name': 'orders-db', 'kind': 'database', 'criticality': 'critical', 'rpo_hours': 24}], 'jobs': [{'asset': 'etcd', 'interval_hours': 0.5, 'retention_days': 30, 'last_success': '2026-10-20T11:45:00+00:00', 'offsite': True, 'last_restore_test': '2026-09-30T08:00:00+00:00'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_backup_coverage_timeout():
+    result = call_tool('resil_backup_coverage', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'min_retention_days': 30, 'restore_test_max_age_days': 90, 'assets': [{'name': 'etcd', 'kind': 'etcd', 'criticality': 'critical', 'rpo_hours': 1}, {'name': 'orders-db', 'kind': 'database', 'criticality': 'critical', 'rpo_hours': 24}], 'jobs': [{'asset': 'etcd', 'interval_hours': 0.5, 'retention_days': 30, 'last_success': '2026-10-20T11:45:00+00:00', 'offsite': True, 'last_restore_test': '2026-09-30T08:00:00+00:00'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_backup_coverage_partial():
+    result = call_tool('resil_backup_coverage', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'min_retention_days': 30, 'restore_test_max_age_days': 90, 'assets': [{'name': 'etcd', 'kind': 'etcd', 'criticality': 'critical', 'rpo_hours': 1}, {'name': 'orders-db', 'kind': 'database', 'criticality': 'critical', 'rpo_hours': 24}], 'jobs': [{'asset': 'etcd', 'interval_hours': 0.5, 'retention_days': 30, 'last_success': '2026-10-20T11:45:00+00:00', 'offsite': True, 'last_restore_test': '2026-09-30T08:00:00+00:00'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_chaos_budget_gate_success():
+    result = call_tool('resil_chaos_budget_gate', 'A25', {'environment': 'production', 'slo_target': 0.999, 'window_days': 30, 'budget_remaining_fraction': 0.8, 'current_burn_rate': 0.4, 'open_incident': False, 'experiment_duration_minutes': 30, 'expected_error_ratio': 0.05, 'reserve_fraction': 0.3, 'max_cost_fraction': 0.1})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_chaos_budget_gate_invalid_input():
+    result = call_tool('resil_chaos_budget_gate', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_chaos_budget_gate_unauthorized():
+    result = call_tool('resil_chaos_budget_gate', 'A01', {'environment': 'production', 'slo_target': 0.999, 'window_days': 30, 'budget_remaining_fraction': 0.8, 'current_burn_rate': 0.4, 'open_incident': False, 'experiment_duration_minutes': 30, 'expected_error_ratio': 0.05, 'reserve_fraction': 0.3, 'max_cost_fraction': 0.1})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_chaos_budget_gate'
+
+
+def test_resil_chaos_budget_gate_dependency():
+    result = call_tool('resil_chaos_budget_gate', 'A25', {'environment': 'production', 'slo_target': 0.999, 'window_days': 30, 'budget_remaining_fraction': 0.8, 'current_burn_rate': 0.4, 'open_incident': False, 'experiment_duration_minutes': 30, 'expected_error_ratio': 0.05, 'reserve_fraction': 0.3, 'max_cost_fraction': 0.1, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_chaos_budget_gate_timeout():
+    result = call_tool('resil_chaos_budget_gate', 'A25', {'environment': 'production', 'slo_target': 0.999, 'window_days': 30, 'budget_remaining_fraction': 0.8, 'current_burn_rate': 0.4, 'open_incident': False, 'experiment_duration_minutes': 30, 'expected_error_ratio': 0.05, 'reserve_fraction': 0.3, 'max_cost_fraction': 0.1, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_chaos_budget_gate_partial():
+    result = call_tool('resil_chaos_budget_gate', 'A25', {'environment': 'production', 'slo_target': 0.999, 'window_days': 30, 'budget_remaining_fraction': 0.8, 'current_burn_rate': 0.4, 'open_incident': False, 'experiment_duration_minutes': 30, 'expected_error_ratio': 0.05, 'reserve_fraction': 0.3, 'max_cost_fraction': 0.1, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_chaos_spec_check_success():
+    result = call_tool('resil_chaos_spec_check', 'A25', {'name': 'kill-one-cart-pod', 'environment': 'staging', 'start': '2026-10-21T10:00:00+00:00', 'duration_minutes': 30, 'max_duration_minutes': 60, 'steady_state': [{'metric': 'http_success_ratio', 'comparison': 'gte', 'threshold': 0.999}], 'abort_conditions': [{'metric': 'http_success_ratio', 'comparison': 'lt', 'threshold': 0.99}], 'affected_instances': 1, 'total_instances': 10, 'max_blast_percent': 25, 'customer_facing': False, 'automatic_abort': True, 'rollback_documented': True, 'approval_recorded': True, 'error_budget_gate_passed': True, 'freeze_windows': [{'start': '2026-12-20T00:00:00+00:00', 'end': '2027-01-03T00:00:00+00:00', 'reason': 'holiday freeze'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_chaos_spec_check_invalid_input():
+    result = call_tool('resil_chaos_spec_check', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_chaos_spec_check_unauthorized():
+    result = call_tool('resil_chaos_spec_check', 'A01', {'name': 'kill-one-cart-pod', 'environment': 'staging', 'start': '2026-10-21T10:00:00+00:00', 'duration_minutes': 30, 'max_duration_minutes': 60, 'steady_state': [{'metric': 'http_success_ratio', 'comparison': 'gte', 'threshold': 0.999}], 'abort_conditions': [{'metric': 'http_success_ratio', 'comparison': 'lt', 'threshold': 0.99}], 'affected_instances': 1, 'total_instances': 10, 'max_blast_percent': 25, 'customer_facing': False, 'automatic_abort': True, 'rollback_documented': True, 'approval_recorded': True, 'error_budget_gate_passed': True, 'freeze_windows': [{'start': '2026-12-20T00:00:00+00:00', 'end': '2027-01-03T00:00:00+00:00', 'reason': 'holiday freeze'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_chaos_spec_check'
+
+
+def test_resil_chaos_spec_check_dependency():
+    result = call_tool('resil_chaos_spec_check', 'A25', {'name': 'kill-one-cart-pod', 'environment': 'staging', 'start': '2026-10-21T10:00:00+00:00', 'duration_minutes': 30, 'max_duration_minutes': 60, 'steady_state': [{'metric': 'http_success_ratio', 'comparison': 'gte', 'threshold': 0.999}], 'abort_conditions': [{'metric': 'http_success_ratio', 'comparison': 'lt', 'threshold': 0.99}], 'affected_instances': 1, 'total_instances': 10, 'max_blast_percent': 25, 'customer_facing': False, 'automatic_abort': True, 'rollback_documented': True, 'approval_recorded': True, 'error_budget_gate_passed': True, 'freeze_windows': [{'start': '2026-12-20T00:00:00+00:00', 'end': '2027-01-03T00:00:00+00:00', 'reason': 'holiday freeze'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_chaos_spec_check_timeout():
+    result = call_tool('resil_chaos_spec_check', 'A25', {'name': 'kill-one-cart-pod', 'environment': 'staging', 'start': '2026-10-21T10:00:00+00:00', 'duration_minutes': 30, 'max_duration_minutes': 60, 'steady_state': [{'metric': 'http_success_ratio', 'comparison': 'gte', 'threshold': 0.999}], 'abort_conditions': [{'metric': 'http_success_ratio', 'comparison': 'lt', 'threshold': 0.99}], 'affected_instances': 1, 'total_instances': 10, 'max_blast_percent': 25, 'customer_facing': False, 'automatic_abort': True, 'rollback_documented': True, 'approval_recorded': True, 'error_budget_gate_passed': True, 'freeze_windows': [{'start': '2026-12-20T00:00:00+00:00', 'end': '2027-01-03T00:00:00+00:00', 'reason': 'holiday freeze'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_chaos_spec_check_partial():
+    result = call_tool('resil_chaos_spec_check', 'A25', {'name': 'kill-one-cart-pod', 'environment': 'staging', 'start': '2026-10-21T10:00:00+00:00', 'duration_minutes': 30, 'max_duration_minutes': 60, 'steady_state': [{'metric': 'http_success_ratio', 'comparison': 'gte', 'threshold': 0.999}], 'abort_conditions': [{'metric': 'http_success_ratio', 'comparison': 'lt', 'threshold': 0.99}], 'affected_instances': 1, 'total_instances': 10, 'max_blast_percent': 25, 'customer_facing': False, 'automatic_abort': True, 'rollback_documented': True, 'approval_recorded': True, 'error_budget_gate_passed': True, 'freeze_windows': [{'start': '2026-12-20T00:00:00+00:00', 'end': '2027-01-03T00:00:00+00:00', 'reason': 'holiday freeze'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_drill_cadence_success():
+    result = call_tool('resil_drill_cadence', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'requirements': [{'scenario': 'region-failover', 'max_interval_days': 180, 'require_evidence': True, 'target_rto_minutes': 60}], 'drills': [{'scenario': 'region-failover', 'performed_at': '2026-08-01T09:00:00+00:00', 'outcome': 'passed', 'evidence_ref': 'drill-2026-08-01', 'measured_rto_minutes': 42}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_drill_cadence_invalid_input():
+    result = call_tool('resil_drill_cadence', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_drill_cadence_unauthorized():
+    result = call_tool('resil_drill_cadence', 'A01', {'as_of': '2026-10-20T12:00:00+00:00', 'requirements': [{'scenario': 'region-failover', 'max_interval_days': 180, 'require_evidence': True, 'target_rto_minutes': 60}], 'drills': [{'scenario': 'region-failover', 'performed_at': '2026-08-01T09:00:00+00:00', 'outcome': 'passed', 'evidence_ref': 'drill-2026-08-01', 'measured_rto_minutes': 42}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_drill_cadence'
+
+
+def test_resil_drill_cadence_dependency():
+    result = call_tool('resil_drill_cadence', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'requirements': [{'scenario': 'region-failover', 'max_interval_days': 180, 'require_evidence': True, 'target_rto_minutes': 60}], 'drills': [{'scenario': 'region-failover', 'performed_at': '2026-08-01T09:00:00+00:00', 'outcome': 'passed', 'evidence_ref': 'drill-2026-08-01', 'measured_rto_minutes': 42}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_drill_cadence_timeout():
+    result = call_tool('resil_drill_cadence', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'requirements': [{'scenario': 'region-failover', 'max_interval_days': 180, 'require_evidence': True, 'target_rto_minutes': 60}], 'drills': [{'scenario': 'region-failover', 'performed_at': '2026-08-01T09:00:00+00:00', 'outcome': 'passed', 'evidence_ref': 'drill-2026-08-01', 'measured_rto_minutes': 42}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_drill_cadence_partial():
+    result = call_tool('resil_drill_cadence', 'A25', {'as_of': '2026-10-20T12:00:00+00:00', 'requirements': [{'scenario': 'region-failover', 'max_interval_days': 180, 'require_evidence': True, 'target_rto_minutes': 60}], 'drills': [{'scenario': 'region-failover', 'performed_at': '2026-08-01T09:00:00+00:00', 'outcome': 'passed', 'evidence_ref': 'drill-2026-08-01', 'measured_rto_minutes': 42}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_fmea_rpn_success():
+    result = call_tool('resil_fmea_rpn', 'A25', {'rpn_threshold': 100, 'modes': [{'id': 'zone-outage', 'severity': 9, 'occurrence': 3, 'detection': 4}, {'id': 'cert-expiry', 'severity': 7, 'occurrence': 4, 'detection': 6}, {'id': 'pod-oom', 'severity': 4, 'occurrence': 5, 'detection': 2}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_fmea_rpn_invalid_input():
+    result = call_tool('resil_fmea_rpn', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_fmea_rpn_unauthorized():
+    result = call_tool('resil_fmea_rpn', 'A01', {'rpn_threshold': 100, 'modes': [{'id': 'zone-outage', 'severity': 9, 'occurrence': 3, 'detection': 4}, {'id': 'cert-expiry', 'severity': 7, 'occurrence': 4, 'detection': 6}, {'id': 'pod-oom', 'severity': 4, 'occurrence': 5, 'detection': 2}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_fmea_rpn'
+
+
+def test_resil_fmea_rpn_dependency():
+    result = call_tool('resil_fmea_rpn', 'A25', {'rpn_threshold': 100, 'modes': [{'id': 'zone-outage', 'severity': 9, 'occurrence': 3, 'detection': 4}, {'id': 'cert-expiry', 'severity': 7, 'occurrence': 4, 'detection': 6}, {'id': 'pod-oom', 'severity': 4, 'occurrence': 5, 'detection': 2}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_fmea_rpn_timeout():
+    result = call_tool('resil_fmea_rpn', 'A25', {'rpn_threshold': 100, 'modes': [{'id': 'zone-outage', 'severity': 9, 'occurrence': 3, 'detection': 4}, {'id': 'cert-expiry', 'severity': 7, 'occurrence': 4, 'detection': 6}, {'id': 'pod-oom', 'severity': 4, 'occurrence': 5, 'detection': 2}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_fmea_rpn_partial():
+    result = call_tool('resil_fmea_rpn', 'A25', {'rpn_threshold': 100, 'modes': [{'id': 'zone-outage', 'severity': 9, 'occurrence': 3, 'detection': 4}, {'id': 'cert-expiry', 'severity': 7, 'occurrence': 4, 'detection': 6}, {'id': 'pod-oom', 'severity': 4, 'occurrence': 5, 'detection': 2}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_load_shed_check_success():
+    result = call_tool('resil_load_shed_check', 'A25', {'capacity_concurrency': 100, 'client_timeout_ms': 2000, 'classes': [{'name': 'checkout', 'priority': 1, 'expected_rps': 200, 'p99_service_ms': 100, 'max_concurrency': 60, 'reserved_concurrency': 30, 'queue_depth': 10, 'queue_bounded': True, 'sheddable': False}, {'name': 'search', 'priority': 2, 'expected_rps': 300, 'p99_service_ms': 200, 'max_concurrency': 80, 'reserved_concurrency': 0, 'queue_depth': 20, 'queue_bounded': True, 'sheddable': True}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_load_shed_check_invalid_input():
+    result = call_tool('resil_load_shed_check', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_load_shed_check_unauthorized():
+    result = call_tool('resil_load_shed_check', 'A01', {'capacity_concurrency': 100, 'client_timeout_ms': 2000, 'classes': [{'name': 'checkout', 'priority': 1, 'expected_rps': 200, 'p99_service_ms': 100, 'max_concurrency': 60, 'reserved_concurrency': 30, 'queue_depth': 10, 'queue_bounded': True, 'sheddable': False}, {'name': 'search', 'priority': 2, 'expected_rps': 300, 'p99_service_ms': 200, 'max_concurrency': 80, 'reserved_concurrency': 0, 'queue_depth': 20, 'queue_bounded': True, 'sheddable': True}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_load_shed_check'
+
+
+def test_resil_load_shed_check_dependency():
+    result = call_tool('resil_load_shed_check', 'A25', {'capacity_concurrency': 100, 'client_timeout_ms': 2000, 'classes': [{'name': 'checkout', 'priority': 1, 'expected_rps': 200, 'p99_service_ms': 100, 'max_concurrency': 60, 'reserved_concurrency': 30, 'queue_depth': 10, 'queue_bounded': True, 'sheddable': False}, {'name': 'search', 'priority': 2, 'expected_rps': 300, 'p99_service_ms': 200, 'max_concurrency': 80, 'reserved_concurrency': 0, 'queue_depth': 20, 'queue_bounded': True, 'sheddable': True}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_load_shed_check_timeout():
+    result = call_tool('resil_load_shed_check', 'A25', {'capacity_concurrency': 100, 'client_timeout_ms': 2000, 'classes': [{'name': 'checkout', 'priority': 1, 'expected_rps': 200, 'p99_service_ms': 100, 'max_concurrency': 60, 'reserved_concurrency': 30, 'queue_depth': 10, 'queue_bounded': True, 'sheddable': False}, {'name': 'search', 'priority': 2, 'expected_rps': 300, 'p99_service_ms': 200, 'max_concurrency': 80, 'reserved_concurrency': 0, 'queue_depth': 20, 'queue_bounded': True, 'sheddable': True}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_load_shed_check_partial():
+    result = call_tool('resil_load_shed_check', 'A25', {'capacity_concurrency': 100, 'client_timeout_ms': 2000, 'classes': [{'name': 'checkout', 'priority': 1, 'expected_rps': 200, 'p99_service_ms': 100, 'max_concurrency': 60, 'reserved_concurrency': 30, 'queue_depth': 10, 'queue_bounded': True, 'sheddable': False}, {'name': 'search', 'priority': 2, 'expected_rps': 300, 'p99_service_ms': 200, 'max_concurrency': 80, 'reserved_concurrency': 0, 'queue_depth': 20, 'queue_bounded': True, 'sheddable': True}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_pdb_check_success():
+    result = call_tool('resil_pdb_check', 'A25', {'workloads': [{'name': 'web', 'kind': 'Deployment', 'replicas': 4, 'min_available': '50%'}, {'name': 'db', 'kind': 'StatefulSet', 'replicas': 3, 'max_unavailable': '1'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_pdb_check_invalid_input():
+    result = call_tool('resil_pdb_check', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_pdb_check_unauthorized():
+    result = call_tool('resil_pdb_check', 'A01', {'workloads': [{'name': 'web', 'kind': 'Deployment', 'replicas': 4, 'min_available': '50%'}, {'name': 'db', 'kind': 'StatefulSet', 'replicas': 3, 'max_unavailable': '1'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_pdb_check'
+
+
+def test_resil_pdb_check_dependency():
+    result = call_tool('resil_pdb_check', 'A25', {'workloads': [{'name': 'web', 'kind': 'Deployment', 'replicas': 4, 'min_available': '50%'}, {'name': 'db', 'kind': 'StatefulSet', 'replicas': 3, 'max_unavailable': '1'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_pdb_check_timeout():
+    result = call_tool('resil_pdb_check', 'A25', {'workloads': [{'name': 'web', 'kind': 'Deployment', 'replicas': 4, 'min_available': '50%'}, {'name': 'db', 'kind': 'StatefulSet', 'replicas': 3, 'max_unavailable': '1'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_pdb_check_partial():
+    result = call_tool('resil_pdb_check', 'A25', {'workloads': [{'name': 'web', 'kind': 'Deployment', 'replicas': 4, 'min_available': '50%'}, {'name': 'db', 'kind': 'StatefulSet', 'replicas': 3, 'max_unavailable': '1'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_probe_check_success():
+    result = call_tool('resil_probe_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'expected_startup_seconds': 40, 'containers': [{'name': 'app', 'startup': {'kind': 'http', 'endpoint': '/healthz', 'period_seconds': 5, 'failure_threshold': 30}, 'liveness': {'kind': 'http', 'endpoint': '/livez'}, 'readiness': {'kind': 'http', 'endpoint': '/readyz'}}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_probe_check_invalid_input():
+    result = call_tool('resil_probe_check', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_probe_check_unauthorized():
+    result = call_tool('resil_probe_check', 'A01', {'workload': 'web', 'serves_traffic': True, 'expected_startup_seconds': 40, 'containers': [{'name': 'app', 'startup': {'kind': 'http', 'endpoint': '/healthz', 'period_seconds': 5, 'failure_threshold': 30}, 'liveness': {'kind': 'http', 'endpoint': '/livez'}, 'readiness': {'kind': 'http', 'endpoint': '/readyz'}}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_probe_check'
+
+
+def test_resil_probe_check_dependency():
+    result = call_tool('resil_probe_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'expected_startup_seconds': 40, 'containers': [{'name': 'app', 'startup': {'kind': 'http', 'endpoint': '/healthz', 'period_seconds': 5, 'failure_threshold': 30}, 'liveness': {'kind': 'http', 'endpoint': '/livez'}, 'readiness': {'kind': 'http', 'endpoint': '/readyz'}}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_probe_check_timeout():
+    result = call_tool('resil_probe_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'expected_startup_seconds': 40, 'containers': [{'name': 'app', 'startup': {'kind': 'http', 'endpoint': '/healthz', 'period_seconds': 5, 'failure_threshold': 30}, 'liveness': {'kind': 'http', 'endpoint': '/livez'}, 'readiness': {'kind': 'http', 'endpoint': '/readyz'}}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_probe_check_partial():
+    result = call_tool('resil_probe_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'expected_startup_seconds': 40, 'containers': [{'name': 'app', 'startup': {'kind': 'http', 'endpoint': '/healthz', 'period_seconds': 5, 'failure_threshold': 30}, 'liveness': {'kind': 'http', 'endpoint': '/livez'}, 'readiness': {'kind': 'http', 'endpoint': '/readyz'}}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_quorum_safety_success():
+    result = call_tool('resil_quorum_safety', 'A25', {'workload': 'etcd', 'replicas': 5, 'members_per_zone': [2, 2, 1], 'unavailable_members': 0, 'max_unavailable': '1'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_quorum_safety_invalid_input():
+    result = call_tool('resil_quorum_safety', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_quorum_safety_unauthorized():
+    result = call_tool('resil_quorum_safety', 'A01', {'workload': 'etcd', 'replicas': 5, 'members_per_zone': [2, 2, 1], 'unavailable_members': 0, 'max_unavailable': '1'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_quorum_safety'
+
+
+def test_resil_quorum_safety_dependency():
+    result = call_tool('resil_quorum_safety', 'A25', {'workload': 'etcd', 'replicas': 5, 'members_per_zone': [2, 2, 1], 'unavailable_members': 0, 'max_unavailable': '1', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_quorum_safety_timeout():
+    result = call_tool('resil_quorum_safety', 'A25', {'workload': 'etcd', 'replicas': 5, 'members_per_zone': [2, 2, 1], 'unavailable_members': 0, 'max_unavailable': '1', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_quorum_safety_partial():
+    result = call_tool('resil_quorum_safety', 'A25', {'workload': 'etcd', 'replicas': 5, 'members_per_zone': [2, 2, 1], 'unavailable_members': 0, 'max_unavailable': '1', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_restore_rto_success():
+    result = call_tool('resil_restore_rto', 'A25', {'data_size_gib': 500, 'restore_throughput_mib_s': 100, 'parallel_streams': 4, 'parallel_efficiency': 0.8, 'replay_size_gib': 20, 'replay_rate_mib_s': 50, 'fixed_overhead_minutes': 15, 'safety_margin': 1.25, 'target_rto_minutes': 120})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_restore_rto_invalid_input():
+    result = call_tool('resil_restore_rto', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_restore_rto_unauthorized():
+    result = call_tool('resil_restore_rto', 'A01', {'data_size_gib': 500, 'restore_throughput_mib_s': 100, 'parallel_streams': 4, 'parallel_efficiency': 0.8, 'replay_size_gib': 20, 'replay_rate_mib_s': 50, 'fixed_overhead_minutes': 15, 'safety_margin': 1.25, 'target_rto_minutes': 120})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_restore_rto'
+
+
+def test_resil_restore_rto_dependency():
+    result = call_tool('resil_restore_rto', 'A25', {'data_size_gib': 500, 'restore_throughput_mib_s': 100, 'parallel_streams': 4, 'parallel_efficiency': 0.8, 'replay_size_gib': 20, 'replay_rate_mib_s': 50, 'fixed_overhead_minutes': 15, 'safety_margin': 1.25, 'target_rto_minutes': 120, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_restore_rto_timeout():
+    result = call_tool('resil_restore_rto', 'A25', {'data_size_gib': 500, 'restore_throughput_mib_s': 100, 'parallel_streams': 4, 'parallel_efficiency': 0.8, 'replay_size_gib': 20, 'replay_rate_mib_s': 50, 'fixed_overhead_minutes': 15, 'safety_margin': 1.25, 'target_rto_minutes': 120, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_restore_rto_partial():
+    result = call_tool('resil_restore_rto', 'A25', {'data_size_gib': 500, 'restore_throughput_mib_s': 100, 'parallel_streams': 4, 'parallel_efficiency': 0.8, 'replay_size_gib': 20, 'replay_rate_mib_s': 50, 'fixed_overhead_minutes': 15, 'safety_margin': 1.25, 'target_rto_minutes': 120, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_shutdown_check_success():
+    result = call_tool('resil_shutdown_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'termination_grace_period_seconds': 60, 'prestop_seconds': 10, 'app_drain_seconds': 30, 'handles_sigterm': True, 'keeps_serving_after_sigterm': False, 'endpoint_propagation_seconds': 5})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_shutdown_check_invalid_input():
+    result = call_tool('resil_shutdown_check', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_shutdown_check_unauthorized():
+    result = call_tool('resil_shutdown_check', 'A01', {'workload': 'web', 'serves_traffic': True, 'termination_grace_period_seconds': 60, 'prestop_seconds': 10, 'app_drain_seconds': 30, 'handles_sigterm': True, 'keeps_serving_after_sigterm': False, 'endpoint_propagation_seconds': 5})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_shutdown_check'
+
+
+def test_resil_shutdown_check_dependency():
+    result = call_tool('resil_shutdown_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'termination_grace_period_seconds': 60, 'prestop_seconds': 10, 'app_drain_seconds': 30, 'handles_sigterm': True, 'keeps_serving_after_sigterm': False, 'endpoint_propagation_seconds': 5, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_shutdown_check_timeout():
+    result = call_tool('resil_shutdown_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'termination_grace_period_seconds': 60, 'prestop_seconds': 10, 'app_drain_seconds': 30, 'handles_sigterm': True, 'keeps_serving_after_sigterm': False, 'endpoint_propagation_seconds': 5, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_shutdown_check_partial():
+    result = call_tool('resil_shutdown_check', 'A25', {'workload': 'web', 'serves_traffic': True, 'termination_grace_period_seconds': 60, 'prestop_seconds': 10, 'app_drain_seconds': 30, 'handles_sigterm': True, 'keeps_serving_after_sigterm': False, 'endpoint_propagation_seconds': 5, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_resil_spread_check_success():
+    result = call_tool('resil_spread_check', 'A25', {'workload': 'web', 'replicas': 6, 'min_available_replicas': 4, 'topology_domains': [{'key': 'topology.kubernetes.io/zone', 'count': 3}, {'key': 'kubernetes.io/hostname', 'count': 9}], 'spread_constraints': [{'topology_key': 'topology.kubernetes.io/zone', 'max_skew': 1, 'when_unsatisfiable': 'DoNotSchedule'}], 'anti_affinity': [{'topology_key': 'kubernetes.io/hostname', 'mode': 'preferred'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_resil_spread_check_invalid_input():
+    result = call_tool('resil_spread_check', 'A25', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_resil_spread_check_unauthorized():
+    result = call_tool('resil_spread_check', 'A01', {'workload': 'web', 'replicas': 6, 'min_available_replicas': 4, 'topology_domains': [{'key': 'topology.kubernetes.io/zone', 'count': 3}, {'key': 'kubernetes.io/hostname', 'count': 9}], 'spread_constraints': [{'topology_key': 'topology.kubernetes.io/zone', 'max_skew': 1, 'when_unsatisfiable': 'DoNotSchedule'}], 'anti_affinity': [{'topology_key': 'kubernetes.io/hostname', 'mode': 'preferred'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'resil_spread_check'
+
+
+def test_resil_spread_check_dependency():
+    result = call_tool('resil_spread_check', 'A25', {'workload': 'web', 'replicas': 6, 'min_available_replicas': 4, 'topology_domains': [{'key': 'topology.kubernetes.io/zone', 'count': 3}, {'key': 'kubernetes.io/hostname', 'count': 9}], 'spread_constraints': [{'topology_key': 'topology.kubernetes.io/zone', 'max_skew': 1, 'when_unsatisfiable': 'DoNotSchedule'}], 'anti_affinity': [{'topology_key': 'kubernetes.io/hostname', 'mode': 'preferred'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_resil_spread_check_timeout():
+    result = call_tool('resil_spread_check', 'A25', {'workload': 'web', 'replicas': 6, 'min_available_replicas': 4, 'topology_domains': [{'key': 'topology.kubernetes.io/zone', 'count': 3}, {'key': 'kubernetes.io/hostname', 'count': 9}], 'spread_constraints': [{'topology_key': 'topology.kubernetes.io/zone', 'max_skew': 1, 'when_unsatisfiable': 'DoNotSchedule'}], 'anti_affinity': [{'topology_key': 'kubernetes.io/hostname', 'mode': 'preferred'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_resil_spread_check_partial():
+    result = call_tool('resil_spread_check', 'A25', {'workload': 'web', 'replicas': 6, 'min_available_replicas': 4, 'topology_domains': [{'key': 'topology.kubernetes.io/zone', 'count': 3}, {'key': 'kubernetes.io/hostname', 'count': 9}], 'spread_constraints': [{'topology_key': 'topology.kubernetes.io/zone', 'max_skew': 1, 'when_unsatisfiable': 'DoNotSchedule'}], 'anti_affinity': [{'topology_key': 'kubernetes.io/hostname', 'mode': 'preferred'}], 'probe': 'partial'})
     assert result["state"] == "PARTIAL_SUCCESS"
     assert isinstance(result["completed_fraction"], (int, float))
 
@@ -6611,6 +12153,856 @@ def test_shared_verdict_timeout():
 
 def test_shared_verdict_partial():
     result = call_tool('shared_verdict', 'A02', {'severities': ['info'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_abi_diff_success():
+    result = call_tool('sol_abi_diff', 'A26', {'old_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}], 'new_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}, {'kind': 'function', 'signature': 'burn(uint256)'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_abi_diff_invalid_input():
+    result = call_tool('sol_abi_diff', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_abi_diff_unauthorized():
+    result = call_tool('sol_abi_diff', 'A01', {'old_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}], 'new_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}, {'kind': 'function', 'signature': 'burn(uint256)'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_abi_diff'
+
+
+def test_sol_abi_diff_dependency():
+    result = call_tool('sol_abi_diff', 'A26', {'old_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}], 'new_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}, {'kind': 'function', 'signature': 'burn(uint256)'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_abi_diff_timeout():
+    result = call_tool('sol_abi_diff', 'A26', {'old_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}], 'new_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}, {'kind': 'function', 'signature': 'burn(uint256)'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_abi_diff_partial():
+    result = call_tool('sol_abi_diff', 'A26', {'old_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}], 'new_abi': [{'kind': 'function', 'signature': 'totalSupply()', 'mutability': 'view'}, {'kind': 'function', 'signature': 'burn(uint256)'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_access_matrix_success():
+    result = call_tool('sol_access_matrix', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_access_matrix_invalid_input():
+    result = call_tool('sol_access_matrix', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_access_matrix_unauthorized():
+    result = call_tool('sol_access_matrix', 'A01', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_access_matrix'
+
+
+def test_sol_access_matrix_dependency():
+    result = call_tool('sol_access_matrix', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_access_matrix_timeout():
+    result = call_tool('sol_access_matrix', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_access_matrix_partial():
+    result = call_tool('sol_access_matrix', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_deploy_plan_check_success():
+    result = call_tool('sol_deploy_plan_check', 'A26', {'chain_id': 11155111, 'expected_chain_id': 11155111, 'network_kind': 'testnet', 'script_asserts_chain_id': True, 'simulated': True, 'broadcast': False, 'verify_source': True, 'constructor_types': ['address', 'uint256'], 'constructor_args': ['0x1111111111111111111111111111111111111111', '1000'], 'owner_kind': 'multisig', 'owner_address': '0x1111111111111111111111111111111111111111', 'multisig_threshold': 2, 'multisig_signers': 3, 'signer_kind': 'hardware', 'rpc_url': 'https://rpc.sepolia.example.org', 'is_proxy_upgrade': False, 'human_approval': False})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_deploy_plan_check_invalid_input():
+    result = call_tool('sol_deploy_plan_check', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_deploy_plan_check_unauthorized():
+    result = call_tool('sol_deploy_plan_check', 'A01', {'chain_id': 11155111, 'expected_chain_id': 11155111, 'network_kind': 'testnet', 'script_asserts_chain_id': True, 'simulated': True, 'broadcast': False, 'verify_source': True, 'constructor_types': ['address', 'uint256'], 'constructor_args': ['0x1111111111111111111111111111111111111111', '1000'], 'owner_kind': 'multisig', 'owner_address': '0x1111111111111111111111111111111111111111', 'multisig_threshold': 2, 'multisig_signers': 3, 'signer_kind': 'hardware', 'rpc_url': 'https://rpc.sepolia.example.org', 'is_proxy_upgrade': False, 'human_approval': False})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_deploy_plan_check'
+
+
+def test_sol_deploy_plan_check_dependency():
+    result = call_tool('sol_deploy_plan_check', 'A26', {'chain_id': 11155111, 'expected_chain_id': 11155111, 'network_kind': 'testnet', 'script_asserts_chain_id': True, 'simulated': True, 'broadcast': False, 'verify_source': True, 'constructor_types': ['address', 'uint256'], 'constructor_args': ['0x1111111111111111111111111111111111111111', '1000'], 'owner_kind': 'multisig', 'owner_address': '0x1111111111111111111111111111111111111111', 'multisig_threshold': 2, 'multisig_signers': 3, 'signer_kind': 'hardware', 'rpc_url': 'https://rpc.sepolia.example.org', 'is_proxy_upgrade': False, 'human_approval': False, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_deploy_plan_check_timeout():
+    result = call_tool('sol_deploy_plan_check', 'A26', {'chain_id': 11155111, 'expected_chain_id': 11155111, 'network_kind': 'testnet', 'script_asserts_chain_id': True, 'simulated': True, 'broadcast': False, 'verify_source': True, 'constructor_types': ['address', 'uint256'], 'constructor_args': ['0x1111111111111111111111111111111111111111', '1000'], 'owner_kind': 'multisig', 'owner_address': '0x1111111111111111111111111111111111111111', 'multisig_threshold': 2, 'multisig_signers': 3, 'signer_kind': 'hardware', 'rpc_url': 'https://rpc.sepolia.example.org', 'is_proxy_upgrade': False, 'human_approval': False, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_deploy_plan_check_partial():
+    result = call_tool('sol_deploy_plan_check', 'A26', {'chain_id': 11155111, 'expected_chain_id': 11155111, 'network_kind': 'testnet', 'script_asserts_chain_id': True, 'simulated': True, 'broadcast': False, 'verify_source': True, 'constructor_types': ['address', 'uint256'], 'constructor_args': ['0x1111111111111111111111111111111111111111', '1000'], 'owner_kind': 'multisig', 'owner_address': '0x1111111111111111111111111111111111111111', 'multisig_threshold': 2, 'multisig_signers': 3, 'signer_kind': 'hardware', 'rpc_url': 'https://rpc.sepolia.example.org', 'is_proxy_upgrade': False, 'human_approval': False, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_eip712_typehash_success():
+    result = call_tool('sol_eip712_typehash', 'A26', {'encode_type': 'Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)', 'domain_name': 'Token', 'domain_version': '1', 'domain_chain_id': 1, 'verifying_contract': '0x1111111111111111111111111111111111111111'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_eip712_typehash_invalid_input():
+    result = call_tool('sol_eip712_typehash', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_eip712_typehash_unauthorized():
+    result = call_tool('sol_eip712_typehash', 'A01', {'encode_type': 'Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)', 'domain_name': 'Token', 'domain_version': '1', 'domain_chain_id': 1, 'verifying_contract': '0x1111111111111111111111111111111111111111'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_eip712_typehash'
+
+
+def test_sol_eip712_typehash_dependency():
+    result = call_tool('sol_eip712_typehash', 'A26', {'encode_type': 'Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)', 'domain_name': 'Token', 'domain_version': '1', 'domain_chain_id': 1, 'verifying_contract': '0x1111111111111111111111111111111111111111', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_eip712_typehash_timeout():
+    result = call_tool('sol_eip712_typehash', 'A26', {'encode_type': 'Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)', 'domain_name': 'Token', 'domain_version': '1', 'domain_chain_id': 1, 'verifying_contract': '0x1111111111111111111111111111111111111111', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_eip712_typehash_partial():
+    result = call_tool('sol_eip712_typehash', 'A26', {'encode_type': 'Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)', 'domain_name': 'Token', 'domain_version': '1', 'domain_chain_id': 1, 'verifying_contract': '0x1111111111111111111111111111111111111111', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_erc_conformance_success():
+    result = call_tool('sol_erc_conformance', 'A26', {'standard': 'erc2612', 'abi': [{'kind': 'function', 'signature': 'nonces(address)', 'mutability': 'view', 'returns': 'uint256'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_erc_conformance_invalid_input():
+    result = call_tool('sol_erc_conformance', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_erc_conformance_unauthorized():
+    result = call_tool('sol_erc_conformance', 'A01', {'standard': 'erc2612', 'abi': [{'kind': 'function', 'signature': 'nonces(address)', 'mutability': 'view', 'returns': 'uint256'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_erc_conformance'
+
+
+def test_sol_erc_conformance_dependency():
+    result = call_tool('sol_erc_conformance', 'A26', {'standard': 'erc2612', 'abi': [{'kind': 'function', 'signature': 'nonces(address)', 'mutability': 'view', 'returns': 'uint256'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_erc_conformance_timeout():
+    result = call_tool('sol_erc_conformance', 'A26', {'standard': 'erc2612', 'abi': [{'kind': 'function', 'signature': 'nonces(address)', 'mutability': 'view', 'returns': 'uint256'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_erc_conformance_partial():
+    result = call_tool('sol_erc_conformance', 'A26', {'standard': 'erc2612', 'abi': [{'kind': 'function', 'signature': 'nonces(address)', 'mutability': 'view', 'returns': 'uint256'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_event_coverage_success():
+    result = call_tool('sol_event_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 100})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_event_coverage_invalid_input():
+    result = call_tool('sol_event_coverage', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_event_coverage_unauthorized():
+    result = call_tool('sol_event_coverage', 'A01', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 100})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_event_coverage'
+
+
+def test_sol_event_coverage_dependency():
+    result = call_tool('sol_event_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 100, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_event_coverage_timeout():
+    result = call_tool('sol_event_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 100, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_event_coverage_partial():
+    result = call_tool('sol_event_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 100, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_gas_regression_success():
+    result = call_tool('sol_gas_regression', 'A26', {'baseline': [{'name': 'transfer', 'gas': 50000}], 'current': [{'name': 'transfer', 'gas': 51000}], 'max_regression_pct': 5})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_gas_regression_invalid_input():
+    result = call_tool('sol_gas_regression', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_gas_regression_unauthorized():
+    result = call_tool('sol_gas_regression', 'A01', {'baseline': [{'name': 'transfer', 'gas': 50000}], 'current': [{'name': 'transfer', 'gas': 51000}], 'max_regression_pct': 5})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_gas_regression'
+
+
+def test_sol_gas_regression_dependency():
+    result = call_tool('sol_gas_regression', 'A26', {'baseline': [{'name': 'transfer', 'gas': 50000}], 'current': [{'name': 'transfer', 'gas': 51000}], 'max_regression_pct': 5, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_gas_regression_timeout():
+    result = call_tool('sol_gas_regression', 'A26', {'baseline': [{'name': 'transfer', 'gas': 50000}], 'current': [{'name': 'transfer', 'gas': 51000}], 'max_regression_pct': 5, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_gas_regression_partial():
+    result = call_tool('sol_gas_regression', 'A26', {'baseline': [{'name': 'transfer', 'gas': 50000}], 'current': [{'name': 'transfer', 'gas': 51000}], 'max_regression_pct': 5, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_natspec_coverage_success():
+    result = call_tool('sol_natspec_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 50})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_natspec_coverage_invalid_input():
+    result = call_tool('sol_natspec_coverage', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_natspec_coverage_unauthorized():
+    result = call_tool('sol_natspec_coverage', 'A01', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 50})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_natspec_coverage'
+
+
+def test_sol_natspec_coverage_dependency():
+    result = call_tool('sol_natspec_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 50, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_natspec_coverage_timeout():
+    result = call_tool('sol_natspec_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 50, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_natspec_coverage_partial():
+    result = call_tool('sol_natspec_coverage', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'min_coverage_pct': 50, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_pragma_policy_success():
+    result = call_tool('sol_pragma_policy', 'A26', {'pragmas': ['0.8.28'], 'min_version': '0.8.20', 'require_pinned': True, 'via_ir': False, 'optimizer_enabled': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_pragma_policy_invalid_input():
+    result = call_tool('sol_pragma_policy', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_pragma_policy_unauthorized():
+    result = call_tool('sol_pragma_policy', 'A01', {'pragmas': ['0.8.28'], 'min_version': '0.8.20', 'require_pinned': True, 'via_ir': False, 'optimizer_enabled': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_pragma_policy'
+
+
+def test_sol_pragma_policy_dependency():
+    result = call_tool('sol_pragma_policy', 'A26', {'pragmas': ['0.8.28'], 'min_version': '0.8.20', 'require_pinned': True, 'via_ir': False, 'optimizer_enabled': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_pragma_policy_timeout():
+    result = call_tool('sol_pragma_policy', 'A26', {'pragmas': ['0.8.28'], 'min_version': '0.8.20', 'require_pinned': True, 'via_ir': False, 'optimizer_enabled': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_pragma_policy_partial():
+    result = call_tool('sol_pragma_policy', 'A26', {'pragmas': ['0.8.28'], 'min_version': '0.8.20', 'require_pinned': True, 'via_ir': False, 'optimizer_enabled': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_selector_check_success():
+    result = call_tool('sol_selector_check', 'A26', {'functions': ['transfer(address,uint256)', 'balanceOf(address)'], 'events': ['Transfer(address,address,uint256)']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_selector_check_invalid_input():
+    result = call_tool('sol_selector_check', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_selector_check_unauthorized():
+    result = call_tool('sol_selector_check', 'A01', {'functions': ['transfer(address,uint256)', 'balanceOf(address)'], 'events': ['Transfer(address,address,uint256)']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_selector_check'
+
+
+def test_sol_selector_check_dependency():
+    result = call_tool('sol_selector_check', 'A26', {'functions': ['transfer(address,uint256)', 'balanceOf(address)'], 'events': ['Transfer(address,address,uint256)'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_selector_check_timeout():
+    result = call_tool('sol_selector_check', 'A26', {'functions': ['transfer(address,uint256)', 'balanceOf(address)'], 'events': ['Transfer(address,address,uint256)'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_selector_check_partial():
+    result = call_tool('sol_selector_check', 'A26', {'functions': ['transfer(address,uint256)', 'balanceOf(address)'], 'events': ['Transfer(address,address,uint256)'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_storage_layout_success():
+    result = call_tool('sol_storage_layout', 'A26', {'old_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}], 'new_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}, {'label': 'paused', 'slot': 1, 'offset': 0, 'type': 't_bool', 'bytes': 1}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_storage_layout_invalid_input():
+    result = call_tool('sol_storage_layout', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_storage_layout_unauthorized():
+    result = call_tool('sol_storage_layout', 'A01', {'old_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}], 'new_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}, {'label': 'paused', 'slot': 1, 'offset': 0, 'type': 't_bool', 'bytes': 1}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_storage_layout'
+
+
+def test_sol_storage_layout_dependency():
+    result = call_tool('sol_storage_layout', 'A26', {'old_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}], 'new_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}, {'label': 'paused', 'slot': 1, 'offset': 0, 'type': 't_bool', 'bytes': 1}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_storage_layout_timeout():
+    result = call_tool('sol_storage_layout', 'A26', {'old_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}], 'new_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}, {'label': 'paused', 'slot': 1, 'offset': 0, 'type': 't_bool', 'bytes': 1}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_storage_layout_partial():
+    result = call_tool('sol_storage_layout', 'A26', {'old_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}], 'new_layout': [{'label': 'owner', 'slot': 0, 'offset': 0, 'type': 't_address', 'bytes': 20}, {'label': 'paused', 'slot': 1, 'offset': 0, 'type': 't_bool', 'bytes': 1}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_test_gate_success():
+    result = call_tool('sol_test_gate', 'A26', {'files': [{'path': 'src/Vault.sol', 'lines_found': 100, 'lines_hit': 96, 'branches_found': 20, 'branches_hit': 19, 'functions_found': 10, 'functions_hit': 10}], 'min_line_pct': 95, 'min_branch_pct': 90, 'tests_total': 40, 'tests_failed': 0, 'tests_skipped': 0, 'fuzz_tests': 6, 'fuzz_runs': 1000, 'invariant_tests': 2, 'require_invariants': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_test_gate_invalid_input():
+    result = call_tool('sol_test_gate', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_test_gate_unauthorized():
+    result = call_tool('sol_test_gate', 'A01', {'files': [{'path': 'src/Vault.sol', 'lines_found': 100, 'lines_hit': 96, 'branches_found': 20, 'branches_hit': 19, 'functions_found': 10, 'functions_hit': 10}], 'min_line_pct': 95, 'min_branch_pct': 90, 'tests_total': 40, 'tests_failed': 0, 'tests_skipped': 0, 'fuzz_tests': 6, 'fuzz_runs': 1000, 'invariant_tests': 2, 'require_invariants': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_test_gate'
+
+
+def test_sol_test_gate_dependency():
+    result = call_tool('sol_test_gate', 'A26', {'files': [{'path': 'src/Vault.sol', 'lines_found': 100, 'lines_hit': 96, 'branches_found': 20, 'branches_hit': 19, 'functions_found': 10, 'functions_hit': 10}], 'min_line_pct': 95, 'min_branch_pct': 90, 'tests_total': 40, 'tests_failed': 0, 'tests_skipped': 0, 'fuzz_tests': 6, 'fuzz_runs': 1000, 'invariant_tests': 2, 'require_invariants': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_test_gate_timeout():
+    result = call_tool('sol_test_gate', 'A26', {'files': [{'path': 'src/Vault.sol', 'lines_found': 100, 'lines_hit': 96, 'branches_found': 20, 'branches_hit': 19, 'functions_found': 10, 'functions_hit': 10}], 'min_line_pct': 95, 'min_branch_pct': 90, 'tests_total': 40, 'tests_failed': 0, 'tests_skipped': 0, 'fuzz_tests': 6, 'fuzz_runs': 1000, 'invariant_tests': 2, 'require_invariants': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_test_gate_partial():
+    result = call_tool('sol_test_gate', 'A26', {'files': [{'path': 'src/Vault.sol', 'lines_found': 100, 'lines_hit': 96, 'branches_found': 20, 'branches_hit': 19, 'functions_found': 10, 'functions_hit': 10}], 'min_line_pct': 95, 'min_branch_pct': 90, 'tests_total': 40, 'tests_failed': 0, 'tests_skipped': 0, 'fuzz_tests': 6, 'fuzz_runs': 1000, 'invariant_tests': 2, 'require_invariants': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_sol_upgrade_safety_success():
+    result = call_tool('sol_upgrade_safety', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'pattern': 'transparent'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_sol_upgrade_safety_invalid_input():
+    result = call_tool('sol_upgrade_safety', 'A26', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_sol_upgrade_safety_unauthorized():
+    result = call_tool('sol_upgrade_safety', 'A01', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'pattern': 'transparent'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'sol_upgrade_safety'
+
+
+def test_sol_upgrade_safety_dependency():
+    result = call_tool('sol_upgrade_safety', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'pattern': 'transparent', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_sol_upgrade_safety_timeout():
+    result = call_tool('sol_upgrade_safety', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'pattern': 'transparent', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_sol_upgrade_safety_partial():
+    result = call_tool('sol_upgrade_safety', 'A26', {'source': 'contract Box {\n    uint256 public value;\n    event ValueSet(uint256 v);\n    function set(uint256 v) external onlyOwner { value = v; emit ValueSet(v); }\n}\n', 'pattern': 'transparent', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_attestation_bundle_success():
+    result = call_tool('supply_attestation_bundle', 'A18', {'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'attestations': [{'predicate_type': 'https://slsa.dev/provenance/v1', 'subject_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'signed': True, 'signature_verified': True}], 'required_kinds': ['provenance']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_attestation_bundle_invalid_input():
+    result = call_tool('supply_attestation_bundle', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_attestation_bundle_unauthorized():
+    result = call_tool('supply_attestation_bundle', 'A01', {'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'attestations': [{'predicate_type': 'https://slsa.dev/provenance/v1', 'subject_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'signed': True, 'signature_verified': True}], 'required_kinds': ['provenance']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_attestation_bundle'
+
+
+def test_supply_attestation_bundle_dependency():
+    result = call_tool('supply_attestation_bundle', 'A18', {'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'attestations': [{'predicate_type': 'https://slsa.dev/provenance/v1', 'subject_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'signed': True, 'signature_verified': True}], 'required_kinds': ['provenance'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_attestation_bundle_timeout():
+    result = call_tool('supply_attestation_bundle', 'A18', {'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'attestations': [{'predicate_type': 'https://slsa.dev/provenance/v1', 'subject_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'signed': True, 'signature_verified': True}], 'required_kinds': ['provenance'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_attestation_bundle_partial():
+    result = call_tool('supply_attestation_bundle', 'A18', {'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'attestations': [{'predicate_type': 'https://slsa.dev/provenance/v1', 'subject_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'signed': True, 'signature_verified': True}], 'required_kinds': ['provenance'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_base_image_policy_success():
+    result = call_tool('supply_base_image_policy', 'A18', {'images': [{'ref': 'ghcr.io/acme/base:1.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'created_at': '2026-02-01T00:00:00+00:00'}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'max_age_days': 90, 'as_of': '2026-03-01T00:00:00+00:00'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_base_image_policy_invalid_input():
+    result = call_tool('supply_base_image_policy', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_base_image_policy_unauthorized():
+    result = call_tool('supply_base_image_policy', 'A01', {'images': [{'ref': 'ghcr.io/acme/base:1.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'created_at': '2026-02-01T00:00:00+00:00'}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'max_age_days': 90, 'as_of': '2026-03-01T00:00:00+00:00'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_base_image_policy'
+
+
+def test_supply_base_image_policy_dependency():
+    result = call_tool('supply_base_image_policy', 'A18', {'images': [{'ref': 'ghcr.io/acme/base:1.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'created_at': '2026-02-01T00:00:00+00:00'}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'max_age_days': 90, 'as_of': '2026-03-01T00:00:00+00:00', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_base_image_policy_timeout():
+    result = call_tool('supply_base_image_policy', 'A18', {'images': [{'ref': 'ghcr.io/acme/base:1.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'created_at': '2026-02-01T00:00:00+00:00'}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'max_age_days': 90, 'as_of': '2026-03-01T00:00:00+00:00', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_base_image_policy_partial():
+    result = call_tool('supply_base_image_policy', 'A18', {'images': [{'ref': 'ghcr.io/acme/base:1.2.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'created_at': '2026-02-01T00:00:00+00:00'}], 'allowed_registries': ['ghcr.io/acme'], 'require_digest': True, 'max_age_days': 90, 'as_of': '2026-03-01T00:00:00+00:00', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_dockerfile_lint_success():
+    result = call_tool('supply_dockerfile_lint', 'A18', {'content': 'FROM alpine:3.20@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRUN apk add --no-cache curl\nUSER app\nHEALTHCHECK CMD wget -q --spider http://localhost:8080/health || exit 1\n'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_dockerfile_lint_invalid_input():
+    result = call_tool('supply_dockerfile_lint', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_dockerfile_lint_unauthorized():
+    result = call_tool('supply_dockerfile_lint', 'A01', {'content': 'FROM alpine:3.20@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRUN apk add --no-cache curl\nUSER app\nHEALTHCHECK CMD wget -q --spider http://localhost:8080/health || exit 1\n'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_dockerfile_lint'
+
+
+def test_supply_dockerfile_lint_dependency():
+    result = call_tool('supply_dockerfile_lint', 'A18', {'content': 'FROM alpine:3.20@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRUN apk add --no-cache curl\nUSER app\nHEALTHCHECK CMD wget -q --spider http://localhost:8080/health || exit 1\n', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_dockerfile_lint_timeout():
+    result = call_tool('supply_dockerfile_lint', 'A18', {'content': 'FROM alpine:3.20@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRUN apk add --no-cache curl\nUSER app\nHEALTHCHECK CMD wget -q --spider http://localhost:8080/health || exit 1\n', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_dockerfile_lint_partial():
+    result = call_tool('supply_dockerfile_lint', 'A18', {'content': 'FROM alpine:3.20@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRUN apk add --no-cache curl\nUSER app\nHEALTHCHECK CMD wget -q --spider http://localhost:8080/health || exit 1\n', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_license_policy_success():
+    result = call_tool('supply_license_policy', 'A18', {'components': [{'name': 'left-pad', 'license': 'MIT'}], 'allow': ['MIT', 'Apache-2.0'], 'deny': [], 'deny_categories': ['network-copyleft']})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_license_policy_invalid_input():
+    result = call_tool('supply_license_policy', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_license_policy_unauthorized():
+    result = call_tool('supply_license_policy', 'A01', {'components': [{'name': 'left-pad', 'license': 'MIT'}], 'allow': ['MIT', 'Apache-2.0'], 'deny': [], 'deny_categories': ['network-copyleft']})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_license_policy'
+
+
+def test_supply_license_policy_dependency():
+    result = call_tool('supply_license_policy', 'A18', {'components': [{'name': 'left-pad', 'license': 'MIT'}], 'allow': ['MIT', 'Apache-2.0'], 'deny': [], 'deny_categories': ['network-copyleft'], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_license_policy_timeout():
+    result = call_tool('supply_license_policy', 'A18', {'components': [{'name': 'left-pad', 'license': 'MIT'}], 'allow': ['MIT', 'Apache-2.0'], 'deny': [], 'deny_categories': ['network-copyleft'], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_license_policy_partial():
+    result = call_tool('supply_license_policy', 'A18', {'components': [{'name': 'left-pad', 'license': 'MIT'}], 'allow': ['MIT', 'Apache-2.0'], 'deny': [], 'deny_categories': ['network-copyleft'], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_pin_audit_success():
+    result = call_tool('supply_pin_audit', 'A18', {'files': [{'path': '.github/workflows/ci.yml', 'content': 'steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_pin_audit_invalid_input():
+    result = call_tool('supply_pin_audit', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_pin_audit_unauthorized():
+    result = call_tool('supply_pin_audit', 'A01', {'files': [{'path': '.github/workflows/ci.yml', 'content': 'steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_pin_audit'
+
+
+def test_supply_pin_audit_dependency():
+    result = call_tool('supply_pin_audit', 'A18', {'files': [{'path': '.github/workflows/ci.yml', 'content': 'steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_pin_audit_timeout():
+    result = call_tool('supply_pin_audit', 'A18', {'files': [{'path': '.github/workflows/ci.yml', 'content': 'steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_pin_audit_partial():
+    result = call_tool('supply_pin_audit', 'A18', {'files': [{'path': '.github/workflows/ci.yml', 'content': 'steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'}], 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_provenance_match_success():
+    result = call_tool('supply_provenance_match', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'artifact_name': 'ghcr.io/acme/app'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_provenance_match_invalid_input():
+    result = call_tool('supply_provenance_match', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_provenance_match_unauthorized():
+    result = call_tool('supply_provenance_match', 'A01', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'artifact_name': 'ghcr.io/acme/app'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_provenance_match'
+
+
+def test_supply_provenance_match_dependency():
+    result = call_tool('supply_provenance_match', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'artifact_name': 'ghcr.io/acme/app', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_provenance_match_timeout():
+    result = call_tool('supply_provenance_match', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'artifact_name': 'ghcr.io/acme/app', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_provenance_match_partial():
+    result = call_tool('supply_provenance_match', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'artifact_digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'artifact_name': 'ghcr.io/acme/app', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_retention_plan_success():
+    result = call_tool('supply_retention_plan', 'A18', {'tags': [{'tag': 'v1.0.0', 'digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'pushed_at': '2025-01-01T00:00:00+00:00'}, {'tag': 'pr-12', 'digest': 'sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210', 'pushed_at': '2025-01-02T00:00:00+00:00'}], 'keep_latest': 1, 'min_age_days': 30, 'protected_prefixes': ['v'], 'protected_digests': [], 'max_delete_pct': 90, 'as_of': '2026-03-01T00:00:00+00:00'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_retention_plan_invalid_input():
+    result = call_tool('supply_retention_plan', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_retention_plan_unauthorized():
+    result = call_tool('supply_retention_plan', 'A01', {'tags': [{'tag': 'v1.0.0', 'digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'pushed_at': '2025-01-01T00:00:00+00:00'}, {'tag': 'pr-12', 'digest': 'sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210', 'pushed_at': '2025-01-02T00:00:00+00:00'}], 'keep_latest': 1, 'min_age_days': 30, 'protected_prefixes': ['v'], 'protected_digests': [], 'max_delete_pct': 90, 'as_of': '2026-03-01T00:00:00+00:00'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_retention_plan'
+
+
+def test_supply_retention_plan_dependency():
+    result = call_tool('supply_retention_plan', 'A18', {'tags': [{'tag': 'v1.0.0', 'digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'pushed_at': '2025-01-01T00:00:00+00:00'}, {'tag': 'pr-12', 'digest': 'sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210', 'pushed_at': '2025-01-02T00:00:00+00:00'}], 'keep_latest': 1, 'min_age_days': 30, 'protected_prefixes': ['v'], 'protected_digests': [], 'max_delete_pct': 90, 'as_of': '2026-03-01T00:00:00+00:00', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_retention_plan_timeout():
+    result = call_tool('supply_retention_plan', 'A18', {'tags': [{'tag': 'v1.0.0', 'digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'pushed_at': '2025-01-01T00:00:00+00:00'}, {'tag': 'pr-12', 'digest': 'sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210', 'pushed_at': '2025-01-02T00:00:00+00:00'}], 'keep_latest': 1, 'min_age_days': 30, 'protected_prefixes': ['v'], 'protected_digests': [], 'max_delete_pct': 90, 'as_of': '2026-03-01T00:00:00+00:00', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_retention_plan_partial():
+    result = call_tool('supply_retention_plan', 'A18', {'tags': [{'tag': 'v1.0.0', 'digest': 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'pushed_at': '2025-01-01T00:00:00+00:00'}, {'tag': 'pr-12', 'digest': 'sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210', 'pushed_at': '2025-01-02T00:00:00+00:00'}], 'keep_latest': 1, 'min_age_days': 30, 'protected_prefixes': ['v'], 'protected_digests': [], 'max_delete_pct': 90, 'as_of': '2026-03-01T00:00:00+00:00', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_sbom_diff_success():
+    result = call_tool('supply_sbom_diff', 'A18', {'before': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'after': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"type": "library", "name": "zlib", "version": "1.3.2", "purl": "pkg:generic/zlib@1.3.2", "licenses": [{"license": {"id": "Zlib"}}]}]}'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_sbom_diff_invalid_input():
+    result = call_tool('supply_sbom_diff', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_sbom_diff_unauthorized():
+    result = call_tool('supply_sbom_diff', 'A01', {'before': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'after': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"type": "library", "name": "zlib", "version": "1.3.2", "purl": "pkg:generic/zlib@1.3.2", "licenses": [{"license": {"id": "Zlib"}}]}]}'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_sbom_diff'
+
+
+def test_supply_sbom_diff_dependency():
+    result = call_tool('supply_sbom_diff', 'A18', {'before': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'after': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"type": "library", "name": "zlib", "version": "1.3.2", "purl": "pkg:generic/zlib@1.3.2", "licenses": [{"license": {"id": "Zlib"}}]}]}', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_sbom_diff_timeout():
+    result = call_tool('supply_sbom_diff', 'A18', {'before': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'after': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"type": "library", "name": "zlib", "version": "1.3.2", "purl": "pkg:generic/zlib@1.3.2", "licenses": [{"license": {"id": "Zlib"}}]}]}', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_sbom_diff_partial():
+    result = call_tool('supply_sbom_diff', 'A18', {'before': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'after': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [{"type": "library", "name": "zlib", "version": "1.3.2", "purl": "pkg:generic/zlib@1.3.2", "licenses": [{"license": {"id": "Zlib"}}]}]}', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_sbom_validate_success():
+    result = call_tool('supply_sbom_validate', 'A18', {'document': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}'})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_sbom_validate_invalid_input():
+    result = call_tool('supply_sbom_validate', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_sbom_validate_unauthorized():
+    result = call_tool('supply_sbom_validate', 'A01', {'document': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}'})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_sbom_validate'
+
+
+def test_supply_sbom_validate_dependency():
+    result = call_tool('supply_sbom_validate', 'A18', {'document': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_sbom_validate_timeout():
+    result = call_tool('supply_sbom_validate', 'A18', {'document': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_sbom_validate_partial():
+    result = call_tool('supply_sbom_validate', 'A18', {'document': '{"bomFormat": "CycloneDX", "specVersion": "1.5", "metadata": {"timestamp": "2026-02-01T10:00:00Z", "authors": [{"name": "build-bot"}], "component": {"type": "application", "name": "app", "version": "1.0.0", "bom-ref": "app", "supplier": {"name": "Acme"}, "purl": "pkg:generic/app@1.0.0"}}, "components": [{"type": "library", "name": "zlib", "version": "1.3.1", "bom-ref": "zlib", "supplier": {"name": "zlib.net"}, "purl": "pkg:generic/zlib@1.3.1", "licenses": [{"license": {"id": "Zlib"}}]}], "dependencies": [{"ref": "app", "dependsOn": ["zlib"]}, {"ref": "zlib", "dependsOn": []}]}', 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_signature_policy_success():
+    result = call_tool('supply_signature_policy', 'A18', {'signatures': [{'signer': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0', 'issuer': 'https://token.actions.githubusercontent.com', 'verified': True, 'in_transparency_log': True}], 'rules': [{'name': 'release-workflow', 'issuer': 'https://token.actions.githubusercontent.com', 'identity': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/*', 'required': True}], 'min_valid_signatures': 1, 'require_transparency_log': True})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_signature_policy_invalid_input():
+    result = call_tool('supply_signature_policy', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_signature_policy_unauthorized():
+    result = call_tool('supply_signature_policy', 'A01', {'signatures': [{'signer': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0', 'issuer': 'https://token.actions.githubusercontent.com', 'verified': True, 'in_transparency_log': True}], 'rules': [{'name': 'release-workflow', 'issuer': 'https://token.actions.githubusercontent.com', 'identity': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/*', 'required': True}], 'min_valid_signatures': 1, 'require_transparency_log': True})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_signature_policy'
+
+
+def test_supply_signature_policy_dependency():
+    result = call_tool('supply_signature_policy', 'A18', {'signatures': [{'signer': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0', 'issuer': 'https://token.actions.githubusercontent.com', 'verified': True, 'in_transparency_log': True}], 'rules': [{'name': 'release-workflow', 'issuer': 'https://token.actions.githubusercontent.com', 'identity': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/*', 'required': True}], 'min_valid_signatures': 1, 'require_transparency_log': True, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_signature_policy_timeout():
+    result = call_tool('supply_signature_policy', 'A18', {'signatures': [{'signer': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0', 'issuer': 'https://token.actions.githubusercontent.com', 'verified': True, 'in_transparency_log': True}], 'rules': [{'name': 'release-workflow', 'issuer': 'https://token.actions.githubusercontent.com', 'identity': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/*', 'required': True}], 'min_valid_signatures': 1, 'require_transparency_log': True, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_signature_policy_partial():
+    result = call_tool('supply_signature_policy', 'A18', {'signatures': [{'signer': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0', 'issuer': 'https://token.actions.githubusercontent.com', 'verified': True, 'in_transparency_log': True}], 'rules': [{'name': 'release-workflow', 'issuer': 'https://token.actions.githubusercontent.com', 'identity': 'https://github.com/acme/app/.github/workflows/release.yml@refs/tags/*', 'required': True}], 'min_valid_signatures': 1, 'require_transparency_log': True, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_slsa_level_success():
+    result = call_tool('supply_slsa_level', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'signature_verified': True, 'trusted_builder_ids': ['https://github.com/actions/runner/github-hosted'], 'isolated_build': False, 'signing_key_isolated': False, 'required_level': 2})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_slsa_level_invalid_input():
+    result = call_tool('supply_slsa_level', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_slsa_level_unauthorized():
+    result = call_tool('supply_slsa_level', 'A01', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'signature_verified': True, 'trusted_builder_ids': ['https://github.com/actions/runner/github-hosted'], 'isolated_build': False, 'signing_key_isolated': False, 'required_level': 2})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_slsa_level'
+
+
+def test_supply_slsa_level_dependency():
+    result = call_tool('supply_slsa_level', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'signature_verified': True, 'trusted_builder_ids': ['https://github.com/actions/runner/github-hosted'], 'isolated_build': False, 'signing_key_isolated': False, 'required_level': 2, 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_slsa_level_timeout():
+    result = call_tool('supply_slsa_level', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'signature_verified': True, 'trusted_builder_ids': ['https://github.com/actions/runner/github-hosted'], 'isolated_build': False, 'signing_key_isolated': False, 'required_level': 2, 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_slsa_level_partial():
+    result = call_tool('supply_slsa_level', 'A18', {'provenance': '{"_type": "https://in-toto.io/Statement/v1", "subject": [{"name": "ghcr.io/acme/app", "digest": {"sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {"buildType": "https://actions.github.io/buildtypes/workflow/v1", "externalParameters": {"workflow": {"ref": "refs/heads/main", "repository": "https://github.com/acme/app"}}}, "runDetails": {"builder": {"id": "https://github.com/actions/runner/github-hosted"}}}}', 'signature_verified': True, 'trusted_builder_ids': ['https://github.com/actions/runner/github-hosted'], 'isolated_build': False, 'signing_key_isolated': False, 'required_level': 2, 'probe': 'partial'})
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert isinstance(result["completed_fraction"], (int, float))
+
+
+def test_supply_vex_apply_success():
+    result = call_tool('supply_vex_apply', 'A18', {'vulnerabilities': [{'id': 'CVE-2026-0001', 'product': 'pkg:pypi/requests@2.31.0', 'severity': 'high'}], 'statements': [{'vulnerability': 'CVE-2026-0001', 'products': ['pkg:pypi/requests@2.31.0'], 'status': 'not_affected', 'justification': 'vulnerable_code_not_in_execute_path', 'timestamp': '2026-02-01T00:00:00+00:00'}]})
+    assert result["state"] == "SUCCESS"
+
+
+def test_supply_vex_apply_invalid_input():
+    result = call_tool('supply_vex_apply', 'A18', {})
+    assert result["state"] == "INVALID_INPUT"
+    assert result["field"]
+
+
+def test_supply_vex_apply_unauthorized():
+    result = call_tool('supply_vex_apply', 'A01', {'vulnerabilities': [{'id': 'CVE-2026-0001', 'product': 'pkg:pypi/requests@2.31.0', 'severity': 'high'}], 'statements': [{'vulnerability': 'CVE-2026-0001', 'products': ['pkg:pypi/requests@2.31.0'], 'status': 'not_affected', 'justification': 'vulnerable_code_not_in_execute_path', 'timestamp': '2026-02-01T00:00:00+00:00'}]})
+    assert result["state"] == "UNAUTHORIZED"
+    assert result['caller'] == 'A01'
+    assert result['target'] == 'supply_vex_apply'
+
+
+def test_supply_vex_apply_dependency():
+    result = call_tool('supply_vex_apply', 'A18', {'vulnerabilities': [{'id': 'CVE-2026-0001', 'product': 'pkg:pypi/requests@2.31.0', 'severity': 'high'}], 'statements': [{'vulnerability': 'CVE-2026-0001', 'products': ['pkg:pypi/requests@2.31.0'], 'status': 'not_affected', 'justification': 'vulnerable_code_not_in_execute_path', 'timestamp': '2026-02-01T00:00:00+00:00'}], 'probe': 'dependency'})
+    assert result["state"] == "DEPENDENCY_UNAVAILABLE"
+
+
+def test_supply_vex_apply_timeout():
+    result = call_tool('supply_vex_apply', 'A18', {'vulnerabilities': [{'id': 'CVE-2026-0001', 'product': 'pkg:pypi/requests@2.31.0', 'severity': 'high'}], 'statements': [{'vulnerability': 'CVE-2026-0001', 'products': ['pkg:pypi/requests@2.31.0'], 'status': 'not_affected', 'justification': 'vulnerable_code_not_in_execute_path', 'timestamp': '2026-02-01T00:00:00+00:00'}], 'probe': 'sleep'}, timeout_s=0.05)
+    assert result["state"] == "TIMEOUT"
+
+
+def test_supply_vex_apply_partial():
+    result = call_tool('supply_vex_apply', 'A18', {'vulnerabilities': [{'id': 'CVE-2026-0001', 'product': 'pkg:pypi/requests@2.31.0', 'severity': 'high'}], 'statements': [{'vulnerability': 'CVE-2026-0001', 'products': ['pkg:pypi/requests@2.31.0'], 'status': 'not_affected', 'justification': 'vulnerable_code_not_in_execute_path', 'timestamp': '2026-02-01T00:00:00+00:00'}], 'probe': 'partial'})
     assert result["state"] == "PARTIAL_SUCCESS"
     assert isinstance(result["completed_fraction"], (int, float))
 

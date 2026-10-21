@@ -1,5 +1,7 @@
 # Agent Swarm Enhancements
 
+> **Dated analysis, committed 2026-10-20.** Sections 1 to 5 and the acceptance table below describe the 15-agent state at the 2.0.0 prompt rewrite and are kept as written. Section 6 and the current status record the v2.3 resolutions; see [Current status (v2.3)](#current-status-v23).
+
 ## 1. Scope and status
 
 - Enhancements 1 to 6 are applied inside the rewritten prompts (`prompts/A01.md` through `prompts/A15.md`).
@@ -172,9 +174,18 @@ All 15 agents are flagged as under-equipped against the target of 10.
 ## 6. Open decisions for the user
 
 - **(a)** Build the missing tools as a separate milestone, or accept under-equipped prompts. Section 4 flags all 15 agents until one of these is chosen.
+  - Resolved in v2.3: each agent holds 10 to 15 registered tools and 10 to 15 skill sources (`capability_policy`, enforced). No agent is flagged under-equipped.
 - **(b)** Whether to ship. The ultrathink config has `autoMerge` set to true, and the worktree mixes uncommitted changes from several sources. Ship stays uninvoked until this is decided.
+  - Resolved in v2.3.
 
-## Status: acceptance criteria as checked
+## Current status (v2.3)
+
+- **Roster.** 30 agents in `agents.json`: A01 to A15 (SDLC), A16 to A20 (cloud-native), A21 to A25 (cluster) and A26 to A30 (Web3). Each has a prompt in `prompts/`.
+- **Tools and skills.** Every agent is inside the 10 to 15 range set by `capability_policy` (`enforce: true`). Lane-owned registered tools are 12 or 13 per agent; skill sources are 10 to 14 per agent. The shared baseline sits on top and is not counted.
+- **Decisions.** (a) Tools: resolved in v2.3. The tools exist as registry tools with handlers in `swarm/tools/` and per-agent test suites in `tests/`. (b) Ship: resolved in v2.3. Section 6 records both.
+- The figures in Sections 2 to 5 and the table below describe the 15-agent state at the 2.0.0 rewrite.
+
+## Status at the 2.0.0 rewrite (dated analysis)
 
 Checks were run by the orchestrator after the prompt rewrites. Results are for the working tree, which also holds uncommitted work from other sources.
 

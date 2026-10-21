@@ -26,7 +26,7 @@ import {
  *   - every capture in the doc equals the fixture with the ANSI removed (needs nothing);
  *   - the captures satisfy the bar's contract on their own (exactly two rows of exactly the capture's width, caps in the same
  *     columns, glyph and word of every state, `+N more`, chips right-anchored and dropped by priority).
- * Refresh after a renderer change: `bun omp/test/fixtures/bar_states.ts --write` (see the doc, section 11).
+ * Refresh after a renderer change: `bun omp/test/fixtures/bar_states.ts --write` (see the doc, section 10).
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -53,7 +53,7 @@ describe("bar captures vs the renderer", () => {
     }
     expect(WIDTHS).toEqual([40, 80, 120]);
     expect(SCENARIOS.map((scenario) => scenario.name)).toEqual(expect.arrayContaining(["idle", "loading", "active", "overflow", "completed", "failed", "error"]));
-    for (const key of ["status", "headless", "spinner:animated+0s@80", "spinner:reduced+0s@80", "linger:done+19s@80", "linger:failed+600s@80"]) {
+    for (const key of ["headless", "spinner:animated+0s@80", "spinner:reduced+0s@80", "linger:done+19s@80", "linger:failed+600s@80"]) {
       expect(Object.keys(fixture)).toContain(key);
     }
   });
@@ -207,7 +207,7 @@ describe("the token chips (row 1, right)", () => {
   test("chips sit at the right end of row 1 with `saved` right-most; row 2 never carries them", () => {
     for (const key of ["tokens-active@80", "tokens-active@120", "tokens-idle@120", "tokens-idle@200", "tokens-minimal@80"]) {
       expect({ key, end: rows(key)[0].endsWith("saved 48.2k ◗") }).toEqual({ key, end: true });
-      expect({ key, row2: rows(key)[1].includes("saved") }).toEqual({ key, row2: false });
+      expect({ key, below: rows(key).slice(1).join("\n").includes("saved") }).toEqual({ key, below: false });
     }
   });
 
@@ -267,7 +267,6 @@ describe("docs/swarm-bar.md names what the bar reads", () => {
       "live.json",
       "task:subagent:progress",
       "task:subagent:lifecycle",
-      "setStatus",
       "+N more",
       "bars:restack",
       "token-opt:savings",

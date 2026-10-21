@@ -389,7 +389,7 @@ def _blank(value) -> bool:
 
 
 def docs_runbook_schema_check(payload: dict) -> dict:
-    """Validate runbook fragments against the executable schema A13 consumes (03-agents/A15-docs.md section 3)."""
+    """Validate runbook fragments against the executable schema A13 consumes (agents/A15-docs.md section 3)."""
 
     def work() -> dict:
         known = payload.get("known_actions")
@@ -453,7 +453,7 @@ def docs_runbook_schema_check(payload: dict) -> dict:
 
 
 def docs_digest_staleness(payload: dict) -> dict:
-    """Staleness law (03-agents/A15-docs.md section 4.2): a doc is stale when its bound artifact digest differs from the current one."""
+    """Staleness law (agents/A15-docs.md section 4.2): a doc is stale when its bound artifact digest differs from the current one."""
 
     def work() -> dict:
         current: dict[str, str] = {}
@@ -535,7 +535,7 @@ MAX_REPORTED_VIOLATIONS = 500  # the list is a sample; violation_count and by_te
 
 
 def docs_terminology_drift(payload: dict) -> dict:
-    """Glossary lint (03-agents/A15-docs.md sections 5 and 6): deprecated or variant terms per file and line."""
+    """Glossary lint (agents/A15-docs.md sections 5 and 6): deprecated or variant terms per file and line."""
 
     def work() -> dict:
         owner: dict[str, str] = {}

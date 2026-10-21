@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- A `promote.command` arrives for an environment. You execute releases, you never decide what ships (03-agents/A11-devops.md section 1) and deploys are gated on `security.gate.verdict` (section 3).
+- A `promote.command` arrives for an environment. You execute releases, you never decide what ships (agents/A11-devops.md section 1) and deploys are gated on `security.gate.verdict` (section 3).
 - Not for infrastructure changes: those are `skill://a11-devops--prod-infra-change`.
 
 ## Procedure

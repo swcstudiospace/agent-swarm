@@ -123,7 +123,7 @@ def test_fixture_converts_to_one_task_per_node_plus_explicit_splits(tmp_path):
     assert [task["id"] for task in tasks] == expected_ids
 
     manifest = {agent["id"]: agent for agent in json.loads((ROOT / "agents.json").read_text())["agents"]}
-    assert len(manifest) == 15
+    assert len(manifest) == 30
     by_node: dict[str, list[dict]] = {}
     for task in tasks:
         by_node.setdefault(task["node_id"], []).append(task)
@@ -312,6 +312,39 @@ def test_mixed_owner_step_names_only_that_agents_files(tmp_path):
     assert tasks["A15"]["acceptance"] == ["Edit docs/GUIDE.md"]
 
 
+def test_a_step_across_domains_splits_by_owner_in_agent_order(tmp_path):
+    step = "Edit contracts/Vault.sol, web3/useVault.ts, k8s/vault.yaml and src/api.py"
+    tasks = _plan(tmp_path, _write_summary(tmp_path, [_node("n1", "generate", [step])]))["tasks"]
+    assert [task["agent"] for task in tasks] == ["A05", "A22", "A26", "A29"]
+    assert [task["acceptance"] for task in tasks] == [
+        ["Edit src/api.py"], ["Edit k8s/vault.yaml"], ["Edit contracts/Vault.sol"], ["Edit web3/useVault.ts"]]
+
+
+@pytest.mark.parametrize("step,owner", [
+    ("Edit infra/main.tf", "A11"),
+    ("Edit .github/workflows/ci.yml", "A11"),
+    ("Edit components/Button.tsx", "A06"),
+    ("Edit db/migrations/001.sql", "A07"),
+    ("Edit docs/contracts/overview.md", "A15"),
+    ("Edit src/api.py", "A05"),
+])
+def test_existing_routes_still_win_where_they_always_did(tmp_path, step, owner):
+    tasks = _plan(tmp_path, _write_summary(tmp_path, [_node("n1", "generate", [step])]))["tasks"]
+    assert [task["agent"] for task in tasks] == [owner]
+
+
+@pytest.mark.parametrize("step,owner", [
+    ("Edit contracts/openapi.yaml", "A05"),
+    ("Edit contracts/Vault.sol", "A26"),
+    ("Edit contracts/abi/Vault.json", "A26"),
+    ("Edit contracts/abi/openapi.json", "A03"),
+])
+def test_contracts_dir_routes_only_smart_contracts_to_a26(tmp_path, step, owner):
+    """An API descriptor under contracts/ keeps its code owner; Solidity and JSON ABIs go to A26."""
+    tasks = _plan(tmp_path, _write_summary(tmp_path, [_node("n1", "generate", [step])]))["tasks"]
+    assert [task["agent"] for task in tasks] == [owner]
+
+
 def test_node_id_leaves_room_for_prefix_and_owner_suffix(tmp_path):
     """orch_plan's default prefix is six characters ("T" + 4 hex + "-") and a split adds "-aNN"."""
     legal = "n" + "x" * 117  # 118: 128 - 6 - 4
@@ -425,7 +458,7 @@ def _event_count(log: Path) -> int:
 
 @pytest.mark.skipif(not HAS_BUN, reason="bun not installed")
 def test_bun_logs_events_in_the_caller_workspace(tmp_path):
-    """passthrough runs Python in the checkout. State paths must still be the caller's."""
+    """passthrough runs Python in the caller's cwd; state paths must still be the caller's."""
     work = tmp_path / "work"
     work.mkdir()
     env = _caller_env()

@@ -9,13 +9,13 @@
 1. **Registry-mediated everything.** Agents are discovered by capability manifest, never hard-wired — consumers bind to artifacts/message types, not to agent identities.
 2. **Additive-first.** New message types, fields, and capabilities are always additive; removals go through deprecation windows.
 3. **Shadow → probation → full autonomy.** New agents earn trust progressively (see §4).
-4. **No special cases in the core.** A01's scheduler, gates, and lifecycle treat every agent class uniformly through the manifest; a new agent needs zero orchestrator changes.
+4. **No special cases in the scheduler.** A01's scheduler, gates, and lifecycle treat every agent class uniformly through the manifest; adding an agent changes data, not the scheduler. The places that list agents by id (tool prefixes, substrate surfaces, plan patterns, path routing, blast-radius lanes, guard rows, count-pinning tests) are enumerated in [docs/swarm-command-center.md §9.1](docs/swarm-command-center.md).
 
 ## 2. Agent manifest schema (`swarm.manifest.v1`)
 
 ```json
 {
-  "id": "A16", "code": "ML", "class": "build", "lane": "code",
+  "id": "A<NN>", "code": "<CODE>", "class": "build", "lane": "code",
   "version": "0.1.0",
   "capabilities": ["code.ml-pipeline", "code.model-eval"],
   "consumes":  [ { "type": "task.assign",  "schema": "swarm.v1.task.assign" },
@@ -30,12 +30,16 @@
 }
 ```
 
+Ids A01–A30 are allocated to the roster in `agents.json`; the example uses placeholders (`A<NN>`, `<CODE>`) and illustrative capability and artifact names, so it does not collide with a real agent.
+
 **Invariants enforced at registration:** every produced type must be schema-registered; artifact ownership must not overlap an existing single-writer claim (unless co-signed by both agents as a carve-out); `gates_required` ⊆ {review, quality, security, release}.
 
 ## 3. Adding a new agent — checklist (zero-disruption path)
 
+The repository-level checklist (roster entry, code and tests that list agents, tools, skills, scripts, regeneration, gates) is [docs/swarm-command-center.md §9.1](docs/swarm-command-center.md). The steps below are the design-level onboarding path.
+
 1. **Gap analysis** — confirm the capability isn't already covered (roles are complementary by policy; A01 arbitration history and the capability registry are checked).
-2. **Write the spec** — same 7-section template as [03-agents/](03-agents/) (purpose, stack, I/O, autonomy, error handling, metrics, security).
+2. **Write the spec** — same 7-section template as [agents/](agents/) (purpose, stack, I/O, autonomy, error handling, metrics, security).
 3. **Register contracts** — new schemas into the registry with exemplars; declare `consumes`/`produces`; run Level C contract tests.
 4. **Build in `sim`** — golden-task corpus (Level U) + dry-run mode.
 5. **Shadow mode (L0)** — deploy alongside; consumes real traffic, outputs recorded but *not* consumed by anyone; verdict/output diffing vs the incumbent (if replacing) or plausibility checks (if net-new).

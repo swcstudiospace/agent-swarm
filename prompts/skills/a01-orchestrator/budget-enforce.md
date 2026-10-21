@@ -9,7 +9,7 @@ tools: [orch_budget_class, orch_budget_guard, shared_cancel_check, shared_scratc
 
 ## When to Use
 
-- A task's usage reaches 80 % of any budget dimension, or a runner reports E-TIMEOUT. Rule: hard-stop at 100 %, checkpoint, requeue once with an annotated budget, second breach ESCALATED (03-agents/A01, rule 5).
+- A task's usage reaches 80 % of any budget dimension, or a runner reports E-TIMEOUT. Rule: hard-stop at 100 %, checkpoint, requeue once with an annotated budget, second breach ESCALATED (agents/A01, rule 5).
 
 ## Procedure
 

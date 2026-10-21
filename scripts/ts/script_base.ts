@@ -37,6 +37,14 @@ export function parseAgentArgs(argv: string[]): AgentArgs {
   return out;
 }
 
+/** Canonical id shape of swarm/script_base.py (TASK_ID_RE and no ".."): the id as the events log may carry it. An absent id stays
+ * absent, a safe id stays, and any other value is logged as null so that a credential typed as an id never reaches events.jsonl. */
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export function loggedId(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  return typeof value === "string" && SAFE_ID.test(value) && !value.includes("..") ? value : null;
+}
+
 function emitEvent(root: string, payload: Record<string, unknown>): void {
   const dir = swarmDir(root);
   if (!existsSync(dir) && !process.env.SWARM_DIR) return;
@@ -44,7 +52,9 @@ function emitEvent(root: string, payload: Record<string, unknown>): void {
   try {
     writeFileSync(resolve(dir, ".gitignore"), "*", { flag: "wx" }); // D-11: never overwrite
   } catch {}
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...payload }) + "\n";
+  const record: Record<string, unknown> = { ...payload };
+  for (const key of ["task_id", "correlation_id"]) if (key in record) record[key] = loggedId(record[key]);
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...record }) + "\n";
   appendFileSync(resolve(dir, "events.jsonl"), line);
 }
 

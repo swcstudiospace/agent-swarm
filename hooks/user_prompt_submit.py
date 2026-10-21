@@ -29,7 +29,7 @@ CONTEXT = """## AgentSwarm orchestration (mandatory)
 This is SDLC work (prompts containing "orchestrate", "build", "implement" etc. trigger this): route through AgentSwarm.
 Load skill `agent-swarm-orchestrate`.
 Spawn subagent `a01-orchestrator` with the user request as the brief.
-A01 plans and spawns a02–a15 by slug for parallel orchestrated execution.
+A01 plans and spawns a02–a30 by slug for parallel orchestrated execution.
 Do not implement domain work in the parent session.
 """
 

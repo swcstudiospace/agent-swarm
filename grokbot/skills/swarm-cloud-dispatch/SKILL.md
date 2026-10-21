@@ -5,7 +5,7 @@ description: "Desk Lead dispatches a unit to a keyless Cursor cloud agent. The b
 
 # Swarm cloud dispatch
 
-This file is the single source for handing a unit to a Cursor cloud agent that runs the 15 AgentSwarm agents as subagents. Use it when Desk Lead has an ultrathink node prompt, a seat, a branch and a graph id.
+This file is the single source for handing a unit to a Cursor cloud agent that runs the 30 AgentSwarm agents as subagents. Use it when Desk Lead has an ultrathink node prompt, a seat, a branch and a graph id.
 
 The box copy is not edited by hand. After Ming merges this file and approves the diff, Desk Lead copies this file over the box copy and records the sha256 of both.
 
@@ -54,7 +54,7 @@ python3 scripts/_install_cursor.py --target /path/to/target-repo --dry-run
 python3 scripts/_install_cursor.py --target /path/to/target-repo
 ```
 
-`build_agents.py --install-cursor /path/to/target-repo` is the same copy. It writes only under `.cursor/` (the 15 agents, `.cursor/rules/agent-swarm.mdc`, and a provenance stamp). It does not write MCP config or env files, and it does not wire substrate.
+`build_agents.py --install-cursor /path/to/target-repo` is the same copy. It writes only under `.cursor/` (the 30 agents, `.cursor/rules/agent-swarm.mdc`, and a provenance stamp). It does not write MCP config or env files, and it does not wire substrate.
 
 ## Dispatch
 

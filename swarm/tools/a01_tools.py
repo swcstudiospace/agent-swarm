@@ -204,7 +204,7 @@ def budget_guard(payload: dict) -> dict:
     """Decide OK, WARN, HARD_STOP, or ESCALATED from usage against budget and earlier breaches.
 
     A dimension breaches at 100 % of its budget. The first breach hard-stops (checkpoint, requeue once with an
-    annotated budget); a breach after a prior one escalates (03-agents/A01 section 3, rule 5).
+    annotated budget); a breach after a prior one escalates (agents/A01 section 3, rule 5).
     """
 
     def work() -> dict:

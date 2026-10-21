@@ -1,8 +1,8 @@
 ---
 name: agent-swarm-orchestrate
 description: >
-  Run the AgentSwarm of 15 SDLC subagents (a01-orchestrator through a15-docs).
-  Use when the user says run the swarm, AgentSwarm, implement a feature with the 15 agents,
+  Run the AgentSwarm of 30 subagents (a01-orchestrator through a30-custody-compliance).
+  Use when the user says run the swarm, AgentSwarm, implement a feature with the 30 agents,
   a01-orchestrator, SDLC swarm, or /swarm. UserPromptSubmit hook injects this skill for SDLC-shaped prompts.
 disable-model-invocation: false
 ---
@@ -29,10 +29,10 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency|cloud-native|cluster|web3|parallel --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
-4. A01 plans and spawns: a01-orchestrator, a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa, a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs.
+4. A01 plans and spawns: a01-orchestrator, a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa, a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs, a16-cloud-architect, a17-platform-engineer, a18-supply-chain, a19-event-driven, a20-finops, a21-cluster-ops, a22-gitops, a23-mesh-network, a24-cluster-security, a25-resilience, a26-smart-contract, a27-contract-audit, a28-chain-infra, a29-dapp-wallet, a30-custody-compliance.
 5. Parent MUST NOT write application code, docs, or IaC.
 6. Unattended alternative: `python3 scripts/swarm_run.py --repo <app> --runtime auto --json` (dry-run with `--dry-run`).
 

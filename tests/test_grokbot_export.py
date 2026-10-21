@@ -1,6 +1,6 @@
 """Grok Bot seat map and installer.
 
-The schema, the 15-role coverage, android/ios/desktop routing, deterministic
+The schema, the 30-role coverage, android/ios/desktop routing, deterministic
 output, --check drift, and the installer's dry-run, check, stamp, hash,
 symlink refusal and rollback are pinned here. The hand-written
 swarm-cloud-dispatch skill is not a generated lane.
@@ -102,16 +102,15 @@ def _run_build(*args: str, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]
     )
 
 
-def test_seat_map_schema_covers_exactly_the_fifteen_roles():
+def test_seat_map_schema_covers_exactly_the_thirty_roles():
     agents = _agents()
     doc = _map()
     assert doc["schema"] == "grokbot.seat-map.v1"
     assert doc["precedence"] == build_agents.SEAT_MAP_PRECEDENCE
     assert "equal length: lowest role id" in doc["precedence"]
-    assert {a["id"] for a in agents} == {f"A{n:02d}" for n in range(1, 16)}
+    assert {a["id"] for a in agents} == {f"A{n:02d}" for n in range(1, 31)}
     assert [r["slug"] for r in doc["roles"]] == sorted(a["slug"] for a in agents)
-    assert len(doc["roles"]) == 15
-    assert all(not r["id"].startswith("A16") and r["slug"] != "a16" for r in doc["roles"])
+    assert len(doc["roles"]) == 30
     by_id = {a["id"]: a for a in agents}
     for role in doc["roles"]:
         assert set(role) == ROLE_KEYS
@@ -199,6 +198,7 @@ def test_android_ios_and_desktop_route_to_their_seats():
 
 
 def test_render_is_deterministic_sorted_and_leaves_dispatch_and_grok_alone():
+    dispatch_before = DISPATCH.read_bytes()
     first = _rendered()
     second = _rendered()
     assert first == second
@@ -224,11 +224,7 @@ def test_render_is_deterministic_sorted_and_leaves_dispatch_and_grok_alone():
                 assert f"$SWARM_ROOT/{agent['prompt']}" in text
     control = first["grokbot/skills/swarm-control/SKILL.md"]
     assert "swarm_run.py" not in control
-    diff = subprocess.run(
-        ["git", "diff", "--exit-code", "HEAD", "--", "grokbot/skills/swarm-cloud-dispatch/SKILL.md"],
-        cwd=ROOT, capture_output=True,
-    )
-    assert diff.returncode == 0
+    assert DISPATCH.read_bytes() == dispatch_before
     assert DISPATCH.is_file()
 
 
@@ -429,13 +425,13 @@ def test_non_utf8_edit_is_not_treated_as_ours(tmp_path):
     assert "Nothing was written" in err.getvalue()
 
 
-def test_render_grokbot_rejects_a_sixteenth_role():
+def test_render_grokbot_rejects_a_thirty_first_role():
     agents = _agents()
     extra = dict(agents[0])
-    extra["id"] = "A16"
-    extra["slug"] = "a16-extra"
+    extra["id"] = "A31"
+    extra["slug"] = "a31-extra"
     extra["code"] = "EXTRA"
-    with pytest.raises(ValueError, match="15"):
+    with pytest.raises(ValueError, match="30"):
         build_agents.render_grokbot(agents + [extra])
 
 
@@ -514,8 +510,8 @@ def test_rejected_roster_writes_nothing(tree):
     before = {name: _tree_bytes(tree / name) for name in roots}
     manifest = json.loads((tree / "agents.json").read_text(encoding="utf-8"))
     extra = dict(manifest["agents"][0])
-    extra["id"] = "A16"
-    extra["slug"] = "a16-extra"
+    extra["id"] = "A31"
+    extra["slug"] = "a31-extra"
     extra["code"] = "EXTRA"
     manifest["agents"].append(extra)
     agents_file = tree / "agents-extra.json"
@@ -527,7 +523,7 @@ def test_rejected_roster_writes_nothing(tree):
         cwd=tree, capture_output=True, text=True, env=env,
     )
     assert proc.returncode == 1
-    assert "15" in proc.stderr
+    assert "30" in proc.stderr
     assert "Traceback" not in proc.stderr
     after = {name: _tree_bytes(tree / name) for name in roots}
     assert after == before

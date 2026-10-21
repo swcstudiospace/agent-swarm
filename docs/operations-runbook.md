@@ -23,6 +23,8 @@ From `omp/`, run `bun run test`, not a bare full `bun test`: the extension regis
 
 The raw shell scanners retain literal spans by index, and plain unquoted words are reused instead of rebuilt character by character. Quote, escape, comment, heredoc and operator handling is unchanged. The WR-09 regression still checks the original million-byte inputs, the 40× differential cap, and the 3× cap for doubling the same input shape from 400 KB to 800 KB.
 
+The v2.3 guard rows for the Web3 and cluster domains are `chain-broadcast` and `chain-key-material` (capabilities `chain_broadcast` and `chain_key_material`), plus `argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle` and `kubeadm-lifecycle` under `prod_infra`. A matching command in a swarm session is blocked with `BLOCKED needs: human-approval (<capability>: <rule id>)`.
+
 ## Private signer bootstrap
 
 
@@ -67,7 +69,7 @@ updated extension code; changing a separate shell cannot refresh an already-runn
 
 Tools and skills are added through intake fragments, never by editing `agents.json` by hand. Full steps with the field list and limits are in [swarm-command-center.md](swarm-command-center.md) (sections 9.2 and 9.3). In short:
 
-1. Handler `fn(payload) -> dict` in `swarm/tools/aNN_tools.py`, wrapped by `support.respond`. Owner prefix from `PREFIX` in `swarm/tool_registry.py` (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`, `shared_`).
+1. Handler `fn(payload) -> dict` in `swarm/tools/aNN_tools.py`, wrapped by `support.respond`. Owner prefix from `PREFIX` in `swarm/tool_registry.py` (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`, `cloud_`, `plat_`, `supply_`, `event_`, `finops_`, `k8s_`, `gitops_`, `mesh_`, `kpol_`, `resil_`, `sol_`, `audit_`, `chain_`, `dapp_`, `custody_`, `shared_`).
 2. Fragment `registry/intake/<slug>.tools.json` (complete `swarm.tool.v1` entries; `<slug>` may be `shared`), and `registry/intake/grants.json` for extra callers of an existing tool.
 3. `python3 scripts/_registry_intake.py --check`, then `--apply`.
 4. `python3 -m swarm.tool_registry check`, `docs`, `gen-tests`, then `python3 scripts/build_agents.py`.
@@ -77,7 +79,7 @@ A skill is `prompts/skills/<owner>/<short>.md`: `python3 -m swarm.skill_registry
 
 Each agent holds 10 to 15 lane tools and 10 to 15 skills (`agents.json` `capability_policy`); the check fails outside that range. Do not invent tools or skills to reach a count: each needs a purpose, a contract and a test.
 
-A shared tool has `owner: shared`, a `shared_` name and goes to `shared_tools` (the merge puts it there). `shared_baseline` tools must permit all 15 agents (validated). For any other shared tool, list the agents that already perform the operation; by convention a one-caller helper stays a lane tool (not validated).
+A shared tool has `owner: shared`, a `shared_` name and goes to `shared_tools` (the merge puts it there). `shared_baseline` tools must permit all 30 agents (validated). For any other shared tool, list the agents that already perform the operation; by convention a one-caller helper stays a lane tool (not validated).
 
 ## Change ACP permissions
 

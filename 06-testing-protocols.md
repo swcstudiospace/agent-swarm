@@ -1,6 +1,6 @@
 # AgentSwarm — Testing & Validation Protocols
 
-**Version:** 1.0.0 · Purpose: prove each agent performs its intended functions reliably, and that the 15-agent swarm operates cohesively to deliver production-ready software.
+**Version:** 1.0.0 · Purpose: prove each agent performs its intended functions reliably, and that the 30-agent swarm operates cohesively to deliver production-ready software.
 
 Testing pyramid (bottom → top): **U** unit/golden → **C** contract → **I** integration flows → **X** chaos/resilience → **E** full-swarm E2E benchmark → **S** security → **V** continuous validation in prod.
 
@@ -26,6 +26,21 @@ Each agent ships a **golden task corpus**: input artifacts → expected output a
 | A13 | burn-rate alert mapping; incident declaration sev rules; monitoring.degraded cascade |
 | A14 | KEV priority routing; bump auto-merge limits; patch regression loop; EOL epic generation |
 | A15 | staleness detection; single-source divergence fix; runbook schema validation; redaction scan |
+| A16 | twelve-factor audit scores each factor; composite availability (series/parallel) against the target; DR strategy versus RTO/RPO; data class × region residency violations; landing-zone lint (guardrails, audit account, break-glass); blast radius names single points of failure; contract conflict goes to `conflict.report`, never an A03 edit |
+| A17 | catalog lint (owner, lifecycle, system, tier); composition schema diff separates breaking from additive; claim validated against the composition schema; maturity scorecard level; catalog graph reports cycles, dangling and orphans; no infrastructure applied, no pipeline edited |
+| A18 | Dockerfile lint (latest tag, root user, unpinned base); SBOM validation against the NTIA minimum elements; SBOM diff (downgrade, license change); SLSA level from provenance; signature policy by issuer and identity; VEX → effective exposure; verdict `fail` exactly when `blocking_count` > 0; no signing key, no gate verdict |
+| A19 | schema compatibility (backward/forward/full); CloudEvents attribute check; partition plan from throughput and key skew; retry schedule fits the visibility timeout; DLQ coverage per consumer; idempotency window versus redelivery window; replay needs the approval gate (production replay is L3) |
+| A20 | budget burn projects the overrun instant; rightsize from p95/p99 with headroom; commitment coverage and break-even; MAD spend-anomaly detection; allocation-tag coverage; showback exact to the cent; location-based carbon estimate; commitment purchase stays L4 |
+| A21 | `k8s_deprecated_api_scan` removes 1.25 PSP and CronJob v1beta1; version skew (kubelet up to three minors behind the API server, two below 1.25); drain feasibility under PodDisruptionBudgets; ordered upgrade plan with blockers; maintenance-window blackout; production change L3, cluster delete L4 |
+| A22 | kustomize overlay integrity; sync waves put CRDs before custom resources; prune risk (PVC, Namespace, CRD) with the autonomy level; canary verdict Successful/Failed/Inconclusive; promotion gate (stage order, soak, change freeze); drift classified benign/drift/dangerous; plaintext Secret scan; opens PRs, never merges |
+| A23 | authorization lint (default-deny, wildcard principals); effective mTLS mode (workload > namespace > mesh > PERMISSIVE); NetworkPolicy reachability under additive policies; retry amplification along a call chain; timeout hierarchy; Gateway API ReferenceGrant validity; CIDR overlap; ingress TLS hygiene |
+| A24 | Pod Security baseline/restricted; RBAC risk (wildcards, escalate/bind/impersonate, cluster-admin); effective access through aggregated ClusterRoles; admission lint flags fail-open webhooks; CIS score; exception-register expiry and staleness; tenant isolation |
+| A25 | PDB check (blocking, unsatisfiable, missing); topology spread versus zone count; probe sanity; backup coverage with restore tests; restore time versus RTO; chaos spec needs steady state, blast radius and abort conditions; chaos go/no-go against the error budget; FMEA RPN ranking; production DR failover stays L4 |
+| A26 | keccak selector and topic check; breaking ABI diff; storage-layout upgrade compatibility; upgrade safety (initializer, selfdestruct, delegatecall, UUPS authorization); access matrix; gas regression; deploy-plan check (chain-id guard, simulation, no RPC URL with a credential); test gate (coverage, fuzz, invariant floors); no key material, mainnet deployment L4 |
+| A27 | SWC class and default severity; severity matrix with the L3 override flag; reentrancy checks-effects-interactions order; oracle TWAP attack cost versus profit; invariant coverage; finding dedupe; report completeness; fix verification; never edits contract source, never accepts risk (L4) |
+| A28 | client diversity; RPC failover plan; confirmation depth; L2 withdrawal window; indexer lag and backfill plan; network guard (testnet by default); validator slashing risk; mainnet node change L3, validator key operations L4 |
+| A29 | EIP-712 typed-data and permit checks (domain, chain id, nonce, deadline, spender); SIWE message; chain-config check; unlimited-approval risk; transaction state machine; ERC-4337 UserOperation coherence; signing-request phishing scan; no key requested, stored or logged; no transaction flow without simulation and user confirmation |
+| A30 | multisig m-of-n and signer diversity; timelock delay versus value at risk; key-ceremony checklist completeness; shard distribution independence; transaction policy evaluates to allow/hold/deny and never signs; sanctions-screening freshness; Travel Rule field completeness; audit-trail hash chain; secret scan reports locations and lengths, never the value; key ceremony and fund movement L4 |
 
 **Pass criteria:** 100 % corpus pass; schema-valid messages; envelope fields correctly propagated (`correlation_id`, `causation_id`). Gate: CI-blocking.
 
@@ -47,6 +62,7 @@ Scripted scenarios from [04-integration-plan.md §3](04-integration-plan.md) exe
 4. **Security event** — KEV CVE injected → A10 blocks → A14 patch task with 24 h deadline → patch promoted via canary.
 5. **Contract evolution** — v1→v2 API contract with deprecation window; consumers migrate; registry enforces window.
 6. **Escalation path** — ambiguous brief → clarification rounds → PROVISIONAL spec flagged → human approve via `esc.human`.
+7. **Domain happy paths** — the `cloud-native`, `cluster` and `web3` flows of [04-integration-plan.md §3.4–3.6](04-integration-plan.md) (assert: `events` ∥ `plat` ∥ `cost`; `net` ∥ `pol`; `dapp` ∥ `aud` ∥ `chain`; A10 waits for `img`/`pol`/`aud` respectively; cluster and web3 implementer rows carry all four gates).
 
 **Pass criteria:** message ordering invariants hold (state machine legal transitions only, verified by replaying the bus stream against the Task Store); `correlation_id` traceable end-to-end; zero orphan tasks; DLQ empty.
 

@@ -33,7 +33,7 @@ Don't use for: Do not implement backend/frontend source.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: requirements.spec, acceptance.criteria, architecture.blueprint.
+2. Read upstream artifacts in consumes: requirements.spec, acceptance.criteria, architecture.blueprint, wallet.flow.spec.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only design.system.tokens, ux.spec, a11y.requirements.
 5. Finish with markdown summary + one fenced json `task.result`.

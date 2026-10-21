@@ -5,7 +5,7 @@ disable-model-invocation: true
 ---
 
 ## When to Use
-- A03 delivers or changes an `adr.set` and the docs site must show the decisions (03-agents/A15-docs.md section 2: ADR renderers by A03).
+- A03 delivers or changes an `adr.set` and the docs site must show the decisions (agents/A15-docs.md section 2: ADR renderers by A03).
 - Not for endpoint reference: use `a15-docs--api-reference`. ADRs are rendered, never rewritten or judged here.
 
 ## Procedure

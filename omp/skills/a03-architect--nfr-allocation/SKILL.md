@@ -7,7 +7,7 @@ disable-model-invocation: true
 ## When to Use
 - A02 delivers `requirements.spec` or `acceptance.criteria`, or an NFR in them changes after PLANNED.
 - Run before `skill://a03-architect--blueprint` and `skill://a03-architect--contract-publish`: they consume the bindings this skill produces. This skill only allocates; it does not design.
-- Spec rule (03-agents/A03 section 4.3): every NFR is bound to a measurable contract clause or component budget; an unallocatable NFR is escalated to A02, never silently dropped. Coverage target is 100 %.
+- Spec rule (agents/A03 section 4.3): every NFR is bound to a measurable contract clause or component budget; an unallocatable NFR is escalated to A02, never silently dropped. Coverage target is 100 %.
 
 ## Procedure
 1. Call `shared_handover_read` with `{task_id}`. Take `requirements.spec` and `acceptance.criteria` from `artifacts`. A `status` other than `ok` means stop and call `shared_escalate` (`reason_code` `stale-handover`).

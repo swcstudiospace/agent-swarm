@@ -388,6 +388,373 @@
         "pytest",
         "ruff"
       ]
+    },
+    {
+      "autonomy_ceiling": {
+        "commitment_or_exit_plan": "L4",
+        "design": "L2",
+        "provider_or_region_change": "L3"
+      },
+      "code": "CLOUD",
+      "home": "executor",
+      "id": "A16",
+      "lane": "delivery",
+      "path_globs": [
+        "cloud/**",
+        "landing-zone/**",
+        "scripts/cloud_readiness_scan.py",
+        "scripts/ts/cloud_readiness_scan.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a16-cloud-architect",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "catalog": "L2",
+        "platform_api_breaking_change": "L3",
+        "tenant_quota_change": "L3"
+      },
+      "code": "PLAT",
+      "home": "executor",
+      "id": "A17",
+      "lane": "ops",
+      "path_globs": [
+        "catalog-info.yaml",
+        "platform/**",
+        "scripts/plat_catalog_lint.py",
+        "scripts/ts/plat_catalog_lint.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a17-platform-engineer",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "image_policy": "L2",
+        "policy_exception": "L3",
+        "signing_key_change": "L4"
+      },
+      "code": "SUPPLY",
+      "home": "bot-06-quality-security",
+      "id": "A18",
+      "lane": "verify",
+      "path_globs": [
+        "provenance/**",
+        "sbom/**",
+        "scripts/supply_image_lint.py",
+        "scripts/ts/supply_image_lint.ts",
+        "slsa/**"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a18-supply-chain",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "breaking_event_schema": "L3",
+        "event_design": "L2",
+        "prod_replay_or_backfill": "L3"
+      },
+      "code": "EVENT",
+      "home": "bot-01-systems-backend",
+      "id": "A19",
+      "lane": "code",
+      "path_globs": [
+        "asyncapi/**",
+        "events/**",
+        "functions/**",
+        "scripts/event_schema_check.py",
+        "scripts/ts/event_schema_check.ts",
+        "serverless.yml"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a19-event-driven",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "analysis": "L2",
+        "budget_change": "L3",
+        "commitment_purchase": "L4"
+      },
+      "code": "FINOPS",
+      "home": "routine",
+      "id": "A20",
+      "lane": "sustain",
+      "path_globs": [
+        "cost/**",
+        "finops/**",
+        "scripts/finops_cost_scan.py",
+        "scripts/ts/finops_cost_scan.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a20-finops",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "cluster_delete": "L4",
+        "non_prod_cluster": "L2",
+        "prod_cluster_change": "L3"
+      },
+      "code": "K8S",
+      "home": "bot-05-infrastructure",
+      "id": "A21",
+      "lane": "ops",
+      "path_globs": [
+        "cluster-api/**",
+        "clusters/**",
+        "scripts/k8s_manifest_check.py",
+        "scripts/ts/k8s_manifest_check.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a21-cluster-ops",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "non_prod_sync": "L2",
+        "prod_promotion": "L3",
+        "prod_prune": "L4"
+      },
+      "code": "GITOPS",
+      "home": "bot-05-infrastructure",
+      "id": "A22",
+      "lane": "ops",
+      "path_globs": [
+        "**/kustomization.yaml",
+        "argocd/**",
+        "charts/**",
+        "flux/**",
+        "gitops/**",
+        "overlays/**",
+        "scripts/gitops_repo_check.py",
+        "scripts/ts/gitops_repo_check.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a22-gitops",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "mtls_strict_flip": "L3",
+        "policy_design": "L2",
+        "prod_mesh_change": "L3"
+      },
+      "code": "MESH",
+      "home": "bot-05-infrastructure",
+      "id": "A23",
+      "lane": "ops",
+      "path_globs": [
+        "gateway/**",
+        "istio/**",
+        "mesh/**",
+        "network-policies/**",
+        "scripts/mesh_policy_check.py",
+        "scripts/ts/mesh_policy_check.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a23-mesh-network",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "enforce_mode_flip": "L3",
+        "exception_grant": "L4",
+        "policy_audit": "L2"
+      },
+      "code": "KSEC",
+      "home": "bot-06-quality-security",
+      "id": "A24",
+      "lane": "verify",
+      "path_globs": [
+        "gatekeeper/**",
+        "kyverno/**",
+        "policies/**",
+        "scripts/kpol_manifest_scan.py",
+        "scripts/ts/kpol_manifest_scan.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a24-cluster-security",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "dr_failover_prod": "L4",
+        "experiment_prod": "L3",
+        "experiment_staging": "L2"
+      },
+      "code": "RESIL",
+      "home": "bot-05-infrastructure",
+      "id": "A25",
+      "lane": "ops",
+      "path_globs": [
+        "chaos/**",
+        "resilience/**",
+        "scripts/resil_manifest_check.py",
+        "scripts/ts/resil_manifest_check.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a25-resilience",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "code": "L2",
+        "fund_moving": "L4",
+        "mainnet_deploy": "L4",
+        "proxy_upgrade": "L3"
+      },
+      "code": "SOL",
+      "home": "bot-01-systems-backend",
+      "id": "A26",
+      "lane": "code",
+      "path_globs": [
+        "**/*.sol",
+        "foundry.toml",
+        "hardhat.config.js",
+        "hardhat.config.ts",
+        "onchain/**",
+        "scripts/sol_contract_lint.py",
+        "scripts/ts/sol_contract_lint.ts"
+      ],
+      "seat": "bot-01-systems-backend",
+      "slug": "a26-smart-contract",
+      "verification_tools": [
+        "cargo",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "accept_risk": "L4",
+        "audit": "L2",
+        "severity_override": "L3"
+      },
+      "code": "AUDIT",
+      "home": "bot-06-quality-security",
+      "id": "A27",
+      "lane": "verify",
+      "path_globs": [
+        "audits/**",
+        "scripts/audit_findings_check.py",
+        "scripts/ts/audit_findings_check.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a27-contract-audit",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "mainnet_node_change": "L3",
+        "testnet_ops": "L2",
+        "validator_key_ops": "L4"
+      },
+      "code": "CHAIN",
+      "home": "bot-05-infrastructure",
+      "id": "A28",
+      "lane": "ops",
+      "path_globs": [
+        "chain/**",
+        "indexers/**",
+        "nodes/**",
+        "scripts/chain_config_check.py",
+        "scripts/ts/chain_config_check.ts"
+      ],
+      "seat": "bot-05-infrastructure",
+      "slug": "a28-chain-infra",
+      "verification_tools": [
+        "helm",
+        "terraform"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "code": "L2",
+        "mainnet_enable": "L3",
+        "signing_flow_change": "L3"
+      },
+      "code": "DAPP",
+      "home": "bot-02-web-edge",
+      "id": "A29",
+      "lane": "code",
+      "path_globs": [
+        "apps/dapp/**",
+        "dapp/**",
+        "scripts/dapp_wallet_check.py",
+        "scripts/ts/dapp_wallet_check.ts",
+        "wallet/**"
+      ],
+      "seat": "bot-02-web-edge",
+      "slug": "a29-dapp-wallet",
+      "verification_tools": [
+        "bun",
+        "deno"
+      ]
+    },
+    {
+      "autonomy_ceiling": {
+        "fund_moving": "L4",
+        "key_ceremony": "L4",
+        "policy_design": "L2",
+        "signer_change": "L3"
+      },
+      "code": "CUSTODY",
+      "home": "executor",
+      "id": "A30",
+      "lane": "ops",
+      "path_globs": [
+        "compliance/**",
+        "custody/**",
+        "scripts/custody_policy_check.py",
+        "scripts/ts/custody_policy_check.ts"
+      ],
+      "seat": "bot-06-quality-security",
+      "slug": "a30-custody-compliance",
+      "verification_tools": [
+        "greptile",
+        "pytest",
+        "ruff"
+      ]
     }
   ],
   "routing": [

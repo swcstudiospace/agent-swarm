@@ -6,7 +6,7 @@ tools: [shared_artifact_digest, docs_digest_staleness, docs_stale_doc_age, share
 ---
 
 ## When to Use
-- After any contract, ADR, release record or SLO manifest changes, or on the scheduled docs sweep (03-agents/A15-docs.md section 4.2, the staleness law).
+- After any contract, ADR, release record or SLO manifest changes, or on the scheduled docs sweep (agents/A15-docs.md section 4.2, the staleness law).
 - Detects and flags only. Rewriting is the job of `a15-docs--api-reference` and `a15-docs--runbook-reverify`; creating a placeholder for an absent artifact is `a15-docs--missing-artifact-stub`.
 
 ## Procedure

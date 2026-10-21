@@ -1,6 +1,6 @@
 # AgentSwarm — Message Protocol & Task Lifecycle
 
-**Version:** 1.0.0 · **Conformance:** All 15 agents MUST implement this protocol exactly.
+**Version:** 1.0.0 · **Conformance:** All 30 agents (A01–A30) MUST implement this protocol exactly.
 Schemas are JSON Schema Draft 2020-12; every message is validated on publish and on consume.
 
 ---
@@ -81,13 +81,13 @@ via `task.status`; A01 validates legality (illegal transition ⇒ `task.status.r
 | `task.assign` | A01 → agent (signed) | `{ task_id, agent_id, lease_s, inputs[], acceptance[], budget }` |
 | `task.status` | agent → A01 | `{ task_id, state, progress_pct?, artifacts[], notes?, error? }` |
 | `task.result` | agent → A01 + consumers | `{ task_id, outputs[], metrics{}, summary_md }` |
-| `gate.verdict` | A08/A09/A10 → A01, producer | `{ gate: quality|review|security, task_id, verdict: pass|fail|waive, findings[], expires_s }` |
+| `gate.verdict` | A08/A09/A10/A12 → A01, producer | `{ gate: quality|review|security|release, task_id, verdict: pass|fail|waive, findings[], expires_s }` — only these four gate owners emit it; A16–A30 never do |
 | `escalation.request` | any → A01 → human | `{ task_id, reason_code, evidence[], options[], deadline_s }` |
 | `agent.heartbeat` | all → A01 | `{ agent_id, load, queue_depth, degraded, version, capabilities[] }` |
 | `conflict.report` | any → A01 | `{ subject, parties[], claims[], evidence[] }` |
 | `memory.write` / `memory.query` | any → memory svc | `{ scope, kind: decision|retro|pattern, content_md, tags[] }` |
 
-Per-agent payload schemas are defined in each agent spec ([03-agents/](03-agents/)).
+Per-agent payload schemas are defined in each agent spec ([agents/](agents/)).
 
 ## 5. Autonomy levels (used by every agent spec)
 

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 OMP_AGENTS = ROOT / "omp" / "agents"
 OMP_SKILLS = ROOT / "omp" / "skills"
 # Generated omp agent files are intentionally long XML prompts (the user explicitly accepted long
-# prompts). The largest, a01-orchestrator.md, is ~58 KiB today; 64 KiB leaves headroom for growth.
+# prompts). The largest, a01-orchestrator.md (its spawns list names the 29 other agents), stays under 64 KiB with headroom for growth.
 OMP_AGENT_MAX_BYTES = 64 * 1024
 
 
@@ -105,7 +105,7 @@ ROLE_GRANT_SPEC = {
     "A12": ["swarm_gate"],
 }
 # Every agent also holds the registry bridge, after its role grants (DESIGN 5.3).
-SWARM_GRANT_SPEC = {f"A{n:02d}": ROLE_GRANT_SPEC.get(f"A{n:02d}", []) + BRIDGE for n in range(1, 16)}
+SWARM_GRANT_SPEC = {f"A{n:02d}": ROLE_GRANT_SPEC.get(f"A{n:02d}", []) + BRIDGE for n in range(1, 31)}
 
 
 def test_omp_tools_exact():
@@ -250,7 +250,7 @@ def test_omp_skill_names_match_dirs_and_are_unique():
 
 
 def test_omp_visible_skills_are_the_index_skills_only():
-    """Every skill outside the 15 index skills and the driver skill is hidden; the visible count stays <= 16."""
+    """Every skill outside the index skills (one per agent) and the driver skill is hidden; the visible count stays <= agents + 1."""
     visible_names = {a["slug"] for a in _agents()} | {"swarm-orchestrate"}
     visible = set()
     for p in _skill_dirs():
@@ -259,7 +259,7 @@ def test_omp_visible_skills_are_the_index_skills_only():
         assert hidden == (p.name not in visible_names), p.name
         if not hidden:
             visible.add(p.name)
-    assert visible == visible_names and len(visible) <= 16
+    assert visible == visible_names and len(visible) <= len(_agents()) + 1
 
 
 def test_omp_per_agent_skill_count_within_policy():

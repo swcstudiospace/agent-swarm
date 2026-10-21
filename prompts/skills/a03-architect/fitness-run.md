@@ -6,7 +6,7 @@ tools: [shared_handover_read, shared_open_findings, arch_layer_violations, arch_
 ---
 
 ## When to Use
-- `design.fitness`, or a gate finding on main from a dependency-direction, cycle or coupling check (03-agents/A03 section 4.4: a CI violation on main blocks further downstream CLAIMED tasks).
+- `design.fitness`, or a gate finding on main from a dependency-direction, cycle or coupling check (agents/A03 section 4.4: a CI violation on main blocks further downstream CLAIMED tasks).
 - The blueprint already exists. Authoring a blueprint is `skill://a03-architect--blueprint`.
 
 ## Procedure

@@ -13,11 +13,14 @@ import type { ToolCallEvent, ToolCallResult } from "./omp-api.ts";
 
 export const ORCHESTRATOR = "a01-orchestrator";
 
-/** The 15 swarm agents (copied from agents.json agents[].slug; guard.test.ts pins the list against agents.json). */
+/** The 30 swarm agents (copied from agents.json agents[].slug; guard.test.ts pins the list against agents.json). */
 export const SWARM_SLUGS: readonly string[] = [
   "a01-orchestrator", "a02-requirements", "a03-architect", "a04-ux-designer", "a05-backend",
   "a06-frontend", "a07-data", "a08-qa", "a09-reviewer", "a10-security",
   "a11-devops", "a12-release", "a13-observability", "a14-maintenance", "a15-docs",
+  "a16-cloud-architect", "a17-platform-engineer", "a18-supply-chain", "a19-event-driven", "a20-finops",
+  "a21-cluster-ops", "a22-gitops", "a23-mesh-network", "a24-cluster-security", "a25-resilience",
+  "a26-smart-contract", "a27-contract-audit", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance",
 ];
 
 /** Tools that move Task Store state: A01 only, for every caller including the unidentified main session (D-05). */
@@ -159,6 +162,7 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   const cdpath = env.get("CDPATH");
   const keyFile = env.get("SWARM_ED25519_KEY_FILE");
   const xdg = env.get("XDG_CONFIG_HOME");
+  const hardhatNetwork = env.get("HARDHAT_NETWORK");
   const shellFacts: GuardFacts = {
     ...facts,
     signerReadPaths: signerSources(facts),
@@ -168,6 +172,7 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
       ...(typeof cdpath === "string" ? { CDPATH: cdpath } : {}),
       ...(typeof keyFile === "string" ? { SWARM_ED25519_KEY_FILE: keyFile } : {}),
       ...(typeof xdg === "string" ? { XDG_CONFIG_HOME: xdg } : {}),
+      ...(typeof hardhatNetwork === "string" ? { HARDHAT_NETWORK: hardhatNetwork } : {}),
     },
   };
   // the bash tool's `cwd` is where the command starts; an internal URL (`local://…`) is a directory the guard cannot place
@@ -270,7 +275,7 @@ const KUBECTL_VERB: Record<string, true> = {
  * it, with a marker in the value of `-n`/`--namespace`/`--context`/`--cluster`/`--kubeconfig`/`--server` (`-n prod`,
  * `-nprod`, `-n=prod`, `--namespace=prod`) or a `KUBECONFIG=` prefix, or — when nothing names the destination — in a
  * positional word after the verb (resource, name; `k=v` words such as `set image` and label values aside). File,
- * selector and output values never count, and `--dry-run[=client|server]` never matches (WR-08).
+ * selector and output values never count, and `--dry-run[=client|server]` never matches (WR-08). A `--` ends the flags; the words after it are positional too, except the pod command of exec, run, debug and attach.
  */
 function kubectlProdChange({ words, marked }: Segment): boolean {
   const k = words.findIndex((w) => w === "kubectl" || w === "oc" || w === "kubecolor");
@@ -278,9 +283,13 @@ function kubectlProdChange({ words, marked }: Segment): boolean {
   const targets: string[] = [];
   const positional: string[] = [];
   let dryRun = false; // only kubectl's own flag counts: not a flag value, not the pod command after `--`
+  let afterDashes: string[] = []; // the words after a `--`: operands, unless the verb runs them as the pod command
   for (let i = k + 1; i < words.length; i++) {
     const w = words[i];
-    if (w === "--") break; // the command `exec`/`debug` run in the pod
+    if (w === "--") {
+      afterDashes = words.slice(i + 1);
+      break;
+    }
     if (!w.startsWith("-") || w === "-") {
       positional.push(w);
       continue;
@@ -299,6 +308,7 @@ function kubectlProdChange({ words, marked }: Segment): boolean {
   const at = positional.findIndex((w) => Object.hasOwn(KUBECTL_VERB, w));
   if (dryRun || at === -1 || !Object.hasOwn(KUBECTL_CHANGE, positional[at])) return false;
   const [verb, sub] = [positional[at], positional[at + 1]];
+  if (!/^(?:exec|run|debug|attach)$/.test(verb)) positional.push(...afterDashes);
   if (verb === "rollout" && (sub === "status" || sub === "history")) return false;
   if (verb === "apply" && sub === "view-last-applied") return false;
   if (verb === "certificate" && sub !== "approve" && sub !== "deny") return false;
@@ -325,6 +335,8 @@ export interface Segment {
   targetWords: string[];
   /** The text with CUT kept (the redirection scan reads it). */
   marked: string;
+  /** The stripped prefix that `marked` starts with: this command's own wrapper words and `NAME=v` assignments. */
+  prefix: string;
   /** The command itself cannot be known (named by an expansion or glob): every operand is a mutate target. */
   opaque: boolean;
   /** Its stdin is a pipe (a pipeline member after the first). */
@@ -716,6 +728,8 @@ interface Normalized {
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
 const COMPOUND_WORD = /^(?:(while|until|for|select)|(if)|(case)|(fi|done|esac))(?=[\s;]|$)/;
+/** The words a compound keyword may follow inside the same piece (`do if`, `then fi`, `! done`): they are prefixes, not part of the keyword. */
+const COMPOUND_LEAD = /^(?:(?:do|then|else|elif|!)\s+)+/;
 
 /**
  * D-03 normalization: the inner text of every `$(…)` / backtick substitution becomes its own command, the rest is
@@ -775,7 +789,8 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
   let pipeIn = false;
   for (const piece of splitTopLevel(rest)) {
     let seg = simplifyWords(piece.text.trim());
-    const keyword = COMPOUND_WORD.exec(seg);
+    // a compound keyword after `do`/`then`/`else`/`!` (`do if …`, `then fi`) opens or closes its group like one at the start
+    const keyword = COMPOUND_WORD.exec(seg.replace(COMPOUND_LEAD, ""));
     const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
     // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
     let at = 0;
@@ -959,7 +974,7 @@ function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "op
   // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
   const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
   const text = item.text.replace(CUT_TOKEN, " ").trim();
-  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined };
+  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -2097,6 +2112,801 @@ function orchStateScript(seg: Segment): boolean {
 /** `claude` / `grok` / `omp` (a path's basename too): a nested agent CLI has no swarm guard and still reaches MCP. */
 const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(seg.words[0] ?? "");
 
+/** A flag name that never takes the next word as its value. */
+const NO_VALUE_FLAG = /(?!)/;
+
+/**
+ * A CLI's words after its program word, up to a `--` (the words after it are another command's): the positional
+ * words, and every flag with its value (`--flag=value`, `-fvalue`, or the next word for a flag `valueFlag` names).
+ */
+function cliArgs(rest: string[], valueFlag: RegExp, operandsAfterDashes = false): { positional: string[]; flags: CliFlag[] } {
+  const positional: string[] = [];
+  const flags: CliFlag[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w === "--") {
+      if (operandsAfterDashes) positional.push(...rest.slice(i + 1));
+      break;
+    }
+    if (!w.startsWith("-") || w === "-") {
+      positional.push(w);
+      continue;
+    }
+    const long = /^(--[^=]+)(?:=(.*))?$/.exec(w);
+    const flag = long === null ? w.slice(0, 2) : long[1];
+    let value = long === null ? (w.length > 2 ? w.slice(2).replace(/^=/, "") : undefined) : long[2];
+    if (value === undefined && valueFlag.test(flag)) value = rest[++i];
+    flags.push({ flag, value });
+  }
+  return { positional, flags };
+}
+
+/** A flag of a parsed command line, with its value when it has one. */
+interface CliFlag {
+  flag: string;
+  value: string | undefined;
+}
+/** A boolean flag that is on: present, and not given a false value (`--prune=false`). */
+const flagOn = (flags: CliFlag[], name: string) => flags.some((f) => f.flag === name && !/^(?:false|0|no)$/i.test(f.value ?? ""));
+/** A word names prod: a D-04 marker or release tag, also as a dotted part of a host name (`argocd.prod.example.com`). */
+const prodWord = (w: string) => isProdMarker(w) || w.split(".").some(isProdMarker);
+/** The values of the flags `names` matches. */
+const flagValues = (flags: CliFlag[], names: RegExp): string[] => flags.flatMap((f) => (names.test(f.flag) && f.value !== undefined ? [f.value] : []));
+
+/** A command word that only prints or searches its operands and never runs them (`echo cast send`, `grep -rn argocd app sync prod .`). */
+const INERT_COMMAND = /^(?:echo|printf|grep|egrep|fgrep|rg|ag|ack|man|whatis|apropos|which|whereis|type)$/;
+/**
+ * `check(at)` for every word naming one of `tools` (toolAt's match), unless the command is an INERT_COMMAND. Every
+ * occurrence counts: a directory, container or `--cwd` value named like the tool may come first (`docker run -w /src/cast img cast send`).
+ */
+const eachTool = (words: string[], tools: RegExp, check: (at: number) => boolean): boolean =>
+  !INERT_COMMAND.test(words[0] ?? "") && words.some((w, at) => tools.test(posix.basename(w).replace(/@[^/]*$/, "")) && check(at));
+/** `--help` (unless `--help=false`) or a bare `-h` before a `--`: the CLI prints usage and exits, whatever verb it follows. */
+const helpOnly = (flags: CliFlag[]) => flagOn(flags, "--help") || flags.some((f) => f.flag === "-h" && f.value === undefined);
+/** cliArgs of the words after the tool at `at`; a launcher's own `--` right after the tool (`npm exec hardhat -- run …`) is skipped. `operandsAfterDashes`: the words after a `--` are operands too (argocd's `--` only ends its options). */
+const argsAfter = (words: string[], at: number, valueFlag: RegExp, operandsAfterDashes = false) =>
+  cliArgs(words.slice(words[at + 1] === "--" ? at + 2 : at + 1), valueFlag, operandsAfterDashes);
+/**
+ * Where a CLI's verb can start among its `positional` words: the first word when the tool is the command itself, and
+ * also the second when a launcher put a word before it (`docker run --entrypoint cast img send` names the image first).
+ */
+const verbStarts = (positional: string[], at: number): string[][] => (at === 0 ? [positional] : [positional, positional.slice(1)]);
+
+const ARGOCD_VALUE_FLAG =
+  /^(?:--server|--auth-token|--argocd-context|--config|--kube-context|--kubeconfig|-H|--header|-p|--project|-N|--app-namespace|-l|--selector|-o|--output|--revision|--repo|--dest-server|--dest-namespace|--dest-name|--name|--path|--patch|--patch-file|--type|-f|--file|--values|--parameter|--helm-set|--helm-set-string|--helm-set-file|--kustomize-image|--sync-policy|--sync-option|--loglevel|--logformat|--grpc-web-root-path|--controller-name|--server-name|--client-crt|--client-crt-key|--redis-name|--repo-server-name|--label|--resource|--timeout|--retry-limit)$/;
+/** argocd flags whose value names where the change lands (the D-04 markers apply to these values and to the operands). */
+const ARGOCD_TARGET_FLAG = /^(?:--server|--argocd-context|--kube-context|--dest-server|--dest-namespace|--dest-name|-N|--app-namespace|-p|--project|--name|-l|--selector)$/;
+const ARGOCD_GROUP = /^(?:app|appset|cluster|repo|repocreds|proj|account|cert|gpg|context|login|logout|relogin|admin|version|notifications|completion|configure|help)$/;
+const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
+  app: {
+    change: /^(?:sync|create|rollback|delete|set|patch|terminate-op|delete-resource)$/,
+    other: /^(?:get|list|ls|diff|history|logs|wait|manifests|resources|actions|unset|edit)$/,
+  },
+  appset: { change: /^(?:create|delete)$/, other: /^(?:get|list|generate)$/ },
+  cluster: { change: /^(?:add|rm|create|delete|set|rotate-auth)$/, other: /^(?:get|list|role|windows|edit)$/ },
+  repo: { change: /^(?:add|rm|create|delete)$/, other: /^(?:get|list|set|role|windows|rotate-auth|edit)$/ },
+  proj: { change: /^(?:add|rm|create|delete|set|(?:add|remove)-[\w-]+)$/, other: /^(?:get|list|role|windows|rotate-auth|edit)$/ },
+};
+
+/**
+ * `argocd app sync|create|rollback|delete|set|patch|terminate-op|delete-resource`, `argocd appset create|delete` and `argocd
+ * cluster|repo|proj add|rm|create|delete` (also `cluster set|rotate-auth`, `proj set|add-*|remove-*`) that land in prod
+ * (a D-04 marker in an operand or in the value of a destination or selector flag: `--server`, `--dest-namespace`,
+ * `--project`, `-l` …) or that prune, force or replace (`--prune`, `--force`, `--replace`, unless `=false`). The verb is
+ * the first positional after the group word that is a known verb, so a flag value never stands in for it; `--dry-run` is
+ * exempt only as argocd's own flag, and `--help` prints usage. get, list, diff, history, logs, wait and manifests never match.
+ */
+function argocdChange({ words }: Segment): boolean {
+  return eachTool(words, /^argocd$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, ARGOCD_VALUE_FLAG, true);
+    if (helpOnly(flags)) return false;
+    const g = positional.findIndex((w) => ARGOCD_GROUP.test(w));
+    const verbs = g === -1 ? undefined : ARGOCD_VERBS[positional[g]];
+    if (verbs === undefined) return false;
+    const v = positional.findIndex((w, i) => i > g && (verbs.change.test(w) || verbs.other.test(w)));
+    // `--dry-run`, `--dry-run=client|server|true` render only; an exemption counts only as argocd's own flag, not as another flag's value
+    const dryRun = flags.some((f) => f.flag === "--dry-run" && (f.value === undefined || /^(?:client|server|true)$/.test(f.value)));
+    if (v === -1 || !verbs.change.test(positional[v]) || dryRun) return false;
+    if (["--prune", "--force", "--replace"].some((f) => flagOn(flags, f))) return true;
+    return [...positional.slice(v + 1), ...flagValues(flags, ARGOCD_TARGET_FLAG)].some(prodWord);
+  });
+}
+
+const FLUX_VALUE_FLAG = /^(?:-n|--namespace|--context|--kubeconfig|--timeout|--as|--as-group|--cache-dir|--server|--token)$/;
+const FLUX_FLAG_TARGET = /^(?:-n|--namespace|--context|--kubeconfig)$/;
+const FLUX_ALWAYS = /^(?:delete|uninstall|bootstrap)$/;
+const FLUX_PROD = /^(?:suspend|resume)$/;
+const FLUX_OTHER =
+  /^(?:get|check|export|build|diff|events|logs|tree|trace|stats|version|create|reconcile|install|push|pull|tag|completion|help|migrate|envsubst|debug|patch)$/;
+
+/**
+ * `flux delete|uninstall|bootstrap` always, `flux suspend|resume` with a D-04 marker in an operand or in the value of
+ * `-n`/`--namespace`/`--context`/`--kubeconfig`. The verb is the first positional that is a flux command. A `--` ends the flags; the words after it are operands (`flux suspend kustomization -- prod`).
+ */
+function fluxChange({ words }: Segment): boolean {
+  return eachTool(words, /^flux$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, FLUX_VALUE_FLAG, true);
+    if (helpOnly(flags)) return false;
+    const v = positional.findIndex((w) => FLUX_ALWAYS.test(w) || FLUX_PROD.test(w) || FLUX_OTHER.test(w));
+    if (v === -1) return false;
+    if (FLUX_ALWAYS.test(positional[v])) return true;
+    return FLUX_PROD.test(positional[v]) && [...positional.slice(v + 1), ...flagValues(flags, FLUX_FLAG_TARGET)].some(prodWord);
+  });
+}
+
+const MESH_VALUE_FLAG =
+  /^(?:-f|--filename|-s|--set|-r|--revision|-n|--namespace|-i|--istioNamespace|-L|--linkerd-namespace|-c|--kubeconfig|--context|-o|--output|--manifests|--charts|--helm-set|--version|--repository|--chart-directory|--datapath-mode)$/;
+
+/** `istioctl|linkerd|cilium install|uninstall|upgrade`, also `istioctl x uninstall`; analyze, manifest generate, x precheck, version, check, status and `--help` never match. */
+function meshLifecycle({ words }: Segment): boolean {
+  return eachTool(words, /^(?:istioctl|linkerd|cilium)$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, MESH_VALUE_FLAG);
+    return !helpOnly(flags) && positional.some((w) => /^(?:install|uninstall|upgrade)$/.test(w));
+  });
+}
+
+const VELERO_VALUE_FLAG =
+  /^(?:-n|--namespace|--kubecontext|--kubeconfig|--features|--cacert|--client-qps|--client-burst|--client-page-size|-v|--v|--vmodule|--log_dir|--log_file|--log_file_max_size|--log_backtrace_at|--stderrthreshold|-o|--output|-l|--selector|--from-backup|--from-schedule)$/;
+const VELERO_OBJECT = /^(?:backup|restore|schedule|backup-location|snapshot-location)$/;
+
+/** `velero install|uninstall`, `restore create`, and `backup|restore|schedule|backup-location|snapshot-location delete` (also `velero create restore`, `velero delete <object>`); backup create, get, describe and `--help` never match. */
+function veleroChange({ words }: Segment): boolean {
+  return eachTool(words, /^velero$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, VELERO_VALUE_FLAG);
+    return (
+      !helpOnly(flags) &&
+      verbStarts(positional, at).some(
+        ([first = "", second = ""]) =>
+          /^(?:install|uninstall)$/.test(first) ||
+          (first === "restore" && second === "create") ||
+          (first === "create" && second === "restore") ||
+          (VELERO_OBJECT.test(first) && second === "delete") ||
+          (first === "delete" && VELERO_OBJECT.test(second)),
+      )
+    );
+  });
+}
+
+const EKSCTL_VALUE_FLAG = /^(?:-f|--config-file|-c|--cluster|--region|--profile|-n|--name|--nodes|--nodegroup-name|--version)$/;
+const GCLOUD_VALUE_FLAG = /^(?:--project|--zone|--region|--account|--configuration|--format|--impersonate-service-account|--billing-project|--verbosity|--filter|--flatten|--limit|--sort-by|--page-size)$/;
+const GCLOUD_CLUSTER_CHANGE = /^(?:create|create-auto|upgrade|resize|update)$/;
+const GCLOUD_CLUSTER_OTHER = /^(?:delete|describe|list|get-credentials|get-upgrade-info|get-values)$/;
+const AZ_VALUE_FLAG = /^(?:-g|--resource-group|-n|--name|--subscription|-l|--location|-o|--output|--query|--cluster-name|--nodepool-name|--kubernetes-version|--node-count|-c)$/;
+const AKS_CHANGE = /^(?:create|upgrade|scale|update|start|stop|rotate-certs)$/;
+const AKS_OTHER = /^(?:delete|show|list|get-credentials|get-upgrades|get-versions|browse|wait|check-acr|kanalyze|kollect|operation-abort|install-cli|command)$/;
+const AKS_NODEPOOL_CHANGE = /^(?:add|scale|update|upgrade|start|stop)$/;
+
+const EKSCTL_CHANGE = /^(?:create|delete|upgrade|scale|update(?:-[\w-]+)?)$/;
+
+/**
+ * Managed-cluster lifecycle: `eksctl create|delete|upgrade|scale|update` (also `eksctl utils update-*`); `gcloud container
+ * clusters|node-pools create|create-auto|upgrade|resize|update`; `az aks create|upgrade|scale|update|start|stop|rotate-certs` and
+ * `az aks nodepool add|scale|update|upgrade|start|stop`. A gcloud/az `delete` is cloud-destructive's (an earlier row),
+ * and get, list, describe, show, get-credentials and `--help` never match.
+ */
+function managedClusterChange({ words }: Segment): boolean {
+  return eachTool(words, /^(?:eksctl|gcloud|az)$/, (at) => {
+    const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
+    const { positional, flags } = argsAfter(words, at, tool === "eksctl" ? EKSCTL_VALUE_FLAG : tool === "gcloud" ? GCLOUD_VALUE_FLAG : AZ_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    if (tool === "eksctl") return positional.some((w) => EKSCTL_CHANGE.test(w));
+    if (tool === "gcloud") {
+      const c = positional.indexOf("container");
+      const g = c === -1 ? -1 : positional.findIndex((w, i) => i > c && /^(?:clusters|node-pools)$/.test(w));
+      const v = g === -1 ? -1 : positional.findIndex((w, i) => i > g && (GCLOUD_CLUSTER_CHANGE.test(w) || GCLOUD_CLUSTER_OTHER.test(w)));
+      return v !== -1 && GCLOUD_CLUSTER_CHANGE.test(positional[v]);
+    }
+    const aks = positional.indexOf("aks");
+    if (aks === -1) return false;
+    const after = positional.slice(aks + 1);
+    const v = after.findIndex((w) => AKS_CHANGE.test(w) || w === "nodepool" || AKS_OTHER.test(w));
+    if (v === -1) return false;
+    if (after[v] !== "nodepool") return AKS_CHANGE.test(after[v]);
+    return after.slice(v + 1).some((w) => AKS_NODEPOOL_CHANGE.test(w));
+  });
+}
+
+const KUBEADM_VERB = /^(?:init|join|reset|upgrade|token|certs|config|version|kubeconfig|completion|help)$/;
+/** kubeadm flags that take the next word, whatever it looks like (`--cri-socket --help` is a socket named `--help`). */
+const KUBEADM_VALUE_FLAG =
+  /^(?:--config|--kubeconfig|--cri-socket|--node-name|--token|--discovery-token|--discovery-token-ca-cert-hash|--discovery-token-unsafe-skip-ca-verification|--discovery-file|--certificate-key|--tls-bootstrap-token|--apiserver-advertise-address|--apiserver-bind-port|--apiserver-cert-extra-sans|--control-plane-endpoint|--pod-network-cidr|--service-cidr|--service-dns-domain|--kubernetes-version|--image-repository|--cert-dir|--ignore-preflight-errors|--patches|--skip-phases|--feature-gates|--rootfs|--ttl|-v|--v)$/;
+
+/** `kubeadm init|join|reset|upgrade`; `upgrade plan|diff` only read, and token, certs, config, version and `--help` never match. */
+function kubeadmChange({ words }: Segment): boolean {
+  return eachTool(words, /^kubeadm$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, KUBEADM_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    const v = positional.findIndex((w) => KUBEADM_VERB.test(w));
+    if (v === -1) return false;
+    if (positional[v] === "upgrade") return !/^(?:plan|diff)$/.test(positional[v + 1] ?? "");
+    return /^(?:init|join|reset)$/.test(positional[v]);
+  });
+}
+
+/** A network name that is a local chain: no transaction reaches a public network (`--network localhost`). */
+const LOCAL_CHAIN_NETWORK = /^(?:hardhat|localhost|anvil|development|local)$/i;
+/** An anchor cluster that is local: `localnet` (`l`), or a loopback URL. */
+const LOCAL_ANCHOR_CLUSTER = /^(?:localnet|l|localhost|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?)$/i;
+/**
+ * A literal loopback RPC endpoint: an http or https URL whose host is `127.0.0.1`, `localhost` or `[::1]`, with an optional
+ * port and path. Nothing else proves locality: a bare name (`local`, `localhost`, `anvil`) resolves through foundry.toml's
+ * [rpc_endpoints], which the guard does not read, and a userinfo or another host after the loopback host is not loopback.
+ */
+const LOCAL_RPC_URL = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]\S*)?$/i;
+/** The RPC flags of cast and forge: each names the endpoint a submitting run reaches. */
+const RPC_FLAG = /^(?:-r|--rpc-url|--fork-url)$/;
+
+/**
+ * Whether a cast or forge line's RPC endpoint is provably local: at least one RPC flag, and every one of them is a literal
+ * loopback URL (LOCAL_RPC_URL). No RPC flag leaves the endpoint to ETH_RPC_URL or the project config, which the guard does not read.
+ */
+function rpcLocal(flags: CliFlag[]): boolean {
+  const rpcs = flags.filter((f) => RPC_FLAG.test(f.flag));
+  return rpcs.length > 0 && rpcs.every((f) => f.value !== undefined && LOCAL_RPC_URL.test(f.value));
+}
+
+/**
+ * The line cannot be modelled with certainty: an assigning expansion, an arithmetic command, or a writer whose target or value
+ * is unknown (`eval`, `source`, `read`, a nameref, an indirect or dynamic write, an exec or env -S assignment). Every framework run on it needs approval.
+ */
+function lineUnknown(command: string): boolean {
+  return ASSIGNING_EXPANSION.test(activeText(command, true)) || ARITHMETIC_COMMAND.test(activeText(command, false)) || hasNonPlainWriter(normalizeSegments(command, 0, []));
+}
+
+/** `exec -a NAME` and `exec NAME=…` after the wrapper: an assignment-like word after `exec` is argv[0] or an operand that cannot be modelled. */
+function execAssigns(prefix: string[]): boolean {
+  const exec = prefix.indexOf("exec");
+  return exec !== -1 && prefix.slice(exec + 1).some((w) => w.includes("="));
+}
+
+/** `env -S LINE` / `--split-string LINE`: a split line that assigns or expands (`NAME=v`, `$X`) cannot be modelled, so its run needs approval. */
+function envSplitAssigns(words: string[]): boolean {
+  for (let i = 0; i < words.length; i++) {
+    const m = /^(?:-[A-Za-z]*S|--split-string=?)(.*)$/.exec(words[i]);
+    if (m === null) continue;
+    const line = m[1] !== "" ? m[1] : (words[i + 1] ?? "");
+    return /[=$`]/.test(line);
+  }
+  return false;
+}
+/** Options foundry's cast and forge take a value for: the global ones that may precede the verb (`cast --color never send`) and the wallet selectors (so `cast wallet address --account deployer` has no key operand). */
+const FOUNDRY_VALUE_FLAG = /^(?:-r|--rpc-url|--fork-url|--color|-j|--threads|--network|--account|--keystore|--password|--password-file|--from|--mnemonic-index|--mnemonic-derivation-path|--hd-path)$/;
+const FRAMEWORK_VALUE_FLAG = /^--(?:network|config|tsconfig|root|cache-path|max-memory)$/;
+/** The first two words (`verb sub`) of a framework command that talks to the chain its network names. */
+const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
+  hardhat: /^(?:run|deploy|console|test|ignition deploy)(?: |$)/,
+  truffle: /^(?:migrate|deploy|exec|console|test)(?: |$)/,
+  brownie: /^(?:run|console|test)(?: |$)/,
+};
+
+/** A wrapper option whose next word is its value (`exec -a NAME`, `env -u NAME`, `env -C DIR`, `sudo -u USER`), never an assignment. */
+const WRAPPER_VALUE_OPTION = /^(?:-a|-u|-C|--unset|--chdir)$/;
+/**
+ * The `HARDHAT_NETWORK` value a command's own prefix assigns (`HARDHAT_NETWORK=v cmd`, `env HARDHAT_NETWORK=v cmd`): the last
+ * such word wins, as in bash, and an empty value is unnamed. Undefined: the prefix assigns none. An option's value word is not
+ * an assignment (`exec -a HARDHAT_NETWORK=x hardhat` names argv[0]; the run keeps the inherited network).
+ */
+function prefixNetwork(prefix: string): string | undefined {
+  let value: string | undefined;
+  let operand = false;
+  for (const raw of shellWords(prefix)) {
+    if (operand) operand = false;
+    else if (WRAPPER_VALUE_OPTION.test(unquote(raw))) operand = true;
+    else if (/^HARDHAT_NETWORK=/.test(raw)) value = unquote(raw).slice("HARDHAT_NETWORK=".length);
+  }
+  return value;
+}
+
+/** A HARDHAT_NETWORK value a bare run may see; undefined is unnamed, the in-process chain (local). */
+type NetworkValue = string | undefined;
+/** One write to HARDHAT_NETWORK. `plain`: a top-level statement that surely runs, so it replaces what was possible. */
+interface NetworkWrite {
+  value: NetworkValue;
+  plain: boolean;
+}
+/** A value the guard cannot read: no local pattern matches it, so the run it reaches needs approval. */
+const UNREAD_NETWORK = "<unread>";
+/** A shell assignment word, `NAME=` or `NAME+=`. */
+const ASSIGNMENT_WORD = /^[A-Za-z_]\w*\+?=/;
+/**
+ * Commands that may write a shell variable under a name their operands give, or run code that may: never a plain write,
+ * whatever their words (`((` is arithmetic, which assigns).
+ */
+const WRITER_COMMAND = /^(?:declare|typeset|local|readonly|export|unset|read|mapfile|readarray|getopts|let|for|select|eval|source|\.|enable|coproc|trap|alias|wait)$|^\(\(/;
+/** Compound keywords a prefix strips before a command (`then X=v`, `do export X=v`): the command stays a plain statement. */
+const COMPOUND_KEYWORD = /^(?:if|then|else|elif|do|while|until|!)$/;
+/** Prefix words that run the rest of the line as code: `eval` (its joined words) and `coproc` (it names an array). */
+const CODE_PREFIX = /^(?:eval|coproc)$/;
+/**
+ * An expansion that may assign, in any word that expands: arithmetic `$((…))`, `$[…]`, and a parameter expansion whose body
+ * has `=` (`${X:=v}`, `${X=v}`, `${X:-a=b}`). Matched on the active text with double quotes kept (they expand), since
+ * splitTopLevel cuts `$((` apart at its parentheses.
+ */
+const ASSIGNING_EXPANSION = /\$\(\(|\$\[|\$\{[^}]*=/;
+/** An arithmetic command `((…))` assigns when it is unquoted; `"(("` is a literal. Matched on the active text with double quotes blanked. */
+const ARITHMETIC_COMMAND = /\(\(/;
+
+/**
+ * The text a shell expands. Single-quoted runs and backslash escapes are literal and blanked, so printed text such as
+ * `printf '%s' '${X:=v}'` assigns nothing. Double-quoted runs are blanked too unless `inDoubleQuotes` keeps them: `"$((x=1))"`
+ * expands, `"(("` does not. An unterminated quote keeps the text whole, which fails closed.
+ */
+function activeText(text: string, inDoubleQuotes: boolean): string {
+  let out = "";
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      out += " ";
+      continue;
+    }
+    if (c === "\\") {
+      i++;
+      out += "  ";
+      continue;
+    }
+    if (c === "'" && quote === undefined) {
+      quote = "'";
+      out += " ";
+      continue;
+    }
+    if (c === '"') quote = quote === '"' ? undefined : '"';
+    out += quote === '"' && !inDoubleQuotes ? " " : c;
+  }
+  return quote === undefined ? out : text;
+}
+/** The wrappers that run their operand as the command (`command`, `builtin`, `exec`): what they wrap is classified instead. */
+const WRAPPER_COMMAND = /^(?:command|builtin|exec)$/;
+/**
+ * A `$` that starts an expansion: one before a name, digit, special parameter, `{`, `(`, `[`, or `'` (ANSI-C quoting, read as
+ * an expansion too). Any other `$` is a literal dollar, as in `"$%s"`.
+ */
+const dollarExpands = (raw: string, i: number): boolean => i + 1 < raw.length && /[A-Za-z_0-9{(\[@*#?$!'\-]/.test(raw[i + 1]);
+/**
+ * Whether a raw shell word expands: a `$` that starts an expansion or a backtick outside single quotes (a backslash-escaped
+ * one is literal), or a cut substitution anywhere. Inside single quotes only a cut substitution counts.
+ */
+function expandsWord(raw: string): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === CUT) return true;
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      continue;
+    }
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "'" && quote === undefined) quote = "'";
+    else if (c === '"') quote = quote === '"' ? undefined : '"';
+    else if (c === "`" || (c === "$" && dollarExpands(raw, i))) return true;
+  }
+  return false;
+}
+/**
+ * The literal text a raw shell word starts with: its unquoted characters before the first expansion (all of them when there
+ * is none). A word that starts with an expansion starts with "".
+ */
+function literalStart(raw: string): string {
+  let out = "";
+  let quote: string | undefined;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quote === "'") {
+      if (c === CUT) break;
+      if (c === "'") quote = undefined;
+      else out += c;
+      continue;
+    }
+    // `$"…"` is a locale-translated double-quoted string: its `$` is neither text nor an expansion, and the `"` opens the string
+    if (c === "$" && raw[i + 1] === '"' && quote === undefined) continue;
+    if (c === CUT || c === "`" || (c === "$" && dollarExpands(raw, i))) break;
+    if (c === "\\") {
+      if (i + 1 < raw.length) out += raw[++i];
+      continue;
+    }
+    if (c === "'" && quote === undefined) quote = "'";
+    else if (c === '"') quote = quote === '"' ? undefined : '"';
+    else out += c;
+  }
+  return out;
+}
+
+/** The value of an unquoted `HARDHAT_NETWORK=v` word: empty is unnamed, a value the guard cannot read is UNREAD_NETWORK. */
+function networkValue(word: string): NetworkValue {
+  const value = word.slice(word.indexOf("=") + 1);
+  if (value.includes(CUT)) return UNREAD_NETWORK;
+  return value === "" ? undefined : value;
+}
+
+/** The writes of the `HARDHAT_NETWORK=v` words among `words`; `NAME+=v` writes a value the guard cannot read. */
+function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
+  const writes: NetworkWrite[] = [];
+  for (const word of words) {
+    if (/^HARDHAT_NETWORK=/.test(word)) writes.push({ value: networkValue(word), plain });
+    else if (/^HARDHAT_NETWORK\+=/.test(word)) writes.push({ value: UNREAD_NETWORK, plain: false });
+  }
+  return writes;
+}
+
+/**
+ * `unset` names plain variables only: bare identifiers, after an optional `-v`. Such an unset writes the names it lists
+ * and no other variable, so `unset OTHER` leaves HARDHAT_NETWORK alone (`-n`, `-f`, subscripts and expansions are not plain).
+ */
+function plainUnset(args: string[]): boolean {
+  const names = args.filter((w, i) => !(i === 0 && w === "-v"));
+  return names.every((w) => /^[A-Za-z_]\w*$/.test(w));
+}
+
+/**
+ * A redirection whose target cannot fail: `/dev/null`, or a dup of stdout or stderr (`2>&1`, `>&2`). Any other target may
+ * fail, and a failed redirection stops the statement it belongs to, so that statement's write is not certain.
+ */
+function redirectMayFail(text: string): boolean {
+  const raw = shellWords(text);
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op === null) continue;
+    const target = unquote(op[0] === raw[i] ? (raw[++i] ?? "") : raw[i].slice(op[0].length));
+    const safe = op[0].endsWith("&") ? /^[12]$/.test(target) : target === "/dev/null";
+    if (!safe) return true;
+  }
+  return false;
+}
+
+
+/**
+ * The HARDHAT_NETWORK writes of a plain statement: `NAME=v` words, `export NAME=v` and `unset HARDHAT_NETWORK`, each with
+ * nothing in front of it but compound keywords. A plain write of another name changes nothing. A prefix assignment
+ * (`NAME=v cmd`) is that command's alone and never persists. Every other writer is nonPlainWriter's.
+ */
+function statementWrites(item: Normalized): NetworkWrite[] {
+  const { prefix, prefixRaw, words, at } = itemWords(item);
+  const keep = prefix.map((w) => !COMPOUND_KEYWORD.test(w));
+  const prefixWords = prefix.filter((_, i) => keep[i]);
+  // Stripping a keyword prefix must not invent a write: only bare `NAME=` words assign, so anything else runs a command and no plain write is recorded (fail closed).
+  if (at === -1) return prefixRaw.filter((_, i) => keep[i]).every((w) => ASSIGNMENT_WORD.test(w)) ? assignmentWrites([...prefixWords, ...words], true) : [];
+  const rest = unwrapCommand(words.slice(at));
+  if (prefixWords.length > 0 || rest.length !== words.length - at) return [];
+  const [name = "", ...args] = rest;
+  if (name === "export") return assignmentWrites(args, true);
+  if (name === "unset" && plainUnset(args)) return args.includes("HARDHAT_NETWORK") ? [{ value: undefined, plain: true }] : [];
+  return [];
+}
+
+/** The command a wrapper (`command`, `builtin`, `exec`) runs, with the wrapper's own flags dropped. */
+function unwrapCommand(cmd: string[]): string[] {
+  let i = 0;
+  while (i < cmd.length && WRAPPER_COMMAND.test(cmd[i])) {
+    i++;
+    while (i < cmd.length && cmd[i].startsWith("-")) i++;
+  }
+  return cmd.slice(i);
+}
+
+/**
+ * A writer token, over the raw words of a command after its wrappers: a dynamic command name; `printf` that may take `-v`
+ * (printfWrites); a WRITER_COMMAND, unless it is a for or select over another name. Readers (printenv, echo, printf with a
+ * static leading format, test, ls, grep, cat) are not writer tokens, whatever they name or expand.
+ */
+function writerToken(raw: string[]): boolean {
+  const [head = "", ...args] = raw;
+  if (expandsWord(head)) return true;
+  const name = unquote(head);
+  if (name === "printf") return printfWrites(args);
+  // a loop names one variable: it writes HARDHAT_NETWORK only when that name is HARDHAT_NETWORK (an alias would need a nameref, a writer on this line)
+  if (name === "for" || name === "select") return !(/^[A-Za-z_]\w*$/.test(args[0] ?? "") && args[0] !== "HARDHAT_NETWORK");
+  return WRITER_COMMAND.test(name);
+}
+
+/** The words of a shell word list without its redirections: each operator word, and the target word a bare operator takes. */
+function commandWords(raw: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op === null) out.push(raw[i]);
+    else if (op[0] === raw[i]) i++;
+  }
+  return out;
+}
+
+/** An item's prefix words, its command words (raw and unquoted), and the index of its first non-assignment word (-1: none). Only a bare `NAME=` word assigns in command position: a quoted or escaped word (`'HARDHAT_NETWORK=localhost'`, `\HARDHAT_NETWORK=v`) is a command name, so the assignment test runs on the raw word. (`export`/`unset` operands below are still read unquoted: quote removal happens before they assign.) */
+function itemWords(item: Normalized): { prefix: string[]; prefixRaw: string[]; raw: string[]; words: string[]; at: number } {
+  const raw = commandWords(shellWords(item.text));
+  const words = raw.map(unquote);
+  const prefixRaw = shellWords(item.prefix);
+  return { prefix: prefixRaw.map(unquote), prefixRaw, raw, words, at: raw.findIndex((w) => !ASSIGNMENT_WORD.test(w)) };
+}
+
+/**
+ * Whether an item runs a non-plain writer: an opaque command word, a prefix that runs code (`eval`, `coproc`), a writer
+ * command, or an export or unset that is not in its plain form. The plain forms are a statement with nothing in front of it
+ * but compound keywords (`then`, `do`, `!`): `export` with no flag (or `-p`) and no dynamic word, and `unset` of plain names.
+ */
+function nonPlainWriter(item: Normalized): boolean {
+  if (item.opaque) return true;
+  const { prefix, prefixRaw, raw, words, at } = itemWords(item);
+  if (prefix.some((w) => CODE_PREFIX.test(w))) return true;
+  if (execAssigns(prefix)) return true;
+  const keep = prefix.map((w) => !COMPOUND_KEYWORD.test(w));
+  const prefixWords = prefix.filter((_, i) => keep[i]);
+  if (at === -1) {
+    // A quoted or escaped word is a command naming HARDHAT_NETWORK, never an assignment: not a plain write, so a writer (fail closed).
+    return !prefixRaw.filter((_, i) => keep[i]).every((w) => ASSIGNMENT_WORD.test(w)) && prefixWords.some((w) => w.includes("HARDHAT_NETWORK"));
+  }
+  const rest = unwrapCommand(words.slice(at));
+  const cmd = raw.slice(raw.length - rest.length);
+  // `NAME+=v` before the command word is an append the normalizer leaves in the text (only `NAME=v` moves to the prefix): its value is unknown
+  if (words.slice(0, at).some((w) => /^HARDHAT_NETWORK\+=/.test(w))) return true;
+  if ((prefix.includes("env") || rest[0] === "env") && envSplitAssigns(rest)) return true;
+  if (prefixWords.length === 0 && rest.length === words.length - at) {
+    const [head = "", ...args] = cmd;
+    if (unquote(head) === "export") {
+      if (args.length === 1 && unquote(args[0]) === "-p") return false;
+      return args.some((w) => unquote(w).startsWith("-") || (!ASSIGNMENT_WORD.test(unquote(w)) && expandsWord(w)));
+    }
+    if (unquote(head) === "unset") return !plainUnset(args.map((w) => unquote(w)));
+  }
+  return writerToken(cmd);
+}
+
+/** Whether any item on the line, a payload or a substitution included, runs a non-plain writer. */
+function hasNonPlainWriter(items: Normalized[]): boolean {
+  return items.some((item) => nonPlainWriter(item) || hasNonPlainWriter(item.payload));
+}
+
+/**
+ * printf takes options only before its format word, so only leading words count. A leading word whose literal start is
+ * empty or dashed may expand to `-v` (a writer token). A word whose literal start is other text is the format, and so is
+ * a literal word that does not start with `-`. A literal `-v` names a variable; `--` or the format ends the options, and
+ * a `-v` after the format is a value.
+ */
+function printfWrites(args: string[]): boolean {
+  for (const w of args) {
+    const lead = literalStart(w);
+    if (expandsWord(w)) return lead === "" || lead.startsWith("-");
+    if (lead === "--" || !lead.startsWith("-")) return false;
+    if (lead.startsWith("-v")) return true;
+  }
+  return false;
+}
+
+/** Every value any write under `items` (payloads included) may leave, as if all of them ran. */
+function collectWrites(items: Normalized[]): NetworkValue[] {
+  return items.flatMap((item) => [...statementWrites(item).map((write) => write.value), ...collectWrites(item.payload)]);
+}
+
+/** Track the groups an item opens or closes: compounds, `(`/`{` subshells and groups; a case pattern's `)` opens nothing. */
+function enterLeave(groups: string[], item: Normalized): void {
+  if (item.compound === "close") groups.pop();
+  else if (item.compound !== undefined) groups.push(item.compound);
+  const top = groups[groups.length - 1];
+  if (item.end === "(" || item.end === "{") groups.push(item.end);
+  else if ((item.end === ")" || item.end === "}") && top !== undefined && !(item.end === ")" && top === "case")) groups.pop();
+}
+
+/** The index of the item that closes the compound opened at `start`, its groups counted as enterLeave counts them. */
+function compoundEnd(items: Normalized[], start: number): number {
+  const groups: string[] = [];
+  for (let k = start; k < items.length; k++) {
+    enterLeave(groups, items[k]);
+    if (groups.length === 0) return k;
+  }
+  return items.length - 1;
+}
+
+/**
+ * Walk the items of a command line in order, carrying every HARDHAT_NETWORK value that may be in effect. A plain write
+ * that is not inside any group, loop, pipeline, background job or `&&`/`||` replaces the set; every other write adds to it.
+ * A loop body may run again, so every value written under it is added before the loop starts. An item that runs after `&&`
+ * runs only when the item before it succeeded, so the network it sees is that item's success-path network. A bare run is
+ * recorded by its marked text when its possible values include a non-local one, or when the line is not modelable.
+ */
+function scanNetwork(
+  items: Normalized[],
+  state: { possible: NetworkValue[]; unknownWriter: boolean },
+  out: Set<string>,
+  inGroup: boolean,
+): void {
+  const groups: string[] = inGroup ? ["payload"] : [];
+  let prev: Op = "";
+  let succeeded: NetworkValue[] | undefined;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.compound === "loop") {
+      state.possible = [...new Set([...state.possible, ...collectWrites(items.slice(i, compoundEnd(items, i) + 1))])];
+    }
+    scanNetwork(item.payload, state, out, true);
+    const marked = `${item.prefix} ${item.text}`;
+    const seen = prev === "&&" && succeeded !== undefined ? succeeded : state.possible;
+    const nonLocal = seen.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));
+    if (state.unknownWriter || nonLocal) out.add(marked);
+    const may = groups.length > 0 || prev === "&&" || prev === "||" || prev === "|" || prev === "&" || item.end === "|" || item.end === "&";
+    let done = state.possible;
+    for (const write of statementWrites(item)) done = write.plain && !may ? [write.value] : [...new Set([...done, write.value])];
+    // `!` inverts the status its successor sees, so the successor runs on the path where this statement's write may not have
+    // happened: a negated statement's writes stay possible, and no successor trusts its success path
+    const negated = shellWords(item.prefix).some((w) => unquote(w) === "!");
+    succeeded = negated ? undefined : done;
+    // a redirection that may fail may skip the statement's write: then the earlier network stays possible as well
+    state.possible = negated || redirectMayFail(marked) ? [...new Set([...state.possible, ...done])] : done;
+    enterLeave(groups, item);
+    prev = item.end;
+  }
+}
+
+/**
+ * The bare runs of `command` (by marked text) that may see a non-local HARDHAT_NETWORK: the value the line starts from is
+ * the environment it inherits (facts.env, bash's own env override included), and scanNetwork follows the writes in order.
+ */
+function unnamedNetworkRuns(command: string, facts: GuardFacts): Set<string> {
+  const out = new Set<string>();
+  scanNetwork(normalizeSegments(command, 0, []), { possible: [facts.env.HARDHAT_NETWORK || undefined], unknownWriter: lineUnknown(command) }, out, false);
+  return out;
+}
+
+/**
+ * `hardhat run|deploy|ignition deploy|console|test`, `truffle migrate|deploy|exec|console|test`, `brownie run|console|test`.
+ * Provably local only: a line the normalizer cannot model blocks every such run (lineUnknown); a `--network` flag must
+ * name a local chain, and every one of several flags counts. Without a flag, hardhat's own `HARDHAT_NETWORK` prefix
+ * decides, else the network the line leaves at (unnamedNetworkRuns). An unnamed truffle or brownie run takes its network
+ * from its config, which the guard does not read, so its deploy verbs block (unnamedConfigDeploy); test and console pass.
+ * compile and `--help` never match.
+ */
+function frameworkDeploy({ words, marked, prefix }: Segment, facts: GuardFacts, command: string): boolean {
+  return eachTool(words, /^(?:hardhat|truffle|brownie)$/, (at) => {
+    const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
+    const { positional, flags } = argsAfter(words, at, FRAMEWORK_VALUE_FLAG);
+    if (helpOnly(flags) || !verbStarts(positional, at).some((p) => FRAMEWORK_NETWORK_VERB[tool].test(p.slice(0, 2).join(" ")))) return false;
+    if (lineUnknown(command)) return true;
+    const named = flags.filter((f) => f.flag === "--network");
+    if (named.length > 0) return !named.every((f) => f.value !== undefined && LOCAL_CHAIN_NETWORK.test(f.value));
+    if (tool !== "hardhat") return unnamedConfigDeploy(tool, verbStarts(positional, at));
+    const own = prefixNetwork(prefix);
+    if (own !== undefined) return !(own === "" || LOCAL_CHAIN_NETWORK.test(own));
+    return unnamedNetworkRuns(command, facts).has(marked);
+  });
+}
+
+/**
+ * An unnamed truffle or brownie run: its network comes from the project config, which the guard does not read, so it cannot be
+ * proven local. `truffle migrate|deploy`, `truffle exec` of a deploy-named script (`deploy` or `migrat` in its name) and any
+ * `brownie run` block. Other unnamed runs (`truffle test|console|exec` of another script, `brownie test|console`) keep passing.
+ */
+function unnamedConfigDeploy(tool: string, starts: string[][]): boolean {
+  return starts.some(([verb = "", script = ""]) => {
+    if (tool === "brownie") return verb === "run";
+    return verb === "migrate" || verb === "deploy" || (verb === "exec" && /deploy|migrat/i.test(script));
+  });
+}
+
+/**
+ * `forge script … --broadcast|--resume` and `forge create` (also `c`); `forge script` without them only simulates, test, build, fmt never match.
+ * A submitting run is judged by its RPC endpoint (rpcLocal): only a local one passes.
+ */
+function forgeBroadcast({ words }: Segment): boolean {
+  return eachTool(words, /^forge$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    const submits = verbStarts(positional, at).some(([verb]) => verb === "create" || verb === "c" || (verb === "script" && (flagOn(flags, "--broadcast") || flagOn(flags, "--resume"))));
+    return submits && !rpcLocal(flags);
+  });
+}
+
+/**
+ * The `group verb` words of the cast subcommands that submit a transaction (short aliases included): `send|s`,
+ * `publish|p`, `batch-send|bs`, `erc20|erc20-token transfer|approve|mint|burn|permit`, `erc4626|vault
+ * deposit|mint|withdraw|redeem`, `safe create|execute|propose|sign|add-delegate|remove-delegate`, and the Tempo
+ * `tip20`, `tip403`, `receive-policy`, `keychain`, `storage-credits`, `vaddr` and `tempo zone` writes.
+ */
+const CAST_SUBMIT =
+  /^(?:(?:send|s|publish|p|batch-send|bs)|(?:erc20|erc20-token) (?:transfer|approve|a|mint|m|burn|bu|permit)|(?:erc4626|vault) (?:deposit|mint|withdraw|redeem)|safe (?:create|execute|propose|sign|add-delegate|remove-delegate)|tip20 (?:create|c|logo-set|grant-role|revoke-role)|tip403 (?:create|whitelist|blacklist)|receive-policy (?:set|claim|burn)|(?:keychain|kc) (?:authorize|auth|revoke|rev|burn-witness|update-limit|ul|set-scope|ss|remove-scope|rs|add-call|set-limit|remove-target)|(?:storage-credits|sc) (?:set-mode|set-budget)|vaddr (?:create|c)|tempo zone (?:deposit|withdraw))(?: |$)/;
+
+/**
+ * `cast send|publish|batch-send` and the other submitting subcommands (CAST_SUBMIT), and `cast rpc|rp` of a `*_send*`
+ * method (`eth_sendRawTransaction`, `personal_sendTransaction`, `wallet_sendCalls`, `eth_sendBundle`); call, balance,
+ * block, 4byte, and `mktx`/`batch-mktx` (they sign and print, nothing reaches a network) only read or sign offline.
+ * A submitting run is judged by its RPC endpoint (rpcLocal): only a local one passes.
+ */
+function castBroadcast({ words }: Segment): boolean {
+  return eachTool(words, /^cast$/, (at) => {
+    const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
+    if (helpOnly(flags)) return false;
+    const submits = verbStarts(positional, at).some((p) => CAST_SUBMIT.test(p.slice(0, 3).join(" ")) || (/^(?:rpc|rp)$/.test(p[0] ?? "") && p.some((w) => /^[a-z0-9]+_send/i.test(w))));
+    return submits && !rpcLocal(flags);
+  });
+}
+
+const SOLANA_VALUE_FLAG = /^(?:-u|--url|--ws|-k|--keypair|-C|--config|--commitment|--output|--fee-payer|--owner|--program-id)$/;
+const SPL_VALUE_FLAG = /^(?:-u|--url|-C|--config|--owner|--fee-payer|--program-id|--output|--verbosity|--with-compute-unit-price|--with-compute-unit-limit)$/;
+const NEAR_VALUE_FLAG = /^--(?:networkId|accountId|masterAccount|nodeUrl|keyPath|helperUrl|walletUrl)$/;
+const SUI_VALUE_FLAG = /^--(?:client\.config|gas|gas-budget|gas-price)$/;
+const ANCHOR_VALUE_FLAG = /^--(?:provider\.cluster|provider\.wallet|program-name|program-keypair|program-id|cwd)$|^-p$/;
+/** The first two words (`verb sub`) of a solana, spl-token, starkli, sui or aptos command that submits a transaction. */
+const CHAIN_SUBMIT: Record<string, RegExp> = {
+  solana:
+    /^(?:transfer|deploy|create-stake-account|delegate-stake|deactivate-stake|withdraw-stake|split-stake|merge-stake|stake-authorize|create-vote-account|withdraw-from-vote-account|create-nonce-account|withdraw-from-nonce-account|program (?:deploy|upgrade|write-buffer|close|extend|migrate|set-buffer-authority|set-upgrade-authority))(?: |$)/,
+  "spl-token":
+    /^(?:transfer|mint|burn|approve|revoke|create-token|create-account|close-account|close-mint|authorize|freeze|thaw|wrap|unwrap|sync-native|gc|set-transfer-fee|initialize-metadata|update-metadata|withdraw-excess-lamports)(?: |$)/,
+  starkli: /^(?:invoke|deploy|declare|account deploy)(?: |$)/,
+  sui: /^client (?:call|publish|upgrade|transfer|transfer-sui|pay|pay-sui|pay-all-sui|split-coin|merge-coin|ptb|execute-signed-tx)(?: |$)/,
+  aptos: /^(?:move (?:publish|run|run-script|deploy-object|upgrade-object|upgrade-object-package|create-object-and-publish-package)|account (?:transfer|create|create-resource-account|rotate-key)|stake (?!show-))/,
+};
+/** anchor commands that put a program or its IDL on a cluster. */
+const ANCHOR_DEPLOY = /^(?:deploy|upgrade|migrate|idl (?:init|upgrade|set-authority|write-buffer|erase-authority|close|create-buffer))(?: |$)/;
+
+/** near-cli (`send|call|deploy|create-account|delete-account|stake|add-key|delete-key`) and near-cli-rs (`tokens … send-*`, `contract deploy|call-function … as-transaction`, `account create-account|delete-account|add-key|delete-key`, `transaction send-signed-transaction`) writes; `view`, `state` and `as-read-only` only read. */
+function nearSubmits(p: string[]): boolean {
+  const [verb = "", sub = ""] = p;
+  if (/^(?:send|send-near|call|deploy|dev-deploy|create-account|delete-account|stake|add-key|delete-key)$/.test(verb)) return true;
+  if (verb === "tokens") return p.some((w) => /^send-(?:near|ft|nft)$/.test(w));
+  if (verb === "contract") return sub === "deploy" || (sub === "call-function" && p.includes("as-transaction"));
+  if (verb === "account") return p.some((w) => /^(?:create-account|delete-account|add-key|delete-key)$/.test(w));
+  return verb === "transaction" && sub === "send-signed-transaction";
+}
+
+/**
+ * Submitting or deploying on a non-EVM chain: `solana transfer|program deploy|upgrade|write-buffer|close|…` and the
+ * stake, vote and nonce fund moves, `anchor deploy|upgrade|migrate|idl init|upgrade|…` unless `--provider.cluster` is
+ * local (an anchor run that names no cluster reads it from Anchor.toml and cannot be judged: it counts; `anchor test`
+ * counts only with a remote cluster), `spl-token transfer|mint|burn|approve|create-token|create-account|…`, near (see
+ * nearSubmits), `starkli invoke|deploy|declare` (and `account deploy`), `sui client call|publish|upgrade|transfer|pay|split-coin|ptb|…`,
+ * `aptos move publish|run|deploy-object|…`, `aptos account transfer|create`, `aptos stake` writes. `--help` never matches.
+ */
+function otherChainBroadcast({ words }: Segment): boolean {
+  return eachTool(words, /^(?:solana|anchor|spl-token|near|starkli|sui|aptos)$/, (at) => {
+    const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
+    const valueFlag =
+      tool === "solana" ? SOLANA_VALUE_FLAG : tool === "spl-token" ? SPL_VALUE_FLAG : tool === "near" ? NEAR_VALUE_FLAG : tool === "sui" ? SUI_VALUE_FLAG : ANCHOR_VALUE_FLAG;
+    const { positional, flags } = argsAfter(words, at, valueFlag);
+    if (helpOnly(flags)) return false;
+    const starts = verbStarts(positional, at);
+    if (tool === "near") return starts.some(nearSubmits);
+    if (tool !== "anchor") return starts.some((p) => CHAIN_SUBMIT[tool].test(p.slice(0, 2).join(" ")));
+    const clusters = flags.filter((f) => f.flag === "--provider.cluster");
+    const local = clusters.length > 0 && clusters.every((f) => f.value !== undefined && LOCAL_ANCHOR_CLUSTER.test(f.value));
+    return starts.some((p) => {
+      const verb = p.slice(0, 2).join(" ");
+      return ANCHOR_DEPLOY.test(verb) ? !local : /^test(?: |$)/.test(verb) && clusters.length > 0 && !local;
+    });
+  });
+}
+
+/** A flag that hands a private key, mnemonic or secret key to a command (`--private-key 0x…`, `--private-keys=…`, `--mnemonics`, `--mnemonic-passphrase`, `--raw-private-key`). */
+const KEY_FLAG = /^--(?:raw-)?(?:private-keys?|mnemonics?|mnemonic-paths?|mnemonic-passphrases?|secret-keys?)(?:=|$)/;
+const CAST_WALLET_KEY_VERB = /^(?:new|n|new-mnemonic|nm|vanity|va|import|i|private-key|pk|derive-private-key|derive|d|decrypt-keystore|dk|sign|s|sign-auth|sa)$/;
+
+/**
+ * Key material on a command line: any command carrying a KEY_FLAG (every word counts, also after `--`, except for a
+ * text search, whose operands are patterns), `cast wallet new|new-mnemonic|vanity|import|private-key|derive|decrypt-keystore|sign|sign-auth`
+ * and `cast wallet address <key>` (aliases included), `solana-keygen new|recover|grind`, `geth account new|import`.
+ * Whatever network the command targets, a key typed on a command line lands in shell history and logs. `--help` never matches.
+ */
+function chainKeyMaterial({ words }: Segment): boolean {
+  const search = /^(?:grep|egrep|fgrep|rg|ag|ack)$/.test(words[0] ?? "") || git(words).sub === "grep";
+  if (!search && words.some((w) => KEY_FLAG.test(w))) return true;
+  return (
+    eachTool(words, /^cast$/, (at) => {
+      const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
+      const wallet = verbStarts(positional, at).some(([group = "", verb = "", arg]) => /^(?:wallet|w)$/.test(group) && (CAST_WALLET_KEY_VERB.test(verb) || (/^(?:address|a|addr)$/.test(verb) && arg !== undefined)));
+      return wallet && !helpOnly(flags);
+    }) ||
+    eachTool(words, /^solana-keygen$/, (at) => {
+      const { positional, flags } = argsAfter(words, at, NO_VALUE_FLAG);
+      return !helpOnly(flags) && /^(?:new|recover|grind)$/.test(positional[0] ?? "");
+    }) ||
+    // geth's global options (`--datadir d`) may come first: the verb is the word after `account`
+    eachTool(words, /^geth$/, (at) => {
+      const { positional, flags } = argsAfter(words, at, NO_VALUE_FLAG);
+      const account = positional.indexOf("account");
+      return !helpOnly(flags) && account !== -1 && /^(?:new|import)$/.test(positional[account + 1] ?? "");
+    })
+  );
+}
+
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
   {
@@ -2410,6 +3220,65 @@ export const RULES: readonly Rule[] = [
     },
     samples: ["aws ec2 terminate-instances --instance-ids i-1", "gcloud app deploy", "aws --profile prod s3 rm s3://b/x", "aws s3 sync . s3://b --delete", "az group delete -n rg"],
   },
+  // A21-A25 cluster tooling (prod_infra, L3): the cluster, GitOps, mesh and recovery lanes
+  {
+    id: "argocd-change",
+    capability: "prod_infra",
+    agents: ["a22-gitops", "a21-cluster-ops"],
+    pattern: argocdChange,
+    samples: [
+      "argocd app sync prod-api",
+      "argocd app sync api --prune",
+      "argocd app rollback api 3 --server argocd.prod.example.com",
+      "argocd app delete api --force",
+      "argocd cluster add prod-ctx",
+      "argocd proj create payments --server argocd.production.example.com",
+      "argocd app sync -l env=prod",
+      "argocd appset delete prod-set",
+    ],
+  },
+  {
+    id: "flux-change",
+    capability: "prod_infra",
+    agents: ["a22-gitops", "a21-cluster-ops"],
+    pattern: fluxChange,
+    samples: ["flux delete kustomization apps", "flux uninstall --silent", "flux bootstrap github --owner=o --repository=fleet", "flux suspend kustomization prod-apps", "flux resume helmrelease api -n production"],
+  },
+  {
+    id: "mesh-lifecycle",
+    capability: "prod_infra",
+    agents: ["a23-mesh-network", "a21-cluster-ops"],
+    pattern: meshLifecycle,
+    samples: ["istioctl install --set profile=default", "istioctl uninstall --purge", "istioctl x uninstall --purge", "linkerd upgrade | kubectl apply -f -", "cilium install", "cilium uninstall"],
+  },
+  {
+    id: "velero-change",
+    capability: "prod_infra",
+    agents: ["a25-resilience", "a21-cluster-ops"],
+    pattern: veleroChange,
+    samples: ["velero restore create --from-backup nightly", "velero backup delete nightly --confirm", "velero schedule delete nightly", "velero uninstall", "velero install --provider aws"],
+  },
+  {
+    id: "managed-cluster-lifecycle",
+    capability: "prod_infra",
+    agents: ["a21-cluster-ops"],
+    pattern: managedClusterChange,
+    samples: [
+      "eksctl create cluster -f cluster.yaml",
+      "eksctl scale nodegroup --cluster c -n ng --nodes 5",
+      "gcloud container clusters create c --zone us-central1-a",
+      "gcloud container node-pools update pool --cluster c --enable-autoscaling",
+      "az aks create -g rg -n c",
+      "az aks nodepool scale -g rg --cluster-name c -n pool --node-count 3",
+    ],
+  },
+  {
+    id: "kubeadm-lifecycle",
+    capability: "prod_infra",
+    agents: ["a21-cluster-ops"],
+    pattern: kubeadmChange,
+    samples: ["kubeadm init --pod-network-cidr=10.244.0.0/16", "kubeadm join 10.0.0.1:6443 --token t", "kubeadm reset -f", "kubeadm upgrade apply v1.30.0"],
+  },
   // A12 prod_high_risk (L4)
   {
     id: "vercel-prod",
@@ -2486,6 +3355,62 @@ export const RULES: readonly Rule[] = [
     agents: ["a12-release"],
     pattern: pushToProtected,
     samples: ["git push --tags", "git push origin main", "git push origin HEAD:master", "git push origin v1.2.0", "git push origin :main", "git push origin --delete main", "gh pr merge 12 --squash"],
+  },
+  // A26-A30 web3 lanes: a transaction or a deploy leaves the session only through a human
+  {
+    id: "chain-broadcast",
+    capability: "chain_broadcast",
+    agents: ["a26-smart-contract", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance"],
+    pattern: (seg, facts, command) => castBroadcast(seg) || forgeBroadcast(seg) || frameworkDeploy(seg, facts, command) || otherChainBroadcast(seg),
+    samples: [
+      "cast send 0xabc 'transfer(address,uint256)' 0xdef 1",
+      "cast publish 0x02f8",
+      "cast rpc eth_sendRawTransaction 0x02f8",
+      "forge script script/Deploy.s.sol --rpc-url sepolia --broadcast",
+      "forge script script/Deploy.s.sol --resume",
+      "forge create src/C.sol:C --rpc-url sepolia",
+      "npx hardhat run scripts/deploy.ts --network sepolia",
+      "hardhat ignition deploy ignition/modules/C.ts --network mainnet",
+      "HARDHAT_NETWORK=mainnet npx hardhat deploy",
+      "truffle migrate --network mainnet",
+      "brownie run deploy --network sepolia",
+      "solana transfer RecipientPubkey 1",
+      "solana program deploy target/deploy/p.so",
+      "anchor deploy --provider.cluster devnet",
+      "anchor migrate",
+      "spl-token transfer Mint 1 Recipient",
+      "near call c.testnet m '{}' --accountId a.testnet",
+      "starkli invoke 0xabc transfer 0x1 1",
+      "sui client publish --gas-budget 100000000",
+      "aptos move publish --named-addresses a=default",
+      "cast p 0x02f8",
+      "cast erc20 transfer 0xtoken 0xdef 1",
+      "forge c src/C.sol:C --rpc-url sepolia",
+      "docker run --rm --entrypoint cast img send 0xabc 'f()'",
+      "hardhat console --network mainnet",
+      "solana program write-buffer target/deploy/p.so",
+      "aptos account transfer --account 0x1 --amount 1",
+    ],
+  },
+  {
+    id: "chain-key-material",
+    capability: "chain_key_material",
+    agents: ["a26-smart-contract", "a28-chain-infra", "a29-dapp-wallet", "a30-custody-compliance"],
+    pattern: chainKeyMaterial,
+    samples: [
+      "cast call 0xabc 'owner()' --private-key 0x01",
+      "forge test --mnemonic 'test test test'",
+      "cast wallet new",
+      "cast wallet import deployer --interactive",
+      "cast wallet sign 'hello'",
+      "solana-keygen new -o id.json",
+      "solana-keygen recover",
+      "geth account new",
+      "somecli --secret-key=abc",
+      "forge script S.s.sol --private-keys 0x01,0x02",
+      "cast wallet derive 'a b c'",
+      "cast wallet public-key --raw-private-key 0x01",
+    ],
   },
 ];
 

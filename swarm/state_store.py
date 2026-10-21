@@ -19,6 +19,20 @@ def _db_path(root: str | Path | None) -> Path:
     return swarm_dir(root, create=True) / "tasks.db"
 
 
+def claude_state_dir(default: Path) -> Path:
+    """Directory of the .claude projection. SWARM_CLAUDE_STATE_DIR replaces it (read per call); empty means unset."""
+    override = os.environ.get("SWARM_CLAUDE_STATE_DIR")
+    return Path(override) if override else default
+
+
+def gsd_state_path(base: Path) -> Path | None:
+    """STATE.md mirror under base. SWARM_GSD_STATE_FILE replaces it (read per call); empty disables the mirror."""
+    override = os.environ.get("SWARM_GSD_STATE_FILE")
+    if override is None:
+        return base / ".planning" / "STATE.md"
+    return Path(override) if override else None
+
+
 @contextmanager
 def _tx(conn: sqlite3.Connection):
     conn.execute("BEGIN IMMEDIATE")
@@ -82,7 +96,7 @@ class SwarmStateStore:
     def __init__(self, path: str | Path | None = None, *, root: str | Path | None = None):
         try:
             self.root = Path(root) if root else Path(".")
-            self.claude_path = self.root / ".claude" / "swarm-state.json"
+            self.claude_path = claude_state_dir(self.root / ".claude") / "swarm-state.json"
             self.swarm_path = swarm_dir(root, create=True) / "swarm-state.json"
             self.claude_path.parent.mkdir(parents=True, exist_ok=True)
             if not self.claude_path.exists():
@@ -92,7 +106,7 @@ class SwarmStateStore:
         except Exception:
             # isolate init
             self.root = Path(".")
-            self.claude_path = self.root / ".claude" / "swarm-state.json"
+            self.claude_path = claude_state_dir(self.root / ".claude") / "swarm-state.json"
             self.swarm_path = self.root / "swarm-state.json"
 
     def _write(self, p: Path, data: dict) -> None:
@@ -154,8 +168,8 @@ class SwarmStateStore:
     def append_gsd_line(self, line: str, *, root: str | Path | None = None, state: str | None = None) -> None:
         try:
             base = Path(root) if root else self.root
-            state_md = base / ".planning" / "STATE.md"
-            if state_md.exists():
+            state_md = gsd_state_path(base)
+            if state_md is not None and state_md.exists():
                 with state_md.open("a") as f:
                     suffix = f" state={state}" if state else ""
                     f.write(f"swarm: {line}{suffix}\n")

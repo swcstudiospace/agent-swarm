@@ -1,8 +1,8 @@
 """End-to-end parallel run of the real `scripts/swarm_run.py` (v2.2 AC4, AC5, AC6, AC11).
 
 The sessions are the fake `omp` of tests/test_scheduler_continuous.py (imported, not copied); the plan is one task per
-specialist agent plus two extra A12 tasks (A12's ceiling is 2) in a mixed DAG: a diamond (A02 -> A03, A04 -> A05), two
-independent lanes and one failing and one timed-out task. Facts are read from what the processes recorded themselves:
+agent of the thirty plus two extra A12 tasks (A12's ceiling is 2) in a mixed DAG: a diamond (A02 -> A03, A04 -> A05), two
+independent lanes, one chain per new domain (cloud-native, cluster, web3) and one failing and one timed-out task. Facts are read from what the processes recorded themselves:
 the fake's start/end timestamps, `events.jsonl`, `live.json` snapshots polled while the runner ran, and the Task Store.
 """
 from __future__ import annotations
@@ -26,11 +26,15 @@ TERMINAL = {"completed", "failed", "cancelled", "timed_out"}
 CAP = 4
 A12_CEILING = 2
 
-# agent id -> first capability of its manifest entry (the plan resolves the task's agent from this pair)
+# agent id -> a capability of its manifest entry (the plan resolves the task's agent from this pair)
 CAPABILITY = {
     "A01": "plan.decompose", "A02": "req.spec", "A03": "design.blueprint", "A04": "ux.spec", "A05": "code.backend",
     "A06": "code.frontend", "A07": "data.model", "A08": "test.unit", "A09": "review.code", "A10": "sec.sast",
     "A11": "deploy.env", "A12": "release.plan", "A13": "obs.slo", "A14": "maint.patch", "A15": "docs.api",
+    "A16": "cloud.architecture", "A17": "platform.catalog", "A18": "supply.sbom", "A19": "event.topology",
+    "A20": "finops.model", "A21": "cluster.lifecycle", "A22": "gitops.reconcile", "A23": "mesh.traffic",
+    "A24": "kpol.admission", "A25": "resilience.chaos", "A26": "web3.contract", "A27": "audit.static",
+    "A28": "chain.node", "A29": "dapp.wallet", "A30": "custody.keys",
 }
 # task id -> (agent, dependencies). Lane 1 holds the diamond, lane 2 is independent of it.
 DAG = {
@@ -41,6 +45,15 @@ DAG = {
     "T-a07": ("A07", []), "T-a08": ("A08", ["T-a07"]), "T-a09": ("A09", ["T-a08"]),   # lane 2
     "T-a11": ("A11", []), "T-a13": ("A13", ["T-a11"]),
     "T-a12": ("A12", []), "T-a12b": ("A12", []), "T-a12c": ("A12", []),
+    # cloud-native: the architecture hangs off A03, events/golden path/cost fan out from it, the image waits for the backend
+    "T-a16": ("A16", ["T-a03"]), "T-a19": ("A19", ["T-a16"]), "T-a17": ("A17", ["T-a16"]), "T-a20": ("A20", ["T-a16"]),
+    "T-a18": ("A18", ["T-a05"]),
+    # cluster: capacity first, traffic and admission policy side by side, then the manifests and resilience
+    "T-a21": ("A21", []), "T-a23": ("A23", ["T-a21"]), "T-a24": ("A24", ["T-a21"]),
+    "T-a22": ("A22", ["T-a23", "T-a24"]), "T-a25": ("A25", ["T-a22"]),
+    # web3: custody policy before the contracts; the dapp, audit and chain infrastructure all read the contracts
+    "T-a30": ("A30", ["T-a03"]), "T-a26": ("A26", ["T-a30"]), "T-a29": ("A29", ["T-a26"]),
+    "T-a27": ("A27", ["T-a26"]), "T-a28": ("A28", ["T-a26"]),
     "T-a14": ("A14", []),   # fails
     "T-a15": ("A15", []),   # never finishes: killed by --task-timeout
 }
@@ -134,7 +147,7 @@ def agent_peak(spans, tasks, agent: str) -> int:
     return sc._max_concurrency({t: s for t, s in spans.items() if tasks[t][0] == agent})
 
 
-# ------------------------------------------------------------------------------------------------ the 17-task DAG run
+# ------------------------------------------------------------------------------------------------ the 32-task DAG run
 @pytest.fixture(scope="module")
 def dag_run(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("e2e-dag")
@@ -159,8 +172,12 @@ def dag_run(tmp_path_factory):
             run.kill()
 
 
-def test_the_plan_names_every_specialist_agent():
-    assert {agent for agent, _ in DAG.values()} == set(CAPABILITY) and len(CAPABILITY) == 15
+def test_the_plan_names_every_agent_of_the_thirty():
+    from swarm.manifest import load_manifest
+
+    manifest = {a["id"]: a["capabilities"] for a in load_manifest()}
+    assert {agent for agent, _ in DAG.values()} == set(CAPABILITY) == set(manifest) and len(CAPABILITY) == 30
+    assert all(cap in manifest[agent] for agent, cap in CAPABILITY.items())
 
 
 def test_independent_tasks_ran_at_the_same_time(dag_run):
@@ -353,10 +370,10 @@ def test_a_mid_run_snapshot_with_every_row_kind_is_captured_for_the_contract_fix
     best = max(rich, key=lambda s: (len({r["agent"] for r in s["runs"]}), s["swarm"]["completed"], -s["seq"]))
     assert validate(best, load_schema("swarm.live.v1")) == []
     if os.environ.get("SWARM_WRITE_LIVE_FIXTURE") == "1":
-        # the bar contract (omp/test/live_contract.test.ts) needs every row kind and all 15 agents in one snapshot
+        # the bar contract (omp/test/live_contract.test.ts) needs every row kind and all 30 agents in one snapshot
         kinds = {"running", "queued", "completed", "waiting", "failed"}
-        full = [s for s in rich if kinds <= {r["state"] for r in s["runs"]} and len({r["agent"] for r in s["runs"]}) == 15]
-        assert full, "no snapshot with every row kind and all 15 agents: run it again"
+        full = [s for s in rich if kinds <= {r["state"] for r in s["runs"]} and len({r["agent"] for r in s["runs"]}) == 30]
+        assert full, "no snapshot with every row kind and all 30 agents: run it again"
         pick = max(full, key=lambda s: (s["swarm"]["completed"], -s["seq"]))
         target = ROOT / "tests" / "fixtures" / "live_runner_sample.json"
         target.write_text(json.dumps(pick, indent=2, sort_keys=True) + "\n")

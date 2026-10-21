@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""A27 - validate an audit findings file for required fields, severity consistency, proof-of-concept references and fix status, and aggregate it by category.
+
+Scans `*findings*.json|yaml|yml` under --root (or the one file given with --path), checks every finding and reports problems as
+findings with severity info|minor|major|blocker; the run status is "fail" when any major or blocker exists. The audit severity
+scale inside a findings file is info|low|medium|high|critical (see swarm/tools/a27_tools.py, which supplies the shared rules).
+Read-only and bounded: files over 1 MiB are skipped, at most 2000 files are visited, symlinks are never followed (a --path that is
+or passes through one, including through `..` after a symlink, is refused), binaries are skipped, YAML needs PyYAML (otherwise
+`skipped:tool-missing`; JSON is always native). Silent by design: the directories .git, .hg, .svn, node_modules, .venv, venv, __pycache__,
+.tox, .mypy_cache, .swarm and .terraform are tool caches, vendored dependencies or runtime state, not repository content; they are pruned by
+name at every depth and never walked, so a findings file inside one is neither read nor reported. Every other directory, build and dist
+included, is walked and read. The only walk-level reasons are a directory that cannot be listed, a symlinked directory and the size or file
+limits; each one makes the scan incomplete, so the status is fail until the input is analysed.
+Every input that is skipped, truncated, unreadable or unparseable, and a run that analysed no input at all, adds a major
+`scan-incomplete` finding (swarm/scan_status.py), so the status is "fail" until every in-scope input is analysed.
+`--dry-run` prints deterministic canned output and reads nothing. Stdlib only.
+"""
+from __future__ import annotations
+
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.gates import make_finding  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
+from swarm.script_base import AgentScript  # noqa: E402
+from swarm.tools import a27_tools  # noqa: E402
+
+MAX_FILE_BYTES = 1 << 20
+MAX_FILES = 2000
+MAX_REPORTED = 1000
+MAX_DEDUPE = 200
+SILENT_SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".swarm", ".terraform"}  # tool caches, vendored dependencies and runtime state, not repository content
+SUFFIXES = {".json", ".yaml", ".yml"}
+REQUIRED = ("id", "title", "severity", "category", "location", "description", "recommendation", "status")
+SERIOUS = ("critical", "high")
+LEVELS = ("low", "medium", "high")
+_FIX_LEVEL = {"critical": "major", "high": "major", "medium": "minor"}  # an unverified or mitigated fix is a finding at the tool's severity: critical and high fail, medium is minor, the rest info
+
+
+def _blank(value) -> bool:
+    return not isinstance(value, str) or not value.strip()
+
+
+_clean = a27_tools._clean  # secret-looking spans become [REDACTED]: a findings file may quote a key, token or credentialed URL
+
+
+def _shown(value) -> str:
+    """A caller-supplied value made safe to quote in a summary: cleaned, at most 80 characters, repr-quoted."""
+    return repr(_clean(str(value))[:80])
+
+
+def _yaml_module():
+    try:
+        import yaml  # noqa: PLC0415 - optional dependency, probed on demand
+    except ImportError:
+        return None
+    return yaml
+
+
+def _regular(path: Path) -> bool:
+    """A regular file only: a FIFO, socket or device named like a findings file would block or misbehave in read_bytes()."""
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _rel(root: Path, path: Path) -> str:
+    return _clean(path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name)
+
+
+def _unlistable(root: Path, reasons: list[str]):
+    """os.walk onerror: a directory that cannot be listed is a reason naming it, never a silent skip."""
+
+    def handle(error: OSError) -> None:
+        name = _rel(root, Path(error.filename)) if error.filename else "(unnamed directory)"
+        reasons.append(f"scan-error: {name} ({type(error).__name__})")
+
+    return handle
+
+
+def _discover(root: Path, target: Path) -> tuple[list[Path], list[str], bool]:
+    """Candidate findings files: the target itself, or `*findings*` json/yaml files below it. (files, reasons, truncated)
+
+    A symlink is never followed, whatever its name, and a non-regular file is never opened. A directory that cannot be listed, a symlinked directory, a non-regular file and the file limit are each a reason the scan is incomplete. A real directory with a silent name is pruned without a reason; every other directory, build and dist included, is walked.
+    """
+    if not target.is_dir():
+        if _regular(target):
+            return [target], [], False
+        return [], [f"skipped:not-regular: {_rel(root, target)}"], False
+    found: list[Path] = []
+    reasons: list[str] = []
+    visited = 0
+    for current, dirs, names in os.walk(target, followlinks=False, onerror=_unlistable(root, reasons)):
+        kept = []
+        for d in sorted(dirs):
+            path = Path(current) / d
+            if path.is_symlink():
+                reasons.append(f"skipped:symlink: {_rel(root, path)}")
+            elif d not in SILENT_SKIP_DIRS:
+                kept.append(d)
+        dirs[:] = kept
+        for name in sorted(names):
+            visited += 1
+            if visited > MAX_FILES:
+                reasons.append(f"file-limit: scan stopped after {MAX_FILES} files")
+                return found, reasons, True
+            path = Path(current) / name
+            if path.suffix.lower() not in SUFFIXES or "findings" not in name.lower():
+                continue
+            if path.is_symlink():
+                reasons.append(f"skipped:symlink: {_rel(root, path)}")
+            elif _regular(path):
+                found.append(path)
+            else:
+                reasons.append(f"skipped:not-regular: {_rel(root, path)}")
+    return found, reasons, False
+
+
+def _incomplete(reasons: list[str], analysed: int) -> list[dict]:
+    return [make_finding(f["id"], f["severity"], f["rule"], f["summary"]) for f in incomplete_findings(reasons, analysed)]
+
+
+def _load(path: Path):
+    """(document, skip_reason, error). Reads at most MAX_FILE_BYTES."""
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        return None, "too-large", ""
+    raw = path.read_bytes()
+    if b"\0" in raw[:8192]:
+        return None, "binary", ""
+    text = raw.decode("utf-8", errors="replace")
+    if path.suffix.lower() == ".json":
+        try:
+            return json.loads(text), "", ""
+        except (ValueError, RecursionError) as exc:
+            if isinstance(exc, ValueError) and hasattr(exc, "lineno"):
+                return None, "", f"not valid JSON at line {exc.lineno} column {exc.colno}"
+            return None, "", "not valid JSON"
+    yaml = _yaml_module()
+    if yaml is None:
+        return None, "tool-missing", ""
+    try:
+        return yaml.safe_load(text), "", ""
+    except Exception as exc:  # noqa: BLE001 - any parser failure is a finding, never a crash
+        mark = getattr(exc, "problem_mark", None)  # PyYAML's message quotes the offending line: report the position only
+        return None, "", f"not valid YAML at line {mark.line + 1} column {mark.column + 1}" if mark is not None else "not valid YAML"
+
+
+def _poc_state(root: Path, reference: str) -> str:
+    """found | missing | outside: where a proof-of-concept reference (path, optional ::test or #anchor suffix) points."""
+    text = reference.split("::", 1)[0].split("#", 1)[0].strip()
+    if not text:
+        return "missing"
+    try:
+        candidate = (root / text).resolve()
+        if not candidate.is_relative_to(root):
+            return "outside"
+        return "found" if candidate.is_file() else "missing"
+    except (ValueError, OSError):  # an embedded NUL or a name longer than the file system allows cannot exist
+        return "missing"
+
+
+def _check_finding(root: Path, rel: str, index: int, item, seen: set[str], out: list[dict], stats: dict) -> None:
+    label = f"#{index}"
+    if not isinstance(item, dict):
+        out.append(make_finding(f"bad-finding:{rel}:{label}", "major", "bad-finding", f"finding {label} is not an object", location=rel))
+        return
+    fid = item.get("id") if isinstance(item.get("id"), str) and item.get("id").strip() else label
+    label = _clean(fid)[:80]
+
+    def add(rule: str, severity: str, summary: str) -> None:
+        out.append(make_finding(f"{rule}:{rel}:{label}", severity, rule, summary, location=rel))
+
+    for key in REQUIRED:
+        if _blank(item.get(key)):
+            add("missing-field", "major", f"{label}: required field {key!r} is missing or empty")
+    if isinstance(item.get("id"), str) and item["id"].strip():
+        if item["id"] in seen:
+            add("duplicate-id", "major", f"{label}: id is used by more than one finding")
+        seen.add(item["id"])
+    severity, status = item.get("severity"), item.get("status")
+    severity_ok = severity in a27_tools.SEVERITIES
+    status_ok = status in a27_tools.FIX_STATUSES
+    if isinstance(severity, str) and severity.strip() and not severity_ok:
+        add("invalid-severity", "major", f"{label}: severity {_shown(severity)} is not one of {', '.join(a27_tools.SEVERITIES)}")
+    if isinstance(status, str) and status.strip() and not status_ok:
+        add("invalid-status", "major", f"{label}: status {_shown(status)} is not one of {', '.join(a27_tools.FIX_STATUSES)}")
+    category = item.get("category")
+    cat = _clean(category.strip())[:80] if isinstance(category, str) and category.strip() else "(none)"
+    bucket = stats["by_category"].setdefault(cat, {"total": 0, "open": 0, "by_severity": {}})
+    bucket["total"] += 1
+    sev_key = severity if severity_ok else "invalid"
+    bucket["by_severity"][sev_key] = bucket["by_severity"].get(sev_key, 0) + 1
+    stats["by_severity"][sev_key] = stats["by_severity"].get(sev_key, 0) + 1
+    stat_key = status if status_ok else "invalid"
+    stats["by_status"][stat_key] = stats["by_status"].get(stat_key, 0) + 1
+    if status == "open":
+        bucket["open"] += 1
+
+    impact, likelihood = item.get("impact"), item.get("likelihood")
+    if (impact is None) != (likelihood is None):
+        add("incomplete-scoring", "minor", f"{label}: impact and likelihood must be given together")
+    elif impact is not None:
+        if impact not in LEVELS or likelihood not in LEVELS:
+            add("invalid-scoring", "minor", f"{label}: impact and likelihood must each be one of {', '.join(LEVELS)}")
+        elif severity_ok and a27_tools._matrix(impact, likelihood) != severity and item.get("severity_override_approved") is not True:
+            expected = a27_tools._matrix(impact, likelihood)
+            add("severity-mismatch", "major", f"{label}: severity {severity} differs from impact x likelihood = {expected}; an override needs L3 approval (severity_override_approved)")
+
+    serious = severity in SERIOUS
+    poc = item.get("poc")
+    if _blank(poc):
+        if serious:
+            add("poc-missing", "major", f"{label}: {severity} finding has no proof-of-concept reference (poc)")
+    else:
+        state = _poc_state(root, poc)
+        if state != "found":
+            level = "major" if serious else "minor"
+            add("poc-not-found" if state == "missing" else "poc-outside-root", level, f"{label}: poc {_shown(poc)} {'does not exist under the root' if state == 'missing' else 'points outside the root'}")
+
+    commit = item.get("fix_commit")
+    if status in ("fixed", "mitigated"):
+        if _blank(commit):
+            add("fix-commit-missing", "major", f"{label}: status {status} but no fix_commit")
+        elif not a27_tools._is_commit(commit.strip()):
+            add("fix-commit-invalid", "major", f"{label}: fix_commit {_shown(commit)} is not a git object id (7-40 or 64 hex characters)")
+        if _blank(commit) or not (item.get("regression_test") is True and item.get("reaudited") is True):
+            add("fix-unverified", _FIX_LEVEL.get(severity, "info") if isinstance(severity, str) else "info", f"{label}: {severity} fix lacks a fix commit, a regression test or a re-audit (fix_commit, regression_test, reaudited)")
+        if status == "mitigated":
+            add("residual-risk", _FIX_LEVEL.get(severity, "info") if isinstance(severity, str) else "info", f"{label}: mitigated, not fixed: residual risk remains at {severity} severity")
+    elif status == "open":
+        if severity == "critical":
+            add("open-blocking", "blocker", f"{label}: critical finding is still open")
+        elif severity == "high":
+            add("open-high", "major", f"{label}: high finding is still open")
+    elif status in ("acknowledged", "wontfix") and serious:
+        if _blank(item.get("risk_acceptance")):
+            add("risk-acceptance-missing", "major", f"{label}: {status} {severity} finding needs an L4 risk acceptance reference (risk_acceptance)")
+        else:
+            add("risk-accepted", "info", f"{label}: {status} {severity} finding carries risk acceptance {_shown(item['risk_acceptance'])}")
+
+
+def _duplicates(rel: str, items: list, out: list[dict], reasons: list[str]) -> None:
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or any(_blank(item.get(k)) for k in ("id", "title", "category", "location")) or item.get("severity") not in a27_tools.SEVERITIES:
+            continue
+        rows.append(
+            {
+                "id": item["id"], "title": item["title"], "category": item["category"], "file": item["location"].split(":", 1)[0] or item["location"],
+                "severity": item["severity"],
+            }
+        )
+    ids = [row["id"] for row in rows]
+    rows = [row for index, row in enumerate(rows) if row["id"] not in ids[:index]]  # first occurrence wins; duplicate ids are reported separately
+    if len(rows) > MAX_DEDUPE:
+        out.append(make_finding(f"dedupe-truncated:{rel}", "info", "dedupe-truncated", f"duplicate detection ran on the first {MAX_DEDUPE} of {len(rows)} findings", location=rel))
+        reasons.append(f"dedupe-truncated: {rel} (only the first {MAX_DEDUPE} of {len(rows)} findings were compared)")
+        rows = rows[:MAX_DEDUPE]
+    if not rows:
+        return
+    result = a27_tools.dedupe_findings({"findings": rows})
+    for group in result.get("groups", []):
+        out.append(
+            make_finding(
+                f"possible-duplicate:{rel}:{group['primary_id']}", "minor", "possible-duplicate",
+                f"{group['primary_id']} duplicates {', '.join(group['duplicate_ids'])}" + ("; severities differ" if group["severity_conflict"] else ""), location=rel,
+            )
+        )
+
+
+def run(args, ctx) -> dict:
+    if ctx.dry_run:
+        return {
+            "status": "ok", "dry_run": True, "findings": [], "summary": "dry-run: audit_findings_check would validate findings files under --root",
+            "files_checked": 0, "files_skipped": [], "findings_total": 0, "by_category": {}, "by_severity": {}, "by_status": {}, "truncated": False,
+        }
+    root = ctx.root
+    target = (root / args.path).resolve()
+    if not target.is_relative_to(root):
+        raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} leaves the repository root")
+    cur = Path((root / args.path).anchor)
+    for part in (root / args.path).parts[1:]:
+        if part == "..":
+            cur = cur.parent
+            continue
+        if part == ".":
+            continue
+        nxt = cur / part
+        if nxt != root and nxt.is_relative_to(root) and nxt.is_symlink():
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} is or passes through a symbolic link; symlinks are never followed")
+        cur = nxt
+    if not target.exists():
+        raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} does not exist under {root}")
+    files, reasons, truncated = _discover(root, target)
+    out: list[dict] = []
+    skipped: list[str] = []
+    stats = {"by_category": {}, "by_severity": {}, "by_status": {}}
+    checked = total = analysed = 0
+    for path in files:
+        rel = _rel(root, path)
+        try:
+            document, skip, error = _load(path)
+        except OSError as exc:
+            skipped.append(f"skipped:unreadable: {rel} ({type(exc).__name__})")
+            continue
+        if skip:
+            skipped.append(f"skipped:{skip}: {rel}" + (" (yaml needs PyYAML)" if skip == "tool-missing" else ""))
+            continue
+        checked += 1
+        if error:
+            out.append(make_finding(f"unparseable:{rel}", "major", "unparseable", f"{rel}: {error}", location=rel))
+            reasons.append(f"unparseable: {rel}")
+            continue
+        items = document.get("findings") if isinstance(document, dict) else document
+        if not isinstance(items, list):
+            out.append(make_finding(f"bad-shape:{rel}", "major", "bad-shape", f"{rel}: expected a list of findings or an object with a 'findings' list", location=rel))
+            reasons.append(f"bad-shape: {rel}")
+            continue
+        analysed += 1
+        seen: set[str] = set()
+        for index, item in enumerate(items):
+            _check_finding(root, rel, index, item, seen, out, stats)
+        total += len(items)
+        _duplicates(rel, items, out, reasons)
+    reasons.extend(skipped)
+    if not files:
+        out.append(make_finding("no-findings-file", "info", "no-findings-file", f"no *findings*.json|yaml|yml file found under {_clean(args.path)}"))
+    out.extend(_incomplete(reasons, analysed))
+    rank = {name: index for index, name in enumerate(("info", "minor", "major", "blocker"))}
+    out.sort(key=lambda f: (-rank[f["severity"]], f["id"]))
+    status = scan_status(out)
+    majors = sum(1 for f in out if f["severity"] in ("major", "blocker"))
+    capped = len(out) > MAX_REPORTED
+    if capped:
+        out = out[:MAX_REPORTED]
+    summary = f"{total} finding(s) in {checked} file(s): " + (f"{majors} major or worse problem(s)" if status == "fail" else "no major or worse problem")
+    return {
+        "status": status,
+        "findings": out,
+        "summary": summary + (f"; {len(skipped)} file(s) skipped" if skipped else ""),
+        "files_checked": checked,
+        "files_skipped": skipped,
+        "findings_total": total,
+        "by_category": {key: stats["by_category"][key] for key in sorted(stats["by_category"])},
+        "by_severity": {key: stats["by_severity"][key] for key in sorted(stats["by_severity"])},
+        "by_status": {key: stats["by_status"][key] for key in sorted(stats["by_status"])},
+        "truncated": truncated or capped,
+    }
+
+
+def add_args(p) -> None:
+    p.add_argument("--path", default=".", help="findings file, or directory under --root to scan for *findings*.json|yaml|yml")
+
+
+if __name__ == "__main__":
+    sys.exit(AgentScript("A27", "audit_findings_check", run, description=__doc__, add_args=add_args).main())

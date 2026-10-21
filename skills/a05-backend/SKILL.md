@@ -35,7 +35,7 @@ Don't use for: Do not edit frontend, schema, or deploy.
 ## Procedure
 
 1. Validate the signed task.assign. Echo task_id and correlation_id.
-2. Read upstream artifacts in consumes: api.contract, data.contract, schema.migration, acceptance.criteria, review.verdict, gate.verdict.
+2. Read upstream artifacts in consumes: api.contract, data.contract, schema.migration, acceptance.criteria, review.verdict, gate.verdict, event.topology.spec, golden.path.template.
 3. Run the scripts above. Never fabricate JSON.
 4. Write only code.patch, unit.tests, task.result.
 5. Finish with markdown summary + one fenced json `task.result`.
