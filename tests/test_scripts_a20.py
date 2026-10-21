@@ -458,6 +458,45 @@ def test_default_tags_exempt_only_through_an_unaliased_provider(tmp_path):
     assert not any(s["status"] == "skipped:provider-default-tags" for s in result["skipped"])
 
 
+def test_a_child_module_handed_a_tagged_provider_inherits_its_tags_and_an_unrelated_root_is_still_judged(tmp_path):
+    put(tmp_path, "main.tf", 'provider "aws" {\n  alias = "west"\n  default_tags {\n    tags = { owner = "x", environment = "dev" }\n  }\n}\n'
+                             'module "child" {\n  source = "./child"\n  providers = { aws = aws.west }\n}\n')
+    put(tmp_path, "child/main.tf", 'resource "aws_instance" "c" { instance_type = "t3.micro" }\n')
+    put(tmp_path, "other/main.tf", 'resource "aws_instance" "u" { instance_type = "t3.micro" }\n')
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert hits(result, "iac-untagged-resource") == [("aws_instance.u", "major")]
+    assert [s["status"] for s in result["skipped"]] == ["skipped:provider-default-tags"]
+
+
+def test_a_child_module_handed_an_untagged_provider_is_still_judged(tmp_path):
+    put(tmp_path, "main.tf", 'provider "aws" {\n  alias = "west"\n  default_tags {\n    tags = { owner = "x", environment = "dev" }\n  }\n}\n'
+                             'provider "aws" {\n  alias = "east"\n  region = "us-east-1"\n}\n'
+                             'module "child" {\n  source = "./child"\n  providers = { aws = aws.east }\n}\n')
+    put(tmp_path, "child/main.tf", 'resource "aws_instance" "c" { instance_type = "t3.micro" }\n')
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert hits(result, "iac-untagged-resource") == [("aws_instance.c", "major")]
+
+
+def test_tags_reach_a_grandchild_module_through_a_chain_of_provider_mappings(tmp_path):
+    put(tmp_path, "main.tf", 'provider "aws" {\n  alias = "west"\n  default_tags {\n    tags = { owner = "x", environment = "dev" }\n  }\n}\n'
+                             'module "mid" {\n  source = "./mid"\n  providers = { aws = aws.west }\n}\n')
+    put(tmp_path, "mid/main.tf", 'module "leaf" {\n  source = "../leaf"\n}\n')
+    put(tmp_path, "leaf/main.tf", 'resource "aws_instance" "l" { instance_type = "t3.micro" }\n')
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert hits(result, "iac-untagged-resource") == []
+    assert [s["status"] for s in result["skipped"]] == ["skipped:provider-default-tags"]
+
+
+def test_an_explicit_provider_reference_is_judged_by_the_alias_it_names(tmp_path):
+    put(tmp_path, "main.tf", 'provider "aws" {\n  alias = "west"\n  default_tags {\n    tags = { owner = "x", environment = "dev" }\n  }\n}\n'
+                             'provider "aws" {\n  alias = "east"\n  region = "us-east-1"\n}\n'
+                             'resource "aws_instance" "w" {\n  provider = aws.west\n  instance_type = "t3.micro"\n}\n'
+                             'resource "aws_instance" "e" {\n  provider = aws.east\n  instance_type = "t3.micro"\n}\n')
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert hits(result, "iac-untagged-resource") == [("aws_instance.e", "major")]
+
+
+
 def test_provider_default_tags_in_one_terraform_root_do_not_hide_untagged_resources_in_another(tmp_path):
     put(tmp_path, "dev/main.tf", 'provider "aws" {\n  default_tags {\n    tags = { owner = "x" }\n  }\n}\nresource "aws_instance" "a" {\n  instance_type = "m5.large"\n}\n')
     put(tmp_path, "prod/main.tf", 'resource "aws_instance" "b" {\n  instance_type = "m5.large"\n}\n')

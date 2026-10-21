@@ -432,28 +432,52 @@ def _blocks(masked: str, skeleton: str, kind: str) -> list[tuple[str, str]]:
     return bodies
 
 
-def _hcl_scope(directory: str, masked: str, skeleton: str) -> tuple[bool, bool, list[str], bool]:
-    """Whether the file declares default_tags on its unaliased (default) provider, whether it declares an unaliased provider of its own
-    (Terraform does not pass the default provider down to such a module), the local child modules it calls, as directories, and whether
-    it declares default_tags on an aliased provider. Only a default_tags block of a provider counts: a variable or local with that name
-    tags nothing."""
-    default_tags = own_provider = aliased_default_tags = False
+_HCL_PROVIDER_PASS = re.compile(r"([A-Za-z0-9_-]+)\s*=\s*[A-Za-z0-9_-]+(?:\.([A-Za-z0-9_-]+))?")
+
+
+def _provider_alias(raw) -> str | None:
+    """The provider a resource names: None when it names none (its directory's default provider applies), "" for the unaliased provider,
+    the alias otherwise, and "*" when the reference is not a plain provider or alias, so any tagged provider of its directory may apply."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        return "*"
+    match = re.fullmatch(r"\s*([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_-]+))?\s*", raw)
+    return (match.group(2) or "") if match else "*"
+
+
+def _module_providers(raw):
+    """None when a module names no providers, so it takes its parent's default provider. Otherwise the parent alias each local provider
+    name is passed from ("" for the unaliased provider); "*" when the argument is not a literal map, so any parent provider may reach it."""
+    if raw is None:
+        return None
+    if not raw.startswith("{"):
+        return "*"
+    return {key: alias for key, alias in _HCL_PROVIDER_PASS.findall(raw)}
+
+
+def _hcl_scope(directory: str, masked: str, skeleton: str) -> tuple[set[str], bool, list[tuple[str, object]]]:
+    """The provider aliases of the file that declare default_tags ("" for the unaliased provider), whether it declares an unaliased provider
+    of its own (Terraform does not pass the default provider down to such a module), and the local child modules it calls, each as its
+    directory and the providers it is passed (see _module_providers). Only a default_tags block of a provider counts: a variable or local
+    with that name tags nothing."""
+    tagged: set[str] = set()
+    own_provider = False
     for bm, bs in _blocks(masked, skeleton, "provider"):
-        declares = _has_top_level_block(bs, "default_tags")
-        if _top_level_attr(bm, bs, "alias") is None:
+        alias = _top_level_attr(bm, bs, "alias")
+        if alias is None:
             own_provider = True
-            default_tags = default_tags or declares
-        else:
-            aliased_default_tags = aliased_default_tags or declares
+        if _has_top_level_block(bs, "default_tags"):
+            tagged.add((alias or "").strip('"'))
     calls = []
     for bm, bs in _blocks(masked, skeleton, "module"):
         local = re.fullmatch(r'"(\.\.?/[^"$]*)"', _top_level_attr(bm, bs, "source") or "")
         if local:
-            calls.append(posixpath.normpath(posixpath.join(directory, local.group(1))))
-    return default_tags, own_provider, calls, aliased_default_tags
+            calls.append((posixpath.normpath(posixpath.join(directory, local.group(1))), _module_providers(_top_level_attr(bm, bs, "providers"))))
+    return tagged, own_provider, calls
 
 
-def _hcl_facts(path: str, text: str) -> tuple[list[dict], tuple[bool, bool, list[str], bool], int]:
+def _hcl_facts(path: str, text: str) -> tuple[list[dict], tuple[set[str], bool, list[tuple[str, object]]], int]:
     """Resource facts of one .tf file, its provider and module scope (see _hcl_scope), and how many resource blocks could
     not be delimited (unbalanced braces) and were therefore not evaluated."""
     masked, skeleton = _mask_hcl(text)
@@ -482,7 +506,7 @@ def _hcl_facts(path: str, text: str) -> tuple[list[dict], tuple[bool, bool, list
             "file": path, "line": bisect_left(newlines, head.start()) + 1, "ref": f"{rtype}.{name}", "type": rtype, "name": name,
             "source": "terraform", "instance_types": instance_types, "volume_types": volume_types,
             "tags": _hcl_tags(body_m, body_s) if rtype in TAGGABLE_TF else None,
-            "explicit_provider": _top_level_attr(body_m, body_s, "provider") is not None,
+            "provider_alias": _provider_alias(_top_level_attr(body_m, body_s, "provider")),
             "lifecycle": _hcl_lifecycle(rtype, body_m, body_s, retention),
             "body": body_m,
             "unevaluated": _hcl_unevaluated(rtype, body_m, body_s) + _retention_reason(LIFECYCLE_TF.get(rtype), _hcl_lifecycle(rtype, body_m, body_s, retention)) + _hcl_tag_key_reasons(rtype, body_m, body_s),
@@ -754,7 +778,7 @@ def _doc_facts(path: str, doc) -> list[dict]:
                     tags = None if _tf_json_tag_key_reasons(rtype, attrs) else _tf_json_tag_values(_declared_tags(attrs, "tags"))
                 facts.append({"file": path, "line": 0, "ref": f"{rtype}.{name}", "type": rtype, "name": name, "source": "terraform",
                               "instance_types": instance_types, "volume_types": volume_types, "tags": tags,
-                              "explicit_provider": "provider" in attrs,
+                              "provider_alias": _provider_alias(attrs["provider"] if "provider" in attrs else None),
                               "lifecycle": lifecycle, "body": " ".join(_strings(attrs)), "unevaluated": _tf_json_unevaluated(rtype, attrs) + _retention_reason(LIFECYCLE_TF.get(rtype), lifecycle)})
     if path.lower().endswith(".tf.json"):  # Terraform reads JSON configuration only from *.tf.json files: elsewhere a module key is data
         blocks, others = _tf_json_modules(doc.get("module"))
@@ -1010,30 +1034,43 @@ def _lifecycle_findings(facts: list[dict]) -> list[dict]:
     return out
 
 
-def _tag_inheriting_dirs(default_dirs: set[str], provider_dirs: set[str], module_calls: dict[str, set[str]]) -> set[str]:
-    """Terraform directories whose resources inherit provider default_tags: those that declare it, and the local child
-    modules they call, unless the child declares an unaliased provider of its own (Terraform passes the default down)."""
-    covered = set(default_dirs)
-    frontier = list(covered)
+def _tag_inheriting_dirs(tagged: dict[str, set[str]], provider_dirs: set[str], module_calls: dict[str, list]) -> dict[str, set[str]]:
+    """Per Terraform directory, the provider aliases whose default_tags reach its resources ("" is the default provider): those it declares,
+    and "" for each local child module that receives a tagged provider from its parent. A child that declares an unaliased provider of its
+    own takes no default from its parent (Terraform passes the default down only without one)."""
+    reach = {directory: set(aliases) for directory, aliases in tagged.items()}
+    frontier = list(reach)
     while frontier:
-        for child in module_calls.get(frontier.pop(), ()):
-            if child not in covered and child not in provider_dirs:
-                covered.add(child)
+        parent = frontier.pop()
+        for child, passed in module_calls.get(parent, ()):
+            if child in provider_dirs:
+                continue
+            if passed is None:
+                sent = {""} & reach[parent]
+            elif passed == "*":
+                sent = set(reach[parent])
+            else:
+                sent = {passed.get("aws", "")} & reach[parent]
+            if sent and "" not in reach.get(child, set()):
+                reach.setdefault(child, set()).add("")
                 frontier.append(child)
-    return covered
+    return reach
 
 
-def _inherits_tags(fact: dict, inheriting: set[str], aliased_dirs: set[str]) -> bool:
-    """Whether a Terraform resource takes its tags from provider default_tags. Without a provider argument it takes the default provider's,
-    so only a directory whose default provider declares them counts. A resource that names a provider is treated as inheriting when its
-    directory declares default_tags on any provider, since the provider it names is not resolved here."""
-    directory = _dir_key(fact["file"])
-    if fact.get("explicit_provider"):
-        return directory in inheriting or directory in aliased_dirs
-    return directory in inheriting
+def _inherits_tags(fact: dict, reach: dict[str, set[str]]) -> bool:
+    """Whether a Terraform resource takes its tags from provider default_tags. A resource with no provider argument takes its directory's
+    default provider, so it inherits only when "" reaches its directory; one that names a provider inherits when that alias reaches its
+    directory (any alias for a reference that is not plain)."""
+    reaching = reach.get(_dir_key(fact["file"]), set())
+    alias = fact.get("provider_alias")
+    if alias is None:
+        return "" in reaching
+    if alias == "*":
+        return bool(reaching)
+    return alias in reaching
 
 
-def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str], aliased_dirs: set[str]) -> tuple[list[dict], list[dict], list[str]]:
+def _tag_findings(facts: list[dict], required: list[str], reach: dict[str, set[str]]) -> tuple[list[dict], list[dict], list[str]]:
     """Tag findings, the skipped checks, and one reason per taggable resource that was not judged (label and path only)."""
     skipped, out, reasons = [], [], []
     if not required:
@@ -1046,7 +1083,7 @@ def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str], 
             if fact["type"] in TAGGABLE_TF or fact["type"] in TAGGABLE_CFN:
                 reasons.append(f"{where}: tags are an expression and were not judged")
             continue
-        if fact["source"] == "terraform" and _inherits_tags(fact, inheriting, aliased_dirs):
+        if fact["source"] == "terraform" and _inherits_tags(fact, reach):
             reasons.append(f"{where}: tags inherited from provider default_tags were not judged")
             continue
         if any(fact["tags"].get(key) == _UNKNOWN for key in required):
@@ -1055,7 +1092,7 @@ def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str], 
         numbered += 1
         rid = f"{fact['file']}::{fact['ref']}#{numbered}"
         candidates.append((rid, fact))
-    if any(f["source"] == "terraform" and f["tags"] is not None and _inherits_tags(f, inheriting, aliased_dirs) for f in facts):
+    if any(f["source"] == "terraform" and f["tags"] is not None and _inherits_tags(f, reach) for f in facts):
         skipped.append({"check": "iac-untagged-resource", "status": "skipped:provider-default-tags", "detail": "Terraform tags are inherited from provider default_tags and are not evaluated"})
     for start in range(0, len(candidates), TAG_CHUNK):
         chunk = candidates[start:start + TAG_CHUNK]
@@ -1182,10 +1219,9 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
     counters = {"too_large": 0, "binary": 0, "parse_error": 0, "symlink": 0, "yaml_skipped": 0, "truncated": False}
     reasons: list[str] = []  # one label and path per in-scope input that was not analysed or not judged
     facts: list[dict] = []
-    default_dirs: set[str] = set()  # directories that declare provider default_tags
-    aliased_default_dirs: set[str] = set()  # directories that declare default_tags on an aliased provider
+    tagged: dict[str, set[str]] = {}  # directory -> provider aliases that declare default_tags ("" is the unaliased provider)
     provider_dirs: set[str] = set()  # directories that declare an unaliased provider of their own
-    module_calls: dict[str, set[str]] = {}  # directory -> the local child module directories it calls
+    module_calls: dict[str, list] = {}  # directory -> (child directory, providers passed) of each local child module it calls
     unclosed: dict[str, int] = {}
     scanned, passed = 0, 0
     analysed_dirs: set[str] = set()  # directories that had at least one analysed file
@@ -1225,16 +1261,14 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
             continue
         try:
             if lower.endswith(".tf"):
-                tf_facts, (has_default_tags, own_provider, calls, has_aliased_default_tags), not_delimited = _hcl_facts(rel, text)
+                tf_facts, (file_tagged, own_provider, calls), not_delimited = _hcl_facts(rel, text)
                 facts.extend(tf_facts)
                 directory = _dir_key(rel)
-                if has_default_tags:
-                    default_dirs.add(directory)
+                if file_tagged:
+                    tagged.setdefault(directory, set()).update(file_tagged)
                 if own_provider:
                     provider_dirs.add(directory)
-                if has_aliased_default_tags:
-                    aliased_default_dirs.add(directory)
-                module_calls.setdefault(directory, set()).update(calls)
+                module_calls.setdefault(directory, []).extend(calls)
                 if not_delimited:
                     unclosed[rel] = not_delimited
                 scanned += 1
@@ -1285,7 +1319,7 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
         findings.extend(_instance_findings(fact, max_xlarge))
         findings.extend(_volume_findings(fact))
     findings.extend(_lifecycle_findings(facts))
-    tag_findings, tag_skipped, tag_reasons = _tag_findings([f for f in facts if f["source"] != "kubernetes"], required_tags, _tag_inheriting_dirs(default_dirs, provider_dirs, module_calls), aliased_default_dirs)
+    tag_findings, tag_skipped, tag_reasons = _tag_findings([f for f in facts if f["source"] != "kubernetes"], required_tags, _tag_inheriting_dirs(tagged, provider_dirs, module_calls))
     findings.extend(tag_findings)
     reasons.extend(tag_reasons)
     skipped = list(tag_skipped)

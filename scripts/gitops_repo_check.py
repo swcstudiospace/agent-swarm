@@ -568,42 +568,48 @@ def _kust_pins(kust: dict) -> frozenset[str]:
                      and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float))))
 
 
-def _render_pins(repo: Repo, kusts: dict, root: str) -> dict[str, set[frozenset[str]]]:
-    """Each file the tree rooted at root renders, with the image names pinned along every path that renders it: the `images:` of each
-    kustomization from the root down to the file. A pin in one overlay therefore never reaches a base that another overlay renders."""
-    rendered: dict[str, set[frozenset[str]]] = {}
-    seen: set[tuple[str, frozenset[str]]] = set()
+def _reached(repo: Repo, kusts: dict, roots: list[str], name: str | None = None) -> set[str]:
+    """Files the trees rooted at roots render. With a name, only the files rendered through a path on which no kustomization pins that
+    image name: a kustomization that pins it blocks its own files and everything below it. Each kustomization is entered once, so the
+    walk is linear in the graph however many paths lead through a shared component."""
+    pins = {directory: _kust_pins(kust) for directory, (_, kust) in kusts.items()}
 
-    def walk(directory: str, inherited: frozenset[str]) -> None:
-        if (directory, inherited) in seen:
-            return
-        seen.add((directory, inherited))
+    def blocked(directory: str) -> bool:
+        return name is not None and name in pins[directory]
+
+    entered = {root for root in roots if not blocked(root)}
+    stack = sorted(entered)
+    files: set[str] = set()
+    while stack:
+        directory = stack.pop()
         rel, kust = kusts[directory]
-        pinned = inherited | _kust_pins(kust)
-        rendered.setdefault(rel, set()).add(pinned)
+        files.add(rel)
         for field in DIRECTORY_FIELDS:
             for entry in _strings(kust.get(field)):
                 target = None if _remote(entry) else _join(directory, entry)
                 if target in kusts:
-                    walk(target, pinned)
+                    if target not in entered and not blocked(target):
+                        entered.add(target)
+                        stack.append(target)
                 elif target in repo.docs:
-                    rendered.setdefault(target, set()).add(pinned)
-
-    walk(root, frozenset())
-    return rendered
+                    files.add(target)
+    return files
 
 
 def _check_images(repo: Repo, kusts: dict) -> None:
     where: dict[str, list[str]] = {}
-    renders = [_render_pins(repo, kusts, root) for root in sorted(set(kusts) - _referenced(kusts))]
+    roots = sorted(set(kusts) - _referenced(kusts))
+    rendered = _reached(repo, kusts, roots)
+    unpinned: dict[str, set[str]] = {}  # image name -> files that some render leaves unpinned, computed once per name
     for rel in sorted(repo.docs):
         for doc in repo.docs[rel]:
             for image in _images(doc, [0]):
+                name = _image_name(image)
+                if name not in unpinned:
+                    unpinned[name] = _reached(repo, kusts, roots, name)
                 # judged on every render that includes the file: a file that an unpinned overlay renders floats there, whatever another overlay
                 # pins; a file no overlay renders is judged as it stands
-                pinned_renders = [pinned for render in renders for pinned in render.get(rel, ())]
-                name = _image_name(image)
-                if not pinned_renders or any(name not in pinned for pinned in pinned_renders):
+                if rel not in rendered or rel in unpinned[name]:
                     where.setdefault(image, []).append(rel)
     for directory, (rel, kust) in sorted(kusts.items()):
         for entry in kust.get("images") or []:

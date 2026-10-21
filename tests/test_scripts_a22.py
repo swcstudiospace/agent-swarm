@@ -585,6 +585,23 @@ def test_an_unpinned_overlay_does_not_inherit_the_pin_of_another_overlay_that_re
 
 
 @needs_yaml
+def test_a_shared_component_reached_by_many_paths_is_walked_once_and_still_judged(tmp_path):
+    levels = 24  # two components per level, each including both components of the next: 2**24 paths, all of them through the same graph
+    for i in range(levels - 1):
+        for side in "ab":
+            pins = f"images:\n  - name: r.io/img{i}\n    newTag: \"1\"\n" if side == "a" else ""
+            put(tmp_path, f"lvl{i}{side}/kustomization.yaml", f"components:\n  - ../lvl{i + 1}a\n  - ../lvl{i + 1}b\n{pins}")
+    for side in "ab":
+        put(tmp_path, f"lvl{levels - 1}{side}/kustomization.yaml", "resources:\n  - ../leaf\n")
+    put(tmp_path, "leaf/kustomization.yaml", "resources:\n  - deploy.yaml\n")
+    put(tmp_path, "leaf/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: leaf\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/leaf:latest\n")
+    put(tmp_path, "overlay/kustomization.yaml", "components:\n  - ../lvl0a\n  - ../lvl0b\n")
+    _, result = scan(tmp_path)
+    assert [(f["id"], f["file"]) for f in result["findings"] if f["check"] == "images"] == [("images:floating-tag:r.io/leaf:latest", "leaf/deploy.yaml")]
+
+
+
+@needs_yaml
 def test_a_pin_in_an_overlay_covers_the_images_of_the_components_it_includes(tmp_path):
     put(tmp_path, "comp/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\nresources:\n  - d.yaml\n")
     put(tmp_path, "comp/d.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/acme/web:latest\n")
