@@ -790,6 +790,16 @@ def test_valid_testnet_endpoints_under_their_own_network_items_are_not_blocked(t
     assert (code, out["status"]) == (0, "ok") and [f for f in out["findings"] if f["rule"] == "rpc-host-chain-mismatch"] == []
 
 
+def test_credentialed_urls_used_as_mapping_keys_are_never_printed(tmp_path):
+    write(tmp_path, "cfg.json", {"https://user:password@rpc.example": {"chainId": 1, "rpcUrl": "https://user:password@rpc.example/?apikey=abcd1234"},
+                                 "networks": [{"https://alice:hunter2pass@rpc.sepolia.org": {"name": "Sepolia", "chainId": 11155111}}]})
+    code, out = cli(tmp_path)
+    assert code == 1 and out["findings"]
+    text = json.dumps(out)
+    for secret in ("password@", "hunter2pass", "abcd1234"):  # the fixed rule text "embeds user:password credentials" names no value
+        assert secret not in text, secret
+
+
 def test_a_host_under_a_directed_key_still_blocks_on_its_own_mainnet_source(tmp_path):
     write(tmp_path, "scoped.json", {"source_chain_id": 1, "destination_chain_id": 8453, "source_rpc_url": "https://rpc.sepolia.org", "allowMainnet": True})
     code, out = cli(tmp_path)

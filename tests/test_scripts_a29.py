@@ -498,6 +498,38 @@ def test_secret_looking_mapping_keys_are_never_echoed_in_finding_locations(tmp_p
     assert "keys.<key 20 chars>.privateKey" in text
 
 
+CREDENTIALED_KEYS = [
+    ("body", {"https://user:password@rpc.example": {"rpcUrl": "https://rpc.example/?apikey=abcd1234"}}),
+    ("url-value", {"https://alice:hunter2pass@rpc.example.org": {"url": "https://alice:hunter2pass@rpc.example.org/x"}}),
+    ("key-material", {"https://alice:hunter2pass@rpc.example.org": {"privateKey": "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"}}),
+]
+
+
+@pytest.mark.parametrize("label,doc", CREDENTIALED_KEYS, ids=[label for label, _ in CREDENTIALED_KEYS])
+def test_credentialed_urls_used_as_json_mapping_keys_are_never_printed(tmp_path, label, doc):
+    write(tmp_path, "cfg.json", json.dumps(doc))
+    code, report, text = scan(tmp_path)
+    assert code == 1 and report["findings"]
+    for secret in ("hunter2pass", "password@", "abcd1234", "4c0883a6"):
+        assert secret not in text, secret
+    assert any("<key " in f["location"] + f["summary"] for f in report["findings"])
+
+
+def test_credentialed_url_key_in_yaml_is_never_printed(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "cfg.yml", '"https://user:password@rpc.example":\n  rpc: "https://rpc.example/?apikey=abcd1234"\n')
+    code, report, text = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["DAPP-RPC-KEY"]
+    assert "password@" not in text and "abcd1234" not in text
+    assert report["findings"][0]["location"] == "cfg.yml#<key 33 chars>.rpc"
+
+
+def test_a_plain_url_mapping_key_is_still_shown_in_its_location(tmp_path):
+    write(tmp_path, "cfg.json", json.dumps({"https://rpc.example.org": {"rpcUrl": "https://rpc.example.org/?apikey=abcd1234"}}))
+    _, report, _ = scan(tmp_path)
+    assert {f["location"] for f in report["findings"] if f["id"] == "DAPP-RPC-KEY"} == {"cfg.json#https://rpc.example.org.rpcUrl"}
+
+
 def test_yaml_alias_cycle_does_not_stop_the_scan(tmp_path):
     pytest.importorskip("yaml")
     write(tmp_path, "config.yaml", "loop: &x {again: *x}\nrpc_url: https://rpc.example.com/?apikey=abcdef123456\n")

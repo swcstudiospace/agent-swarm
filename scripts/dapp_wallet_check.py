@@ -1159,10 +1159,24 @@ def _scan_env(rel: str, text: str) -> list[dict]:
     return findings
 
 
+_URL_IN_KEY = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")  # a URL inside a mapping key, from its scheme to the next whitespace
+
+
+def _credentialed_url_in(text: str) -> bool:
+    """True when a key holds a URL that carries a credential: userinfo, a key-looking path segment or a secret query parameter.
+    Such a URL is never shown, so the key it sits in is shown by length only (every path that copies a key goes through _path_key)."""
+    for match in _URL_IN_KEY.finditer(text):
+        codes = {issue["code"] for issue in rpc_url_inspect(match.group(0))["issues"]}
+        if codes & {"credentials", "path-key", "query-key"}:
+            return True
+    return False
+
+
 def _path_key(key) -> str:
-    """A mapping key as shown in a finding path. A key that looks like a secret (a map keyed by API key or token) is shown by length only."""
+    """A mapping key as shown in a finding path. A key that looks like a secret (a map keyed by API key or token), or that holds a URL
+    with credentials, is shown by length only."""
     text = str(key)
-    return f"<key {len(text)} chars>" if len(text) > 64 or _segment_is_key(text) else text
+    return f"<key {len(text)} chars>" if len(text) > 64 or _segment_is_key(text) or _credentialed_url_in(text) else text
 
 
 MAX_WALK_VISITS = 1_000_000  # values per file, containers and scalars; a file within the 1 MiB bound has fewer unless it aliases
