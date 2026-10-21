@@ -15,7 +15,7 @@ from typing import Any
 
 from .paths import swarm_dir
 from .runlog import emit, read_events
-from .state_store import get_swarm_state_store
+from .state_store import claude_state_dir, get_swarm_state_store
 from .lifecycle import TRANSITIONS, RunState, from_task_state
 
 # a subagent id is `subagent-<task_id>-<12 hex>-<epoch ms>` (subagent_lifecycle.new_subagent_id)
@@ -105,8 +105,8 @@ def build_swarm_state(*, corr: str | None = None, root: str | Path | None = None
 
 
 def write_claude_state(data: dict, *, root: str | Path | None = None) -> Path:
-    """Atomic write .claude/swarm-state.json (n5)."""
-    cdir = Path(swarm_dir(root, create=True)).parent / ".claude"
+    """Atomic write .claude/swarm-state.json (n5); SWARM_CLAUDE_STATE_DIR replaces the .claude directory."""
+    cdir = claude_state_dir(Path(swarm_dir(root, create=True)).parent / ".claude")
     cdir.mkdir(parents=True, exist_ok=True)
     p = cdir / "swarm-state.json"
     tmp = p.with_suffix(".tmp")
