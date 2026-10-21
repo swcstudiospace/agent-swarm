@@ -512,6 +512,8 @@ Other variables the runtime reads, documented where they belong:
 | `SWARM_REQUIRE_KEY`, `SWARM_ED25519_KEY_FILE` | unset | `swarm/envelope.py` | Signing: see the [runbook](operations-runbook.md) |
 | `SWARM_SIGNING_KEY`, `SWARM_ED25519_KEY`, `SWARM_ALLOW_INSECURE_DEV_KEY` | unset | `swarm/envelope.py` | Signer material and the explicit opt-in (`1`) to the public dev key; the runner strips the keys from agent sessions |
 | `SWARM_AGENTS_FILE` | `<repo>/agents.json` | `swarm/manifest.py`, `swarm/tool_registry.py`, `swarm/handover.py` | Registry file to load (tests and scratch copies) |
+| `SWARM_GSD_STATE_FILE` | `<root>/.planning/STATE.md` | `swarm/state_store.py` | Path of the GSD state mirror; empty disables the mirror (the test suite sets it empty) |
+| `SWARM_CLAUDE_STATE_DIR` | `<root>/.claude` | `swarm/state_store.py`, `swarm/observability.py` | Directory of the `swarm-state.json` Claude projection; empty means unset |
 | `SWARM_RUNTIME` | unset | `scripts/swarm_run.py` | What `--runtime auto` resolves to when set to `grok` or `omp`; otherwise `auto` picks grok only when it alone is on PATH, else claude, never omp |
 | `SWARM_ALLOW_AUTONOMOUS`, `SWARM_AFTER_ORCH` | unset | `swarm/hook_trigger.py` | Opt-ins of the post-plan autonomous run: `SWARM_ALLOW_AUTONOMOUS=1`; `SWARM_AFTER_ORCH` (or `AIO_SWARM_AFTER_ORCH`) one of `1`, `true`, `yes`, `on`; see [README.md](../README.md) |
 | `SWARM_DRYRUN_FAIL` | unset | `swarm/verdicts.py` | `<task>:<gate>,...`: those dry-run gate verdicts fail every time |
@@ -580,6 +582,7 @@ failure). A write error names the field (`/artifacts/0/digest: ...`). See the ru
   tool, caller, state, duration. No payload.
 - **Output and input hygiene.** Registry results are strict JSON and at most `SWARM_TOOL_OUTPUT_MAX_BYTES`; an oversized
   one is withheld. `number` inputs must be finite.
+- **Scanner completeness (v2.3).** The A16–A30 scanners (`swarm/scan_status.py`) fail closed on in-scope input: a skipped, unreadable, binary, oversized, truncated or unanalysed input, a missing tool among them, adds a major `scan-incomplete` finding, and `status` is `fail` until every in-scope input is analysed. A run that analysed nothing is incomplete too. Dependency directories such as `node_modules` or `lib` never fail; `sol_contract_lint.py` lists them by name under `excluded_dirs`.
 - **Limits.** Input 100 000 bytes per call, tool output 262144 bytes by default, handover 16384 bytes
   (`SWARM_HANDOVER_MAX_BYTES`), skill source 6 KiB, scratchpad values 8 KiB, per-tool `timeout_s`, `runs` capped at 64 in
   `live.json`.
@@ -767,3 +770,5 @@ editor is unchanged and is the one place the counts appear; `SWARM_BAR=off` disa
 
 **omp skills:** 30 per-agent index skills plus `swarm-orchestrate` are visible (31); every omp agent file stays at or
 under 64 KiB, with `a01-orchestrator` the largest.
+
+**Scanners and test isolation:** the A16–A30 scanners fail closed on in-scope input (section 12). `tests/conftest.py` points each test's GSD and Claude state mirrors away from the checkout with `SWARM_GSD_STATE_FILE` (empty) and `SWARM_CLAUDE_STATE_DIR` (section 10).

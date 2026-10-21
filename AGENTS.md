@@ -268,7 +268,9 @@ sys.exit(AgentScript("A08", "qa_gate", run, description=__doc__, add_args=add_ar
 - Any finding of severity `major` or worse makes `derive_verdict` return fail.
 - A `waive` verdict requires `waived_by`.
 
-**Optional tools degrade.** If an external tool is missing, the script reports `skipped:tool-missing` instead of failing. This covers ruff, mypy, eslint, pip-audit, git, PyYAML and similar. `sec_gate.py --strict` turns a missing tool into a finding.
+**Optional tools degrade.** If an external tool is missing, the script reports `skipped:tool-missing` instead of failing. A scanner that could not analyse an in-scope input fails closed (next paragraph). This covers ruff, mypy, eslint, pip-audit, git, PyYAML and similar. `sec_gate.py --strict` turns a missing tool into a finding.
+
+**Scanners fail closed.** The A16–A30 scanners share `swarm/scan_status.py`. An in-scope input that was skipped (a missing tool, a symlink, a file or entry limit), unreadable, binary, oversized, truncated or unanalysed adds one major `scan-incomplete` finding, and a run that analysed no input is incomplete too. `status` is `fail` until every in-scope input is analysed. `sol_contract_lint.py` lists excluded dependency directories such as `node_modules` or `lib` by name under `excluded_dirs` and does not fail on them.
 
 **State writes.**
 - Only through `TaskStore.transition`, which logs to the `transitions` table. Each transition reads, checks and writes under one `BEGIN IMMEDIATE` transaction, and the state write is conditional on the expected from-state, so concurrent callers cannot both apply it. Notes writes go through `set_notes`/`append_feedback`, which re-read inside a transaction.
