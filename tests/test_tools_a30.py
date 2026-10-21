@@ -290,7 +290,8 @@ def test_timelock_band_selection_is_inclusive_and_takes_the_longest_applicable_d
     assert ok("custody_timelock_check", timelock(value_at_risk_usd=1000000))["required_delay_seconds"] == 172800
     assert ok("custody_timelock_check", timelock(value_at_risk_usd=999999.99))["required_delay_seconds"] == 3600
     only_high = timelock(value_at_risk_usd=500, delay_bands=[{"min_value_usd": 1000, "min_delay_seconds": 600}])
-    assert ok("custody_timelock_check", only_high)["required_delay_seconds"] == 0
+    gap = ok("custody_timelock_check", only_high)
+    assert gap["required_delay_seconds"] == 0 and sev(gap) == {"band-gap-below-lowest": "major"} and gap["verdict"] == "fail"
     odd = timelock(value_at_risk_usd=5000, delay_bands=[{"min_value_usd": 0, "min_delay_seconds": 86400}, {"min_value_usd": 1000, "min_delay_seconds": 3600}])
     assert ok("custody_timelock_check", odd)["required_delay_seconds"] == 86400
 
@@ -782,12 +783,12 @@ def test_sanctions_screening_age_boundary_applies_to_clear_results():
     ("potential_match", "none", "potential-match-unactioned", "major"),
     ("potential_match", "held", "potential-match-under-review", "info"),
     ("potential_match", "blocked", "potential-match-under-review", "info"),
-    ("potential_match", "reported", "potential-match-under-review", "info"),
+    ("potential_match", "reported", "potential-match-unactioned", "major"),
     ("confirmed_match", "released", "confirmed-match-not-blocked", "blocker"),
     ("confirmed_match", "none", "confirmed-match-not-blocked", "blocker"),
     ("confirmed_match", "held", "confirmed-match-not-blocked", "blocker"),
     ("confirmed_match", "blocked", "confirmed-match-report-pending", "minor"),
-    ("confirmed_match", "reported", "confirmed-match-reported", "info"),
+    ("confirmed_match", "reported", "confirmed-match-not-blocked", "blocker"),
     ("clear", "held", "clear-but-withheld", "info"),
     ("clear", "blocked", "clear-but-withheld", "info"),
 ])
@@ -1012,9 +1013,16 @@ def drills(required, *records, max_age_days=180, target=240):
 def test_recovery_example_current_and_never():
     result = ok("custody_recovery_drill", drills(["signer_key_loss", "full_restore"], drill()))
     assert result["counts"] == {"current": 1, "overdue": 0, "failed": 0, "rto_exceeded": 0, "never": 1} and result["required_count"] == 2
-    assert result["scenarios"] == [{"scenario": "full_restore", "status": "never", "age_days": -1.0},
+    assert result["scenarios"] == [{"scenario": "full_restore", "status": "never"},
                                    {"scenario": "signer_key_loss", "status": "current", "age_days": 80.0}]
     assert sev(result) == {"never-drilled:full_restore": "major"} and result["verdict"] == "fail"
+
+
+def test_recovery_never_drilled_scenario_has_no_age_days_and_passes_the_output_schema():
+    result = ok("custody_recovery_drill", drills(["full_restore"]))
+    assert result["scenarios"] == [{"scenario": "full_restore", "status": "never"}]
+    assert "age_days" not in result["scenarios"][0] and result["verdict"] == "fail"
+    assert sev(result) == {"never-drilled:full_restore": "major"}
 
 
 def test_recovery_age_boundary_is_inclusive_of_the_maximum():

@@ -196,8 +196,11 @@ def test_large_binary_symlinked_and_vendored_files_are_skipped(tree, tmp_path):
     (tree / "linkdir").symlink_to(outside, target_is_directory=True)
     put(tree, "ok.txt", "fine")
     code, report, _ = run_script(tree)
-    assert code == 0 and report["findings"] == [] and report["files_scanned"] == 1
-    assert report["files_skipped"] == {"binary": 1, "symlink": 1, "too_large": 1, "unreadable": 0}
+    assert code == 1 and report["status"] == "fail" and report["files_scanned"] == 1
+    assert report["files_skipped"] == {"binary": 1, "symlink": 2, "too_large": 1, "unreadable": 0}
+    assert [f["id"] for f in report["findings"]] == ["scan/incomplete"] and report["findings"][0]["severity"] == "major"
+    summary = report["findings"][0]["summary"]
+    assert "big.env skipped: too_large" in summary and "linkdir skipped: symlink" in summary and "node_modules" not in summary
 
 
 def test_file_exactly_one_mebibyte_is_still_scanned(tree):
@@ -211,8 +214,9 @@ def test_scan_stops_at_two_thousand_files(tree):
     for index in range(2005):
         put(tree, f"f/{index:04d}.txt", "x")
     code, report, _ = run_script(tree)
-    assert code == 0 and report["truncated"] is True and report["files_scanned"] == 2000
-    assert by_id(report)["scan-limit-reached"]["severity"] == "minor"
+    assert code == 1 and report["truncated"] is True and report["files_scanned"] == 2000
+    assert [f["id"] for f in report["findings"]] == ["scan/incomplete"] and report["findings"][0]["severity"] == "major"
+    assert "scan stopped after 2000 files" in report["findings"][0]["summary"]
 
 
 # --- policy validation ------------------------------------------------------------------------------------------------
@@ -269,10 +273,20 @@ def test_invalid_section_values_are_reported_with_the_offending_field(tree):
     assert found["multisig:policy-invalid"]["severity"] == "major"
 
 
-def test_policy_named_file_without_known_sections_is_informational(tree):
+def test_policy_named_file_without_known_sections_fails_closed(tree):
     put_json(tree, "custody.schema.json", {"type": "object"})
     code, report, _ = run_script(tree)
-    assert code == 0 and [(f["id"], f["severity"]) for f in report["findings"]] == [("no-policy-sections", "info")]
+    assert code == 1 and report["status"] == "fail"
+    assert [(f["id"], f["severity"]) for f in report["findings"]] == [("scan/incomplete", "major")]
+    assert "custody.schema.json policy not analysed" in report["findings"][0]["summary"]
+
+
+def test_timelock_file_without_a_timelock_section_is_not_read_as_compliant(tree):
+    put_json(tree, "custody/timelock.json", {"delay_seconds": 0, "value_at_risk_usd": 5000000,
+                                             "delay_bands": [{"min_value_usd": 0, "min_delay_seconds": 172800}]})
+    code, report, _ = run_script(tree)
+    assert code == 1 and report["status"] == "fail" and report["policy_files"] == 1
+    assert [f["id"] for f in report["findings"]] == ["scan/incomplete"]
 
 
 def test_files_not_named_like_policies_are_not_validated(tree):
@@ -314,7 +328,8 @@ def test_yaml_policies_report_skipped_tool_missing_when_pyyaml_is_absent(tree, t
     module = load_script()
     monkeypatch.setattr(module, "yaml_module", lambda: None)
     code, report = run_in_process(module, tree, capsys, tmp_path, monkeypatch)
-    assert code == 0 and report["policy_files"] == 1 and report["findings"] == []
+    assert code == 1 and report["policy_files"] == 1
+    assert [f["id"] for f in report["findings"]] == ["scan/incomplete"]
     assert report["skipped"] == [{"check": "yaml-policy-files", "status": "skipped:tool-missing", "tool": "PyYAML", "files": 2}]
 
 
@@ -380,6 +395,16 @@ def test_named_pipe_in_the_tree_is_skipped_and_never_opened(tree):
     proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tree), "--json"], capture_output=True, text=True, env=env,
                           cwd=tree.parent, timeout=60)
     report = json.loads(proc.stdout)
-    assert proc.returncode == 0 and report["status"] == "ok"
+    assert proc.returncode == 1 and report["status"] == "fail"
+    assert [f["id"] for f in report["findings"]] == ["scan/incomplete"]
     assert report["files_scanned"] == 1 and report["policy_files"] == 0
     assert report["files_skipped"] == {"binary": 0, "symlink": 0, "too_large": 0, "unreadable": 1}
+
+
+def test_symlink_given_as_path_is_skipped_and_its_target_is_not_read(tree):
+    put(tree, "policy/real.env", f"PRIVATE_KEY={HEX_KEY}\n")
+    (tree / "alias.env").symlink_to(tree / "policy" / "real.env")
+    code, report, raw = run_script(tree, "--path", "alias.env")
+    assert code == 1 and report["status"] == "fail" and report["files_scanned"] == 0
+    assert report["files_skipped"]["symlink"] == 1 and report["secret_findings"] == 0
+    assert [f["id"] for f in report["findings"]] == ["scan/incomplete"] and HEX_KEY not in raw

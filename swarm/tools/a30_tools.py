@@ -433,6 +433,8 @@ def _timelock_check(payload: dict) -> dict:
         if value >= low:
             required = max(required, min_delay)
     findings: list[dict] = []
+    if bands and bands[0][0] != 0:
+        findings.append(_finding("band-gap-below-lowest", "major", f"values below {bands[0][0]} USD fall under no delay band"))
     if delay == 0:
         findings.append(_finding("no-delay", "blocker", "delay is 0: a queued operation can execute immediately, nothing can be cancelled in time"))
     if delay < required:
@@ -456,7 +458,7 @@ def _timelock_check(payload: dict) -> dict:
 
 
 def timelock_check(payload: dict) -> dict:
-    """Delay >= the band required for the value at risk (highest band whose min_value_usd <= value) and >= the response time
+    """Delay >= the longest band delay among the bands whose min_value_usd <= the value at risk, and >= the response time
     (detect + decide + cancel); needs a cancel path (canceller or guardian), a renounced admin and an expiry window. House
     policy, with these references: OpenZeppelin TimelockController says its optional admin "should be subsequently renounced"
     (an admin acts outside the delay), and has no expiry; Compound's Timelock hard-codes a 14-day GRACE_PERIOD after the eta."""
@@ -845,17 +847,15 @@ def _sanctions_screening(payload: dict) -> dict:
         elif result == "potential_match":
             if action == "released":
                 findings.append(_finding(f"potential-match-released:{tag}", "blocker", "released while the potential match is unresolved"))
-            elif action == "none":
-                findings.append(_finding(f"potential-match-unactioned:{tag}", "major", "a potential match has no action: hold it for review"))
-            else:
+            elif action in ("held", "blocked"):
                 findings.append(_finding(f"potential-match-under-review:{tag}", "info", f"potential match, action {action}"))
+            else:
+                findings.append(_finding(f"potential-match-unactioned:{tag}", "major", f"a potential match with action {action} is not held: hold it for review"))
         elif result == "confirmed_match":
-            if action in ("released", "none", "held"):
-                findings.append(_finding(f"confirmed-match-not-blocked:{tag}", "blocker", f"confirmed match with action {action}: the funds must be blocked"))
-            elif action == "blocked":
+            if action == "blocked":
                 findings.append(_finding(f"confirmed-match-report-pending:{tag}", "minor", "blocked but not yet reported to the regulator (OFAC: 31 CFR 501.603, 10 business days)"))
             else:
-                findings.append(_finding(f"confirmed-match-reported:{tag}", "info", "confirmed match blocked and reported"))
+                findings.append(_finding(f"confirmed-match-not-blocked:{tag}", "blocker", f"confirmed match with action {action}: the funds must be blocked"))
         elif action in ("held", "blocked"):
             findings.append(_finding(f"clear-but-withheld:{tag}", "info", f"result is clear but the action is {action}: record why"))
     findings, omitted = _capped(findings)
@@ -1019,8 +1019,9 @@ def _recovery_drill(payload: dict) -> dict:
     findings: list[dict] = []
     for scenario in sorted(set(payload["required_scenarios"])):
         drill = by_scenario.get(scenario)
+        age: float | None = None  # absent for a scenario never drilled: there is no age to report
         if drill is None:
-            status, age = "never", -1.0
+            status = "never"
             findings.append(_finding(f"never-drilled:{scenario}", "major", f"no {scenario} drill on record"))
         else:
             age_td = as_of - drill["when"]
@@ -1036,7 +1037,10 @@ def _recovery_drill(payload: dict) -> dict:
                 findings.append(_finding(f"drill-overdue:{scenario}", "major", f"last drill {age} days ago, maximum {payload['max_age_days']}"))
             else:
                 status = "current"
-        rows.append({"scenario": scenario, "status": status, "age_days": age})
+        row = {"scenario": scenario, "status": status}
+        if age is not None:
+            row["age_days"] = age
+        rows.append(row)
     findings = _ordered(findings)
     count = Counter(r["status"] for r in rows)
     return {

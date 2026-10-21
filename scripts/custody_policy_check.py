@@ -9,10 +9,12 @@ Every text file is scanned with custody_secret_scan for PEM private keys, BIP32 
 and mnemonics assigned to key-like names, and encrypted keystores. Only locations and lengths are reported, never a value;
 a path that is itself secret-shaped is shown as <redacted-path-N> (N = position in the walk).
 
-Read-only: it reads files under --root and writes nothing. Bounded: files over 1 MiB and binary files are skipped, at most
-2000 files are visited, symlinks are never followed or read. Stdlib only; YAML-dependent checks report
-`skipped:tool-missing` when PyYAML is absent. Findings carry the severity info|minor|major|blocker and `status` is `fail`
-when any major or worse exists. `--dry-run` prints deterministic canned output and touches nothing.
+Read-only: it reads files under --root and writes nothing. Bounded: files over 1 MiB, binary files and symlinks are skipped
+(a symlink is never followed or read, not even when it is the --path), and at most 2000 files are visited. Stdlib only;
+YAML-dependent checks report `skipped:tool-missing` when PyYAML is absent. Every skipped input, unparseable file and policy
+without a recognised section is one major `scan/incomplete` finding, so `status` is `fail` until every in-scope input is analysed.
+Findings carry the severity info|minor|major|blocker and `status` is `fail` when any major or worse exists. `--dry-run` prints
+deterministic canned output and touches nothing.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm import tool_registry  # noqa: E402
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.tools.a30_tools import _path_label as path_label  # noqa: E402  (one definition of "secret-shaped path")
 
 AGENT = "A30"
@@ -88,13 +91,15 @@ def yaml_module():
 
 
 def walk(base: Path):
-    """Files below base in a deterministic order; symlinked directories are not descended into."""
-    if base.is_file() or base.is_symlink():
+    """Files below base in a deterministic order. A symlink (a file, a directory, or base itself) is yielded and never followed:
+    read_text reports it as skipped."""
+    if base.is_symlink() or not base.is_dir():
         yield base
         return
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
-        for name in sorted(filenames):
+        linked_dirs = [d for d in dirnames if (Path(dirpath) / d).is_symlink()]
+        for name in sorted([*filenames, *linked_dirs]):
             yield Path(dirpath) / name
 
 
@@ -147,13 +152,14 @@ def check_policy(document: dict, rel: str, text: str, yaml, shown: str | None = 
     return out, found
 
 
-def scan_secrets(document: dict, rel: str, text: str) -> tuple[list[dict], int]:
+def scan_secrets(document: dict, rel: str, text: str) -> tuple[list[dict], int, bool]:
+    """(findings, omitted count, whether the scan ran to completion)."""
     result = call(document, "custody_secret_scan", {"files": [{"path": rel, "content": text}]})
     if result.get("state") != "SUCCESS":
-        return [finding("secret-scan-failed", "major", f"key-material scan of {rel} returned {result.get('state')}", rel)], 0
+        return [finding("secret-scan-failed", "major", f"key-material scan of {rel} returned {result.get('state')}", rel)], 0, False
     out = [finding(f"secret:{item['id']}", item["severity"], item["summary"], item["location"], kind=item["kind"], length=item["length"])
            for item in result["findings"]]
-    return out, result["omitted_findings"]
+    return out, result["omitted_findings"], True
 
 
 def run(args, ctx) -> dict:
@@ -162,7 +168,8 @@ def run(args, ctx) -> dict:
                 "counts": {s: 0 for s in SEVERITIES}, "files_skipped": {"binary": 0, "symlink": 0, "too_large": 0, "unreadable": 0},
                 "skipped": [], "truncated": False,
                 "summary": "dry-run: would validate custody policy sections and scan --path under --root for key material"}
-    target = (ctx.root / args.path).resolve()
+    lexical = Path(os.path.normpath(ctx.root / args.path))
+    target = lexical.parent.resolve() / lexical.name  # the final component is not resolved: a symlink is skipped, never read
     if not target.is_relative_to(ctx.root):
         raise SwarmError(ErrorCode.E_INPUT, f"--path {args.path!r} leaves the repository root")
     if not target.exists():
@@ -172,6 +179,7 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_DEP, "the A30 custody tools are not registered (agents.json and the intake fragment lack them)")
     yaml = yaml_module()
     findings: list[dict] = []
+    reasons: list[str] = []
     skipped_counts = {"binary": 0, "symlink": 0, "too_large": 0, "unreadable": 0}
     skipped: list[dict] = []
     yaml_policies = scanned = policies = omitted = 0
@@ -185,31 +193,35 @@ def run(args, ctx) -> dict:
         text, reason = read_text(path)
         if text is None:
             skipped_counts[reason] += 1
+            reasons.append(f"{shown} skipped: {reason}")
             continue
         scanned += 1
-        secret_findings, more = scan_secrets(document, shown, text)
+        secret_findings, more, complete = scan_secrets(document, shown, text)
         findings += secret_findings
         omitted += more
+        if not complete:
+            reasons.append(f"{shown} not scanned for key material")
         if not is_policy_candidate(rel):
             continue
         if not rel.lower().endswith(".json") and yaml is None:
             yaml_policies += 1
+            reasons.append(f"{shown} policy not checked: PyYAML is missing")
             continue
         policies += 1
         policy_findings, found = check_policy(document, rel, text, yaml, shown)
         findings += policy_findings
-        if not found and not policy_findings:
-            findings.append(finding("no-policy-sections", "info", f"{shown} names a custody policy but has none of: {', '.join(SECTIONS)}", shown))
+        if not found:
+            reasons.append(f"{shown} policy not analysed: no recognised section, or not a parseable mapping")
     if yaml_policies:
         skipped.append({"check": "yaml-policy-files", "status": "skipped:tool-missing", "tool": "PyYAML", "files": yaml_policies})
     if truncated:
-        findings.append(finding("scan-limit-reached", "minor", f"stopped after {MAX_FILES} files; the rest of the tree was not scanned", "."))
+        reasons.append(f"scan stopped after {MAX_FILES} files; the rest of the tree was not scanned")
+    findings += [{**item, "location": "."} for item in incomplete_findings(reasons, scanned)]
     findings.sort(key=lambda f: (-SEVERITIES.index(f["severity"]), f["location"], f["id"]))
     counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEVERITIES}
     secrets = sum(1 for f in findings if f["id"].startswith("secret:"))
-    bad = counts["major"] + counts["blocker"]
     return {
-        "status": "fail" if bad else "ok", "findings": findings, "files_scanned": scanned, "policy_files": policies,
+        "status": scan_status(findings), "findings": findings, "files_scanned": scanned, "policy_files": policies,
         "secret_findings": secrets + omitted, "counts": counts, "files_skipped": skipped_counts, "skipped": skipped, "truncated": truncated,
         "summary": f"{scanned} file(s) scanned, {policies} policy file(s) checked, {secrets + omitted} key-material finding(s); "
                    f"{counts['blocker']} blocker, {counts['major']} major, {counts['minor']} minor, {counts['info']} info",
