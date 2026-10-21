@@ -144,9 +144,11 @@ def test_domain_owners_sit_upstream_of_the_rows_that_consume_them(tmp_path):
     assert cluster["P-roll"]["depends_on"] == ["P-qa", "P-rev", "P-sec", "P-res"]
     web3 = {t["task_id"]: t for t in _plan(tmp_path / "w", "web3")}
     assert web3["P-sol"]["depends_on"] == ["P-arch", "P-cust"] and web3["P-sec"]["depends_on"] == ["P-sol", "P-dapp", "P-aud"]
+    assert web3["P-qa"]["depends_on"] == ["P-sol", "P-dapp", "P-aud"]
     assert web3["P-rel"]["depends_on"] == ["P-build", "P-chain"]
     cloud = {t["task_id"]: t for t in _plan(tmp_path / "k", "cloud-native")}
-    assert cloud["P-be"]["depends_on"] == ["P-arch", "P-cloud", "P-events"]
+    assert cloud["P-be"]["depends_on"] == ["P-arch", "P-cloud", "P-events", "P-plat"]
+    assert cloud["P-events"]["depends_on"] == ["P-arch", "P-cloud", "P-plat"]
     assert cloud["P-rel"]["depends_on"] == ["P-build", "P-plat", "P-cost"]
 
 
