@@ -1872,12 +1872,15 @@ def test_retention_plan_names_the_input_position_of_a_bad_protected_digest():
 
 
 def test_dockerfile_lint_final_user_is_expanded_from_build_args():
-    assert ids(lint(f"ARG U=root\nFROM alpine:3@{DIGEST}\nUSER $U\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    # a global ARG (before FROM) is not visible inside the stage, so USER $U is unresolved; a bare stage ARG takes the global default
+    assert ids(lint(f"ARG U=root\nFROM alpine:3@{DIGEST}\nUSER $U\nHEALTHCHECK CMD true\n")) == ["docker.final-user-unresolved"]
+    assert ids(lint(f"ARG U=root\nFROM alpine:3@{DIGEST}\nARG U\nUSER $U\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
     assert ids(lint(f"FROM alpine:3@{DIGEST}\nARG U=root\nUSER ${{U}}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
     unresolved = lint(f"ARG UID\nFROM alpine:3@{DIGEST}\nUSER ${{UID}}\nHEALTHCHECK CMD true\n")
     assert ids(unresolved) == ["docker.final-user-unresolved"] and severity_of(unresolved, "docker.final-user-unresolved") == "major"
     assert unresolved["verdict"] == "fail"
-    assert ids(lint(f"ARG UID=1000\nFROM alpine:3@{DIGEST}\nUSER ${{UID}}\nHEALTHCHECK CMD true\n")) == []
+    # the global default 1000 is not visible in the stage, so ${UID} stays unresolved (Docker expands it to an empty user)
+    assert ids(lint(f"ARG UID=1000\nFROM alpine:3@{DIGEST}\nUSER ${{UID}}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-unresolved"]
 
 
 def test_pin_audit_action_metadata_docker_image_is_pinned_like_a_workflow_docker_action():
@@ -1922,9 +1925,15 @@ def test_dockerfile_lint_env_values_expand_in_order_before_user():
     assert ids(braced) == ["docker.final-user-root"] and braced["verdict"] == "fail"
     # B took A's value when B was set; a later ENV A=app does not change B
     assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV A=root\nENV B=$A\nENV A=app\nUSER $B\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
-    assert ids(lint(f"ARG A=root\nARG B=${{A}}\nFROM alpine:3@{DIGEST}\nUSER $B\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(f"ARG A=root\nARG B=${{A}}\nFROM alpine:3@{DIGEST}\nUSER $B\nHEALTHCHECK CMD true\n")) == ["docker.final-user-unresolved"]
     unresolved = lint(f"ARG X\nFROM alpine:3@{DIGEST}\nENV B=$X\nUSER $B\nHEALTHCHECK CMD true\n")
     assert ids(unresolved) == ["docker.final-user-unresolved"] and unresolved["verdict"] == "fail"
+
+
+def test_dockerfile_lint_global_arg_defaults_do_not_reach_a_stage_unless_redeclared():
+    # the exact input: a global ARG U=1000 with a stage USER ${U:-0} runs as root in Docker, because the stage does not redeclare U
+    assert ids(lint(f"ARG U=1000\nFROM alpine:3@{DIGEST}\nUSER ${{U:-0}}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(f"ARG U=1000\nFROM alpine:3@{DIGEST}\nARG U\nUSER ${{U:-0}}\nHEALTHCHECK CMD true\n")) == []
 
 
 def test_dockerfile_lint_env_pairs_of_one_instruction_expand_against_the_earlier_environment():

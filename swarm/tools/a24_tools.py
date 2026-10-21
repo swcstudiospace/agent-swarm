@@ -488,41 +488,94 @@ def _selector_matches(selector: dict, labels: dict) -> bool:
     return True
 
 
-def _aggregated_children(role: dict, cluster_roles: list[dict], seen: tuple[str, ...] = ()) -> list[dict]:
-    """ClusterRoles whose labels match one of the role's clusterRoleSelectors (an empty selector matches every role)."""
+AGGREGATION_BUDGET = 1_000_000  # selector matches and walk steps per call; a call that needs more is refused rather than expanded
+
+
+def _aggregated_children(role: dict, cluster_roles: list[dict]) -> list[dict]:
+    """ClusterRoles whose labels match one of the role's clusterRoleSelectors (an empty selector matches every role), not the role itself."""
     aggregation = role.get("aggregationRule")
     name = _meta(role).get("name")
     selectors = [s for s in _list(_dict(aggregation).get("clusterRoleSelectors")) if isinstance(s, dict)]
     out = []
     for child in cluster_roles:
-        child_name = _meta(child).get("name")
-        if child_name == name or child_name in seen:
+        if _meta(child).get("name") == name:
             continue
         if any(_selector_matches(selector, _dict(_meta(child).get("labels"))) for selector in selectors):
             out.append(child)
     return out
 
 
-def _uses_own_rules(role: dict, cluster_roles: list[dict]) -> bool:
-    """True for a role judged on its own `rules`: not aggregated, or aggregated with selectors that match no supplied role
-    (a live dump whose children were not supplied: its rules are then the aggregation result and are never dropped)."""
-    aggregation = role.get("aggregationRule")
-    if not isinstance(aggregation, dict):
-        return True
-    has_selectors = any(isinstance(s, dict) for s in _list(aggregation.get("clusterRoleSelectors")))
-    return has_selectors and not _aggregated_children(role, cluster_roles)
+def _distinct(rules: list[dict]) -> list[dict]:
+    """The rules without repeats, first occurrence kept: aggregated roles that select the same role contribute the same rules."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for rule in rules:
+        key = json.dumps(rule, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(rule)
+    return out
 
 
-def _effective_rules(role: dict, cluster_roles: list[dict], field: str, seen: tuple[str, ...] = ()) -> list[dict]:
-    """Rules of a role. An aggregated ClusterRole (aggregationRule) gets the rules of every ClusterRole whose labels
-    match one of its clusterRoleSelectors; the control plane overwrites its own `rules` (RBAC docs), so they are ignored,
-    except when no supplied role matches (see `_uses_own_rules`)."""
-    if _uses_own_rules(role, cluster_roles):
-        return _rules_of(role, field)
-    rules: list[dict] = []
-    for child in _aggregated_children(role, cluster_roles, seen):
-        rules.extend(_effective_rules(child, cluster_roles, field, (*seen, str(_meta(role).get("name")))))
-    return rules
+class _Aggregation:
+    """The aggregated ClusterRoles of one call, resolved once. The roles reached from an aggregated role are found by one walk
+    that visits each role once, so a shared descendant is not copied once per path: the copies grow exponentially with depth when
+    two roles select the same pair. Children and effective rules are memoised per role object, and the rules a walk collects are
+    de-duplicated. Selector matches and walk steps share one budget; a call that exceeds it is refused, not partly answered."""
+
+    def __init__(self, cluster_roles: list[dict], field: str):
+        self.roles = cluster_roles
+        self.field = field
+        self.steps = 0
+        self._children: dict[int, list[dict]] = {}
+        self._rules: dict[int, list[dict]] = {}
+
+    def _spend(self, steps: int) -> None:
+        self.steps += steps
+        if self.steps > AGGREGATION_BUDGET:
+            raise _Bad(self.field, f"the aggregated ClusterRoles need more than {AGGREGATION_BUDGET} steps to resolve: "
+                                   "the aggregation graph is too large")
+
+    def children(self, role: dict) -> list[dict]:
+        if id(role) not in self._children:
+            self._spend(len(self.roles))
+            self._children[id(role)] = _aggregated_children(role, self.roles)
+        return self._children[id(role)]
+
+    def uses_own_rules(self, role: dict) -> bool:
+        """True for a role judged on its own `rules`: not aggregated, or aggregated with selectors that match no supplied role
+        (a live dump whose children were not supplied: its rules are then the aggregation result and are never dropped)."""
+        aggregation = role.get("aggregationRule")
+        if not isinstance(aggregation, dict):
+            return True
+        has_selectors = any(isinstance(s, dict) for s in _list(aggregation.get("clusterRoleSelectors")))
+        return has_selectors and not self.children(role)
+
+    def effective(self, role: dict) -> list[dict]:
+        """Rules of a role. An aggregated ClusterRole gets the rules of the roles its selectors reach; the control plane overwrites
+        its own `rules` (RBAC docs), so they are ignored, except when no supplied role matches (see `uses_own_rules`)."""
+        if id(role) not in self._rules:
+            self._rules[id(role)] = _rules_of(role, self.field) if self.uses_own_rules(role) else self._reached(role)
+        return self._rules[id(role)]
+
+    def _reached(self, role: dict) -> list[dict]:
+        """The own rules of every role reached from `role` through aggregation, each role visited once, de-duplicated."""
+        visited = {str(_meta(role).get("name"))}
+        stack = list(reversed(self.children(role)))
+        found: list[dict] = []
+        while stack:
+            node = stack.pop()
+            name = str(_meta(node).get("name"))
+            if name in visited:
+                continue
+            visited.add(name)
+            if self.uses_own_rules(node):
+                found.extend(_rules_of(node, self.field))
+            else:
+                kids = self.children(node)
+                self._spend(len(kids))
+                stack.extend(reversed(kids))
+        return _distinct(found)
 
 
 def _role_label(kind: str, namespace: str, name: str) -> str:
@@ -652,6 +705,7 @@ def rbac_risk_scan(payload: dict) -> dict:
         if not roles and not bindings:
             raise _Bad("roles", "supply at least one role or binding")
         cluster_roles = [r for r in roles if r["kind"] == "ClusterRole"]
+        aggregation = _Aggregation(cluster_roles, "roles")
         findings: list[dict] = []
         risk: dict[str, str] = {}
         for role in roles:
@@ -659,10 +713,10 @@ def rbac_risk_scan(payload: dict) -> dict:
                 findings.append(_finding("rbac.api-removed", "blocker", _loc(role), f"{_REMOVED_RBAC_API} is removed since Kubernetes 1.22; use rbac.authorization.k8s.io/v1"))
             meta = _meta(role)
             label = _role_label(role["kind"], str(meta.get("namespace", "")), str(meta.get("name", "")))
-            rules = _effective_rules(role, cluster_roles, "roles")
+            rules = aggregation.effective(role)
             found = [(index, rule_id, severity, text) for index, rule in enumerate(rules) for rule_id, severity, text in _rule_risks(rule)]
             risk[label] = _worst([severity for _, _, severity, _ in found])
-            if not _uses_own_rules(role, cluster_roles):
+            if not aggregation.uses_own_rules(role):
                 continue  # judged through the roles it aggregates; findings are reported on those roles
             for index, rule_id, severity, text in found:
                 findings.append(_finding(rule_id, severity, _loc(role), f"rules[{index}]: {text}"))
@@ -790,6 +844,7 @@ def rbac_effective_access(payload: dict) -> dict:
         subject = payload["subject"]
         identity = _identity(subject, _strings(payload.get("groups")))
         cluster_roles = [r for r in roles if r["kind"] == "ClusterRole"]
+        aggregation = _Aggregation(cluster_roles, "roles")
         index = {}
         for role in roles:
             meta = _meta(role)
@@ -813,7 +868,7 @@ def rbac_effective_access(payload: dict) -> dict:
                 continue
             roles_used.add(label)
             scope = "cluster" if binding["kind"] == "ClusterRoleBinding" else f"namespace:{namespace}"
-            for rule in _effective_rules(role, cluster_roles, "roles"):
+            for rule in aggregation.effective(role):
                 grants.append({"scope": scope, "role": label, "rule": rule})
         if "system:masters" in identity["groups"]:
             # the API server authorizes this group before RBAC runs (Kubernetes authorization docs: it bypasses authorization)

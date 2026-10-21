@@ -2189,3 +2189,30 @@ def test_kyverno_null_validation_failure_action_matches_the_omitted_default():
     nulled = lint(kyverno([kyverno_rule()], validationFailureAction=None))
     assert rules_of(nulled) == rules_of(omitted) == [("admission.audit-only", "minor")]
     assert (nulled["enforcing"], nulled["audit_only"]) == (omitted["enforcing"], omitted["audit_only"])
+
+
+def _labelled(name: str, labels: dict, rules: list, aggregation: dict | None = None) -> dict:
+    doc = {"kind": "ClusterRole", "apiVersion": "rbac.authorization.k8s.io/v1", "metadata": {"name": name, "labels": labels}, "rules": rules}
+    if aggregation is not None:
+        doc["aggregationRule"] = aggregation
+    return doc
+
+
+def test_shared_aggregated_roles_are_walked_once_not_once_per_path():
+    # 60 roles: two aggregated roles per level, both selecting both roles of the next level, over two identical leaves. The old walk
+    # copied the rules once per path (2^29 copies) and timed out; each role is now visited once and its rule is listed once
+    depth = 29
+    roles = [_labelled(f"agg-{i}-{s}", {"tier": str(i)}, [], {"clusterRoleSelectors": [{"matchLabels": {"tier": str(i + 1)}}]})
+             for i in range(depth) for s in "ab"]
+    roles += [_labelled(f"leaf-{s}", {"tier": str(depth)}, [rule(["get"], ["pods"])]) for s in "ab"]
+    result = access(roles, [binding("top", "agg-0-a", [USER])], USER)
+    assert (result["permission_count"], [p["resource_names"] for p in result["permissions"]]) == (1, [[]])
+
+
+def test_aggregation_graph_over_the_step_budget_is_refused_with_its_reason():
+    # 499 roles that all select each other, plus one leaf: resolving them needs far more steps than the budget, so the call is refused
+    roles = [_labelled(f"c{i}", {"tier": "x"}, [], {"clusterRoleSelectors": [{"matchLabels": {"tier": "x"}}]}) for i in range(499)]
+    roles.append(_labelled("leaf", {"tier": "x"}, [rule(["get"], ["pods"])]))
+    refused = call("kpol_rbac_risk_scan", {"roles": roles, "bindings": []})
+    assert refused["state"] == "INVALID_INPUT" and refused["field"] == "roles"
+    assert "the aggregation graph is too large" in refused["message"]

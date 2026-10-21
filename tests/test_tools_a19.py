@@ -1570,6 +1570,25 @@ def test_schema_compat_tuple_positions_past_the_source_maxitems_never_occur():
     assert _backward(_tuple_items(STR, INT), _tuple_items(STR, STR))["backward_compatible"] is False
 
 
+def test_schema_compat_const_is_not_a_keyword_of_draft_3_or_4():
+    # draft 4 has no const, so the base accepts every integer and an enum head that narrows it is breaking; under draft 6 the const counts
+    d4, d6 = "http://json-schema.org/draft-04/schema#", "http://json-schema.org/draft-06/schema#"
+    base4 = {"$schema": d4, "type": "integer", "const": 1}
+    head4 = {"$schema": d4, "type": "integer", "enum": [1]}
+    assert fx(_backward(base4, head4)) == [("major", "[backward] $: target restricts to an enum but the source accepts any value")]
+    assert _backward(head4, base4)["backward_compatible"] is True
+    assert _backward({**base4, "$schema": d6}, {**head4, "$schema": d6})["backward_compatible"] is True
+
+
+def test_schema_compat_keywords_beside_anyof_apply_to_each_alternative():
+    # the source is a string AND (minLength 1): a string target is backward compatible, and the empty string is the forward break
+    base = {"type": "string", "anyOf": [{"minLength": 1}]}
+    assert _backward(base, STR)["backward_compatible"] is True and fx(_backward(base, STR)) == []
+    assert fx(compat(base, STR, "full")) == [("major", "[forward] $: not accepted by any alternative of the target anyOf/oneOf")]
+    # no instance is both a string and an integer, so the source accepts nothing and is compatible with any target
+    assert _backward({"type": "string", "anyOf": [INT]}, STR)["backward_compatible"] is True
+
+
 def test_schema_compat_pointer_array_index_takes_ascii_digits_without_leading_zero():
     base = {"allOf": [STR], "properties": {"a": {"$ref": "#/allOf/0"}}}
     assert compat(base, copy.deepcopy(base), "full")["compatible"] is True  # index 0 resolves

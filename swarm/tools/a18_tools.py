@@ -533,12 +533,13 @@ def _env_pairs(args: str) -> list[tuple[str, str]]:
 
 def _run_stage(stage: dict, global_args: dict, inherited: dict, before: int) -> tuple[dict, dict]:
     """(variables, env) at position `before` of one stage. `inherited` is the ENV its in-file parent hands down (empty for an external
-    base image: that image's ENV is not known to the scanner, see dockerfile_lint). `variables` maps each name to its build-time value:
-    global ARG defaults, the inherited ENV, then the stage's own ARG and ENV in order. `env` holds the names bound by an ENV, inherited or
-    the stage's own, with their values: an ENV overrides an ARG of the same name whatever the order, so no later ARG rebinds such a name.
-    An ARG with no value and no global default stays empty, which _expand reads as unresolved."""
-    variables = dict(global_args)
-    variables.update(inherited)
+    base image: that image's ENV is not known to the scanner, see dockerfile_lint). `variables` maps each name to its build-time value
+    inside the stage: the inherited ENV, then the stage's own ARG and ENV in order. A global ARG (before the first FROM) is not visible
+    here: Docker makes it available to a stage only when the stage redeclares it, and then a bare `ARG NAME` takes the global default.
+    `env` holds the names bound by an ENV, inherited or the stage's own, with their values: an ENV overrides an ARG of the same name
+    whatever the order, so no later ARG rebinds such a name. An ARG with no value and no default stays empty, which _expand reads as
+    unresolved."""
+    variables = dict(inherited)
     env = dict(inherited)
     for ins in stage["instructions"][:before]:
         if ins["kw"] == "ARG":
@@ -549,7 +550,7 @@ def _run_stage(stage: dict, global_args: dict, inherited: dict, before: int) -> 
                 if eq:
                     _bind(variables, key, value)
                 else:
-                    variables.setdefault(key, "")
+                    variables.setdefault(key, global_args.get(key, ""))
         elif ins["kw"] == "ENV":
             # Docker expands every pair of one ENV instruction against the variables from before it, then binds the values
             pairs = [(name, _resolved(value, variables)) for name, value in _env_pairs(ins["args"])]

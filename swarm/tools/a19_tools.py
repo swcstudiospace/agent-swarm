@@ -488,8 +488,12 @@ class _JsonCompare:
         if sub_alts is not None:
             if self._same(sub, sup):
                 return
+            # the source is the union of its alternatives, and each one keeps the source keywords beside anyOf/oneOf
+            beside = self._beside(sub)
             for index, alt in enumerate(sub_alts):
-                self.compare(alt, ss, sup, ps, f"{path}<alt{index}>", out)
+                node = self._with_siblings(beside, alt, ss, f"{path}<alt{index}>", out)
+                if node is not None:
+                    self.compare(node, ss, sup, ps, f"{path}<alt{index}>", out)
             return
         for key in ("anyOf", "oneOf"):
             if isinstance(sup.get(key), list):
@@ -502,7 +506,7 @@ class _JsonCompare:
             elif not st <= widened:
                 out.append(("blocker", f"{path}: type {sorted(st)} is not accepted by target type {sorted(pt)}"))
         can = (lambda *names: st is None or bool(st & set(names)))  # noqa: E731 - tiny local predicate
-        self._enum(sub, sup, path, out)
+        self._enum(sub, ss, sup, ps, path, out)
         if can("number", "integer"):
             self._range(sub, sup, path, out)
             self._multiple(sub, sup, st, path, out)
@@ -517,6 +521,33 @@ class _JsonCompare:
             self._array(sub, ss, sup, ps, path, out)
         if can("object"):
             self._object(sub, ss, sup, ps, path, out)
+
+    def _beside(self, node: dict) -> dict:
+        """The keywords of `node` other than its anyOf/oneOf, cached per node so that the cycle check sees a stable identity."""
+        key = ("beside", id(node))
+        if key not in self.cache:
+            self.cache[key] = ({k: v for k, v in node.items() if k not in ("anyOf", "oneOf")}, node)
+        return self.cache[key][0]
+
+    def _with_siblings(self, beside: dict, alt, side: str, path: str, out: list):
+        """The source alternative `alt` with the source keywords beside its anyOf/oneOf: one schema at least as weak as their
+        conjunction, so a proof for it proves the source alternative. None when the alternative accepts nothing, or when the
+        conjunction cannot be merged (the finding then says so)."""
+        if beside and self._disjoint(beside, side, alt, side):
+            return None  # no instance has both the source keywords beside anyOf/oneOf and this alternative: it accepts nothing
+        parts = [part for part in self._conjuncts(alt, side) if part is not True]
+        if any(part is False for part in parts):
+            return None
+        parts = [part for part in (beside, *parts) if part]
+        if not parts:
+            return {}
+        if len(parts) == 1:
+            return parts[0]
+        merged = self._merged(parts)
+        if merged is None:
+            out.append(("major", f"{path}: the keywords beside anyOf/oneOf and this alternative combine if/then/else, which cannot be "
+                                 "merged: compatibility is not proven"))
+        return merged
 
     def _alternatives(self, sub: dict, ss: str, alts: list, ps: str, key: str, path: str, out: list) -> None:
         """`sub` against the anyOf/oneOf of the target: some alternative must accept it, and for oneOf exactly one."""
@@ -556,7 +587,7 @@ class _JsonCompare:
             widen = lambda t: t | ({"integer"} if "number" in t else set())  # noqa: E731
             if not widen(ta) & widen(tb):
                 return True
-        va, vb = self._values(first), self._values(second)
+        va, vb = self._values(first, fs), self._values(second, ss)
         if va is not None and vb is not None:
             return not {_canon(v) for v in va} & {_canon(v) for v in vb}
         if va is not None and tb is not None and not any(_value_fits(v, tb) for v in va):
@@ -572,21 +603,27 @@ class _JsonCompare:
                     return True
         return False
 
-    @staticmethod
-    def _values(node: dict):
-        """The finite value set of a schema (`enum` and `const` intersected when both are present), or None."""
+    def _const_applies(self, side: str) -> bool:
+        """`const` is a keyword from draft 6 on: drafts 3 and 4 ignore it, so a const there proves nothing about the instances."""
+        root = self.roots[side]
+        declared = root.get("$schema") if isinstance(root, dict) else None
+        return not (isinstance(declared, str) and any(f"draft-0{number}" in declared for number in "34"))
+
+    def _values(self, node: dict, side: str):
+        """The finite value set of a schema (`enum` and `const` intersected when both are present), or None. A `const` counts
+        only under a draft that has the keyword."""
         enum = node.get("enum") if isinstance(node.get("enum"), list) else None
-        if "const" in node:
+        if "const" in node and self._const_applies(side):
             if enum is None:
                 return [node["const"]]
             return [node["const"]] if _canon(node["const"]) in {_canon(v) for v in enum} else []
         return enum
 
-    def _enum(self, sub: dict, sup: dict, path: str, out: list) -> None:
-        target = self._values(sup)
+    def _enum(self, sub: dict, ss: str, sup: dict, ps: str, path: str, out: list) -> None:
+        target = self._values(sup, ps)
         if target is None:
             return
-        source = self._values(sub)
+        source = self._values(sub, ss)
         if source is None:
             out.append(("major", f"{path}: target restricts to an enum but the source accepts any value"))
             return
