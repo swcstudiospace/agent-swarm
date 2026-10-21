@@ -443,50 +443,29 @@ def pss_check(payload: dict) -> dict:
 
 # --- RBAC shared helpers ----------------------------------------------------------------------------------------
 
-_BOOTSTRAP_ROLE_NAMES = frozenset({"admin", "edit", "view"})  # ClusterRoles the API server creates; trusted only with the label (see _is_builtin)
-_BOOTSTRAP_LABEL = "kubernetes.io/bootstrapping"
 _READ_VERBS = frozenset({"get", "list", "watch"})
 # rbac.authorization.k8s.io/v1beta1 stopped being served in Kubernetes 1.22 (deprecation guide, v1.22 removals).
 _REMOVED_RBAC_API = "rbac.authorization.k8s.io/v1beta1"
 
 
-def _has_wildcard(role: dict) -> bool:
-    """True when any rule of the role names a wildcard verb, resource or API group."""
-    return any("*" in _strings(_dict(rule).get(field)) for rule in _list(role.get("rules")) for field in ("verbs", "resources", "apiGroups"))
-
-
-def _is_builtin(manifest: dict) -> bool:
-    """A bootstrap object the scan leaves alone: the exact built-in ClusterRoles admin, edit and view that carry no wildcard,
-    and the cluster-admin ClusterRoleBinding while it binds exactly the system:masters group.
-
-    The label kubernetes.io/bootstrapping=rbac-defaults is never trusted alone: whoever writes a manifest can set it, and a
-    `system:` prefix names no fixed set of objects. A role with any wildcard in its rules is never skipped, label or not, since
-    a label cannot suppress a wildcard grant. The cluster-admin ClusterRole is never skipped, whatever it is named.
-    """
-    meta = _meta(manifest)
-    name = meta.get("name")
-    if not isinstance(name, str) or _dict(meta.get("labels")).get(_BOOTSTRAP_LABEL) != "rbac-defaults":
-        return False
-    if manifest["kind"] == "ClusterRole":
-        return name in _BOOTSTRAP_ROLE_NAMES and not _has_wildcard(manifest)
-    if manifest["kind"] == "ClusterRoleBinding" and name == "cluster-admin":
-        ref, subjects = _dict(manifest.get("roleRef")), _list(manifest.get("subjects"))
-        return (ref.get("kind") == "ClusterRole" and ref.get("name") == "cluster-admin" and len(subjects) == 1
-                and _dict(subjects[0]).get("kind") == "Group" and _dict(subjects[0]).get("name") == "system:masters")
-    return False
-
-
 def _rules_of(role: dict, field: str) -> list[dict]:
-    """The PolicyRules of a role with every list normalised to a list of strings."""
+    """The PolicyRules of a role, every list normalised to a list of strings. A rule field that is not a list is refused, since a
+    bare string such as "*" would otherwise read as no grant."""
     rules = role.get("rules")
     if rules is None:
         return []
     if not isinstance(rules, list) or any(not isinstance(r, dict) for r in rules):
         raise _Bad(field, f"{_loc(role)} rules must be a list of objects")
-    return [
-        {key: _strings(rule.get(key)) for key in ("apiGroups", "resources", "resourceNames", "verbs", "nonResourceURLs")}
-        for rule in rules
-    ]
+    out: list[dict] = []
+    for rule in rules:
+        normalised: dict[str, list[str]] = {}
+        for key in ("apiGroups", "resources", "resourceNames", "verbs", "nonResourceURLs"):
+            value = rule.get(key)
+            if value is not None and not isinstance(value, list):
+                raise _Bad(field, f"{_loc(role)} rules {key} must be a list")
+            normalised[key] = _strings(value)
+        out.append(normalised)
+    return out
 
 
 def _selector_matches(selector: dict, labels: dict) -> bool:
@@ -660,12 +639,11 @@ def rbac_risk_scan(payload: dict) -> dict:
     secret read without resourceNames, pods/exec, nodes/proxy, serviceaccounts/token (also through `*/exec`-style
     subresource wildcards), pod creation; bindings to cluster-admin, the default admin or edit role cluster-wide,
     system:masters, anonymous or system:authenticated subjects, the default service account, and bindings whose referenced
-    role carries a major or blocker rule. Bootstrap objects (label kubernetes.io/bootstrapping=rbac-defaults on the exact names
-    admin, edit or view as ClusterRoles without any wildcard in their rules, or the cluster-admin ClusterRoleBinding while it binds
-    only system:masters) are not scanned: the label alone, or a system: prefix, is never trusted, since a manifest can set both. A
-    role with a wildcard in its rules is always scanned, label or not. The cluster-admin ClusterRole
-    is always scanned, whatever its name. Aggregated ClusterRoles are judged on the rules they aggregate (their own
-    rules only when no supplied role matches). Severities are this tool's house judgement, not a Kubernetes standard.
+    role carries a major or blocker rule. No object is exempt for carrying the kubernetes.io/bootstrapping label or a built-in
+    name: a manifest can set both, so the default roles (admin, edit, view, cluster-admin) and the cluster-admin and
+    system:masters bindings are scanned like any other object, and a real cluster dump shows their findings. Aggregated
+    ClusterRoles are judged on the rules they aggregate (their own rules only when no supplied role matches). Severities are
+    this tool's house judgement, not a Kubernetes standard.
     rbac.authorization.k8s.io/v1beta1 was removed in Kubernetes 1.22.
     """
 
@@ -679,8 +657,6 @@ def rbac_risk_scan(payload: dict) -> dict:
         for role in roles:
             if role.get("apiVersion") == _REMOVED_RBAC_API:
                 findings.append(_finding("rbac.api-removed", "blocker", _loc(role), f"{_REMOVED_RBAC_API} is removed since Kubernetes 1.22; use rbac.authorization.k8s.io/v1"))
-            if _is_builtin(role):
-                continue
             meta = _meta(role)
             label = _role_label(role["kind"], str(meta.get("namespace", "")), str(meta.get("name", "")))
             rules = _effective_rules(role, cluster_roles, "roles")
@@ -694,8 +670,6 @@ def rbac_risk_scan(payload: dict) -> dict:
             location = _loc(binding)
             if binding.get("apiVersion") == _REMOVED_RBAC_API:
                 findings.append(_finding("rbac.api-removed", "blocker", location, f"{_REMOVED_RBAC_API} is removed since Kubernetes 1.22; use rbac.authorization.k8s.io/v1"))
-            if _is_builtin(binding):
-                continue
             ref_kind, ref_name = _role_ref(binding, "bindings")
             namespace = _binding_namespace(binding, "bindings")
             subjects = _subjects(binding, "bindings")
@@ -972,7 +946,9 @@ def _lint_kyverno(manifest: dict, findings: list[dict]) -> tuple[bool, bool]:
     location, spec = _loc(manifest), _dict(manifest.get("spec"))
     if spec.get("failurePolicy") == "Ignore":
         findings.append(_finding("admission.fail-open", "major", location, "failurePolicy Ignore admits requests when Kyverno cannot evaluate the policy"))
-    default_action = spec.get("validationFailureAction", "Audit")
+    default_action = spec.get("validationFailureAction")
+    if default_action is None:
+        default_action = "Audit"  # Kyverno's default; an explicit null is unset (CRD structural defaulting prunes a null)
     enforcing = audit = False
     for index, rule in enumerate(_list(spec.get("rules"))):
         rule = _dict(rule)
@@ -985,7 +961,9 @@ def _lint_kyverno(manifest: dict, findings: list[dict]) -> tuple[bool, bool]:
         validate = rule.get("validate")
         if not isinstance(validate, dict):
             continue
-        action = validate.get("failureAction", default_action)  # rule level overrides the policy default (Kyverno 1.13+)
+        action = validate.get("failureAction")
+        if action is None:
+            action = default_action  # rule level overrides the policy default (Kyverno 1.13+); a null rule field is unset
         mode = action.lower() if isinstance(action, str) else ""
         if mode == "enforce":
             enforcing = True

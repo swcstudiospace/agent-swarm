@@ -516,6 +516,14 @@ def test_traffic_split_invalid_inputs_name_the_field():
     invalid("mesh_traffic_split", {"virtual_services": [], "destination_rules": [res("d", "n", {"host": "a", "subsets": [{}]})]}, "destination_rules")
 
 
+def test_traffic_split_subset_must_be_a_string():
+    # a list or object subset was an unhashable key in the DestinationRule subset set (a crash); an integer is not a valid subset either
+    rules = [dr("reviews", "d", "reviews", ["v1"])]
+    for subset in (["v1"], {"name": "v1"}, 1):
+        invalid("mesh_traffic_split", {"virtual_services": [vs("r", "d", [{"route": [{"destination": {"host": "reviews", "subset": subset}, "weight": 100}]}])],
+                                       "destination_rules": rules}, "virtual_services")
+
+
 # --- mesh_destination_policy ----------------------------------------------------------------------------------
 
 
@@ -834,6 +842,28 @@ def test_gateway_invalid_inputs_name_the_field():
     invalid("mesh_gateway_api_check", {"gateways": [gw], "routes": [], "reference_grants": [], "namespaces": [{"labels": {}}]}, "namespaces")
     invalid("mesh_gateway_api_check", {"gateways": [gateway("g", "n", [listener("a", True, "HTTP")])], "routes": [], "reference_grants": []}, "gateways")
     invalid("mesh_gateway_api_check", {"gateways": [gateway("g", "n", [listener("a", 70000, "HTTP")])], "routes": [], "reference_grants": []}, "gateways")
+
+
+def test_gateway_route_parent_namespace_must_be_a_string():
+    # a list parentRefs.namespace was an unhashable Gateway lookup key (a crash the registry reported as a dependency outage)
+    gw = gateway("edge", "infra", [listener("http", 80, "HTTP")])
+    invalid("mesh_gateway_api_check", {"gateways": [gw], "routes": [route("r", "app", [{"name": "edge", "namespace": ["infra"]}])],
+                                       "reference_grants": []}, "routes")
+
+
+def test_gateway_listener_hostname_must_be_a_string():
+    # a non-string hostname reached the RFC 1123 check, which called string methods on it (a crash)
+    invalid("mesh_gateway_api_check", {"gateways": [gateway("edge", "infra", [listener("http", 80, "HTTP", hostname=5)])],
+                                       "routes": [], "reference_grants": []}, "gateways")
+
+
+def test_gateway_listener_protocol_must_be_a_string():
+    # a list protocol was an unhashable member of a port group's protocol set (a crash); a valid string protocol stays valid
+    invalid("mesh_gateway_api_check", {"gateways": [gateway("edge", "infra", [listener("a", 80, ["HTTP"]), listener("b", 80, "HTTP")])],
+                                       "routes": [], "reference_grants": []}, "gateways")
+    invalid("mesh_gateway_api_check", {"gateways": [gateway("edge", "infra", [listener("a", 80, ["HTTP"])])], "routes": [],
+                                       "reference_grants": []}, "gateways")
+    assert not found(gwcheck(gateways=[gateway("edge", "infra", [listener("http", 80, "HTTP")])]), "GW-LISTENER-PROTOCOL")
 
 
 # --- mesh_netpol_coverage -------------------------------------------------------------------------------------
@@ -1256,7 +1286,6 @@ def test_timeout_hierarchy_per_try_above_the_total_is_capped_at_the_total():
     result = hierarchy([tcall("gw", "a", 1000, 5000, 0), tcall("a", "b", 2000)])
     assert result["tightest_gap_ms"] == -1000 and result["verdict"] == "fail"
     assert ids(result) == ["TIMEOUT-INVERTED", "TIMEOUT-PERTRY-EXCEEDS-TOTAL"] and severity(result, "TIMEOUT-INVERTED") == "major"
-
 
 
 def test_timeout_hierarchy_per_try_and_retry_rules():
@@ -1724,6 +1753,134 @@ def test_list_caps_keep_results_small_while_counts_stay_exact():
 # Sources: istio.io VirtualService / DestinationRule / ServiceEntry / AuthorizationPolicy references and istio/istio
 # pkg/config/validation (agent.ValidateDuration, ValidateHTTPRetry, validateOutlierDetection); kubernetes
 # pkg/apis/networking/v1/defaults.go (SetDefaults_NetworkPolicy); gateway-api apis/v1/gateway_types.go and the TLS guide.
+
+
+def test_authz_allow_rule_with_an_empty_source_matches_everything_like_the_empty_rule():
+    # istio.io authorization policy: a from item whose source has no value constrains nothing, so the rule admits every request
+    result = ok("mesh_authz_lint", {"policies": [res("open-source", "a", {"rules": [{"from": [{"source": {}}]}]})], "namespaces": ["a"]})
+    assert result["namespaces_without_default_deny"] == ["a"] and result["verdict"] == "fail"
+    assert severity(result, "AUTHZ-ALLOW-ALL") == "blocker"
+
+
+def test_authz_allow_rule_with_only_empty_principal_lists_matches_everything():
+    # empty lists are no constraint: source {principals: []} admits every principal, as the literal {} rule does
+    result = ok("mesh_authz_lint", {"policies": [res("open-principals", "a", {"rules": [{"from": [{"source": {"principals": []}}]}]})],
+                                    "namespaces": ["a"]})
+    assert result["namespaces_without_default_deny"] == ["a"] and result["verdict"] == "fail"
+    assert severity(result, "AUTHZ-ALLOW-ALL") == "blocker"
+
+
+def test_authz_allow_rule_with_an_empty_operation_matches_everything_and_a_narrowing_to_keeps_the_credit():
+    # to operation {} constrains nothing; a to item that names a method narrows the rule, so the namespace keeps its default-deny credit
+    result = ok("mesh_authz_lint", {"policies": [res("open-operation", "a", {"rules": [{"to": [{"operation": {}}]}]})], "namespaces": ["a"]})
+    assert result["namespaces_without_default_deny"] == ["a"] and result["verdict"] == "fail"
+    assert severity(result, "AUTHZ-ALLOW-ALL") == "blocker"
+    narrowed = ok("mesh_authz_lint", {"policies": [res("get-only", "a", {"rules": [{"to": [{"operation": {"methods": ["GET"]}}]}]})],
+                                      "namespaces": ["a"]})
+    assert narrowed["namespaces_without_default_deny"] == [] and "AUTHZ-ALLOW-ALL" not in ids(narrowed)
+
+
+def test_authz_unrecognised_fields_are_no_constraint():
+    # Istio ignores unknown fields: a source key that is a typo for principals, an operation key that is a typo for methods and a when
+    # condition with a misspelled value key all constrain nothing, so the rule admits every request
+    typo = ok("mesh_authz_lint", {"policies": [res("typo", "a", {"rules": [{"from": [{"source": {"principal": ["cluster.local/ns/x/sa/y"]}}]}]})],
+                                  "namespaces": ["a"]})
+    assert typo["namespaces_without_default_deny"] == ["a"] and typo["verdict"] == "fail"
+    assert severity(typo, "AUTHZ-ALLOW-ALL") == "blocker"
+    for rule in ({"to": [{"operation": {"method": ["GET"]}}]}, {"when": [{"key": "request.headers[x]", "value": ["1"]}]}):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [rule]})], "namespaces": ["a"]})
+        assert result["namespaces_without_default_deny"] == ["a"] and severity(result, "AUTHZ-ALLOW-ALL") == "blocker", rule
+    mixed = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"principal": ["x"], "namespaces": ["web"]}}]}]})],
+                                   "namespaces": ["a"]})
+    assert mixed["namespaces_without_default_deny"] == [] and "AUTHZ-ALLOW-ALL" not in ids(mixed)
+
+
+def test_authz_wildcard_in_operation_fields_is_no_constraint_and_a_restricted_source_is_not_a_blocker():
+    # a positive to.operation field whose values include "*" matches every value, so the rule admits every request: a blocker
+    for rule in ({"to": [{"operation": {"methods": ["*"]}}]}, {"to": [{"operation": {"paths": ["*"]}}]}):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [rule]})], "namespaces": ["a"]})
+        assert severity(result, "AUTHZ-ALLOW-ALL") == "blocker" and result["namespaces_without_default_deny"] == ["a"], rule
+    restricted = {"from": [{"source": {"principals": ["cluster.local/ns/x/sa/y"]}}], "to": [{"operation": {"methods": ["*"]}}]}
+    control = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [restricted]})], "namespaces": ["a"]})
+    assert "AUTHZ-ALLOW-ALL" not in ids(control) and control["namespaces_without_default_deny"] == []
+
+
+def test_authz_wildcard_source_narrows_the_source_and_keeps_its_wildcard_finding():
+    # from principals, requestPrincipals or namespaces "*" means any authenticated request: it narrows the source, so no blocker and
+    # the namespace is credited; the wildcard finding stays
+    for key, fid in (("principals", "AUTHZ-WILDCARD-PRINCIPAL"), ("requestPrincipals", "AUTHZ-WILDCARD-REQUEST-PRINCIPAL"),
+                     ("namespaces", "AUTHZ-WILDCARD-NAMESPACE")):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {key: ["*"]}}]}]})], "namespaces": ["a"]})
+        assert severity(result, fid) == "major" and "AUTHZ-ALLOW-ALL" not in ids(result), key
+        assert result["namespaces_without_default_deny"] == [], key
+
+
+def test_authz_when_wildcard_values_narrow_and_negated_wildcards_are_not_a_blocker():
+    # a when value "*" means the attribute must be present, so the rule is restrictive and the namespace is credited
+    present = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"when": [{"key": "request.headers[x]", "values": ["*"]}]}]})],
+                                     "namespaces": ["a"]})
+    assert "AUTHZ-ALLOW-ALL" not in ids(present) and present["namespaces_without_default_deny"] == []
+    # notPrincipals "*" and when notValues "*" admit only requests without that value: the negative-match finding, never a blocker
+    for rule in ({"from": [{"source": {"notPrincipals": ["*"]}}]}, {"when": [{"key": "request.headers[x]", "notValues": ["*"]}]}):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [rule]})], "namespaces": ["a"]})
+        assert "AUTHZ-ALLOW-ALL" not in ids(result) and severity(result, "AUTHZ-NEGATIVE-MATCH") == "major", rule
+
+
+def test_authz_universal_ip_blocks_match_every_address_so_they_do_not_narrow():
+    # 0.0.0.0/0 and ::/0 admit every address: the rule is open, so the namespace gets no default-deny credit
+    for source in ({"ipBlocks": ["0.0.0.0/0"]}, {"remoteIpBlocks": ["::/0"]}):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": source}]}]})], "namespaces": ["a"]})
+        assert severity(result, "AUTHZ-OPEN-IPBLOCK") == "major" and severity(result, "AUTHZ-ALLOW-ALL") == "blocker", source
+        assert result["namespaces_without_default_deny"] == ["a"], source
+    # a principals constraint in the same rule still narrows it: no blocker, and the namespace is credited
+    narrowed = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"ipBlocks": ["0.0.0.0/0"],
+                                                              "principals": ["cluster.local/ns/x/sa/y"]}}]}]})], "namespaces": ["a"]})
+    assert severity(narrowed, "AUTHZ-OPEN-IPBLOCK") == "major" and "AUTHZ-ALLOW-ALL" not in ids(narrowed)
+    assert narrowed["namespaces_without_default_deny"] == []
+
+
+def test_authz_narrower_ip_block_still_narrows_and_is_credited():
+    result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"ipBlocks": ["10.0.0.0/8"]}}]}]})],
+                                    "namespaces": ["a"]})
+    assert result["namespaces_without_default_deny"] == [] and "AUTHZ-ALLOW-ALL" not in ids(result)
+    assert "AUTHZ-OPEN-IPBLOCK" not in ids(result)
+
+
+def test_authz_ipv4_mapped_universal_range_matches_every_ipv4_peer_so_it_does_not_narrow():
+    # ::ffff:0.0.0.0/96 covers every IPv4 peer written in IPv6 notation (the inference marked in _universal_block): the rule is open
+    result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"ipBlocks": ["::ffff:0.0.0.0/96"]}}]}]})],
+                                    "namespaces": ["a"]})
+    # old: AUTHZ-ALLOW-ALL blocker only; new: AUTHZ-OPEN-IPBLOCK major too, as 0.0.0.0/0 and ::/0 get (one predicate for every universal range)
+    assert severity(result, "AUTHZ-ALLOW-ALL") == "blocker" and severity(result, "AUTHZ-OPEN-IPBLOCK") == "major"
+    assert result["namespaces_without_default_deny"] == ["a"]
+    narrower = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"ipBlocks": ["::ffff:10.0.0.0/104"]}}]}]})],
+                                      "namespaces": ["a"]})
+    # old: no AUTHZ-ALLOW-ALL asserted; new: neither finding, and the namespace is credited
+    assert ids(narrower) == [] and narrower["namespaces_without_default_deny"] == []
+
+
+def test_authz_open_ip_block_is_one_predicate_for_every_universal_range():
+    # 0.0.0.0/0 and ::/0 keep the findings they had; ::ffff:0.0.0.0/96 gets the same set, through the same predicate, for both fields
+    for block in ("0.0.0.0/0", "::/0", "::ffff:0.0.0.0/96"):
+        for field in ("ipBlocks", "remoteIpBlocks"):
+            result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {field: [block]}}]}]})],
+                                            "namespaces": ["a"]})
+            assert ids(result) == ["AUTHZ-ALLOW-ALL", "AUTHZ-NO-DEFAULT-DENY", "AUTHZ-OPEN-IPBLOCK"], (block, field)
+            assert result["namespaces_without_default_deny"] == ["a"], (block, field)
+
+
+def test_authz_ipv6_network_containing_the_mapped_range_is_universal_and_narrower_ones_still_narrow():
+    # a network that contains all of ::ffff:0.0.0.0/96 admits every IPv4 peer under the same inference: ::/64 and ::/80 are universal,
+    # so they get the open-block findings and no credit (old: no finding and credit, since only equality was checked)
+    for block in ("::/64", "::/80"):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"ipBlocks": [block]}}]}]})], "namespaces": ["a"]})
+        assert severity(result, "AUTHZ-ALLOW-ALL") == "blocker" and severity(result, "AUTHZ-OPEN-IPBLOCK") == "major", block
+        assert result["namespaces_without_default_deny"] == ["a"], block
+    # a network that does not contain the whole mapped range still narrows: ::/81 has bit 80 fixed, ::/96 excludes ::ffff:0:0/96
+    for block in ("::/81", "::/96"):
+        result = ok("mesh_authz_lint", {"policies": [res("p", "a", {"rules": [{"from": [{"source": {"ipBlocks": [block]}}]}]})], "namespaces": ["a"]})
+        assert "AUTHZ-ALLOW-ALL" not in ids(result) and "AUTHZ-OPEN-IPBLOCK" not in ids(result), block
+        assert result["namespaces_without_default_deny"] == [], block
 
 
 def test_authz_deny_all_rule_is_a_default_deny_that_an_allow_all_cannot_cancel():

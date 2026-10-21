@@ -348,7 +348,7 @@ def test_oversized_and_binary_files_are_skipped_and_reported(repo):
     assert {s["status"] for s in data["skipped"]} == {"skipped:bounded"}
 
 
-def test_symlinks_leaving_the_root_are_never_followed(repo, tmp_path):
+def test_symlinks_are_never_followed_or_read(repo, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.json").write_text(json.dumps(deployment("leak", "leaked")), encoding="utf-8")
@@ -360,10 +360,11 @@ def test_symlinks_leaving_the_root_are_never_followed(repo, tmp_path):
     put(repo, "real.json", deployment("web", "shop"))
     (repo / "inside-link.json").symlink_to(repo / "real.json")
     _, data = run(repo)
-    assert data["counts"]["workloads"] == 2  # real.json and the in-root symlink to it
+    assert data["counts"]["workloads"] == 1  # real.json only: the in-root file symlink is a reason, never read
     assert not any("leaked" in f["summary"] for f in data["findings"])
-    assert {s["what"]: s["files"] for s in data["skipped"]} == {"symlinks-outside-root": 2}
-    assert data["status"] == "fail" and "symlink leaves the root" in next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert {s["what"]: s["files"] for s in data["skipped"]} == {"symlinks-not-followed": 4}  # two linked files, a linked directory, a dangling link
+    incomplete = next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert data["status"] == "fail" and "inside-link.json: symlinked file not read" in incomplete
 
 
 def test_skip_directories_are_not_scanned(repo):
@@ -482,3 +483,174 @@ def test_a_rejected_manifest_fails_the_gate_and_its_value_is_never_echoed(repo):
     assert check_status(data, "mtls-coverage") == "error" and check_status(data, "authz-default-deny") == "ran"
     assert {f["id"] for f in data["findings"]} == {"MESH-SCAN-INVALID-INPUT", "scan/incomplete"}
     assert "STRCT" not in json.dumps(data)
+
+
+def test_a_non_mapping_pod_template_is_an_unanalysed_workload_and_the_other_checks_still_run(repo):
+    broken = deployment("bad", "shop")
+    broken["spec"]["template"]["metadata"] = "oops"
+    put(repo, "k8s/bad.json", broken)
+    put(repo, "k8s/web.json", deployment("web", "shop"))
+    put(repo, "k8s/netpol.json", netpol("default-deny", "shop"))
+    rc, data = run(repo)
+    assert rc == 1 and data["status"] == "fail"
+    assert check_status(data, "netpol-default-deny") == "ran" and data["counts"]["workloads"] == 1
+    assert not any(f["id"] == "MESH-SCAN-ERROR" for f in data["findings"])
+    incomplete = [f for f in data["findings"] if f["id"] == "scan/incomplete"]
+    assert len(incomplete) == 1 and incomplete[0]["severity"] == "major" and "Deployment shop/bad" in incomplete[0]["summary"]
+
+
+def test_a_directory_symlink_leaving_the_root_is_an_unread_input_and_fails_the_scan(repo, tmp_path):
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "deploy.json").write_text(json.dumps(deployment("leak", "leaked")), encoding="utf-8")
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+    put(repo, "deploy.json", deployment("web", "shop"))
+    (repo / "linkdir").symlink_to(outside, target_is_directory=True)
+    rc, data = run(repo)
+    assert rc == 1 and data["status"] == "fail"
+    assert data["counts"]["workloads"] == 1 and not any("leaked" in f["summary"] for f in data["findings"])
+    incomplete = next(f for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert "linkdir/: symlinked directory not followed" in incomplete["summary"]
+
+
+def test_a_workload_without_a_spec_or_template_is_an_unread_input_not_a_phantom_pod(repo):
+    put(repo, "k8s/nospec.json", {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "nospec", "namespace": "shop"}})
+    put(repo, "k8s/nullspec.json", {**deployment("nullspec", "shop"), "spec": None})
+    put(repo, "k8s/notemplate.json", {**deployment("notemplate", "shop"), "spec": {}})
+    put(repo, "k8s/netpol.json", netpol("default-deny", "shop"))
+    rc, data = run(repo)
+    assert rc == 1 and data["status"] == "fail" and data["counts"]["workloads"] == 0
+    incomplete = next(f for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert "k8s/nospec.json: Deployment shop/nospec: spec is missing, null or not a mapping" in incomplete["summary"]
+    assert "k8s/nullspec.json: Deployment shop/nullspec: spec is missing, null or not a mapping" in incomplete["summary"]
+    assert "k8s/notemplate.json: Deployment shop/notemplate: spec.template is missing, null or not a mapping" in incomplete["summary"]
+
+
+def test_null_template_metadata_and_labels_read_as_no_labels_and_the_workload_is_analysed(repo):
+    plain = deployment("plain", "shop")
+    plain["spec"]["template"]["metadata"] = None
+    labelled = deployment("labelled", "shop")
+    labelled["spec"]["template"]["metadata"] = {"labels": None}
+    put(repo, "k8s/plain.json", plain)
+    put(repo, "k8s/labelled.json", labelled)
+    rc, data = run(repo)
+    assert data["counts"]["workloads"] == 2 and not any(f["id"] == "scan/incomplete" for f in data["findings"])
+
+
+def test_a_directory_symlink_is_not_followed_even_when_its_target_is_inside_the_root(repo):
+    # the scan path excludes the target: the link is a reason naming it, and the Deployment behind it is never read
+    put(repo, "target/deploy.json", deployment("leak", "shop"))
+    (repo / "parent").mkdir()
+    (repo / "parent" / "linked").symlink_to(repo / "target", target_is_directory=True)
+    rc, data = run(repo, "--path", "parent")
+    assert rc == 1 and data["status"] == "fail"
+    assert data["counts"]["files_scanned"] == 0 and data["counts"]["workloads"] == 0
+    assert [f["id"] for f in data["findings"]] == ["scan/incomplete"]
+    assert "parent/linked/: symlinked directory not followed" in data["findings"][0]["summary"]
+
+
+def test_an_unlistable_directory_is_an_unread_input_and_fails_the_scan(repo, monkeypatch):
+    # os.walk reports a directory it cannot list and skips it: the locked directory is a reason, never a silent pass
+    module = load_script()
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+    put(repo, "locked/deploy.json", deployment("hidden", "shop"))
+    real_scandir = os.scandir
+    locked = str(repo / "locked")
+
+    def scandir(path="."):
+        if os.fspath(path) == locked:
+            raise PermissionError(13, "Permission denied", locked)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    data = module.scan(repo, repo)
+    assert data["status"] == "fail" and data["counts"]["workloads"] == 0
+    incomplete = next(f for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert "locked directory not listed: PermissionError" in incomplete["summary"]
+    assert data["skipped"] == [{"what": "directories-not-listed", "status": "skipped:bounded", "directories": 1}]  # a count of directories, no files key
+
+
+@pytest.mark.parametrize("shape", ["symlinked-file", "unparsable-file", "binary-file", "symlinked-directory"])
+def test_secret_shaped_paths_are_redacted_in_every_reason_and_finding(repo, tmp_path, shape):
+    # a file or directory named with a key-shaped assignment: its value and the assignment appear nowhere, the redacted label does
+    secret = "9f3ac2e87b41d05f6e2c9a84b17d3f60e5a2c81b4d7f9e0a6c3b58d2e1f47a09"
+    name = f"secret={secret}"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.json").write_text("{}", encoding="utf-8")
+    if shape == "symlinked-file":
+        (repo / f"{name}.json").symlink_to(outside / "x.json")
+    elif shape == "unparsable-file":
+        put(repo, f"{name}.json", "{not json")
+    elif shape == "binary-file":
+        (repo / f"{name}.json").write_bytes(b"\x00\x01\x02")
+    else:
+        (repo / name).symlink_to(outside, target_is_directory=True)
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+    rc, data = run(repo)
+    shown = json.dumps(data)
+    assert secret not in shown and "secret=" not in shown, shape
+    incomplete = next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert "<redacted-path-" in incomplete and secret not in incomplete and "secret=" not in incomplete, shape
+    assert rc == 1 and data["status"] == "fail"
+
+
+def test_ordinary_names_in_reasons_and_findings_are_shown_unchanged(repo):
+    put(repo, "data.json", "{not json")
+    rc, data = run(repo)
+    assert [(f["id"], f["summary"], f["location"]) for f in data["findings"] if f["id"] == "MESH-SCAN-UNPARSABLE"] == [
+        ("MESH-SCAN-UNPARSABLE", "data.json: not parsed (JSONDecodeError)", "data.json")]
+    incomplete = next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert "data.json: not parsed (JSONDecodeError)" in incomplete and "<redacted-path-" not in incomplete
+
+
+def test_a_token_shaped_workload_name_is_redacted_in_the_reason_and_an_ordinary_name_is_not(repo):
+    # a token needs no "=" to be a credential: its name is routed through the same redaction as paths, the ordinary name is unchanged
+    token = "sk-abcdef0123456789abcdef"
+    put(repo, "k8s/token.json", {**deployment(token, "shop"), "spec": {"template": "oops"}})
+    put(repo, "k8s/web.json", {**deployment("web", "shop"), "spec": {"template": "oops"}})
+    rc, data = run(repo)
+    assert token not in json.dumps(data)
+    incomplete = next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert token not in incomplete and "<redacted-path-" in incomplete
+    assert "shop/web: spec.template is missing, null or not a mapping" in incomplete
+
+
+def test_a_secret_shaped_path_is_redacted_in_the_cli_errors_and_an_ordinary_one_is_not(repo):
+    secret = "secret=9f3ac2e87b41d05f6e2c9a84b17d3f60e5a2c81b4d7f9e0a6c3b58d2e1f47a09"
+    for args in (("--path", f"../{secret}"), ("--path", f"missing-{secret}")):
+        rc, data = run(repo, *args)
+        shown = json.dumps(data)
+        assert rc == 2 and data["error"]["code"] == "E-INPUT", args
+        assert "secret=" not in shown and "9f3ac2e8" not in shown and "<redacted-path-1>" in shown, args
+    rc, data = run(repo, "--path", "missing")
+    assert "--path 'missing' does not exist" in json.dumps(data)
+
+
+def test_a_secret_shaped_root_is_redacted_in_the_does_not_exist_message(tmp_path):
+    # the root is a path in the error envelope too: a root whose directory name is secret-shaped is shown through the redaction
+    secret = "secret=9f3ac2e87b41d05f6e2c9a84b17d3f60e5a2c81b4d7f9e0a6c3b58d2e1f47a09"
+    root = tmp_path / secret
+    root.mkdir()
+    rc, data = run(root, "--path", "missing")
+    shown = json.dumps(data)
+    assert rc == 2 and data["error"]["code"] == "E-INPUT"
+    assert secret not in shown and "9f3ac2e8" not in shown and "secret=" not in shown
+    assert "does not exist under <redacted-path-2>" in shown
+
+
+def test_an_ordinary_root_is_shown_unchanged_in_the_does_not_exist_message(repo):
+    rc, data = run(repo, "--path", "missing")
+    assert rc == 2 and f"does not exist under {repo}" in data["error"]["message"]
+
+
+def test_a_bare_hex_workload_name_is_redacted_in_the_reason_and_an_ordinary_name_is_not(repo):
+    # a bare 64-digit hex name is an identifier that echoes in a reason, so the strict rule (the handler's, too) refuses it
+    hex64 = "9f3ac2e87b41d05f6e2c9a84b17d3f60e5a2c81b4d7f9e0a6c3b58d2e1f47a09"
+    put(repo, "k8s/hex.json", {**deployment(hex64, "shop"), "spec": {"template": "oops"}})
+    put(repo, "k8s/web.json", {**deployment("web", "shop"), "spec": {"template": "oops"}})
+    rc, data = run(repo)
+    assert hex64 not in json.dumps(data)
+    incomplete = next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+    assert hex64 not in incomplete and "<redacted-path-" in incomplete
+    assert "shop/web: spec.template is missing, null or not a mapping" in incomplete

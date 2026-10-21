@@ -42,6 +42,10 @@ def _registry():
     return importlib.import_module("swarm.tool_registry")
 
 
+def _a22_tools():
+    return importlib.import_module("swarm.tools.a22_tools")
+
+
 def _fragment_entries() -> list[dict]:
     """Entries still waiting in the lane's intake fragment(s): <slug>.tools.json and <slug>.<shard>.tools.json."""
     entries: list[dict] = []
@@ -2374,3 +2378,34 @@ def test_helm_drift_literal_dotted_keys_do_not_collide_with_nested_paths():
     assert severities(hdrift([("s", {"a.b": 1}), ("p", {"a": {"b": 1}})], invariant=["a.b"]))["invariant-key-differs:a.b"] == "major"
     literal = hdrift([("s", {"a.b": 1}), ("p", {"a.b": 1})], invariant=["a\\.b"])
     assert literal["findings"] == [] and literal["verdict"] == "pass"
+
+
+def test_secret_scan_accepts_a_generate_name_only_object_and_flags_its_data():
+    manifest = {"apiVersion": "v1", "kind": "Secret", "metadata": {"generateName": "db-"}, "data": {"password": "aHVudGVyMmh1bnRlcjI="}}
+    result = scan(manifest)
+    assert severities(result) == {"plaintext-secret:Secret/db-": "blocker"} and "aHVudGVyMmh1bnRlcjI" not in json.dumps(result)
+    assert call("gitops_secret_scan", {"manifests": [{"apiVersion": "v1", "kind": "Secret", "metadata": {}}]})["state"] == "INVALID_INPUT"
+
+
+def t_flatten(values):
+    """The registry's flatten, imported for the regression tests (a22_tools is loaded through the registry, not by name)."""
+    return _a22_tools()._flatten(values)
+
+
+def test_helm_drift_empty_key_is_its_own_path_segment_and_never_collapses_into_its_parent():
+    # was: {"": {"x": 1}} flattened to x, so an env with an empty key and one without it looked identical
+    assert set(t_flatten({"": {"x": 1}})) == {"\\e.x"} and set(t_flatten({"x": 1})) == {"x"}
+    collided = hdrift([("s", {"": {"x": 1}}), ("p", {"x": 1})], invariant=["x"])
+    assert severities(collided) == {"invariant-key-differs:x": "major", "key-missing-in-env:p": "minor", "key-only-in-env:p": "info"}  # was: only the two key findings; the invariant x is absent in s, so it differs too
+
+
+def test_helm_drift_top_level_empty_string_leaf_is_kept():
+    # was: a top-level empty-string key was dropped by the elif prefix guard, so it could never differ between environments
+    assert t_flatten({"": "a"}) == {"\\e": "a"}
+    result = hdrift([("s", {"": "a"}), ("p", {})])
+    assert severities(result) == {"key-missing-in-env:p": "minor"}
+
+
+def test_a_literal_backslash_e_key_does_not_collide_with_the_empty_key():
+    assert t_flatten({"\\e": 1}) == {"\\\\e": 1} and t_flatten({"": 1}) == {"\\e": 1}
+    assert set(t_flatten({"\\e": 1})) != set(t_flatten({"": 1}))

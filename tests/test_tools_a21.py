@@ -555,13 +555,15 @@ def test_etcd_healthy_baseline_values():
                       "healthy_voters": 3, "quorum": 2, "tolerable_failures": 1, "findings": []}
 
 
-def test_etcd_quota_thresholds_are_inclusive_at_80_and_95_percent():
+def test_etcd_quota_major_is_inclusive_at_80_and_blocker_is_strict_above_95_percent():
     assert etcd(quota_bytes=1000, db_size_bytes=799)["findings"] == []
     high = etcd(quota_bytes=1000, db_size_bytes=800)
     assert finds(high) == [("etcd/quota-high", "major")] and high["verdict"] == "degraded" and high["quota_used_pct"] == 80.0
     assert finds(etcd(quota_bytes=1000, db_size_bytes=949)) == [("etcd/quota-high", "major")]
-    full = etcd(quota_bytes=1000, db_size_bytes=950)
-    assert finds(full) == [("etcd/quota-exhausted", "blocker")] and full["verdict"] == "critical"
+    full = etcd(quota_bytes=1000, db_size_bytes=950)  # exactly 95%: the blocker is strictly above 95
+    assert finds(full) == [("etcd/quota-high", "major")] and full["verdict"] == "degraded"
+    over = etcd(quota_bytes=1000, db_size_bytes=951)  # 95.1%
+    assert finds(over) == [("etcd/quota-exhausted", "blocker")] and over["verdict"] == "critical"
 
 
 def test_etcd_size_and_quota_above_the_suggested_8_gib():

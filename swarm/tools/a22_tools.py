@@ -152,13 +152,22 @@ def _bounded(field: str, *values) -> dict | None:
     return _invalid(field, f"{field}: {problem}") if problem else None
 
 
+def _name_of(manifest) -> str:
+    """The object's name: metadata.name, or metadata.generateName when only that is set (the API server creates the name on apply); "" when neither."""
+    metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+    if isinstance(metadata, dict):
+        for key in ("name", "generateName"):
+            if isinstance(metadata.get(key), str) and metadata[key]:
+                return metadata[key]
+    return ""
+
+
 def _manifest_problem(items: list, field: str) -> dict | None:
-    """INVALID_INPUT unless every item is a Kubernetes object with string apiVersion, kind and metadata.name."""
+    """INVALID_INPUT unless every item is a Kubernetes object with string apiVersion, kind and metadata.name or generateName."""
     for index, item in enumerate(items):
         if not (isinstance(item, dict) and isinstance(item.get("apiVersion"), str) and item["apiVersion"]
-                and isinstance(item.get("kind"), str) and item["kind"] and isinstance(item.get("metadata"), dict)
-                and isinstance(item["metadata"].get("name"), str) and item["metadata"]["name"]):
-            return _invalid(field, f"{field}[{index}] must be an object with string apiVersion, kind and metadata.name")
+                and isinstance(item.get("kind"), str) and item["kind"] and isinstance(item.get("metadata"), dict) and _name_of(item)):
+            return _invalid(field, f"{field}[{index}] must be an object with string apiVersion, kind and metadata.name or generateName")
     return None
 
 
@@ -177,7 +186,7 @@ def _namespace(manifest: dict) -> str:
 def _label(manifest: dict) -> str:
     """Kind/namespace/name of a manifest, namespace omitted when absent."""
     ns = _namespace(manifest)
-    return f"{manifest['kind']}/{ns}/{manifest['metadata']['name']}" if ns else f"{manifest['kind']}/{manifest['metadata']['name']}"
+    return f"{manifest['kind']}/{ns}/{_name_of(manifest)}" if ns else f"{manifest['kind']}/{_name_of(manifest)}"
 
 
 def _annotations(manifest: dict) -> dict:
@@ -289,7 +298,7 @@ def _target_hit(target: dict, literal: bool, manifest: dict) -> bool | None:
     apiVersion selects nothing); an explicit `target` treats every field as a regular expression over the whole value."""
     api = manifest["apiVersion"]
     fields = (("group", _group(api)), ("version", _version(api)), ("kind", manifest["kind"]),
-              ("name", manifest["metadata"]["name"]), ("namespace", _namespace(manifest)))
+              ("name", manifest["metadata"].get("name", "")), ("namespace", _namespace(manifest)))
     undecided = False
     for key, value in fields:
         wanted = target.get(key)
@@ -391,7 +400,7 @@ def kustomize_check(payload: dict) -> dict:
         renamed: list[str] = []
         for manifest in resources:
             cluster = manifest["kind"] in scoped
-            name, version = manifest["metadata"]["name"], _version(manifest["apiVersion"])
+            name, version = _name_of(manifest), _version(manifest["apiVersion"])
             original = "" if cluster else _namespace(manifest)
             effective = override if override and not cluster else original
             new_name = override if override and manifest["apiVersion"] == "v1" and manifest["kind"] == "Namespace" else name
@@ -473,20 +482,29 @@ def kustomize_check(payload: dict) -> dict:
 # --- gitops_helm_values_drift ----------------------------------------------------------------------------------------
 
 
+_EMPTY_KEY = "\\e"  # an empty key is one path segment, spelled as a backslash and e; an escaped backslash never reads as it
+
+
 def _segment(key: str) -> str:
-    """One path segment of a key: each backslash or dot inside it gets a backslash in front, so the literal key a.b never collides with a nested a -> b."""
+    """One path segment of a key: an empty key is _EMPTY_KEY; each backslash or dot inside a key gets a backslash in front, so the
+    literal key a.b never collides with a nested a -> b, and the empty key never collides with a parent or a sibling."""
+    if key == "":
+        return _EMPTY_KEY
     return key.replace("\\", "\\\\").replace(".", "\\.")
 
 
 def _flatten(values) -> dict:
-    """Dotted-path leaves of a values tree; scalars, lists and empty maps are leaves. Keys are escaped by _segment."""
+    """Dotted-path leaves of a values tree; scalars, lists and empty maps are leaves. Keys are escaped by _segment, so every leaf
+    has its own path and no leaf is dropped."""
     flat: dict = {}
-    stack = [("", values)]
+    stack: list = [(None, values)]
     while stack:
         prefix, node = stack.pop()
         if isinstance(node, dict) and node:
-            stack.extend((f"{prefix}.{_segment(key)}" if prefix else _segment(key), child) for key, child in node.items())
-        elif prefix:
+            for key, child in node.items():
+                segment = _segment(key)
+                stack.append((segment if prefix is None else f"{prefix}.{segment}", child))
+        elif prefix is not None:
             flat[prefix] = node
     return flat
 
@@ -1248,9 +1266,9 @@ def sync_wave_check(payload: dict) -> dict:
                     findings.append(_finding(f"hook-unknown-type:{label}:{_redact(token)}", "major",
                                              f"{label} has hook type {_echo(token)}; use PreSync, Sync, PostSync, SyncFail, PreDelete, PostDelete or Skip"))
                 if "Skip" in tokens:
-                    skipped_keys.add((manifest["kind"], _namespace(manifest), manifest["metadata"]["name"]))
+                    skipped_keys.add((manifest["kind"], _namespace(manifest), _name_of(manifest)))
                     if manifest["kind"] == "Namespace":
-                        skipped_namespaces.add(manifest["metadata"]["name"])
+                        skipped_namespaces.add(_name_of(manifest))
                     continue
                 valid = sorted({t for t in tokens if t in _PHASE_ORDER}, key=_PHASE_ORDER.__getitem__)
                 phases = valid or ["Sync"]
@@ -1261,7 +1279,7 @@ def sync_wave_check(payload: dict) -> dict:
             entries.append({"manifest": manifest, "label": label, "wave": wave, "phases": phases,
                             "position": (_PHASE_ORDER[phases[0]], wave)})
 
-        namespaces = {e["manifest"]["metadata"]["name"]: e for e in entries if e["manifest"]["kind"] == "Namespace"}
+        namespaces = {_name_of(e["manifest"]): e for e in entries if e["manifest"]["kind"] == "Namespace"}
         crds: dict[tuple[str, str], dict] = {}
         for entry in entries:
             spec = entry["manifest"].get("spec")
@@ -1269,7 +1287,7 @@ def sync_wave_check(payload: dict) -> dict:
                 group, kind = spec.get("group"), _dig(spec, "names", "kind")
                 if isinstance(group, str) and isinstance(kind, str):
                     crds[(group, kind)] = entry
-        dependencies = {(e["manifest"]["kind"], _namespace(e["manifest"]), e["manifest"]["metadata"]["name"]): e
+        dependencies = {(e["manifest"]["kind"], _namespace(e["manifest"]), _name_of(e["manifest"])): e
                         for e in entries if e["manifest"]["kind"] in ("ConfigMap", "Secret", "ServiceAccount", "PersistentVolumeClaim")}
         for entry in entries:
             if entry["phases"][0] in _DELETE_PHASES:

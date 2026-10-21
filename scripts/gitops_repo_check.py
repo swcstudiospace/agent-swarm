@@ -41,7 +41,10 @@ MAX_FINDINGS = 500
 MAX_DEPTH = 60
 MAX_NODES = 200_000
 UNIT_LIMIT = 300  # gitops_sync_wave_check bound
-SKIP_DIRS = frozenset({".git", ".hg", ".svn", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".swarm", ".terraform"})
+SKIP_DIRS = frozenset({".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".swarm", ".terraform"})
+# Kept on purpose: VCS metadata (.git, .hg, .svn) and the package or tool caches of a checkout (node_modules, .venv, venv, __pycache__,
+# .terraform, .swarm), which hold no repository manifests. build/ and dist/ are NOT skipped: build tools write rendered manifests there,
+# and a directory this scan skips is a file it never reads.
 CONFIG_SUFFIXES = (".yaml", ".yml", ".json")
 KUSTOMIZATION_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 DIRECTORY_FIELDS = ("resources", "bases", "components")
@@ -211,7 +214,7 @@ def _scan(repo: Repo, base: Path, yaml_mod) -> None:
 
 def _is_object(doc) -> bool:
     return (isinstance(doc, dict) and isinstance(doc.get("apiVersion"), str) and isinstance(doc.get("kind"), str)
-            and isinstance(doc.get("metadata"), dict) and isinstance(doc["metadata"].get("name"), str) and bool(doc["metadata"]["name"]))
+            and isinstance(doc.get("metadata"), dict) and bool(rules._name_of(doc)))
 
 
 def _join(directory: str, entry: str) -> str | None:
@@ -305,6 +308,12 @@ def _check_references(repo: Repo, kusts: dict) -> dict[str, list[str]]:
                         else:
                             repo.add("kustomize", rel, f"base-without-kustomization:{entry}", "blocker",
                                      f"{rel}: {field} entry {entry} is a directory without a kustomization file")
+                    else:
+                        repo.add("kustomize", rel, f"directory-not-file:{field}:{entry}", "major",
+                                 f"{rel}: {field} entry {entry} is a directory, but this field takes a file; kustomize's behaviour for it is not verified by this scan")
+                        if not _under(target, directory):
+                            repo.add("kustomize", rel, f"load-restrictor:{field}:{entry}", "major",
+                                     f"{rel}: {field} entry {entry} is a directory outside the kustomization directory; kustomize refuses it unless run with --load-restrictor LoadRestrictionsNone")
                 elif not _under(target, directory):
                     repo.add("kustomize", rel, f"load-restrictor:{field}:{entry}", "major",
                              f"{rel}: file {entry} is outside the kustomization directory; kustomize refuses it unless run with --load-restrictor LoadRestrictionsNone")
@@ -340,11 +349,21 @@ def _check_references(repo: Repo, kusts: dict) -> dict[str, list[str]]:
 
 
 def _minimal(doc: dict, name: str | None = None, namespace: str | None = None) -> dict:
-    metadata = {"name": name if name is not None else doc["metadata"]["name"]}
+    """The object as the kustomize check sees it: its real metadata.name (or `name` when a rename applies). An object that has only
+    generateName keeps generateName: it is never copied into name, so a patch target can match only a name the object really has."""
+    real = doc["metadata"].get("name")
+    metadata: dict = {}
+    if name is not None:
+        metadata["name"] = name
+    elif isinstance(real, str) and real:
+        metadata["name"] = real
+    else:
+        metadata["generateName"] = rules._name_of(doc)
     ns = namespace if namespace is not None else doc["metadata"].get("namespace")
     if isinstance(ns, str) and ns:
         metadata["namespace"] = ns
     return {"apiVersion": doc["apiVersion"], "kind": doc["kind"], "metadata": metadata}
+
 
 
 def _items_of(repo: Repo, kusts: dict, directory: str, trail: tuple = ()) -> list[dict]:
@@ -361,9 +380,11 @@ def _items_of(repo: Repo, kusts: dict, directory: str, trail: tuple = ()) -> lis
                 prefix, suffix, namespace = (child.get(k) if isinstance(child.get(k), str) else "" for k in ("namePrefix", "nameSuffix", "namespace"))
                 for item in _items_of(repo, kusts, target, trail + (directory,)):
                     cluster = item["kind"] in rules.CLUSTER_SCOPED_KINDS
+                    real = item["metadata"].get("name")
+                    named = isinstance(real, str) and bool(real)
                     renamed = item["kind"] not in PREFIX_EXEMPT_KINDS
-                    changes = bool((renamed and (prefix or suffix)) or (namespace and not cluster))
-                    new_name = prefix + item["metadata"]["name"] + suffix if renamed else item["metadata"]["name"]
+                    changes = bool((renamed and named and (prefix or suffix)) or (namespace and not cluster))
+                    new_name = (prefix + real + suffix if renamed else real) if named else None
                     items.append(_minimal(item, new_name, namespace if namespace and not cluster else None) if changes else item)
             elif target in repo.docs:
                 items += [_minimal(d) for d in repo.docs[target] if _is_object(d) and not d["apiVersion"].startswith("kustomize.config.k8s.io/")]
@@ -428,7 +449,10 @@ def _check_kustomize(repo: Repo) -> dict[str, tuple[str, dict]]:
     kusts = _kustomizations(repo)
     _check_references(repo, kusts)
     for directory, (rel, kust) in sorted(kusts.items()):
-        items = _items_of(repo, kusts, directory)[:500]
+        every = _items_of(repo, kusts, directory)
+        items = every[:500]
+        if len(every) > 500:
+            repo.reasons.append(f"{rel}: kustomize checked the first 500 of {len(every)} rendered objects for duplicate ids and patch targets")
         result = rules.kustomize_check({"kustomization": _inline_patches(repo, directory, kust), "resources": items})
         if result.get("state") == "SUCCESS" and _opaque(kusts, directory):
             # remote bases, components, Helm charts and generators add objects this scan cannot see: a patch target that matches none of the visible ones is unproven, not missing
@@ -557,6 +581,7 @@ def _check_images(repo: Repo, kusts: dict) -> None:
                 where.setdefault(f"{name}:{entry['newTag']}", []).append(rel)
     for image in sorted(where):
         if any(marker in image for marker in ("{{", "$(", "${")):
+            repo.reasons.append(f"{where[image][0]}: an image reference with a template is not analysed; its value is known only at deploy time")
             continue
         rel = where[image][0]
         result = rules.image_policy({"image": image, "candidate_tags": [], "require_digest": repo.require_digest})

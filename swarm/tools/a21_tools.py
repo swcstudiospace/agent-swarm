@@ -636,7 +636,7 @@ def _etcd_health(payload: dict) -> dict:
     _unique(payload["members"], "name", "members", "member name")
     findings: list[dict] = []
     used_pct = Decimal(size) * HUNDRED / Decimal(quota)
-    if used_pct >= ETCD_QUOTA_BLOCKER_PCT:
+    if used_pct > ETCD_QUOTA_BLOCKER_PCT:
         findings.append(_finding("etcd/quota-exhausted", "blocker", f"database uses {round(float(used_pct), 2)}% of its {quota}-byte quota; at 100% etcd raises NOSPACE and rejects writes: compact and defragment now"))
     elif used_pct >= ETCD_QUOTA_MAJOR_PCT:
         findings.append(_finding("etcd/quota-high", "major", f"database uses {round(float(used_pct), 2)}% of its quota; schedule compaction and defragmentation"))
@@ -698,7 +698,7 @@ def _etcd_health(payload: dict) -> dict:
 
 
 def etcd_health(payload: dict) -> dict:
-    """Quota use >= 80% major (house) and >= 95% blocker (etcd mixin alerts above 95%); leader changes at 4 or more per 15 min, WAL fsync p99 above 500 ms or commit p99 above 250 ms major (etcd mixin); fsync above 10 ms and commit above 25 ms are minor (etcd FAQ guidance); quorum from voting members."""
+    """Quota use >= 80% major (house) and > 95% blocker (etcd mixin alerts fire above 95%; exactly 95% is major); leader changes at 4 or more per 15 min, WAL fsync p99 above 500 ms or commit p99 above 250 ms major (etcd mixin); fsync above 10 ms and commit above 25 ms are minor (etcd FAQ guidance); quorum from voting members."""
 
     def work() -> dict:
         try:

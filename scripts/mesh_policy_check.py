@@ -8,14 +8,15 @@ attachment plus cross-namespace ReferenceGrants (mesh_gateway_api_check). The me
 tree contains an Istio security resource, because a plain cluster has no mesh to configure. Without PyYAML the YAML
 files are not read and every check that depends on them reports `skipped:tool-missing`; JSON is always handled natively.
 
-Read-only and bounded: files over 1 MiB and binary files are skipped, at most 2000 manifest files are read, symlinks that
-leave the root are never followed. Findings use info|minor|major|blocker. `status` is `fail` when any major or blocker finding
-exists, and also when no in-scope input was analysed (none found, or none parsed) or one was not (skipped, unparsable, over a
-bound, or rejected by a check): the shared rule in swarm/scan_status.py. `--dry-run` prints deterministic canned output and
-reads nothing. Stdlib only (PyYAML optional).
+Read-only and bounded: files over 1 MiB and binary files are skipped, at most 2000 manifest files are read. Symlinks are never
+followed or read, and a directory that cannot be listed is skipped: each is a reason naming its input. Findings use
+info|minor|major|blocker. `status` is `fail` when any major or blocker finding exists, and also when no in-scope input was analysed
+(none found, or none parsed) or one was not (skipped, unparsable, over a bound, or rejected by a check): the shared rule in
+swarm/scan_status.py. `--dry-run` prints deterministic canned output and reads nothing. Stdlib only (PyYAML optional).
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import sys
@@ -26,6 +27,8 @@ from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a23_tools  # noqa: E402
 from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
+from swarm.tools.a30_tools import _path_label as path_label  # noqa: E402  (one definition of "secret-shaped path", shared with A30)
+from swarm.tools.a30_tools import _secret_kind  # noqa: E402  (the strict rule an identifier is shown by)
 
 try:  # optional: only YAML-dependent checks need it
     import yaml as _YAML
@@ -56,15 +59,52 @@ def _rel(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
 
 
-def _walk(root: Path, start: Path) -> tuple[list[Path], dict]:
-    """Candidate manifest files in deterministic order, what the bounds skipped, and a reason for each input left unread."""
-    stats = {"symlink_outside_root": 0, "truncated": False, "reasons": []}
+def _dir_label(root: Path, path: str, ordinal: int) -> str:
+    """A directory as a reason shows it: repository-relative, then the same redaction as every other path in a reason or finding
+    (a30 _path_label), so a directory whose name is secret-shaped shows as its <redacted-path-N> label."""
+    p = Path(path)
+    rel = p.relative_to(root).as_posix() if p.is_relative_to(root) else "<outside-root>"
+    return path_label(rel, ordinal)
+
+
+def _name_label(text: str, ordinal: int) -> str:
+    """A workload namespace/name as a reason shows it. A name is echoed as an identifier, not a file path, so the strict rule applies: a
+    bare 64-digit hex value is refused (a30 strict), and so is anything the handler scrubs (its credential shapes, the 40-plus hex-run
+    pattern included). Otherwise the name is shown unchanged."""
+    if _secret_kind(text, strict=True) or a23_tools._scrub(text) != text:
+        return f"<redacted-path-{ordinal}>"
+    return text
+
+
+def _walk(root: Path, start: Path, labels) -> tuple[list[Path], dict]:
+    """Candidate manifest files in deterministic order, what the bounds skipped, and a reason for each input left unread.
+    A symlink is never followed and never read, wherever its target is: a symlinked directory is not descended into and a
+    symlinked file is not opened. A directory that cannot be listed is skipped and recorded the same way. Each one is a reason
+    naming the input, so the scan is incomplete."""
+    stats = {"symlinks_not_followed": 0, "unlistable_directories": 0, "truncated": False, "reasons": []}
     if start.is_file():
         return [start], stats
     files: list[Path] = []
     visited = 0
-    for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not os.path.islink(os.path.join(dirpath, d)))
+
+    def unlistable_directory(error: OSError) -> None:
+        stats["unlistable_directories"] += 1
+        reason = _dir_label(root, error.filename or str(start), next(labels))
+        stats["reasons"].append(f"{reason} directory not listed: {type(error).__name__}")
+
+    for dirpath, dirnames, filenames in os.walk(start, followlinks=False, onerror=unlistable_directory):
+        kept: list[str] = []
+        for d in sorted(dirnames):
+            if d in SKIP_DIRS:
+                continue
+            child = Path(dirpath) / d
+            if child.is_symlink():
+                stats["symlinks_not_followed"] += 1
+                shown = path_label(_rel(root, child), next(labels))
+                stats["reasons"].append(f"{shown}/: symlinked directory not followed")
+                continue
+            kept.append(d)
+        dirnames[:] = kept
         for name in sorted(filenames):
             visited += 1
             if visited > MAX_VISITED:
@@ -75,14 +115,10 @@ def _walk(root: Path, start: Path) -> tuple[list[Path], dict]:
                 continue
             path = Path(dirpath) / name
             if path.is_symlink():
-                try:
-                    inside = path.resolve(strict=True).is_relative_to(root)
-                except OSError:
-                    inside = False
-                if not inside:
-                    stats["symlink_outside_root"] += 1
-                    stats["reasons"].append(f"{_rel(root, path)}: symlink leaves the root, not followed")
-                    continue
+                stats["symlinks_not_followed"] += 1
+                shown = path_label(_rel(root, path), next(labels))
+                stats["reasons"].append(f"{shown}: symlinked file not read")
+                continue
             if len(files) >= MAX_FILES:
                 stats["truncated"] = True
                 stats["reasons"].append(f"file limit of {MAX_FILES} reached; the rest of the tree was not read")
@@ -110,14 +146,14 @@ def _expand(value, ancestors: set[int] | None = None) -> list[dict]:
     return [value]
 
 
-def _load(root: Path, files: list[Path], yaml_module) -> tuple[list[tuple[str, dict]], dict, list[dict]]:
+def _load(root: Path, files: list[Path], yaml_module, labels) -> tuple[list[tuple[str, dict]], dict, list[dict]]:
     """(relative path, document) pairs, skip counters, info findings for unparsable files, and a reason per input not analysed.
-    A reason names the path and the cause only, never the content that failed to parse."""
+    A path is shown through path_label (redacted when secret-shaped, as A30 does); a reason names the cause only, never the content."""
     stats = {"too_large": 0, "binary": 0, "yaml_skipped": 0, "unparsable": 0, "parsed": 0, "reasons": []}
     docs: list[tuple[str, dict]] = []
     findings: list[dict] = []
     for path in files:
-        rel = _rel(root, path)
+        rel = path_label(_rel(root, path), next(labels))
         try:
             if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the scan
                 stats["unparsable"] += 1
@@ -189,13 +225,25 @@ def _coords(doc: dict) -> tuple[str, str] | None:
     return (namespace if isinstance(namespace, str) and namespace else "default"), metadata["name"]
 
 
-def _pod_of(doc: dict) -> dict | None:
+def _pod_of(doc: dict) -> tuple[dict | None, str]:
+    """(workload, ""): the namespace, name and pod-template labels; or (None, the path that is not a mapping). A missing or null spec or
+    template is not analysed; a null template metadata or labels reads as no labels."""
     coords = _coords(doc)
-    template = ((doc.get("spec") or {}).get("template") or {}) if isinstance(doc.get("spec"), dict) else {}
-    labels = ((template.get("metadata") or {}).get("labels") or {}) if isinstance(template, dict) else {}
-    if coords is None or not isinstance(labels, dict):
-        return None
-    return {"namespace": coords[0], "name": coords[1], "labels": {str(k): str(v) for k, v in labels.items()}}
+    if coords is None:
+        return None, "metadata.name is missing"
+    spec = doc.get("spec")
+    if not isinstance(spec, dict):
+        return None, "spec is missing, null or not a mapping"
+    template = spec.get("template")
+    if not isinstance(template, dict):
+        return None, "spec.template is missing, null or not a mapping"
+    metadata = {} if template.get("metadata") is None else template["metadata"]
+    if not isinstance(metadata, dict):
+        return None, "spec.template.metadata is not a mapping"
+    labels = {} if metadata.get("labels") is None else metadata["labels"]
+    if not isinstance(labels, dict):
+        return None, "spec.template.metadata.labels is not a mapping"
+    return {"namespace": coords[0], "name": coords[1], "labels": {str(k): str(v) for k, v in labels.items()}}, ""
 
 
 def _sorted(findings: list[dict]) -> list[dict]:
@@ -205,11 +253,13 @@ def _sorted(findings: list[dict]) -> list[dict]:
 def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 100) -> dict:
     """Scan `start` (inside `root`) and return the result document. An input that was not analysed, or a check that could not be
     evaluated, makes the scan incomplete: its status is `fail` (swarm/scan_status.py)."""
-    files, walk_stats = _walk(root, start)
-    docs, load_stats, findings = _load(root, files, yaml_module)
+    labels = itertools.count(1)  # one numbering for every redacted path, by position in the scan, so no two labels collide
+    files, walk_stats = _walk(root, start, labels)
+    docs, load_stats, findings = _load(root, files, yaml_module, labels)
     reasons = [*walk_stats["reasons"], *load_stats["reasons"]]
     by_kind: dict[str, list[dict]] = {}
     locations: dict[str, str] = {}
+    workloads: list[dict] = []
     for rel, doc in docs:
         kind = _kind(doc)
         if kind is None:
@@ -218,7 +268,13 @@ def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 
         coords = _coords(doc)
         if coords:
             locations.setdefault(f"{coords[0]}/{coords[1]}", rel)
-    workloads = [p for kind in WORKLOAD_KINDS for p in (_pod_of(d) for d in by_kind.get(kind, [])) if p]
+        if kind in WORKLOAD_KINDS:
+            pod, problem = _pod_of(doc)
+            if pod is None:  # not analysed: a reason, never a phantom pod and never silently dropped
+                named = _name_label(f"{coords[0]}/{coords[1]}", next(labels)) if coords else "unnamed document"
+                reasons.append(f"{rel}: {kind} {named}: {problem}; workload not analysed")
+            else:
+                workloads.append(pod)
     namespaces = sorted({p["namespace"] for p in workloads} | {c[0] for k in ("NetworkPolicy", "AuthorizationPolicy", "PeerAuthentication")
                                                               for d in by_kind.get(k, []) if (c := _coords(d))}
                         | {c[1] for d in by_kind.get("Namespace", []) if (c := _coords(d))})
@@ -278,8 +334,11 @@ def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 
     for key, what in (("too_large", "files-over-1MiB"), ("binary", "binary-files")):
         if load_stats[key]:
             skipped.append({"what": what, "status": "skipped:bounded", "files": load_stats[key]})
-    if walk_stats["symlink_outside_root"]:
-        skipped.append({"what": "symlinks-outside-root", "status": "skipped:bounded", "files": walk_stats["symlink_outside_root"]})
+    if walk_stats["symlinks_not_followed"]:
+        skipped.append({"what": "symlinks-not-followed", "status": "skipped:bounded", "files": walk_stats["symlinks_not_followed"]})
+    if walk_stats["unlistable_directories"]:
+        skipped.append({"what": "directories-not-listed", "status": "skipped:bounded",
+                        "directories": walk_stats["unlistable_directories"]})
     truncated = bool(walk_stats["truncated"] or load_stats.get("truncated_documents"))
     findings.extend({**item, "location": "."} for item in incomplete_findings(reasons, load_stats["parsed"]))
     ordered = _sorted(findings)
@@ -313,10 +372,14 @@ def run(args, ctx) -> dict:
     if not 0 <= args.min_strict_pct <= 100:
         raise SwarmError(ErrorCode.E_INPUT, "--min-strict-pct must be between 0 and 100")
     target = (ctx.root / args.path).resolve()
+    labels = itertools.count(1)  # one numbering for the redacted paths of this call, as scan numbers its own
     if not target.is_relative_to(ctx.root):
-        raise SwarmError(ErrorCode.E_INPUT, f"--path {args.path!r} leaves the repository root")
+        shown = path_label(args.path, next(labels))  # a --path can carry a credential or key shape: the same redaction as paths
+        raise SwarmError(ErrorCode.E_INPUT, f"--path {shown!r} leaves the repository root")
     if not target.exists():
-        raise SwarmError(ErrorCode.E_INPUT, f"--path {args.path!r} does not exist under {ctx.root}")
+        shown = path_label(args.path, next(labels))
+        root = path_label(str(ctx.root), next(labels))  # the root is a path in this envelope too
+        raise SwarmError(ErrorCode.E_INPUT, f"--path {shown!r} does not exist under {root}")
     return scan(ctx.root, target, min_strict_pct=args.min_strict_pct)
 
 

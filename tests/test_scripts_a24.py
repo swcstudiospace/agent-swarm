@@ -71,12 +71,12 @@ def test_clean_tree_exits_zero_with_no_findings(tmp_path):
 
 
 def test_pss_rbac_and_service_account_findings_with_file_locations(tmp_path):
-    write_json(tmp_path / "apps" / "web.json", {"kind": "Deployment", "metadata": {"name": "web", "namespace": "prod"},
+    write_json(tmp_path / "apps" / "web.json", {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web", "namespace": "prod"},
                                                 "spec": {"template": {"spec": {"hostNetwork": True, "containers": [
                                                     {"name": "app", "image": "x", "securityContext": {"privileged": True}}]}}}})
-    write_json(tmp_path / "rbac" / "roles.json", {"kind": "List", "items": [
-        {"kind": "ClusterRole", "metadata": {"name": "wide"}, "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]},
-        {"kind": "ClusterRoleBinding", "metadata": {"name": "root"}, "roleRef": {"kind": "ClusterRole", "name": "cluster-admin"},
+    write_json(tmp_path / "rbac" / "roles.json", {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "List", "items": [
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "wide"}, "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]},
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": "root"}, "roleRef": {"kind": "ClusterRole", "name": "cluster-admin"},
          "subjects": [{"kind": "User", "name": "alice"}]}]})
     result, payload = scan(tmp_path)
     assert result.returncode == 1 and payload["status"] == "fail"
@@ -112,8 +112,8 @@ def test_level_option_selects_baseline_or_restricted(tmp_path):
 
 
 def test_rbac_findings_resolve_across_files_and_map_back_to_the_defining_file(tmp_path):
-    write_json(tmp_path / "roles.json", {"kind": "ClusterRole", "metadata": {"name": "wide"}, "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["list"]}]})
-    write_json(tmp_path / "binds" / "b.json", {"kind": "ClusterRoleBinding", "metadata": {"name": "b"}, "roleRef": {"kind": "ClusterRole", "name": "wide"},
+    write_json(tmp_path / "roles.json", {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "wide"}, "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["list"]}]})
+    write_json(tmp_path / "binds" / "b.json", {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": "b"}, "roleRef": {"kind": "ClusterRole", "name": "wide"},
                                                "subjects": [{"kind": "ServiceAccount", "name": "ci", "namespace": "build"}]})
     result, payload = scan(tmp_path)
     assert result.returncode == 1
@@ -121,15 +121,15 @@ def test_rbac_findings_resolve_across_files_and_map_back_to_the_defining_file(tm
 
 
 def test_legacy_service_account_token_secret_is_reported_with_its_file(tmp_path):
-    write_json(tmp_path / "secrets" / "t.json", {"kind": "Secret", "type": "kubernetes.io/service-account-token", "metadata": {"name": "tok", "namespace": "prod"}})
-    write_json(tmp_path / "secrets" / "opaque.json", {"kind": "Secret", "type": "Opaque", "metadata": {"name": "x", "namespace": "prod"}})
+    write_json(tmp_path / "secrets" / "t.json", {"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/service-account-token", "metadata": {"name": "tok", "namespace": "prod"}})
+    write_json(tmp_path / "secrets" / "opaque.json", {"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "metadata": {"name": "x", "namespace": "prod"}})
     result, payload = scan(tmp_path)
     assert result.returncode == 1
     assert ids(payload) == [("sa.legacy-token-secret:Secret/prod/tok", "major", "secrets/t.json")]
 
 
 def test_service_account_manifests_in_the_tree_change_the_automount_decision(tmp_path):
-    write_json(tmp_path / "sa.json", {"kind": "ServiceAccount", "metadata": {"name": "builder", "namespace": "prod"}, "automountServiceAccountToken": False})
+    write_json(tmp_path / "sa.json", {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "builder", "namespace": "prod"}, "automountServiceAccountToken": False})
     workload = pod(automount=True)
     del workload["spec"]["automountServiceAccountToken"]
     write_json(tmp_path / "pod.json", workload)
@@ -138,8 +138,8 @@ def test_service_account_manifests_in_the_tree_change_the_automount_decision(tmp
 
 
 def test_rejected_manifests_are_listed_as_skipped_not_fatal(tmp_path):
-    write_json(tmp_path / "broken.json", {"kind": "Deployment", "metadata": {"name": "d"}, "spec": {}})
-    write_json(tmp_path / "other.json", {"kind": "ConfigMap", "metadata": {"name": "c"}})
+    write_json(tmp_path / "broken.json", {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "d"}, "spec": {}})
+    write_json(tmp_path / "other.json", {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}})
     result, payload = scan(tmp_path)
     assert result.returncode == 1 and payload["status"] == "fail" and "scan/incomplete" in {f["id"] for f in payload["findings"]}
     assert payload["skipped"][0].startswith("broken.json pss: INVALID_INPUT workloads")
@@ -152,7 +152,7 @@ def test_rejected_manifests_are_listed_as_skipped_not_fatal(tmp_path):
 def test_oversized_binary_non_utf8_and_unparseable_files_are_skipped_with_reasons(tmp_path):
     (tmp_path / "big.json").write_text(json.dumps({"kind": "Pod", "pad": "x" * (1024 * 1024 + 1)}))
     exactly = tmp_path / "exact.json"
-    prefix, suffix = '{"kind": "ConfigMap", "metadata": {"name": "c"}, "pad": "', '"}'
+    prefix, suffix = '{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}, "pad": "', '"}'
     exactly.write_text(prefix + "x" * (1024 * 1024 - len(prefix) - len(suffix)) + suffix)
     assert exactly.stat().st_size == 1024 * 1024
     (tmp_path / "bin.json").write_bytes(b'{"kind": "Pod"}\x00\x01')
@@ -176,7 +176,7 @@ def test_symlinks_are_never_followed(tmp_path):
     os.symlink(outside, root / "linkdir")
     result, payload = scan(root)
     assert result.returncode == 1 and payload["status"] == "fail" and [f["id"] for f in payload["findings"]] == ["scan/incomplete"]
-    assert payload["skipped"] == ["link.json: symlink"] and payload["files_scanned"] == 1
+    assert payload["skipped"] == ["link.json: symlink", "linkdir: symlink-directory"] and payload["files_scanned"] == 1
     escaped = run_script(SCRIPT, "--root", str(root), "--path", "link.json", "--json")
     assert escaped.returncode == 2 and json.loads(escaped.stdout)["status"] == "error"
 
@@ -191,7 +191,7 @@ def test_tool_and_vcs_directories_are_not_walked(tmp_path):
 
 def test_file_count_is_capped_at_2000(tmp_path):
     for index in range(2003):
-        (tmp_path / f"f{index:04d}.json").write_text('{"kind": "ConfigMap", "metadata": {"name": "c"}}')
+        (tmp_path / f"f{index:04d}.json").write_text('{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}}')
     result, payload = scan(tmp_path)
     assert result.returncode == 1 and payload["files_scanned"] == 2000 and payload["limits_hit"] == ["max-files:2000"]
     assert payload["status"] == "fail" and [f["id"] for f in payload["findings"]] == ["scan/incomplete"]
@@ -315,7 +315,7 @@ def test_yaml_alias_bomb_and_recursive_anchor_are_refused_before_anything_is_bui
 
 def test_yaml_with_a_modest_number_of_aliases_still_parses(tmp_path):
     pytest.importorskip("yaml")
-    (tmp_path / "shared.yaml").write_text("kind: Pod\nmetadata: {name: web, namespace: prod}\nspec:\n  containers:\n"
+    (tmp_path / "shared.yaml").write_text("apiVersion: v1\nkind: Pod\nmetadata: {name: web, namespace: prod}\nspec:\n  containers:\n"
                                           "  - &c {name: app, image: x, securityContext: {privileged: true}}\n  - {<<: *c, name: second}\n")
     _, payload = scan(tmp_path)
     # the merge key `<<: *c` copies the privileged container, so both containers are reported
@@ -326,7 +326,7 @@ def test_yaml_with_a_modest_number_of_aliases_still_parses(tmp_path):
 
 def test_yaml_non_string_keys_and_dates_do_not_stop_the_scan(tmp_path):
     pytest.importorskip("yaml")
-    (tmp_path / "odd.yaml").write_text("kind: Pod\nmetadata:\n  name: odd\n  annotations:\n    1: one\n    2026-01-01: day\nspec:\n  containers: [{name: c, image: x}]\n")
+    (tmp_path / "odd.yaml").write_text("apiVersion: v1\nkind: Pod\nmetadata:\n  name: odd\n  annotations:\n    1: one\n    2026-01-01: day\nspec:\n  containers: [{name: c, image: x}]\n")
     write_json(tmp_path / "bad.json", pod("bad", privileged=True))
     _, payload = scan(tmp_path)
     assert payload["skipped"] == [] and payload["files_scanned"] == 2
@@ -355,7 +355,7 @@ def test_a_fifo_named_like_a_manifest_is_skipped_not_read(tmp_path):
 
 
 def test_an_object_defined_in_two_files_lists_both_files(tmp_path):
-    wide = {"kind": "ClusterRole", "metadata": {"name": "wide"}, "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]}
+    wide = {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "wide"}, "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]}
     write_json(tmp_path / "a" / "role.json", wide)
     write_json(tmp_path / "b" / "role.json", wide)
     _, payload = scan(tmp_path)
@@ -369,7 +369,7 @@ def test_findings_never_echo_secret_values_found_in_manifests(tmp_path):
     document["spec"]["containers"][0]["command"] = ["run", canary]
     document["metadata"]["annotations"] = {"container.apparmor.security.beta.kubernetes.io/app": canary}
     write_json(tmp_path / "pod.json", document)
-    write_json(tmp_path / "secret.json", {"kind": "Secret", "type": "kubernetes.io/service-account-token", "metadata": {"name": "t", "namespace": "prod"},
+    write_json(tmp_path / "secret.json", {"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/service-account-token", "metadata": {"name": "t", "namespace": "prod"},
                                           "data": {"token": canary}, "stringData": {"token": canary}})
     result, payload = scan(tmp_path)
     assert canary not in result.stdout and canary not in result.stderr and payload["findings"]
@@ -408,17 +408,434 @@ def test_the_incomplete_finding_names_each_skipped_input_by_label_and_path(tmp_p
 def test_a_list_nested_too_deep_is_reported_not_silently_dropped(tmp_path):
     innermost = {"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "p", "namespace": "prod"},
                  "spec": {"containers": [{"name": "app", "image": "x", "securityContext": {"privileged": True}}]}}
-    write_json(tmp_path / "nested.json", {"kind": "List", "items": [{"kind": "List", "items": [{"kind": "List", "items": [innermost]}]}]})
+    write_json(tmp_path / "nested.json", {"apiVersion": "v1", "kind": "List", "items": [{"apiVersion": "v1", "kind": "List", "items": [{"apiVersion": "v1", "kind": "List", "items": [innermost]}]}]})
     write_json(tmp_path / "pod.json", pod())
     result, payload = scan(tmp_path)
     assert result.returncode == 1 and payload["status"] == "fail"
-    assert payload["skipped"] == ["nested.json: list-nesting-limit:2"] and payload["files_scanned"] == 2
+    assert payload["skipped"] == ["nested.json: list-nesting-limit:2 at items[0].items[0]"] and payload["files_scanned"] == 2
     assert not [f for f in payload["findings"] if f["id"].endswith("Pod/prod/p")]
     assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
 
 
 def test_a_list_item_that_is_not_an_object_is_reported_not_silently_dropped(tmp_path):
-    write_json(tmp_path / "items.json", {"kind": "List", "items": ["just text", pod("ok")]})
+    write_json(tmp_path / "items.json", {"apiVersion": "v1", "kind": "List", "items": ["just text", pod("ok")]})
     result, payload = scan(tmp_path)
     assert result.returncode == 1 and payload["status"] == "fail"
-    assert payload["skipped"] == ["items.json: list-item-not-object"] and payload["files_scanned"] == 1
+    assert payload["skipped"] == ["items.json: list-item-not-object at items[0]"] and payload["files_scanned"] == 1
+
+
+def test_a_symlinked_directory_is_reported_and_its_contents_are_not_read(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_json(outside / "evil.json", pod("evil", privileged=True))
+    root = tmp_path / "root"
+    root.mkdir()
+    write_json(root / "ok.json", pod())
+    os.symlink(outside, root / "linkdir")
+    result, payload = scan(root)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["linkdir: symlink-directory"] and payload["files_scanned"] == 1
+    assert not [f for f in payload["findings"] if f["id"].endswith("Pod/prod/evil")]
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_an_unreadable_subdirectory_is_reported_not_skipped_silently(tmp_path, monkeypatch):
+    module = importlib.import_module("swarm.tools.support").script("kpol_manifest_scan")
+    write_json(tmp_path / "ok.json", pod())
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    write_json(locked / "pod.json", pod("hidden", privileged=True))
+    real_walk = os.walk
+
+    def walk_with_denied_subdir(top, *args, **kwargs):
+        onerror = kwargs.get("onerror")
+        for current, dirs, names in real_walk(top, *args, **kwargs):
+            yield current, dirs, names
+        if onerror is not None:
+            onerror(PermissionError(13, "Permission denied", str(locked)))
+
+    monkeypatch.setattr(module.os, "walk", walk_with_denied_subdir)
+    payload = module.scan(tmp_path, tmp_path, "baseline")
+    assert payload["status"] == "fail"
+    assert payload["skipped"] == ["locked: unreadable-directory"]
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_a_list_whose_items_is_not_a_list_is_reported_not_dropped(tmp_path):
+    write_json(tmp_path / "list.json", {"apiVersion": "v1", "kind": "PodList", "items": "pod"})
+    write_json(tmp_path / "pod.json", pod())
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-items-not-a-list"] and payload["files_scanned"] == 2
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_a_document_without_a_string_kind_is_reported_not_dropped(tmp_path):
+    write_json(tmp_path / "values.json", {"apiVersion": "v1", "metadata": {"name": "x"}})
+    write_json(tmp_path / "pod.json", pod())
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["values.json: missing-kind"] and payload["files_scanned"] == 2
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_documents_outside_the_kubernetes_scope_are_passed_over_silently(tmp_path):
+    write_json(tmp_path / "package.json", {"name": "app", "version": "1.0.0", "scripts": {"test": "pytest"}})
+    write_json(tmp_path / ".github" / "workflows" / "ci.json", {"name": "CI", "on": {"push": {}},
+                                                                "jobs": {"build": {"runs-on": "ubuntu-latest", "steps": [{"run": "make"}]}}})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == [] and payload["files_scanned"] == 2
+
+
+def test_a_yaml_workflow_is_passed_over_silently_when_pyyaml_is_available(tmp_path):
+    pytest.importorskip("yaml")
+    (tmp_path / "ci.yml").write_text("name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n")
+    _, payload = scan(tmp_path)
+    assert payload["status"] == "ok" and payload["skipped"] == [] and payload["files_scanned"] == 1
+
+
+def test_a_kind_without_an_api_version_is_reported_and_still_analysed(tmp_path):
+    write_json(tmp_path / "pod.json", {"kind": "Pod", "metadata": {"name": "p", "namespace": "prod"},
+                                       "spec": {"containers": [{"name": "app", "image": "x", "securityContext": {"privileged": True}}]}})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["pod.json: missing-apiVersion"]
+    assert ("pss.privileged:Pod/prod/p", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_helm_chart_file_beside_a_clean_pod_is_passed_over_silently(tmp_path):
+    pytest.importorskip("yaml")
+    (tmp_path / "Chart.yaml").write_text("apiVersion: v2\nname: app\nversion: 1.0.0\n")
+    write_json(tmp_path / "pod.json", pod())
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == [] and payload["files_scanned"] == 2
+
+
+def test_a_kind_less_wrapper_with_items_cannot_hide_a_privileged_pod(tmp_path):
+    write_json(tmp_path / "wrapper.json", {"items": [pod("bad", privileged=True), {"name": "ignored"}, "text"]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/bad", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []
+
+
+def test_a_generic_payload_with_a_non_kubernetes_api_version_and_data_is_passed_over(tmp_path):
+    write_json(tmp_path / "payload.json", {"apiVersion": "2", "data": {"k": "v"}})
+    write_json(tmp_path / "pod.json", pod())
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == [] and payload["files_scanned"] == 2
+
+
+def test_a_group_api_version_with_a_body_and_no_kind_is_reported_as_missing_kind(tmp_path):
+    write_json(tmp_path / "pdb.json", {"apiVersion": "policy/v1beta1", "spec": {"minAvailable": 1}})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["pdb.json: missing-kind"] and payload["files_scanned"] == 1
+
+
+def test_a_privileged_pod_in_a_nested_array_is_analysed(tmp_path):
+    write_json(tmp_path / "nested.json", [[pod("bad", privileged=True)]])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/bad", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []
+
+
+def test_a_privileged_pod_in_an_items_array_is_analysed(tmp_path):
+    write_json(tmp_path / "wrapped.json", {"items": [[pod("wrapped", privileged=True)]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/wrapped", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []
+
+
+def test_a_three_level_nested_array_records_the_nesting_limit_and_fails(tmp_path):
+    write_json(tmp_path / "deep.json", [[[pod("deep", privileged=True)]]])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["deep.json: list-nesting-limit:2 at [0][0]"]
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_a_mapping_items_on_a_kindless_wrapper_is_analysed_as_one_element(tmp_path):
+    write_json(tmp_path / "single.json", {"items": pod("single", privileged=True)})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/single", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []
+
+
+def test_a_mapping_items_inside_an_array_or_a_nested_wrapper_is_analysed(tmp_path):
+    write_json(tmp_path / "array.json", [{"items": pod("inarray", privileged=True)}])
+    write_json(tmp_path / "nested.json", {"items": [{"items": pod("nested", privileged=True)}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    found = {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert ("pss.privileged:Pod/prod/inarray", "blocker") in found and ("pss.privileged:Pod/prod/nested", "blocker") in found
+    assert payload["skipped"] == []
+
+
+def test_scalar_items_on_a_kindless_wrapper_stay_silent(tmp_path):
+    write_json(tmp_path / "generic.json", {"items": "text"})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == []
+
+
+def test_a_privileged_pod_in_an_array_inside_a_list_is_analysed(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "List", "apiVersion": "v1", "items": [[pod("inlist", privileged=True)]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/inlist", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []
+
+
+def test_a_scalar_item_in_a_list_keeps_the_list_item_not_object_reason(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "List", "apiVersion": "v1", "items": [pod("ok"), "x"]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-not-object at items[1]"]
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def _pod_body():
+    return {"metadata": {"name": "body", "namespace": "prod"}, "spec": pod("body", privileged=True)["spec"]}
+
+
+def test_a_kind_less_pod_body_in_an_array_inside_a_pod_list_is_reported_not_inherited(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [[_pod_body()]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0][0]"]
+    assert not [f for f in payload["findings"] if f["id"].startswith(("pss.", "sa."))]
+
+
+def test_a_kind_less_pod_body_as_a_mapping_item_of_a_pod_list_is_reported_not_inherited(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [_pod_body()]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]"]
+    assert not [f for f in payload["findings"] if f["id"].startswith(("pss.", "sa."))]
+
+
+def test_a_scalar_inside_an_array_in_a_pod_list_keeps_the_list_item_not_object_reason(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [["x", _pod_body()]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-not-object at items[0][0]", "list.json: list-item-without-kind at items[0][1]"]
+    assert not [f for f in payload["findings"] if f["id"].startswith(("pss.", "sa."))]
+
+
+def test_a_kind_less_generic_record_in_a_pod_list_is_reported_not_judged_as_a_pod(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"foo": 1}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]"]
+    assert not [f for f in payload["findings"] if f["id"].startswith(("pss.", "sa."))]
+
+
+def test_a_kind_less_service_shaped_body_in_a_pod_list_array_gets_no_pod_finding(tmp_path):
+    service_body = {"metadata": {"name": "svc", "namespace": "prod"}, "spec": {"ports": [{"port": 80}]}}
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [[service_body]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0][0]"]
+    assert not [f for f in payload["findings"] if f["id"].startswith(("pss.", "sa."))]
+
+
+def test_a_pod_item_with_its_own_kind_in_a_pod_list_array_is_analysed(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [[pod("own", privileged=True)]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/own", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []
+
+
+def test_a_service_item_with_its_own_kind_in_a_pod_list_gives_no_pod_finding(tmp_path):
+    service = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "svc", "namespace": "prod"}, "spec": {"ports": [{"port": 80}]}}
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [service]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["findings"] == [] and payload["skipped"] == []
+
+
+def test_a_three_level_array_inside_a_pod_list_records_the_nesting_limit(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [[[pod("deep", privileged=True)]]]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-nesting-limit:2 at items[0][0]"]
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_a_kind_less_wrapper_inside_a_pod_list_reports_the_item_and_analyses_the_pod_inside(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"items": [pod("inside", privileged=True)]}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]"]
+    assert ("pss.privileged:Pod/prod/inside", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_kind_less_item_with_no_items_list_keeps_only_the_reason(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"name": "bare"}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]"]
+    assert [f["id"] for f in payload["findings"]] == ["scan/incomplete"]
+
+
+def test_a_three_level_kind_less_wrapper_chain_inside_a_pod_list_hits_the_nesting_limit(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"items": [{"items": [pod("deep", privileged=True)]}]}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]", "list.json: list-item-without-kind at items[0].items[0]",
+                                  "list.json: list-nesting-limit:2 at items[0].items[0].items"]
+    assert not [f for f in payload["findings"] if f["id"].startswith(("pss.", "sa."))]
+
+
+def test_a_two_level_kind_less_wrapper_chain_inside_a_pod_list_analyses_the_pod_at_depth_two(tmp_path):
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"items": [pod("two", privileged=True)]}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]"]
+    assert ("pss.privileged:Pod/prod/two", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_single_mapping_items_on_a_kind_less_list_item_is_judged_as_one_element(tmp_path):
+    solo = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "solo", "namespace": "prod"},
+            "spec": {"containers": [{"name": "app", "image": "x", "securityContext": {"privileged": True}}], "serviceAccountName": "builder",
+                     "automountServiceAccountToken": False}}
+    write_json(tmp_path / "list.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"name": "x", "items": solo}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-without-kind at items[0]"]
+    assert ("pss.privileged:Pod/prod/solo", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_kind_less_candidate_with_items_reports_missing_kind_and_analyses_the_pod_inside(tmp_path):
+    write_json(tmp_path / "top.json", {"apiVersion": "v1", "items": [pod("inside", privileged=True)]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["top.json: missing-kind"]
+    assert ("pss.privileged:Pod/prod/inside", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_kind_less_candidate_inside_an_array_with_items_analyses_the_pod_inside(tmp_path):
+    write_json(tmp_path / "array.json", [{"apiVersion": "v1", "items": [pod("arrayed", privileged=True)]}])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["array.json: missing-kind at [0]"]
+    assert ("pss.privileged:Pod/prod/arrayed", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_kind_less_candidate_with_no_items_list_keeps_only_its_reason(tmp_path):
+    write_json(tmp_path / "bare.json", {"apiVersion": "v1", "metadata": {"name": "x"}})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["bare.json: missing-kind"]
+    assert [f["id"] for f in payload["findings"]] == ["scan/incomplete"]
+
+
+def test_a_two_level_kind_less_candidate_chain_reports_one_reason_per_level_and_analyses_the_pod(tmp_path):
+    write_json(tmp_path / "list.json", {"apiVersion": "v1", "items": [{"apiVersion": "v1", "items": [pod("p2", privileged=True)]}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: missing-kind", "list.json: missing-kind at items[0]"]
+    assert ("pss.privileged:Pod/prod/p2", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_a_kind_less_candidate_items_get_their_own_reasons_at_their_paths_and_the_pod_is_analysed(tmp_path):
+    body = {"metadata": {"name": "b", "namespace": "prod"}, "spec": pod("b", privileged=True)["spec"]}
+    write_json(tmp_path / "list.json", {"apiVersion": "v1", "items": ["x", body, pod("p", privileged=True)]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: list-item-not-object at items[0]", "list.json: list-item-without-kind at items[1]",
+                                  "list.json: missing-kind"]
+    assert ("pss.privileged:Pod/prod/p", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+
+
+def test_generic_data_in_a_nested_list_records_no_nesting_limit(tmp_path):
+    write_json(tmp_path / "generic.json", [[{"name": "x", "items": [1, 2]}]])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == []
+
+
+def test_a_pod_cut_off_by_the_nesting_limit_still_records_the_limit(tmp_path):
+    write_json(tmp_path / "cut.json", [[[pod("cut", privileged=True)]]])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["cut.json: list-nesting-limit:2 at [0][0]"]
+
+
+def test_two_nested_candidates_lacking_an_api_version_each_get_their_own_path_reason_and_their_pods_are_analysed(tmp_path):
+    write_json(tmp_path / "list.json", {"apiVersion": "v1", "kind": "List", "items": [
+        {"kind": "List", "items": [pod("a", privileged=True)]},
+        {"kind": "List", "items": [pod("b", privileged=True)]}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["list.json: missing-apiVersion at items[0]", "list.json: missing-apiVersion at items[1]"]
+    found = {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert ("pss.privileged:Pod/prod/a", "blocker") in found and ("pss.privileged:Pod/prod/b", "blocker") in found
+
+
+def test_a_single_mapping_items_value_of_a_candidate_is_reported_at_items_with_no_index(tmp_path):
+    write_json(tmp_path / "w1.json", {"apiVersion": "v1", "items": {"apiVersion": "v1", "metadata": {"name": "x"}}})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["w1.json: missing-kind", "w1.json: missing-kind at items"]
+
+
+def test_a_single_mapping_items_of_a_kind_less_list_item_is_reported_at_items_with_no_index(tmp_path):
+    write_json(tmp_path / "w2.json", {"kind": "PodList", "apiVersion": "v1", "items": [{"name": "x", "items": {"name": "y"}}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["w2.json: list-item-without-kind at items[0]", "w2.json: list-item-without-kind at items[0].items"]
+
+
+def test_two_list_items_with_string_items_each_get_their_own_reason(tmp_path):
+    write_json(tmp_path / "c1.json", {"kind": "PodList", "apiVersion": "v1", "items": [
+        {"kind": "List", "apiVersion": "v1", "items": "a"}, {"kind": "List", "apiVersion": "v1", "items": "b"}]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["c1.json: list-items-not-a-list at items[0]", "c1.json: list-items-not-a-list at items[1]"]
+
+
+def test_two_depth_cuts_at_different_positions_each_get_their_own_reason(tmp_path):
+    a = [[pod("a", privileged=True)]]
+    b = [[pod("b", privileged=True)]]
+    write_json(tmp_path / "c2.json", {"kind": "PodList", "apiVersion": "v1", "items": [a, b]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["c2.json: list-nesting-limit:2 at items[0][0]", "c2.json: list-nesting-limit:2 at items[1][0]"]
+
+
+def test_a_bare_v2_payload_beside_data_is_passed_over_silently(tmp_path):
+    write_json(tmp_path / "payload.json", {"apiVersion": "v2", "data": {"count": 3}})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == []
+
+
+def test_a_bare_v2_payload_nested_in_arrays_records_no_nesting_limit(tmp_path):
+    write_json(tmp_path / "payload.json", [[[{"apiVersion": "v2", "data": {"count": 3}}]]])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 0 and payload["status"] == "ok"
+    assert payload["skipped"] == [] and payload["findings"] == []
+
+
+def test_a_grouped_api_version_with_data_is_still_a_candidate_and_reports_missing_kind_at_its_position(tmp_path):
+    write_json(tmp_path / "scaler.json", [{"apiVersion": "autoscaling/v2", "data": {"count": 3}}])
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["scaler.json: missing-kind at [0]"]
+
+
+def test_a_v1_pod_is_still_analysed(tmp_path):
+    write_json(tmp_path / "pod.json", pod("p", privileged=True))
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert ("pss.privileged:Pod/prod/p", "blocker") in {(f["id"], f["severity"]) for f in payload["findings"]}
+    assert payload["skipped"] == []

@@ -928,7 +928,7 @@ def test_drill_unmeasured_targets_are_minor():
 
 def test_drill_for_an_unknown_scenario_is_reported_so_typos_show():
     result = cadence([req()], [drill(), drill("region-failovr")])
-    assert found(result) == {("drill-without-requirement", "region-failovr"): "info"}
+    assert found(result) == {("drill-without-requirement", "drills[1]"): "info"}
 
 
 def test_drill_schedule_is_sorted_and_counts_each_scenario():
@@ -1283,3 +1283,65 @@ def test_pdb_percentages_round_up_like_the_disruption_controller(replicas, perce
     assert (by_min["desired_healthy"], by_min["disruptions_allowed"]) == (expected_scaled, replicas - expected_scaled)
     by_max = pdb(wl("x", replicas, max_unavailable=f"{percent}%"))["budgets"][0]
     assert (by_max["desired_healthy"], by_max["disruptions_allowed"]) == (replicas - expected_scaled, expected_scaled)
+
+
+# --- INVALID_INPUT and info messages name the field, never a name that may hold a secret -----------------------------
+
+SECRET_NAME = "sk_" + "live_" + "4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a"
+
+
+def test_backup_invalid_input_never_echoes_an_unknown_asset_name():
+    result = invalid("resil_backup_coverage", {"as_of": AS_OF, "min_retention_days": 30, "restore_test_max_age_days": 90,
+                                               "assets": [asset("db")], "jobs": [job(SECRET_NAME)]}, "jobs")
+    assert SECRET_NAME not in json.dumps(result)
+
+
+def test_backup_invalid_input_never_echoes_a_future_job_asset_name():
+    result = invalid("resil_backup_coverage", {"as_of": AS_OF, "min_retention_days": 30, "restore_test_max_age_days": 90,
+                                               "assets": [asset(SECRET_NAME)], "jobs": [job(SECRET_NAME, last="2026-10-21T00:00:00+00:00")]},
+                     "jobs")
+    assert SECRET_NAME not in json.dumps(result)
+
+
+@pytest.mark.parametrize(("over", "field"), [
+    ({"spread_constraints": [{"topology_key": SECRET_NAME, "max_skew": 1, "when_unsatisfiable": "DoNotSchedule"}]}, "spread_constraints"),
+    ({"anti_affinity": [{"topology_key": SECRET_NAME, "mode": "required"}]}, "anti_affinity"),
+    ({"topology_domains": [{"key": ZONE, "count": 3}, {"key": SECRET_NAME, "count": 3}, {"key": SECRET_NAME, "count": 3}]}, "topology_domains"),
+])
+def test_spread_invalid_input_never_echoes_a_topology_key(over, field):
+    result = invalid("resil_spread_check", spread_payload(**over), field)
+    assert SECRET_NAME not in json.dumps(result)
+
+
+def test_drill_invalid_input_never_echoes_a_scenario_name():
+    result = invalid("resil_drill_cadence", {"as_of": AS_OF, "requirements": [req()],
+                                             "drills": [drill(SECRET_NAME, at="2026-10-21T00:00:00+00:00")]}, "drills")
+    assert SECRET_NAME not in json.dumps(result)
+
+
+def test_drill_info_names_the_drill_by_position_and_never_the_scenario():
+    result = cadence([req()], [drill(), drill(SECRET_NAME)])
+    assert found(result) == {("drill-without-requirement", "drills[1]"): "info"} and SECRET_NAME not in json.dumps(result)
+
+
+# --- consensus is a boolean: a non-boolean is an input error, never read as true; an absent consensus is true -------------
+
+CONSENSUS_BASE = {"workload": "etcd", "replicas": 4, "members_per_zone": [1, 1, 1, 1], "unavailable_members": 0,
+                  "max_unavailable": "1", "quorum_size": 2}
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_quorum_consensus_must_be_a_boolean_at_the_registry(value):
+    invalid("resil_quorum_safety", {**CONSENSUS_BASE, "consensus": value}, "consensus")
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_quorum_safety_handler_rejects_a_non_boolean_consensus(value):
+    handler = importlib.import_module("swarm.tools.a25_tools")
+    result = handler.quorum_safety({**CONSENSUS_BASE, "consensus": value})
+    assert result["state"] == "INVALID_INPUT" and result["field"] == "consensus"
+
+
+def test_quorum_consensus_missing_is_true():
+    result = ok("resil_quorum_safety", CONSENSUS_BASE)
+    assert found(result) == {("quorum-below-majority", "etcd"): "blocker"} and result["status"] == "fail"

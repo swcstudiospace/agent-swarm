@@ -196,6 +196,41 @@ def test_overlay_is_checked_against_the_resources_its_bases_render(tmp_path):
 
 
 @needs_yaml
+def test_a_generate_name_only_object_is_not_matched_by_a_patch_target_named_after_its_generate_name(tmp_path):
+    put(tmp_path, "k/kustomization.yaml", "resources:\n  - gen.yaml\npatches:\n  - target: {kind: ConfigMap, name: cfg-}\n    patch: |-\n      - op: add\n        path: /data/x\n        value: y\n")
+    put(tmp_path, "k/gen.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {generateName: cfg-}\ndata: {a: b}\n")
+    code, result = scan(tmp_path)
+    # was: _minimal copied generateName into name, so the target matched a name the object does not have and the scan passed
+    assert code == 1 and result["status"] == "fail" and ids(result, "kustomize") == {"kustomize:patch-target-not-found:patches[0]"}
+    assert result["findings"][0]["severity"] == "major"
+    put(tmp_path, "real/kustomization.yaml", "resources:\n  - gen.yaml\npatches:\n  - target: {kind: ConfigMap, name: cfg-x}\n    patch: |-\n      - op: add\n        path: /data/x\n        value: y\n")
+    put(tmp_path, "real/gen.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: cfg-x}\ndata: {a: b}\n")
+    code, control = scan(tmp_path / "real")
+    assert code == 0 and control["findings"] == []  # a real name is still matched
+
+
+@needs_yaml
+def test_a_directory_outside_the_kustomization_in_a_file_field_breaks_the_load_restrictor(tmp_path):
+    put(tmp_path, "app/kustomization.yaml", "transformers:\n  - ../shared\n")
+    put(tmp_path, "shared/x.yaml", "kind: Foo\n")
+    code, result = scan(tmp_path)
+    # was: the directory branch returned before the load-restrictor check, so a directory outside the kustomization directory passed
+    assert code == 1 and result["status"] == "fail"
+    assert ids(result, "kustomize") == {"kustomize:load-restrictor:transformers:../shared", "kustomize:directory-not-file:transformers:../shared"}
+    restrictor = next(f for f in result["findings"] if f["id"] == "kustomize:load-restrictor:transformers:../shared")
+    assert restrictor["severity"] == "major" and restrictor["location"] == "app/kustomization.yaml"
+
+
+@needs_yaml
+def test_a_kustomization_directory_outside_the_overlay_is_a_base_and_not_a_restrictor_breach(tmp_path):
+    # kustomize loads a directory base outside the overlay (resources: ../base is the usual overlay layout); it is not flagged here
+    put(tmp_path, "base/kustomization.yaml", "resources: []\n")
+    put(tmp_path, "overlay/kustomization.yaml", "resources:\n  - ../base\n")
+    code, result = scan(tmp_path)
+    assert code == 0 and result["status"] == "ok" and not ids(result, "kustomize")
+
+
+@needs_yaml
 def test_patch_files_are_read_so_their_targets_can_be_checked(tmp_path):
     put(tmp_path, "k/kustomization.yaml", "resources:\n  - deploy.yaml\npatches:\n  - path: ok.yaml\n  - path: wrong.yaml\n  - path: ops.yaml\n    target: {kind: Deployment, name: web}\n"
                                          "  - path: ops.yaml\n    target: {kind: Deployment, name: nope}\npatchesStrategicMerge:\n  - merge.yaml\n")
@@ -333,10 +368,10 @@ def test_floating_images_are_major_and_tag_pinning_is_optional(tmp_path):
     put(tmp_path, "d.yaml", deployment_with("ghcr.io/acme/db@sha256:" + "a" * 64, "d"))
     put(tmp_path, "e.yaml", deployment_with("'{{ .Values.image }}'", "e"))
     code, result = scan(tmp_path)
-    assert code == 1
-    assert found(result) == [("images:floating-tag:ghcr.io/acme/web:latest", "major", "a.yaml"), ("images:floating-tag:nginx", "major", "b.yaml")]
+    assert code == 1 and ids(result) == {"images:floating-tag:ghcr.io/acme/web:latest", "images:floating-tag:nginx", "scan/incomplete"}  # was: exactly the two floating tags, e.yaml's templated image passed silently
+    assert ("images:floating-tag:ghcr.io/acme/web:latest", "major", "a.yaml") in found(result) and ("images:floating-tag:nginx", "major", "b.yaml") in found(result)
     code, strict = scan(tmp_path, "--require-digest")
-    assert ("images:digest-required:ghcr.io/acme/api:2.1.0", "major", "c.yaml") in found(strict) and len(found(strict)) == 3
+    assert ("images:digest-required:ghcr.io/acme/api:2.1.0", "major", "c.yaml") in found(strict) and "scan/incomplete" in ids(strict)
     assert not any("sha256" in i for i, s, f in found(strict))
 
 
@@ -692,3 +727,72 @@ def test_a_kustomize_patch_target_inside_a_kind_list_is_found_like_the_bare_docu
         assert sorted(found(wrapped)) == sorted(found(bare)), name
         # was: a target inside a List was never seen, so "web" reported a false patch-target-not-found
         assert ("kustomize:patch-target-not-found:patches[0]" in ids(wrapped)) is (name == "gone"), name
+
+
+
+@needs_yaml
+def test_a_build_or_dist_directory_is_read_not_skipped(tmp_path):
+    secret = "apiVersion: v1\nkind: Secret\nmetadata: {name: db, namespace: shop}\ndata: {password: aHVudGVyMmh1bnRlcjI=}\n"
+    put(tmp_path, "build/secret.yaml", secret)
+    put(tmp_path, "dist/secret.yaml", secret)
+    put(tmp_path, "ok.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and ids(result) == {"secrets:plaintext-secret:Secret/shop/db"} and result["files_scanned"] == 3
+    assert "hunter2" not in json.dumps(result) and "aHVudGVyMmh1bnRlcjI" not in json.dumps(result)
+
+
+@needs_yaml
+def test_out_of_scope_directories_are_still_skipped(tmp_path):
+    secret = "apiVersion: v1\nkind: Secret\nmetadata: {name: db}\ndata: {password: aHVudGVyMmh1bnRlcjI=}\n"
+    put(tmp_path, ".git/hooks/x.yaml", secret)
+    put(tmp_path, "node_modules/p/x.yaml", secret)
+    put(tmp_path, "ok.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c}\n")
+    code, result = scan(tmp_path)
+    assert code == 0 and result["status"] == "ok" and result["files_scanned"] == 1 and result["findings"] == []
+
+
+@needs_yaml
+def test_a_generate_name_only_secret_is_read_as_a_secret(tmp_path):
+    put(tmp_path, "s.yaml", "apiVersion: v1\nkind: Secret\nmetadata: {generateName: db-}\ndata: {password: aHVudGVyMmh1bnRlcjI=}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and ids(result) == {"secrets:plaintext-secret:Secret/db-"} and "aHVudGVyMmh1bnRlcjI" not in json.dumps(result)
+
+
+@needs_yaml
+def test_a_templated_image_is_a_reason_not_a_silent_pass(tmp_path):
+    put(tmp_path, "a.yaml", deployment_with("reg.io/{{ .Values.repo }}/app:1.0", "a"))
+    put(tmp_path, "b.yaml", deployment_with("reg.io/${REPO}/app:latest", "b"))
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and ids(result) == {"scan/incomplete"}
+    assert "reg.io" not in json.dumps(result)  # labels and paths only, never the template value
+
+
+@needs_yaml
+@pytest.mark.parametrize("field", ["transformers", "generators", "validators", "crds"])
+def test_a_directory_in_a_file_field_is_a_major_finding_and_fails_the_scan(tmp_path, field):
+    # was: a minor directory-not-file with status ok, so a directory where kustomize expects a file passed the gate
+    put(tmp_path, "app/kustomization.yaml", f"{field}:\n  - tr\n")
+    put(tmp_path, "app/tr/x.yaml", "kind: Foo\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and ids(result, "kustomize") == {f"kustomize:directory-not-file:{field}:tr"}
+    finding = next(f for f in result["findings"] if f["id"] == f"kustomize:directory-not-file:{field}:tr")
+    assert finding["severity"] == "major" and "not verified" in finding["summary"]
+
+
+@needs_yaml
+def test_a_directory_in_a_directory_field_is_valid_and_not_flagged(tmp_path):
+    put(tmp_path, "app/kustomization.yaml", "resources:\n  - sub\n")
+    put(tmp_path, "app/sub/kustomization.yaml", "resources: []\n")
+    code, result = scan(tmp_path)
+    assert code == 0 and result["status"] == "ok" and not ids(result, "kustomize")
+
+
+@needs_yaml
+def test_more_than_500_rendered_items_record_a_reason_and_do_not_pass_silently(tmp_path):
+    body = "".join(f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{index}}}\n---\n" for index in range(600))
+    put(tmp_path, "k/kustomization.yaml", "resources:\n  - a.yaml\n  - b.yaml\n")
+    put(tmp_path, "k/a.yaml", body)
+    put(tmp_path, "k/b.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c0}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and ids(result) == {"scan/incomplete"}
+    assert "500" in next(f["summary"] for f in result["findings"] if f["id"] == "scan/incomplete")

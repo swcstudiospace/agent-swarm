@@ -358,3 +358,345 @@ def test_comments_that_contain_asterisk_names_are_not_yaml_aliases(tmp_path):
     code, result = scan(tmp_path, "--target-version", "1.22")
     assert code == 1 and result["files_skipped"]["unparsable"] == 0 and result["files_scanned"] == 1
     assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "commented.yaml")]
+
+
+
+def test_a_yaml_tree_with_no_kubernetes_manifest_is_incomplete_not_ok(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "values.yaml", "replicaCount: 1\nimage: nginx\n")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0 and result["files_scanned"] == 1
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "read 1 file (values.yaml); none held a Kubernetes manifest" in result["findings"][0]["summary"] and "no in-scope input" not in result["findings"][0]["summary"]
+
+
+def test_a_top_level_yaml_sequence_is_a_reason_not_a_silent_drop(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "seq.yaml", "- apiVersion: extensions/v1beta1\n  kind: Ingress\n  metadata:\n    name: site\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.22")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "seq.yaml: document is not a mapping; not analysed" in result["findings"][0]["summary"]
+
+
+def test_a_non_mapping_list_item_is_a_reason_not_a_silent_drop(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "items.yaml", "apiVersion: v1\nkind: List\nitems:\n- just text\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and [f["id"] for f in result["findings"]] == ["scan/incomplete"]
+    assert "items.yaml: List item is not a mapping; not analysed" in result["findings"][0]["summary"]
+
+
+def test_a_policy_v1beta1_pdb_inside_nested_lists_is_found(tmp_path):
+    pdb = {"apiVersion": "policy/v1beta1", "kind": "PodDisruptionBudget", "metadata": {"name": "pdb"}}
+    nested = {"apiVersion": "v1", "kind": "List", "items": [{"apiVersion": "v1", "kind": "List", "items": [pdb]}]}
+    put(tmp_path, "list.json", nested)
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert rules(result) == [("removed-api/policy/v1beta1/PodDisruptionBudget/pdb", "blocker", "list.json")]
+
+
+def test_a_list_nested_past_the_bound_is_a_reason_and_fails_closed(tmp_path):
+    innermost = {"apiVersion": "policy/v1beta1", "kind": "PodDisruptionBudget", "metadata": {"name": "pdb"}}
+    document = {"apiVersion": "v1", "kind": "List", "items": []}
+    cursor = document
+    for _ in range(9):  # one more level than MAX_LIST_DEPTH allows
+        child = {"apiVersion": "v1", "kind": "List", "items": []}
+        cursor["items"].append(child)
+        cursor = child
+    cursor["items"].append(innermost)
+    put(tmp_path, "deep.json", document)
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "List nested deeper than 8 levels" in result["findings"][0]["summary"]
+
+
+def test_a_symlinked_file_named_by_path_is_not_followed_and_the_scan_fails(tmp_path):
+    put(tmp_path, "real/ing.json", {"apiVersion": "extensions/v1beta1", "kind": "Ingress", "metadata": {"name": "site"}})
+    os.symlink(tmp_path / "real" / "ing.json", tmp_path / "link.json")
+    code, result = scan(tmp_path, "--path", "link.json", "--target-version", "1.22")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0
+    assert result["files_skipped"]["symlink"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", "link.json")]
+    assert "link.json: symlink not followed" in result["findings"][0]["summary"]
+
+
+def test_a_symlinked_directory_named_by_path_is_not_followed_and_the_scan_fails(tmp_path):
+    put(tmp_path, "real/ing.json", {"apiVersion": "extensions/v1beta1", "kind": "Ingress", "metadata": {"name": "site"}})
+    os.symlink(tmp_path / "real", tmp_path / "linkdir")
+    code, result = scan(tmp_path, "--path", "linkdir", "--target-version", "1.22")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0
+    assert result["files_skipped"]["symlink"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", "linkdir")]
+    assert "linkdir: symlink not followed" in result["findings"][0]["summary"]
+
+
+
+def test_a_multi_document_object_with_a_misspelt_api_version_is_a_reason_and_the_configmap_is_still_analysed(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "multi.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n---\n"
+        "apiVersionX: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: pdb\n")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1 and result["files_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "multi.yaml#1: malformed Kubernetes object, apiVersion not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+def test_a_mapping_with_neither_apiversion_nor_kind_is_not_a_kubernetes_object_and_stays_silent(tmp_path):
+    put(tmp_path, "values.json", {"replicaCount": 1, "image": "nginx"})
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+
+def test_a_helm_chart_metadata_without_kind_is_not_a_kubernetes_object_and_the_tree_stays_ok(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1 and result["files_scanned"] == 2
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+def test_a_mapping_with_apiversion_and_metadata_but_no_kind_is_a_malformed_object_reason(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "odd.yaml", "apiVersion: v1\nmetadata:\n  name: x\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "odd.yaml: malformed Kubernetes object, kind not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+def test_an_empty_apiversion_is_malformed_and_not_counted_as_an_analysed_manifest(tmp_path):
+    put(tmp_path, "pdb.json", {"apiVersion": "", "kind": "PodDisruptionBudget", "metadata": {"name": "p"}})
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "pdb.json: malformed Kubernetes object, apiVersion not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+def test_a_whitespace_only_kind_is_malformed_and_not_counted_as_an_analysed_manifest(tmp_path):
+    put(tmp_path, "x.json", {"apiVersion": "policy/v1beta1", "kind": "  ", "metadata": {"name": "p"}})
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "x.json: malformed Kubernetes object, kind not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+
+def test_a_body_only_object_with_a_removed_api_version_and_no_kind_is_a_malformed_reason_not_a_silent_drop(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "pdb.yaml", "apiVersion: policy/v1beta1\nspec:\n  minAvailable: 1\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.25")
+    # policy/v1beta1 PodDisruptionBudget is removed in 1.25, but without a kind no removed-API blocker can be computed:
+    # the object must be reported as malformed rather than dropped.
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "pdb.yaml: malformed Kubernetes object, kind not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+
+def test_a_storage_class_without_kind_is_a_malformed_reason_and_the_deployment_is_still_counted(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "sc.yaml", "apiVersion: storage.k8s.io/v1beta1\nprovisioner: kubernetes.io/aws-ebs\nparameters:\n  type: gp2\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.25")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "sc.yaml: malformed Kubernetes object, kind not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+def test_a_priority_class_without_kind_is_a_malformed_reason_and_the_deployment_is_still_counted(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "pc.yaml", "apiVersion: scheduling.k8s.io/v1beta1\nvalue: 1000\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.25")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "pc.yaml: malformed Kubernetes object, kind not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+
+def test_a_helm2_chart_with_tillerversion_is_chart_metadata_and_the_tree_stays_ok(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: v1\nname: app\nversion: 0.1.0\ntillerVersion: \">=2.8.0\"\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1 and result["files_scanned"] == 2
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+
+def test_a_helm3_chart_with_an_unlisted_top_level_key_is_chart_metadata_by_file_name_and_the_tree_stays_ok(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\nlintrc: custom\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+def test_a_values_file_with_a_top_level_apiversion_and_a_non_chart_key_fails_closed_as_malformed(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "values.yaml", "apiVersion: v1\nreplicaCount: 1\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "values.yaml: malformed Kubernetes object, kind not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+
+def test_a_kind_bearing_pdb_inside_chart_yaml_is_analysed_and_its_removed_api_is_a_blocker(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: policy/v1beta1\nkind: PodDisruptionBudget\nmetadata:\n  name: pdb\nspec:\n  minAvailable: 1\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 2
+    assert rules(result) == [("removed-api/policy/v1beta1/PodDisruptionBudget/pdb", "blocker", "Chart.yaml")]
+
+
+def test_a_chart_yaml_whose_document_is_a_sequence_keeps_the_not_a_mapping_reason(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "- apiVersion: v2\n  name: app\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "Chart.yaml: document is not a mapping; not analysed" in result["findings"][0]["summary"]
+
+
+def test_a_kustomization_without_kind_is_chart_style_metadata_and_the_deployment_is_analysed(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\nresources:\n- good.json\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+
+def test_a_kustomization_of_kind_kustomization_without_apiversion_is_silent_and_the_deployment_is_analysed(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "kustomization.yaml", "kind: Kustomization\nresources:\n- good.json\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+def test_a_kustomization_with_a_non_kustomize_kind_and_no_apiversion_keeps_the_malformed_reason(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "kustomization.yaml", "kind: Pod\nmetadata:\n  name: p\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "kustomization.yaml: malformed Kubernetes object, apiVersion not a non-empty string; not analysed" in result["findings"][0]["summary"]
+
+
+def test_an_extensionless_kustomization_with_a_removed_pdb_is_read_by_the_walk_and_by_path_alike(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Kustomization", "apiVersion: policy/v1beta1\nkind: PodDisruptionBudget\nmetadata:\n  name: pdb\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 2 and result["manifests_scanned"] == 2
+    assert rules(result) == [("removed-api/policy/v1beta1/PodDisruptionBudget/pdb", "blocker", "Kustomization")]
+    code, by_path = scan(tmp_path, "--path", "Kustomization", "--target-version", "1.30")
+    assert code == 1 and by_path["files_scanned"] == 1 and rules(by_path) == rules(result)
+
+
+def test_an_extensionless_kustomization_of_kind_kustomization_is_silent_in_the_walk(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Kustomization", "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n- good.json\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+def test_a_path_to_a_non_manifest_file_is_not_read_as_a_manifest_and_the_scan_is_incomplete(tmp_path):
+    put(tmp_path, "notes.txt", "kind: Pod\nmetadata:\n  name: p\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--path", "notes.txt", "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 0 and result["manifests_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "no in-scope input was analysed" in result["findings"][0]["summary"]
+
+
+
+def test_a_directory_holding_only_a_kind_kustomization_is_read_but_not_ok_and_names_the_file(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n- x.json\n")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 1 and result["manifests_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "read 1 file (kustomization.yaml); none held a Kubernetes manifest" in result["findings"][0]["summary"]
+
+
+def test_a_directory_holding_only_chart_metadata_is_read_but_not_ok_and_names_the_file(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 1 and result["manifests_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "read 1 file (Chart.yaml); none held a Kubernetes manifest" in result["findings"][0]["summary"]
+
+
+def test_chart_metadata_beside_a_values_file_is_read_but_not_ok_and_names_both_files(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n")
+    put(tmp_path, "values.yaml", "replicaCount: 1\n")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 2 and result["manifests_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "read 2 files (Chart.yaml, values.yaml); none held a Kubernetes manifest" in result["findings"][0]["summary"]
+
+
+def test_an_empty_kustomization_yaml_alone_is_read_but_not_ok(tmp_path):
+    put(tmp_path, "kustomization.yaml", "")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 1 and result["manifests_scanned"] == 0
+    assert "read 1 file (kustomization.yaml); none held a Kubernetes manifest" in result["findings"][0]["summary"]
+
+
+def test_a_kustomization_of_kind_component_without_apiversion_is_silent_and_the_deployment_is_analysed(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "kustomization.yaml", "kind: Component\nresources:\n- good.json\n")
+    put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["status"] == "ok" and result["manifests_scanned"] == 1
+    assert result["findings"] == [] and result["skipped"] == []
+
+
+
+def test_a_malformed_pdb_alone_names_the_file_read_as_holding_no_inspectable_manifest(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "pdb.yaml", "apiVersion: policy/v1beta1\nspec:\n  minAvailable: 1\n")
+    code, result = scan(tmp_path, "--target-version", "1.25")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0 and result["files_scanned"] == 1
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    summary = result["findings"][0]["summary"]
+    assert "read 1 file (pdb.yaml); none held an inspectable Kubernetes manifest" in summary
+    assert "pdb.yaml: malformed Kubernetes object, kind not a non-empty string; not analysed" in summary
+
+
+def test_a_read_file_reason_is_listed_first_so_six_malformed_candidates_cannot_hide_it(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n")
+    for index in range(6):
+        put(tmp_path, f"bad{index}.yaml", "apiVersion: policy/v1beta1\nspec:\n  minAvailable: 1\n")
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0 and result["files_scanned"] == 7
+    summary = result["findings"][0]["summary"]
+    assert "read 7 files (Chart.yaml, bad0.yaml, bad1.yaml, bad2.yaml, bad3.yaml and 2 more); none held an inspectable Kubernetes manifest" in summary
+    assert summary.index("read 7 files") < summary.index("bad0.yaml: malformed")

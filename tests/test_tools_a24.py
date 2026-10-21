@@ -462,11 +462,11 @@ def test_rbac_scan_other_escalation_primitives():
     assert role_rules(["create"], ["pods/exec"], names=["x"]) == []
 
 
-def test_rbac_scan_skips_only_named_bootstrap_roles_and_checks_cluster_admin_by_its_rules():
+def test_rbac_scan_checks_every_role_whatever_its_name_or_label():
     wildcard = [rule(["*"], ["*"], ["*"])]
     labelled = role("system:thing", wildcard)
     labelled["metadata"]["labels"] = {"kubernetes.io/bootstrapping": "rbac-defaults"}
-    assert rules_of(scan([labelled])) == [("rbac.admin-equivalent", "blocker")]  # a system: prefix is not a trusted name
+    assert rules_of(scan([labelled])) == [("rbac.admin-equivalent", "blocker")]  # neither the label nor a system: prefix hides a role
     assert rules_of(scan([role("cluster-admin", wildcard)])) == [("rbac.admin-equivalent", "blocker")]  # checked whatever its name
     assert scan([role("cluster-admin", wildcard, kind="Role", namespace="x")])["finding_count"] == 1
     bootstrap_admin = role("admin", [rule(["get"], ["pods"])])
@@ -491,8 +491,8 @@ def test_rbac_scan_cluster_admin_bindings():
     rb = scan(bindings=[binding("b", "cluster-admin", [USER], kind="RoleBinding", namespace="dev")])
     assert rules_of(rb) == [("rbac.cluster-admin-binding", "major")]
     assert rb["findings"][0]["summary"] == "binds cluster-admin inside namespace dev"
-    builtin = binding("cluster-admin", "cluster-admin", [{"kind": "Group", "name": "system:masters"}], **{"labels": {"kubernetes.io/bootstrapping": "rbac-defaults"}})
-    assert scan(bindings=[builtin])["finding_count"] == 0
+    labelled = binding("cluster-admin", "cluster-admin", [{"kind": "Group", "name": "system:masters"}], **{"labels": {"kubernetes.io/bootstrapping": "rbac-defaults"}})
+    assert rules_of(scan(bindings=[labelled])) == [("rbac.cluster-admin-binding", "blocker"), ("rbac.system-masters", "blocker")]
 
 
 def test_rbac_scan_dangerous_subjects():
@@ -2098,8 +2098,27 @@ def test_rbac_bootstrap_label_on_a_system_name_or_a_cluster_admin_binding_suppre
     labels = {"kubernetes.io/bootstrapping": "rbac-defaults"}
     assert rules_of(scan(bindings=[binding("system:debug-binding", "cluster-admin", [USER], **{"labels": labels})])) == [("rbac.cluster-admin-binding", "blocker")]
     assert rules_of(scan(bindings=[binding("cluster-admin", "cluster-admin", [USER], **{"labels": labels})])) == [("rbac.cluster-admin-binding", "blocker")]
-    genuine = [{"kind": "Group", "name": "system:masters"}]
-    assert scan(bindings=[binding("cluster-admin", "cluster-admin", genuine, **{"labels": labels})])["finding_count"] == 0
+    masters = [{"kind": "Group", "name": "system:masters"}]
+    assert rules_of(scan(bindings=[binding("cluster-admin", "cluster-admin", masters, **{"labels": labels})])) == [
+        ("rbac.cluster-admin-binding", "blocker"), ("rbac.system-masters", "blocker")]
+
+
+def test_a_labelled_edit_with_pods_exec_create_is_flagged():
+    edit = role("edit", [rule(["create"], ["pods/exec"])])
+    edit["metadata"]["labels"] = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    assert rules_of(scan([edit])) == [("rbac.pod-exec", "major")]
+
+
+def test_a_labelled_edit_with_secrets_list_is_flagged():
+    edit = role("edit", [rule(["list"], ["secrets"])])
+    edit["metadata"]["labels"] = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    assert rules_of(scan([edit])) == [("rbac.secret-read", "major")]
+
+
+def test_a_labelled_view_with_star_exec_create_is_flagged():
+    view = role("view", [rule(["create"], ["*/exec"])])
+    view["metadata"]["labels"] = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    assert rules_of(scan([view])) == [("rbac.pod-exec", "major")]
 
 
 def test_rbac_resource_names_narrow_admin_equivalence_to_a_wildcard_verb():
@@ -2136,3 +2155,37 @@ def test_null_failure_policy_and_enforcement_action_read_as_their_api_defaults()
     nulled = {"apiVersion": "constraints.gatekeeper.sh/v1beta1", "kind": "K8sRequiredLabels", "metadata": {"name": "c"},
               "spec": {"enforcementAction": None}}
     assert (lint(nulled)["finding_count"], lint(nulled)["enforcing"]) == (0, 1)
+
+
+def test_string_typed_rule_fields_fail_closed_as_invalid_input_naming_roles():
+    # N1: a bare string such as "*" is not a list; it must never read as no grant and pass with 0 findings
+    for field in ("apiGroups", "resources", "verbs", "resourceNames"):
+        rule_ = {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}
+        rule_[field] = "*"
+        result = call("kpol_rbac_risk_scan", {"roles": [role("root", [rule_])], "bindings": []})
+        assert (result["state"], result["field"]) == ("INVALID_INPUT", "roles"), field
+        assert "*" not in result["message"]
+
+
+def test_a_labelled_admin_with_string_wildcards_does_not_pass():
+    labels = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    stringly = role("admin", [{"apiGroups": "*", "resources": "*", "verbs": "*"}])
+    stringly["metadata"]["labels"] = labels
+    result = call("kpol_rbac_risk_scan", {"roles": [stringly], "bindings": []})
+    assert (result["state"], result["field"]) == ("INVALID_INPUT", "roles")
+
+
+def test_a_labelled_view_with_bind_and_escalate_is_flagged_not_hidden():
+    labels = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    hidden = role("view", [rule(["bind", "escalate"], ["roles", "clusterroles"], [RBAC_GROUP])])
+    hidden["metadata"]["labels"] = labels
+    result = scan([hidden])
+    assert rules_of(result) == [("rbac.bind", "major"), ("rbac.escalate", "major")]
+    assert result["verdict"] == "fail"
+
+
+def test_kyverno_null_validation_failure_action_matches_the_omitted_default():
+    omitted = lint(kyverno([kyverno_rule()]))
+    nulled = lint(kyverno([kyverno_rule()], validationFailureAction=None))
+    assert rules_of(nulled) == rules_of(omitted) == [("admission.audit-only", "minor")]
+    assert (nulled["enforcing"], nulled["audit_only"]) == (omitted["enforcing"], omitted["audit_only"])

@@ -287,7 +287,7 @@ def spread_check(payload: dict) -> dict:
         domains: dict[str, int] = {}
         for domain in payload["topology_domains"]:
             if domain["key"] in domains:
-                raise _Invalid("topology_domains", f"topology key {domain['key']!r} is listed twice")
+                raise _Invalid("topology_domains", "topology_domains lists one topology key twice")
             domains[domain["key"]] = domain["count"]
         zone_key = ZONE_KEY if ZONE_KEY in domains else LEGACY_ZONE_KEY if LEGACY_ZONE_KEY in domains else None
         if zone_key is None:
@@ -301,7 +301,7 @@ def spread_check(payload: dict) -> dict:
         for constraint in payload["spread_constraints"]:
             key = constraint["topology_key"]
             if key not in domains:
-                raise _Invalid("spread_constraints", f"topology key {key!r} has no entry in topology_domains")
+                raise _Invalid("spread_constraints", "a spread constraint names a topology key with no entry in topology_domains")
             hard = constraint["when_unsatisfiable"] == "DoNotSchedule"
             min_domains = constraint.get("min_domains")
             if min_domains is not None and not hard:
@@ -321,7 +321,7 @@ def spread_check(payload: dict) -> dict:
         for rule in payload["anti_affinity"]:
             key = rule["topology_key"]
             if key not in domains:
-                raise _Invalid("anti_affinity", f"topology key {key!r} has no entry in topology_domains")
+                raise _Invalid("anti_affinity", "an anti-affinity rule names a topology key with no entry in topology_domains")
             legacy = legacy or key == LEGACY_ZONE_KEY
             if rule["mode"] == "required":
                 pending = max(pending, replicas - domains[key])
@@ -400,7 +400,7 @@ def probe_check(payload: dict) -> dict:
             probes += sum(p is not None for p in (startup, liveness, readiness))
             for kind, probe in (("startup", startup), ("liveness", liveness)):
                 if probe is not None and probe["success_threshold"] != 1:
-                    raise _Invalid("containers", f"container {name}: {kind} success_threshold must be 1")
+                    raise _Invalid("containers", f"a container's {kind} success_threshold must be 1")
             if readiness is None:
                 missing_readiness += 1
                 if serves:
@@ -462,12 +462,12 @@ def backup_coverage(payload: dict) -> dict:
         merged: dict[str, dict] = {}
         for job in payload["jobs"]:
             if job["asset"] not in known:
-                raise _Invalid("jobs", f"job references unknown asset {job['asset']!r}")
+                raise _Invalid("jobs", "a job references an asset that is not in assets")
             last = _ts(job["last_success"], "jobs") if "last_success" in job else None
             tested = _ts(job["last_restore_test"], "jobs") if "last_restore_test" in job else None
             for stamp in (last, tested):
                 if stamp is not None and stamp > as_of:
-                    raise _Invalid("jobs", f"job for {job['asset']!r} has a timestamp after as_of")
+                    raise _Invalid("jobs", "a job has a timestamp after as_of")
             entry = merged.setdefault(job["asset"], {"interval": job["interval_hours"], "retention": job["retention_days"],
                                                      "last": last, "offsite": job["offsite"], "tested": tested})
             entry["interval"] = min(entry["interval"], job["interval_hours"])
@@ -821,11 +821,13 @@ def drill_cadence(payload: dict) -> dict:
         requirements = payload["requirements"]
         _unique([r["scenario"] for r in requirements], "requirements", "scenario")
         by_scenario: dict[str, list[tuple[datetime, dict]]] = {}
-        for drill in payload["drills"]:
+        first_drill: dict[str, int] = {}
+        for index, drill in enumerate(payload["drills"]):
             when = _ts(drill["performed_at"], "drills")
             if when > as_of:
-                raise _Invalid("drills", f"drill {drill['scenario']!r} is dated after as_of")
+                raise _Invalid("drills", "a drill is dated after as_of")
             by_scenario.setdefault(drill["scenario"], []).append((when, drill))
+            first_drill.setdefault(drill["scenario"], index)
         findings: list[dict] = []
         schedule: list[dict] = []
         compliant = overdue = never = 0
@@ -875,7 +877,8 @@ def drill_cadence(payload: dict) -> dict:
                 compliant += 1
         required = {r["scenario"] for r in requirements}
         for scenario in sorted(set(by_scenario) - required):
-            findings.append(_finding("drill-without-requirement", "info", scenario, "drills exist for a scenario that has no cadence requirement"))
+            findings.append(_finding("drill-without-requirement", "info", f"drills[{first_drill[scenario]}]",
+                                     "drills exist for a scenario that has no cadence requirement"))
         findings = _ordered(findings)
         return {"state": "SUCCESS", "scenarios_total": len(requirements), "compliant": compliant, "overdue": overdue,
                 "never_drilled": never, "schedule": schedule, "status": _status(findings), "findings": findings}
@@ -908,7 +911,7 @@ def load_shed_check(payload: dict) -> dict:
         rows = []
         for c in classes:
             if c["reserved_concurrency"] > c["max_concurrency"]:
-                raise _Invalid("classes", f"class {c['name']}: reserved_concurrency exceeds max_concurrency")
+                raise _Invalid("classes", "a class's reserved_concurrency exceeds its max_concurrency")
             needed = _ceil(_dec(c["expected_rps"]) * _dec(c["p99_service_ms"]) / 1000)
             rows.append({"c": c, "needed": needed, "cap": min(needed, c["max_concurrency"]), "admitted": 0})
         rows.sort(key=lambda r: (r["c"]["priority"], r["c"]["name"]))
@@ -992,6 +995,8 @@ def quorum_safety(payload: dict) -> dict:
             raise _Invalid("members_per_zone", f"members_per_zone sums to {sum(zones)} but replicas is {n}")
         custom = payload.get("quorum_size")
         consensus = payload.get("consensus", True)
+        if not isinstance(consensus, bool):
+            raise _Invalid("consensus", "consensus must be a boolean: true for a consensus store, false for a replica set")
         if custom is not None and custom > n:
             raise _Invalid("quorum_size", "quorum_size cannot exceed replicas")
         unavailable = payload["unavailable_members"]

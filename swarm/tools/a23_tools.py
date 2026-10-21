@@ -51,6 +51,10 @@ DEFAULT_CLUSTER_DOMAIN = "cluster.local"
 AUTHZ_ACTIONS = ("ALLOW", "DENY", "AUDIT", "CUSTOM")  # AuthorizationPolicy.spec.action; ALLOW is the default
 AUTHZ_NEGATIVE_SOURCE = ("notPrincipals", "notRequestPrincipals", "notNamespaces", "notIpBlocks", "notRemoteIpBlocks")  # source.not*
 AUTHZ_NEGATIVE_OPERATION = ("notHosts", "notPorts", "notPaths", "notMethods")  # to.operation.not*
+AUTHZ_SOURCE_FIELDS = ("principals", "notPrincipals", "requestPrincipals", "notRequestPrincipals", "namespaces", "notNamespaces",
+                       "ipBlocks", "notIpBlocks", "remoteIpBlocks", "notRemoteIpBlocks")  # recognised from.source keys; a value narrows unless universal
+AUTHZ_OPERATION_FIELDS = ("hosts", "ports", "methods", "paths")  # positive to.operation keys: "*" matches any value, so no constraint
+AUTHZ_CONDITION_FIELDS = ("values", "notValues")  # when[] keys; any value narrows, "*" included; `key` only names the attribute
 # --- Istio PeerAuthentication --------------------------------------------------------------------------------------
 MTLS_MODES = ("UNSET", "DISABLE", "PERMISSIVE", "STRICT")  # UNSET inherits from the parent; with no parent it is PERMISSIVE
 # --- Istio VirtualService / DestinationRule ------------------------------------------------------------------------
@@ -324,6 +328,76 @@ def _has_wildcard(values: list) -> tuple[bool, bool]:
     return exact, pattern
 
 
+_IPV4_MAPPED_ALL = ipaddress.ip_network("::ffff:0.0.0.0/96")  # every IPv4 address written in IPv6 notation
+
+
+def _universal_block(value) -> bool:
+    """Whether an ipBlock CIDR admits every address: 0.0.0.0/0, ::/0, or an IPv6 network that contains the whole IPv4-mapped range
+    ::ffff:0.0.0.0/96 (::/64 and ::/80, and the shorter prefixes down to ::/0; not ::/81 or ::/96). The mapped range counts as universal
+    on the inference [INFERENCE] that Istio matches IPv4 peers under that range, so a network containing all of it covers every IPv4
+    peer written in IPv6 notation. A narrower mapped range (for example ::ffff:10.0.0.0/104) is not universal."""
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except (TypeError, ValueError):
+        return False
+    return network.prefixlen == 0 or (network.version == 6 and _IPV4_MAPPED_ALL.subnet_of(network))
+
+
+def _no_universal(key: str, values: list) -> bool:
+    """No value of this key matches every value of it."""
+    return False
+
+
+def _operation_wildcard(key: str, values: list) -> bool:
+    """A to.operation list containing "*" matches every value of its field."""
+    return "*" in values
+
+
+def _source_universal(key: str, values: list) -> bool:
+    """An ipBlocks or remoteIpBlocks list containing 0.0.0.0/0 or ::/0 matches every address."""
+    return key in ("ipBlocks", "remoteIpBlocks") and any(_universal_block(value) for value in values)
+
+
+def _narrows(fields: dict, keys: tuple, field: str, where: str, *, universal) -> bool:
+    """Whether one group of recognised fields constrains a request: some key holds values that do not all match every value of it.
+    `universal(key, values)` says when they do, and such a key does not narrow. Otherwise a value narrows, as Istio reads it: a source
+    "*" means any authenticated request, a negated "*" means only requests without that value, and a when "*" means the attribute
+    must be present. Unrecognised fields are ignored, as Istio ignores them."""
+    for key in keys:
+        values = _list(fields.get(key), field, f"{where}.{key}")
+        if values and not universal(key, values):
+            return True
+    return False
+
+
+def _matches_everything(rule: dict, field: str, where: str) -> bool:
+    """Whether an ALLOW rule matches every request: the literal `{}`, or one whose from, to and when all constrain nothing. Within one
+    list the items are ORed, so one unconstrained item frees the list; an absent or empty list constrains nothing; the lists are ANDed,
+    so the rule is open only when every one of them is free. A from source is unconstrained when none of its recognised fields narrows
+    it: a value narrows unless its key matches every value (a universal ipBlock, 0.0.0.0/0 or ::/0). A to operation is unconstrained
+    when its positive fields (hosts, ports, methods, paths) contain "*" or are empty, and its negated fields are empty. A when condition
+    is unconstrained when its values and notValues are both empty."""
+
+    def free(key: str, item_free) -> bool:
+        items = _list(rule.get(key), field, f"{where}.{key}")
+        return not items or any(item_free(_dict(item, field, f"{where}.{key} item")) for item in items)
+
+    def source_free(item: dict) -> bool:
+        source = _dict(item.get("source") or {}, field, f"{where}.from.source")
+        return not _narrows(source, AUTHZ_SOURCE_FIELDS, field, f"{where}.from.source", universal=_source_universal)
+
+    def operation_free(item: dict) -> bool:
+        operation = _dict(item.get("operation") or {}, field, f"{where}.to.operation")
+        positive = _narrows(operation, AUTHZ_OPERATION_FIELDS, field, f"{where}.to.operation", universal=_operation_wildcard)
+        negated = _narrows(operation, AUTHZ_NEGATIVE_OPERATION, field, f"{where}.to.operation", universal=_no_universal)
+        return not (positive or negated)
+
+    def condition_free(item: dict) -> bool:
+        return not _narrows(item, AUTHZ_CONDITION_FIELDS, field, f"{where}.when", universal=_no_universal)
+
+    return free("from", source_free) and free("to", operation_free) and free("when", condition_free)
+
+
 def _authz_lint(payload: dict) -> dict:
     root = payload.get("root_namespace", DEFAULT_ROOT_NAMESPACE)
     policies = _list(payload["policies"], "policies", "policies")
@@ -379,19 +453,20 @@ def _authz_lint(payload: dict) -> dict:
         allows_everything = False
         for rule_index, rule in enumerate(rules):
             rule = _dict(rule, "policies", f"policies[{index}].spec.rules[{rule_index}]")
-            if not rule:
+            rule_where = f"policies[{index}].spec.rules[{rule_index}]"
+            if _matches_everything(rule, "policies", rule_where):
                 allows_everything = True
                 where = "the mesh" if mesh_wide else "the namespace" if not scoped else "the selected workloads"
                 findings.append(_finding("AUTHZ-ALLOW-ALL", "major" if scoped else "blocker",
-                                         f"{subject}: rules[{rule_index}] is empty and allows every request to {where}"))
+                                         f"{subject}: rules[{rule_index}] matches every request (no recognised value in its from, to or when) "
+                                         f"and allows every request to {where}"))
                 if mesh_wide:
                     mesh_allow = True
                 elif not scoped:
                     allow_all.add(namespace)
-                continue
             negated: list[str] = []  # negative matches in this rule: the rule admits everything except the listed values
-            sources = _list(rule.get("from"), "policies", f"policies[{index}].spec.rules[{rule_index}].from")
-            if not sources and not rule.get("when"):
+            sources = _list(rule.get("from"), "policies", f"{rule_where}.from")
+            if rule and not sources and not rule.get("when"):  # the literal {} rule is reported as AUTHZ-ALLOW-ALL alone
                 findings.append(_finding("AUTHZ-NO-SOURCE", "minor", f"{subject}: rules[{rule_index}] has no from: any source, including "
                                          "unauthenticated plaintext clients, matches"))
             for source_item in sources:
@@ -406,7 +481,7 @@ def _authz_lint(payload: dict) -> dict:
                         findings.append(_finding("AUTHZ-BROAD-PATTERN", "minor", f"{subject}: rules[{rule_index}] {key} uses a prefix or "
                                                  "suffix wildcard that admits many identities"))
                 for key in ("ipBlocks", "remoteIpBlocks"):
-                    if any(v in ("0.0.0.0/0", "::/0") for v in _list(source.get(key), "policies", f"from.source.{key}")):
+                    if any(_universal_block(v) for v in _list(source.get(key), "policies", f"from.source.{key}")):
                         findings.append(_finding("AUTHZ-OPEN-IPBLOCK", "major", f"{subject}: rules[{rule_index}] {key} admits every address"))
                 negated.extend(f"from.source.{key}" for key in AUTHZ_NEGATIVE_SOURCE if _list(source.get(key), "policies", f"from.source.{key}"))
             for op_item in _list(rule.get("to"), "policies", f"policies[{index}].spec.rules[{rule_index}].to"):
@@ -632,7 +707,10 @@ def _destinations(route_list, field: str, where: str) -> list[dict]:
         weight = item.get("weight")
         if weight is not None and (isinstance(weight, bool) or not isinstance(weight, int) or weight < 0):
             raise _Invalid(field, f"{where} weight {weight!r} must be a non-negative integer")
-        out.append({"host": host, "subset": destination.get("subset"), "weight": weight})
+        subset = destination.get("subset")
+        if subset is not None and not isinstance(subset, str):
+            raise _Invalid(field, f"{where} destination.subset must be a string")
+        out.append({"host": host, "subset": subset, "weight": weight})
     return out
 
 
@@ -982,10 +1060,15 @@ def _gateway_api_check(payload: dict) -> dict:
             names.add(lname)
             if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
                 raise _Invalid("gateways", f"{where}: port must be an integer in 1..65535")
+            if protocol is not None and not isinstance(protocol, str):
+                raise _Invalid("gateways", f"{where}: protocol must be a string")
             if not isinstance(protocol, str) or not (protocol in LISTENER_PROTOCOLS or "/" in protocol):
                 findings.append(_finding("GW-LISTENER-PROTOCOL", "major", f"{where}: protocol {protocol!r} is not one of "
                                          f"{', '.join(LISTENER_PROTOCOLS)} or a domain-prefixed custom protocol"))
-            hostname = listener.get("hostname") or ""
+            hostname = listener.get("hostname")
+            if hostname is not None and not isinstance(hostname, str):
+                raise _Invalid("gateways", f"{where}: hostname must be a string")
+            hostname = hostname or ""
             if hostname and not _valid_hostname(hostname):
                 findings.append(_finding("GW-LISTENER-HOSTNAME", "major", f"{where}: hostname {hostname!r} is not a lowercase RFC 1123 name"))
             if hostname and protocol in ("TCP", "UDP"):
@@ -1054,7 +1137,8 @@ def _gateway_api_check(payload: dict) -> dict:
             ref = _dict(ref, "routes", f"{subject} parentRef")
             if _api_group(ref.get("group"), GATEWAY_GROUP) != GATEWAY_GROUP or (ref.get("kind") or "Gateway") != "Gateway":
                 continue  # Service parents (mesh / GAMMA) are outside this check
-            parent_ns, parent_name = ref.get("namespace") or namespace, _str(ref.get("name"), "routes", f"{subject} parentRef.name")
+            parent_ns = _str(ref.get("namespace") or namespace, "routes", f"{subject} parentRef.namespace")
+            parent_name = _str(ref.get("name"), "routes", f"{subject} parentRef.name")
             gateway = gateways.get((parent_ns, parent_name))
             if gateway is None:
                 findings.append(_finding("ROUTE-PARENT-MISSING", "major", f"{subject}: parent Gateway {parent_ns}/{parent_name} is not in the supplied gateways"))

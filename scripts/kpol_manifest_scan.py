@@ -7,11 +7,18 @@ symlinks and non-UTF-8 files are skipped, at most 2000 files are examined, symli
 JSON is read natively; YAML needs PyYAML and is reported as `skipped:tool-missing` when it does not import. No external
 binary is required or looked for. Findings use info|minor|major|blocker and `status` is `fail` when any is major or worse, or when any in-scope input was skipped, truncated by a limit or not analysed (a `scan-incomplete` finding lists why).
 Read-only: it writes nothing. `--dry-run` prints deterministic canned output and reads nothing.
+
+A mapping is a Kubernetes object when it has a kind key, or an apiVersion shaped like a Kubernetes apiVersion (v1, apps/v1) together
+with a body key (metadata, spec, data, ...). A kind-less mapping with an items list is descended into, and each element is judged by
+its own identifiers. A mapping with neither a kind nor an apiVersion (a body-only mapping) carries no Kubernetes identifiers and the
+API server rejects it, so it is passed over silently.
+A generic record with a kind key inside items, or as a single-mapping items value, such as {"kind": "file"}, is a candidate and gets missing-apiVersion: this is the accepted residual of a kind without apiVersion, reached through the items descent.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -47,28 +54,171 @@ def _object_key(manifest: dict) -> str:
     return f"{manifest['kind']}/{namespace}/{name}" if namespace else f"{manifest['kind']}/{name}"
 
 
-def _flatten(doc, rel: str, skipped: list[str], depth: int = 0) -> list[dict]:
-    """Kubernetes objects of one parsed document: dicts with a string kind; kind List / <Kind>List items are expanded.
-    A List nested at depth 2 or deeper, or a List item that is not an object, is never dropped silently: its path and label go
-    to skipped, so the scan reports it incomplete."""
-    if not isinstance(doc, dict) or not isinstance(doc.get("kind"), str) or not doc["kind"]:
+_KUBERNETES_BODY_KEYS = frozenset({"metadata", "spec", "data", "stringData", "items", "rules", "subjects", "roleRef", "webhooks", "status"})
+# a Kubernetes apiVersion: the core group's only version, v1, or a named group (a DNS name, dotted or not) with a version such as
+# apps/v1, policy/v1beta1 or autoscaling/v2. A bare v2 is not one: the core group has no version but v1.
+_API_VERSION = re.compile(r"v1|[a-z0-9][a-z0-9.-]*/v[0-9]+(?:(?:alpha|beta)[0-9]+)?")
+
+
+def _is_candidate(doc: dict) -> bool:
+    """A mapping with a kind key is a Kubernetes candidate on its own. Without one it is a candidate when its apiVersion is a
+    Kubernetes apiVersion (v1, or a named group's version such as apps/v1 or autoscaling/v2) and it has a body key. A Helm
+    Chart.yaml (apiVersion v2, no body key), a generic payload (apiVersion "2" beside data) and a bare v2 beside data are not."""
+    if "kind" in doc:
+        return True
+    version = doc.get("apiVersion")
+    return isinstance(version, str) and _API_VERSION.fullmatch(version) is not None and not _KUBERNETES_BODY_KEYS.isdisjoint(doc)
+
+
+def _at(where: str, step: str) -> str:
+    """The path of a child: an index joins directly (items[1][0]), a key joins with a dot (items[1].items[0])."""
+    if not where:
+        return step
+    return f"{where}{step}" if step.startswith("[") else f"{where}.{step}"
+
+
+def _reaches_object(value) -> bool:
+    """True when a Kubernetes object sits in value on the paths the scan descends: lists, and the items of a mapping that is not
+    itself an object. A depth limit cuts off only what this finds, so generic data never records a limit."""
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            if _is_candidate(current):
+                return True
+            current = current.get("items")
+            if isinstance(current, dict):
+                current = [current]
+        if isinstance(current, list):
+            stack.extend(current)
+    return False
+
+
+def _reason(rel: str, text: str, where: str) -> str:
+    """One skipped reason: its label, and the path of its position unless that is the document root."""
+    return f"{rel}: {text} at {where}" if where else f"{rel}: {text}"
+
+
+def _element_path(where: str, index: int, single: bool) -> str:
+    """The path of an element of a mapping's items value. One mapping is the items value itself, so it has no index."""
+    return _at(where, "items") if single else _at(where, f"items[{index}]")
+
+
+def _candidate_item(element, rel: str, skipped: list[str], where: str, depth: int) -> list[dict]:
+    """One element of a kind-less candidate's items. A candidate is judged as a document (missing-kind at its path); anything else
+    is judged as a List item (a scalar or a kind-less mapping gets its reason at its path)."""
+    if isinstance(element, dict) and _is_candidate(element):
+        return _flatten(element, rel, skipped, depth, where)
+    return _list_item(element, rel, skipped, where, depth)
+
+
+def _list_item(item, rel: str, skipped: list[str], where: str, depth: int) -> list[dict]:
+    """One item of a kind-bearing List, or one element of an array inside one, at the path where. Each item is a Kubernetes object in
+    its own right and must carry its own kind: a scalar is a List item that is not an object, and a mapping without a kind is reported
+    at its path and never given the List's identity. A kind-less item's items value is descended too, a list element by element or one
+    mapping as a single element, each judged by its own kind. A depth cut is reported at the position it cuts, as in _flatten, and
+    recorded only when a Kubernetes object is in what was cut off; generic data stays silent."""
+    if isinstance(item, list) and depth >= 2:
+        if _reaches_object(item):
+            skipped.append(_reason(rel, "list-nesting-limit:2", where))
         return []
-    kind = doc["kind"]
-    if kind.endswith("List") and isinstance(doc.get("items"), list):
-        if not doc["items"]:
+    if isinstance(item, list):
+        out: list[dict] = []
+        for index, element in enumerate(item):
+            out.extend(_list_item(element, rel, skipped, _at(where, f"[{index}]"), depth + 1))
+        return out
+    if not isinstance(item, dict):
+        skipped.append(_reason(rel, "list-item-not-object", where))
+        return []
+    if not isinstance(item.get("kind"), str) or not item["kind"]:
+        skipped.append(_reason(rel, "list-item-without-kind", where))
+        nested = item.get("items")
+        single = isinstance(nested, dict)
+        if single:
+            nested = [nested]  # one mapping is one element, judged by its own identifiers
+        if not isinstance(nested, list):
             return []
         if depth >= 2:
-            skipped.append(f"{rel}: list-nesting-limit:2")
+            if _reaches_object(nested):
+                skipped.append(_reason(rel, "list-nesting-limit:2", _at(where, "items")))
             return []
-        inner = kind[: -len("List")]
+        found: list[dict] = []
+        for index, element in enumerate(nested):
+            found.extend(_list_item(element, rel, skipped, _element_path(where, index, single), depth + 1))
+        return found
+    return _flatten(item, rel, skipped, depth, where)
+
+
+def _flatten(doc, rel: str, skipped: list[str], depth: int = 0, where: str = "") -> list[dict]:
+    """Kubernetes objects of one parsed document, or of the elements of an array, at the path where ('' for the document root).
+    Each element is judged by its own identifiers, and the same depth limit applies to arrays and to items. A mapping that is not a
+    candidate (see _is_candidate) is passed over silently, except that its items (a list, or one mapping as a single element) is
+    descended into; scalar items of such a generic wrapper are generic data and stay silent. A candidate needs a string kind: a
+    kind-less candidate records missing-kind at its path, and its items are read as a List's, so a scalar or a kind-less mapping there
+    gets its own reason at its path. A missing string apiVersion is reported at its path and the object is still analysed. kind List
+    and <Kind>List items are each judged by their own kind (see _list_item). A depth cut is reported at the position it cuts: an
+    array's own position, or the items of a mapping (at items, with no index when items is one mapping). The cut is recorded only when
+    a Kubernetes object is in what was cut off. Nothing else is dropped silently, so the scan reports it incomplete."""
+    if isinstance(doc, list):
+        if not doc:
+            return []
+        if depth >= 2:
+            if _reaches_object(doc):
+                skipped.append(_reason(rel, "list-nesting-limit:2", where))
+            return []
         out: list[dict] = []
-        for item in doc["items"]:
-            if not isinstance(item, dict):
-                skipped.append(f"{rel}: list-item-not-object")
-                continue
-            if "kind" not in item and inner:
-                item = {**item, "kind": inner}
-            out.extend(_flatten(item, rel, skipped, depth + 1))
+        for index, element in enumerate(doc):
+            out.extend(_flatten(element, rel, skipped, depth + 1, _at(where, f"[{index}]")))
+        return out
+    if not isinstance(doc, dict):
+        return []
+    if not _is_candidate(doc):
+        items = doc.get("items")
+        single = isinstance(items, dict)
+        if single:
+            items = [items]  # one mapping is one element, judged by its own identifiers
+        if not isinstance(items, list) or not items:
+            return []  # no items, or scalar items: generic data, passed over silently
+        if depth >= 2:
+            if _reaches_object(items):
+                skipped.append(_reason(rel, "list-nesting-limit:2", _at(where, "items")))
+            return []
+        out: list[dict] = []
+        for index, element in enumerate(items):
+            out.extend(_flatten(element, rel, skipped, depth + 1, _element_path(where, index, single)))
+        return out
+    kind = doc.get("kind")
+    if not isinstance(kind, str) or not kind:
+        skipped.append(_reason(rel, "missing-kind", where))
+        items = doc.get("items")
+        single = isinstance(items, dict)
+        if single:
+            items = [items]  # one mapping is one element, judged by its own identifiers
+        if not isinstance(items, list) or not items:
+            return []
+        if depth >= 2:
+            if _reaches_object(items):
+                skipped.append(_reason(rel, "list-nesting-limit:2", _at(where, "items")))
+            return []
+        found: list[dict] = []
+        for index, element in enumerate(items):
+            found.extend(_candidate_item(element, rel, skipped, _element_path(where, index, single), depth + 1))
+        return found
+    version = doc.get("apiVersion")
+    if not isinstance(version, str) or not version:
+        skipped.append(_reason(rel, "missing-apiVersion", where))
+    if kind.endswith("List"):
+        if not isinstance(doc.get("items"), list):
+            skipped.append(_reason(rel, "list-items-not-a-list", where))
+            return []
+        if not doc["items"]:
+            return []
+        if depth >= 2:  # a List is a Kubernetes object itself, so its own cut-off is always reported
+            skipped.append(_reason(rel, "list-nesting-limit:2", where))
+            return []
+        out: list[dict] = []
+        for index, item in enumerate(doc["items"]):
+            out.extend(_list_item(item, rel, skipped, _at(where, f"items[{index}]"), depth + 1))
         return out
     return [doc]
 
@@ -84,7 +234,16 @@ def _candidates(target: Path, root: Path) -> tuple[list[Path], list[str], list[s
     files: list[Path] = []
     skipped: list[str] = []
     limits: list[str] = []
-    for current, dirs, names in os.walk(target, followlinks=False):
+
+    def walk_error(error: OSError) -> None:
+        skipped.append(f"{_rel(Path(error.filename or target), root)}: unreadable-directory")
+
+    for current, dirs, names in os.walk(target, followlinks=False, onerror=walk_error):
+        for d in dirs:
+            if d in SKIP_DIRS:
+                continue
+            if (Path(current) / d).is_symlink():
+                skipped.append(f"{_rel(Path(current) / d, root)}: symlink-directory")
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not (Path(current) / d).is_symlink())
         for name in sorted(names):
             path = Path(current) / name
@@ -243,7 +402,7 @@ def scan(root: Path, target: Path, level: str) -> dict:
             skipped.append(f"{rel}: {exc}")
             continue
         scanned += 1
-        for document in (item for doc in documents for item in (doc if isinstance(doc, list) else [doc])):
+        for document in documents:
             for manifest in _flatten(document, rel, skipped):
                 kind = manifest["kind"]
                 key_to_file.setdefault(_object_key(manifest), set()).add(rel)
