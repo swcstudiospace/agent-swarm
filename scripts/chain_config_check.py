@@ -698,13 +698,17 @@ class _Scan:
                 scope = _Scope(frame, scope)
             here["scope"] = scope
             # an object with chain ids of its own judges its endpoints by those ids alone, as check_names does for its names; an
-            # inherited id must not stand in for them. An object without its own ids leaves own_scope None and inherits the scope.
+            # inherited id must not stand in for them. An object without ids of its own inherits the nearest enclosing own-id scope,
+            # so an endpoint in a child object of a network item is judged by that item's id, not by a mainnet id above it. An object
+            # with legs and no ids of its own keeps the full scope (None here), which fails closed.
             own_scope = None
             if own:
                 own_frame: dict = {}
                 for chain_id, dirs, where in own:
                     own_frame.setdefault((chain_id, dirs), where)
                 own_scope = _Scope(own_frame, None)
+            elif not legs:
+                own_scope = ctx.get("own_scope")
             here["own_scope"] = own_scope
             # the holding context of this object: the key that holds it. An unrecognised key inherits its enclosing holder's context only
             # when that holder has no chain id of its own, i.e. a keyed map (ND9-3). A list passes its own context to its items. The root declares networks.

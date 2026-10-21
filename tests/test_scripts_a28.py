@@ -751,6 +751,12 @@ def test_an_endpoint_under_its_own_testnet_id_is_not_judged_by_an_inherited_main
     assert (code, out["status"]) == (0, "ok") and [f for f in out["findings"] if f["rule"] == "rpc-host-chain-mismatch"] == []
 
 
+def test_a_nested_endpoint_of_a_testnet_item_is_judged_by_that_item_not_an_inherited_mainnet_id(tmp_path):
+    write(tmp_path, "nested.json", {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "rpc": {"url": "https://rpc.sepolia.org"}, "endpoints": [{"url": "https://rpc.sepolia.org"}]}]})
+    code, out = cli(tmp_path)
+    assert (code, out["status"]) == (0, "ok") and [f for f in out["findings"] if f["rule"] == "rpc-host-chain-mismatch"] == []
+
+
 def test_a_host_under_a_directed_key_still_blocks_on_its_own_mainnet_source(tmp_path):
     write(tmp_path, "scoped.json", {"source_chain_id": 1, "destination_chain_id": 8453, "source_rpc_url": "https://rpc.sepolia.org", "allowMainnet": True})
     code, out = cli(tmp_path)
