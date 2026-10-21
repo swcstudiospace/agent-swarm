@@ -544,9 +544,10 @@ def test_landing_zone_break_glass_checks_and_the_180_day_boundary():
     assert ids(missing) == ["break-glass-missing"] and severity_of(missing, "break-glass-missing") == "blocker"
 
 
-def test_landing_zone_with_only_a_management_account_has_vacuous_full_coverage():
+def test_landing_zone_with_only_a_management_account_evaluates_nothing_and_scores_zero():
     result = lz([account("mgmt", "management", "")])
-    assert result["guardrail_coverage_pct"] == 100.0 and "no-log-archive-account" in ids(result)
+    assert result["guardrail_coverage_pct"] == 0.0 and "guardrails-not-evaluated" in ids(result) and "no-log-archive-account" in ids(result)
+    assert severity_of(result, "guardrails-not-evaluated") == "major" and result["verdict"] == "fail"
 
 
 def test_landing_zone_rejects_semantic_problems_naming_the_field():
@@ -1232,3 +1233,57 @@ def test_secret_shaped_ids_become_stable_kind_length_digest_labels():
 
 
 CANARY_DIGESTS = {0: "1a5d44", 2: "a8ae6e"}
+
+
+# --- QA-03 regressions ----------------------------------------------------------------------------------------------
+
+
+def direct(handler: str, payload: dict) -> dict:
+    """Call a handler without the registry, which validates first and refuses booleans and zero before the handler runs."""
+    return getattr(importlib.import_module("swarm.tools.a16_tools"), handler)(payload)
+
+
+def test_blast_domains_with_slashes_in_region_or_az_names_are_distinct_failure_domains():
+    result = blast([svc("X", 5, [inst("1", region="us/east")]), svc("Y", 5, [inst("east/1", region="us")])], 50)
+    assert [(r["domain"], r["blast_pct"], r["down_services"]) for r in result["ranking"]] == [
+        ("az:us%2Feast/1", 50.0, ["X"]), ("az:us/east%2F1", 50.0, ["Y"]), ("region:us", 50.0, ["Y"]), ("region:us%2Feast", 50.0, ["X"])]
+    assert ids(result) == ["spof:X", "spof:Y"] and result["verdict"] == "warn"  # neither AZ is above the 50% limit
+
+
+def test_blast_domain_labels_escape_percent_so_escaped_and_literal_names_stay_apart():
+    result = blast([svc("s", 5, [inst("a", cell="c/1"), inst("b", cell="c%2F1")])], 100)
+    labels = [r["domain"] for r in result["ranking"]]
+    assert {"cell:c%2F1", "cell:c%252F1"} <= set(labels) and len(labels) == len(set(labels))
+
+
+def test_landing_zone_whitespace_around_ou_names_is_not_part_of_the_name():
+    for padded in ("Workloads/Prod ", " Workloads / Prod "):
+        zone = good_zone()
+        zone[4]["ou"] = padded  # the non-prod account, padded: the same OU as prod once each name is normalised
+        result = lz(zone)
+        assert severity_of(result, "prod-nonprod-shared-ou:Workloads/Prod") == "major", padded
+        assert result["ou_count"] == 3 and result["verdict"] == "fail", padded
+
+
+@pytest.mark.parametrize("key,value,factor,severity", [
+    ("repos_per_app", True, 1, "major"), ("hardcoded_backing_service_hosts", False, 4, "major"),
+    ("startup_seconds", True, 9, "minor"), ("deploy_gap_days", "1", 10, "minor"),
+])
+def test_twelve_factor_booleans_and_non_numbers_fail_their_check_instead_of_passing_or_crashing(key, value, factor, severity):
+    result = direct("twelve_factor_audit", {"service": {**CONFORMANT, key: value}})
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [(f"factor-{factor:02d}:{key}", severity)]
+
+
+def test_cell_capacity_zero_load_or_zero_utilisation_is_invalid_input_on_a_direct_call():
+    zero_load = direct("cell_capacity", {**CELL, "load_rps": 0})
+    assert zero_load["state"] == "INVALID_INPUT" and zero_load["field"] == "load_rps"
+    zero_utilisation = direct("cell_capacity", {**CELL, "target_utilisation_pct": 0})
+    assert zero_utilisation["state"] == "INVALID_INPUT" and zero_utilisation["field"] == "target_utilisation_pct"
+
+
+def test_landing_zone_empty_evaluation_scores_zero_and_cannot_pass_without_accounts_or_guardrail_evidence():
+    for accounts in ([], [account("mgmt", "management", "")]):
+        result = direct("landing_zone_lint", {"accounts": accounts, "break_glass": GOOD_GLASS})
+        assert result["guardrail_coverage_pct"] == 0.0, accounts
+        assert severity_of(result, "guardrails-not-evaluated") == "major" and result["verdict"] == "fail", accounts
+        assert "guardrails-not-evaluated" in ids(result), accounts

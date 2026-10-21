@@ -196,6 +196,8 @@ def _workload(doc: dict, path: str) -> dict | None:
     lifecycles = [_mapping(c.get("lifecycle")) for c in containers]
     affinity = _mapping(pod.get("affinity"))
     replicas = spec.get("replicas")
+    if replicas is None and doc["kind"] != "DaemonSet":
+        replicas = 1  # apps/v1 defaults an unset or null spec.replicas to 1
     return {
         "path": path, "kind": doc["kind"], "name": a16_tools._safe_label(str(metadata.get("name", "?"))),
         "replicas": replicas if isinstance(replicas, int) and not isinstance(replicas, bool) else None,
@@ -345,6 +347,16 @@ def scan_tree(root: Path, target: Path) -> dict:
     return facts
 
 
+def _absence(facts: dict, rule: str, fid: str, summary: str, location: str = "") -> dict:
+    """A minor absence finding. A Kubernetes manifest that PyYAML could not parse may hold the very signal being looked for, so while
+    one is unparsed the answer is unknown: a finding that says so, never a claim that the content is missing."""
+    if facts["yaml_skipped"]:
+        unknown_id = fid.removesuffix("-missing") + "-unknown"  # health-probe-missing -> health-probe-unknown
+        return _finding(rule, unknown_id, "minor",
+                        f"unknown, not missing: {summary}; Kubernetes YAML was not parsed (PyYAML missing)", location)
+    return _finding(rule, fid, "minor", summary, location)
+
+
 def evaluate(facts: dict) -> list[dict]:
     """Rules over the facts. Each finding is tagged with its rule; a rule that does not apply yields no finding and no answer."""
     out: list[dict] = []
@@ -362,7 +374,7 @@ def evaluate(facts: dict) -> list[dict]:
         if not w["has_probe"]:
             out.append(_finding("health-probes", "k8s-probes-missing", "major", f"{w['kind']} {w['name']} has no readiness, liveness or startup probe", w["path"]))
     if not workloads and not facts["compose_health"] and not any(d["healthcheck"] for d in facts["dockerfiles"]):
-        out.append(_finding("health-probes", "health-probe-missing", "minor",
+        out.append(_absence(facts, "health-probes", "health-probe-missing",
                             "no health check signal found (Dockerfile HEALTHCHECK, compose healthcheck, Kubernetes probes)"))
     # graceful shutdown
     for d in facts["dockerfiles"]:
@@ -370,7 +382,8 @@ def evaluate(facts: dict) -> list[dict]:
             out.append(_finding("graceful-shutdown", "docker-shell-form-entrypoint", "minor",
                                 f"{d['launcher']} runs through `sh -c`, so SIGTERM never reaches the app; use the exec form or `exec`", d["path"]))
     if (facts["sources"] or facts["dockerfiles"] or workloads) and not facts["sigterm"] and not any(w["graceful"] for w in workloads):
-        out.append(_finding("graceful-shutdown", "graceful-shutdown-missing", "minor", "no SIGTERM handling, shutdown hook, preStop hook or termination grace period found"))
+        out.append(_absence(facts, "graceful-shutdown", "graceful-shutdown-missing",
+                            "no SIGTERM handling, shutdown hook, preStop hook or termination grace period found"))
     # multi-AZ / region
     out.extend(_finding("multi-az", "multi-az-disabled", "major", "multi-AZ is explicitly disabled", p) for p in facts["multi_az_off"])
     if facts["iac_compute"] and not facts["multi_az"]:
@@ -392,7 +405,7 @@ def evaluate(facts: dict) -> list[dict]:
             out.append(_finding("resource-requests", "k8s-no-resource-requests", "minor",
                                 f"{w['kind']} {w['name']} container(s) without resource requests: {', '.join(w['no_requests'])}", w["path"]))
     if not facts["scalers"] and not facts["autoscaling"]:
-        out.append(_finding("autoscaling", "autoscaling-missing", "minor", "no autoscaler (HPA, KEDA, cloud autoscaling group/target) declared"))
+        out.append(_absence(facts, "autoscaling", "autoscaling-missing", "no autoscaler (HPA, KEDA, cloud autoscaling group/target) declared"))
     if facts["iac"] and not facts["encryption"]:
         out.append(_finding("encryption", "encryption-not-declared", "minor", "IaC is present but no encryption-at-rest setting was found", facts["iac"][0]))
     # tagging
@@ -403,7 +416,7 @@ def evaluate(facts: dict) -> list[dict]:
             out.append(_finding("tagging", "tag-keys-missing", "minor",
                                 f"allocation tag keys not found in IaC: {', '.join(sorted(set(REQUIRED_TAGS) - facts['tag_keys']))}", facts["tags"][0]))
     elif not facts["k8s_labels"]:
-        out.append(_finding("tagging", "tags-missing", "minor", "no resource tags or labels found in IaC or Kubernetes manifests"))
+        out.append(_absence(facts, "tagging", "tags-missing", "no resource tags or labels found in IaC or Kubernetes manifests"))
     if not facts["efficiency"]:
         out.append(_finding("efficiency", "efficiency-signals-missing", "minor", "no arm64/Graviton, scale-to-zero or data lifecycle/retention signal found"))
     return out

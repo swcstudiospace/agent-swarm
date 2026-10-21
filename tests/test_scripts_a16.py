@@ -306,7 +306,9 @@ def test_kubernetes_findings_per_workload_zone_spread_and_daemonset_exemptions(t
     write(tmp_path, "d.yaml", spec.format(kind="StatefulSet", name="solo", replicas="  replicas: 1\n"))
     result = scan(tmp_path)
     kube = [(f["id"], f["location"]) for f in result["findings"] if "k8s" in f["id"]]
-    assert kube == [("cloud.k8s-no-zone-spread", "a.yaml"), ("cloud.k8s-single-replica", "d.yaml")]
+    # an unset StatefulSet replicas field defaults to one replica (the apps/v1 API default), so b.yaml is a single-replica workload
+    assert kube == [("cloud.k8s-no-zone-spread", "a.yaml"), ("cloud.k8s-single-replica", "b.yaml"),
+                    ("cloud.k8s-single-replica", "d.yaml")]
     assert result["signals"]["kubernetes_workloads"] == 4
 
 
@@ -484,3 +486,30 @@ def test_string_typed_workload_metadata_is_skipped_and_counted_and_the_scan_comp
     data = json.loads(result.stdout)
     assert data["signals"]["kubernetes_workloads"] == 1
     assert [f for f in brief(data) if f[0] == "cloud.workload-malformed"] == [("cloud.workload-malformed", "info", "k8s/broken.json")]
+
+
+# --- QA-03 regressions ------------------------------------------------------------------------------------------
+
+
+def test_unset_replicas_default_to_one_so_a_single_replica_workload_is_flagged(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/web.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n"
+                                    "      containers:\n        - name: web\n          readinessProbe: {httpGet: {path: /, port: 80}}\n"
+                                    "          resources:\n            requests: {cpu: 1m}\n")
+    result = scan(tmp_path)
+    assert [(f["id"], f["location"]) for f in result["findings"] if "k8s-single" in f["id"]] == [("cloud.k8s-single-replica", "k8s/web.yaml")]
+    assert result["signals"]["kubernetes_workloads"] == 1
+
+
+def test_unparsed_manifest_makes_absence_rules_unknown_not_missing(tmp_path):
+    module = load_script()
+    module.yaml = None
+    write(tmp_path, "app.py", "print('no signals')\n")
+    write(tmp_path, "k8s/deploy.yaml", DEPLOYMENT_GOOD)  # may hold the probes, grace period, labels and autoscaler the scan cannot read
+    result = scan(tmp_path, module=module)
+    ids = {f["id"] for f in result["findings"]}
+    assert {"cloud.health-probe-unknown", "cloud.autoscaling-unknown", "cloud.tags-unknown", "cloud.graceful-shutdown-unknown"} <= ids
+    assert not {"cloud.health-probe-missing", "cloud.autoscaling-missing", "cloud.tags-missing", "cloud.graceful-shutdown-missing"} & ids
+    unknown = next(f for f in result["findings"] if f["id"] == "cloud.health-probe-unknown")
+    assert unknown["severity"] == "minor" and unknown["summary"].startswith("unknown, not missing: no health check signal found")
+    assert unknown["summary"].endswith("Kubernetes YAML was not parsed (PyYAML missing)")

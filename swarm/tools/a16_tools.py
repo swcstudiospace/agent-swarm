@@ -193,10 +193,21 @@ def _unique(finding_id: str, taken: dict[str, int]) -> str:
 FACTOR_NAMES = {1: "codebase", 2: "dependencies", 3: "config", 4: "backing_services", 5: "build_release_run", 6: "processes",
                 7: "port_binding", 8: "concurrency", 9: "disposability", 10: "dev_prod_parity", 11: "logs", 12: "admin_processes"}
 
+
+def _is_int(value, expected: int) -> bool:
+    """True when value is the integer `expected`. A boolean is not an integer here, although True == 1."""
+    return type(value) is int and value == expected
+
+
+def _at_most(value, limit: Decimal) -> bool:
+    """True when value is a finite real number no greater than limit. Any other type, booleans included, does not pass."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and _dec(value) <= limit
+
+
 # (factor, descriptor key, passes(value), severity when failing, summary). Booleans are listed with the passing value.
 TWELVE_FACTOR_CHECKS = (
     (1, "codebase_in_vcs", lambda v: v is True, "blocker", "the app is not tracked in version control"),
-    (1, "repos_per_app", lambda v: v == 1, "major", "one app must map to exactly one codebase; shared code belongs in libraries"),
+    (1, "repos_per_app", lambda v: _is_int(v, 1), "major", "one app must map to exactly one codebase; shared code belongs in libraries"),
     (2, "dependencies_declared", lambda v: v is True, "major", "dependencies are not declared in a manifest"),
     (2, "dependencies_locked", lambda v: v is True, "minor", "dependency versions are not pinned by a lockfile"),
     (2, "assumes_system_tools", lambda v: v is False, "minor", "the app relies on system-wide tools instead of isolated dependencies"),
@@ -205,7 +216,7 @@ TWELVE_FACTOR_CHECKS = (
     (3, "config_grouped_by_named_environment", lambda v: v is False,
      "minor", "config is grouped into named environments (development/test/production) instead of granular per-deploy variables"),
     (4, "backing_services_via_config_urls", lambda v: v is True, "major", "backing services are not attached through config URLs/credentials"),
-    (4, "hardcoded_backing_service_hosts", lambda v: v == 0, "major", "backing service hosts are hardcoded in the code"),
+    (4, "hardcoded_backing_service_hosts", lambda v: _is_int(v, 0), "major", "backing service hosts are hardcoded in the code"),
     (5, "build_release_run_separated", lambda v: v is True, "major", "build, release and run are not separate stages"),
     (5, "immutable_releases", lambda v: v is True, "major", "releases are not immutable and uniquely identified"),
     (5, "code_changed_at_runtime", lambda v: v is False, "major", "code is changed in the running environment"),
@@ -217,10 +228,10 @@ TWELVE_FACTOR_CHECKS = (
      "the bind port is not taken from the environment (house rule from factor III; factor VII itself only requires binding a port)"),
     (8, "scales_out_via_processes", lambda v: v is True, "major", "the app cannot scale out horizontally through the process model"),
     (8, "daemonizes_itself", lambda v: v is False, "minor", "the app daemonizes or writes PID files instead of leaving that to the process manager"),
-    (9, "startup_seconds", lambda v: _dec(v) <= STARTUP_MAX_S, "minor", f"startup takes longer than {STARTUP_MAX_S} s"),
+    (9, "startup_seconds", lambda v: _at_most(v, STARTUP_MAX_S), "minor", f"startup takes longer than {STARTUP_MAX_S} s"),
     (9, "handles_sigterm_gracefully", lambda v: v is True, "major", "SIGTERM does not trigger a graceful shutdown"),
     (9, "jobs_idempotent_or_requeued", lambda v: v is True, "minor", "jobs are neither idempotent nor returned to the queue on a crash"),
-    (10, "deploy_gap_days", lambda v: _dec(v) <= DEPLOY_GAP_MAX_DAYS, "minor", f"code takes longer than {DEPLOY_GAP_MAX_DAYS} day to reach production"),
+    (10, "deploy_gap_days", lambda v: _at_most(v, DEPLOY_GAP_MAX_DAYS), "minor", f"code takes longer than {DEPLOY_GAP_MAX_DAYS} day to reach production"),
     (10, "dev_prod_backing_service_mismatch", lambda v: v is False, "major", "development and production use different backing services"),
     (11, "logs_to_stdout", lambda v: v is True, "major", "logs are not written as an event stream to stdout"),
     (11, "app_manages_log_files", lambda v: v is False, "minor", "the app routes or rotates its own log files"),
@@ -537,6 +548,8 @@ def landing_zone_lint(payload: dict) -> dict:
         for item in accounts:
             if any(not part.strip() for part in item["ou"].split("/")) and item["ou"] != "":
                 return _invalid("accounts", f"account {item['id']}: ou must be '' (root) or a path of non-empty OU names like Workloads/Prod")
+        # canonical OU paths: surrounding whitespace is not part of an OU name, so 'Workloads/Prod ' is the OU 'Workloads/Prod'
+        accounts = [{**item, "ou": "/".join(part.strip() for part in item["ou"].split("/"))} for item in accounts]
         findings: list[dict] = []
         by_role: dict[str, list[dict]] = {role: [] for role in LANDING_ROLES}
         for item in accounts:
@@ -590,7 +603,10 @@ def landing_zone_lint(payload: dict) -> dict:
             if glass["last_tested_days_ago"] > BREAK_GLASS_TEST_MAX_DAYS:
                 findings.append(_finding("break-glass-untested", "minor",
                                          f"break-glass was last tested {glass['last_tested_days_ago']} days ago, limit is {BREAK_GLASS_TEST_MAX_DAYS}"))
-        coverage = Decimal(100) if required_total == 0 else Decimal(required_present * 100) / Decimal(required_total)
+        if required_total == 0:  # no guardrail check ran: an empty evaluation must neither report full coverage nor pass
+            findings.append(_finding("guardrails-not-evaluated", "major",
+                                     "no non-management account was evaluated for guardrails, so guardrail coverage is 0.0 and unproven"))
+        coverage = Decimal(0) if required_total == 0 else Decimal(required_present * 100) / Decimal(required_total)
         findings = _ordered(findings)
         return {
             "state": "SUCCESS",
@@ -666,6 +682,11 @@ def wellarch_scorecard(payload: dict) -> dict:
 # --- 7. blast radius -------------------------------------------------------------------------------------------
 
 
+def _domain_label(key: tuple[str, ...]) -> str:
+    """Display name `scope:part/part`. Each part escapes '%' and '/' first, so a '/' inside a region, AZ or cell id cannot read as a separator."""
+    return key[0] + ":" + "/".join(part.replace("%", "%25").replace("/", "%2F") for part in key[1:])
+
+
 @_safe
 def blast_radius(payload: dict) -> dict:
     """Loss of each AZ, region and cell: which services go down (directly or through hard dependencies) and the criticality share lost.
@@ -688,13 +709,14 @@ def blast_radius(payload: dict) -> dict:
                 return _invalid("services", f"service {s['id']} depends on unknown services: {', '.join(unknown)}")
         total_weight = sum(s["criticality"] for s in services)
         by_id = {s["id"]: s for s in services}
-        # instances of each service per failure domain: a service is out when a domain holds all of its instances
-        counts: dict[str, dict[tuple[str, str], int]] = {}
-        domains: set[tuple[str, str]] = set()
+        # instances of each service per failure domain, keyed by tuples so that no separator inside a name can merge two domains;
+        # a service is out when a domain holds all of its instances
+        counts: dict[str, dict[tuple[str, ...], int]] = {}
+        domains: set[tuple[str, ...]] = set()
         for s in services:
-            per: dict[tuple[str, str], int] = {}
+            per: dict[tuple[str, ...], int] = {}
             for inst in s["instances"]:
-                keys = [("az", f"{inst['region']}/{inst['az']}"), ("region", inst["region"])]
+                keys = [("az", inst["region"], inst["az"]), ("region", inst["region"])]
                 if inst.get("cell"):
                     keys.append(("cell", inst["cell"]))
                 for key in keys:
@@ -707,10 +729,11 @@ def blast_radius(payload: dict) -> dict:
                 dependents[dep].append(s["id"])
         evaluated = []
         spof: set[str] = set()
-        for scope, name in sorted(domains):
+        for key in sorted(domains):
+            scope = key[0]
             direct_down, degraded = set(), set()
             for s in services:
-                lost = counts[s["id"]].get((scope, name), 0)
+                lost = counts[s["id"]].get(key, 0)
                 if lost == len(s["instances"]):
                     direct_down.add(s["id"])
                 elif lost:
@@ -726,7 +749,7 @@ def blast_radius(payload: dict) -> dict:
             if scope in ("az", "cell"):
                 spof |= direct_down
             lost_weight = sum(by_id[i]["criticality"] for i in down)
-            evaluated.append({"scope": scope, "domain": f"{scope}:{name}", "down": sorted(down), "degraded": len(degraded),
+            evaluated.append({"scope": scope, "domain": _domain_label(key), "down": sorted(down), "degraded": len(degraded),
                               "blast": Decimal(lost_weight * 100) / Decimal(total_weight)})
         affecting = [e for e in evaluated if e["down"] or e["degraded"]]
         scope_order = {"cell": 0, "az": 1, "region": 2}
@@ -767,6 +790,10 @@ def cell_capacity(payload: dict) -> dict:
     def work() -> dict:
         usable = Fraction(_dec(payload["cell_max_rps"])) * Fraction(_dec(payload["target_utilisation_pct"])) / 100
         projected = Fraction(_dec(payload["load_rps"])) * (100 + Fraction(_dec(payload["growth_pct"]))) / 100
+        if usable == 0:  # the schema keeps both positive; a direct call must not divide by zero
+            return _invalid("target_utilisation_pct", "cell_max_rps and target_utilisation_pct must both be positive")
+        if projected == 0:  # headroom is relative to the projected load, so it is undefined at zero load
+            return _invalid("load_rps", "the projected load is zero, so headroom is undefined: load_rps must be positive")
         for_load = max(1, math.ceil(projected / usable))  # exact rational ceil: a load of exactly k cells needs k, not k+1
         required = for_load + payload["spare_cells"]
         provisioned = usable * required
