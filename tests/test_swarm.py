@@ -155,6 +155,11 @@ def test_all_scripts_dry_run(swarm_dir):
         if script.name in skip or script.name.startswith("_"):
             continue
         r = run_script(script.name, "--dry-run", "--json", env={"SWARM_DIR": str(swarm_dir)})
+        if script.name == "orch_assign.py":
+            data = json.loads(r.stdout)
+            assert r.returncode == 2 and data["error"]["code"] == "E-POLICY"
+            assert "assignment" not in data and "prompt" not in data
+            continue
         assert r.returncode in (0, 1), f"{script.name}: rc={r.returncode}\n{r.stderr[-800:]}"
         assert "Traceback" not in r.stderr, script.name
         data = json.loads(r.stdout)

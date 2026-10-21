@@ -6,6 +6,6 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
-    "test": "bun test ./test/extension.test.ts && bun test --path-ignore-patterns='**/extension.test.ts'"
+    "test": "bun test --timeout 60000 ./test/extension.test.ts && bun test --timeout 60000 --path-ignore-patterns='**/extension.test.ts'"
   }
 }

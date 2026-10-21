@@ -1,12 +1,13 @@
 /**
- * Typed swarm tools (TOOL-01..06). Each execute builds `--flag=value` argv and calls the injected
- * Bridge exactly once; Python decides everything (TS holds no state or validation logic).
+ * Typed swarm tools. Each execute builds `--flag=value` argv and calls the injected Bridge exactly once;
+ * Python decides state and signature validity; the assignment consumer also checks returned dispatch metadata.
  * D-01: every tool is hidden + essential, so only sessions whose agent frontmatter names it get it.
  * D-03: mutating tools refuse with E-POLICY in plan mode before any argv, file or bridge work.
  * WR-03: swarm_gate runs only the calling gate agent's own gate (GATE_AGENTS), E-POLICY otherwise.
  */
 import { type Bridge, type BridgeResult, type Script, SwarmToolError, writeInputFile } from "./bridge.ts";
 import { callingAgent, GATE_AGENTS, inPlanMode } from "./context.ts";
+import { ORCHESTRATOR, SWARM_SLUGS } from "./guard.ts";
 import type { ExtensionContext, JsonSchema, ToolDefinition, ToolResult } from "./omp-api.ts";
 import { gitToplevel } from "./paths.ts";
 
@@ -58,6 +59,13 @@ const FINDING = {
   additionalProperties: false,
 } as const;
 
+/** swarm_tool.py --kind choices. */
+const CATALOG_KINDS = ["tools", "skills", "all"] as const;
+/** Registry tool names (swarm/tool_registry.py `_conventional_name`): lowercase, digits, underscore. */
+const TOOL_NAME_PATTERN = "^[a-z][a-z0-9_]{0,63}$";
+/** One argv value is capped by the kernel at 128 KiB; swarm_tool.py enforces the same 100 000 byte ceiling. */
+const MAX_TOOL_INPUT_BYTES = 100_000;
+
 type Details = Record<string, unknown>;
 
 /** A registered swarm tool as omp sees it (params are the model's JSON, shaped by `parameters`). */
@@ -77,6 +85,7 @@ export type PlanParams = {
   slices?: Array<{ id: string; paths: string[]; agent?: string; capability?: string; title?: string; acceptance?: string[] }>;
 };
 export type IngestParams = { task_id: string; result: Record<string, unknown> };
+export type AssignmentParams = { task_id: string; correlation_id: string };
 export type Finding = { severity: (typeof SEVERITIES)[number]; summary: string } & Partial<
   Record<"id" | "kind" | "evidence", string> & Record<"ac_ref" | "owner_suggestion" | "location", string | null>
 >;
@@ -87,6 +96,8 @@ export type GateParams = {
   per_target_findings?: Record<string, Finding[]>;
   dry_run?: boolean;
 };
+export type CatalogParams = { kind?: (typeof CATALOG_KINDS)[number]; query?: string };
+export type ToolCallParams = { name: string; input: Record<string, unknown> };
 export type TransitionParams = { task_id: string; state: (typeof STATES)[number]; reason: string; dry_run?: boolean };
 
 interface ToolSpec<P> {
@@ -146,6 +157,40 @@ function toolResult(res: BridgeResult, extra: string[] = []): ToolResult<Details
   const text = [res.exitCode === 1 ? `FAIL: ${summary}` : summary, ...extra].join("\n");
   return { content: [{ type: "text", text }], details: res.json };
 }
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const ASSIGNMENT_HEADING = "# task.assign (signed envelope)\n```json\n";
+
+/** Python verifies the signature; this consumer refuses mismatched dispatch metadata or an unrelated prompt. */
+function validAssignment(res: BridgeResult, params: AssignmentParams): boolean {
+  const result = res.json;
+  if (!isObject(result)) return false;
+  if (res.exitCode !== 0 || result.status !== "ok" || result.assignment_verified !== true ||
+      result.task_id !== params.task_id || result.correlation_id !== params.correlation_id ||
+      typeof result.agent_slug !== "string" || !SWARM_SLUGS.includes(result.agent_slug) ||
+      typeof result.prompt !== "string" || !isObject(result.assignment)) return false;
+  const envelope = result.assignment;
+  const payload = envelope.payload;
+  if (envelope.type !== "task.assign" || envelope.schema !== "swarm.v1.task.assign" ||
+      envelope.source !== "A01@runner" || envelope.correlation_id !== params.correlation_id ||
+      typeof envelope.sig !== "string" || !/^(?:hmac|ed25519):.+$/.test(envelope.sig) ||
+      typeof envelope.target !== "string" || result.agent_slug.split("-")[0].toUpperCase() !== envelope.target ||
+      !isObject(payload) || payload.task_id !== params.task_id || payload.correlation_id !== params.correlation_id ||
+      payload.agent_id !== envelope.target) return false;
+  // Memory precedes the real envelope and may quote the same heading and fence. Like orch_assign.py, count only
+  // blocks that carry the verified envelope and require exactly one; forged or unrelated blocks never match.
+  const expected = JSON.stringify(envelope);
+  const matches = result.prompt.split(ASSIGNMENT_HEADING).slice(1).filter((block) => {
+    try {
+      return JSON.stringify(JSON.parse(block.split("\n```", 1)[0])) === expected;
+    } catch {
+      return false;
+    }
+  });
+  return matches.length === 1;
+}
 
 export function buildTools(bridge: Bridge): SwarmTool[] {
   const status = define<StatusParams>({
@@ -168,6 +213,55 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
       if (params.correlation_id) args.push(`--correlation-id=${params.correlation_id}`);
       const res = await bridge({ script: "orch_status", args, cwd: ctx.cwd, signal });
       return toolResult(res, typeof res.json.db === "string" ? [`db: ${res.json.db}`] : []);
+    },
+  });
+
+  const assignment = define<AssignmentParams>({
+    name: "swarm_assignment",
+    label: "Swarm assignment",
+    description:
+      "Obtain the canonical verified signed task.assign envelope and exact specialist prompt for an existing " +
+      "IN_PROGRESS leased task in this correlation. A01 only; refused in plan mode. Read-only Task Store access, " +
+      "but grants dispatch authority. No caller-supplied envelope, agent, payload or signer input.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { ...ID, description: "Existing leased task id" },
+        correlation_id: { ...ID, description: "The leased task's plan correlation id" },
+      },
+      required: ["task_id", "correlation_id"],
+      additionalProperties: false,
+    },
+    mutating: false,
+    async run(_toolCallId, params, signal, ctx) {
+      // Direct execute callers must meet the same authority boundary as the tool_call guard.
+      if (callingAgent(ctx) !== ORCHESTRATOR || inPlanMode(ctx)) {
+        throw new SwarmToolError("E-POLICY", "swarm_assignment refused: only A01 outside plan mode may obtain dispatch authority");
+      }
+      if (!isObject(params) || Object.keys(params).some((key) => key !== "task_id" && key !== "correlation_id") ||
+          typeof params.task_id !== "string" || !new RegExp(ID_PATTERN).test(params.task_id) ||
+          typeof params.correlation_id !== "string" || !new RegExp(ID_PATTERN).test(params.correlation_id)) {
+        throw new SwarmToolError("E-INPUT", "swarm_assignment requires only valid task_id and correlation_id");
+      }
+      let res: BridgeResult;
+      try {
+        res = await bridge({
+          script: "orch_assign",
+          args: [rootArg(ctx), `--task-id=${params.task_id}`, `--correlation-id=${params.correlation_id}`],
+          cwd: ctx.cwd,
+          signal,
+        });
+      } catch (error) {
+        // Never forward a failed child's stdout, stderr or details: they may contain invalid authority material.
+        throw new SwarmToolError(
+          error instanceof SwarmToolError ? error.code : "E-INTERNAL",
+          "swarm_assignment failed: canonical assignment unavailable",
+        );
+      }
+      if (!validAssignment(res, params)) {
+        throw new SwarmToolError("E-CONTRACT", "swarm_assignment refused: invalid canonical assignment response");
+      }
+      return { content: [{ type: "text", text: res.json.prompt as string }], details: res.json };
     },
   });
 
@@ -334,5 +428,83 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
     },
   });
 
-  return [status, plan, ingest, transition, gate];
+  /** The session's own agent slug; a tool call is authorized for it and for nobody the model names (DESIGN 5.3). */
+  function sessionCaller(tool: string, ctx: ExtensionContext): string {
+    const agent = callingAgent(ctx);
+    if (agent === undefined || !SWARM_SLUGS.includes(agent)) {
+      throw new SwarmToolError(
+        "E-POLICY",
+        `${tool} refused: the session has no swarm agent identity, so there is no caller to authorize`,
+      );
+    }
+    return agent;
+  }
+
+  const catalog = define<CatalogParams>({
+    name: "swarm_catalog",
+    label: "Swarm catalog",
+    description:
+      "List the registry tools you may call with swarm_tool_call (name, purpose, side-effect tier, timeout) and the " +
+      "skills available to you (your own plus shared), optionally filtered by kind and by words matched against " +
+      "name and purpose. The list is computed for the calling agent only. Read-only; works in plan mode.",
+    parameters: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: CATALOG_KINDS, description: "tools, skills or all (default all)" },
+        query: { type: "string", minLength: 1, maxLength: 200, description: "Words that must all appear in the name or purpose" },
+      },
+      additionalProperties: false,
+    },
+    mutating: false,
+    async run(_toolCallId, params, signal, ctx) {
+      const caller = sessionCaller("swarm_catalog", ctx);
+      // argv from whitelisted fields only; the caller is the session identity, never a model field
+      const args = [rootArg(ctx), "catalog", `--caller=${caller}`];
+      if (params.kind !== undefined) args.push(`--kind=${params.kind}`);
+      if (params.query !== undefined) args.push(`--query=${params.query}`);
+      const res = await bridge({ script: "swarm_tool", args, cwd: ctx.cwd, signal });
+      const { tools, skills, skills_unavailable: unavailable } = res.json;
+      const listing = JSON.stringify({ tools, skills, ...(unavailable === undefined ? {} : { skills_unavailable: unavailable }) });
+      return { content: [{ type: "text", text: `${String(res.json.summary)}\n${listing}` }], details: res.json };
+    },
+  });
+
+  const toolCall = define<ToolCallParams>({
+    name: "swarm_tool_call",
+    label: "Swarm tool call",
+    description:
+      "Call one registry tool you are permitted to use (see swarm_catalog) with a JSON input object. Returns the " +
+      "registry result object unchanged: state SUCCESS, INVALID_INPUT, UNAUTHORIZED, DEPENDENCY_UNAVAILABLE, TIMEOUT " +
+      "or PARTIAL_SUCCESS plus the tool's fields; read `state` before using any field. READ tools work in plan " +
+      "mode; a WRITE tool is refused there. The caller is your own agent identity and cannot be changed.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", pattern: TOOL_NAME_PATTERN, description: "Registered tool name, for example be_route_norm" },
+        input: { type: "object", description: "The tool's input object; python validates it against the tool's input schema" },
+      },
+      required: ["name", "input"],
+      additionalProperties: false,
+    },
+    mutating: false,
+    async run(_toolCallId, params, signal, ctx) {
+      const caller = sessionCaller("swarm_tool_call", ctx);
+      if (!isObject(params) || typeof params.name !== "string" || !new RegExp(TOOL_NAME_PATTERN).test(params.name) ||
+          !isObject(params.input)) {
+        throw new SwarmToolError("E-INPUT", "swarm_tool_call requires a tool name and an input object");
+      }
+      const input = JSON.stringify(params.input);
+      if (Buffer.byteLength(input, "utf8") > MAX_TOOL_INPUT_BYTES) {
+        throw new SwarmToolError("E-INPUT", `swarm_tool_call input exceeds ${MAX_TOOL_INPUT_BYTES} bytes`);
+      }
+      const args = [rootArg(ctx), "call", `--caller=${caller}`, `--name=${params.name}`, `--input=${input}`];
+      // python knows each tool's tier: in plan mode it refuses anything above READ before importing the handler
+      if (inPlanMode(ctx)) args.push("--plan-mode");
+      const res = await bridge({ script: "swarm_tool", args, cwd: ctx.cwd, signal });
+      const result = isObject(res.json.result) ? res.json.result : res.json;
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    },
+  });
+
+  return [status, plan, assignment, ingest, transition, gate, catalog, toolCall];
 }

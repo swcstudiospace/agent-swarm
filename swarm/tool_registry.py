@@ -8,11 +8,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
-from swarm.tools.support import Busy, StillRunning, Waiting, invoke_bounded
+from swarm.tools.support import Busy, StillRunning, Waiting, caller_scope, invoke_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_FILE = Path(os.environ.get("SWARM_AGENTS_FILE", ROOT / "agents.json"))
@@ -47,6 +50,10 @@ ERROR_STATES = (
 TERMINAL_STATES = ("SUCCESS", *ERROR_STATES)
 IDEMPOTENCY = {"idempotent", "at-least-once", "unsafe"}
 EXAMPLE_KEYS = ("success", "invalid_input", "unauthorized_caller", "dependency", "timeout", "partial")
+TIERS = ("READ", "WRITE", "DESTRUCTIVE", "EXTERNAL")
+# v2.2 (D2): no tool may be DESTRUCTIVE or EXTERNAL. WRITE tools write only inside swarm_dir().
+ALLOWED_TIERS = ("READ", "WRITE")
+DEFAULT_TIER = "READ"
 REQUIRED_FIELDS = (
     "name",
     "owner",
@@ -122,7 +129,72 @@ def validate_registry(path: Path | None = None, *, root: Path | None = None) -> 
 
     for _container, tool in ready:
         errors.extend(_check_handler(tool, root))
+    errors.extend(_policy_errors(data, agents))
+    errors.extend(_baseline_errors(data, agents))
     return errors
+
+
+_AUDIT_ID = re.compile(r"[A-Za-z0-9._:@-]{1,80}")
+
+
+def _audit_id(value: object) -> str | None:
+    """The value when it has the shape of an identifier and is not secret-shaped (never free text), else None."""
+    from swarm.redact import redact_text
+
+    if not isinstance(value, str) or not _AUDIT_ID.fullmatch(value) or redact_text(value) != value:
+        return None
+    return value
+
+
+def _plan_of(task_id: str) -> str | None:
+    """The correlation id of the task's plan from the Task Store (read-only; absent store or task is None)."""
+    import sqlite3
+
+    from swarm.paths import swarm_dir
+
+    db = swarm_dir() / "tasks.db"
+    if not db.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = conn.execute("SELECT correlation_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):  # a locked or unreadable store only costs the correlation id, never the audit row
+        return None
+    return _audit_id(row[0]) if row else None
+
+
+def _audit_call(name: object, caller: object, payload: object, result: object, started: float) -> None:
+    """One local-only `swarm.tool.call` run-log row per registry call (SEC-03): names, state and duration, never a payload
+    value. The ids come from the run's env (SWARM_CORRELATION_ID, SWARM_TASK_ID), which an agent session does not inherit
+    (the runner strips them), so the fallbacks are the call's own `task_id` / `correlation_id` identifiers, the plan of that
+    task in the Task Store, and the latest plan. A failure to log never changes the call result and never raises."""
+    try:
+        from swarm import runlog
+        from swarm.paths import latest_correlation
+
+        state = result.get("state") if isinstance(result, dict) else None
+        state = state if isinstance(state, str) else "DEPENDENCY_UNAVAILABLE"
+        body: dict = {
+            "tool": _audit_id(name) or "",
+            "caller": _audit_id(caller) or "",
+            "state": state,
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+        if state not in ("SUCCESS", "PARTIAL_SUCCESS"):
+            body["error_state"] = state
+        named = payload if isinstance(payload, dict) else {}
+        task = _audit_id(os.environ.get("SWARM_TASK_ID")) or _audit_id(named.get("task_id"))
+        corr = _audit_id(os.environ.get("SWARM_CORRELATION_ID")) or _audit_id(named.get("correlation_id"))
+        if corr is None and task is not None:
+            corr = _plan_of(task)
+        if corr is None:
+            corr = _audit_id(latest_correlation())
+        runlog.emit("swarm.tool.call", body, source="registry", correlation_id=corr, task_id=task, tee=False)
+    except Exception:  # noqa: BLE001 - the audit is best effort: the call result is the contract
+        return
 
 
 def call_tool(
@@ -134,10 +206,40 @@ def call_tool(
     path: Path | None = None,
     data: dict | None = None,
 ) -> dict:
-    """Call one registered tool. Unregistered names do not import a handler.
+    """Call one registered tool and record it in the run log (`swarm.tool.call`, local only). Unregistered names do not
+    import a handler.
 
-    ``data`` is the registry to use. When it is omitted, the on-disk document is loaded.
+    ``data`` is the registry to use. When it is omitted, the on-disk document is loaded. The audit row is written when
+    the swarm state dir already exists or the tool is WRITE tier; a READ call in a workspace without `.swarm` writes nothing.
     """
+    started = time.monotonic()
+    existed = _state_dir_exists()
+    seen: dict = {}
+    result = _call_tool(name, caller, payload, timeout_s=timeout_s, path=path, data=data, seen=seen)
+    if existed or seen.get("tier") == "WRITE":  # a READ call never creates the state dir, not even for its own audit row
+        _audit_call(name, caller, payload, result, started)
+    return result
+
+
+def _state_dir_exists() -> bool:
+    try:
+        from swarm.paths import swarm_dir
+
+        return swarm_dir(create=False).exists()
+    except Exception:  # noqa: BLE001 - unknown means "do not create it": the call itself is unaffected
+        return False
+
+
+def _call_tool(
+    name: str,
+    caller: str,
+    payload: object,
+    *,
+    timeout_s: float | None = None,
+    path: Path | None = None,
+    data: dict | None = None,
+    seen: dict | None = None,
+) -> dict:
     if not isinstance(name, str) or not name:
         return {"state": "INVALID_INPUT", "field": "name", "message": "tool name is required"}
     if data is None:
@@ -148,6 +250,8 @@ def call_tool(
     tool = _find(data, name)
     if tool is None:
         return {"state": "INVALID_INPUT", "field": "name", "message": f"tool {name!r} is not registered"}
+    if seen is not None:
+        seen["tier"] = tool_tier(tool)
     if caller not in (tool.get("permitted_callers") or []):
         return {
             "state": "UNAUTHORIZED",
@@ -164,7 +268,8 @@ def call_tool(
     limit = tool["timeout_s"] if timeout_s is None else timeout_s
     try:
         fn = _import_handler(tool["handler"])
-        raw = invoke_bounded(fn, payload, float(limit))
+        with caller_scope(caller):
+            raw = invoke_bounded(fn, payload, float(limit))
     except Waiting:
         return {"state": "TIMEOUT", "message": "previous call is still running"}
     except Busy:
@@ -176,6 +281,12 @@ def call_tool(
     except Exception as exc:
         return {"state": "DEPENDENCY_UNAVAILABLE", "message": f"handler failed: {exc}"}
     return _finish(tool, raw)
+
+
+def tool_tier(tool: dict) -> str:
+    """The declared side-effect tier; an absent field means READ."""
+    tier = tool.get("side_effect_tier")
+    return tier if isinstance(tier, str) else DEFAULT_TIER
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -224,7 +335,18 @@ def _schema_file_errors() -> list[str]:
         return [f"tool.contract.v1.json: unreadable ({exc})"]
     if list(required) != list(REQUIRED_FIELDS):
         return ["tool.contract.v1.json: required fields drifted from the checker"]
+    try:
+        tiers = json.loads(SCHEMA_FILE.read_text(encoding="utf-8"))["properties"]["side_effect_tier"]["enum"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        return [f"tool.contract.v1.json: side_effect_tier is not declared ({exc})"]
+    if list(tiers) != list(TIERS):
+        return ["tool.contract.v1.json: side_effect_tier values drifted from the checker"]
     return []
+
+
+def find_tool(data: dict, name: str) -> dict | None:
+    """The registry entry for a tool name, else None."""
+    return _find(data, name)
 
 
 def _find(data: dict, name: str) -> dict | None:
@@ -262,6 +384,7 @@ def _check_tool(tool: dict, container: str, agent_ids: set, root: Path) -> tuple
         errors.append(f"{where}: timeout_s must be a number in (0, 3600]")
     if "idempotency" in tool and tool.get("idempotency") not in IDEMPOTENCY:
         errors.append(f"{where}: idempotency must be one of {', '.join(sorted(IDEMPOTENCY))}")
+    errors.extend(_check_tier(where, tool))
     callers = tool.get("permitted_callers")
     if "permitted_callers" in tool:
         if not isinstance(callers, list) or not callers or not all(isinstance(c, str) and c in agent_ids for c in callers):
@@ -273,6 +396,91 @@ def _check_tool(tool: dict, container: str, agent_ids: set, root: Path) -> tuple
         errors.extend(_check_examples(where, tool, agent_ids))
     structural = bool(errors) or bool(missing) or tool.get("stub") is True
     return errors, not structural
+
+
+def _check_tier(where: str, tool: dict) -> list[str]:
+    if "side_effect_tier" not in tool:
+        return []
+    tier = tool["side_effect_tier"]
+    if tier not in TIERS:
+        return [f"{where}: side_effect_tier must be one of {', '.join(TIERS)} (absent means READ)"]
+    if tier not in ALLOWED_TIERS:
+        return [
+            f"{where}: side_effect_tier {tier} is not allowed in v2.2: register only READ or WRITE tools; "
+            "WRITE tools may write only inside the swarm state dir, so split the destructive or external step "
+            "out of the tool and leave it to a human-approved path"
+        ]
+    return []
+
+
+def _range_error(where: str, spec) -> str | None:
+    if not isinstance(spec, dict):
+        return f"agents.json: {where} must be an object with integer min and max"
+    low, high = spec.get("min"), spec.get("max")
+    if not _is_count(low) or not _is_count(high) or low > high:
+        return f"agents.json: {where} needs integer min and max with 0 <= min <= max"
+    return None
+
+
+def _policy_errors(data: dict, agents: list) -> list[str]:
+    """capability_policy shape, then per-agent tool counts against it (D3)."""
+    policy = data.get("capability_policy")
+    if not isinstance(policy, dict):
+        return ["agents.json: capability_policy must be an object with tools and skills min/max"]
+    errors: list[str] = []
+    for kind in ("tools", "skills"):
+        problem = _range_error(f"capability_policy.{kind}", policy.get(kind))
+        if problem:
+            errors.append(problem)
+    if "combined" in policy:
+        problem = _range_error("capability_policy.combined", policy["combined"])
+        if problem:
+            errors.append(problem)
+    tools_policy = policy.get("tools")
+    if isinstance(tools_policy, dict) and "enforce" in tools_policy and not isinstance(tools_policy["enforce"], bool):
+        errors.append("agents.json: capability_policy.tools.enforce must be true or false")
+    if errors:
+        return errors
+    high, low = tools_policy["max"], tools_policy["min"]
+    enforce = tools_policy.get("enforce", True)
+    for agent in agents:
+        if not isinstance(agent, dict) or not isinstance(agent.get("registered_tools"), list):
+            continue
+        count = len(agent["registered_tools"])
+        if count > high:
+            errors.append(f"agent {agent.get('id')}: {count} registered tools exceed capability_policy.tools.max {high}")
+        elif enforce and count < low:
+            errors.append(f"agent {agent.get('id')}: {count} registered tools are below capability_policy.tools.min {low}")
+    return errors
+
+
+def _baseline_errors(data: dict, agents: list) -> list[str]:
+    """shared_baseline: every listed tool is a shared tool that all agents may call (section 8)."""
+    baseline = data.get("shared_baseline")
+    if not isinstance(baseline, dict):
+        return ["agents.json: shared_baseline must be an object with tools and skills lists"]
+    errors: list[str] = []
+    for kind in ("tools", "skills"):
+        names = baseline.get(kind)
+        if not isinstance(names, list) or not all(isinstance(n, str) and n for n in names):
+            errors.append(f"agents.json: shared_baseline.{kind} must be a list of names")
+        elif len(names) != len(set(names)):
+            errors.append(f"agents.json: shared_baseline.{kind} contains a duplicate")
+    if errors:
+        return errors
+    shared = {t.get("name"): t for t in data.get("shared_tools") or [] if isinstance(t, dict)}
+    agent_ids = sorted(str(a.get("id")) for a in agents if isinstance(a, dict))
+    for name in baseline["tools"]:
+        tool = shared.get(name)
+        if tool is None:
+            errors.append(f"agents.json: shared_baseline tool {name!r} is not a shared tool")
+            continue
+        callers = tool.get("permitted_callers")
+        callers = set(callers) if isinstance(callers, list) else set()
+        missing = [a for a in agent_ids if a not in callers]
+        if missing:
+            errors.append(f"agents.json: shared_baseline tool {name!r} must permit every agent; missing {', '.join(missing)}")
+    return errors
 
 
 def _conventional_name(name: str) -> bool:
@@ -441,8 +649,12 @@ def _check_examples(where: str, tool: dict, agent_ids: set) -> list[str]:
     if not isinstance(invalid, dict) or not _payload_errors(schema, invalid):
         errors.append(f"{where}: examples.invalid_input must be an object that fails input_schema")
     caller = examples["unauthorized_caller"]
-    if not isinstance(caller, str) or caller not in agent_ids or caller in tool["permitted_callers"]:
+    permitted = tool["permitted_callers"]
+    if not isinstance(caller, str) or not caller or caller in permitted:
         errors.append(f"{where}: examples.unauthorized_caller must be an agent id that is not permitted")
+    elif caller not in agent_ids and agent_ids - set(permitted):
+        errors.append(f"{where}: examples.unauthorized_caller must be an agent id that is not permitted")
+    # when every agent is permitted (the shared baseline), no agent id can be refused: any other name is the probe
     return errors
 
 
@@ -515,6 +727,10 @@ def _integer_error(spec: dict, value) -> str | None:
 def _number_error(spec: dict, value) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "expected number"
+    if isinstance(value, float) and not math.isfinite(value):
+        # NaN and Infinity compare false against every bound, so a handler written for finite input fails OPEN on them
+        # (a NaN error rate passes `<= limit`). JSON has no such numbers: refuse them once, here, for every tool.
+        return "expected a finite number"
     return _bound_error(spec, value)
 
 
@@ -577,7 +793,45 @@ def _import_handler(handler: str):
     return fn
 
 
+OUTPUT_LIMIT_DEFAULT = 256 * 1024
+OUTPUT_LIMIT_FLOOR, OUTPUT_LIMIT_CEILING = 4096, 16 * 1024 * 1024
+
+
+def output_limit() -> int:
+    """Bytes a tool result may serialise to: env SWARM_TOOL_OUTPUT_MAX_BYTES, clamped to [4 KiB, 16 MiB], default 256 KiB."""
+    try:
+        value = int(os.environ.get("SWARM_TOOL_OUTPUT_MAX_BYTES", ""))
+    except ValueError:
+        return OUTPUT_LIMIT_DEFAULT
+    return min(max(value, OUTPUT_LIMIT_FLOOR), OUTPUT_LIMIT_CEILING)
+
+
+def _within_limits(result: dict) -> dict:
+    """The last gate on a result (SEC-02): it must be strict JSON (no NaN or Infinity, which most parsers refuse) and no
+    larger than `output_limit()`. An oversized result is WITHHELD, not truncated: a half result is worse than none for a
+    gate or a handover. A SUCCESS or PARTIAL_SUCCESS becomes a PARTIAL_SUCCESS with completed_fraction 0 so the caller
+    narrows its input; any other state keeps its state (a failed call stays a failure) and its short routing fields."""
+    try:
+        size = len(json.dumps(result, allow_nan=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        return {"state": "DEPENDENCY_UNAVAILABLE", "message": f"handler result is not strict JSON ({str(exc)[:120]})"}
+    limit = output_limit()
+    if size > limit and result.get("state") not in ("SUCCESS", "PARTIAL_SUCCESS"):
+        kept = {k: result[k] for k in ("field", "caller", "target")
+                if isinstance(result.get(k), str) and len(result[k]) <= 200}
+        return {"state": result["state"], **kept, "output_withheld": True, "output_bytes": size, "limit_bytes": limit,
+                "message": f"{result['state']} result of {size} bytes exceeds the {limit}-byte output limit"}
+    if size > limit:
+        return {"state": "PARTIAL_SUCCESS", "completed_fraction": 0.0, "output_withheld": True, "output_bytes": size,
+                "limit_bytes": limit, "message": f"result of {size} bytes exceeds the {limit}-byte output limit; narrow the input"}
+    return result
+
+
 def _finish(tool: dict, raw) -> dict:
+    return _within_limits(_finish_state(tool, raw))
+
+
+def _finish_state(tool: dict, raw) -> dict:
     if not isinstance(raw, dict) or raw.get("state") not in TERMINAL_STATES:
         return {"state": "DEPENDENCY_UNAVAILABLE", "message": "handler did not return a terminal state"}
     state = raw["state"]

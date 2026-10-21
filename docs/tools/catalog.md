@@ -2,62 +2,428 @@
 
 # Tool catalog
 
-Registered tools: 23. Shared tools: 4.
+Registered tools: 206. Shared tools: 25.
 
-| Name | Owner | Category | Purpose | Permitted callers | Contract test |
-| --- | --- | --- | --- | --- | --- |
-| `arch_adr_slug` | A03 | lane | Slugify an ADR title the way arch_adr.py does. | A03 | `tests/generated/test_tool_contracts.py` |
-| `arch_contract_ops` | A03 | lane | Count OpenAPI or AsyncAPI operations in a contract document. | A03 | `tests/generated/test_tool_contracts.py` |
-| `be_route_norm` | A05 | lane | Normalize an HTTP path template the way be_contract_conformance.py does. | A05 | `tests/generated/test_tool_contracts.py` |
-| `data_down_present` | A07 | lane | Report whether migration text contains a down or reversible marker. | A07 | `tests/generated/test_tool_contracts.py` |
-| `devops_build_systems` | A11 | lane | List build-system markers devops_build_record finds at the repo root. | A11 | `tests/generated/test_tool_contracts.py` |
-| `devops_ci_kind` | A11 | lane | Classify a path as a CI or IaC manifest the way devops_ci_check.py does. | A11 | `tests/generated/test_tool_contracts.py` |
-| `docs_heading_order` | A15 | lane | Count H1 headings and skipped heading levels in a markdown fragment. | A15 | `tests/generated/test_tool_contracts.py` |
-| `fe_a11y_scan` | A06 | lane | Scan an HTML snippet with the fe_a11y_check rules and return the issue count. | A06 | `tests/generated/test_tool_contracts.py` |
-| `maint_spec_pin` | A14 | lane | Classify a dependency spec as pinned, range, or wildcard. | A14 | `tests/generated/test_tool_contracts.py` |
-| `obs_error_burn` | A13 | lane | Compute the SLI and error-budget burn rate obs_slo uses. | A13 | `tests/generated/test_tool_contracts.py` |
-| `orch_budget_class` | A01 | lane | Return the token, wall, and cost budget orch_plan assigns to a risk class. | A01 | `tests/generated/test_tool_contracts.py` |
-| `orch_dag_order` | A01 | lane | Order a task DAG the way orch_plan does, and reject a cycle instead of hanging. | A01 | `tests/generated/test_tool_contracts.py` |
-| `orch_registry_ping` | A01 | lane | Pilot A01 lane tool that echoes a short token so register, call, test, and document can be proven without writing the task store. | A01 | `tests/generated/test_tool_contracts.py` |
-| `qa_runner_detect` | A08 | lane | List test runners qa_gate would detect at this repo root. | A08 | `tests/generated/test_tool_contracts.py` |
-| `rel_canary_steps` | A12 | lane | Build the canary step list and approval class rel_plan assigns to a risk. | A12 | `tests/generated/test_tool_contracts.py` |
-| `req_gwt_check` | A02 | lane | Count Given/When/Then acceptance criteria in a text block. | A02 | `tests/generated/test_tool_contracts.py` |
-| `rev_diff_size` | A09 | lane | Report whether an added plus deleted line count exceeds the review split budget. | A09 | `tests/generated/test_tool_contracts.py` |
-| `sec_line_entropy` | A10 | lane | Compute the Shannon entropy sec_gate uses before treating a string as a secret. | A10 | `tests/generated/test_tool_contracts.py` |
-| `shared_check_plan` | shared | shared | Name the lint, typecheck, and test commands code_checks would run for this repo. | A05, A06 | `tests/generated/test_tool_contracts.py` |
-| `shared_git_head` | shared | shared | Return the git sha and branch that the build record hands to release. | A11, A12 | `tests/generated/test_tool_contracts.py` |
-| `shared_toolchain` | shared | shared | Detect which language toolchains are present, as code_checks does for backend and frontend. | A05, A06 | `tests/generated/test_tool_contracts.py` |
-| `shared_verdict` | shared | shared | Derive pass or fail from finding severities using the same rule as the gate scripts. | A02, A03, A04, A08, A09, A10, A11, A12 | `tests/generated/test_tool_contracts.py` |
-| `ux_contrast` | A04 | lane | Compute the WCAG contrast ratio for a foreground and background hex pair. | A04 | `tests/generated/test_tool_contracts.py` |
+| Name | Owner | Category | Tier | Purpose | Permitted callers | Contract test |
+| --- | --- | --- | --- | --- | --- | --- |
+| `arch_adr_slug` | A03 | lane | READ | Slugify an ADR title the way arch_adr.py does. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_adr_supersession` | A03 | lane | READ | Validate the supersession links of an ADR set: dangling targets, superseded ADRs without a successor, status mismatches, forks and cycles, with chains and live heads. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_adr_transition` | A03 | lane | READ | Decide whether an ADR may move from one status to another under the lifecycle recorded by the ADR script. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_breaking_readiness` | A03 | lane | READ | Decide the autonomy level of a contract change and list the migration plan, consumer acknowledgements and human approval still outstanding before it may be published. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_c4_fanout` | A03 | lane | READ | Count C4 containers and distinct relations, and flag containers whose fan-out exceeds the coupling budget. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_contract_ops` | A03 | lane | READ | Count OpenAPI or AsyncAPI operations in a contract document. | A03, A06 | `tests/generated/test_tool_contracts.py` |
+| `arch_cycle_check` | A03 | lane | READ | Find dependency cycles, as strongly connected module groups and self-edges, in a supplied module dependency graph. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_field_breaks` | A03 | lane | READ | List the breaking and additive field changes between two field sets of one contract side, request or response. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_layer_violations` | A03 | lane | READ | Find module dependency edges that point from a layer to a layer above it in the ordered layering. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_nfr_allocation` | A03 | lane | READ | Check that every NFR is bound to a contract clause or component budget and that each quantitative NFR carries a numeric limit; report unallocated and unmeasurable ones. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_nfr_budget` | A03 | lane | READ | Check measured NFR values against their allocated budgets and report breaches and budgets that have no measurement. | A03 | `tests/generated/test_tool_contracts.py` |
+| `arch_semver_bump` | A03 | lane | READ | Classify the bump between two release versions and check it against the bump a breaking or additive contract change requires. | A03 | `tests/generated/test_tool_contracts.py` |
+| `be_acceptance_coverage` | A05 | lane | READ | Compute the share of acceptance criteria covered by a backend test plan and list the criteria still uncovered. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_coverage_delta` | A05 | lane | READ | Compute the percentage-point test coverage change between two backend runs (full precision) and flag regressions; any drop below before is regressed with direction down. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_dependency_class` | A05 | lane | READ | Classify each proposed dependency change as L2 (allowlisted, semver-compatible: same major, and for 0.x the same minor, not a downgrade) or L3 (new, major, downgrade or off-allowlist). | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_license_allowlist_check` | A05 | lane | READ | Flag backend dependency packages whose license expression is not covered by the approved license allowlist. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_method_status_check` | A05 | lane | READ | Check an endpoint's HTTP method and response status against the allowlists in its API contract. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_openapi_path_params` | A05 | lane | READ | Extract OpenAPI {name} path parameters from a route template so contract checks compare declared and used parameters. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_patch_shape_check` | A05 | lane | READ | Validate the code.patch JSON an implementer emits (branch, contract pins, digest, checks, tests, signing) and say whether it is ready for review. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_perf_regression` | A05 | lane | READ | Flag benchmarks whose after-timing is slower than a percentage budget against their baseline timing. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_route_auth_coverage` | A05 | lane | READ | List new routes that carry no auth marker and are not in the declared public list, matching paths by normalized shape. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_route_collision` | A05 | lane | READ | Detect same-method routes whose templated shapes collide so the backend API surface has no ambiguous dispatch. | A05 | `tests/generated/test_tool_contracts.py` |
+| `be_route_norm` | A05 | lane | READ | Normalize an HTTP path template the way be_contract_conformance.py does. | A05, A06 | `tests/generated/test_tool_contracts.py` |
+| `be_semver_range_class` | A05 | lane | READ | Classify a dependency semver range and report whether it has an upper bound so unbounded backend dependencies are flagged. | A05 | `tests/generated/test_tool_contracts.py` |
+| `data_contract_field_compat` | A07 | lane | READ | Classify field-set changes between two data contract versions as breaking or additive for BACKWARD compatibility. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_destructive_ddl_scan` | A07 | lane | READ | Classify destructive DDL statements (DROP TABLE, SCHEMA, DATABASE, TRUNCATE, DROP COLUMN, column TYPE change) in migration SQL so L4 approval can be routed. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_down_present` | A07 | lane | READ | Report whether migration text contains a down or reversible marker. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_explain_regression_check` | A07 | lane | READ | Compare baseline and shadow EXPLAIN cost or time per query against the percentage regression budget (default 20) before shadow_tested is set. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_fk_cycle_check` | A07 | lane | READ | Detect a cycle in supplied table-to-table foreign-key edges so migration ordering and cascade deletes can be reviewed. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_index_name_check` | A07 | lane | READ | Check CREATE INDEX names against the prefix_table_suffix convention, lowercase rule and 63-character identifier limit. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_lock_risk_scan` | A07 | lane | READ | Flag DDL that takes blocking locks on populated tables (index build without CONCURRENTLY, validating FOREIGN KEY or CHECK, SET NOT NULL, column-level UNIQUE, PRIMARY KEY or REFERENCES in ADD COLUMN, also inside DO blocks) and check that a lock_timeout is in effect at each of them so requires_lock_timeout_s can be confirmed. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_migration_version_order` | A07 | lane | READ | Check migration version ids are unique and strictly increasing in the supplied order, using natural numeric comparison. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_not_null_default_check` | A07 | lane | READ | Flag ALTER TABLE ADD COLUMN definitions that are NOT NULL or PRIMARY KEY without a DEFAULT, which fail or rewrite populated tables. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_pii_tag_coverage` | A07 | lane | READ | Compute the share of PII-flagged columns that carry an allowed classification tag and list the untagged PII columns. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_reversible_pair_check` | A07 | lane | READ | Pair up/down and Flyway V/U migration files by name and report missing or orphan reverse scripts. | A07 | `tests/generated/test_tool_contracts.py` |
+| `data_row_count_reconcile` | A07 | lane | READ | Reconcile a before row count and an after row count against a declared delta and report the drift. | A07 | `tests/generated/test_tool_contracts.py` |
+| `devops_build_systems` | A11 | lane | READ | List build-system markers devops_build_record finds at the repo root. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_change_gate` | A11 | lane | READ | Decide whether an environment change may proceed, requiring a change ticket, blast-radius note, and rollback plan for production. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_ci_kind` | A11 | lane | READ | Classify a path as a CI or IaC manifest the way devops_ci_check.py does. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_cost_overrun` | A11 | lane | READ | Compare an environment's actual cost with its modeled budget and flag overruns above 120 percent for auto-downscale. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_deploy_gate` | A11 | lane | READ | Combine the A10 verdict, freeze window, drift freeze, provenance check and environment tier into allow, block or needs-human-approval, failing closed. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_drift_count` | A11 | lane | READ | Count GitOps drift between desired and actual state keys and choose the reconcile action under the three-reconcile freeze rule. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_env_tier` | A11 | lane | READ | Classify an environment name as ephemeral, staging, or production and derive its autonomy level, as the A11 tier rules do. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_freeze_window` | A11 | lane | READ | Test whether a deploy timestamp falls inside any supplied freeze window, using UTC instants with start inclusive and end exclusive. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_image_tag_check` | A11 | lane | READ | Flag container image references that are not pinned by digest or an immutable version tag, rejecting latest and other mutable tags. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_provenance_gate` | A11 | lane | READ | Self-gate a build.artifact record: reject without a provenance attestation, a sha256 tree digest or a digest-pinned image, and warn on a dirty tree. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_rollback_target` | A11 | lane | READ | After an IaC apply failure choose retry, rollback or escalate and name the newest last-good state snapshot, under the retry-once rule. | A11 | `tests/generated/test_tool_contracts.py` |
+| `devops_tf_blast_radius` | A11 | lane | READ | Summarise terraform show -json resource_changes into create, update, delete and replace counts and a note for devops_change_gate blast_radius. | A11 | `tests/generated/test_tool_contracts.py` |
+| `docs_adr_render_coverage` | A15 | lane | READ | Compute the share of in-scope ADRs rendered into docs and list missing and orphan renders. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_anchor_check` | A15 | lane | READ | Derive GitHub-style heading anchors from supplied headings and report fragment references that match none of them. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_api_endpoint_coverage` | A15 | lane | READ | Compute the percentage of API endpoints present in the documented endpoint list, with undocumented and unmatched entries. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_changelog_section_order` | A15 | lane | READ | Check one Keep-a-Changelog release block for unknown, duplicate and out-of-order section headings. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_conventional_groups` | A15 | lane | READ | Group supplied conventional-commit subjects into Keep-a-Changelog sections and count breaking changes. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_digest_staleness` | A15 | lane | READ | Apply the staleness law: compare each document's bound artifact digest with the current digest and list stale and unbound documents and the stale artifact scopes. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_flesch_grade` | A15 | lane | READ | Score supplied prose with Flesch-Kincaid grade and reading ease and compare the grade against a limit. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_heading_order` | A15 | lane | READ | Count H1 headings and skipped heading levels in a markdown fragment. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_link_targets` | A15 | lane | READ | Resolve repo-relative markdown link targets against a supplied file list and report broken internal links. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_runbook_schema_check` | A15 | lane | READ | Validate runbook fragments against A13's executable schema and list missing fields, unknown actions, bad dates and whitelisted actions that are not reversible steps. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_runbook_verified_ratio` | A15 | lane | READ | Compute the share of tier-1 runbooks with a recent valid verified date against a target percentage. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_stale_doc_age` | A15 | lane | READ | Compute document age in days from supplied verified dates and list documents older than the staleness limit. | A15 | `tests/generated/test_tool_contracts.py` |
+| `docs_terminology_drift` | A15 | lane | READ | Lint supplied markdown files against a glossary of preferred and deprecated terms, reporting each violation with file and line and the files that pass. | A15 | `tests/generated/test_tool_contracts.py` |
+| `fe_a11y_scan` | A06 | lane | READ | Scan an HTML snippet with the fe_a11y_check rules and return the issue count. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_alt_text_check` | A06 | lane | READ | Flag non-decorative images with missing, empty, or generic alt text and decorative images that carry alt text. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_bundle_budget_check` | A06 | lane | READ | Compare total bundle bytes against a byte budget and, when a baseline is given, against the regression limit percentage. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_client_security_scan` | A06 | lane | READ | Scan supplied source text for XSS sinks, inline scripts and handlers, external scripts or stylesheets without integrity, and PII or credential keys written to web storage. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_cwv_budget_check` | A06 | lane | READ | Gate Core Web Vitals (LCP, INP, CLS) and Lighthouse scores against thresholds, defaulting to LCP 2.5 s, INP 200 ms, CLS 0.1, perf 90 and a11y 100. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_form_label_check` | A06 | lane | READ | Find visible form controls that lack an accessible name from a label, a non-blank aria-label, or aria-labelledby. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_heading_sequence_check` | A06 | lane | READ | Check that heading levels start at h1 and never skip a level when descending, as the a11y self-gate requires. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_prop_type_coverage` | A06 | lane | READ | Measure the share of component props with a concrete declared type and list components below the minimum ratio. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_state_parity_check` | A06 | lane | READ | Compare the states implemented per screen or component with ux.spec states for exact parity, listing missing and extra states; dotted sub-states count separately. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_tab_order_check` | A06 | lane | READ | Count positive tabindex values and the focus-order inversions they create among supplied DOM-ordered elements. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_target_size_check` | A06 | lane | READ | List interactive targets smaller than the minimum CSS-pixel size on either side, default 24 px per WCAG 2.2 SC 2.5.8. | A06 | `tests/generated/test_tool_contracts.py` |
+| `fe_token_literal_scan` | A06 | lane | READ | Flag raw colour and spacing literals (hex, rgb/hsl functions, non-zero px/rem/em) in supplied style declarations that are not design-token references. | A06 | `tests/generated/test_tool_contracts.py` |
+| `maint_changelog_check` | A14 | lane | READ | Validate one Keep a Changelog release entry: heading, version match, date, categories, and bullets. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_debt_priority` | A14 | lane | READ | Score a tech-debt item from impact, recurrence, and effort, and propose its planning iteration. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_eol_distance` | A14 | lane | READ | Measure days from a review date to platform EOL and flag upgrade epics and EOL compliance findings. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_hotfix_decision` | A14 | lane | READ | Apply the hotfix-versus-rollback rule: sev 1 or 2 (sev 1 is the worst) primes the hotfix path, a low-risk rollback is preferred, a hotfix needs a root-cause fix under 4 h. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_license_change` | A14 | lane | READ | Detect SPDX license changes between two records and flag allowlist breaches and newly introduced copyleft terms. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_patch_deadline` | A14 | lane | READ | Compute a patch deadline: 24 hours for KEV or critical findings, otherwise the supplied SLA. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_patch_priority` | A14 | lane | READ | Score a vulnerability patch priority from CVSS, KEV listing, exploit maturity, blast radius, and usage. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_semver_bump` | A14 | lane | READ | Classify a version bump as major, minor, patch, prerelease, downgrade, or none, with its autonomy level. Implements strict 3-part semver 2.0.0 (MAJOR.MINOR.PATCH with optional -prerelease and +build; empty or leading-zero numeric prerelease identifiers are rejected). | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_spec_pin` | A14 | lane | READ | Classify a dependency spec as pinned (one exact version), range (including wildcard components like == 1.2.* and compound specs like ==1.2.3,<2), or wildcard. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_stale_age` | A14 | lane | READ | Compute how many days a dependency release trails the latest release and whether it breaches the staleness threshold. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_unpinned_count` | A14 | lane | READ | Count dependency version specifiers that are not exact pins, including wildcard and unconstrained entries; compound specs such as ==1.2.3,<2 count as ranges. | A14 | `tests/generated/test_tool_contracts.py` |
+| `maint_version_affected` | A14 | lane | READ | Say whether a semver version lies inside an advisory range of comma-separated <, <=, >= and > clauses. | A14 | `tests/generated/test_tool_contracts.py` |
+| `obs_alert_fatigue` | A13 | lane | READ | Measure the non-actionable share of pages against the allowed alert-fatigue noise ratio. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_budget_remaining` | A13 | lane | READ | Compute remaining error budget for an SLO window from good and total event counts. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_cardinality_estimate` | A13 | lane | READ | Estimate worst-case metric series count from per-label distinct value counts and flag a series budget breach. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_dashboard_staleness` | A13 | lane | READ | Check how old a dashboard's last refresh is at a supplied check time against the freshness limit. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_error_burn` | A13 | lane | READ | Compute the SLI and error-budget burn rate obs_slo uses. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_escalation_due` | A13 | lane | READ | Check whether an unstabilized sev 1 or 2 incident has reached the escalation clock (10 minutes by default) at a supplied time. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_incident_mttd_mttr` | A13 | lane | READ | Compute mean time to detect and mean time to restore from incident start, detection, and resolution timestamps. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_ingestion_lag_p95` | A13 | lane | READ | Compute the nearest-rank P95 telemetry ingestion lag and check it against the ingestion target. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_mitigation_gate` | A13 | lane | READ | Decide whether a proposed automatic mitigation may run: whitelisted playbook, canary or staging (or full prod with A12), under the per-incident cap. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_multiwindow_alert` | A13 | lane | READ | Decide burn-rate paging (14.4x over 1h with 6x over 6h) and ticketing (1x over 3d) for an SLO. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_probe_availability` | A13 | lane | READ | Compute synthetic probe availability and the longest consecutive failure run against an availability target. | A13 | `tests/generated/test_tool_contracts.py` |
+| `obs_runbook_link_coverage` | A13 | lane | READ | Report which alerts link to a known runbook and which alerts lack a resolvable runbook. | A13 | `tests/generated/test_tool_contracts.py` |
+| `orch_assign` | A01 | lane | READ | Orchestrator unit: assign task to agent (part of monitor/assign). | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_budget_class` | A01 | lane | READ | Return the token, wall, and cost budget orch_plan assigns to a risk class. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_budget_guard` | A01 | lane | READ | Decide OK, WARN, HARD_STOP, or ESCALATED from usage against a task budget and earlier breaches, and name the next action. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_dag_blocked` | A01 | lane | READ | Classify a plan's dispatchable tasks as ready, waiting, or blocked, and report dependency cycles, so A01 dispatches only tasks whose inputs are met. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_dag_order` | A01 | lane | READ | Order a task DAG the way orch_plan does, and reject a cycle instead of hanging. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_dispatch_batch` | A01 | lane | READ | Choose which ready tasks start this round under each agent's max_parallel and the global cap, with the deferred ones and their reason. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_gate_coverage` | A01 | lane | READ | Check the latest verdict per gate against the gates a risk class requires, so A01 approves a task only when every required gate passed or was waived. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_plan` | A01 | lane | READ | Orchestrator unit: decompose brief into typed task DAG (plan). | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_reconcile` | A01 | lane | WRITE | Orchestrator unit: reassign on failure, aggregate gate results (reconcile). | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_registry_ping` | A01 | lane | READ | Pilot A01 lane tool that echoes a short token so register, call, test, and document can be proven without writing the task store. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_rework_bound` | A01 | lane | READ | Apply the rework-loop cap to a gate failure and return REWORK, ESCALATED, or PASS with the loops left, so A01 escalates after the second rework. | A01 | `tests/generated/test_tool_contracts.py` |
+| `orch_run` | A01 | lane | READ | Orchestrator unit: assign tasks, monitor DAG execution (run). | A01 | `tests/generated/test_tool_contracts.py` |
+| `qa_criteria_coverage` | A08 | lane | READ | Map A02 acceptance criteria to test traces and report uncovered criteria and tests that trace to no known criterion. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_defect_dedupe` | A08 | lane | READ | Group defect reports that share a dedupe key (derived from component, acceptance criterion and normalized title when absent) and name the canonical report and the duplicates. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_defect_escape_rate` | A08 | lane | READ | Compute pre-production detection and production escape rates from defect stages against the A08 quality targets. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_finding_shape_check` | A08 | lane | READ | Check quality-gate findings against the A08 finding contract before the gate call: QF-n ids unique, kind and severity in their enums, ac_ref on functional findings, evidence on major and critical ones. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_flaky_classify` | A08 | lane | READ | Classify each test's recent pass/fail history under the A08 flake policy: quarantine at 3 of the last 10 clean runs failing intermittently. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_mutation_gate` | A08 | lane | READ | Compute the mutation score for a critical module and check it against the A08 mutation threshold, 70 percent by default. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_name_convention` | A08 | lane | READ | Check test names against the supplied prefix, snake_case, length limit, and uniqueness rules. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_retry_budget` | A08 | lane | READ | Check flaky-rerun use against a rerun budget and list tests that passed only after a retry or never passed. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_runner_detect` | A08 | lane | READ | List test runners qa_gate would detect at this repo root. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_runtime_p95` | A08 | lane | READ | Compute nearest-rank P95 suite runtime from supplied durations and check it against the 45-minute escalation budget. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_skip_ratio` | A08 | lane | READ | Compute the skipped-test ratio and list skipped tests with no recorded reason against a caller-supplied limit. | A08 | `tests/generated/test_tool_contracts.py` |
+| `qa_tier_plan` | A08 | lane | READ | Say which test tiers a risk class requires and whether the reported run statuses pass or fail the quality gate; degraded mode narrows the requirement to the unit smoke tier and is a planning input only, because scripts/qa_gate.py has no degraded mode and always selects tiers by risk class. | A08 | `tests/generated/test_tool_contracts.py` |
+| `rel_canary_steps` | A12 | lane | READ | Build the canary step list and approval class rel_plan assigns to a risk. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_canary_verdict` | A12 | lane | READ | Decide promote, hold, or rollback for one canary step from canary and baseline error rates, the regression allowance, and soak time. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_change_failure_rate` | A12 | lane | READ | Compute the change failure rate from per-change failure outcomes over a release window. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_deploy_frequency` | A12 | lane | READ | Compute deployments per week from supplied production deploy dates for the release record. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_freeze_decision` | A12 | lane | READ | Decide whether incident alerts force a deploy freeze (severity 2 or worse) and whether an unfreeze request comes from the declaring authority. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_gate_freshness` | A12 | lane | READ | Report which gate verdicts are older than their maximum age, waived without an approval id, or failed, at an injected now. | A12, A10 | `tests/generated/test_tool_contracts.py` |
+| `rel_gate_order_check` | A12 | lane | READ | Verify that required promotion gates appear in the release plan in the required order with none missing. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_guardrail_breaches` | A12 | lane | READ | List the guardrails one canary sample breaches against the risk-class limits and the metrics it is missing. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_lead_time_p95` | A12 | lane | READ | Compute median and nearest-rank P95 change lead time in hours from supplied commit-to-deploy durations. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_release_record_check` | A12 | lane | READ | Check that a release record carries every required field with a non-empty value before it is signed and appended. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_resume_point` | A12 | lane | READ | Pick resume, rollback or complete for an interrupted canary promotion from the plan steps, the confirmed steps and the breach flag. | A12 | `tests/generated/test_tool_contracts.py` |
+| `rel_rollback_trigger` | A12 | lane | READ | Report whether SLO burn-rate samples breach the rollback threshold for the required run of consecutive samples. | A12 | `tests/generated/test_tool_contracts.py` |
+| `req_ambiguity_scan` | A02 | lane | READ | Flag modal, quantifier and vague terms in requirement text and score the share of sentences that are ambiguous. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_change_impact` | A02 | lane | READ | Estimate tasks at risk and committed-scope change ratio from the requirement ids a change affects and the requirement-to-task links. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_clarification_window` | A02 | lane | READ | Account clarification rounds against the 2-round, 48 h rule from supplied timestamps and report overdue rounds, exhaustion, provisional need and P50 latency. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_conflict_matrix` | A02 | lane | READ | Detect contradictory structured requirements on the same subject and attribute and emit the conflict matrix, blocked ids and equal-rank pairs. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_criteria_testability` | A02 | lane | READ | Measure the manual-only share of acceptance criteria and list criteria that can be verified neither automatically nor by a measurable outcome. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_gwt_check` | A02 | lane | READ | Count Given/When/Then acceptance criteria in a text block. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_invest_score` | A02 | lane | READ | Score one user story against the six INVEST checks using its text, dependencies, estimate and criteria. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_nfr_coverage` | A02 | lane | READ | Check that a set of NFRs covers the required categories (perf, security, a11y, i18n, compliance) and list the missing categories. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_pii_scan` | A02 | lane | READ | Detect email, phone, SSN, Luhn-valid card and IPv4 patterns in brief or story text and return a redacted copy with regime hints. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_story_duplicates` | A02 | lane | READ | Find user stories whose normalized token overlap (Jaccard similarity) meets a duplicate threshold. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_traceability_coverage` | A02 | lane | READ | Compute requirement-to-artifact traceability coverage from requirement and link id lists, reporting uncovered and unknown requirement ids. | A02 | `tests/generated/test_tool_contracts.py` |
+| `req_wsjf_rank` | A02 | lane | READ | Rank backlog items by WSJF from supplied value, criticality, risk and job size, and name the prioritization method policy applies. | A02 | `tests/generated/test_tool_contracts.py` |
+| `rev_auto_approve_check` | A09 | lane | READ | Apply the L2 auto-approve thresholds (diff under 100 lines, no restricted paths, SAST clean, tests present, first-pass rate above 90 percent) and name each failed criterion. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_comment_density` | A09 | lane | READ | Measure the share of non-blank added source lines that are comment lines, excluding preprocessor and shebang directives. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_diff_size` | A09 | lane | READ | Report whether an added plus deleted line count exceeds the review split budget. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_false_approve_rate` | A09 | lane | READ | Compute the percentage of approved reviews later linked to defects and compare it with the false-approve target. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_review_latency_p95` | A09 | lane | READ | Compute the nearest-rank P95 of supplied review durations in minutes and compare it with the review latency target. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_risk_tier` | A09 | lane | READ | Derive risk_tier low, medium or high: high when co_sign_required or max_severity is critical or blocker; medium when any restricted category is present, diff_lines is at least 100 (the auto-approve size threshold) or blocking_count is above 0; else low. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_rule_dispute_flag` | A09 | lane | READ | Flag review rules that one producer disputed on at least threshold distinct pull requests (default 2) for standards review; counts are per rule and producer, and a repeated rule, pr and producer dispute counts once. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_sensitive_paths` | A09 | lane | READ | Classify changed paths into restricted categories (contracts, auth, payments, migrations, PII, IaC) and report whether co-sign is required. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_severity_histogram` | A09 | lane | READ | Count finding severities on the gate scale (info, minor, major, critical, blocker), the blocking count at major and above, and the highest severity present. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_test_pairing` | A09 | lane | READ | Pair changed source files with test files by stem, report the test-to-source ratio and list source files with no matching test. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_unresolved_threads` | A09 | lane | READ | Count review threads still open, including open blocking threads, and report whether no blocking thread remains unresolved. | A09 | `tests/generated/test_tool_contracts.py` |
+| `rev_verdict_shape` | A09 | lane | READ | Check the final review json block against the output contract (gate review, verdict pass or fail with approve, request_changes and block normalized, blocking and non_blocking item fields, risk_tier, mode, co_sign_required, expires_s up to 172800) and list every field error. | A09 | `tests/generated/test_tool_contracts.py` |
+| `sec_allowlist_check` | A10 | lane | READ | Apply the sec_gate allow-list rules to supplied entries: report entries lacking a justification, entries expired on or before the as_of date, and which finding ids would be suppressed. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_credential_scan` | A10 | lane | READ | Report hard-coded credential rule hits by rule name and line number, never the matched value. | A10, A15 | `tests/generated/test_tool_contracts.py` |
+| `sec_cvss_band` | A10 | lane | READ | Map a CVSS base score to its qualitative severity band and the gate's high-or-critical blocking threshold. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_dependency_age` | A10 | lane | READ | Measure a dependency release age in days against a supplied maximum for dependency-request review. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_finding_dedup` | A10 | lane | READ | Merge findings of several scanners by CWE and location, or by rule for flood batching; group severity is the maximum and differing severities are listed as conflicts. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_header_presence` | A10 | lane | READ | Report which required security response headers are absent from an observed header set. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_kev_match_count` | A10 | lane | READ | Count distinct CVE identifiers that appear in a supplied KEV list for the KEV blocking rule. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_license_risk` | A10 | lane | READ | Flag license identifiers outside a supplied allowlist for the dependency license check. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_line_entropy` | A10 | lane | READ | Compute the Shannon entropy sec_gate uses before treating a string as a secret. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_sbom_diff` | A10 | lane | READ | Compare two SBOM component lists by name: added, removed, version-changed and newly unpinned components, with a drift flag. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_sbom_summary` | A10 | lane | READ | Count SBOM components and those without an exact dotted-numeric pinned version. | A10 | `tests/generated/test_tool_contracts.py` |
+| `sec_tls_min_version` | A10 | lane | READ | Check TLS and SSL protocol versions against a minimum and report weak or unrecognized entries. | A10 | `tests/generated/test_tool_contracts.py` |
+| `shared_artifact_check` | shared | shared | READ | Check each output of a task: local file exists, digest matches, producer is the task's agent; non-file uris are reported unchecked, never assumed fine. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_artifact_digest` | shared | shared | READ | Compute the sha256 digest of a file inside the workspace so an artifact can be listed in a handover with a verifiable digest. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_attempt_history` | shared | shared | READ | Show a task's attempt count, rework loops against the cap, state transitions and the last error, so a retry starts from what already failed. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_cancel_check` | shared | shared | READ | Report whether a cooperative cancel was requested for the task's correlation, the grace left, and the seconds to its running deadline. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_check_plan` | shared | shared | READ | Name the lint, typecheck, and test commands code_checks would run for this repo. | A05, A06 | `tests/generated/test_tool_contracts.py` |
+| `shared_dod_check` | shared | shared | READ | Check each acceptance criterion against a supplied result by deterministic keyword and evidence matching: met only with supporting evidence, otherwise unknown. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_escalate` | shared | shared | WRITE | Record escalation.request for the caller's own task and return a ready BLOCKED task.result patch plus the escalation owner. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_escalation_owner` | shared | shared | READ | Name who becomes accountable when the swarm gives up on a task: A14 when a direct upstream task is A14's work order, else A01. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_git_head` | shared | shared | READ | Return the git sha and branch that the build record hands to release. | A11, A12 | `tests/generated/test_tool_contracts.py` |
+| `shared_handover_bundle` | shared | shared | READ | Everything a receiver needs for one task in one bounded object: goal, acceptance criteria, handover, upstream results and needs, artifacts, signed verdict summaries (stale: true for verdicts issued before the last rework), redacted lease mirror and attempts. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_handover_read` | shared | shared | READ | Read the newest (or a given seq) handover of a task, re-validated and digest-checked, with its status ok, missing, partial, stale or malformed and the reasons. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_handover_receipt` | shared | shared | WRITE | Record, idempotently by task, receiver and digest, what the receiving agent ascertained from a handover and the questions it still has; only the addressed receiver may write it. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_handover_validate` | shared | shared | READ | Validate a handover document against swarm.handover.v1 and the semantic rules before writing it; reports every problem by field, its stored size and whether it would be summarized. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_handover_verify` | shared | shared | READ | Judge whether a task can start from its handover: handover status plus the state of every upstream task. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_handover_write` | shared | shared | WRITE | Write the versioned handover for a task to the next agent: goal, done, remaining, constraints, artifacts with digests; validated, redacted, size-capped and digest-sealed, from_agent is always the caller. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_lease_state` | shared | shared | READ | Show the lease mirror recorded on a task (state, holder, ttl, age, expired) with the lease id always redacted. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_log_emit` | shared | shared | WRITE | Write one structured agent.log event (level, message, scalar fields) to the run log with correlation and task ids; secrets are redacted. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_open_findings` | shared | shared | READ | List the unexpired findings of failing gate verdicts for a task with their gate and issuing agent, most severe first. After a rework the failing verdicts that caused it are included and flagged stale: true; a newer verdict of the same gate replaces them. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_open_questions` | shared | shared | READ | List unresolved questions for a task: the needs of upstream results still waiting and the open questions of its handover. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_route_check` | shared | shared | READ | Say whether ACP allows a message type from one agent to another, from the live agents.json routing matrix, and why not. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_scratchpad_get` | shared | shared | READ | Read one scratchpad key, or list every key with its owner, version, size and update time. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_scratchpad_put` | shared | shared | WRITE | Store a JSON object under a key in the per-correlation scratchpad (8 KiB value, 64 keys, owner-only overwrite unless shared, optional if_version compare-and-swap). | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_status_report` | shared | shared | WRITE | Record the caller's progress, blocked or done status for its own task and emit swarm.run.activity for the live bar. | A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15 | `tests/generated/test_tool_contracts.py` |
+| `shared_toolchain` | shared | shared | READ | Detect which language toolchains are present, as code_checks does for backend and frontend. | A05, A06 | `tests/generated/test_tool_contracts.py` |
+| `shared_verdict` | shared | shared | READ | Derive pass or fail from finding severities using the same rule as the gate scripts. | A02, A03, A04, A08, A09, A10, A11, A12 | `tests/generated/test_tool_contracts.py` |
+| `ux_ac_trace_check` | A04 | lane | READ | Trace acceptance-criterion ids to per-screen ux.spec acceptance_refs both ways by id; unlike shared_dod_check it matches no evidence text, it finds uncovered ACs, unknown refs and orphan screens. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_breakpoint_order_check` | A04 | lane | READ | Check responsive breakpoints have unique names and strictly ascending minimum widths in the declared order. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_contrast` | A04 | lane | READ | Compute the WCAG contrast ratio for a foreground and background hex pair; the ratio is truncated, never rounded up, to two decimals so it cannot cross the 3, 4.5 or 7 thresholds. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_focus_contrast_check` | A04 | lane | READ | Check focus indicator contrast against each adjacent surface meets the required non-text contrast ratio. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_motion_duration_check` | A04 | lane | READ | Check animation durations stay within a bound and that each animation offers a reduced-motion variant. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_scale_monotonic_check` | A04 | lane | READ | Check that a colour tone scale is strictly monotonic in WCAG relative luminance in the stated order. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_spacing_scale_check` | A04 | lane | READ | Check spacing values are integer multiples of a base unit and report the multiplier of each on-scale value. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_spec_completeness_check` | A04 | lane | READ | Check one ux.spec against the output_format shape: required fields, fidelity and version values, required states, focus order against interactive ids, AC refs and contrast floor. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_state_coverage_check` | A04 | lane | READ | Check that every required component state family is declared, treating dotted sub-states such as error.network as covering error. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_target_size_check` | A04 | lane | READ | Check interactive targets against the WCAG 2.2 SC 2.5.8 24 CSS px minimum, including the spacing exception. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_token_name_check` | A04 | lane | READ | Check design token names against the kebab-case dot-path convention, depth limit, allowed roots and duplicates. | A04 | `tests/generated/test_tool_contracts.py` |
+| `ux_token_semver_impact` | A04 | lane | READ | Diff two flat design-token maps and name the semver bump, next version, and removed tokens that still lack a deprecation alias; a breaking change is L3. | A04 | `tests/generated/test_tool_contracts.py` |
 
 ## By category
 
 ### lane
 
 - `arch_adr_slug` (A03)
+- `arch_adr_supersession` (A03)
+- `arch_adr_transition` (A03)
+- `arch_breaking_readiness` (A03)
+- `arch_c4_fanout` (A03)
 - `arch_contract_ops` (A03)
+- `arch_cycle_check` (A03)
+- `arch_field_breaks` (A03)
+- `arch_layer_violations` (A03)
+- `arch_nfr_allocation` (A03)
+- `arch_nfr_budget` (A03)
+- `arch_semver_bump` (A03)
+- `be_acceptance_coverage` (A05)
+- `be_coverage_delta` (A05)
+- `be_dependency_class` (A05)
+- `be_license_allowlist_check` (A05)
+- `be_method_status_check` (A05)
+- `be_openapi_path_params` (A05)
+- `be_patch_shape_check` (A05)
+- `be_perf_regression` (A05)
+- `be_route_auth_coverage` (A05)
+- `be_route_collision` (A05)
 - `be_route_norm` (A05)
+- `be_semver_range_class` (A05)
+- `data_contract_field_compat` (A07)
+- `data_destructive_ddl_scan` (A07)
 - `data_down_present` (A07)
+- `data_explain_regression_check` (A07)
+- `data_fk_cycle_check` (A07)
+- `data_index_name_check` (A07)
+- `data_lock_risk_scan` (A07)
+- `data_migration_version_order` (A07)
+- `data_not_null_default_check` (A07)
+- `data_pii_tag_coverage` (A07)
+- `data_reversible_pair_check` (A07)
+- `data_row_count_reconcile` (A07)
 - `devops_build_systems` (A11)
+- `devops_change_gate` (A11)
 - `devops_ci_kind` (A11)
+- `devops_cost_overrun` (A11)
+- `devops_deploy_gate` (A11)
+- `devops_drift_count` (A11)
+- `devops_env_tier` (A11)
+- `devops_freeze_window` (A11)
+- `devops_image_tag_check` (A11)
+- `devops_provenance_gate` (A11)
+- `devops_rollback_target` (A11)
+- `devops_tf_blast_radius` (A11)
+- `docs_adr_render_coverage` (A15)
+- `docs_anchor_check` (A15)
+- `docs_api_endpoint_coverage` (A15)
+- `docs_changelog_section_order` (A15)
+- `docs_conventional_groups` (A15)
+- `docs_digest_staleness` (A15)
+- `docs_flesch_grade` (A15)
 - `docs_heading_order` (A15)
+- `docs_link_targets` (A15)
+- `docs_runbook_schema_check` (A15)
+- `docs_runbook_verified_ratio` (A15)
+- `docs_stale_doc_age` (A15)
+- `docs_terminology_drift` (A15)
 - `fe_a11y_scan` (A06)
+- `fe_alt_text_check` (A06)
+- `fe_bundle_budget_check` (A06)
+- `fe_client_security_scan` (A06)
+- `fe_cwv_budget_check` (A06)
+- `fe_form_label_check` (A06)
+- `fe_heading_sequence_check` (A06)
+- `fe_prop_type_coverage` (A06)
+- `fe_state_parity_check` (A06)
+- `fe_tab_order_check` (A06)
+- `fe_target_size_check` (A06)
+- `fe_token_literal_scan` (A06)
+- `maint_changelog_check` (A14)
+- `maint_debt_priority` (A14)
+- `maint_eol_distance` (A14)
+- `maint_hotfix_decision` (A14)
+- `maint_license_change` (A14)
+- `maint_patch_deadline` (A14)
+- `maint_patch_priority` (A14)
+- `maint_semver_bump` (A14)
 - `maint_spec_pin` (A14)
+- `maint_stale_age` (A14)
+- `maint_unpinned_count` (A14)
+- `maint_version_affected` (A14)
+- `obs_alert_fatigue` (A13)
+- `obs_budget_remaining` (A13)
+- `obs_cardinality_estimate` (A13)
+- `obs_dashboard_staleness` (A13)
 - `obs_error_burn` (A13)
+- `obs_escalation_due` (A13)
+- `obs_incident_mttd_mttr` (A13)
+- `obs_ingestion_lag_p95` (A13)
+- `obs_mitigation_gate` (A13)
+- `obs_multiwindow_alert` (A13)
+- `obs_probe_availability` (A13)
+- `obs_runbook_link_coverage` (A13)
+- `orch_assign` (A01)
 - `orch_budget_class` (A01)
+- `orch_budget_guard` (A01)
+- `orch_dag_blocked` (A01)
 - `orch_dag_order` (A01)
+- `orch_dispatch_batch` (A01)
+- `orch_gate_coverage` (A01)
+- `orch_plan` (A01)
+- `orch_reconcile` (A01)
 - `orch_registry_ping` (A01)
+- `orch_rework_bound` (A01)
+- `orch_run` (A01)
+- `qa_criteria_coverage` (A08)
+- `qa_defect_dedupe` (A08)
+- `qa_defect_escape_rate` (A08)
+- `qa_finding_shape_check` (A08)
+- `qa_flaky_classify` (A08)
+- `qa_mutation_gate` (A08)
+- `qa_name_convention` (A08)
+- `qa_retry_budget` (A08)
 - `qa_runner_detect` (A08)
+- `qa_runtime_p95` (A08)
+- `qa_skip_ratio` (A08)
+- `qa_tier_plan` (A08)
 - `rel_canary_steps` (A12)
+- `rel_canary_verdict` (A12)
+- `rel_change_failure_rate` (A12)
+- `rel_deploy_frequency` (A12)
+- `rel_freeze_decision` (A12)
+- `rel_gate_freshness` (A12)
+- `rel_gate_order_check` (A12)
+- `rel_guardrail_breaches` (A12)
+- `rel_lead_time_p95` (A12)
+- `rel_release_record_check` (A12)
+- `rel_resume_point` (A12)
+- `rel_rollback_trigger` (A12)
+- `req_ambiguity_scan` (A02)
+- `req_change_impact` (A02)
+- `req_clarification_window` (A02)
+- `req_conflict_matrix` (A02)
+- `req_criteria_testability` (A02)
 - `req_gwt_check` (A02)
+- `req_invest_score` (A02)
+- `req_nfr_coverage` (A02)
+- `req_pii_scan` (A02)
+- `req_story_duplicates` (A02)
+- `req_traceability_coverage` (A02)
+- `req_wsjf_rank` (A02)
+- `rev_auto_approve_check` (A09)
+- `rev_comment_density` (A09)
 - `rev_diff_size` (A09)
+- `rev_false_approve_rate` (A09)
+- `rev_review_latency_p95` (A09)
+- `rev_risk_tier` (A09)
+- `rev_rule_dispute_flag` (A09)
+- `rev_sensitive_paths` (A09)
+- `rev_severity_histogram` (A09)
+- `rev_test_pairing` (A09)
+- `rev_unresolved_threads` (A09)
+- `rev_verdict_shape` (A09)
+- `sec_allowlist_check` (A10)
+- `sec_credential_scan` (A10)
+- `sec_cvss_band` (A10)
+- `sec_dependency_age` (A10)
+- `sec_finding_dedup` (A10)
+- `sec_header_presence` (A10)
+- `sec_kev_match_count` (A10)
+- `sec_license_risk` (A10)
 - `sec_line_entropy` (A10)
+- `sec_sbom_diff` (A10)
+- `sec_sbom_summary` (A10)
+- `sec_tls_min_version` (A10)
+- `ux_ac_trace_check` (A04)
+- `ux_breakpoint_order_check` (A04)
 - `ux_contrast` (A04)
+- `ux_focus_contrast_check` (A04)
+- `ux_motion_duration_check` (A04)
+- `ux_scale_monotonic_check` (A04)
+- `ux_spacing_scale_check` (A04)
+- `ux_spec_completeness_check` (A04)
+- `ux_state_coverage_check` (A04)
+- `ux_target_size_check` (A04)
+- `ux_token_name_check` (A04)
+- `ux_token_semver_impact` (A04)
 
 ### shared
 
+- `shared_artifact_check` (shared)
+- `shared_artifact_digest` (shared)
+- `shared_attempt_history` (shared)
+- `shared_cancel_check` (shared)
 - `shared_check_plan` (shared)
+- `shared_dod_check` (shared)
+- `shared_escalate` (shared)
+- `shared_escalation_owner` (shared)
 - `shared_git_head` (shared)
+- `shared_handover_bundle` (shared)
+- `shared_handover_read` (shared)
+- `shared_handover_receipt` (shared)
+- `shared_handover_validate` (shared)
+- `shared_handover_verify` (shared)
+- `shared_handover_write` (shared)
+- `shared_lease_state` (shared)
+- `shared_log_emit` (shared)
+- `shared_open_findings` (shared)
+- `shared_open_questions` (shared)
+- `shared_route_check` (shared)
+- `shared_scratchpad_get` (shared)
+- `shared_scratchpad_put` (shared)
+- `shared_status_report` (shared)
 - `shared_toolchain` (shared)
 - `shared_verdict` (shared)
 
@@ -68,101 +434,273 @@ Registered tools: 23. Shared tools: 4.
 - `orch_registry_ping` (A01)
 - `orch_dag_order` (A01)
 - `orch_budget_class` (A01)
+- `orch_plan` (A01)
+- `orch_run` (A01)
+- `orch_reconcile` (A01)
+- `orch_assign` (A01)
+- `orch_dag_blocked` (A01)
+- `orch_gate_coverage` (A01)
+- `orch_rework_bound` (A01)
+- `orch_dispatch_batch` (A01)
+- `orch_budget_guard` (A01)
+
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`.
 
 ### A02 `a02-requirements`
 
 - `req_gwt_check` (A02)
+- `req_invest_score` (A02)
+- `req_ambiguity_scan` (A02)
+- `req_story_duplicates` (A02)
+- `req_wsjf_rank` (A02)
+- `req_criteria_testability` (A02)
+- `req_traceability_coverage` (A02)
+- `req_change_impact` (A02)
+- `req_nfr_coverage` (A02)
+- `req_pii_scan` (A02)
+- `req_clarification_window` (A02)
+- `req_conflict_matrix` (A02)
 
-Shared: `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A03 `a03-architect`
 
 - `arch_adr_slug` (A03)
 - `arch_contract_ops` (A03)
+- `arch_semver_bump` (A03)
+- `arch_field_breaks` (A03)
+- `arch_layer_violations` (A03)
+- `arch_cycle_check` (A03)
+- `arch_c4_fanout` (A03)
+- `arch_adr_transition` (A03)
+- `arch_nfr_budget` (A03)
+- `arch_nfr_allocation` (A03)
+- `arch_breaking_readiness` (A03)
+- `arch_adr_supersession` (A03)
 
-Shared: `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A04 `a04-ux-designer`
 
 - `ux_contrast` (A04)
+- `ux_token_name_check` (A04)
+- `ux_target_size_check` (A04)
+- `ux_scale_monotonic_check` (A04)
+- `ux_spacing_scale_check` (A04)
+- `ux_state_coverage_check` (A04)
+- `ux_focus_contrast_check` (A04)
+- `ux_motion_duration_check` (A04)
+- `ux_breakpoint_order_check` (A04)
+- `ux_token_semver_impact` (A04)
+- `ux_spec_completeness_check` (A04)
+- `ux_ac_trace_check` (A04)
 
-Shared: `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A05 `a05-backend`
 
 - `be_route_norm` (A05)
+- `be_openapi_path_params` (A05)
+- `be_route_collision` (A05)
+- `be_method_status_check` (A05)
+- `be_semver_range_class` (A05)
+- `be_license_allowlist_check` (A05)
+- `be_coverage_delta` (A05)
+- `be_acceptance_coverage` (A05)
+- `be_perf_regression` (A05)
+- `be_dependency_class` (A05)
+- `be_route_auth_coverage` (A05)
+- `be_patch_shape_check` (A05)
 
-Shared: `shared_check_plan`, `shared_toolchain`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_check_plan`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_toolchain`.
 
 ### A06 `a06-frontend`
 
 - `fe_a11y_scan` (A06)
+- `fe_heading_sequence_check` (A06)
+- `fe_alt_text_check` (A06)
+- `fe_form_label_check` (A06)
+- `fe_tab_order_check` (A06)
+- `fe_bundle_budget_check` (A06)
+- `fe_prop_type_coverage` (A06)
+- `fe_target_size_check` (A06)
+- `fe_token_literal_scan` (A06)
+- `fe_state_parity_check` (A06)
+- `fe_cwv_budget_check` (A06)
+- `fe_client_security_scan` (A06)
 
-Shared: `shared_check_plan`, `shared_toolchain`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_check_plan`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_toolchain`.
 
 ### A07 `a07-data`
 
 - `data_down_present` (A07)
+- `data_destructive_ddl_scan` (A07)
+- `data_not_null_default_check` (A07)
+- `data_index_name_check` (A07)
+- `data_fk_cycle_check` (A07)
+- `data_pii_tag_coverage` (A07)
+- `data_contract_field_compat` (A07)
+- `data_row_count_reconcile` (A07)
+- `data_migration_version_order` (A07)
+- `data_reversible_pair_check` (A07)
+- `data_lock_risk_scan` (A07)
+- `data_explain_regression_check` (A07)
+
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`.
 
 ### A08 `a08-qa`
 
 - `qa_runner_detect` (A08)
+- `qa_flaky_classify` (A08)
+- `qa_criteria_coverage` (A08)
+- `qa_mutation_gate` (A08)
+- `qa_runtime_p95` (A08)
+- `qa_skip_ratio` (A08)
+- `qa_defect_escape_rate` (A08)
+- `qa_retry_budget` (A08)
+- `qa_name_convention` (A08)
+- `qa_tier_plan` (A08)
+- `qa_finding_shape_check` (A08)
+- `qa_defect_dedupe` (A08)
 
-Shared: `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A09 `a09-reviewer`
 
 - `rev_diff_size` (A09)
+- `rev_sensitive_paths` (A09)
+- `rev_auto_approve_check` (A09)
+- `rev_review_latency_p95` (A09)
+- `rev_severity_histogram` (A09)
+- `rev_false_approve_rate` (A09)
+- `rev_comment_density` (A09)
+- `rev_test_pairing` (A09)
+- `rev_unresolved_threads` (A09)
+- `rev_risk_tier` (A09)
+- `rev_verdict_shape` (A09)
+- `rev_rule_dispute_flag` (A09)
 
-Shared: `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A10 `a10-security`
 
 - `sec_line_entropy` (A10)
+- `sec_credential_scan` (A10)
+- `sec_cvss_band` (A10)
+- `sec_dependency_age` (A10)
+- `sec_license_risk` (A10)
+- `sec_tls_min_version` (A10)
+- `sec_header_presence` (A10)
+- `sec_kev_match_count` (A10)
+- `sec_sbom_summary` (A10)
+- `sec_finding_dedup` (A10)
+- `sec_allowlist_check` (A10)
+- `sec_sbom_diff` (A10)
 
-Shared: `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A11 `a11-devops`
 
 - `devops_ci_kind` (A11)
 - `devops_build_systems` (A11)
+- `devops_env_tier` (A11)
+- `devops_change_gate` (A11)
+- `devops_drift_count` (A11)
+- `devops_cost_overrun` (A11)
+- `devops_image_tag_check` (A11)
+- `devops_freeze_window` (A11)
+- `devops_provenance_gate` (A11)
+- `devops_deploy_gate` (A11)
+- `devops_rollback_target` (A11)
+- `devops_tf_blast_radius` (A11)
 
-Shared: `shared_git_head`, `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_git_head`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A12 `a12-release`
 
 - `rel_canary_steps` (A12)
+- `rel_canary_verdict` (A12)
+- `rel_rollback_trigger` (A12)
+- `rel_release_record_check` (A12)
+- `rel_change_failure_rate` (A12)
+- `rel_deploy_frequency` (A12)
+- `rel_lead_time_p95` (A12)
+- `rel_gate_order_check` (A12)
+- `rel_gate_freshness` (A12)
+- `rel_freeze_decision` (A12)
+- `rel_resume_point` (A12)
+- `rel_guardrail_breaches` (A12)
 
-Shared: `shared_git_head`, `shared_verdict`.
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_git_head`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`, `shared_verdict`.
 
 ### A13 `a13-observability`
 
 - `obs_error_burn` (A13)
+- `obs_multiwindow_alert` (A13)
+- `obs_budget_remaining` (A13)
+- `obs_alert_fatigue` (A13)
+- `obs_incident_mttd_mttr` (A13)
+- `obs_ingestion_lag_p95` (A13)
+- `obs_dashboard_staleness` (A13)
+- `obs_runbook_link_coverage` (A13)
+- `obs_cardinality_estimate` (A13)
+- `obs_probe_availability` (A13)
+- `obs_mitigation_gate` (A13)
+- `obs_escalation_due` (A13)
+
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`.
 
 ### A14 `a14-maintenance`
 
 - `maint_spec_pin` (A14)
+- `maint_patch_priority` (A14)
+- `maint_patch_deadline` (A14)
+- `maint_semver_bump` (A14)
+- `maint_eol_distance` (A14)
+- `maint_unpinned_count` (A14)
+- `maint_stale_age` (A14)
+- `maint_debt_priority` (A14)
+- `maint_license_change` (A14)
+- `maint_changelog_check` (A14)
+- `maint_hotfix_decision` (A14)
+- `maint_version_affected` (A14)
+
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`.
 
 ### A15 `a15-docs`
 
 - `docs_heading_order` (A15)
+- `docs_link_targets` (A15)
+- `docs_anchor_check` (A15)
+- `docs_changelog_section_order` (A15)
+- `docs_conventional_groups` (A15)
+- `docs_api_endpoint_coverage` (A15)
+- `docs_flesch_grade` (A15)
+- `docs_stale_doc_age` (A15)
+- `docs_runbook_verified_ratio` (A15)
+- `docs_adr_render_coverage` (A15)
+- `docs_runbook_schema_check` (A15)
+- `docs_digest_staleness` (A15)
+- `docs_terminology_drift` (A15)
+
+Shared: `shared_artifact_check`, `shared_artifact_digest`, `shared_attempt_history`, `shared_cancel_check`, `shared_dod_check`, `shared_escalate`, `shared_escalation_owner`, `shared_handover_bundle`, `shared_handover_read`, `shared_handover_receipt`, `shared_handover_validate`, `shared_handover_verify`, `shared_handover_write`, `shared_lease_state`, `shared_log_emit`, `shared_open_findings`, `shared_open_questions`, `shared_route_check`, `shared_scratchpad_get`, `shared_scratchpad_put`, `shared_status_report`.
 
 ## Agents
 
 | Agent | Lane tools | Shared tools used |
 | --- | --- | --- |
-| A01 `a01-orchestrator` | 3 | 0 |
-| A02 `a02-requirements` | 1 | 1 |
-| A03 `a03-architect` | 2 | 1 |
-| A04 `a04-ux-designer` | 1 | 1 |
-| A05 `a05-backend` | 1 | 2 |
-| A06 `a06-frontend` | 1 | 2 |
-| A07 `a07-data` | 1 | 0 |
-| A08 `a08-qa` | 1 | 1 |
-| A09 `a09-reviewer` | 1 | 1 |
-| A10 `a10-security` | 1 | 1 |
-| A11 `a11-devops` | 2 | 2 |
-| A12 `a12-release` | 1 | 2 |
-| A13 `a13-observability` | 1 | 0 |
-| A14 `a14-maintenance` | 1 | 0 |
-| A15 `a15-docs` | 1 | 0 |
+| A01 `a01-orchestrator` | 12 | 21 |
+| A02 `a02-requirements` | 12 | 22 |
+| A03 `a03-architect` | 12 | 22 |
+| A04 `a04-ux-designer` | 12 | 22 |
+| A05 `a05-backend` | 12 | 23 |
+| A06 `a06-frontend` | 12 | 23 |
+| A07 `a07-data` | 12 | 21 |
+| A08 `a08-qa` | 12 | 22 |
+| A09 `a09-reviewer` | 12 | 22 |
+| A10 `a10-security` | 12 | 22 |
+| A11 `a11-devops` | 12 | 23 |
+| A12 `a12-release` | 12 | 23 |
+| A13 `a13-observability` | 12 | 21 |
+| A14 `a14-maintenance` | 12 | 21 |
+| A15 `a15-docs` | 13 | 21 |

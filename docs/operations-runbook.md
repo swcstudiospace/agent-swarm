@@ -1,8 +1,8 @@
 # Operations runbook
 
-Commands assume the repo root. The registry command is `python3 -m swarm.tool_registry`. Docs and contract tests are generated; do not hand-edit `docs/tools/` or `tests/generated/test_tool_contracts.py`.
+Commands assume the repo root. The registry command is `python3 -m swarm.tool_registry`. Docs and contract tests are generated; do not hand-edit `docs/tools/`, `docs/skills/` or `tests/generated/test_tool_contracts.py`. The v2.2 runtime (scheduler, telemetry, handover, skills, bar) is described in [swarm-command-center.md](swarm-command-center.md).
 
-CI (`.github/workflows/ci.yml`) runs `check`, `docs --check`, and `gen-tests --check` on every push and pull request. `.pre-commit-config.yaml` runs the same three checks before a commit when the hook is installed. Both checks are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
+CI (`.github/workflows/ci.yml`) runs `ruff`, `pytest`, `build_agents.py --check`, the tool registry `check`, `docs --check` and `gen-tests --check`, the skill registry `check` and `docs --check`, `scripts/_registry_intake.py --check`, and both TS suites on every push and pull request. `.pre-commit-config.yaml` runs the registry, skill and intake checks (not the TS suites or pytest) before a commit when the hook is installed. Both are read-only: drift fails instead of silently regenerating files. CI remains the enforced branch gate.
 
 ## Enable the commit-time drift gate
 
@@ -25,8 +25,9 @@ The raw shell scanners retain literal spans by index, and plain unquoted words a
 
 ## Private signer bootstrap
 
+
 Use an existing operator-provisioned signer; never print it or paste it into an agent prompt.
-The trusted signer accepts `SWARM_ED25519_KEY_FILE`, or the conventional
+The trusted signer accepts `SWARM_ED25519_KEY_FILE` (an absolute path; relative paths are rejected), or the conventional
 `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when raw signing variables are unset.
 The file must be owned by the controller user, have no group/world permissions, and contain
 exactly a 64-hex Ed25519 seed with an optional final newline. Symlink components, nonregular
@@ -47,6 +48,14 @@ OMP receives separate `SWARM_SIGNER_DENY_PATHS` metadata so its guard also prote
 controller key locations. This deny-only policy cannot load a signer, grants no authority,
 and is excluded from prompts, argv, and dry-run diagnostics.
 
+After leasing a specialist task `IN_PROGRESS`, A01 obtains its exact canonical prompt with
+`swarm_assignment({task_id, correlation_id})`. The fixed `orch_assign` operation verifies
+the persisted task/correlation/manifest target and real signature without changing state,
+attempts, history, or logs. Only A01 can call it; no arbitrary code, envelope, agent, payload,
+key, or path is accepted. Pass the verified prompt unchanged to the specialist.
+Missing, unleased, child/advisory, mismatched, and dry-run requests fail closed.
+Generic code-execution devices remain forbidden; this operation is not an eval exception.
+
 Use normal OMP `write` approvals or `--approval-mode always-ask`; do not substitute a bypass.
 Grok's unsupported headless transport is rejected before claims. The lexical shell guard protects
 deterministically resolved signer reads, but is not an OS sandbox for opaque code or symlink aliases.
@@ -54,26 +63,21 @@ Run only trusted controller code and preserve normal approvals. Restart the OMP 
 updated extension code; changing a separate shell cannot refresh an already-running host.
 
 
-## Add a lane tool
+## Add a tool or a skill
 
-1. Pick the owner agent and the prefix from the manifest (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`). The name must be unique.
-2. Add a handler `call`-style function under `swarm/tools/`. The registry imports it only through `call`.
-3. Append a `swarm.tool.v1` object to that agent's `registered_tools` in `agents.json`: purpose, input and output schemas, the five error states, `timeout_s`, idempotency, `permitted_callers`, `entrypoint`, `handler`, and examples for success, invalid input, an unauthorized caller, dependency, timeout, and partial success.
-4. `python3 -m swarm.tool_registry check`
-5. `python3 -m swarm.tool_registry docs` and `python3 -m swarm.tool_registry gen-tests`
-6. `python3 -m pytest -o addopts='' tests/generated/test_tool_contracts.py tests/test_lane_tools.py`
+Tools and skills are added through intake fragments, never by editing `agents.json` by hand. Full steps with the field list and limits are in [swarm-command-center.md](swarm-command-center.md) (sections 9.2 and 9.3). In short:
 
-Counts below 8 are normal. Do not invent tools to fill the table. Write the reason in the phase dedup notes.
+1. Handler `fn(payload) -> dict` in `swarm/tools/aNN_tools.py`, wrapped by `support.respond`. Owner prefix from `PREFIX` in `swarm/tool_registry.py` (`orch_`, `req_`, `arch_`, `ux_`, `be_`, `fe_`, `data_`, `qa_`, `rev_`, `sec_`, `devops_`, `rel_`, `obs_`, `maint_`, `docs_`, `shared_`).
+2. Fragment `registry/intake/<slug>.tools.json` (complete `swarm.tool.v1` entries; `<slug>` may be `shared`), and `registry/intake/grants.json` for extra callers of an existing tool.
+3. `python3 scripts/_registry_intake.py --check`, then `--apply`.
+4. `python3 -m swarm.tool_registry check`, `docs`, `gen-tests`, then `python3 scripts/build_agents.py`.
+5. `python3 -m pytest -o addopts='' tests/generated/test_tool_contracts.py tests/test_capability_acceptance.py tests/test_tools_aNN.py tests/test_tools_aNN_existing.py` (the second file exists for the v2.1 tools of that agent; a new agent gets only `test_tools_aNN.py`). Tests never write into the checkout's `.swarm/`: `tests/conftest.py` gives each test its own `SWARM_DIR`.
 
-## Add a shared tool
+A skill is `prompts/skills/<owner>/<short>.md`: `python3 -m swarm.skill_registry check`, then `python3 scripts/build_agents.py`, `python3 scripts/_write_skills.py` and `python3 -m swarm.skill_registry docs`.
 
-Same contract, with three differences:
+Each agent holds 10 to 15 lane tools and 10 to 15 skills (`agents.json` `capability_policy`); the check fails outside that range. Do not invent tools or skills to reach a count: each needs a purpose, a contract and a test.
 
-- `owner` is `shared` and the name starts with `shared_`.
-- The object goes in top-level `shared_tools`, not on an agent.
-- `permitted_callers` lists at least two agent ids that already perform this operation. A one-caller helper stays a lane tool.
-
-Then regenerate docs and contract tests the same way. The catalog groups the new row under `### shared` and under each permitted agent.
+A shared tool has `owner: shared`, a `shared_` name and goes to `shared_tools` (the merge puts it there). `shared_baseline` tools must permit all 15 agents (validated). For any other shared tool, list the agents that already perform the operation; by convention a one-caller helper stays a lane tool (not validated).
 
 ## Change ACP permissions
 
@@ -112,6 +116,100 @@ python3 -m swarm.tool_registry docs
 python3 -m swarm.tool_registry gen-tests
 python3 -m swarm.tool_registry docs --check
 python3 -m swarm.tool_registry gen-tests --check
+python3 -m swarm.skill_registry docs
+python3 -m swarm.skill_registry docs --check
 ```
 
-`--check` exits 1 and prints the drifted paths. Commit the regenerated catalog, agent pages, and contract tests together. The pages always contain identity, handoffs, lane tools, shared tools, the ACP profile, and degradation. Empty lanes say so in a sentence; they do not use placeholder headings.
+`--check` exits 1 and prints the drifted paths. Commit the regenerated catalog, agent pages, and contract tests together. The pages always contain identity, handoffs, lane tools, shared tools, the ACP profile, and degradation. Empty lanes say so in a sentence; they do not use placeholder headings. The skill docs (`docs/skills/catalog.md`, `docs/skills/agents/<owner>.md`) are generated the same way.
+
+## Skill regeneration
+
+Sources are `prompts/skills/<owner>/<short>.md`; everything under `omp/skills/` and `skills/` is generated.
+
+```bash
+python3 -m swarm.skill_registry check        # names, tools, sections, counts, near-duplicates; one message per problem
+python3 scripts/build_agents.py              # omp/skills/<name>/SKILL.md (hidden) and each agent's index skill
+python3 scripts/_write_skills.py             # skills/** and omp/skills/**; validates first, writes nothing on an error
+python3 -m swarm.skill_registry docs         # docs/skills/**
+python3 scripts/build_agents.py --check      # drift gate
+```
+
+`build_agents.py` refuses an autoload name that has no generated skill. A skill the check rejects is not rendered. If `check` reports `names no tool or script it uses`, every numbered step of `## Procedure` must cite a registry tool from `tools:` or a host tool (`read`, `grep`, `bash`, ...).
+
+## Registry intake
+
+`registry/intake/` holds fragments that are not yet in `agents.json`: `<slug>.tools.json` (array of tool entries) and `grants.json` (`{tool: [agent ids]}`). Normally it is empty.
+
+```bash
+python3 scripts/_registry_intake.py --check   # validate the registry as it would be after the merge; changes nothing
+python3 scripts/_registry_intake.py --apply   # merge into agents.json, then delete the applied fragments
+```
+
+- Both modes print every error and exit non-zero; `--apply` then changes nothing (no byte of `agents.json`, no fragment).
+- `--apply` holds an exclusive `flock` on `registry/intake/.lock` from planning to the last delete. Two applies queue; the lock dies with the process, so a leftover `.lock` file is harmless and never needs deleting.
+- A fragment edited while an apply runs is kept for the next run. A crash between the `agents.json` write and the delete is repaired by the next run (the already merged fragment is reported as applied and removed).
+- After `--apply` run the tool-registry `check`, `docs`, `gen-tests` and `scripts/build_agents.py` (see above); unauthorized-caller examples are rewritten by the merge when a grant makes the old probe an authorized caller.
+
+## Read `live.json`
+
+`<swarm_dir>/live.json` (schema `swarm.live.v1`) is what the bar and `scripts/swarm_live.py` read.
+
+```bash
+python3 scripts/swarm_live.py                 # table; first line is the swarm summary
+python3 scripts/swarm_live.py --json          # {"source": "live.json" | "task-store", "live": {...}}
+python3 -c 'from swarm.telemetry import read_live; print(read_live())'   # None when absent or malformed
+```
+
+- `swarm.state` is `idle` (no runs), `running` (any run running, handing off, starting, queued or waiting), `failed` (nothing live and a run failed or timed out) or `completed`. `queued` counts queued and starting runs, `running` counts running and handing-off runs. `max_parallel` is the cap, `effective_parallel` the cap after the rate-limit and failure-circuit steps; `degraded` names the active fallback or is `null`.
+- Per run: `elapsed_s` (counted from the queue time, restarted when the process starts), `state_elapsed_s` in the current state, `since_activity_s` since the last tool or turn (omp reports tools; claude and grok are pinged), `stalled`, `activity`, `last_tool`, `error`. Values are producer-monotonic as of `updated_wall`; do not subtract wall clocks to get elapsed time.
+- `source: task-store` means no scheduler wrote a fresh file (older than three heartbeats, i.e. `3 x SWARM_HEARTBEAT_S`): the view was derived from the Task Store and `events.jsonl`. `producer` in the file tells who wrote it: `scheduler` or `derived`.
+- A missing file is normal before the first run or transition. A file that never changes while tasks are `IN_PROGRESS` means the runner is gone; check `pgrep -af swarm_run.py`.
+- The omp bar picks up a `live.json` written by another process (a detached run, a second terminal) within `SWARM_BAR_IDLE_POLL_MS` (default 2000 ms, clamped 500..30000): while idle it only `stat`s the file at that period, and the full read and redraw run only when the file changed.
+
+## Stalled agent
+
+1. `python3 scripts/swarm_live.py`. A row marked `stalled` is `running` with no activity for longer than `SWARM_STALL_AFTER_S` (180 s). Only omp sessions stream activity; claude and grok sessions are pinged while their process lives and do not read as stalled, so for them use `--task-timeout`.
+2. Read the evidence: `grep swarm.run.stalled "$SWARM_DIR/events.jsonl"` (one event per stall episode, with `since_activity_s`), the last `swarm.run.activity` of that `run_id`, and `results/<task_id>.a<N>.md` (partial output; the runner redacts secrets from it before writing, so a `[REDACTED]` there is expected; the redactor is best effort, see "Redaction" in [swarm-command-center.md](swarm-command-center.md), so treat the file as sensitive and do not paste it into tickets unreviewed).
+3. A session that is busy but quiet (one long tool call) is not broken: raise `SWARM_STALL_AFTER_S` for that run instead of killing it.
+4. A wedged session is ended by `--task-timeout` (default 1800 s): its process group gets SIGTERM, then SIGKILL after 10 s, the partial output is kept and the task fails `E-TIMEOUT` and is retried while attempts remain. To end it sooner, cancel the swarm (next section).
+5. After a hard kill, tasks may be left `IN_PROGRESS` with `notes.running`; the next `swarm_run.py` fails them `E-TIMEOUT: stranded` once `notes.running_deadline` has passed and retries them.
+
+## Cancel a swarm
+
+```bash
+kill -TERM <runner pid>        # or SIGINT / SIGHUP; a second signal skips the wait and kills at once
+python3 scripts/swarm_run.py --repo /path/to/codebase --swarm-timeout 3600   # cancel by itself after an hour
+```
+
+1. The runner writes `<swarm_dir>/cancel/<correlation_id>` (`{requested_wall, reason, grace_s}`) and dispatches nothing new. Sessions that call `shared_cancel_check` see it and hand over what exists (`swarm-cooperative-cancel`).
+2. After the wait the runner kills the remaining process groups (SIGTERM, then SIGKILL) and ends every run record (`cancelled`, or `timeout` for `--swarm-timeout`). Unfinished tasks end FAILED with `E-TIMEOUT: runner shutdown` (or `swarm timeout`) and are retried on the next run. The runner exits `128 + signal`.
+3. The wait is `min(SWARM_CANCEL_GRACE_S, SWARM_SHUTDOWN_BUDGET_S - 8)` seconds: 7 s with the defaults 10 and 15. Raise `SWARM_SHUTDOWN_BUDGET_S` (not only the grace) to lengthen it. `hooks/autonomous_run.py` sets the budget from `SWARM_AUTONOMOUS_RUN_GRACE_S` (15) and SIGTERMs the runner at `SWARM_AUTONOMOUS_RUN_CAP_S` (3600).
+4. Confirm nothing is left: `pgrep -af 'omp -p|claude -p'` shows no session of this run, and `python3 scripts/orch_status.py` shows no task you did not expect in `IN_PROGRESS`. The flag is removed when the runner exits; a stale one is cleared when the next run of that plan starts.
+
+## Rate limits and backpressure
+
+1. A provider rate limit (HTTP 429, "rate limit", "overloaded", `Retry-After`) halves the effective parallelism once per burst (floor 1) and writes `swarm.degraded` with mode `reduced_parallelism`. One slot returns per successful run after `SWARM_RATE_COOLDOWN_S` (60 s); when the cap is whole again the degrade is cleared (`mode: recovered`).
+2. Look: `grep -E 'swarm.degraded|swarm.scheduler.tick' "$SWARM_DIR/events.jsonl"` (the tick's `effective_parallel` against `max_parallel`, `skipped` with the reason each ready task waits: `no-free-slot`, `class-ceiling:<agent>`, `claim-conflict:<task>`, `lease:<status>`, `backoff:<s>`, `internal-failure`) or the `slots R/L` of the summary line.
+3. The failed run is retried after `notes.retry_after` = capped exponential backoff (`SWARM_RETRY_BASE_S` 2, `SWARM_RETRY_CAP_S` 120, a provider `Retry-After` can lengthen it up to the cap) while attempts remain. A task left in `backoff` is not stuck: the loop sleeps to the earliest retry.
+4. A task that keeps hitting limits: lower the global cap (`--max-parallel 2` or `SWARM_MAX_PARALLEL=2`) rather than raising the cooldown. One failed task does not reduce parallelism (it follows the retry ladder). `SWARM_FAIL_STREAK` (default 3, `0` off) consecutive failures of distinct tasks with no success in between halve it once (`swarm.degraded` with `reason: consecutive_failures`, `mode: reduced_parallelism`); a success resets the streak and recovers one slot after `SWARM_RATE_COOLDOWN_S`.
+5. `SWARM_SCHEDULER=rounds` runs the old per-round barrier if you suspect the continuous scheduler; report what you saw.
+
+## Handover verification failures
+
+`shared_handover_verify {task_id}` (and the bar-less `python3 scripts/swarm_tool.py call --caller A08 --name shared_handover_verify --input '{"task_id": "<id>"}'`) returns `status`, `reasons`, `ready` and `upstream`.
+
+| `status` | Meaning | Fix |
+|---|---|---|
+| `missing` | no file for that task id | Name the producer's task id; a fresh dependent task has none of its own. With every upstream task satisfied nothing was handed over and the task continues from its assignment; with an upstream task still open `swarm-handover-intake` escalates with reason `blocked` |
+| `partial` | no remaining work, no artifacts and `verification.status` unverified | The writer adds `remaining` or `artifacts` and writes again |
+| `stale` | older than `SWARM_HANDOVER_STALE_S` (21600 s), or written under another correlation than the task's plan | Re-run the producer; raise the limit only for a deliberately long pause |
+| `malformed` | invalid schema or digest mismatch (edited or truncated file) | Never edit `handovers/**` by hand; the producer writes a new `seq` |
+
+- `ready` is false while an upstream task is not yet reviewed or approved, whatever the handover says.
+- A write is refused with `INVALID_INPUT` and the field (`/artifacts/0/digest`, `/to_agent`, `from_agent`): `from_agent` must be the calling agent id, ids are agent ids (`A05`), digests are `sha256:` plus 64 hex. If the mandatory sections (`goal`, `remaining`, `blockers`, `open_questions`, `constraints`) alone exceed `SWARM_HANDOVER_MAX_BYTES` (16384) the write is refused: shorten them.
+- A receipt is refused when the digest matches no valid handover of that task id or it is addressed to another agent.
+- Files live in `<swarm_dir>/handovers/<correlation_id>/<task_id>.<seq>.json`; receipts next to them as `<task_id>.receipt.<agent>.<digest16>.json`. `swarm.run.handover` in `events.jsonl` records each write.
+
+## A registry call came back `PARTIAL_SUCCESS` with `output_withheld`
+
+`swarm_tool_call` and `python3 -m swarm.tool_registry call` never return a result larger than `SWARM_TOOL_OUTPUT_MAX_BYTES` (default 262144, clamped 4096..16777216). A larger result is withheld, not truncated: the state is `PARTIAL_SUCCESS` with `completed_fraction: 0.0`, `output_withheld: true`, `output_bytes` (what it would have been), `limit_bytes` and a `message`. Narrow the input (fewer files, a shorter text, a tighter filter) and call again; raise the variable only for one deliberate caller. Related refusals: a `number` input that is NaN or Infinity is `INVALID_INPUT` (`expected a finite number`); a handler result that is not strict JSON is `DEPENDENCY_UNAVAILABLE`. The `swarm.tool.call` audit row (`grep swarm.tool.call "$SWARM_DIR/events.jsonl"`) is written only when `$SWARM_DIR` already exists or the tool is WRITE tier, so a READ call through `python3 -m swarm.tool_registry call` in a fresh workspace leaves no `.swarm/` behind (`scripts/swarm_tool.py` writes its own `script.swarm_tool` row and does create it).

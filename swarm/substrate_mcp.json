@@ -13,6 +13,10 @@
     "grok": {
       "path": ".grok/config.toml",
       "format": "toml"
+    },
+    "cursor": {
+      "path": ".cursor/mcp.json",
+      "format": "json"
     }
   },
   "json": {

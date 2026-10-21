@@ -1,0 +1,760 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "swarm.event v1",
+  "description": "One events.jsonl record written by runlog.emit for a swarm.* runtime event (DESIGN 4.4). Per-type payload fields are required; extra payload fields are allowed.",
+  "type": "object",
+  "required": [
+    "ts",
+    "type",
+    "source",
+    "correlation_id",
+    "task_id",
+    "payload",
+    "msg_id"
+  ],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "enum": [
+        "swarm.run.queued",
+        "swarm.run.started",
+        "swarm.run.state",
+        "swarm.run.activity",
+        "swarm.run.heartbeat",
+        "swarm.run.stalled",
+        "swarm.run.finished",
+        "swarm.run.handover",
+        "swarm.scheduler.tick",
+        "swarm.degraded",
+        "swarm.tool.call"
+      ]
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload": {
+      "type": "object"
+    },
+    "msg_id": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.queued"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "attempt",
+              "priority",
+              "deps",
+              "queue_depth"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "priority": {
+                "type": [
+                  "string",
+                  "number",
+                  "null"
+                ]
+              },
+              "deps": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "queue_depth": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.started"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "attempt",
+              "sid",
+              "runtime",
+              "started_wall",
+              "deadline_wall",
+              "budget_max_wall_s"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "sid": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "runtime": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "started_wall": {
+                "type": "number"
+              },
+              "deadline_wall": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "budget_max_wall_s": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.state"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "from",
+              "to",
+              "event",
+              "reason",
+              "wait_kind"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "from": {
+                "enum": [
+                  "waiting",
+                  "queued",
+                  "starting",
+                  "running",
+                  "handing_off",
+                  "completed",
+                  "failed",
+                  "cancelled",
+                  "timed_out"
+                ]
+              },
+              "to": {
+                "enum": [
+                  "waiting",
+                  "queued",
+                  "starting",
+                  "running",
+                  "handing_off",
+                  "completed",
+                  "failed",
+                  "cancelled",
+                  "timed_out"
+                ]
+              },
+              "event": {
+                "enum": [
+                  "deps_satisfied",
+                  "slot_acquired",
+                  "process_started",
+                  "await_input",
+                  "input_received",
+                  "begin_handoff",
+                  "handoff_done",
+                  "finish_ok",
+                  "finish_error",
+                  "cancel",
+                  "deadline_exceeded"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "wait_kind": {
+                "enum": [
+                  "dependency",
+                  "input",
+                  null
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.activity"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "tool",
+              "text",
+              "tool_calls",
+              "turns",
+              "tokens"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "tool": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tool_calls": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "turns": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tokens": {
+                "type": [
+                  "number",
+                  "object",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.heartbeat"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "state",
+              "elapsed_s",
+              "state_elapsed_s",
+              "since_activity_s",
+              "stalled",
+              "tool_calls",
+              "last_tool",
+              "activity"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "waiting",
+                  "queued",
+                  "starting",
+                  "running",
+                  "handing_off",
+                  "completed",
+                  "failed",
+                  "cancelled",
+                  "timed_out"
+                ]
+              },
+              "elapsed_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "state_elapsed_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "since_activity_s": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "stalled": {
+                "type": "boolean"
+              },
+              "tool_calls": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "last_tool": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "activity": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.stalled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "since_activity_s",
+              "threshold_s"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "since_activity_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "threshold_s": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.finished"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "agent",
+              "state",
+              "outcome",
+              "duration_s",
+              "error_code",
+              "error"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "waiting",
+                  "queued",
+                  "starting",
+                  "running",
+                  "handing_off",
+                  "completed",
+                  "failed",
+                  "cancelled",
+                  "timed_out"
+                ]
+              },
+              "outcome": {
+                "type": "string"
+              },
+              "duration_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.run.handover"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "from_agent",
+              "to_agent",
+              "handover_id",
+              "digest",
+              "bytes",
+              "summarized"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "from_agent": {
+                "type": "string"
+              },
+              "to_agent": {
+                "type": "string"
+              },
+              "handover_id": {
+                "type": "string"
+              },
+              "digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "summarized": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.scheduler.tick"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "round",
+              "ready",
+              "running",
+              "queued",
+              "waiting",
+              "free_slots",
+              "max_parallel",
+              "effective_parallel",
+              "per_agent",
+              "skipped"
+            ],
+            "properties": {
+              "round": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "ready": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "running": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "queued": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "waiting": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "free_slots": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "max_parallel": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "effective_parallel": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "per_agent": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "required": [
+                    "running",
+                    "limit"
+                  ],
+                  "properties": {
+                    "running": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                }
+              },
+              "skipped": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.degraded"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "reason",
+              "mode",
+              "detail"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "swarm.tool.call"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": [
+              "tool",
+              "caller",
+              "state",
+              "duration_ms"
+            ],
+            "properties": {
+              "tool": {
+                "type": "string"
+              },
+              "caller": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              },
+              "duration_ms": {
+                "type": "number",
+                "minimum": 0
+              },
+              "error_state": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true
+}

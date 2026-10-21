@@ -36,8 +36,8 @@ ROUTE_PATTERNS = [
 def norm_path(p: str) -> str:
     p = p.split("?")[0].rstrip("/") or "/"
     p = re.sub(r"<(?:\w+:)?(\w+)>", r"{\1}", p)          # Flask <int:id>
-    p = re.sub(r":(\w+)", r"{\1}", p)                      # Express :id
-    p = re.sub(r"\{(\w+):[^}]*\}", r"{\1}", p)             # chi {id:[0-9]+}
+    p = re.sub(r"\{(\w+):[^}]*\}", r"{\1}", p)             # chi {id:[0-9]+}, {id:int}, {path:path}
+    p = re.sub(r":(\w+)", r"{\1}", p)                      # Express :id (after chi, so '{id:int}' is already '{id}')
     return re.sub(r"\{[^}]+\}", "{}", p)                   # anonymise param names
 
 

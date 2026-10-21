@@ -11,6 +11,7 @@ Finding ids are stable hashes so --allow-list can suppress them with a justifica
 Writes a signed `gate.verdict` (gate=security) to .swarm/verdicts/<task_id>.security.json.
 """
 from __future__ import annotations
+from collections import Counter
 import hashlib
 import json
 import math
@@ -56,7 +57,7 @@ AUDITS = [  # (name, manifest globs, binary, command)
 
 
 def _entropy(s: str) -> float:
-    return -sum((c / len(s)) * math.log2(c / len(s)) for c in {ch: s.count(ch) for ch in s}.values())
+    return -sum((c / len(s)) * math.log2(c / len(s)) for c in Counter(s).values())
 
 
 def fid(*parts: str) -> str:

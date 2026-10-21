@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """A11 — discover CI/CD, container, IaC and Kubernetes configs and lint them for platform hygiene.
 
-Finds .github/workflows/*.yml, .gitlab-ci.yml, Jenkinsfile, Dockerfile*, docker-compose*.yml,
-*.tf and k8s manifests under --root, then checks: pinned action versions (flags @main/@master
+Finds .github/workflows/*.yml, .gitlab-ci.yml, Jenkinsfile, Dockerfile*, compose files, *.tf and k8s manifests
+under --root. A compose file is compose[.<seg>]*.yml, docker-compose[.<seg>]*.yml or docker-compose-<suffix>.yml
+(a name without the docker- prefix must use dots: compose-extra.yml, composer.yml, composed.yml are not compose).
+Then checks: pinned action versions (flags @main/@master
 and unpinned uses), no plaintext secrets, Dockerfile non-root USER / pinned base tag / HEALTHCHECK,
 k8s Deployments carrying resources.limits and readinessProbe. Uses PyYAML when present,
 otherwise a regex-based fallback. Never crashes on malformed files.
@@ -38,7 +40,7 @@ def classify(p: Path) -> str | None:
         return "jenkins"
     if n.startswith("Dockerfile") or n.endswith(".Dockerfile"):
         return "dockerfile"
-    if re.match(r"(docker-)?compose[\w.-]*\.ya?ml$", n):
+    if re.fullmatch(r"(?:compose(?:\.[\w-]+)*|docker-compose(?:[.-][\w-]+(?:\.[\w-]+)*)?)\.ya?ml", n):
         return "compose"
     if p.suffix in (".tf", ".tfvars"):
         return "terraform"

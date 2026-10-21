@@ -625,9 +625,11 @@ def _ppid(pid: int) -> int:
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
 def test_signal_to_runner_group_ends_sessions(tmp_path, sig):
     """WR-09 / T-06-12: sessions sit in their own OS session, so a SIGTERM/SIGHUP sent to the runner's process group
-    (GNU timeout, a terminal hangup) misses them; the runner must end them itself and leave the task retryable."""
+    (GNU timeout, a terminal hangup) misses them; the runner must end them itself and leave the task retryable. The
+    runner first writes the cooperative cancel flag and gives sessions SWARM_CANCEL_GRACE_S to leave; this stub does
+    not, so the process-group kill follows."""
     swarm = tmp_path / ".swarm"
-    env = _env(swarm)
+    env = _env(swarm, SWARM_CANCEL_GRACE_S="1")
     work = _plan(tmp_path, env)
     stub = stub_omp(tmp_path, RESULT, hang=True)
     runner = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "swarm_run.py"), "--runtime", "omp", "--omp-bin",

@@ -231,7 +231,7 @@ empty: required inputs missing → BLOCKED needs=input
 blocked: L3/L4 or missing mandatory tool → BLOCKED needs=human-approval|tool
 in-progress: scripts running; checkpoint notes in Task Store via A01 ingest
 in-review: JSON result emitted; gates pending
-failed: taxonomy error in JSON (E-INPUT, E-TIMEOUT, E-DEP, E-CAPACITY, E-CONTRACT, E-POLICY, E-INTERNAL)
+failed: taxonomy error in JSON (E-INPUT, E-TIMEOUT, E-DEP, E-CAPACITY, E-CONTRACT, E-INTERNAL)
 escalated: third gate failure or poison task — do not retry; report for A01
 </states>
 
@@ -290,7 +290,6 @@ def main() -> None:
 <failure_modes>
 E-INPUT: assignment missing task_id, capability, or required inputs[] — BLOCKED needs=input.
 E-CONTRACT: artifact violates a bound contract version — fail the self-gate; request A03 if you are not A03.
-E-POLICY: autonomy ceiling or signed-envelope rule violated — BLOCKED or FAILED, never bypass.
 E-DEP: required runtime missing (python3, bun, git, Task Store, signing key) — FAILED with skipped vs missing distinguished.
 E-TIMEOUT: budget.max_wall_s exceeded — FAILED; do not continue silently.
 E-CAPACITY: too many in-flight tasks for this class — A01 reschedules; you do not steal work.

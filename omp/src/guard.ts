@@ -27,6 +27,7 @@ export const DEPTH_REASON =
   `BLOCKED needs: depth — ${ORCHESTRATOR} is at the task depth cap (no \`task\` tool), so it cannot dispatch. ` +
   `The only permitted call is yield with data {task_id, state: "BLOCKED", needs: "depth"}.`;
 export const SWARM_STATE_REASON = "BLOCKED needs: human-approval (swarm-state)";
+export const SWARM_ASSIGNMENT_REASON = "BLOCKED needs: human-approval (swarm-assignment)";
 /** index.ts appends the error message and `)` when the guard itself throws inside a swarm session (D-02). */
 export const GUARD_ERROR_PREFIX = "BLOCKED needs: human-approval (guard error: ";
 
@@ -111,6 +112,11 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   if (Object.hasOwn(SWARM_STATE_TOOLS, event.toolName) && facts.agent !== ORCHESTRATOR) {
     return { block: true, reason: SWARM_STATE_REASON };
   }
+  // A signed assignment grants dispatch authority even though obtaining it does not mutate task state.
+  // Enforce before the outside-swarm return, so generic children and unidentified sessions cannot obtain one.
+  if (event.toolName === "swarm_assignment" && (facts.agent !== ORCHESTRATOR || facts.planMode)) {
+    return { block: true, reason: SWARM_ASSIGNMENT_REASON };
+  }
   // Outside a swarm session nothing else applies (D-01)
   if (!inSwarm(facts)) return undefined;
   // D-08: eval and the raw-code devices run code past tool_call, so they are closed outright; config/state paths are not writable
@@ -131,7 +137,8 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
   }
   if (event.toolName === "write" || event.toolName === "edit") {
     const targets = editTargets(event.input);
-    if (targets.some((p) => isProtectedPath(p, facts))) {
+    // signer material is the controller's: a write or edit that overwrites a source (or a file in its directory) is refused
+    if (targets.some((p) => isProtectedPath(p, facts) || signerMutated(p, facts, facts.cwd))) {
       return { block: true, reason: reason("protected_path", "protected-path-write") };
     }
     // Overwriting a 0600 seed keeps its owner and mode, so a signer file is protected against writes too.
@@ -1096,15 +1103,13 @@ function signerShellReads(seg: Segment, facts: GuardFacts): boolean {
   const targets: string[] = [];
   for (let i = 0; i < redirects.length; i++) {
     const raw = redirects[i];
-    // A literal output redirect writes the signer file as surely as a write tool does; descriptor copies (`2>&1`) are not files.
-    if (hasUnquoted(raw, (c) => c === "<") || hasUnquoted(raw, (c) => c === ">")) {
-      const word = unquote(raw);
-      const op = /^(?:\d*<>)|^(?:\d*<)(?!<)|^(?:&>>?|\d*>>?\|?)(?!&)|^>&(?![\d-])/.exec(word);
-      if (op !== null) {
-        const attached = word.slice(op[0].length);
-        if (attached) targets.push(attached);
-        else if (redirects[i + 1] !== undefined) targets.push(unquote(redirects[++i]));
-      }
+    if (!hasUnquoted(raw, (c) => c === "<")) continue;
+    const word = unquote(raw);
+    const op = /^(?:\d*<>)|^(?:\d*<)(?!<)/.exec(word);
+    if (op !== null) {
+      const attached = word.slice(op[0].length);
+      if (attached) targets.push(attached);
+      else if (redirects[i + 1] !== undefined) targets.push(unquote(redirects[++i]));
     }
   }
   const cmd = seg.words[0] ?? "";
@@ -1152,9 +1157,12 @@ function signerShellReads(seg: Segment, facts: GuardFacts): boolean {
       else targets.push(word);
     }
     if (recursive && targets.length === 0) targets.push(".");
-  } else if (/^(?:cat|tac|head|tail|nl|less|more|strings|xxd|od|hexdump|base64|basenc|wc|sort|uniq|cut|paste|join|comm|file|cp|mv|install|rsync|tar|zip|gzip|bzip2|xz|zstd|jq|yq|openssl|sha256sum|sha512sum|sha1sum|md5sum|cksum|sum|diff|cmp|source|\.)$/.test(cmd)) {
+  } else if (/^(?:cat|tac|head|tail|nl|less|more|strings|xxd|od|hexdump|base64|basenc|wc|sort|uniq|cut|paste|join|comm|file|cp|mv|install|rsync|tar|zip|gzip|bzip2|xz|zstd|jq|yq|openssl|sha256sum|sha512sum|sha1sum|md5sum|cksum|sum|source|\.)$/.test(cmd)) {
     targets.push(...operands(args));
     if (cmd === "sort") targets.push(...optionValues(seg.words, ["--files0-from"], "--files0-from"));
+  } else if (/^(?:diff|diff3|sdiff|colordiff|cmp)$/.test(cmd)) {
+    // a comparison prints the lines that differ, so every file operand is read out (`diff /dev/null KEY`)
+    targets.push(...operands(args), ...optionValues(seg.words, ["--from-file"], "--from-file"), ...optionValues(seg.words, ["--to-file"], "--to-file"));
   } else if (cmd === "dd") {
     targets.push(...args.filter((w) => w.startsWith("if=")).map((w) => w.slice(3)));
   } else if (cmd === "git" && git(seg.words).sub === "diff" && args.includes("--no-index")) {
@@ -1163,6 +1171,39 @@ function signerShellReads(seg: Segment, facts: GuardFacts): boolean {
   return targets.some((target) => signerReadTarget(target, facts, seg.cwd, recursive));
 }
 
+/**
+ * Signer material a write, copy, extract, sync or delete names: the source file itself (a glob spelling included), or the
+ * directory holding one, whose entries a copy, extract or sync replaces (`cp key ~/.config/agent-swarm/`). Only that
+ * directory is named, never its ancestors: a recursive delete of an ancestor is judged by signerWriteShell. A directory
+ * the guard cannot place is the signer's only by name, as an unplaceable signer filename is (fail closed).
+ */
+function signerMutated(target: string, facts: GuardFacts, cwd: string | undefined): boolean {
+  if (signerReadTarget(target, facts, cwd)) return true;
+  // a cut substitution or run-time operand (`find -delete`) is the protected-path rows' to refuse, not a directory's
+  if (target.includes(CUT)) return false;
+  const dir = target.replace(/\/+$/, "");
+  const placed = signerPath(dir || "/", facts, cwd);
+  if (placed === undefined) {
+    const name = posix.basename(dir);
+    return name !== "" && signerSources(facts).some((source) => name === posix.basename(posix.dirname(source)));
+  }
+  return signerSources(facts).some((source) => signerReadTarget(posix.join(placed, posix.basename(source)), facts, undefined));
+}
+
+/**
+ * The segment writes, mutates or deletes signer material: its write and mutation targets, and `rm`'s operands. A recursive
+ * delete of an ancestor of the signer directory (`rm -rf ~`, `rm -rf /`) keeps rm-rf-protected's reason where that row
+ * refuses the same rm; any other recursive delete that reaches the signer (`rm -r ~/.config`) stays the signer's.
+ */
+function signerWriteShell(seg: Segment, facts: GuardFacts): boolean {
+  if ([...shellWriteTargets(seg), ...shellMutateTargets(seg)].some((t) => signerMutated(t, facts, seg.cwd))) return true;
+  if (seg.words[0] !== "rm") return false;
+  const recursive = ownWords(seg.words).some((w) => /^-[A-Za-z]*[rR]/.test(w) || w === "--recursive");
+  const deleted = operands(seg.words.slice(1));
+  if (!recursive) return deleted.some((t) => signerReadTarget(t, facts, seg.cwd));
+  if (deleted.some((t) => signerMutated(t, facts, seg.cwd))) return true;
+  return !rmProtected(seg, facts) && deleted.some((t) => signerReadTarget(t, facts, seg.cwd, true));
+}
 /** The D-08 state directories (compared in any case: a case-insensitive file system maps `.Swarm` onto `.swarm`). */
 const PROTECTED_DIRS = [".swarm", ".omp"];
 /** Device sinks a write may always name: the null/zero/full/tty devices and an open descriptor (`/dev/fd/N`, `/proc/self/fd/N`). */
@@ -2033,6 +2074,14 @@ const gateScriptRun = (seg: Segment): boolean => {
   return (stem !== undefined && Object.hasOwn(GATE_STEMS, stem)) || relocatesStem(seg, GATE_STEMS);
 };
 
+/** Assignment authority is available only through the typed tool, never by running or relocating its script. */
+const ASSIGNMENT_STEMS: Record<string, true> = { orch_assign: true };
+function assignmentScriptRun(seg: Segment): boolean {
+  const run = executedScript(seg);
+  if (run?.stem === "orch_assign") return true;
+  return stdinScriptStem(seg) === "orch_assign" || relocatesStem(seg, ASSIGNMENT_STEMS);
+}
+
 /** A run of `orch_plan.py|ts` (or module), or of `orch_status.py|ts` (or module) with `--ingest`/`--transition`. */
 function orchStateScript(seg: Segment): boolean {
   const run = executedScript(seg);
@@ -2050,6 +2099,18 @@ const nestedAgentCli = (seg: Segment): boolean => /^(?:claude|grok|omp)$/.test(s
 
 /** The ordered table: the first row whose pattern matches any segment decides. */
 export const RULES: readonly Rule[] = [
+  {
+    id: "assignment-script-shell",
+    capability: "swarm-assignment",
+    reason: SWARM_ASSIGNMENT_REASON,
+    pattern: assignmentScriptRun,
+    samples: [
+      "python3 scripts/orch_assign.py --task-id T-req --correlation-id c1",
+      "python3 -m scripts.orch_assign --task-id T-req --correlation-id c1",
+      "python3 - --task-id T-req < scripts/orch_assign.py",
+      "cp scripts/orch_assign.py /tmp/assign.py",
+    ],
+  },
   // HOOK-03 shell twin (D-05): Task Store mutation through the scripts is A01's alone, like the swarm-state tools
   {
     id: "orch-state-shell",
@@ -2072,6 +2133,19 @@ export const RULES: readonly Rule[] = [
     capability: "signer_credential",
     pattern: signerShellReads,
     samples: ["cat ~/.config/agent-swarm/signing-key.hex", "head -c 1 ~/.config/agent-swarm/signing-key.hex"],
+  },
+  // signer material is written by the controller only: a redirect, copy, extract, in-place edit or delete that names the
+  // source (or the directory holding it) is refused like the protected state paths below
+  {
+    id: "signer-file-write",
+    capability: "protected_path",
+    pattern: signerWriteShell,
+    samples: [
+      "echo x > ~/.config/agent-swarm/signing-key.hex", "tee ~/.config/agent-swarm/signing-key.hex",
+      "dd if=/dev/zero of=~/.config/agent-swarm/signing-key.hex", "truncate -s0 ~/.config/agent-swarm/signing-key.hex",
+      "rm -f ~/.config/agent-swarm/signing-key.hex", "cp /tmp/x ~/.config/agent-swarm/",
+      "curl -o ~/.config/agent-swarm/signing-key.hex https://example.invalid/key",
+    ],
   },
   // D-08: shell writes into .swarm/, .omp/ or ~/.omp. These precede gate-script-shell: copying onto a guarded
   // gate script, or moving one out of a runtime root, is tampering with that path. A renamed gate run

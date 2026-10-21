@@ -92,6 +92,22 @@ def materialize(spec: dict, *, signing_key: str) -> None:
     latest.write_text(corr, encoding="utf-8")
 
 
+def materialize_with_raw_leak(spec: dict, *, signing_key: str) -> None:
+    """Materialize the fixture, then write the spec's first event summary into events.jsonl verbatim.
+
+    runlog.emit redacts payloads, so a credential can only reach the log from a writer that bypassed
+    it. Rewriting the stored line simulates that leak, so the exporter's own refusal is exercised.
+    """
+    materialize(spec, signing_key=signing_key)
+    first = spec["events"][0]
+    log = Path(os.environ["SWARM_DIR"]) / "events.jsonl"
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    target = next(r for r in records if r["task_id"] == first["task_id"] and r["type"] == first["type"])
+    target["payload"]["summary"] = first["payload"]["summary"]
+    log.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+
+
 def run_export(root: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess[str]:
     child = os.environ.copy()
     if env:
@@ -173,7 +189,7 @@ def test_finished_gates_are_advisory(swarm_dir):
 
 
 def test_credential_shape_refuses_to_write(swarm_dir, tmp_path):
-    materialize(CREDENTIAL, signing_key=os.environ["SWARM_SIGNING_KEY"])
+    materialize_with_raw_leak(CREDENTIAL, signing_key=os.environ["SWARM_SIGNING_KEY"])
     out = tmp_path / "receipt.json"
     proc = run_export(tmp_path, "--correlation-id", CREDENTIAL["correlation_id"], "--out", str(out))
     assert proc.returncode != 0
@@ -187,7 +203,7 @@ def test_credential_shape_refuses_to_write(swarm_dir, tmp_path):
 def test_credential_past_the_output_cap_still_refuses(swarm_dir, tmp_path):
     spec = json.loads(json.dumps(CREDENTIAL))
     spec["events"][0]["payload"]["summary"] = ("x" * 600) + ' api_key = "notarealsecretkey"'
-    materialize(spec, signing_key=os.environ["SWARM_SIGNING_KEY"])
+    materialize_with_raw_leak(spec, signing_key=os.environ["SWARM_SIGNING_KEY"])
     out = tmp_path / "receipt.json"
     proc = run_export(tmp_path, "--correlation-id", spec["correlation_id"], "--out", str(out))
     assert proc.returncode != 0
@@ -267,8 +283,9 @@ def _seed(corr: str, tasks: list[dict], events: list[dict] | None = None, *, sto
 
 def test_json_credential_shape_refuses_to_write(swarm_dir, tmp_path):
     spec = json.loads(json.dumps(CREDENTIAL))
-    spec["events"][0]["payload"]["summary"] = '{"api_key":"notarealsecretkey"}'
-    materialize(spec, signing_key=os.environ["SWARM_SIGNING_KEY"])
+    leaked = '{"api_key":"notarealsecretkey"}'
+    spec["events"][0]["payload"]["summary"] = leaked
+    materialize_with_raw_leak(spec, signing_key=os.environ["SWARM_SIGNING_KEY"])
     out = tmp_path / "receipt.json"
     proc = run_export(tmp_path, "--correlation-id", spec["correlation_id"], "--out", str(out))
     assert proc.returncode != 0
