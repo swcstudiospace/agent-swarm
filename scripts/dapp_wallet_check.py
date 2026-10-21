@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 
 MAX_FILE_BYTES = 1 << 20
@@ -112,7 +113,7 @@ def rpc_url_inspect(url: str) -> dict:
     result.update(valid=True, scheme=scheme, host=host)
     issues = result["issues"]
     if scheme not in ("http", "https", "ws", "wss"):
-        issues.append({"code": "scheme", "detail": f"scheme {scheme!r} is not http, https, ws or wss"})
+        issues.append({"code": "scheme", "detail": f"scheme of {len(scheme)} chars is not http, https, ws or wss"})
     loopback = _is_local_host(host)
     if loopback:
         issues.append({"code": "local-endpoint", "detail": f"host {host} is a loopback, private-network or single-label address"})
@@ -130,6 +131,10 @@ def rpc_url_inspect(url: str) -> dict:
     return result
 
 
+_SCHEME_PREFIX = re.compile(r"[\x00-\x20]*([A-Za-z][A-Za-z0-9+.\-]*):")
+_TAB_NEWLINE = re.compile(r"[\t\r\n]")
+
+
 def url_scheme_userinfo(url: str) -> tuple[str, str]:
     """(scheme lower-cased, userinfo kind) of a URL string; the userinfo itself is never returned. Kind is `` (none), `plain`
     (credentials) or `host-like` (a dotted name before the @, the `trusted.example@evil.example` look-alike). Shared with the A29 tools,
@@ -137,7 +142,10 @@ def url_scheme_userinfo(url: str) -> tuple[str, str]:
     try:
         parts = urlsplit(url)
     except ValueError:
-        return "", ""
+        # urlsplit refuses some URLs (a `[` in the authority that is no IPv6 literal) that a browser still opens: read the scheme the way
+        # a browser does (leading controls and spaces dropped, tabs and newlines removed), so a `javascript:` link cannot pass as malformed
+        match = _SCHEME_PREFIX.match(_TAB_NEWLINE.sub("", url))
+        return (match.group(1).lower() if match else ""), ""
     kind = ""
     if parts.username is not None or parts.password is not None:
         kind = "host-like" if "." in (parts.username or "") else "plain"
@@ -146,7 +154,7 @@ def url_scheme_userinfo(url: str) -> tuple[str, str]:
 
 # ---- line rules ------------------------------------------------------------------------------------------------------
 
-_COMMENT_LINE = re.compile(r"^\s*(//|/\*|\*|#|<!--)")
+_COMMENT_LINE = re.compile(r"^\s*(//|/\*|\*|<!--)")  # `#` is no comment in JS/TS/HTML: a `#privateKey` class field is code
 _URL = re.compile(r"""(?:https?|wss?)://[^\s"'`<>)\]},;]+""")
 _RPC_CONTEXT = re.compile(
     r"rpc|provider|transport|endpoint|infura|alchemy|quiknode|quicknode|ankr|chainstack|getblock|blastapi|drpc|llamarpc|nodereal|moralis"
@@ -158,9 +166,18 @@ _MAX_UINT = re.compile(
     r"MaxUint256|MAX_UINT256|UINT256_MAX|maxUint256|MaxUint\b|type\(uint256\)\.max|uint256\.max|2n\s*\*\*\s*256n\s*-\s*1n"
     r"|2\s*\*\*\s*256\s*-\s*1|\(1\s*<<\s*256\)\s*-\s*1|0x[fF]{64}\b|(?<![0-9])115792089237316195423570985008687907853269984665640564039457584007913129639935(?![0-9])")
 _APPROVE_ALL = re.compile(r"\bsetApprovalForAll\b")
-_KEY_LITERAL = re.compile(
-    r"""\b(?:private[_-]?key|priv[_-]?key|secret[_-]?key)\b["'`]?\s*[:=]\s*["'`]([^"'`\s]{16,})["'`]""", re.IGNORECASE)
-_PHRASE_LITERAL = re.compile(r"""\b(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\b["'`]?\s*[:=]\s*["'`]([^"'`]{20,})["'`]""", re.IGNORECASE)
+# Key-named assignments. No leading \b (camelCase `deployerPrivateKey` counts); a trailing \b keeps `PRIVATE_KEY_URL` and `seedUrl` out.
+_KEY_ASSIGNMENT = re.compile(
+    r"""(private[_-]?key|priv[_-]?key|secret[_-]?key|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|seed|secret)\b["'`]?\??\s*([:=])(?![=>])""",
+    re.IGNORECASE)
+_STRING_TOKEN = r"""(?:"[^"\n]*"|'[^'\n]*'|`[^`\n]*`)"""
+_STRING_CHAIN = re.compile(rf"\s*{_STRING_TOKEN}(?:\s*\+\s*{_STRING_TOKEN})*")  # adjacent literals joined with +
+_STRING_PART = re.compile(_STRING_TOKEN)
+_VALUE_END = re.compile(r"\s*(?:[;,)}\]]|$|//|/\*)")  # what may follow a plain literal: a terminator or a comment, never `*16` or `+ x`
+_ENV_VALUE = re.compile(r"\s*(?:process\.env\.|import\.meta\.env\.)\w")
+_NULLISH_VALUE = re.compile(r"\s*(?:null|undefined|None|nil)\s*(?:[;,)}\]]|$|//)")
+_TYPE_VALUE = re.compile(r"\s*(?:string|number|bigint|boolean|Hex|`0x\$\{string\}`)\s*(?:[;,}]|$)")  # `privateKey: string` in a type
+_NON_SECRET_ENV_SUFFIX = re.compile(r"_(?:URL|URI|ENDPOINT|HOST)$", re.IGNORECASE)  # `REACT_APP_SEED_PHRASE_URL` names a URL, not a seed
 _CLIENT_SIGNER = re.compile(
     r"\bnew\s+(?:ethers\.)?Wallet\s*\(|\bWallet\.fromMnemonic\b|\bfromPhrase\s*\(|\bprivateKeyToAccount\s*\(|\bmnemonicToAccount\s*\("
     r"|\bKeypair\.fromSecretKey\b")
@@ -232,7 +249,32 @@ def _call_text(lines: list[str], index: int, start: int) -> str:
     return " ".join(chunks)
 
 
-def _scan_code(rel: str, text: str) -> list[dict]:
+def _key_material_findings(line: str, loc: str, reasons: list[str]) -> list[dict]:
+    """DAPP-KEY-MATERIAL for each key-named assignment on a line whose value joins to a secret-length literal. Adjacent string literals
+    joined with `+` are one literal (`"0x" + "ab12"` is 6 chars). A value that is not then a plain literal adds a scan-incomplete reason
+    naming the file and line, never the value: env references, null-like keywords and TypeScript type names are exempt."""
+    findings: list[dict] = []
+    for match in _KEY_ASSIGNMENT.finditer(line):
+        name, sep, at = match.group(1).lower(), match.group(2), match.end()
+        chain = _STRING_CHAIN.match(line, at)
+        if chain and _VALUE_END.match(line, chain.end()):
+            joined = "".join(part.group(0)[1:-1] for part in _STRING_PART.finditer(chain.group(0)))
+            if "${" not in joined:
+                if "phrase" in name or "mnemonic" in name:
+                    if len(joined) >= 20:
+                        findings.append(_finding("DAPP-KEY-MATERIAL", "blocker", f"key material literal in source ({len(joined)} chars, value not shown)", loc))
+                elif "key" in name and len(joined) >= 16 and not any(c.isspace() for c in joined):
+                    findings.append(_finding("DAPP-KEY-MATERIAL", "blocker", f"key material literal in source ({len(joined)} chars, value not shown)", loc))
+                continue
+        if _ENV_VALUE.match(line, at) or _NULLISH_VALUE.match(line, at):
+            continue
+        if sep == ":" and _TYPE_VALUE.match(line, at):
+            continue
+        reasons.append(f"{loc}: key-named assignment is not a plain string literal (value not checked)")
+    return findings
+
+
+def _scan_code(rel: str, text: str, reasons: list[str]) -> list[dict]:
     findings: list[dict] = []
     lines = text.splitlines()
     first_send = 0
@@ -254,9 +296,7 @@ def _scan_code(rel: str, text: str) -> list[dict]:
         if _APPROVE_ALL.search(line):
             findings.append(_finding("DAPP-APPROVAL-FOR-ALL", "minor",
                                      "setApprovalForAll grants control of a whole collection; show a dedicated confirmation naming operator and collection", loc))
-        match = _KEY_LITERAL.search(line) or _PHRASE_LITERAL.search(line)
-        if match:
-            findings.append(_finding("DAPP-KEY-MATERIAL", "blocker", f"key material literal in source ({len(match.group(1))} chars, value not shown)", loc))
+        findings.extend(_key_material_findings(line, loc, reasons))  # every assignment on the line counts, not one per line
         if _CLIENT_SIGNER.search(line):
             findings.append(_finding("DAPP-CLIENT-SIGNER", "major", "a key-holding signer is constructed in frontend code; sign through the user's wallet instead", loc))
         if _KEY_STORAGE.search(line):
@@ -304,7 +344,7 @@ def _scan_env(rel: str, text: str) -> list[dict]:
         if not public or not value:
             continue
         loc = f"{rel}:{number}"
-        if _SECRET_ENV_NAME.search(name):
+        if _SECRET_ENV_NAME.search(name) and not _NON_SECRET_ENV_SUFFIX.search(name):
             findings.append(_finding("DAPP-PUBLIC-SECRET-ENV", "blocker",
                                      f"{name} uses a client-exposed prefix and a secret-looking name ({len(value)} chars, value not shown)", loc))
         if re.match(r"(?:https?|wss?)://", value):
@@ -396,14 +436,15 @@ def _load_yaml():
     return yaml
 
 
-def _scan_data(rel: str, text: str, suffix: str, yaml_module, findings: _Findings) -> None:
+def _scan_data(rel: str, text: str, suffix: str, yaml_module, findings: _Findings, skipped: list[str]) -> None:
     try:
         if suffix in JSON_EXTS:
             documents = [json.loads(text)]
         else:
             documents = list(yaml_module.safe_load_all(text))
-    except Exception as exc:  # a config that does not parse is a finding, not a crash
+    except Exception as exc:  # a config that does not parse is a finding, not a crash; its exception name is a label, never its message
         findings.append(_finding("DAPP-CONFIG-PARSE", "info", f"{type(exc).__name__}: file is not valid {suffix.lstrip('.')} and was not checked", rel))
+        skipped.append(f"{rel}: skipped:unparsable {suffix.lstrip('.')} ({type(exc).__name__})")
         return
     budget = [MAX_WALK_VISITS]  # one budget for the whole file: many documents cannot multiply the work either
     for document in documents:
@@ -411,6 +452,7 @@ def _scan_data(rel: str, text: str, suffix: str, yaml_module, findings: _Finding
             _walk_structure(document, "", rel, findings, set(), budget)
         except (RecursionError, _WalkLimit):  # too deep or too aliased to walk completely: keep what was found, scan the other files
             findings.append(_finding("DAPP-CONFIG-PARSE", "info", "configuration is nested or aliased too deeply to check completely", rel))
+            skipped.append(f"{rel}: only partly checked (nested or aliased too deeply)")
             break
 
 
@@ -445,9 +487,10 @@ def _kind(path: Path) -> str:
 
 
 def scan_tree(base: Path, root: Path) -> dict:
-    """Scan `base` (a file or directory inside `root`). Returns the result body without `status`/`agent`/`script`."""
+    """Scan `base` (a file or directory inside `root`). Returns the result body without `status`/`agent`/`script`. Every in-scope input that
+    was not analysed in full is a label in `skipped` and a major `scan-incomplete` finding, so the status is `fail` (swarm/scan_status.py)."""
     findings = _Findings()
-    skipped: list[str] = []
+    skipped: list[str] = []  # one label and path per input not analysed in full: labels and paths only, never a value
     scanned = skipped_files = 0
     truncated = False
     yaml_module = _load_yaml()
@@ -458,24 +501,30 @@ def scan_tree(base: Path, root: Path) -> dict:
             continue
         if scanned >= MAX_FILES:
             truncated = True
+            skipped.append(f"scan stopped at the {MAX_FILES}-file limit; the remaining files were not scanned")
             break
         rel = path.relative_to(root).as_posix()
         try:
             if path.is_symlink() and not path.resolve().is_relative_to(root):
                 skipped_files += 1
+                skipped.append(f"{rel}: skipped:symlink-outside-root")
                 continue
             if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the whole scan
                 skipped_files += 1
+                skipped.append(f"{rel}: skipped:not-a-regular-file")
                 continue
             if path.stat().st_size > MAX_FILE_BYTES:
                 skipped_files += 1
+                skipped.append(f"{rel}: skipped:oversized")
                 continue
             data = path.read_bytes()
         except OSError:
             skipped_files += 1
+            skipped.append(f"{rel}: skipped:unreadable")
             continue
         if b"\0" in data[:BINARY_SNIFF_BYTES]:
             skipped_files += 1
+            skipped.append(f"{rel}: skipped:binary")
             continue
         text = data.decode("utf-8", errors="replace")
         if kind == "yaml" and yaml_module is None:
@@ -484,21 +533,23 @@ def scan_tree(base: Path, root: Path) -> dict:
             continue
         scanned += 1
         if kind == "code":
-            findings.extend(_scan_code(rel, text))
+            findings.extend(_scan_code(rel, text, skipped))
         elif kind == "env":
             findings.extend(_scan_env(rel, text))
         else:
-            _scan_data(rel, text, path.suffix.lower(), yaml_module, findings)
+            _scan_data(rel, text, path.suffix.lower(), yaml_module, findings, skipped)
     if saw_yaml:
         skipped.append("yaml-config-structure: skipped:tool-missing (PyYAML is not installed)")
+    findings.extend({**item, "location": "."} for item in incomplete_findings(skipped, scanned))
     counts = dict(findings.counts)
     failing = sum(counts[name] for name in FAIL_SEVERITIES)
     total = sum(counts.values())
     capped = total > MAX_FINDINGS
     if capped:
         skipped.append(f"findings: output capped at {MAX_FINDINGS} of {total} (counts are complete)")
+    listed = findings.listed()
     return {
-        "findings": findings.listed(),
+        "findings": listed,
         "counts": counts,
         "files_scanned": scanned,
         "files_skipped": skipped_files,
@@ -507,7 +558,7 @@ def scan_tree(base: Path, root: Path) -> dict:
         "summary": f"{scanned} file(s) scanned, {total} finding(s) ({failing} major or worse)"
                    + (f"; stopped at the {MAX_FILES}-file limit" if truncated else "")
                    + (f"; only the {MAX_FINDINGS} most severe are listed" if capped else ""),
-        "status": "fail" if failing else "ok",
+        "status": scan_status(listed),
     }
 
 

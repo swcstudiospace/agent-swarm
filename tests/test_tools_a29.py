@@ -264,7 +264,7 @@ def test_typed_data_verifying_contract_rules():
     document = typed_doc()
     del document["domain"]["verifyingContract"]
     del document["types"]["EIP712Domain"][3]
-    assert ids(typed(document)) == {"TD-VERIFYING-MISSING": "minor"}
+    assert ids(typed(document)) == {"TD-VERIFYING-MISSING": "major"}  # old minor, new major: an unbound signature replays on any contract with the same domain
     allowed = typed(typed_doc(), expected_verifying_contracts=[BOB])
     assert ids(allowed) == {"TD-VERIFYING-UNEXPECTED": "major"}
     assert typed(typed_doc(), expected_verifying_contracts=[USDC.lower()])["findings"] == []
@@ -324,7 +324,7 @@ def test_typed_data_nested_structs_and_arrays_are_closed_and_walked():
         "message": {"legs": [{"token": USDC, "amount": "5"}], "pair": [{"token": USDC, "amount": 1}], "nonce": 7},
     }
     result = typed(document)
-    assert ids(result) == {"TD-ARRAY-LENGTH": "major", "TD-VERIFYING-MISSING": "minor", "TD-DOMAIN-NAME-VERSION": "minor", "TD-DEADLINE-MISSING": "major"}
+    assert ids(result) == {"TD-ARRAY-LENGTH": "major", "TD-VERIFYING-MISSING": "major", "TD-DOMAIN-NAME-VERSION": "minor", "TD-DEADLINE-MISSING": "major"}
     assert any("message.pair" in f["summary"] for f in result["findings"] if f["id"] == "TD-ARRAY-LENGTH")
 
 
@@ -353,10 +353,10 @@ def test_typed_data_bytes_bool_string_int_values():
         "message": {"h": "0x" + "ab" * 32, "b": "0x", "f": False, "s": "hi", "i": -128, "nonce": 1, "deadline": NOW_EPOCH + 600},
     }
     base = ids(typed(document))
-    assert base == {"TD-VERIFYING-MISSING": "minor", "TD-DOMAIN-NAME-VERSION": "minor"}
+    assert base == {"TD-VERIFYING-MISSING": "major", "TD-DOMAIN-NAME-VERSION": "minor"}
     document["message"].update(h="0x" + "ab" * 31, b="0xz", f="no", s=5, i=128)
     result = typed(document)
-    assert ids(result) == {"TD-VALUE-TYPE": "major", "TD-VALUE-RANGE": "blocker", "TD-VERIFYING-MISSING": "minor", "TD-DOMAIN-NAME-VERSION": "minor"}
+    assert ids(result) == {"TD-VALUE-TYPE": "major", "TD-VALUE-RANGE": "blocker", "TD-VERIFYING-MISSING": "major", "TD-DOMAIN-NAME-VERSION": "minor"}
     assert sum(1 for f in result["findings"] if f["id"] == "TD-VALUE-TYPE") == 4
 
 
@@ -689,6 +689,7 @@ def test_chain_config_clean_testnet_and_mainnet_flag():
     assert ids(mainnet) == {"CHAIN-MAINNET": "info"} and mainnet["verdict"] == "pass"
     unknown = ok("dapp_chain_config_check", chain(chain_id="0x2710", chain_name="Some Chain"))
     assert unknown["network_class"] == "unknown" and ids(unknown) == {"CHAIN-UNKNOWN": "info"}
+    assert unknown["mainnet_enable_requires_approval"] is True  # old False, new True: a chain outside the reference table fails closed to L3 approval
 
 
 def test_chain_id_form_rules():
@@ -1498,7 +1499,8 @@ def test_gas_buffer_estimate_age_and_recommendation():
     assert gas(estimate_age_seconds=60)["findings"] == [] and ids(gas(estimate_age_seconds=61)) == {"GAS-ESTIMATE-STALE": "minor"}
     assert gas(estimated_gas=100001)["recommended_gas_limit"] == 120002  # ceil(100001 * 1.2)
     assert gas(estimated_gas=100000, contract_call=False)["recommended_gas_limit"] == 100000
-    assert gas(estimated_gas=28000000, gas_limit=28000000, contract_call=True)["recommended_gas_limit"] == 28000000  # 90% ceiling is below the estimate
+    assert gas(estimated_gas=28000000, gas_limit=28000000, contract_call=True)["recommended_gas_limit"] == 28000000  # above the 90% ceiling: the estimate is kept and flagged
+    assert ids(gas(estimated_gas=28000000, gas_limit=28000000, contract_call=True))["GAS-RECOMMEND-OVER-CEILING"] == "minor"
     assert gas(estimated_gas=26000000, gas_limit=28000000)["recommended_gas_limit"] == 27000000  # capped at 90% of 30M
     invalid("dapp_gas_buffer_check", {"estimated_gas": 100000, "gas_limit": 0, "block_gas_limit": 1, "contract_call": True, "max_fee_per_gas_wei": 1,
                                       "value_wei": 0, "balance_wei": 0, "estimate_age_seconds": 0}, "gas_limit")
@@ -1860,6 +1862,7 @@ def test_gas_buffer_matches_an_independent_exact_fraction_computation():
         ceiling = block * 90 // 100
         wanted = max(estimate, min(-(-estimate * 120 // 100), ceiling)) if contract else estimate
         assert result["recommended_gas_limit"] == wanted
+        assert ("GAS-RECOMMEND-OVER-CEILING" in found) == (estimate > ceiling)
 
 
 def test_rpc_worst_case_and_quorum_match_an_independent_computation():
@@ -1896,3 +1899,73 @@ def test_known_transaction_fragment_does_not_match_inside_unknown_transaction():
     assert (unrelated["category"], unrelated["message_class"], unrelated["show_error_toast"], unrelated["matched_by"]) == ("server_error", "error", True, "code")
     assert refine(-32000, "already known")["category"] == "already_known"
     assert refine(-32000, "known transaction: 0xabc")["category"] == "already_known"
+
+
+# --- QA-03 remediation: regressions for the blocker and major fixes ----------------------------------------------------
+
+
+def test_dangerous_link_schemes_block_even_when_urlsplit_refuses_the_url():
+    result = scan(links=["javascript://[%0aalert(document.cookie)", "vbscript://[x", "DATA://[x", "javascript:alert(1)"], domains=("app.example.com",))
+    assert ids(result) == {"LINK-DANGEROUS-SCHEME": "blocker"} and result["verdict"] == "block"
+    assert [f["id"] for f in result["findings"]].count("LINK-DANGEROUS-SCHEME") == 4
+
+
+def test_unlisted_chain_fails_the_mainnet_gate_closed():
+    cronos = ok("dapp_chain_config_check", chain(chain_id="0x19", chain_name="Cronos Mainnet", native_symbol="CRO", rpc_urls=["https://rpc.cronos.org"],
+                                                  explorer_urls=["https://cronoscan.com"], expected_chain_id=25))
+    assert cronos["network_class"] == "unknown" and cronos["mainnet_enable_requires_approval"] is True
+    zora = ok("dapp_chain_config_check", chain(chain_id="0x76adf1", chain_name="Zora", native_symbol="ETH", rpc_urls=["https://rpc.zora.energy"]))
+    assert zora["mainnet_enable_requires_approval"] is True
+    testnet = ok("dapp_chain_config_check", chain(chain_id="0x14a34", chain_name="Base Sepolia", native_symbol="ETH", rpc_urls=["https://sepolia.base.org"]))
+    assert testnet["network_class"] == "testnet" and testnet["mainnet_enable_requires_approval"] is False
+
+
+def test_lookalike_links_and_origins_block_consistently():
+    result = scan(links=["https://app.example.com-login.io/x", "https://app-example.com/login", "https://appexample.com/login"], domains=("app.example.com",))
+    assert [f["id"] for f in result["findings"]] == ["LINK-LOOKALIKE"] * 3 and result["verdict"] == "block"
+    assert ids(scan({"method": "personal_sign", "origin": "https://app-example.com"}, domains=("app.example.com",))) == {"ORIGIN-LOOKALIKE": "blocker"}
+    assert ids(scan(links=["https://twitter.com/x"], domains=("app.example.com",))) == {"LINK-UNEXPECTED": "minor"}
+    assert scan(links=["https://docs.app.example.com/x"], domains=("app.example.com",))["findings"] == []
+
+
+def test_permit2_approve_and_dai_permit_allowances_are_decoded():
+    unknown = "0x87517c45" + word_address(USDC) + word_address(CAROL) + word_uint(2**160 - 1) + word_uint(2**48 - 1)
+    result = scan({"method": "eth_sendTransaction", "to": USDC, "data": unknown})
+    assert ids(result) == {"SIGN-SPENDER-UNKNOWN": "blocker", "SIGN-UNLIMITED": "blocker"}
+    assert result["decoded_calls"][0]["signature"] == "approve(address,address,uint160,uint48)"
+    known = "0x87517c45" + word_address(USDC) + word_address(BOB) + word_uint(2**159) + word_uint(0)
+    assert ids(scan({"method": "eth_sendTransaction", "to": USDC, "data": known})) == {"SIGN-UNLIMITED": "major"}
+    # a Permit2 amount is a uint160: 2**159 is unlimited under the Permit2 threshold, 2**159 - 1 is not
+    below = "0x87517c45" + word_address(USDC) + word_address(BOB) + word_uint(2**159 - 1) + word_uint(0)
+    assert scan({"method": "eth_sendTransaction", "to": USDC, "data": below})["findings"] == []
+    revoke = "0x87517c45" + word_address(USDC) + word_address(CAROL) + word_uint(0) + word_uint(0)
+    assert scan({"method": "eth_sendTransaction", "to": USDC, "data": revoke})["findings"] == []
+    short = "0x87517c45" + word_address(USDC) + word_address(BOB) + word_uint(1)
+    assert ids(scan({"method": "eth_sendTransaction", "to": USDC, "data": short})) == {"SIGN-CALLDATA-TRUNCATED": "major"}
+
+    def dai(allowed: int) -> str:
+        return "0x8fcbaf0c" + word_address(ALICE) + word_address(CAROL) + word_uint(0) + word_uint(NOW_EPOCH) + word_uint(allowed) + word_uint(27) + word_uint(1) + word_uint(2)
+
+    assert ids(scan({"method": "eth_sendTransaction", "to": USDC, "data": dai(1)})) == {"SIGN-SPENDER-UNKNOWN": "blocker", "SIGN-UNLIMITED": "blocker"}
+    assert ids(scan({"method": "eth_sendTransaction", "to": USDC, "data": dai(1)}, known=(USDC, BOB, CAROL))) == {"SIGN-UNLIMITED": "major"}
+    assert scan({"method": "eth_sendTransaction", "to": USDC, "data": dai(0)})["findings"] == []
+    assert ids(scan({"method": "eth_sendTransaction", "to": USDC, "data": dai(2)})) == {"SIGN-CALLDATA-MALFORMED": "major"}
+    assert ids(scan({"method": "eth_sendTransaction", "to": USDC, "data": "0x8fcbaf0c" + "00" * 32 * 7})) == {"SIGN-CALLDATA-TRUNCATED": "major"}
+
+
+def test_malformed_origin_is_reported_without_expected_domains():
+    result = scan({"method": "personal_sign", "origin": "javascript://[%0aalert(1)"}, domains=())
+    assert ids(result) == {"SIGN-ORIGIN-MALFORMED": "major"} and result["verdict"] == "review"
+
+
+def test_dangerous_explorer_scheme_is_a_blocker():
+    assert ids(ok("dapp_chain_config_check", chain(explorer_urls=["javascript:alert(1)"]))) == {"CHAIN-EXPLORER-1-DANGEROUS-SCHEME": "blocker"}
+    assert ids(ok("dapp_chain_config_check", chain(explorer_urls=["data:text/html,x"]))) == {"CHAIN-EXPLORER-1-DANGEROUS-SCHEME": "blocker"}
+
+
+def test_urls_that_urlsplit_rejects_never_echo_the_scheme_text():
+    token = "sk1a2b3c4d5e6f7g8h9i0jKLMNOP"
+    result = ok("dapp_chain_config_check", chain(rpc_urls=[f"{token}://polygon-rpc.com"]))
+    assert ids(result)["CHAIN-RPC-1-SCHEME"] == "blocker" and token.lower() not in json.dumps(result)
+    link = scan(links=[f"{token}://app.example.com"], domains=())
+    assert ids(link) == {"LINK-SCHEME": "major"} and token.lower() not in json.dumps(link) and token not in json.dumps(link)

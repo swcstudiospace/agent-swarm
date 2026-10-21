@@ -237,7 +237,7 @@ def test_json_configuration_is_parsed_by_key_and_value(tmp_path):
     _, report, text = scan(tmp_path)
     assert found(report) == {
         ("DAPP-RPC-KEY", "major", "config/chains.json#chains[0].rpcUrls[0]"), ("DAPP-RPC-CREDENTIALS", "blocker", "config/chains.json#chains[0].rpcUrls[1]"),
-        ("DAPP-KEY-MATERIAL", "blocker", "config/chains.json"), ("DAPP-CONFIG-PARSE", "info", "config/broken.json"),
+        ("DAPP-KEY-MATERIAL", "blocker", "config/chains.json"), ("DAPP-CONFIG-PARSE", "info", "config/broken.json"), ("scan/incomplete", "major", "."),
     }
     assert "abcdef0123456789" not in text and INFURA_KEY not in text and "pw@" not in text
     assert "16 chars" in next(f for f in report["findings"] if f["id"] == "DAPP-KEY-MATERIAL")["summary"]
@@ -248,9 +248,9 @@ def test_yaml_configuration_when_pyyaml_is_available(tmp_path):
     write(tmp_path, "config.yaml", "rpc_url: https://rpc.example.com/?apikey=abcdef123456\nsigner:\n  private_key: deadbeefdeadbeef\nnote: plain\n")
     write(tmp_path, "bad.yml", "key: [unclosed\n")
     code, report, text = scan(tmp_path)
-    assert code == 1 and report["skipped"] == []
+    assert code == 1 and len(report["skipped"]) == 1 and report["skipped"][0].startswith("bad.yml: skipped:unparsable yml")  # old: skipped == []; the unparsed file is now a reason
     assert found(report) == {("DAPP-RPC-KEY", "major", "config.yaml#rpc_url"), ("DAPP-KEY-MATERIAL", "blocker", "config.yaml"),
-                             ("DAPP-CONFIG-PARSE", "info", "bad.yml")}
+                             ("DAPP-CONFIG-PARSE", "info", "bad.yml"), ("scan/incomplete", "major", ".")}
     assert "abcdef123456" not in text and "deadbeefdeadbeef" not in text
 
 
@@ -262,11 +262,11 @@ def test_yaml_checks_report_tool_missing_when_pyyaml_is_absent(tmp_path, monkeyp
     report = loaded.scan_tree(tmp_path, tmp_path)
     assert report["skipped"] == ["yaml-config-structure: skipped:tool-missing (PyYAML is not installed)"]
     assert (report["files_scanned"], report["files_skipped"]) == (1, 1)
-    assert [f["id"] for f in report["findings"]] == ["DAPP-ETH-SIGN"] and report["status"] == "fail"  # JSON and code checks stay native
+    assert [f["id"] for f in report["findings"]] == ["DAPP-ETH-SIGN", "scan/incomplete"] and report["status"] == "fail"  # JSON and code checks stay native
     only_yaml = tmp_path / "only"
     write(only_yaml, "c.yml", "a: b\n")
     clean = loaded.scan_tree(only_yaml, only_yaml)
-    assert clean["status"] == "ok" and clean["skipped"] != []
+    assert clean["status"] == "fail" and clean["skipped"] != []  # old: ok; the only in-scope file was not analysed, so the scan is incomplete
 
 
 # --- real mode: bounds and traversal ----------------------------------------------------------------------------
@@ -282,7 +282,7 @@ def test_large_binary_and_ignored_directories_are_skipped(tmp_path):
     write(tmp_path, "src/real.ts", hazard)
     write(tmp_path, "notes.txt", hazard)
     _, report, _ = scan(tmp_path)
-    assert found(report) == {("DAPP-ETH-SIGN", "blocker", "src/real.ts:1")}
+    assert found(report) == {("DAPP-ETH-SIGN", "blocker", "src/real.ts:1"), ("scan/incomplete", "major", ".")}  # the skipped files make the scan incomplete
     assert (report["files_scanned"], report["files_skipped"]) == (1, 2)  # big.ts and bin.js
 
 
@@ -316,7 +316,7 @@ def test_symlinks_leaving_the_root_are_not_followed(tmp_path):
     os.symlink(outside / "dir", root / "linked-dir")
     os.symlink(root / "src" / "ok.ts", root / "src" / "inside.ts")  # a link that stays inside the root is read
     code, report, _ = scan(root)
-    assert code == 0 and report["findings"] == []
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"] and report["status"] == "fail"  # old: code 0; a skipped link is not ok
     assert report["files_scanned"] == 2 and report["files_skipped"] == 1
 
 
@@ -541,3 +541,85 @@ def test_decimal_and_hex_ipv4_hosts_are_classed_as_addresses_not_single_label_na
     assert [i["code"] for i in inspect("http://127.0.0.1:8545")["issues"]] == ["local-endpoint"]
     assert [i["code"] for i in inspect("http://2130706433:8545")["issues"]] == ["local-endpoint"]  # decimal 127.0.0.1
     assert [i["code"] for i in inspect("http://4294967296/rpc")["issues"]] == ["insecure-scheme"]  # beyond 32 bits: not a local address
+
+
+# --- QA-03 remediation: regressions for the blocker and major fixes ----------------------------------------------------
+
+
+def test_hash_prefixed_and_camel_case_key_literals_are_reported(tmp_path):
+    key = "0x" + "ab" * 32
+    write(tmp_path, "src/signer.ts", f'class Signer {{\n  #privateKey = "{key}";\n}}\n')
+    write(tmp_path, "src/a.ts", f'const deployerPrivateKey = "{key}";\nconst MY_PRIVATE_KEY = "{key}";\nconst signerSecretKey = "{key}";\n')
+    write(tmp_path, "src/m.ts", f'const deployerMnemonic = "{MNEMONIC}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/signer.ts:2"), ("DAPP-KEY-MATERIAL", "blocker", "src/a.ts:1"),
+        ("DAPP-KEY-MATERIAL", "blocker", "src/a.ts:2"), ("DAPP-KEY-MATERIAL", "blocker", "src/a.ts:3"),
+        ("DAPP-KEY-MATERIAL", "blocker", "src/m.ts:1"),
+    }
+    assert key not in text and MNEMONIC not in text
+
+
+def test_every_key_literal_on_one_line_is_counted(tmp_path):
+    key = "0x" + "ab" * 32
+    write(tmp_path, "src/cfg.ts", f'const cfg = {{ privateKey: "{key}", mnemonic: "{MNEMONIC}" }};\n')
+    _, report, text = scan(tmp_path)
+    assert [f["id"] for f in report["findings"]] == ["DAPP-KEY-MATERIAL", "DAPP-KEY-MATERIAL"] and report["counts"]["blocker"] == 2
+    assert key not in text and MNEMONIC not in text
+
+
+def test_url_named_public_variables_are_not_secret_findings(tmp_path):
+    write(tmp_path, ".env.local", "REACT_APP_SEED_PHRASE_URL=https://ok.example.org\nREACT_APP_SEED=abcdef0123456789\n")
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-PUBLIC-SECRET-ENV", "blocker", ".env.local:2")} and "abcdef0123456789" not in text
+
+
+def test_url_scheme_is_read_when_urlsplit_refuses_the_url():
+    loaded = module()
+    assert loaded.url_scheme_userinfo("javascript://[%0aalert(document.cookie)") == ("javascript", "")
+    assert loaded.url_scheme_userinfo("\x01 VBS\tcript://[x") == ("vbscript", "")
+    assert loaded.url_scheme_userinfo("https://user@rpc.example.com") == ("https", "plain")
+
+
+def test_rpc_scheme_detail_never_echoes_the_scheme_text():
+    token = "sk1a2b3c4d5e6f7g8h9i0jKLMNOP"
+    issues = module().rpc_url_inspect(f"{token}://polygon-rpc.com")["issues"]
+    assert [i["code"] for i in issues] == ["scheme"] and token.lower() not in json.dumps(issues)
+
+
+def test_unparsable_config_makes_the_scan_incomplete(tmp_path):
+    write(tmp_path, "config/broken.json", "{ not json")
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail"
+    assert found(report) == {("DAPP-CONFIG-PARSE", "info", "config/broken.json"), ("scan/incomplete", "major", ".")}
+    assert report["skipped"] == ["config/broken.json: skipped:unparsable json (JSONDecodeError)"]
+
+
+def test_scan_with_no_analysed_input_is_not_ok(tmp_path):
+    write(tmp_path, "README.md", "# nothing in scope\n")
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail" and report["files_scanned"] == 0
+    assert found(report) == {("scan/incomplete", "major", ".")}
+
+
+def test_joined_string_literals_are_one_key_literal(tmp_path):
+    write(tmp_path, "src/join.ts", 'const privateKey = "0x" + "ab12ab12ab12ab12";\nconst short = "0x" + "ab12";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/join.ts:1")}  # "0x" + "ab12" is 6 chars, below the key length
+    assert "18 chars" in report["findings"][0]["summary"] and "ab12ab12" not in text
+
+
+def test_key_named_value_that_is_not_a_plain_literal_makes_the_scan_incomplete(tmp_path):
+    write(tmp_path, "src/deploy.ts", 'const deployerPrivateKey = "0x" + "ab12"*16;\n')  # the report's exact shape
+    code, report, text = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail"
+    incomplete = [f for f in report["findings"] if f["id"] == "scan/incomplete"]
+    assert len(incomplete) == 1 and incomplete[0]["severity"] == "major"
+    assert "src/deploy.ts:1" in incomplete[0]["summary"]  # file and line named, never the value
+    assert "ab12" not in text
+
+
+def test_env_references_type_names_and_nullish_values_are_not_incomplete(tmp_path):
+    write(tmp_path, "src/ok.ts", "const privateKey = process.env.PRIVATE_KEY;\nconst mnemonic = null;\ninterface W { privateKey: string; mnemonic?: string }\n")
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == []

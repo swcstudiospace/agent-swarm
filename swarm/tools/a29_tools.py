@@ -57,6 +57,7 @@ UNLIMITED_THRESHOLD = 2**255  # house policy, not a standard: an allowance at or
 ZERO_ADDRESS = "0x" + "0" * 40
 PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3"  # canonical Permit2 deployment (same address on every supported chain)
 MAX_UINT160 = 2**160 - 1
+PERMIT2_UNLIMITED_THRESHOLD = (MAX_UINT160 + 1) // 2  # house policy: a Permit2 amount (uint160) at or above half of uint160 counts as unlimited
 MAX_UINT48 = 2**48 - 1
 MS_EPOCH_HEURISTIC = 10**11  # a "seconds" timestamp above this (year 5138) is almost certainly milliseconds
 MS_EPOCH_CEILING = 10**14  # largest "seconds" value that can still be a millisecond clock (year 5138 in ms); above it a value is neither
@@ -480,7 +481,7 @@ def typed_data_check(payload: dict) -> dict:
                 if parsed != payload["expected_chain_id"]:
                     findings.append(_f("TD-CHAIN-MISMATCH", "blocker", f"domain.chainId {parsed} differs from the expected chain {payload['expected_chain_id']}"))
         if "verifyingContract" not in domain:
-            findings.append(_f("TD-VERIFYING-MISSING", "minor", "domain has no verifyingContract: the signature is not bound to one contract"))
+            findings.append(_f("TD-VERIFYING-MISSING", "major", "domain has no verifyingContract: the signature is not bound to one contract and replays on any contract with the same domain name and chain"))
         elif _address_findings("TD-VERIFYING", "domain.verifyingContract", domain["verifyingContract"], findings):
             contract = domain["verifyingContract"]
             if _same_address(contract, ZERO_ADDRESS):
@@ -836,7 +837,7 @@ def chain_config_check(payload: dict) -> dict:
         network_class = known[0] if known else "unknown"
         name_looks_test = bool(_TESTNET_WORDS.search(payload["chain_name"]))
         if known is None:
-            findings.append(_f("CHAIN-UNKNOWN", "info", f"chain id {chain_id} is not in the built-in reference table: verify it against chainlist before enabling"))
+            findings.append(_f("CHAIN-UNKNOWN", "info", f"chain id {chain_id} is not in the built-in reference table: verify it against chainlist; until it is listed it is treated as a mainnet and needs L3 approval"))
         else:
             if payload["native_symbol"] not in known[1]:
                 findings.append(_f("CHAIN-SYMBOL-MISMATCH", "major", f"native symbol {payload['native_symbol']!r} differs from the registry symbol {'/'.join(known[1])} for chain {chain_id}"))
@@ -847,8 +848,8 @@ def chain_config_check(payload: dict) -> dict:
         claimed = WELL_KNOWN_NAMES.get(" ".join(payload["chain_name"].lower().split()))
         if claimed is not None and claimed != chain_id:
             findings.append(_f("CHAIN-NAME-IMPERSONATION", "blocker", f"the name claims well-known chain {claimed} but the chain id is {chain_id}: a fake network that borrows a trusted name"))
-        mainnet = network_class == "mainnet"
-        if mainnet:
+        mainnet = network_class not in ("testnet", "devnet")  # fail closed: a chain outside the reference table may be a mainnet
+        if known is not None and mainnet:
             findings.append(_f("CHAIN-MAINNET", "info", "mainnet chain: enabling it in a client needs L3 approval"))
         if not 1 <= len(payload["native_symbol"]) <= 6:
             findings.append(_f("CHAIN-SYMBOL-LENGTH", "major", "native currency symbol must be 1-6 characters (MetaMask's wallet_addEthereumChain rule)"))
@@ -869,6 +870,9 @@ def chain_config_check(payload: dict) -> dict:
         if not explorers:
             findings.append(_f("CHAIN-EXPLORER-NONE", "minor", "no block explorer URL: transaction links cannot be shown"))
         for position, url in enumerate(explorers, start=1):
+            if _scheme_of(url) in DANGEROUS_SCHEMES:
+                findings.append(_f(f"CHAIN-EXPLORER-{position}-DANGEROUS-SCHEME", "blocker", f"explorer_urls[{position}] uses a script or embedded-content scheme; explorer links are shown to users as clickable links"))
+                continue
             info = inspect(url)
             for issue in info["issues"]:
                 if issue["code"] in ("insecure-scheme", "credentials", "malformed", "scheme"):
@@ -1552,6 +1556,8 @@ CALL_SIGNATURES = {
     "increaseAllowance(address,uint256)": "approval",
     "setApprovalForAll(address,bool)": "approval_for_all",
     "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)": "permit",
+    "approve(address,address,uint160,uint48)": "permit2_approval",  # Permit2 AllowanceTransfer: the amount is a uint160
+    "permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)": "dai_permit",  # DAI-style permit: `allowed` is an unlimited allowance
     "transfer(address,uint256)": "transfer",
     "transferFrom(address,address,uint256)": "transfer_from",
     "safeTransferFrom(address,address,uint256)": "transfer_from",
@@ -1609,6 +1615,11 @@ def _edit_distance(left: str, right: str) -> int:
     return previous[-1]
 
 
+def _squash(name: str) -> str:
+    """A host with its dots and hyphens removed: `app-example.com` and `appexample.com` both read as `appexamplecom`, as `app.example.com` does."""
+    return name.replace(".", "").replace("-", "")
+
+
 def _domain_findings(label: str, host: str, expected: list[str], findings: list[dict], *, kind: str) -> None:
     if any(host == e or host.endswith("." + e) for e in expected):
         return
@@ -1626,6 +1637,9 @@ def _domain_findings(label: str, host: str, expected: list[str], findings: list[
         limit = 2 if len(target) >= 8 else 1
         if reg != target and len(reg) <= 64 and abs(len(reg) - len(target)) <= limit and _edit_distance(reg, target) <= limit:
             findings.append(_f(f"{kind}-LOOKALIKE", "blocker", f"{label} host {host} is within {limit} edit(s) of the trusted domain {e}"))
+            return
+        if _squash(host) == _squash(e) or re.search(r"(?:^|\.)" + re.escape(e) + "-", host):
+            findings.append(_f(f"{kind}-LOOKALIKE", "blocker", f"{label} host {host} merges or hyphenates the trusted domain {e}"))
             return
     findings.append(_f(f"{kind}-UNEXPECTED", "major" if kind == "ORIGIN" else "minor", f"{label} host {host} is not one of the expected domains"))
 
@@ -1669,11 +1683,10 @@ def signing_request_scan(payload: dict) -> dict:
             if origin:
                 origin_url = origin if "://" in origin else f"https://{origin}"
                 _userinfo_findings("ORIGIN", f"{tag} origin", origin_url, findings)
-            if origin and expected:
                 host = inspect(origin_url)
                 if not host["valid"]:
                     findings.append(_f("SIGN-ORIGIN-MALFORMED", "major", f"{tag}: origin is not a valid URL or host"))
-                else:
+                elif expected:
                     _domain_findings(f"{tag} origin", host["host"], expected, findings, kind="ORIGIN")
             data = request.get("data", "")
             raw = _hex_bytes(data) if data else b""
@@ -1686,12 +1699,12 @@ def signing_request_scan(payload: dict) -> dict:
                 signature, kind = entry
                 decoded.append({"index": index, "selector": "0x" + raw[:4].hex(), "signature": signature})
                 words = [raw[4 + 32 * i:36 + 32 * i] for i in range((len(raw) - 4) // 32)]
-                need = {"approval": 2, "approval_for_all": 2, "permit": 7, "transfer": 2, "transfer_from": 3}[kind]
+                need = {"approval": 2, "approval_for_all": 2, "permit": 7, "permit2_approval": 4, "dai_permit": 8, "transfer": 2, "transfer_from": 3}[kind]
                 if len(words) < need:
                     findings.append(_f("SIGN-CALLDATA-TRUNCATED", "major", f"{tag}: {signature} calldata has {len(words)} argument words, needs at least {need}"))
                     continue
-                if kind in ("approval", "approval_for_all", "permit"):
-                    spender = "0x" + words[1 if kind == "permit" else 0][12:].hex()
+                if kind in ("approval", "approval_for_all", "permit", "permit2_approval", "dai_permit"):
+                    spender = "0x" + words[0 if kind in ("approval", "approval_for_all") else 1][12:].hex()
                     unknown = spender not in known
                     if kind == "approval_for_all":
                         flag = int.from_bytes(words[1], "big")
@@ -1700,12 +1713,21 @@ def signing_request_scan(payload: dict) -> dict:
                         elif flag == 1:
                             findings.append(_f("SIGN-APPROVAL-FOR-ALL", "blocker" if unknown else "major",
                                                f"{tag}: setApprovalForAll(true) hands every token of the collection to {'an unknown' if unknown else 'a known'} operator"))
+                    elif kind == "dai_permit":  # the allowance is a bool: true is an unlimited allowance, and a non-canonical bool reverts
+                        flag = int.from_bytes(words[4], "big")
+                        if flag > 1:
+                            findings.append(_f("SIGN-CALLDATA-MALFORMED", "major", f"{tag}: {signature} allowed flag word is {flag}, not a canonical bool: Solidity 0.8+ reverts on it"))
+                        elif flag == 1:
+                            if unknown:
+                                findings.append(_f("SIGN-SPENDER-UNKNOWN", "blocker", f"{tag}: {signature} grants an allowance to a spender that is not a known contract of this app"))
+                            findings.append(_f("SIGN-UNLIMITED", "blocker" if unknown else "major", f"{tag}: {signature} grants an effectively unlimited allowance"))
                     else:
-                        amount = int.from_bytes(words[2 if kind == "permit" else 1], "big")
+                        amount = int.from_bytes(words[2 if kind in ("permit", "permit2_approval") else 1], "big")
+                        threshold = PERMIT2_UNLIMITED_THRESHOLD if kind == "permit2_approval" else UNLIMITED_THRESHOLD  # a Permit2 amount is a uint160
                         if amount:  # a zero amount (or setApprovalForAll(false)) is a revoke: decoded_calls shows it, nothing to warn about
                             if unknown:
                                 findings.append(_f("SIGN-SPENDER-UNKNOWN", "blocker", f"{tag}: {signature} grants an allowance to a spender that is not a known contract of this app"))
-                            if amount >= UNLIMITED_THRESHOLD:
+                            if amount >= threshold:
                                 findings.append(_f("SIGN-UNLIMITED", "blocker" if unknown else "major", f"{tag}: {signature} grants an effectively unlimited allowance"))
                 elif kind in ("transfer", "transfer_from"):
                     findings.append(_f("SIGN-ASSET-MOVEMENT", "info", f"{tag}: {signature} moves assets out of the connected account"))
@@ -1720,7 +1742,7 @@ def signing_request_scan(payload: dict) -> dict:
                 findings.append(_f("LINK-MALFORMED", "minor", f"{tag} is not a valid URL"))
                 continue
             if info["scheme"] not in ("http", "https"):
-                findings.append(_f("LINK-SCHEME", "major", f"{tag} uses the {info['scheme']} scheme; a displayed link must be http or https"))
+                findings.append(_f("LINK-SCHEME", "major", f"{tag} uses a {len(info['scheme'])}-char scheme that is not http or https; a displayed link must be http or https"))
             elif info["scheme"] == "http":
                 findings.append(_f("LINK-INSECURE", "minor", f"{tag} uses http"))
             _userinfo_findings("LINK", tag, link, findings)
@@ -1776,12 +1798,14 @@ def gas_buffer_check(payload: dict) -> dict:
             findings.append(_f("GAS-INSUFFICIENT-BALANCE", "blocker", f"balance {payload['balance_wei']} wei is below value + gas_limit * maxFeePerGas = {max_cost} wei: nodes reject the transaction"))
         if payload["estimate_age_seconds"] > STALE_ESTIMATE_S:
             findings.append(_f("GAS-ESTIMATE-STALE", "minor", f"estimate is {payload['estimate_age_seconds']}s old (over {STALE_ESTIMATE_S}s): re-estimate before signing"))
+        ceiling = int(_dec(block) * BLOCK_SHARE_PCT / 100)
+        if cap is not None:
+            ceiling = min(ceiling, cap)
         recommended = estimate
         if contract:
-            ceiling = int(_dec(block) * BLOCK_SHARE_PCT / 100)
-            if cap is not None:
-                ceiling = min(ceiling, cap)
             recommended = max(estimate, min(-((-estimate * (100 + int(RECOMMENDED_BUFFER_PCT))) // 100), ceiling))
+        if estimate > ceiling:
+            findings.append(_f("GAS-RECOMMEND-OVER-CEILING", "minor", f"the estimate {estimate} is above the {ceiling} gas ceiling (90% of the block gas limit or the protocol cap): no limit under the ceiling covers it, so the recommendation is the estimate and the transaction may never be included"))
         ordered, blockers, majors, minors, verdict = _finish(findings)
         return {"state": "SUCCESS", "verdict": verdict, "findings": ordered, "blocker_count": blockers, "major_count": majors, "minor_count": minors,
                 "buffer_percent": round(float(buffer_pct), 4), "max_cost_wei": str(max_cost), "recommended_gas_limit": recommended}
