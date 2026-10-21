@@ -2268,6 +2268,9 @@ def non_negative_seconds(value, name: str) -> float:
 def run(args, ctx) -> dict:
     from swarm.envelope import perform_signing_key_lifecycle
     repo = Path(args.repo).resolve()
+    # A malformed deny-path policy is a controller configuration error. Refuse it here, before the lifecycle, leases or
+    # any claim; per-task rejection would burn each task's attempts (headless_command re-checks it defensively).
+    signer_deny_metadata(dict(os.environ))
     # the run's workspace: its keys, state and status writes are scoped to it, not to the cwd it started in
     ctx.root = repo
     key_state = perform_signing_key_lifecycle(root=ctx.root)

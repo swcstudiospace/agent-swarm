@@ -159,7 +159,7 @@ def test_invalid_private_signer_leaves_plan_unclaimed(tmp_path, monkeypatch, bad
     assert tasks and all(t["attempt"] == 0 and t["state"] == "PLANNED" for t in tasks)
 
 
-@pytest.mark.parametrize("flag", ["SWARM_AGENT_SESSION", "SWARM_CHILD"])
+@pytest.mark.parametrize("flag", ["SWARM_AGENT_SESSION"])
 def test_child_preflight_cannot_use_private_signer(tmp_path, monkeypatch, flag):
     from swarm.errors import SwarmError
     from swarm import envelope
@@ -171,3 +171,36 @@ def test_child_preflight_cannot_use_private_signer(tmp_path, monkeypatch, flag):
     with pytest.raises(SwarmError, match="unavailable in agent sessions"):
         mod.preflight_signing()
     assert reads == []
+
+
+def test_trusted_hook_child_preflight_keeps_private_signer(tmp_path, monkeypatch):
+    """hooks/autonomous_run.py launches the runner with SWARM_CHILD=1 only; that trusted runner must still sign."""
+    pytest.importorskip("cryptography")
+    mod = _load(monkeypatch, tmp_path / ".swarm")
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(_private_signer(tmp_path)))
+    monkeypatch.setenv("SWARM_CHILD", "1")
+    mod.preflight_signing()
+
+
+@pytest.mark.parametrize("bad", ["not-json", '{"paths": []}', '["relative/signer.hex"]'])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_malformed_signer_deny_policy_leaves_plan_unclaimed(tmp_path, monkeypatch, bad, dry_run):
+    """With a valid signing key, a bad SWARM_SIGNER_DENY_PATHS must stop the run before any task is claimed."""
+    from swarm.errors import ErrorCode, SwarmError
+    from swarm.taskstore import TaskStore
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    swarm = repo / ".swarm"
+    corr = _plan(repo, swarm)
+    mod = _load(monkeypatch, swarm)
+    monkeypatch.setenv("SWARM_SIGNING_KEY", "fixture-hmac")
+    monkeypatch.setenv("SWARM_SIGNER_DENY_PATHS", bad)
+    _guard(mod, monkeypatch)
+    args = _args(repo, dry_run=dry_run)
+    args.runtime = "omp"
+    ctx = Ctx("A01", "swarm_run", None, corr, dry_run, repo)
+    with pytest.raises(SwarmError, match="invalid or oversized signer deny-path policy") as exc:
+        mod.run(args, ctx)
+    assert exc.value.code is ErrorCode.E_INPUT
+    tasks = TaskStore(swarm / "tasks.db").list(correlation_id=corr)
+    assert tasks and all(t["attempt"] == 0 and t["state"] == "PLANNED" for t in tasks)

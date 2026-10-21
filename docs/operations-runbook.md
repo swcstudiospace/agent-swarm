@@ -25,6 +25,7 @@ The raw shell scanners retain literal spans by index, and plain unquoted words a
 
 ## Private signer bootstrap
 
+
 Use an existing operator-provisioned signer; never print it or paste it into an agent prompt.
 The trusted signer accepts `SWARM_ED25519_KEY_FILE` (an absolute path; relative paths are rejected), or the conventional
 `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when raw signing variables are unset.

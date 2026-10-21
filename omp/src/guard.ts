@@ -141,6 +141,10 @@ export function guardToolCall(event: ToolCallEvent, facts: GuardFacts): ToolCall
     if (targets.some((p) => isProtectedPath(p, facts) || signerMutated(p, facts, facts.cwd))) {
       return { block: true, reason: reason("protected_path", "protected-path-write") };
     }
+    // Overwriting a 0600 seed keeps its owner and mode, so a signer file is protected against writes too.
+    if (targets.some((p) => signerReadTarget(p, facts, facts.cwd))) {
+      return { block: true, reason: reason("signer_credential", "signer-file-write") };
+    }
     return undefined;
   }
   // HOOK-02 (D-03): bash only; normalize, then the first matching row in table order decides
@@ -1200,7 +1204,6 @@ function signerWriteShell(seg: Segment, facts: GuardFacts): boolean {
   if (deleted.some((t) => signerMutated(t, facts, seg.cwd))) return true;
   return !rmProtected(seg, facts) && deleted.some((t) => signerReadTarget(t, facts, seg.cwd, true));
 }
-
 /** The D-08 state directories (compared in any case: a case-insensitive file system maps `.Swarm` onto `.swarm`). */
 const PROTECTED_DIRS = [".swarm", ".omp"];
 /** Device sinks a write may always name: the null/zero/full/tty devices and an open descriptor (`/dev/fd/N`, `/proc/self/fd/N`). */
