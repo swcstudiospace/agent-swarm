@@ -2326,14 +2326,21 @@ const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
   brownie: /^(?:run|console|test)(?: |$)/,
 };
 
+/** A wrapper option whose next word is its value (`exec -a NAME`, `env -u NAME`, `env -C DIR`, `sudo -u USER`), never an assignment. */
+const WRAPPER_VALUE_OPTION = /^(?:-a|-u|-C|--unset|--chdir)$/;
 /**
  * The `HARDHAT_NETWORK` value a command's own prefix assigns (`HARDHAT_NETWORK=v cmd`, `env HARDHAT_NETWORK=v cmd`): the last
- * such word wins, as in bash, and an empty value is unnamed. Undefined: the prefix assigns none. Only the prefix counts, so a
- * `HARDHAT_NETWORK=v` argument of the tool is never the network it runs on.
+ * such word wins, as in bash, and an empty value is unnamed. Undefined: the prefix assigns none. An option's value word is not
+ * an assignment (`exec -a HARDHAT_NETWORK=x hardhat` names argv[0]; the run keeps the inherited network).
  */
 function prefixNetwork(prefix: string): string | undefined {
   let value: string | undefined;
-  for (const raw of shellWords(prefix)) if (/^HARDHAT_NETWORK=/.test(raw)) value = unquote(raw).slice("HARDHAT_NETWORK=".length);
+  let operand = false;
+  for (const raw of shellWords(prefix)) {
+    if (operand) operand = false;
+    else if (WRAPPER_VALUE_OPTION.test(unquote(raw))) operand = true;
+    else if (/^HARDHAT_NETWORK=/.test(raw)) value = unquote(raw).slice("HARDHAT_NETWORK=".length);
+  }
   return value;
 }
 
@@ -2441,6 +2448,8 @@ function literalStart(raw: string): string {
       else out += c;
       continue;
     }
+    // `$"…"` is a locale-translated double-quoted string: its `$` is neither text nor an expansion, and the `"` opens the string
+    if (c === "$" && raw[i + 1] === '"' && quote === undefined) continue;
     if (c === CUT || c === "`" || (c === "$" && dollarExpands(raw, i))) break;
     if (c === "\\") {
       if (i + 1 < raw.length) out += raw[++i];
@@ -2480,11 +2489,33 @@ function plainUnset(args: string[]): boolean {
 }
 
 /**
+ * A redirection whose target cannot fail: `/dev/null`, or a dup of stdout or stderr (`2>&1`, `>&2`). Any other target may
+ * fail, and a failed redirection stops the statement it belongs to, so that statement's write is not certain.
+ */
+function redirectMayFail(text: string): boolean {
+  const raw = shellWords(text);
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op === null) continue;
+    const target = unquote(op[0] === raw[i] ? (raw[++i] ?? "") : raw[i].slice(op[0].length));
+    const safe = op[0].endsWith("&") ? /^[12]$/.test(target) : target === "/dev/null";
+    if (!safe) return true;
+  }
+  return false;
+}
+
+/** The HARDHAT_NETWORK writes of an item. When one of its redirections may fail, the write may not happen: it is kept possible, not certain. */
+function networkWrites(item: Normalized): NetworkWrite[] {
+  const risky = redirectMayFail(`${item.prefix} ${item.text}`);
+  return statementWrites(item).map((write) => (risky ? { ...write, plain: false } : write));
+}
+
+/**
  * The HARDHAT_NETWORK writes of a plain statement: `NAME=v` words, `export NAME=v` and `unset HARDHAT_NETWORK`, each with
  * nothing in front of it but compound keywords. A plain write of another name changes nothing. A prefix assignment
  * (`NAME=v cmd`) is that command's alone and never persists. Every other writer is nonPlainWriter's.
  */
-function networkWrites(item: Normalized): NetworkWrite[] {
+function statementWrites(item: Normalized): NetworkWrite[] {
   const { prefix, prefixRaw, words, at } = itemWords(item);
   const keep = prefix.map((w) => !COMPOUND_KEYWORD.test(w));
   const prefixWords = prefix.filter((_, i) => keep[i]);

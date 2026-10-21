@@ -1229,6 +1229,33 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
   });
 
+  test("an exec -a operand is an argv[0] name, not an assignment: the leading mainnet decides, and an inherited mainnet still reaches the run", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("HARDHAT_NETWORK=mainnet exec -a HARDHAT_NETWORK=localhost hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash("exec -a HARDHAT_NETWORK=localhost hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash("exec -a HARDHAT_NETWORK=localhost hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("a redirection that may fail keeps the earlier network: unset behind a failing redirect leaves inherited mainnet; /dev/null and a stdout dup do not", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("unset HARDHAT_NETWORK >/dev/null/not-a-directory; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash("unset HARDHAT_NETWORK >/dev/null; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost 2>&1; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+  });
+
+  test("a locale-quoted $\"...\" is a double-quoted string: a printf -v written through it needs approval, a locale-quoted print does not", () => {
+    expect(guardToolCall(bash('export HARDHAT_NETWORK=localhost; opt=-v; printf $"$opt" HARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts'), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash('printf $"cost\\n"; hardhat test'), insideAs(A26))).toBeUndefined();
+  });
+
   test("the last export on the line decides: a mainnet export after a local one still needs approval", () => {
     expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; export HARDHAT_NETWORK=mainnet; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",

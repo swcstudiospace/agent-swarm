@@ -2089,8 +2089,26 @@ describe("stack order with a rank-20 peer bar (restack protocol)", () => {
   });
 });
 
+/** A host whose footer is recorded: the widget host plus a recording `setStatus`, the status channel a footer line would use. */
+function footerHost(swarmDir?: string) {
+  const h = harness({ swarmDir });
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const ui: NonNullable<ExtensionContext["ui"]> & { setStatus(key: string, text: string | undefined): void } = {
+    ...h.host.ui,
+    setStatus: (key, text) => void statuses.push({ key, text }),
+  };
+  h.ctx.ui = ui;
+  return { h, statuses, ui };
+}
+
 describe("footer status stays absent", () => {
-  test("no footer status with a `swarm:` prefix is ever written, across idle, loading, running, completed and telemetry-error bars", () => {
+  test("the recording footer records a status write, so the empty-footer assertions below can fail", () => {
+    const { statuses, ui } = footerHost();
+    ui.setStatus("swarm", "swarm: control write");
+    expect(statuses).toEqual([{ key: "swarm", text: "swarm: control write" }]);
+  });
+
+  test("no status or footer text is written in the loading, idle, running, completed or error states, nor as the timers drive them", () => {
     const errorDir = join(tmpDir("swarm-footer-"), ".swarm");
     mkdirSync(errorDir, { recursive: true });
     writeFileSync(join(errorDir, "live.json"), "{ not json");
@@ -2119,18 +2137,49 @@ describe("footer status stays absent", () => {
       error: { swarmDir: errorDir, setup: () => {}, rows: (lines) => lines.join("\n") === TELEMETRY.join("\n") },
     };
     for (const [name, state] of Object.entries(states)) {
-      // a recording footer next to the widget host: every `setStatus` the bar makes lands here
-      const statuses: Array<{ key: string; text: string | undefined }> = [];
-      const h = harness({ swarmDir: state.swarmDir });
-      const ui: NonNullable<ExtensionContext["ui"]> & { setStatus(key: string, text: string | undefined): void } = {
-        ...h.host.ui,
-        setStatus: (key, text) => void statuses.push({ key, text }),
-      };
-      h.ctx.ui = ui;
+      const { h, statuses } = footerHost(state.swarmDir);
       h.fire("session_start");
       state.setup(h);
       expect({ state: name, mounted: h.host.order(), rows: state.rows(h.host.lines()) }).toEqual({ state: name, mounted: [SWARM_BAR_KEY], rows: true });
-      expect({ state: name, footer: statuses.filter((status) => status.text?.startsWith("swarm:")) }).toEqual({ state: name, footer: [] });
+      h.timers.turn();
+      h.timers.tickInterval();
+      expect({ state: name, statuses }).toEqual({ state: name, statuses: [] });
+    }
+  });
+
+  test("a state change writes no status text: one session walks loading, running, completed and the linger clear, checking the footer at each step", () => {
+    const { h, statuses } = footerHost();
+    const started = { id: "a", agent: "a05-backend", status: "started", index: 0 };
+    const steps: Array<{ step: string; act: () => void; marker: string }> = [
+      {
+        step: "loading",
+        act: () => h.fire("tool_call", { toolName: "task", toolCallId: "call-1", input: { tasks: [{ id: "a", agent: "a05-backend" }] } }),
+        marker: "start",
+      },
+      {
+        step: "running",
+        act: () => {
+          h.bus.emit(LIFECYCLE_CHANNEL, started);
+          h.bus.emit(PROGRESS_CHANNEL, frame("a", "a05-backend", "running", 1000));
+        },
+        marker: "1 run",
+      },
+      { step: "completed", act: () => h.bus.emit(LIFECYCLE_CHANNEL, { ...started, status: "completed" }), marker: "1 done" },
+      {
+        step: "linger cleared",
+        act: () => {
+          h.clock.mono += 21_000;
+          h.timers.wakeUp();
+        },
+        marker: "",
+      },
+    ];
+    h.fire("session_start");
+    for (const { step, act, marker } of steps) {
+      act();
+      const shown = marker === "" || h.host.lines().join("\n").includes(marker);
+      expect({ step, shown, mounted: h.host.order() }).toEqual({ step, shown: true, mounted: [SWARM_BAR_KEY] });
+      expect({ step, statuses }).toEqual({ step, statuses: [] });
     }
   });
 });
