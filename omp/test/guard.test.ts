@@ -1574,6 +1574,33 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
     expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost >/dev/null && hardhat test"), inherited)).toBeUndefined();
   });
+
+  test("a bare RPC name is not proof of a local endpoint: foundry resolves it through foundry.toml, so local, localhost and anvil block", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("forge script script/Deploy.s.sol --broadcast --rpc-url local --account deployer"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("forge script script/Deploy.s.sol --broadcast --rpc-url localhost --account deployer"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("cast send --rpc-url anvil 0xabc 'f()'"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("cast send -r local 0xabc 'f()'"), insideAs(A26))?.reason).toBe(CHAIN);
+  });
+
+  test("a literal loopback URL is local: http://127.0.0.1:8545 and http://localhost:8545 pass, with or without a path", () => {
+    expect(guardToolCall(bash("forge script script/Deploy.s.sol --broadcast --rpc-url http://127.0.0.1:8545 --account deployer"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("forge script script/Deploy.s.sol --broadcast --rpc-url http://localhost:8545 --account deployer"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("cast send --rpc-url http://localhost:8545/rpc 0xabc 'f()'"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("a remote RPC URL blocks, and a host that only starts with a loopback name is not loopback", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("forge script script/Deploy.s.sol --broadcast --rpc-url https://mainnet.example.org --account deployer"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("cast send --rpc-url http://localhost.evil.example 0xabc 'f()'"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("cast send --rpc-url http://127.0.0.1@mainnet.example 0xabc 'f()'"), insideAs(A26))?.reason).toBe(CHAIN);
+  });
+
+  test("read-only cast and forge forms with a bare RPC name stay passing: no submit, nothing reaches a network", () => {
+    expect(guardToolCall(bash("cast call --rpc-url local 0xabc 'f()'"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("forge test --fork-url local"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("cast rpc --rpc-url local eth_blockNumber"), insideAs(A26))).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {

@@ -2319,18 +2319,22 @@ function kubeadmChange({ words }: Segment): boolean {
 const LOCAL_CHAIN_NETWORK = /^(?:hardhat|localhost|anvil|development|local)$/i;
 /** An anchor cluster that is local: `localnet` (`l`), or a loopback URL. */
 const LOCAL_ANCHOR_CLUSTER = /^(?:localnet|l|localhost|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?)$/i;
-/** A loopback RPC endpoint: `http(s)://localhost|127.0.0.1|[::1]` with an optional port. */
-const LOCAL_RPC_URL = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?$/i;
+/**
+ * A literal loopback RPC endpoint: an http or https URL whose host is `127.0.0.1`, `localhost` or `[::1]`, with an optional
+ * port and path. Nothing else proves locality: a bare name (`local`, `localhost`, `anvil`) resolves through foundry.toml's
+ * [rpc_endpoints], which the guard does not read, and a userinfo or another host after the loopback host is not loopback.
+ */
+const LOCAL_RPC_URL = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]\S*)?$/i;
 /** The RPC flags of cast and forge: each names the endpoint a submitting run reaches. */
 const RPC_FLAG = /^(?:-r|--rpc-url|--fork-url)$/;
 
 /**
- * Whether a cast or forge line's RPC endpoint is provably local: at least one RPC flag, and every one of them names a local
- * chain or a loopback URL. No RPC flag leaves the endpoint to ETH_RPC_URL or the project config, which the guard does not read.
+ * Whether a cast or forge line's RPC endpoint is provably local: at least one RPC flag, and every one of them is a literal
+ * loopback URL (LOCAL_RPC_URL). No RPC flag leaves the endpoint to ETH_RPC_URL or the project config, which the guard does not read.
  */
 function rpcLocal(flags: CliFlag[]): boolean {
   const rpcs = flags.filter((f) => RPC_FLAG.test(f.flag));
-  return rpcs.length > 0 && rpcs.every((f) => f.value !== undefined && (LOCAL_CHAIN_NETWORK.test(f.value) || LOCAL_RPC_URL.test(f.value)));
+  return rpcs.length > 0 && rpcs.every((f) => f.value !== undefined && LOCAL_RPC_URL.test(f.value));
 }
 
 /**
