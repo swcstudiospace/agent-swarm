@@ -107,7 +107,14 @@ def _r(value, digits: int = 4) -> float:
 
 
 def _num(value) -> str:
-    return f"{float(value):.6g}"
+    """Six significant figures, never exponent form: a money amount above 1e6 prints as digits, not 1e+06."""
+    number = float(value)
+    text = f"{number:.6g}"
+    if "e" not in text:
+        return text
+    if abs(number) >= 1:
+        return f"{number:.0f}"
+    return format(Decimal(text), "f")
 
 
 def _finding(fid: str, severity: str, summary: str) -> dict:
@@ -258,8 +265,9 @@ def rightsize(payload: dict) -> dict:
     """Recommend per-replica CPU and memory requests from observed usage.
 
     CPU = ceil(p95 or p99 x (1 + headroom)); memory = ceil(p99 x (1 + headroom)) because memory is not compressible
-    (the kernel evicts or OOM-kills instead of throttling). A change inside +-tolerance (inclusive) is `keep`; a CPU
-    downsize is withheld while the p99 exceeds the current request. A dimension whose action is keep (inside the band
+    (the kernel evicts or OOM-kills instead of throttling). A change inside +-tolerance (inclusive) is `keep`, except
+    a memory p99 above its request, which is always an upsize. A CPU downsize is withheld while the p99 exceeds the
+    current request. A dimension whose action is keep (inside the band
     or withheld) reports its current request, rounded up to a whole unit, as the recommendation, so applying every
     `*_recommended` field never applies a change the action does not name. There is no floor above 1 m / 1 MiB:
     callers apply their own platform minimums. Saving = replicas x hours x unit price x delta; positive for
@@ -289,6 +297,8 @@ def rightsize(payload: dict) -> dict:
             mem_rec = Fraction(max(1, math.ceil(mem_p99 * mem_headroom)))
             cpu_action = _resize_action(cpu_req, cpu_rec, tolerance)
             mem_action = _resize_action(mem_req, mem_rec, tolerance)
+            if mem_action == "keep" and mem_p99 > mem_req:
+                mem_action = "upsize"
             if cpu_action == "downsize" and cpu_p99 > cpu_req:
                 cpu_action = "keep"
                 findings.append(_finding(f"RS-{name}-cpu-peak", "minor", f"{name}: cpu downsize withheld, p99 {_num(cpu_p99)}m is above the request {_num(cpu_req)}m"))
@@ -443,7 +453,7 @@ def budget_burn(payload: dict) -> dict:
         findings: list[dict] = []
         if spend >= budget:
             verdict, days_until = "over_budget", Fraction(0)
-            findings.append(_finding("BB-OVER", "major", f"spend {_num(spend)} has reached the budget {_num(budget)}"))
+            findings.append(_finding("BB-OVER", "major", f"spend {_num(spend)} has reached or exceeded the budget {_num(budget)}"))
         elif projected > budget:
             verdict = "will_overrun"
             days_until = (budget - spend) / rate
@@ -480,7 +490,8 @@ def spend_anomaly(payload: dict) -> dict:
     (default 3.5, Iglewicz and Hoaglin). When the MAD is 0 (more than half the days are identical) the mean absolute
     deviation about the median is used instead, M = (x - median) / (1.253314 x meanAD): IBM's convention, `scale_method`
     says `mean_ad`; a constant series has no anomalies (`constant`). The series is one value per consecutive day: the
-    dates are start_date + index. Excess spend = sum of upward deviations from the median. Upward anomalies at
+    dates are start_date + index. Excess spend = sum of (value - median) over the flagged upward anomalies only; days
+    inside the threshold and downward days add nothing. Upward anomalies at
     |M| >= 2 x threshold are major, other upward ones minor and downward ones info."""
 
     def work() -> dict:

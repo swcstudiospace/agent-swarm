@@ -222,6 +222,14 @@ def test_rightsize_memory_p99_above_request_is_an_upsize_with_a_major_finding():
     assert [f["severity"] for f in peak] == ["major"]
 
 
+def test_rightsize_memory_peak_inside_the_tolerance_band_is_an_upsize():
+    # headroom 0 puts the formula at the p99 itself (1050), inside the +-10 % band of 1000: a kept dimension would hide a peak above the request
+    result = sized([workload(mem_request_mib=1000, mem_p95_mib=1000, mem_p99_mib=1050, cpu_request_m=230)], mem_headroom_pct=0)
+    record = result["workloads"][0]
+    assert (record["action"], record["mem_recommended_mib"], result["keep_count"]) == ("upsize", 1050, 0)
+    assert result["verdict"] == "rightsizing_needed" and "RS-api-mem" in [f["id"] for f in result["findings"]]
+
+
 def test_rightsize_mixed_action_and_gross_versus_extra_cost():
     result = sized([workload(replicas=1, cpu_request_m=1000, cpu_p95_m=100, cpu_p99_m=200, mem_request_mib=500, mem_p95_mib=400, mem_p99_mib=600)],
                    cpu_price_per_core_hour=1, mem_price_per_gib_hour=1, hours_per_month=100)
@@ -322,7 +330,7 @@ SHORT = {"period_start": "2026-10-01T00:00:00Z", "period_end": "2026-10-11T00:00
 
 
 def test_budget_burn_verdict_boundaries():
-    assert burn(**SHORT, spend_to_date=449)["verdict"] == "on_track"  # projected 898.2
+    assert burn(**SHORT, spend_to_date=449)["verdict"] == "on_track"  # projected 898.0
     at_risk = burn(**SHORT, spend_to_date=450)  # projected exactly 90 % of the budget
     assert (at_risk["verdict"], at_risk["projected_total"], at_risk["overrun_at"], at_risk["days_until_overrun"]) == ("at_risk", 900.0, "", -1.0)
     assert burn(**SHORT, spend_to_date=500)["verdict"] == "at_risk"  # projected exactly the budget: not an overrun
@@ -333,6 +341,13 @@ def test_budget_burn_spend_at_budget_is_over_budget_with_zero_days():
     result = burn(**SHORT, spend_to_date=1000)
     assert (result["verdict"], result["days_until_overrun"], result["overrun_at"]) == ("over_budget", 0.0, "")
     assert [f["id"] for f in result["findings"]] == ["BB-OVER"]
+
+
+def test_money_in_summaries_prints_full_digits_above_a_million():
+    over = burn(**{**SHORT, "budget": 1000000}, spend_to_date=1000000)
+    assert [f["summary"] for f in over["findings"]] == ["spend 1000000 has reached or exceeded the budget 1000000"]
+    big = tagged([res("big", 1234567.89, environment="prod")], required=("owner", "environment"))
+    assert [f["summary"] for f in big["findings"]] == ["big (1234568/month) missing: owner"]
 
 
 def test_budget_burn_uses_the_recent_run_rate_when_supplied():

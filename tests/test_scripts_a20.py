@@ -89,10 +89,12 @@ def test_only_minor_findings_exit_zero(tmp_path):
     assert out["status"] == "ok" and out["counts"]["minor"] == 1 and out["counts"]["major"] == 0
 
 
-def test_clean_tree_is_ok_with_no_findings(tmp_path):
+def test_a_tree_without_iac_inputs_is_incomplete_not_ok(tmp_path):
     put(tmp_path, "README.md", "nothing to scan")
     out = json.loads(cli(tmp_path).stdout)
-    assert (out["status"], out["files_scanned"], out["findings"]) == ("ok", 0, [])
+    assert (out["status"], out["files_scanned"]) == ("fail", 0)
+    assert [(f["rule"], f["severity"]) for f in out["findings"]] == [("scan-incomplete", "major")]
+    assert out["findings"][0]["summary"].endswith("no in-scope input was analysed")
 
 
 def test_path_must_stay_inside_root_and_exist(tmp_path):
@@ -255,9 +257,91 @@ def test_instance_types_list_and_launch_template_volumes(tmp_path):
     assert hits(result, "iac-previous-generation-volume") == [("aws_launch_template.lt", "minor")]
 
 
-def test_interpolated_instance_types_are_not_evaluated(tmp_path):
-    put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  instance_type = "${var.size}"\n}\nresource "aws_instance" "b" {\n  instance_type = var.size\n}\n')
-    assert scan(tmp_path)["findings"] == []
+def test_interpolated_instance_and_volume_types_are_reported_not_skipped(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  instance_type = "${var.size}"\n}\n'
+                             'resource "aws_launch_template" "lt" {\n  block_device_mappings {\n    ebs {\n      volume_type = "${var.vt}"\n    }\n  }\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    summary = result["findings"][0]["summary"]
+    assert "main.tf::aws_instance.a: instance_type is an interpolation and was not evaluated" in summary
+    assert "main.tf::aws_launch_template.lt: volume_type is an interpolation and was not evaluated" in summary
+    assert "var.size" not in summary and "var.vt" not in summary  # the value is never echoed
+
+
+def test_variable_and_local_references_in_type_values_are_reported_not_skipped(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "b" {\n  instance_type = var.size\n}\n'
+                             'resource "aws_eks_node_group" "ng" {\n  instance_types = local.types\n}\n'
+                             'resource "aws_ebs_volume" "v" {\n  type = var.vt\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    summary = result["findings"][0]["summary"]
+    assert "main.tf::aws_instance.b: instance_type is a variable reference and was not evaluated" in summary
+    assert "main.tf::aws_eks_node_group.ng: instance_types is a variable reference and was not evaluated" in summary
+    assert "main.tf::aws_ebs_volume.v: type is a variable reference and was not evaluated" in summary
+
+
+def test_count_and_for_each_are_reported_not_skipped(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "web" {\n  count = var.n\n  instance_type = "m5.large"\n}\n'
+                             'resource "aws_instance" "pool" {\n  for_each = var.pools\n  instance_type = "m5.large"\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    summary = result["findings"][0]["summary"]
+    assert "main.tf::aws_instance.web: count is not evaluated: the instance count is unknown" in summary
+    assert "main.tf::aws_instance.pool: for_each is not evaluated: the instance count is unknown" in summary
+
+
+def test_dynamic_blocks_are_reported_not_skipped(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_launch_template" "lt" {\n  dynamic "block_device_mappings" {\n    for_each = var.disks\n    content {\n      ebs {\n        volume_type = "gp2"\n      }\n    }\n  }\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete", "iac-previous-generation-volume"]
+    assert "main.tf::aws_launch_template.lt: dynamic block is not evaluated" in result["findings"][0]["summary"]
+
+
+def test_terraform_json_and_cloudformation_type_values_and_counts_are_reported_not_skipped(tmp_path):
+    put(tmp_path, "main.tf.json", json.dumps({"resource": {"aws_instance": {"a": {"instance_type": "${var.size}", "count": 2}}}}))
+    put(tmp_path, "stack.json", json.dumps({"Resources": {"Ref": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": {"Ref": "Size"}}}}}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    summary = result["findings"][0]["summary"]
+    assert "main.tf.json::aws_instance.a: instance_type is an interpolation and was not evaluated" in summary
+    assert "main.tf.json::aws_instance.a: count is not evaluated: the instance count is unknown" in summary
+    assert "stack.json::AWS::EC2::Instance:Ref: InstanceType is an intrinsic function and was not evaluated" in summary
+
+
+def test_module_block_with_a_remote_source_is_an_incomplete_input(tmp_path):
+    put(tmp_path, "main.tf", 'module "vpc" {\n  source = "terraform-aws-modules/vpc/aws"\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "main.tf::module.vpc: module block is not evaluated" in result["findings"][0]["summary"]
+
+
+def test_module_with_a_local_source_is_covered_by_its_analysed_directory(tmp_path):
+    put(tmp_path, "main.tf", 'module "vpc" {\n  source = "./vpc"\n}\n')
+    put(tmp_path, "vpc/main.tf", 'resource "aws_ebs_volume" "v" {\n  type = "gp2"\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["iac-previous-generation-volume"] and result["status"] == "ok"
+
+
+def test_module_count_is_reported_on_the_module_block_even_with_an_analysed_source(tmp_path):
+    put(tmp_path, "main.tf", 'module "pool" {\n  source = "./pool"\n  count = var.n\n}\n')
+    put(tmp_path, "pool/main.tf", 'resource "aws_instance" "a" {\n  instance_type = "m5.large"\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "main.tf::module.pool: count is not evaluated: the instance count is unknown" in result["findings"][0]["summary"]
+
+
+def test_terraform_json_module_blocks_are_reported_like_hcl(tmp_path):
+    put(tmp_path, "main.tf.json", json.dumps({"module": {"db": {"source": "git::https://example.com/db.git"}}}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "main.tf.json::module.db: module block is not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_commented_out_module_block_is_not_reported(tmp_path):
+    put(tmp_path, "main.tf", '# module "vpc" {\n#   source = "terraform-aws-modules/vpc/aws"\n# }\n')
+    result = scan(tmp_path)
+    assert (result["findings"], result["status"]) == ([], "ok")
+
 
 
 def test_ebs_volume_generations(tmp_path):
@@ -323,16 +407,30 @@ def test_untagged_resources_use_the_tag_coverage_rules(tmp_path):
     assert all(f["severity"] == "major" for f in by_ref.values())
 
 
-def test_tag_expressions_are_unknown_and_not_flagged(tmp_path):
+def test_tag_expressions_are_not_judged_and_never_count_as_present(tmp_path):
     put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  tags = merge(local.common, { Name = "a" })\n}\nresource "aws_instance" "b" {\n  tags = local.tags\n}\n'
                              'resource "aws_instance" "c" {\n  tags = { owner = var.owner, environment = "${var.env}" }\n}\n')
-    assert scan(tmp_path, required=["owner", "environment"])["findings"] == []
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    detail = result["findings"][0]["summary"]
+    assert all(f"main.tf::aws_instance.{ref}:" in detail for ref in "abc")
+
+
+def test_an_intrinsic_tag_value_is_not_counted_as_present(tmp_path):
+    put(tmp_path, "stack.json", json.dumps({"Resources": {
+        "Queue": {"Type": "AWS::SQS::Queue", "Properties": {"Tags": [{"Key": "owner", "Value": {"Ref": "OwnerParam"}}, {"Key": "environment", "Value": "prod"}]}},
+        "Plain": {"Type": "AWS::SQS::Queue", "Properties": {"Tags": [{"Key": "owner", "Value": "x"}, {"Key": "environment", "Value": "prod"}]}},
+    }}))
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert [f for f in result["findings"] if f["rule"] == "iac-untagged-resource"] == []
+    assert "stack.json::AWS::SQS::Queue:Queue: a required tag value is an expression" in result["findings"][0]["summary"]
+    assert result["status"] == "fail"
 
 
 def test_provider_default_tags_skip_the_terraform_tag_check_and_say_so(tmp_path):
     put(tmp_path, "main.tf", 'provider "aws" {\n  default_tags {\n    tags = { owner = "x" }\n  }\n}\nresource "aws_instance" "a" {\n  instance_type = "m5.large"\n}\n')
     result = scan(tmp_path, required=["owner"])
-    assert result["findings"] == []
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"]  # inherited tags are not judged: the scan says so
     assert [(s["check"], s["status"]) for s in result["skipped"]] == [("iac-untagged-resource", "skipped:provider-default-tags")]
 
 
@@ -438,7 +536,9 @@ Resources:
         - {Key: owner, Value: x}
 """)
     result = scan(tmp_path, required=["owner"])
-    assert [(f["rule"], f["summary"].split(" ")[0]) for f in result["findings"]] == [("iac-previous-generation-instance", "AWS::EC2::Instance:Old")]
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete", "iac-previous-generation-instance"]
+    assert "stack.yaml::AWS::EC2::Instance:Web" in result["findings"][0]["summary"]  # the !Sub owner value is not counted as present
+    assert [f["summary"].split(" ")[0] for f in result["findings"] if f["rule"] == "iac-previous-generation-instance"] == ["AWS::EC2::Instance:Old"]
 
 
 def test_a_whole_tags_property_that_is_an_intrinsic_is_unknown_not_missing(tmp_path):
@@ -471,7 +571,7 @@ Resources:
 # --- optional PyYAML ------------------------------------------------------------------------------------------------
 
 
-def test_yaml_checks_are_skipped_not_failed_when_pyyaml_is_missing(tmp_path):
+def test_yaml_checks_are_reported_as_incomplete_when_pyyaml_is_missing(tmp_path):
     put(tmp_path, "dep.yaml", DEPLOYMENT)
     put(tmp_path, "dep.json", json.dumps({"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "image": "i"}]}}))
     mod = module()
@@ -479,6 +579,8 @@ def test_yaml_checks_are_skipped_not_failed_when_pyyaml_is_missing(tmp_path):
     result = scan(tmp_path, required=["owner"], mod=mod)
     assert result["skipped"] == [{"check": "yaml-manifests", "status": "skipped:tool-missing", "detail": "PyYAML is not importable: 1 YAML file(s) not read"}]
     assert result["files_skipped"]["yaml_tool_missing"] == 1 and result["files_scanned"] == 1
+    assert [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"] == [
+        "scan incomplete, status is fail until every in-scope input is analysed: dep.yaml: YAML not read, PyYAML is not importable"]
     assert hits(result, "k8s-missing-requests") == [("Pod/p", "major")]  # JSON handling stays native
 
 
@@ -501,7 +603,7 @@ def test_large_binary_and_malformed_files_are_skipped_and_counted(tmp_path):
     result = scan(tmp_path)
     assert result["files_skipped"] == {"too_large": 1, "binary": 2, "parse_error": 1, "symlink": 0, "yaml_tool_missing": 0}
     assert result["files_scanned"] == 1  # edge.json
-    assert result["findings"] == [] and result["status"] == "ok"
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
 
 
 def test_scan_stops_at_two_thousand_files(tmp_path):
@@ -524,7 +626,8 @@ def test_symlinks_are_never_followed(tmp_path):
     (root / "linked.tf").symlink_to(outside / "evil.tf")
     (root / "linkdir").symlink_to(outside, target_is_directory=True)
     result = scan(root)
-    assert result["findings"] == [] and result["files_skipped"]["symlink"] == 1
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["files_skipped"]["symlink"] == 1
+    assert "linked.tf: symlink not followed" in result["findings"][0]["summary"] and "linkdir: symlinked directory not followed" in result["findings"][0]["summary"]
     assert result["files_scanned"] == 1
 
 
@@ -640,7 +743,7 @@ def test_hcl_crlf_files_mask_heredoc_bodies(tmp_path):
 def test_a_terraform_resource_that_cannot_be_delimited_is_reported_not_dropped_silently(tmp_path):
     put(tmp_path, "broken.tf", 'resource "aws_instance" "x" {\n  instance_type = "m5.24xlarge"\n')
     result = scan(tmp_path)
-    assert result["findings"] == []
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and "broken.tf: 1 resource block(s) could not be delimited" in result["findings"][0]["summary"]
     (entry,) = [e for e in result["skipped"] if e["check"] == "terraform-resources"]
     assert entry["check"] == "terraform-resources" and entry["status"] == "skipped:unbalanced-braces"
     assert "1 resource block(s)" in entry["detail"] and "broken.tf" in entry["detail"]

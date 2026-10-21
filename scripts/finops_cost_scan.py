@@ -19,12 +19,13 @@ Rules (each finding carries its `rule`):
 Reads Terraform (.tf, .tf.json), CloudFormation and Kubernetes manifests (.json, and .yaml/.yml when PyYAML imports;
 otherwise the YAML-dependent checks are reported as `skipped:tool-missing` and JSON/Terraform keep working). HCL is
 read by a lexer for comments, heredocs and quoted strings with nested `${ }` templates, then regular expressions over
-the resource blocks: variables, modules, `count` and dynamic blocks are not evaluated, and a resource block whose
+the resource blocks: variables, `count` and dynamic blocks are not evaluated, a module block is an incomplete input unless its local source directory was analysed, and a resource block whose
 braces do not balance is reported under `skipped` (`terraform-resources`), never dropped silently.
 Bounded: files over 1 MiB are skipped, at most 2000 candidate files are read, symlinks are never followed out of
 --root, binary and non-regular files are skipped, a malformed manifest is counted under `parse_error`. It reads files
 under --root and writes nothing; findings carry paths, resource references, container names and instance or volume
-types only, never file contents. Status is `fail` when any finding is major or worse. `--dry-run` prints deterministic
+types only, never file contents. Status is `fail` when any finding is major or worse, or when an in-scope input was not
+analysed or not evaluated: every such input (a file, a resource block, a tag, a type value that is an interpolation, variable or intrinsic reference, a `count`, `for_each` or `dynamic` block, a module block not covered by an analysed local directory) is a reason in one major `scan-incomplete` finding (swarm/scan_status.py). `--dry-run` prints deterministic
 canned output and reads nothing. No external binary is required.
 """
 from __future__ import annotations
@@ -42,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools.a20_tools import tag_coverage  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 
 try:
     import yaml
@@ -243,7 +245,7 @@ def _hcl_tags(masked: str, skeleton: str) -> dict | None:
     tags: dict[str, str] = {}
     for entry in re.finditer(r'"?([A-Za-z0-9_.:/-]+)"?[ \t]*=[ \t]*("(?:[^"\\]|\\.)*"|[^,\n}]+)', raw[1:-1]):
         quoted = re.fullmatch(r'"(.*)"', entry.group(2))
-        tags[entry.group(1)] = quoted.group(1) if quoted else _UNKNOWN
+        tags[entry.group(1)] = quoted.group(1) if quoted and not re.search(r"[$%]\{", quoted.group(1)) else _UNKNOWN
     return tags
 
 
@@ -306,7 +308,19 @@ def _hcl_facts(path: str, text: str) -> tuple[list[dict], tuple[bool, bool, list
             "tags": _hcl_tags(body_m, body_s) if rtype in TAGGABLE_TF else None,
             "lifecycle": _hcl_lifecycle(rtype, body_m, body_s, retention),
             "body": body_m,
+            "unevaluated": _hcl_unevaluated(rtype, body_m, body_s),
         })
+    for head in re.finditer(r'^[ \t]*module[ \t]+"([^"]+)"[ \t]*\{', masked, re.M):
+        line = bisect_left(newlines, head.start()) + 1
+        close = _close_index(skeleton, head.end() - 1)
+        if close < 0:  # unbalanced braces: the source is unknown, so the block is an unanalysed input
+            facts.append(_module_fact(path, head.group(1), line, None, []))
+            continue
+        body_m, body_s = masked[head.end():close], skeleton[head.end():close]
+        source = re.fullmatch(r'"(\.\.?/[^"$]*)"', _top_level_attr(body_m, body_s, "source") or "")
+        child = posixpath.normpath(posixpath.join(_dir_key(path), source.group(1))) if source else None
+        constructs = [reason for key, reason in (("count", COUNT_REASON), ("for_each", FOR_EACH_REASON)) if _top_level_attr(body_m, body_s, key) is not None]
+        facts.append(_module_fact(path, head.group(1), line, child, constructs))
     return facts, _hcl_scope(_dir_key(path), masked, skeleton), unclosed
 
 
@@ -378,6 +392,119 @@ def _declared_tags(container: dict, key: str) -> dict | None:
     return _tag_map(container[key]) if key in container else {}
 
 
+COUNT_REASON = "count is not evaluated: the instance count is unknown"
+FOR_EACH_REASON = "for_each is not evaluated: the instance count is unknown"
+MODULE_REASON = "module block is not evaluated: the resources it builds and its inputs were not analysed"
+TF_VALUE_KEYS = ("instance_type", "instance_class", "node_type", "instance_types", "volume_type")
+CFN_VALUE_KEYS = ("InstanceType", "InstanceTypes", "DBInstanceClass", "CacheNodeType", "VolumeType")
+
+
+def _value_problems(key: str, value) -> list[str]:
+    """Reasons for a type value that is not a plain string: an interpolation, an intrinsic function or another
+    expression. The value itself is never echoed."""
+    out = []
+    for item in value if isinstance(value, list) else [value]:
+        if isinstance(item, str) and "${" not in item and "%{" not in item:
+            continue
+        if isinstance(item, str):
+            out.append(f"{key} is an interpolation and was not evaluated")
+        elif isinstance(item, dict) and any(k == "Ref" or str(k).startswith("Fn::") for k in item):
+            out.append(f"{key} is an intrinsic function and was not evaluated")
+        else:
+            out.append(f"{key} is an expression and was not evaluated")
+    return out
+
+
+def _doc_unevaluated(node, keys: tuple[str, ...], structural: bool) -> list[str]:
+    """Reasons for every type value under `keys`, at any depth, that is not a plain string; with `structural`, every
+    Terraform `dynamic` block as well. Shared YAML aliases are visited once."""
+    out: list[str] = []
+    stack, seen = [node], set()
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if key in keys:
+                    out.extend(_value_problems(str(key), child))
+                if structural and key == "dynamic" and isinstance(child, (dict, list)):
+                    out.append("dynamic block is not evaluated")
+                stack.append(child)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return out
+
+
+def _tf_json_unevaluated(rtype: str, attrs: dict) -> list[str]:
+    out = _doc_unevaluated(attrs, TF_VALUE_KEYS, structural=True)
+    if rtype == "aws_ebs_volume" and "type" in attrs:
+        out.extend(_value_problems("type", attrs["type"]))
+    if "count" in attrs:
+        out.append(COUNT_REASON)
+    if "for_each" in attrs:
+        out.append(FOR_EACH_REASON)
+    return list(dict.fromkeys(out))
+
+
+_HCL_LITERAL = re.compile(r'"[^"$%]*"[ \t]*(?:\}|$)')
+_HCL_LIST = re.compile(r'\[\s*(?:"[^"$%]*"\s*,?\s*)*\]')
+_HCL_SCALARS = ("instance_type", "instance_class", "node_type", "volume_type")
+
+
+def _hcl_family(raw: str) -> str:
+    if "${" in raw or "%{" in raw:
+        return "an interpolation"
+    if re.search(r"\b(?:var|local|module|data)\.", raw):
+        return "a variable reference"
+    return "an expression"
+
+
+def _hcl_unevaluated(rtype: str, body_m: str, body_s: str) -> list[str]:
+    """Constructs in one resource body that A20 does not evaluate, as reasons without their values. Attribute names are
+    found in the skeleton, so text inside strings and comments is never read as an attribute."""
+    out: list[str] = []
+    for name in _HCL_SCALARS:
+        for match in re.finditer(rf"\b{name}[ \t]*=[ \t]*", body_s):
+            end = body_m.find("\n", match.end())
+            raw = body_m[match.end(): len(body_m) if end < 0 else end].strip()
+            if not _HCL_LITERAL.match(raw):
+                out.append(f"{name} is {_hcl_family(raw)} and was not evaluated")
+    listed = _top_level_attr(body_m, body_s, "instance_types")
+    if listed is not None and not _HCL_LIST.fullmatch(listed):
+        out.append(f"instance_types is {_hcl_family(listed)} and was not evaluated")
+    if rtype == "aws_ebs_volume":
+        own = _top_level_attr(body_m, body_s, "type")
+        if own is not None and not _HCL_LITERAL.match(own):
+            out.append(f"type is {_hcl_family(own)} and was not evaluated")
+    if _top_level_attr(body_m, body_s, "count") is not None:
+        out.append(COUNT_REASON)
+    if _top_level_attr(body_m, body_s, "for_each") is not None:
+        out.append(FOR_EACH_REASON)
+    if re.search(r'\bdynamic[ \t]+"', body_s):
+        out.append("dynamic block is not evaluated")
+    return list(dict.fromkeys(out))
+
+
+def _module_fact(path: str, label: str, line: int, child: str | None, constructs: list[str]) -> dict:
+    """A module block. The scanner never expands a module call: `child` is the local directory its source names (None for
+    a remote or expression source), and only the files of that directory are analysed on their own."""
+    return {"file": path, "line": line, "ref": f"module.{label}", "type": "module", "name": label, "source": "terraform",
+            "instance_types": [], "volume_types": [], "tags": None, "lifecycle": None, "body": "", "local": child,
+            "unevaluated": constructs}
+
+
+def _unevaluated(fact: dict, analysed_dirs: set[str]) -> list[str]:
+    """Constructs of one fact that were not evaluated. A module block whose local source directory was analysed is covered
+    by that directory's own files; any other module block is an unanalysed input and adds MODULE_REASON."""
+    if fact["type"] != "module":
+        return fact.get("unevaluated", [])
+    if fact["local"] in analysed_dirs:
+        return fact["unevaluated"]
+    return [MODULE_REASON, *fact["unevaluated"]]
+
+
 def _doc_facts(path: str, doc) -> list[dict]:
     facts: list[dict] = []
     if not isinstance(doc, dict):
@@ -405,7 +532,16 @@ def _doc_facts(path: str, doc) -> list[dict]:
                     tags = _declared_tags(attrs, "tags")
                 facts.append({"file": path, "line": 0, "ref": f"{rtype}.{name}", "type": rtype, "name": name, "source": "terraform",
                               "instance_types": instance_types, "volume_types": volume_types, "tags": tags,
-                              "lifecycle": lifecycle, "body": " ".join(_strings(attrs))})
+                              "lifecycle": lifecycle, "body": " ".join(_strings(attrs)), "unevaluated": _tf_json_unevaluated(rtype, attrs)})
+    modules = doc.get("module")
+    if isinstance(modules, dict):  # Terraform JSON module blocks
+        for label, body in modules.items():
+            body = body[0] if isinstance(body, list) and body else body
+            body = body if isinstance(body, dict) else {}
+            source = body.get("source")
+            local = posixpath.normpath(posixpath.join(_dir_key(path), source)) if isinstance(source, str) and re.fullmatch(r"\.\.?/[^$]*", source) else None
+            constructs = [reason for key, reason in (("count", COUNT_REASON), ("for_each", FOR_EACH_REASON)) if key in body]
+            facts.append(_module_fact(path, str(label), 0, local, constructs))
     resources = doc.get("Resources")
     if isinstance(resources, dict):  # CloudFormation
         for name, res in resources.items():
@@ -426,7 +562,7 @@ def _doc_facts(path: str, doc) -> list[dict]:
             tags = _declared_tags(props, "Tags") if rtype in TAGGABLE_CFN else None
             facts.append({"file": path, "line": 0, "ref": f"{rtype}:{name}", "type": rtype, "name": name, "source": "cloudformation",
                           "instance_types": instance_types, "volume_types": volume_types, "tags": tags,
-                          "lifecycle": lifecycle, "body": ""})
+                          "lifecycle": lifecycle, "body": "", "unevaluated": _doc_unevaluated(props, CFN_VALUE_KEYS, structural=False)})
     kind = doc.get("kind")
     if kind == "List" and isinstance(doc.get("items"), list):
         for item in doc["items"]:
@@ -568,16 +704,24 @@ def _tag_inheriting_dirs(default_dirs: set[str], provider_dirs: set[str], module
     return covered
 
 
-def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str]) -> tuple[list[dict], list[dict]]:
-    skipped, out = [], []
+def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str]) -> tuple[list[dict], list[dict], list[str]]:
+    """Tag findings, the skipped checks, and one reason per taggable resource that was not judged (label and path only)."""
+    skipped, out, reasons = [], [], []
     if not required:
-        return out, [{"check": "iac-untagged-resource", "status": "skipped:no-required-tags"}]
+        return out, [{"check": "iac-untagged-resource", "status": "skipped:no-required-tags"}], reasons
     candidates = []
     numbered = 0
     for fact in facts:
+        where = f"{fact['file']}::{fact['ref']}"
         if fact["tags"] is None:
+            if fact["type"] in TAGGABLE_TF or fact["type"] in TAGGABLE_CFN:
+                reasons.append(f"{where}: tags are an expression and were not judged")
             continue
         if fact["source"] == "terraform" and _dir_key(fact["file"]) in inheriting:
+            reasons.append(f"{where}: tags inherited from provider default_tags were not judged")
+            continue
+        if any(fact["tags"].get(key) == _UNKNOWN for key in required):
+            reasons.append(f"{where}: a required tag value is an expression and was not judged")
             continue
         numbered += 1
         rid = f"{fact['file']}::{fact['ref']}#{numbered}"
@@ -595,17 +739,26 @@ def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str]) 
             fact = by_id[item["id"]]
             detail = item["summary"].removeprefix(f"{item['id']} (0/month) ")
             out.append(_finding("iac-untagged-resource", item["severity"], f"{fact['ref']}: {detail}", fact))
-    return out, skipped
+    return out, skipped, reasons
 
 
 # --- scan ------------------------------------------------------------------------------------------------------
 
 
-def _candidates(root: Path, base: Path, counters: dict):
+def _candidates(root: Path, base: Path, counters: dict, reasons: list[str]):
     """Candidate manifest files below `base`, sorted, never following symlinks, at most MAX_FILES."""
     seen = 0
     for folder, dirs, files in os.walk(base, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not os.path.islink(os.path.join(folder, d)))
+        kept = []
+        for d in sorted(dirs):
+            if d in SKIP_DIRS:
+                continue
+            here = os.path.join(folder, d)
+            if os.path.islink(here):
+                reasons.append(f"{Path(here).relative_to(root).as_posix()}: symlinked directory not followed")
+                continue
+            kept.append(d)
+        dirs[:] = kept
         for name in sorted(files):
             lower = name.lower()
             if not lower.endswith((".tf", ".json", ".yaml", ".yml")):
@@ -613,47 +766,62 @@ def _candidates(root: Path, base: Path, counters: dict):
             full = Path(folder, name)
             if full.is_symlink():
                 counters["symlink"] += 1
+                reasons.append(f"{full.relative_to(root).as_posix()}: symlink not followed")
                 continue
             if seen >= MAX_FILES:
                 counters["truncated"] = True
+                reasons.append(f"more than {MAX_FILES} candidate files: the rest were not read")
                 return
             seen += 1
             yield full
 
 
+def _incomplete(reasons: list[str], analysed: int) -> list[dict]:
+    """The shared fail-closed rule (swarm/scan_status.py), in this script's finding shape."""
+    return [{**item, "file": "", "location": ""} for item in incomplete_findings(reasons, analysed)]
+
+
 def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> dict:
     counters = {"too_large": 0, "binary": 0, "parse_error": 0, "symlink": 0, "yaml_skipped": 0, "truncated": False}
+    reasons: list[str] = []  # one label and path per in-scope input that was not analysed or not judged
     facts: list[dict] = []
     default_dirs: set[str] = set()  # directories that declare provider default_tags
     provider_dirs: set[str] = set()  # directories that declare an unaliased provider of their own
     module_calls: dict[str, set[str]] = {}  # directory -> the local child module directories it calls
     unclosed: dict[str, int] = {}
     scanned = 0
-    for path in _candidates(root, base, counters):
+    analysed_dirs: set[str] = set()  # directories that had at least one analysed file
+    for path in _candidates(root, base, counters, reasons):
         rel = path.relative_to(root).as_posix()
         try:
             info = path.stat()
             if not stat.S_ISREG(info.st_mode):  # a FIFO or device named *.json would block the read
                 counters["parse_error"] += 1
+                reasons.append(f"{rel}: not a regular file")
                 continue
             if info.st_size > MAX_FILE_BYTES:
                 counters["too_large"] += 1
+                reasons.append(f"{rel}: larger than 1 MiB")
                 continue
             data = path.read_bytes()
         except OSError:
             counters["parse_error"] += 1
+            reasons.append(f"{rel}: could not be read")
             continue
         if b"\0" in data:
             counters["binary"] += 1
+            reasons.append(f"{rel}: binary")
             continue
         try:
             text = data.decode("utf-8-sig")  # a byte-order mark is not part of the first line
         except UnicodeDecodeError:
             counters["binary"] += 1
+            reasons.append(f"{rel}: binary")
             continue
         lower = path.name.lower()
         if lower.endswith((".yaml", ".yml")) and yaml is None:
             counters["yaml_skipped"] += 1
+            reasons.append(f"{rel}: YAML not read, PyYAML is not importable")
             continue
         try:
             if lower.endswith(".tf"):
@@ -668,10 +836,12 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
                 if not_delimited:
                     unclosed[rel] = not_delimited
                 scanned += 1
+                analysed_dirs.add(directory)
                 continue
             docs = [json.loads(text)] if lower.endswith(".json") else list(yaml.load_all(text, Loader=_yaml_loader()))
         except (ValueError, RecursionError, yaml.YAMLError if yaml else ValueError):
             counters["parse_error"] += 1
+            reasons.append(f"{rel}: could not be parsed")
             continue
         malformed = False
         for doc in docs:
@@ -681,31 +851,37 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
                 malformed = True  # one malformed document must not abort the scan of the rest of the tree
         if malformed:
             counters["parse_error"] += 1
+            reasons.append(f"{rel}: a document could not be evaluated")
         else:
             scanned += 1
+            analysed_dirs.add(_dir_key(rel))
+    for fact in facts:
+        reasons.extend(f"{fact['file']}::{fact['ref']}: {construct}" for construct in _unevaluated(fact, analysed_dirs))
     findings: list[dict] = []
     for fact in facts:
         findings.extend(_k8s_findings(fact) if fact["source"] == "kubernetes" else [])
         findings.extend(_instance_findings(fact, max_xlarge))
         findings.extend(_volume_findings(fact))
     findings.extend(_lifecycle_findings(facts))
-    tag_findings, tag_skipped = _tag_findings([f for f in facts if f["source"] != "kubernetes"], required_tags, _tag_inheriting_dirs(default_dirs, provider_dirs, module_calls))
+    tag_findings, tag_skipped, tag_reasons = _tag_findings([f for f in facts if f["source"] != "kubernetes"], required_tags, _tag_inheriting_dirs(default_dirs, provider_dirs, module_calls))
     findings.extend(tag_findings)
+    reasons.extend(tag_reasons)
     skipped = list(tag_skipped)
     if unclosed:
         listed = ", ".join(sorted(unclosed)[:5]) + (f" and {len(unclosed) - 5} more" if len(unclosed) > 5 else "")
         skipped.append({"check": "terraform-resources", "status": "skipped:unbalanced-braces",
                         "detail": f"{sum(unclosed.values())} resource block(s) could not be delimited and were not evaluated: {listed}"})
+        reasons.extend(f"{where}: {count} resource block(s) could not be delimited and were not evaluated" for where, count in sorted(unclosed.items()))
     if counters["yaml_skipped"]:
         skipped.append({"check": "yaml-manifests", "status": "skipped:tool-missing", "detail": f"PyYAML is not importable: {counters['yaml_skipped']} YAML file(s) not read"})
+    findings.extend(_incomplete(reasons, scanned))
     findings.sort(key=lambda f: (-SEVERITY_RANK[f["severity"]], f["file"], f["id"]))
     counts = {severity: sum(1 for f in findings if f["severity"] == severity) for severity in SEVERITY_RANK}
     by_rule: dict[str, int] = {}
     for finding in findings:
         by_rule[finding["rule"]] = by_rule.get(finding["rule"], 0) + 1
-    blocking = counts["major"] + counts["blocker"]
     return {
-        "status": "fail" if blocking else "ok",
+        "status": scan_status(findings),
         "files_scanned": scanned,
         "files_skipped": {"too_large": counters["too_large"], "binary": counters["binary"], "parse_error": counters["parse_error"], "symlink": counters["symlink"], "yaml_tool_missing": counters["yaml_skipped"]},
         "file_limit_reached": counters["truncated"],
