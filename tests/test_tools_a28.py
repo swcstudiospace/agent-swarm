@@ -598,7 +598,7 @@ def test_fee_policy_projection_uses_the_assumed_fullness():
 def test_fee_policy_cap_binds_and_reports_the_runway():
     result = fee(max_fee_cap_gwei=150)
     assert (result["max_fee_gwei"], result["capped"], result["full_blocks_survived"]) == (150.0, True, 4)
-    assert ids(result) == {"max-fee-capped": "major"} and "covers the base fee for 4 consecutive full blocks, the horizon asks for 6" in result["findings"][0]["summary"]
+    assert ids(result) == {"max-fee-capped": "major"} and "covers the base fee for 4 consecutive blocks (the next block, then full blocks), the horizon asks for 6" in result["findings"][0]["summary"]
     exact = fee(max_fee_cap_gwei=181.703247069)
     assert exact["capped"] is False and exact["findings"] == []
 
@@ -854,7 +854,7 @@ def test_bridge_rejects_inconsistent_messages_and_amounts():
     for field in ("locked_amount", "minted_amount"):
         for bad in ("abc", "-1", "1e31", "NaN", "Infinity"):
             invalid("chain_bridge_monitor", {**BRIDGE, field: bad}, field)
-    assert bridge(locked_amount="1000000000000000000000000000000", minted_amount="0")["collateral_surplus"] == 1e30
+    assert bridge(locked_amount="1000000000000000000000000000000", minted_amount="0")["collateral_surplus"] == 10**30
 
 
 # --- chain_network_guard --------------------------------------------------------------------------------------
@@ -1127,3 +1127,45 @@ def test_indexer_eta_uses_the_exact_span_between_first_and_last_sample():
 def test_diversity_reports_only_clients_that_exist_and_ranks_ties_by_name():
     result = diversity(0, 0, 3, names=["a", "b", "c"])
     assert [s["client"] for s in result["shares"]] == ["c", "a", "b"] and result["active_clients"] == 1
+
+
+# --- QA-03 remediation: reorg bounds the policy depth, log margin, key identity, exact surplus, private routes ------
+
+
+def test_pos_observed_reorg_past_the_policy_depth_sets_the_confirmations():
+    for value, tag in ((1000000, "finalized"), (10, "safe")):
+        result = depth("ethereum_pos", value=value, tolerance=1, reorg=100)
+        assert (result["required_confirmations"], result["block_tag"], result["basis"]) == (101, tag, "reorg-history")
+        assert ids(result) == {"reorg-history-dominates": "info"}
+
+
+def test_pos_reorg_within_the_policy_depth_keeps_the_policy_values():
+    assert depth("ethereum_pos", value=1000000, tolerance=1, reorg=95)["required_confirmations"] == 96
+    assert depth("ethereum_pos", value=10000, tolerance=100, reorg=63)["findings"] == []
+
+
+def test_backfill_average_block_over_half_the_response_cap_has_no_margin():
+    result = backfill(est_logs_per_block=6000)
+    assert ids(result) == {"workers-exceed-rate-limit": "info", "no-log-margin": "major"} and result["verdict"] == "fail"
+    assert "no-log-margin" not in ids(backfill(est_logs_per_block=5000))
+    assert ids(backfill(est_logs_per_block=5000.1))["no-log-margin"] == "major"
+
+
+def test_one_validator_key_spelled_two_ways_on_two_live_hosts_is_a_double_sign():
+    bare, lower, upper = "ab" * 48, "0x" + "ab" * 48, "0x" + "AB" * 48
+    result = slashing(inst(key=upper, host="h1"), inst(key=lower, host="h2"))
+    assert result["double_sign_keys"] == [lower] and result["slashing_exposed"] is True and result["key_count"] == 1
+    assert ids(result) == {f"double-sign:{lower}": "blocker"}
+    assert slashing(inst(key=bare, host="h1"), inst(key=lower, host="h2"))["slashing_exposed"] is True
+
+
+def test_a_bridge_surplus_above_two_to_the_53_is_exact():
+    result = bridge(locked_amount="1234567890123456789", minted_amount="0")
+    assert result["collateral_surplus"] == 1234567890123456789 and type(result["collateral_surplus"]) is int
+
+
+def test_a_private_route_is_never_moved_to_the_public_mempool():
+    assert mempool(tx_kind="transfer", submitted_route="private")["route_change_required"] is False
+    low = mempool(max_acceptable_loss_usd=500, submitted_route="private")  # sandwich loss equal to tolerance: low exposure
+    assert (low["route"], low["exposure"], low["route_change_required"]) == ("public_mempool", "low", False)
+    assert mempool(submitted_route="public")["route_change_required"] is True

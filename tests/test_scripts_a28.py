@@ -336,7 +336,7 @@ def test_missing_pyyaml_is_reported_as_skipped_and_json_still_runs(tmp_path, mon
     monkeypatch.setitem(sys.modules, "yaml", None)  # `import yaml` now raises ImportError
     out = module().scan(tmp_path, tmp_path)
     assert out["checks"] == {"json": "ran", "toml": "no-files", "yaml": "skipped:tool-missing", "env": "no-files"}
-    assert out["files_scanned"] == 1 and {f["file"] for f in out["findings"]} == {"c.json"} and out["status"] == "fail"
+    assert out["files_scanned"] == 1 and {f["file"] for f in out["findings"]} == {"c.json", "."} and out["status"] == "fail"
 
 
 def test_unparseable_and_unrelated_files_never_crash_the_scan(tmp_path):
@@ -345,14 +345,14 @@ def test_unparseable_and_unrelated_files_never_crash_the_scan(tmp_path):
     write(tmp_path, "scalar.json", "42")
     write(tmp_path, "settings.toml", "= broken")
     code, out = cli(tmp_path)
-    assert code == 0 and out["findings"] == [] and out["skipped"]["unparsed"] >= 2
+    assert code == 1 and {f["rule"] for f in out["findings"]} == {"scan-incomplete"} and out["skipped"]["unparsed"] >= 2
 
 
 def test_deeply_nested_json_does_not_crash(tmp_path):
     write(tmp_path, "deep.json", "[" * 5000 + "]" * 5000)
     write(tmp_path, "deep2.json", '{"a":' * 100 + "1" + "}" * 100)
     code, out = cli(tmp_path)
-    assert code == 0 and out["findings"] == []
+    assert code == 1 and {f["rule"] for f in out["findings"]} == {"scan-incomplete"} and "deep2.json: nested deeper than 30 levels" in out["findings"][0]["summary"]
 
 
 # --- bounds -----------------------------------------------------------------------------------------------------
@@ -371,7 +371,8 @@ def test_files_over_1_mib_binaries_symlinks_and_vendored_dirs_are_skipped(tmp_pa
     write(tmp_path, "package-lock.json", net(1))
     write(tmp_path, "ok/c.json", net(11155111))
     code, out = cli(tmp_path)
-    assert code == 0 and out["findings"] == [] and out["files_scanned"] == 1
+    assert code == 1 and {f["rule"] for f in out["findings"]} == {"scan-incomplete"} and out["files_scanned"] == 1
+    assert all(part in out["findings"][0]["summary"] for part in ("big.json: larger than 1 MiB", "bin.json: binary", "link.json: symlink", "linkdir: symlinked directory"))
     assert out["skipped"] == {"too_large": 1, "binary": 1, "symlink": 1, "unparsed": 0}
 
 
@@ -386,7 +387,7 @@ def test_scan_stops_after_2000_candidate_files(tmp_path):
     for index in range(2005):
         write(tmp_path, f"d{index % 7}/f{index:04d}.json", {"x": index})
     code, out = cli(tmp_path)
-    assert code == 0 and out["truncated"] is True and out["files_scanned"] == 2000
+    assert code == 1 and out["truncated"] is True and out["files_scanned"] == 2000
 
 
 def test_finding_count_is_capped(tmp_path):
@@ -482,7 +483,7 @@ def test_a_yaml_alias_bomb_is_cut_off_quickly_and_reported(tmp_path):
     started = time.monotonic()
     code, out = cli(tmp_path)
     assert time.monotonic() - started < 20
-    assert {f["rule"] for f in out["findings"]} == {"scan-truncated", "mainnet-without-opt-in"} and code == 1
+    assert {f["rule"] for f in out["findings"]} == {"scan-truncated", "mainnet-without-opt-in", "scan-incomplete"} and code == 1
     assert [f for f in out["findings"] if f["rule"] == "scan-truncated"][0]["file"] == "bomb.yaml"
 
 
@@ -490,8 +491,8 @@ def test_exceeding_the_file_cap_adds_a_visible_note_instead_of_a_silent_ok(tmp_p
     for index in range(2001):
         write(tmp_path, f"d{index % 7}/f{index:04d}.json", {"x": index})
     code, out = cli(tmp_path)
-    assert code == 0 and out["truncated"] is True
-    assert [(f["rule"], f["severity"], f["file"]) for f in out["findings"]] == [("scan-truncated", "minor", ".")]
+    assert code == 1 and out["truncated"] is True
+    assert [(f["rule"], f["severity"], f["file"]) for f in out["findings"]] == [("scan-incomplete", "major", "."), ("scan-truncated", "minor", ".")]
 
 
 def test_dotenv_inline_comments_and_quoted_values_do_not_hide_a_mainnet_chain_id(tmp_path):
@@ -500,3 +501,84 @@ def test_dotenv_inline_comments_and_quoted_values_do_not_hide_a_mainnet_chain_id
     assert sorted(f["rule"] for f in out["findings"]) == ["mainnet-without-opt-in", "rpc-url-credentials"]
     assert not any(f["rule"] == "chain-id-unparseable" for f in out["findings"])
     assert "alice" not in json.dumps(out) and "primary" not in json.dumps(out)
+
+
+# --- QA-03 remediation: test-network names, aliases, unknown ids, fail-closed scan reasons ----------------------------
+
+
+@pytest.mark.parametrize("name,chain_id", [("SepoliaTestnet", 1), ("BaseSepolia", 8453), ("GoerliDevnet", 137)])
+def test_a_single_token_testnet_name_on_a_mainnet_id_is_a_blocker(tmp_path, name, chain_id):
+    write(tmp_path, "n.json", net(chain_id, name=name, allowMainnet=True))
+    code, out = cli(tmp_path)
+    assert code == 1 and out["status"] == "fail"
+    assert [(f["rule"], f["severity"]) for f in out["findings"] if f["rule"] == "chain-id-name-mismatch"] == [("chain-id-name-mismatch", "blocker")]
+
+
+@pytest.mark.parametrize("name,chain_id", [("Mumbai", 137), ("Ropsten", 1), ("Rinkeby", 1), ("Kovan", 1)])
+def test_deprecated_testnet_names_on_a_mainnet_id_are_blockers(tmp_path, name, chain_id):
+    write(tmp_path, "n.json", net(chain_id, name=name, allowMainnet=True))
+    assert rules(tmp_path)["chain-id-name-mismatch"] == "blocker"
+
+
+def test_deprecated_testnets_on_their_own_ids_pass(tmp_path):
+    write(tmp_path, "a.json", net(80001, name="Mumbai"))
+    write(tmp_path, "b.json", net(3, name="Ropsten"))
+    code, out = cli(tmp_path)
+    assert code == 0 and out["findings"] == []
+
+
+def test_an_unknown_chain_id_is_checked_for_test_network_names_and_hosts_like_a_mainnet(tmp_path):
+    write(tmp_path, "name.json", net(999999, name="Sepolia Testnet", allowMainnet=True))
+    write(tmp_path, "host.json", net(999999, "https://rpc.sepolia.org", allowMainnet=True))
+    found = rules(tmp_path)
+    assert found["chain-id-name-mismatch"] == "blocker" and found["rpc-host-chain-mismatch"] == "blocker" and found["chain-id-unknown"] == "minor"
+
+
+def test_a_test_network_host_on_a_mainnet_id_is_a_blocker_like_the_name(tmp_path):
+    write(tmp_path, "h.json", net(1, "https://rpc.sepolia.org", allowMainnet=True))
+    assert rules(tmp_path)["rpc-host-chain-mismatch"] == "blocker"
+
+
+@pytest.mark.parametrize("name,chain_id", [("optimism", 11155420), ("bsc", 97)])
+def test_family_aliases_on_a_testnet_id_stay_minor_like_base(tmp_path, name, chain_id):
+    write(tmp_path, "f.json", net(chain_id, name=name, allowMainnet=True))
+    code, out = cli(tmp_path)
+    assert code == 0 and out["status"] == "ok"
+    assert [(f["rule"], f["severity"]) for f in out["findings"]] == [("chain-id-name-mismatch", "minor")]
+
+
+def test_ambiguity_counts_aliases_as_well_as_canonical_names():
+    mod = module()
+    assert mod._ambiguous_name("optimism") and mod._ambiguous_name("bsc") and mod._ambiguous_name("base")
+    assert not mod._ambiguous_name("sepolia")
+
+
+def test_inputs_the_scan_could_not_read_fail_with_labelled_reasons_only(tmp_path):
+    write(tmp_path, "broken.json", "{not json")
+    write(tmp_path, "ok.json", net(11155111))
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    write(outside, "s.json", net(1))
+    (tmp_path / "linkdir").symlink_to(outside, target_is_directory=True)
+    code, out = cli(tmp_path)
+    assert code == 1 and out["status"] == "fail"
+    assert [(f["rule"], f["severity"]) for f in out["findings"]] == [("scan-incomplete", "major")]
+    assert "broken.json: could not be parsed as json" in out["findings"][0]["summary"] and "linkdir: symlinked directory" in out["findings"][0]["summary"]
+    assert "not json" not in json.dumps(out) and "s.json" not in out["findings"][0]["summary"]
+
+
+def test_a_document_nested_past_the_depth_limit_is_reported_not_skipped_silently(tmp_path):
+    deep: dict = {}
+    node = deep
+    for _ in range(40):
+        node["a"] = {}
+        node = node["a"]
+    node["chainId"] = 1  # a mainnet id no one checked
+    write(tmp_path, "deep.json", deep)
+    code, out = cli(tmp_path)
+    assert code == 1 and [f["rule"] for f in out["findings"]] == ["scan-incomplete"]
+    assert "deep.json: nested deeper than 30 levels" in out["findings"][0]["summary"]
+
+
+def test_an_empty_tree_stays_ok_with_nothing_in_scope(tmp_path):
+    code, out = cli(tmp_path)
+    assert code == 0 and out["status"] == "ok" and out["findings"] == []

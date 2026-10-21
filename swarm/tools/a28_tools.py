@@ -27,6 +27,8 @@ from swarm.tools.support import respond
 # "zkSync Mainnet", "Ethereum Hoodi"...), the class is this table's judgement. Holesky (shut down Oct 2025) and Goerli are
 # deprecated but stay listed so a stale config is still classified as a testnet. 1337 and 31337 are the conventional local-chain
 # ids (Ganache and geth --dev, Hardhat and Anvil); the registry lists unrelated test chains under them.
+# Mumbai (80001), Ropsten (3), Rinkeby (4) and Kovan (42) are deprecated testnets added from their well-known ids; re-check them
+# against that registry at the next refresh.
 # id -> (name, class, aliases). class is "mainnet", "testnet" or "local". Aliases are normalised names ([a-z0-9-]).
 CHAINS: dict[int, tuple[str, str, tuple[str, ...]]] = {
     1: ("Ethereum Mainnet", "mainnet", ("ethereum", "ethereum-mainnet", "eth", "homestead")),
@@ -55,10 +57,17 @@ CHAINS: dict[int, tuple[str, str, tuple[str, ...]]] = {
     560048: ("Hoodi", "testnet", ("hoodi",)),
     11155111: ("Sepolia", "testnet", ("sepolia", "ethereum-sepolia")),
     11155420: ("OP Sepolia", "testnet", ("op-sepolia", "optimism-sepolia")),
+    80001: ("Polygon Mumbai", "testnet", ("mumbai", "polygon-mumbai")),
+    3: ("Ropsten", "testnet", ("ropsten",)),
+    4: ("Rinkeby", "testnet", ("rinkeby",)),
+    42: ("Kovan", "testnet", ("kovan",)),
     1337: ("Local development chain", "local", ("ganache",)),
     31337: ("Hardhat/Anvil local chain", "local", ("hardhat", "anvil", "foundry")),
 }
-TESTNET_NAME_TOKENS = ("sepolia", "holesky", "hoodi", "goerli", "amoy", "fuji", "chiado", "testnet", "devnet")
+# Test-network words, matched inside a name's or host's letters: a long word is unambiguous ("SepoliaTestnet", "BaseSepolia").
+TESTNET_NAME_WORDS = ("sepolia", "holesky", "goerli", "amoy", "chiado", "testnet", "devnet", "mumbai", "ropsten", "rinkeby", "kovan")
+# Short words that count only as whole tokens: "fuji" sits inside "fujitsu" and "hoodi" inside "hoodie", both ordinary words.
+TESTNET_NAME_TOKENS = ("fuji", "hoodi")
 MAX_CHAIN_ID = 2**53 - 1  # the contract's bound: the largest integer a JSON number carries exactly in JavaScript (not an EIP-2294 value)
 LEVELS = ("L0", "L1", "L2", "L3", "L4")  # autonomy ladder of the swarm: L2 testnet ops, L3 mainnet node change, L4 keys
 
@@ -409,7 +418,7 @@ def confirmation_depth(payload: dict) -> dict:
     probabilistic: Nakamoto section 11 counts z blocks linked AFTER the block that holds the transaction, so the number of
     confirmations (that block counts as the first) is z + 1; a reorg of r blocks needs r + 1. ethereum_pos: 64 and 96
     are the worst-case slots until the block's epoch is justified (safe) or finalized (consensus spec: finality needs two
-    consecutive justified epochs); the 100x value-to-tolerance switch between them is this tool's own policy."""
+    consecutive justified epochs); the 100x value-to-tolerance switch between them is this tool's own policy. An observed reorg of r blocks bounds the depth too: it needs r + 1."""
 
     def work() -> dict:
         model = payload["finality_model"]
@@ -441,10 +450,13 @@ def confirmation_depth(payload: dict) -> dict:
         elif model == "ethereum_pos":
             if ratio <= 1:
                 depth, tag, basis = max(1, reorg + 1), "latest", "loss-within-tolerance"
-            elif ratio <= POLICY_SAFE_MULTIPLE:
-                depth, tag, basis = 2 * SLOTS_PER_EPOCH, "safe", "justified-checkpoint"
             else:
-                depth, tag, basis = 3 * SLOTS_PER_EPOCH, "finalized", "economic-finality"
+                safe = ratio <= POLICY_SAFE_MULTIPLE
+                policy = 2 * SLOTS_PER_EPOCH if safe else 3 * SLOTS_PER_EPOCH
+                tag, basis, depth = ("safe", "justified-checkpoint", policy) if safe else ("finalized", "economic-finality", policy)
+                if reorg + 1 > policy:
+                    depth, basis = reorg + 1, "reorg-history"
+                    findings.append(_finding("reorg-history-dominates", "info", f"an observed {reorg}-block reorg needs {reorg + 1} confirmations, more than the policy depth ({policy})"))
         else:
             depth, tag, basis = 1, "n/a", "instant-finality"
             if reorg > 0:
@@ -599,6 +611,8 @@ def backfill_plan(payload: dict) -> dict:
             chunk = 1
         elif per_block > 0:
             chunk = max(1, min(payload["max_block_range"], int(Decimal(cap) / (per_block * LOGS_SAFETY))))
+            if per_block * LOGS_SAFETY > cap:
+                findings.append(_finding("no-log-margin", "major", f"one average block returns {per_block} logs against a response cap of {cap}: a busier block exceeds the cap and the window has no margin; filter by address or topic to shrink the average"))
         else:
             chunk = payload["max_block_range"]
         blocks = end - start + 1
@@ -683,7 +697,7 @@ def fee_policy(payload: dict) -> dict:
         if next_fee > fee_cap:
             findings.append(_finding("cap-below-next-base-fee", "blocker", "the max-fee cap is below the next block's base fee: no transaction under this policy can be included"))
         elif worst > fee_cap:
-            findings.append(_finding("max-fee-capped", "major", f"the cap binds: it covers the base fee for {survived} consecutive full blocks, the horizon asks for {horizon}"))
+            findings.append(_finding("max-fee-capped", "major", f"the cap binds: it covers the base fee for {survived} consecutive blocks (the next block, then full blocks), the horizon asks for {horizon}"))
         elif uncapped > fee_cap:
             findings.append(_finding("max-fee-trims-tip", "minor", f"the cap covers the worst-case base fee over the {horizon}-block horizon but leaves only {_wei_to_gwei(fee_cap - worst)} gwei of the {_wei_to_gwei(priority)} gwei tip at its end"))
         if wanted > priority_cap:
@@ -792,6 +806,12 @@ def stuck_transactions(payload: dict) -> dict:
     return respond(payload, _safe(work))
 
 
+def _key_identity(ref: str) -> str:
+    """A hex key reference is compared and shown as 0x plus lowercase hex, so case and the optional prefix do not split one key; any other label compares as given."""
+    body = ref[2:] if ref[:2].lower() == "0x" else ref
+    return "0x" + body.lower() if re.fullmatch(r"[0-9A-Fa-f]+", body) else ref
+
+
 def validator_slashing_risk(payload: dict) -> dict:
     """Validator keys by label: the same key active twice, missing slashing protection, unsafe standby failover."""
 
@@ -801,13 +821,13 @@ def validator_slashing_risk(payload: dict) -> dict:
         for inst in instances:
             _label("instances", inst["key_ref"])
             _label("instances", inst["host"])
-            pair = (inst["key_ref"], inst["host"])
+            pair = (_key_identity(inst["key_ref"]), inst["host"])
             if pair in seen:
                 raise _Bad("instances", "one key_ref appears twice on the same host")
             seen.add(pair)
         by_key: dict[str, list[dict]] = {}
         for inst in instances:
-            by_key.setdefault(inst["key_ref"], []).append(inst)
+            by_key.setdefault(_key_identity(inst["key_ref"]), []).append(inst)
         findings, double_keys, unprotected = [], [], 0
         for key in sorted(by_key):
             group = sorted(by_key[key], key=lambda i: i["host"])
@@ -864,6 +884,11 @@ def _amount(field: str, text: str) -> Decimal:
     return value
 
 
+def _exact_number(value: Decimal) -> int | float:
+    """An integral amount as an exact int, which JSON carries without float rounding; any other amount as a float to 6 places."""
+    return int(value) if value == value.to_integral_value() else round(float(value), 6)
+
+
 def bridge_monitor(payload: dict) -> dict:
     """Lock-and-mint bridge health: message lag, overdue in-flight messages, collateral invariant, pause advice."""
 
@@ -914,7 +939,7 @@ def bridge_monitor(payload: dict) -> dict:
             "late_delivered_count": late,
             "p95_delivery_lag_min": round(float(p95 / 60), 2),
             "max_pending_age_min": round(float(max(pending_ages, default=Decimal(0)) / 60), 2),
-            "collateral_surplus": round(float(locked - minted), 6),
+            "collateral_surplus": _exact_number(locked - minted),
             "undercollateralized": under,
             "pause_recommended": pause,
             "verdict": _verdict(findings),
@@ -1006,7 +1031,7 @@ def mempool_privacy(payload: dict) -> dict:
         if sandwich and not payload["has_deadline"]:
             findings.append(_finding("no-deadline", "major", "a swap without a deadline can be held by a block builder and executed at a later, worse price"))
         findings = _ordered(findings)
-        changed = network == "l1_public_mempool" and ((payload["submitted_route"] == "private") != (route == "private_relay"))
+        changed = network == "l1_public_mempool" and route == "private_relay" and payload["submitted_route"] != "private"
         return {
             "state": "SUCCESS",
             "route": route,

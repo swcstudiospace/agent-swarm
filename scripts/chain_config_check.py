@@ -26,8 +26,9 @@ from urllib.parse import parse_qsl, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
-from swarm.tools.a28_tools import CHAINS, MAX_CHAIN_ID, SEVERITY_RANK, TESTNET_NAME_TOKENS, _secret_like  # noqa: E402
+from swarm.tools.a28_tools import CHAINS, MAX_CHAIN_ID, SEVERITY_RANK, TESTNET_NAME_TOKENS, TESTNET_NAME_WORDS, _secret_like  # noqa: E402
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_CANDIDATES = 2000
@@ -46,6 +47,7 @@ URL_KEY_PARTS = ("rpc", "endpoint", "websocket", "nodeurl", "providerurl")
 NOT_RPC_URL_PARTS = ("explorer", "faucet", "icon", "website", "docs", "info", "homepage")
 SECRET_PARAMS = {"key", "apikey", "api_key", "api-key", "token", "access_token", "accesstoken", "auth", "secret", "authorization", "x-api-key", "password", "passwd", "pwd", "jwt", "bearer", "client_secret", "private_key", "privatekey"}
 LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]"}
+MAINNET_LIKE = ("mainnet", "unknown")  # an unknown chain id is treated as a mainnet, as its finding says
 URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 SEGMENT_KEY_RE = re.compile(r"[A-Za-z0-9_-]{20,}")
 # environment-variable templates (${KEY}, $KEY, {{KEY}}, {KEY}, <KEY>, %KEY%): a bare "%" or "$" inside a literal secret is not one
@@ -77,17 +79,20 @@ def _norm_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-CANONICAL_NAME_TO_ID: dict[str, int] = {_norm_name(name): _id for _id, (name, _cls, _aliases) in CHAINS.items()}
-
-
 def _ambiguous_name(norm: str) -> bool:
-    """True for a name that is also the leading word(s) of another chain's full name ("base" of "base-sepolia")."""
-    return any(other.startswith(norm + "-") for other in CANONICAL_NAME_TO_ID)
+    """True for a name, alias included, that is also the leading word(s) of another name ("base" of "base-sepolia", "bsc" of "bsc-testnet")."""
+    return any(other.startswith(norm + "-") for other in NAME_TO_ID)
 
 
 def _tokens(text: str) -> set[str]:
-    """Whole words of a name or host: a testnet word must match a whole token, never a piece of another word."""
+    """Whole words of a name or host, split on anything that is not a letter or digit."""
     return {part for part in re.split(r"[^a-z0-9]+", text.lower()) if part}
+
+
+def _says_testnet(text: str) -> bool:
+    """A name or host that names a test network: a long test-network word anywhere in its letters, or a short one as a whole word."""
+    letters = re.sub(r"[^a-z0-9]", "", text.lower())
+    return any(word in letters for word in TESTNET_NAME_WORDS) or not _tokens(text).isdisjoint(TESTNET_NAME_TOKENS)
 
 
 def _parse_chain_id(value) -> int | None:
@@ -164,6 +169,7 @@ class _Scan:
         self.names: dict[str, dict[int, str]] = {}
         self.budget = MAX_NODES
         self.exhausted = False
+        self.too_deep = False
 
     def add(self, rel: str, rule: str, severity: str, where: str, message: str) -> None:
         if len(self.findings) >= MAX_STORED:
@@ -174,8 +180,11 @@ class _Scan:
         self.findings.append({"id": f"{rule}:{location}", "severity": severity, "rule": rule, "file": rel, "location": location, "summary": message, "message": message})
 
     def walk(self, rel: str, node, path: str, ctx: dict, depth: int, in_rpc: bool = False) -> None:
-        if depth > MAX_DEPTH or self.budget <= 0:
-            self.exhausted = self.exhausted or self.budget <= 0
+        if depth > MAX_DEPTH:
+            self.too_deep = True
+            return
+        if self.budget <= 0:
+            self.exhausted = True
             return
         self.budget -= 1
         if isinstance(node, dict):
@@ -219,10 +228,11 @@ class _Scan:
         norm = _norm_name(name)
         shown = _safe_name(name)
         expected = NAME_TO_ID.get(norm)
+        says_test = _says_testnet(norm)
+        as_mainnet = "a mainnet" if cls == "mainnet" else "unknown, treated as a mainnet"
         if expected is not None and expected != chain_id:
-            says_test = not _tokens(norm).isdisjoint(TESTNET_NAME_TOKENS)
-            if says_test and cls == "mainnet":
-                self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} says test network but chain id {chain_id} is a mainnet")
+            if says_test and cls in MAINNET_LIKE:
+                self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} says test network but chain id {chain_id} is {as_mainnet}")
             elif not _ambiguous_name(norm):
                 self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} belongs to chain id {expected}, the file says {chain_id}")
             elif "mainnet" in norm and cls in ("testnet", "local"):
@@ -230,9 +240,8 @@ class _Scan:
             else:
                 self.add(rel, "chain-id-name-mismatch", "minor", where, f"the network name {shown!r} is not the full name of chain id {expected} and may mean another network; the file says {chain_id}")
         elif expected is None:
-            says_test = not _tokens(norm).isdisjoint(TESTNET_NAME_TOKENS)
-            if says_test and cls == "mainnet":
-                self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} says test network but chain id {chain_id} is a mainnet")
+            if says_test and cls in MAINNET_LIKE:
+                self.add(rel, "chain-id-name-mismatch", "blocker", where, f"the network name {shown!r} says test network but chain id {chain_id} is {as_mainnet}")
             elif "mainnet" in norm and cls in ("testnet", "local"):
                 self.add(rel, "chain-id-name-mismatch", "major", where, f"the network name {shown!r} says mainnet but chain id {chain_id} is a {cls} chain")
         by_id = self.names.setdefault(norm, {})
@@ -250,8 +259,8 @@ class _Scan:
             return
         cls = _chain_class(chain_id)
         host = _host_tokens(url)
-        if not _tokens(host).isdisjoint(TESTNET_NAME_TOKENS) and cls == "mainnet":
-            self.add(rel, "rpc-host-chain-mismatch", "major", where, f"the endpoint host names a test network but the chain id {chain_id} is a mainnet")
+        if _says_testnet(host) and cls in MAINNET_LIKE:
+            self.add(rel, "rpc-host-chain-mismatch", "blocker", where, f"the endpoint host names a test network but the chain id {chain_id} is {'a mainnet' if cls == 'mainnet' else 'unknown, treated as a mainnet'}")
         elif "mainnet" in host and cls in ("testnet", "local"):
             self.add(rel, "rpc-host-chain-mismatch", "major", where, f"the endpoint host names a mainnet but the chain id {chain_id} is a {cls} chain")
 
@@ -292,19 +301,39 @@ def _parse_env(text: str) -> dict:
     return out
 
 
-def _candidates(base: Path, root: Path):
-    """Yield (path, kind) for chain-config candidates, depth-first in sorted order, symlinks never followed."""
+def _rel(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
+
+
+def _candidates(base: Path, root: Path, reasons: list[str]):
+    """Yield (path, kind) for chain-config candidates, depth-first in sorted order, symlinks never followed.
+
+    A symlinked directory, a directory that cannot be listed and the visited-file limit are inputs the scan did not read: each adds a reason."""
     visited = 0
     if base.is_file():
         kind = _kind(base)
         if kind and not base.is_symlink():
             yield base, kind
         return
-    for current, dirs, files in os.walk(base, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not os.path.islink(os.path.join(current, d)))
+
+    def unlistable(err: OSError) -> None:
+        reasons.append(f"{_rel(Path(err.filename or base), root)}: directory could not be listed, not scanned")
+
+    for current, dirs, files in os.walk(base, followlinks=False, onerror=unlistable):
+        keep = []
+        for d in sorted(dirs):
+            here = Path(current) / d
+            if d in SKIP_DIRS:
+                continue
+            if here.is_symlink():
+                reasons.append(f"{_rel(here, root)}: symlinked directory, not followed")
+                continue
+            keep.append(d)
+        dirs[:] = keep
         for name in sorted(files):
             visited += 1
             if visited > MAX_VISITED:
+                reasons.append(f"more than {MAX_VISITED} files under the scanned path: the rest were not listed")
                 return
             path = Path(current) / name
             kind = _kind(path)
@@ -323,32 +352,39 @@ def scan(root: Path, base: Path) -> dict:
     scanner = _Scan()
     seen = {"json": 0, "yaml": 0, "toml": 0, "env": 0}
     skipped = {"too_large": 0, "binary": 0, "symlink": 0, "unparsed": 0}
+    reasons: list[str] = []  # one label and path per in-scope input that was not analysed; incomplete_findings turns them into a finding
     candidates, truncated_files = 0, False
-    for path, kind in _candidates(base, root):
+    for path, kind in _candidates(base, root, reasons):
+        rel = _rel(path, root)
         if path.is_symlink():
             skipped["symlink"] += 1
+            reasons.append(f"{rel}: symlink, not followed")
             continue
         if candidates >= MAX_CANDIDATES:
             truncated_files = True
             break
         candidates += 1
-        rel = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
         if kind == "yaml" and yaml_mod is None:
             seen["yaml"] += 1
+            reasons.append(f"{rel}: not checked, PyYAML is not installed")
             continue
         if kind == "toml" and toml_mod is None:
             seen["toml"] += 1
+            reasons.append(f"{rel}: not checked, no TOML parser is available")
             continue
         try:
             if path.stat().st_size > MAX_FILE_BYTES:
                 skipped["too_large"] += 1
+                reasons.append(f"{rel}: larger than 1 MiB, not checked")
                 continue
             raw = path.read_bytes()
         except OSError:
             skipped["unparsed"] += 1
+            reasons.append(f"{rel}: could not be read, not checked")
             continue
         if b"\0" in raw:
             skipped["binary"] += 1
+            reasons.append(f"{rel}: binary, not checked")
             continue
         text = raw.decode("utf-8", errors="replace")
         try:
@@ -362,21 +398,29 @@ def scan(root: Path, base: Path) -> dict:
                 docs = [_parse_env(text)]
         except (ValueError, RecursionError, yaml_mod.YAMLError if yaml_mod else ValueError):
             skipped["unparsed"] += 1
+            reasons.append(f"{rel}: could not be parsed as {kind}, not checked")
             continue
         seen[kind] += 1
         for doc in docs:
-            scanner.budget, scanner.exhausted = MAX_NODES, False
+            scanner.budget, scanner.exhausted, scanner.too_deep = MAX_NODES, False, False
             scanner.walk(rel, doc, "", {}, 0)
             if scanner.exhausted:
                 scanner.add(rel, "scan-truncated", "minor", "", f"the document has more than {MAX_NODES} nodes: only part of it was checked")
+                reasons.append(f"{rel}: more than {MAX_NODES} nodes, only part checked")
+            if scanner.too_deep:
+                reasons.append(f"{rel}: nested deeper than {MAX_DEPTH} levels, that part not checked")
     if truncated_files:
         scanner.add(".", "scan-truncated", "minor", "", f"more than {MAX_CANDIDATES} candidate files: the rest were not scanned")
+        reasons.append(f"more than {MAX_CANDIDATES} candidate files: the rest were not scanned")
     checks = {
         "json": "ran" if seen["json"] else "no-files",
         "toml": "skipped:tool-missing" if toml_mod is None and seen["toml"] else "ran" if seen["toml"] else "no-files",
         "yaml": "skipped:tool-missing" if yaml_mod is None and seen["yaml"] else "ran" if seen["yaml"] else "no-files",
         "env": "ran" if seen["env"] else "no-files",
     }
+    files_scanned = sum(seen[k] for k in seen if checks[k] != "skipped:tool-missing")
+    if reasons or candidates:
+        scanner.findings += [{**item, "file": ".", "location": ".", "message": item["summary"]} for item in incomplete_findings(reasons, files_scanned)]
     ordered = sorted(scanner.findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["file"], f["rule"], f["location"]))
     findings, cut = ordered[:MAX_FINDINGS], ordered[MAX_FINDINGS:]
     dropped = dict(scanner.dropped)
@@ -385,11 +429,11 @@ def scan(root: Path, base: Path) -> dict:
     unlisted = sum(dropped.values())
     # a finding that did not fit in the list still counts: a blocker past the cap must not leave the status ok
     counts = {sev: sum(1 for f in findings if f["severity"] == sev) + dropped[sev] for sev in SEVERITY_RANK}
-    failing = counts["major"] > 0 or counts["blocker"] > 0
+    status = "fail" if scan_status(ordered) == "fail" or scanner.dropped["major"] or scanner.dropped["blocker"] else "ok"
     tail = f" ({unlisted} not listed)" if unlisted else ""
     return {
-        "status": "fail" if failing else "ok",
-        "files_scanned": sum(seen[k] for k in seen if checks[k] != "skipped:tool-missing"),
+        "status": status,
+        "files_scanned": files_scanned,
         "skipped": skipped,
         "checks": checks,
         "truncated": truncated_files or scanner.truncated or unlisted > 0,
