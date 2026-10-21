@@ -311,7 +311,6 @@ def test_relative_private_reference_fails_closed_for_every_cwd(tmp_path, monkeyp
     assert not real_key_configured()
     assert signing_config_error() == "fail-closed: private Ed25519 signing reference must be an absolute path"
 
-
 def test_configured_bad_reference_never_falls_back_to_conventional_seed(tmp_path, monkeypatch):
     from swarm.envelope import real_key_configured, signing_config_error
     _clear_keys(monkeypatch)
@@ -338,7 +337,7 @@ def test_raw_signers_take_precedence_without_reading_reference(tmp_path, monkeyp
     assert calls == []
 
 
-@pytest.mark.parametrize("flag", ["SWARM_AGENT_SESSION", "SWARM_CHILD"])
+@pytest.mark.parametrize("flag", ["SWARM_AGENT_SESSION"])
 @pytest.mark.parametrize("explicit", [True, False])
 def test_agent_sessions_never_read_private_files_or_acquire_signing_authority(tmp_path, monkeypatch, flag, explicit):
     from swarm import envelope
@@ -362,6 +361,17 @@ def test_agent_sessions_never_read_private_files_or_acquire_signing_authority(tm
         envelope.sign_envelope(_assignment())
     assert not envelope.verify_envelope({**_assignment(), "sig": "ed25519:" + "A" * 88})
     assert calls == []
+
+
+def test_trusted_hook_child_marker_keeps_private_signer(tmp_path, monkeypatch):
+    """hooks/autonomous_run.py starts the trusted planner and runner with SWARM_CHILD=1 only; they must still sign."""
+    from swarm import envelope
+    pytest.importorskip("cryptography")
+    _clear_keys(monkeypatch)
+    monkeypatch.setenv("SWARM_ED25519_KEY_FILE", str(_private_file(tmp_path)))
+    monkeypatch.setenv("SWARM_CHILD", "1")
+    assert envelope.signing_config_error() is None and envelope.real_key_configured()
+    assert envelope.verify_envelope(envelope.sign_envelope(_assignment()))
 
 
 def test_private_reference_detects_metadata_change_during_read(tmp_path, monkeypatch):

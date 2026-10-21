@@ -2441,6 +2441,28 @@ describe("private signer file reads", () => {
   const blockedWrite = { block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-write)" };
   const blockedMutate = { block: true, reason: "BLOCKED needs: human-approval (protected_path: signer-file-write)" };
 
+  test("signer files are protected against writes, output redirects and diff/cmp reads", () => {
+    expect(guardToolCall(call("write", { path: KEY, content: "x" }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("edit", { path: KEY, old: "a", new: "b" }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("write", { path: `${CWD}/notes.txt`, content: "x" }), facts)).toBeUndefined();
+    const bash = (command: string) => guardToolCall(call("bash", { command }), facts);
+    // output redirects, tee and dd write the seed: the write rule reports them, in attached and detached forms
+    for (const command of [`echo x > ${KEY}`, `echo x >> ${KEY}`, `echo x &> ${KEY}`, `echo x >& ${KEY}`, `echo x>${KEY}`,
+      `echo x>>${KEY}`, `tee ${KEY}`, `tee -a ${KEY}`, `dd if=/dev/zero of=${KEY}`, `dd of=${KEY} if=/dev/zero`]) {
+      expect(bash(command)).toEqual(blockedMutate);
+    }
+    expect(bash("echo x > /dev/null 2>&1")).toBeUndefined();
+    // comparison tools print the bytes they read, including the attached file-valued option forms
+    for (const command of [`diff /dev/null ${KEY}`, `cmp ${KEY} /dev/null`, `diff --from-file=${KEY} /dev/null`,
+      `diff --to-file=${KEY} /dev/null`]) {
+      expect(bash(command)).toEqual(blockedShell);
+    }
+    // the spellings the review named: a home-relative attached redirect, and a quoted $HOME --from-file= operand
+    expect(bash("echo x>~/.config/agent-swarm/signing-key.hex")).toEqual(blockedMutate);
+    expect(bash('diff --from-file="$HOME/.config/agent-swarm/signing-key.hex" /dev/null')).toEqual(blockedShell);
+    expect(bash('tee "$HOME/.config/agent-swarm/signing-key.hex"')).toEqual(blockedMutate);
+  });
+
   test("bounded deny-only metadata normalizes absolute paths without replacing ordinary private sources", () => {
     expect(parseSignerDenyPaths(undefined)).toEqual([]);
     expect(parseSignerDenyPaths("[]")).toEqual([]);

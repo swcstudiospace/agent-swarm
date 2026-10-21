@@ -10,7 +10,8 @@ emits a `security.dev_key` event, except a key-less agent-session preview.
 Without a real key and without the opt-in, signing refuses and APPROVED fails closed.
 Raw signing variables take precedence over SWARM_ED25519_KEY_FILE and the conventional
 XDG_CONFIG_HOME-or-HOME/.config/agent-swarm/signing-key.hex source. Private references
-are never read inside agent/child sessions. Configuration failures are redacted.
+are never read inside agent sessions (SWARM_AGENT_SESSION=1, set for every specialist). The trusted controller and
+autonomous hook, which carry only SWARM_CHILD=1, may use them. Configuration failures are redacted.
 Private references must be absolute; a relative one fails closed instead of resolving against the caller's cwd.
 """
 from __future__ import annotations
@@ -105,7 +106,9 @@ def _canonical(env: dict) -> bytes:
 
 
 def _agent_session() -> bool:
-    return any(os.environ.get(name) == "1" for name in ("SWARM_AGENT_SESSION", "SWARM_CHILD"))
+    # Only SWARM_AGENT_SESSION marks a model session: swarm_run sets it for every specialist. SWARM_CHILD alone is
+    # not enough, because the trusted autonomous hook starts its planner and runner with SWARM_CHILD=1 and they sign.
+    return os.environ.get("SWARM_AGENT_SESSION") == "1"
 
 
 def _private_seed(path: Path, *, fallback: bool) -> bytes | None:
@@ -163,7 +166,6 @@ def _conventional_reference() -> Path | None:
     if not config and not home:
         return None
     return (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
-
 
 def _ed25519_material() -> tuple[object | None, str | None]:
     raw = os.environ.get("SWARM_ED25519_KEY")
