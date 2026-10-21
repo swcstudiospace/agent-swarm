@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 ## When to Use
 - The blueprint is accepted (gate passed) and A09 will review code against it.
-- Output is `review.standards`, the coding-standards input for A09 (03-agents/A03 section 3). It is the only A03 skill whose consumer is A09.
+- Output is `review.standards`, the coding-standards input for A09 (agents/A03 section 3). It is the only A03 skill whose consumer is A09.
 - It restates decisions already taken; new decisions go through `skill://a03-architect--adr-record`.
 
 ## Procedure

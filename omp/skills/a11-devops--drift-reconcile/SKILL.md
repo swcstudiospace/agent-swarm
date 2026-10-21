@@ -9,7 +9,7 @@ disable-model-invocation: true
 ## When to Use
 
 - `infra.drift.alert` from A13 or from yourself for one environment.
-- Rule (03-agents/A11-devops.md section 4.3): auto-reconcile at L2; drift that persists across 3 reconciles freezes deploys for that environment and ends ESCALATED. Spend, not drift, is `skill://a11-devops--cost-guardrail`.
+- Rule (agents/A11-devops.md section 4.3): auto-reconcile at L2; drift that persists across 3 reconciles freezes deploys for that environment and ends ESCALATED. Spend, not drift, is `skill://a11-devops--cost-guardrail`.
 
 ## Procedure
 

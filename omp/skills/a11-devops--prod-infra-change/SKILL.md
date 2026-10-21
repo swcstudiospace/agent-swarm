@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- An `iac.change` targets a production environment (autonomy ceiling L3, 03-agents/A11-devops.md section 4.1).
+- An `iac.change` targets a production environment (autonomy ceiling L3, agents/A11-devops.md section 4.1).
 - You never apply production changes alone: the result is BLOCKED `needs=human-approval` with plan, diff and rollback attached (prompt, OPERATING_PROCEDURE step 6). Your guard also refuses `terraform apply|destroy`, prod `kubectl` changes and `helm upgrade`.
 
 ## Procedure

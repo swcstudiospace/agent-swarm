@@ -2,7 +2,7 @@
 
 # A01 ORCH — Swarm Orchestrator — skills
 
-Owner: `a01-orchestrator`. 12 skill(s), 36747 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a01-orchestrator`. 12 skill(s), 36738 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

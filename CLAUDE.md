@@ -1,6 +1,6 @@
 # AgentSwarm — Claude Code project guide
 
-This repo is both the **design spec** (`01-*.md` … `07-*.md`, `03-agents/`) and a **runnable
+This repo is both the **design spec** (`01-*.md` … `07-*.md`, `agents/`) and a **runnable
 Claude Code subagent swarm** built from it. Thirty agents (A01–A30) cover the SDLC and three specialist domains: A01–A15 are the core SDLC agents, A16–A30 are cloud-native (A16–A20), cluster (A21–A25) and Web3 (A26–A30), five agents each; each one is
 a Claude Code and Grok Build subagent and an omp task agent, generated from the Prompt-Uplift XML prompt in `prompts/`; its tools are Python plus TypeScript twins (`scripts/ts/`). Skills: `skills/<slug>/SKILL.md`. Orchestration: `skills/orchestrate/SKILL.md` + `hooks/user_prompt_submit.py` (Claude Code), or `/swarm <brief>` + the `before_agent_start` context hook (omp).
 
@@ -8,7 +8,7 @@ a Claude Code and Grok Build subagent and an omp task agent, generated from the 
 
 | Path | What it is |
 |---|---|
-| `03-agents/A??-*.md` | Original 7-section specs (source of truth for behaviour) |
+| `agents/A??-*.md` | Original 7-section specs (source of truth for behaviour) |
 | `prompts/A??-*.md` | XML-tagged system prompts derived from the specs (edit these, not `.claude/agents/`) |
 | `agents.json` | Manifest: id, code, slug, capabilities, consumes/produces, tools, model, scripts, `registered_tools`, plus top-level `shared_tools`, `capability_policy` and `shared_baseline` (edit tools through `registry/intake/`, see below) |
 | `.claude/agents/*.md` | **Generated** Claude Code subagents (`python3 scripts/build_agents.py`) |

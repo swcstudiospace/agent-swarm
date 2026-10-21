@@ -1,7 +1,7 @@
 """Behaviour of the v2.2 A07 data lane tools: data_lock_risk_scan and data_explain_regression_check.
 
 The handlers are pure: every result is computed from the payload. Rules come from prompts/A07-data.md
-(decision_logic 2 and 5, operating procedure step 5) and 03-agents/A07-data.md (requires_lock_timeout_s).
+(decision_logic 2 and 5, operating procedure step 5) and agents/A07-data.md (requires_lock_timeout_s).
 """
 import copy
 import json

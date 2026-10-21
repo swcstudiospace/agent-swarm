@@ -41,7 +41,7 @@ Not boundaries, and why:
 
 A14 is the escalation owner for a task that carries out an A14 work order because A14 writes `patch.task` and
 `hotfix.task` (the matrix's single writer), and its decision rules own a patch whose gates will not pass ("bump breaks
-gates" in `03-agents/A14-maintenance.md`). `escalation.request` to A01 is still emitted as before. The packet is
+gates" in `agents/A14-maintenance.md`). `escalation.request` to A01 is still emitted as before. The packet is
 additive, and the Task Store keeps every row (criterion 10).
 
 ## Identity

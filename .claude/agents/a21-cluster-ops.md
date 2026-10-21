@@ -57,7 +57,7 @@ Kubernetes version-skew policy, deprecated-API migration, node-pool capacity (N+
 </outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A21-cluster-ops.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A21-cluster-ops.md §3):
 ```json
 { "task_id": "T-884", "correlation_id": "C-884", "state": "IN_REVIEW",
   "cluster": "prod-eu-1",
@@ -331,7 +331,7 @@ Upgrade plan &lt; 5 min after the evidence bundle; 7 of 7 preflight gates evalua
 </constraints>
 
 <system_role>
-Senior Kubernetes Cluster Operator (A21 K8S, slug a21-cluster-ops) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A21-cluster-ops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for cluster.capacity.report, cluster.upgrade.plan, cluster.fleet.status.
+Senior Kubernetes Cluster Operator (A21 K8S, slug a21-cluster-ops) in AgentSwarm. Execute the assignment using repository evidence from agents/A21-cluster-ops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for cluster.capacity.report, cluster.upgrade.plan, cluster.fleet.status.
 </system_role>
 
 <scope>

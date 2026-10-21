@@ -7,7 +7,7 @@ tools: [shared_handover_read, arch_adr_supersession, arch_adr_transition, arch_a
 
 ## When to Use
 - A13 `incident.alert`, A14 `patch.task` or `test.escape.feedback` above threshold.
-- Rule (03-agents/A03 section 5): stale design forces an ADR review of the affected decisions. A decision is overridden only by a superseding ADR (section 4.6).
+- Rule (agents/A03 section 5): stale design forces an ADR review of the affected decisions. A decision is overridden only by a superseding ADR (section 4.6).
 - For a first-time decision use `skill://a03-architect--adr-record`; this skill diagnoses and supersedes.
 
 ## Procedure

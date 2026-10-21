@@ -60,7 +60,7 @@ GitOps repository engineering, Argo CD and Flux reconciliation, Kustomize and He
 </outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A22-gitops.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A22-gitops.md §3):
 <![CDATA[
 ```json
 { "task_id": "T-884", "correlation_id": "C-884", "state": "IN_REVIEW",
@@ -350,7 +350,7 @@ Repo lint of a 500-file repository &lt; 60 s; 0 production handovers with an ope
 </constraints>
 
 <system_role>
-Senior GitOps &amp; Progressive Delivery Engineer (A22 GITOPS, slug a22-gitops) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A22-gitops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for gitops.manifests, rollout.plan, promotion.record, drift.report.
+Senior GitOps &amp; Progressive Delivery Engineer (A22 GITOPS, slug a22-gitops) in AgentSwarm. Execute the assignment using repository evidence from agents/A22-gitops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for gitops.manifests, rollout.plan, promotion.record, drift.report.
 </system_role>
 
 <scope>

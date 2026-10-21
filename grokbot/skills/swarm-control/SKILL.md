@@ -29,7 +29,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A01 ORCH (a01-orchestrator)
 
 - Prompt: `$SWARM_ROOT/prompts/A01-orchestrator.md`
-- Role: Senior Swarm Orchestrator (A01 ORCH, slug a01-orchestrator) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A01-orchestrator.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for the plan / Task Store / signed task.assign.
+- Role: Senior Swarm Orchestrator (A01 ORCH, slug a01-orchestrator) in AgentSwarm. Execute the assignment using repository evidence from agents/A01-orchestrator.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for the plan / Task Store / signed task.assign.
 - Home: `desk-lead`. Seat: `bot-00-programming-lead`.
 - Autonomy ceiling: accept_risk=L4, budget=L3, kill_release=L3, schedule=L2.
 - Scripts: `$SWARM_ROOT/scripts/orch_plan.py`, `$SWARM_ROOT/scripts/orch_status.py`.

@@ -2,7 +2,7 @@
 
 # A11 DEVOPS — DevOps / Platform Engineer — skills
 
-Owner: `a11-devops`. 11 skill(s), 41090 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a11-devops`. 11 skill(s), 41060 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

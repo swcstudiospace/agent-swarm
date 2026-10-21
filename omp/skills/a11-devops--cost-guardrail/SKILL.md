@@ -9,7 +9,7 @@ disable-model-invocation: true
 ## When to Use
 
 - Read-only billing telemetry gives an `actual_cost` for an environment that has a `modeled_cost` (both from the task inputs or a read-only billing query the task names).
-- Rule (03-agents/A11-devops.md section 4.4): above 120 percent of modeled cost means auto-downscale and a report to A03 and A13. Drift is `skill://a11-devops--drift-reconcile`.
+- Rule (agents/A11-devops.md section 4.4): above 120 percent of modeled cost means auto-downscale and a report to A03 and A13. Drift is `skill://a11-devops--drift-reconcile`.
 
 ## Procedure
 

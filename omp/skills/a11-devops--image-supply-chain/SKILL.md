@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- A release (A12) or environment needs a `deployment.manifest` that lists images (03-agents/A11-devops.md section 3).
+- A release (A12) or environment needs a `deployment.manifest` that lists images (agents/A11-devops.md section 3).
 - Covers the images at deploy time (immutability, signatures, SBOM). Repo and workflow lint is `skill://a11-devops--pipeline-lint`.
 
 ## Procedure

@@ -7,7 +7,7 @@ disable-model-invocation: true
 # Lofi fallback
 
 ## When to Use
-- Figma cannot be read or written (A04 has no Figma tool of its own: the trigger is a failed Figma call you made through `bash`, or an input that says Figma is down) after its retries (E-DEP), or no `brand.guide` was supplied. Both fallbacks come from the prompt `error_handling` and 03-agents section 5.
+- Figma cannot be read or written (A04 has no Figma tool of its own: the trigger is a failed Figma call you made through `bash`, or an input that says Figma is down) after its retries (E-DEP), or no `brand.guide` was supplied. Both fallbacks come from the prompt `error_handling` and agents section 5.
 - Normal-fidelity specs are `skill://a04-ux-designer--screen-spec`. Use this skill only when a trigger above is true; otherwise degraded output hides a fixable problem.
 
 ## Procedure

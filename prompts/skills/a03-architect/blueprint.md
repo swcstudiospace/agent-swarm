@@ -8,7 +8,7 @@ tools: [shared_handover_read, arch_c4_fanout, arch_layer_violations, arch_cycle_
 ## When to Use
 - A `design.blueprint` task is assigned and the NFR bindings exist (`skill://a03-architect--nfr-allocation`).
 - You are the single writer of `architecture.blueprint`. This skill authors it. To re-audit an existing blueprint after a CI violation use `skill://a03-architect--fitness-run`.
-- Decision order (03-agents/A03 section 4): catalog pattern first, contract before task references, NFR allocation, fitness functions, compatibility, boundaries.
+- Decision order (agents/A03 section 4): catalog pattern first, contract before task references, NFR allocation, fitness functions, compatibility, boundaries.
 
 ## Procedure
 1. Call `shared_handover_read` with `{task_id}`. Take `requirements.spec`, NFR bindings, `infra.constraints` and `security.policy` from `artifacts`. Missing bindings: run `skill://a03-architect--nfr-allocation` first.

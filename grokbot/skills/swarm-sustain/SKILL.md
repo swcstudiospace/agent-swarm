@@ -29,7 +29,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A14 MAINT (a14-maintenance)
 
 - Prompt: `$SWARM_ROOT/prompts/A14-maintenance.md`
-- Role: Senior Maintenance Engineer (A14 MAINT, slug a14-maintenance) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A14-maintenance.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for patch.task, debt.register, rca.report, dependency.bump.
+- Role: Senior Maintenance Engineer (A14 MAINT, slug a14-maintenance) in AgentSwarm. Execute the assignment using repository evidence from agents/A14-maintenance.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for patch.task, debt.register, rca.report, dependency.bump.
 - Home: `routine`. Seat: `bot-01-systems-backend`.
 - Autonomy ceiling: major_bump=L3, patch_task=L2.
 - Scripts: `$SWARM_ROOT/scripts/maint_deps.py`.
@@ -37,7 +37,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A15 DOC (a15-docs)
 
 - Prompt: `$SWARM_ROOT/prompts/A15-docs.md`
-- Role: Senior Documentation Engineer (A15 DOC, slug a15-docs) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A15-docs.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for docs.bundle, api.reference, runbook, changelog.
+- Role: Senior Documentation Engineer (A15 DOC, slug a15-docs) in AgentSwarm. Execute the assignment using repository evidence from agents/A15-docs.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for docs.bundle, api.reference, runbook, changelog.
 - Home: `executor`. Seat: `bot-06-quality-security`.
 - Autonomy ceiling: docs=L2, public_docs=L3.
 - Scripts: `$SWARM_ROOT/scripts/docs_bundle.py`.
@@ -45,7 +45,7 @@ Regenerate with `python3 scripts/build_agents.py`.
 ### A20 FINOPS (a20-finops)
 
 - Prompt: `$SWARM_ROOT/prompts/A20-finops.md`
-- Role: Senior FinOps &amp; GreenOps Analyst (A20 FINOPS, slug a20-finops) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A20-finops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for cost.report, budget.policy, rightsizing.plan, carbon.report.
+- Role: Senior FinOps &amp; GreenOps Analyst (A20 FINOPS, slug a20-finops) in AgentSwarm. Execute the assignment using repository evidence from agents/A20-finops.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for cost.report, budget.policy, rightsizing.plan, carbon.report.
 - Home: `routine`. Seat: `bot-05-infrastructure`.
 - Autonomy ceiling: analysis=L2, budget_change=L3, commitment_purchase=L4.
 - Scripts: `$SWARM_ROOT/scripts/finops_cost_scan.py`.

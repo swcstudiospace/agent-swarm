@@ -276,7 +276,7 @@ def test_guard_negative_budget_is_refused_by_the_handler_too():
 
 
 def test_guard_worked_example_from_the_spec_hard_stop_then_escalate(doc):
-    """03-agents/A01 section 3 rule 5: hard-stop at 100 %, requeue once annotated, second breach is ESCALATED."""
+    """agents/A01 section 3 rule 5: hard-stop at 100 %, requeue once annotated, second breach is ESCALATED."""
     first = guard(doc, budget=BUDGET, usage=usage(tokens=300000), prior_breaches=0)
     assert (first["decision"], first["breaches_after"]) == ("HARD_STOP", 1)
     second = guard(doc, budget=BUDGET, usage=usage(tokens=300000), prior_breaches=first["breaches_after"])

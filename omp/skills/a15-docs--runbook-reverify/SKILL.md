@@ -5,7 +5,7 @@ disable-model-invocation: true
 ---
 
 ## When to Use
-- A13 reports failed or unused steps, or the verified-date ratio fell under 95 percent (03-agents/A15-docs.md section 5: runbook drift, rewrite within one iteration).
+- A13 reports failed or unused steps, or the verified-date ratio fell under 95 percent (agents/A15-docs.md section 5: runbook drift, rewrite within one iteration).
 - Not for first-time runbooks: use `a15-docs--runbook-author`. This skill states only what differs: edit named steps, never raise a date without a drill record.
 
 ## Procedure

@@ -6,7 +6,7 @@ tools: [shared_handover_bundle, sec_kev_match_count, shared_verdict, rel_gate_fr
 ---
 
 ## When to Use
-- A12 (or A01) asks for the security leg of a release candidate, or the newest security verdict is older than 24 h, or none exists. A12 consumes only a fresh verdict (A10 prompt, decision logic item 4; 03-agents A10 section 4, rule 4).
+- A12 (or A01) asks for the security leg of a release candidate, or the newest security verdict is older than 24 h, or none exists. A12 consumes only a fresh verdict (A10 prompt, decision logic item 4; agents A10 section 4, rule 4).
 - Not for per-PR gating (`skill://a10-security--pr-gate`). The difference is strict mode, KEV and DAST evidence, and the freshness proof.
 
 ## Procedure

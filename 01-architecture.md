@@ -198,7 +198,7 @@ then re-plans the subtree, then escalates (§5).
 | Document | Content |
 |----------|---------|
 | [02-message-protocol.md](02-message-protocol.md) | Envelope, subjects, task lifecycle, payload schema conventions |
-| [03-agents/](03-agents/) | 30 agent specifications (A01–A30) |
+| [agents/](agents/) | 30 agent specifications (A01–A30) |
 | [04-integration-plan.md](04-integration-plan.md) | Interaction matrix, event flows, conflict resolution |
 | [05-deployment-guide.md](05-deployment-guide.md) | Deployment, configuration, bootstrap, operations |
 | [06-testing-protocols.md](06-testing-protocols.md) | Unit/contract/integration/chaos/E2E test protocols |

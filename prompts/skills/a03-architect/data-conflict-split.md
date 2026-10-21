@@ -7,7 +7,7 @@ tools: [shared_handover_read, arch_field_breaks, arch_semver_bump, arch_contract
 
 ## When to Use
 - A07 reports that a schema or migration cannot satisfy a contract field, or the contract exposes a shape the model cannot hold.
-- Rule (03-agents/A03 section 5, prompts/A03 ESCALATION): arbitration through A01 first; if unresolved in one cycle, split the contract into versioned increments.
+- Rule (agents/A03 section 5, prompts/A03 ESCALATION): arbitration through A01 first; if unresolved in one cycle, split the contract into versioned increments.
 - Driven by the data model, not by a consumer. Consumer-driven breaks are `skill://a03-architect--breaking-change`.
 
 ## Procedure

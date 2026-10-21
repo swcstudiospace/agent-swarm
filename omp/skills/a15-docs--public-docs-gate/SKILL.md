@@ -5,7 +5,7 @@ disable-model-invocation: true
 ---
 
 ## When to Use
-- External API docs, marketing-adjacent pages or any public-facing bundle (03-agents/A15-docs.md section 4.4 and section 7: confidentiality scan and DLP before publish).
+- External API docs, marketing-adjacent pages or any public-facing bundle (agents/A15-docs.md section 4.4 and section 7: confidentiality scan and DLP before publish).
 - Not for internal L2 docs and not for structure checks alone: use `a15-docs--bundle-audit`. This skill never publishes.
 
 ## Procedure

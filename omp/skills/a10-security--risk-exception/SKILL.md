@@ -7,7 +7,7 @@ disable-model-invocation: true
 ## When to Use
 - A requester (A05, A06, A01) proposes an allow-list entry for `sec_gate`, asks to accept a finding for a release, or an entry in an allow-list is expiring.
 - This is the only decision path for exceptions. It does not scan; scanning is `skill://a10-security--pr-gate`.
-- You may block (L2) but never accept risk yourself: medium needs A01 with a mitigation plan, high and critical need an L4 human (A10 prompt, decision logic; 03-agents A10 section 4, rule 3).
+- You may block (L2) but never accept risk yourself: medium needs A01 with a mitigation plan, high and critical need an L4 human (A10 prompt, decision logic; agents A10 section 4, rule 3).
 
 ## Procedure
 1. Read the allow-list file the requester supplied with `read`. `sec_gate --allow-list` takes a JSON list of `{id, justification, expires?}` (an object `{"allow": [...]}` or a bare id string without justification also loads, and the latter is refused). You do not create or edit that file.

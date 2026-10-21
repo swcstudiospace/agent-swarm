@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- The brief splits into scopes whose paths, owners or acceptance criteria share no file (03-agents/A01 decision rule 1). Single-stream work: `skill://a01-orchestrator--plan-decompose`.
+- The brief splits into scopes whose paths, owners or acceptance criteria share no file (agents/A01 decision rule 1). Single-stream work: `skill://a01-orchestrator--plan-decompose`.
 
 ## Procedure
 

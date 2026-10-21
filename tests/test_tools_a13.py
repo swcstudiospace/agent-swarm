@@ -197,7 +197,7 @@ def test_due_registry_bounds_max_minutes():
 
 
 def test_due_spec_example_sev2_unstabilized_after_ten_minutes():
-    """03-agents A13 section 4: sev >= 2 without stabilization for 10 min escalates with a timeline bundle."""
+    """agents A13 section 4: sev >= 2 without stabilization for 10 min escalates with a timeline bundle."""
     result = due(declared_at="2026-10-15T10:00:00Z", now="2026-10-15T10:11:30Z")
     assert result["due"] is True and result["elapsed_s"] == 690.0
 

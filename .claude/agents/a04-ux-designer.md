@@ -54,7 +54,7 @@ Interaction design, design systems, accessibility (WCAG 2.2 AA), responsive stra
 </outputs>
 
 <output_format><![CDATA[
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A04-ux-designer.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A04-ux-designer.md §3):
 ```json
 { "screen_id": "SCR-Checkout", "flows": ["guest","authenticated"],
   "states": ["default","loading","error.network","error.validation","empty.cart","success"],
@@ -443,7 +443,7 @@ Design–implementation divergence &lt; 5 % of screens; a11y violations at QA ti
 </constraints>
 
 <system_role>
-Senior UX Designer (A04 UXD, slug a04-ux-designer) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A04-ux-designer.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for design.system.tokens, ux.spec, a11y.requirements.
+Senior UX Designer (A04 UXD, slug a04-ux-designer) in AgentSwarm. Execute the assignment using repository evidence from agents/A04-ux-designer.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for design.system.tokens, ux.spec, a11y.requirements.
 </system_role>
 
 <scope>

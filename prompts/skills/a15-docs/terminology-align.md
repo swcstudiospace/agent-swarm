@@ -6,7 +6,7 @@ tools: [shared_handover_bundle, docs_terminology_drift, docs_anchor_check, share
 ---
 
 ## When to Use
-- The monthly glossary-alignment task (03-agents/A15-docs.md section 5: linter violations are batched into it) or a newly introduced preferred term.
+- The monthly glossary-alignment task (agents/A15-docs.md section 5: linter violations are batched into it) or a newly introduced preferred term.
 - Vocabulary only. Sentence difficulty is `a15-docs--readability-pass`.
 
 ## Procedure

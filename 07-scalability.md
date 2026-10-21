@@ -39,7 +39,7 @@ Ids A01–A30 are allocated to the roster in `agents.json`; the example uses pla
 The repository-level checklist (roster entry, code and tests that list agents, tools, skills, scripts, regeneration, gates) is [docs/swarm-command-center.md §9.1](docs/swarm-command-center.md). The steps below are the design-level onboarding path.
 
 1. **Gap analysis** — confirm the capability isn't already covered (roles are complementary by policy; A01 arbitration history and the capability registry are checked).
-2. **Write the spec** — same 7-section template as [03-agents/](03-agents/) (purpose, stack, I/O, autonomy, error handling, metrics, security).
+2. **Write the spec** — same 7-section template as [agents/](agents/) (purpose, stack, I/O, autonomy, error handling, metrics, security).
 3. **Register contracts** — new schemas into the registry with exemplars; declare `consumes`/`produces`; run Level C contract tests.
 4. **Build in `sim`** — golden-task corpus (Level U) + dry-run mode.
 5. **Shadow mode (L0)** — deploy alongside; consumes real traffic, outputs recorded but *not* consumed by anyone; verdict/output diffing vs the incumbent (if replacing) or plausibility checks (if net-new).

@@ -4,7 +4,7 @@
 
 AgentSwarm contains two things:
 
-- **Design spec** for a 30-agent SDLC swarm, A01 ORCH through A30 CUSTODY: `01-*.md` … `07-*.md` and `03-agents/`. A01–A15 are the core SDLC agents; A16–A30 are three domains of five agents each: cloud-native (A16–A20), cluster (A21–A25) and Web3 (A26–A30). Only A08, A09, A10 and A12 own gates; the domain agents' work flows through them.
+- **Design spec** for a 30-agent SDLC swarm, A01 ORCH through A30 CUSTODY: `01-*.md` … `07-*.md` and `agents/`. A01–A15 are the core SDLC agents; A16–A30 are three domains of five agents each: cloud-native (A16–A20), cluster (A21–A25) and Web3 (A26–A30). Only A08, A09, A10 and A12 own gates; the domain agents' work flows through them.
 - **Runnable implementation:**
   - `swarm/` — Python runtime: signed envelopes, a SQLite task state machine, and gates.
   - `scripts/` — per-agent CLI tools, each with a Bun TypeScript twin.
@@ -183,7 +183,7 @@ This makes swarm activation default observable.
 | `scripts/ts/` | Bun twins. 36 pass through to Python via `passthrough.ts`. 5 are native **subsets**: `code_checks`, `fe_a11y_check`, `req_lint`, `sec_gate`, `ux_tokens`. `build_agents.ts` calls the Python generator |
 | `prompts/` | **Source of truth** for agent behaviour: XML-tagged system prompts. `prompts/skills/<owner>/<short>.md` are the skill sources (`<owner>` an agent slug or `shared`) |
 | `registry/intake/` | Pending tool fragments (`<slug>.tools.json`, `grants.json`) merged into `agents.json` by `scripts/_registry_intake.py --apply`; empty in a clean tree (a `.lock` file may remain) |
-| `03-agents/` | Original 7-section agent specs (Purpose, Stack, Communication, Decision logic, Errors, Metrics, Security) |
+| `agents/` | Original 7-section agent specs (Purpose, Stack, Communication, Decision logic, Errors, Metrics, Security) |
 | `hooks/` | `user_prompt_submit.py` and `autonomous_run.py` |
 | `grokbot/` | Grok Bot export: generated `swarm/seat-map.json` and `skills/swarm-<lane>/`, plus the hand-written `skills/swarm-cloud-dispatch/` |
 | `.claude/agents/`, `.grok/agents/`, `.cursor/agents/`, `skills/`, `omp/agents/`, `omp/skills/`, `docs/tools/`, `docs/skills/`, `tests/generated/` | **Generated.** Never hand-edit. `.cursor/rules/agent-swarm.mdc` is hand-written and copied by the Cursor installer. `omp/skills/` holds the 31 visible skills (30 index skills and `swarm-orchestrate`) and one hidden flat skill per `prompts/skills/` source |

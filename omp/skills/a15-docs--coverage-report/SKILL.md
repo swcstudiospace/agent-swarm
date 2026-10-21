@@ -5,7 +5,7 @@ disable-model-invocation: true
 ---
 
 ## When to Use
-- Once per release, before the docs-release gate (03-agents/A15-docs.md section 4.5: coverage report published per release).
+- Once per release, before the docs-release gate (agents/A15-docs.md section 4.5: coverage report published per release).
 - Not for finding defects: use `a15-docs--bundle-audit`. Not for fixing gaps: run the matching authoring skill, then re-measure here.
 
 ## Procedure
@@ -20,7 +20,7 @@ disable-model-invocation: true
 9. Use `write` to save the report at the path the task `outputs[]` names (with none named, `docs/coverage-report.json`, a convention of this skill), then call `shared_artifact_digest` with that `path`.
 
 ## Outputs
-- `doc.coverage.report` JSON per 03-agents/A15-docs.md section 3: `apis.covered_pct`, `apis.stale`, `adr_rendered_pct`, `runbooks_with_verified_date_pct`, `readability_avg`, plus `packages_documented_pct` and one `meets_target` flag per metric.
+- `doc.coverage.report` JSON per agents/A15-docs.md section 3: `apis.covered_pct`, `apis.stale`, `adr_rendered_pct`, `runbooks_with_verified_date_pct`, `readability_avg`, plus `packages_documented_pct` and one `meets_target` flag per metric.
 
 ## Failure Handling
 - A tool PARTIAL_SUCCESS: do not report that metric as complete; mark it `partial` with the gap.

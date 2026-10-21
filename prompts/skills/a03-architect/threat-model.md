@@ -6,7 +6,7 @@ tools: [shared_handover_read, arch_c4_fanout, shared_open_questions, shared_arti
 ---
 
 ## When to Use
-- Any component of the blueprint that crosses a trust boundary (03-agents/A03 section 7: a STRIDE model is mandatory, and A10 must co-sign high-risk designs before implementation tasks open).
+- Any component of the blueprint that crosses a trust boundary (agents/A03 section 7: a STRIDE model is mandatory, and A10 must co-sign high-risk designs before implementation tasks open).
 - No other A03 skill emits `threat.model`. A03 designs mitigations; accepting a residual risk is A10's decision only.
 - Compliance hooks: map controls to the applicable framework named in `security.policy` (for example network segmentation) before IMPLEMENTATION tasks are released.
 

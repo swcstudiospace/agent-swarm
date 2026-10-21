@@ -10,7 +10,7 @@ tools: [devops_env_tier, devops_change_gate, devops_cost_overrun, shared_lease_s
 ## When to Use
 
 - `environment.request` routed by A01, a closed PR with a live `env-pr<N>`, or an environment whose TTL elapsed.
-- Ephemeral and staging only (autonomy L2, 03-agents/A11-devops.md section 4.1). Production is `skill://a11-devops--prod-infra-change`.
+- Ephemeral and staging only (autonomy L2, agents/A11-devops.md section 4.1). Production is `skill://a11-devops--prod-infra-change`.
 
 ## Procedure
 

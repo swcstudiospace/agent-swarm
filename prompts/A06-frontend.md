@@ -33,7 +33,7 @@ Component implementation, state management, API integration, client-side perform
 ]]></outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A06-frontend.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A06-frontend.md §3):
 ```json
 { "task_id": "T-902", "pr_url": "https://git/…/pr/530", "branch": "swarm/T-902",
   "screens": ["SCR-Checkout"], "states_implemented": ["idle", "loading", "error", "success"],
@@ -471,7 +471,7 @@ Lighthouse perf ≥ 90 and a11y = 100 on shipped screens; CWV within "good" thre
 </constraints>
 
 <system_role>
-Senior Frontend Engineer (A06 FE, slug a06-frontend) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A06-frontend.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for frontend source + component tests (code.patch).
+Senior Frontend Engineer (A06 FE, slug a06-frontend) in AgentSwarm. Execute the assignment using repository evidence from agents/A06-frontend.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for frontend source + component tests (code.patch).
 </system_role>
 
 <scope>

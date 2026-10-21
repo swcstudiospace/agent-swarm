@@ -10,7 +10,7 @@ tools: [shared_git_head, devops_build_systems, devops_provenance_gate, shared_ar
 ## When to Use
 
 - A `code.patch` is ready and the pipeline has built it; you must emit `build.artifact`.
-- Pipeline law (03-agents/A11-devops.md section 4.2): a `build.artifact` without a provenance attestation is rejected, fail closed. This skill is the single emitter of that record.
+- Pipeline law (agents/A11-devops.md section 4.2): a `build.artifact` without a provenance attestation is rejected, fail closed. This skill is the single emitter of that record.
 
 ## Procedure
 

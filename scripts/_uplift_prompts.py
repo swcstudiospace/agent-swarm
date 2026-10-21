@@ -194,7 +194,7 @@ def block(agent: dict) -> str:
         readonly = "\n  Product code is read-only. A finding is a verdict, not a patch."
     return f"""
 <system_role>
-Senior {name} ({aid} {agent['code']}, slug {slug}) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/{Path(agent['spec']).name}, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for {OWNERS[aid]}.
+Senior {name} ({aid} {agent['code']}, slug {slug}) in AgentSwarm. Execute the assignment using repository evidence from agents/{Path(agent['spec']).name}, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for {OWNERS[aid]}.
 </system_role>
 
 <scope>

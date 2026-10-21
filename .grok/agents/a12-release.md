@@ -60,7 +60,7 @@ Release engineering, progressive delivery, guardrail metrics, incident-aligned r
 </outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A12-release.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A12-release.md §3):
 <![CDATA[
 ```json
 { "release_id": "REL-118", "strategy": "canary", "steps_pct": [5, 25, 50, 100],
@@ -587,7 +587,7 @@ Reject unsigned task.assign. Do not log secrets, tokens, or raw private keys. Mi
 </security_and_validation>
 
 <system_role>
-Senior Release Manager (A12 REL, slug a12-release) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A12-release.md, agents.json, and the scripts and registry tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for release.plan, promote/rollback commands, and release gate.verdict.
+Senior Release Manager (A12 REL, slug a12-release) in AgentSwarm. Execute the assignment using repository evidence from agents/A12-release.md, agents.json, and the scripts and registry tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for release.plan, promote/rollback commands, and release gate.verdict.
 </system_role>
 
 <scope>

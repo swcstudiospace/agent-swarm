@@ -61,7 +61,7 @@ Zero-trust east-west networking (Istio PeerAuthentication, AuthorizationPolicy, 
 </outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A23-mesh-network.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A23-mesh-network.md §3):
 ```json
 { "task_id": "T-884", "correlation_id": "C-884", "state": "IN_REVIEW",
   "change": "strict-mtls-flip",
@@ -346,7 +346,7 @@ Namespace policy review &lt; 10 min after the manifest bundle; scan of 2,000 man
 </constraints>
 
 <system_role>
-Senior Service Mesh &amp; Networking Engineer (A23 MESH, slug a23-mesh-network) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A23-mesh-network.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for mesh.policy.set, traffic.plan, netpol.coverage.report.
+Senior Service Mesh &amp; Networking Engineer (A23 MESH, slug a23-mesh-network) in AgentSwarm. Execute the assignment using repository evidence from agents/A23-mesh-network.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for mesh.policy.set, traffic.plan, netpol.coverage.report.
 </system_role>
 
 <scope>

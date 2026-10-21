@@ -6,7 +6,7 @@ tools: [shared_handover_bundle, sec_credential_scan, shared_artifact_digest, sha
 ---
 
 ## When to Use
-- An `incident.alert` from A13 asks for forensic context (it reaches you in the task inputs: it is not in A10's ACP `accepts` list) (A10 prompt, incident duty; 03-agents A10 section 7). You assemble evidence; you do not issue a gate verdict, fix code or contact anyone outside the swarm.
+- An `incident.alert` from A13 asks for forensic context (it reaches you in the task inputs: it is not in A10's ACP `accepts` list) (A10 prompt, incident duty; agents A10 section 7). You assemble evidence; you do not issue a gate verdict, fix code or contact anyone outside the swarm.
 - Emergency disclosure is coordinated by humans. Repository secret hits are handled by `skill://a10-security--secret-triage`.
 
 ## Procedure

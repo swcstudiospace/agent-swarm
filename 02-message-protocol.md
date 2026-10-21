@@ -87,7 +87,7 @@ via `task.status`; A01 validates legality (illegal transition ⇒ `task.status.r
 | `conflict.report` | any → A01 | `{ subject, parties[], claims[], evidence[] }` |
 | `memory.write` / `memory.query` | any → memory svc | `{ scope, kind: decision|retro|pattern, content_md, tags[] }` |
 
-Per-agent payload schemas are defined in each agent spec ([03-agents/](03-agents/)).
+Per-agent payload schemas are defined in each agent spec ([agents/](agents/)).
 
 ## 5. Autonomy levels (used by every agent spec)
 

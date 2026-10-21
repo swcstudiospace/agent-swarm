@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- A Terraform or OpenTofu apply, or an equivalent IaC step, failed (03-agents/A11-devops.md section 5, prompt error_handling): diagnose, retry once, then roll back to the last-good snapshot.
+- A Terraform or OpenTofu apply, or an equivalent IaC step, failed (agents/A11-devops.md section 5, prompt error_handling): diagnose, retry once, then roll back to the last-good snapshot.
 - Only the failure path. A registry or credential outage is `skill://a11-devops--dependency-outage`.
 - Your omp guard refuses `terraform|tofu apply`, `destroy`, `import`, `taint`, `refresh`, `force-unlock` and `state rm|mv|push` (rule `terraform-apply-destroy`, `BLOCKED needs: human-approval`). You diagnose and prepare; the pipeline applies.
 

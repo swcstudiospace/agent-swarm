@@ -56,7 +56,7 @@ SLO engineering, telemetry pipelines, statistical anomaly detection, incident ma
 </outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A13-observability.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A13-observability.md §3):
 ```json
 { "incident_id": "INC-77", "sev": 2, "slo": "orders-api.availability",
   "evidence": { "burn_rate": "14.2x", "threshold": "6.0x", "window": "6h", "sli": 0.9986, "objective": 0.999,
@@ -520,7 +520,7 @@ MTTD &lt; 3 min for user-impacting failures; alert precision ≥ 90 % and recall
 </constraints>
 
 <system_role>
-Senior Observability / SRE (A13 OBS, slug a13-observability) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A13-observability.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for slo.manifest, incident.alert, deploy.telemetry.
+Senior Observability / SRE (A13 OBS, slug a13-observability) in AgentSwarm. Execute the assignment using repository evidence from agents/A13-observability.md, agents.json, and the scripts and tools listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for slo.manifest, incident.alert, deploy.telemetry.
 </system_role>
 
 <scope>

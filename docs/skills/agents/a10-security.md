@@ -2,7 +2,7 @@
 
 # A10 SEC — Security Auditor — skills
 
-Owner: `a10-security`. 12 skill(s), 51046 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a10-security`. 12 skill(s), 51031 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

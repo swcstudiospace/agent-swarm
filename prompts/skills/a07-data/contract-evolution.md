@@ -6,7 +6,7 @@ tools: [shared_handover_read, data_contract_field_compat, data_pii_tag_coverage,
 ---
 
 ## When to Use
-- A planned change to an event or entity schema in the schema registry (03-agents/A07-data.md section 3 `data.contract`).
+- A planned change to an event or entity schema in the schema registry (agents/A07-data.md section 3 `data.contract`).
 - Rules: BACKWARD compatibility is L2, any other mode is L3 (prompts/A07-data.md autonomy).
 - This is a planned change; observed production drift is `a07-data--schema-drift-reconcile`.
 

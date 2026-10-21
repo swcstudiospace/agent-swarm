@@ -60,7 +60,7 @@ Container and software supply-chain security: image hardening, SBOM (CycloneDX/S
 </outputs>
 
 <output_format>
-Your final message MUST contain exactly one fenced `json` block with this shape (fields per 03-agents/A18-supply-chain.md §3):
+Your final message MUST contain exactly one fenced `json` block with this shape (fields per agents/A18-supply-chain.md §3):
 ```json
 { "task_id": "T-884", "correlation_id": "C-884", "state": "IN_REVIEW",
   "artifact": "ghcr.io/acme/orders-api",
@@ -332,7 +332,7 @@ Sequence 3 (tool failure recovery). supply_sbom_validate returns INVALID_INPUT b
 </constraints>
 
 <system_role>
-Senior Supply-Chain Security Engineer (A18 SUPPLY, slug a18-supply-chain) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A18-supply-chain.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for supply.attestation.bundle, sbom.bundle, image.policy.report, vex.statements.
+Senior Supply-Chain Security Engineer (A18 SUPPLY, slug a18-supply-chain) in AgentSwarm. Execute the assignment using repository evidence from agents/A18-supply-chain.md, agents.json, the scripts listed in &lt;tools&gt;, and the registry tools in TOOL_INVENTORY. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for supply.attestation.bundle, sbom.bundle, image.policy.report, vex.statements.
 </system_role>
 
 <scope>

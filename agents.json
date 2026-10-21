@@ -3811,7 +3811,7 @@
       "class": "control",
       "lane": "control",
       "model": "opus",
-      "spec": "03-agents/A01-orchestrator.md",
+      "spec": "agents/A01-orchestrator.md",
       "prompt": "prompts/A01-orchestrator.md",
       "description": "Swarm control plane. Use to decompose a brief into a task DAG, schedule/assign tasks to the other 29 agents, enforce gates and budgets, arbitrate conflicts and escalate to humans. Owns the plan, never writes code/docs/IaC. Splits disjoint blast radii into parallel lanes, including several of the same agent, and reviews them once with Greptile after the branches merge.",
       "capabilities": [
@@ -5396,7 +5396,7 @@
       "name": "Requirements Engineer",
       "class": "delivery",
       "lane": "delivery",
-      "spec": "03-agents/A02-requirements.md",
+      "spec": "agents/A02-requirements.md",
       "prompt": "prompts/A02-requirements.md",
       "description": "Turns briefs into a requirements spec, user stories and machine-checkable acceptance criteria (Given/When/Then). Use at the start of any feature or when criteria are ambiguous/untestable.",
       "capabilities": [
@@ -7369,7 +7369,7 @@
       "class": "delivery",
       "lane": "delivery",
       "model": "opus",
-      "spec": "03-agents/A03-architect.md",
+      "spec": "agents/A03-architect.md",
       "prompt": "prompts/A03-architect.md",
       "description": "Produces the C4 blueprint, API contracts (OpenAPI/AsyncAPI), ADRs and tech-stack decisions from requirements. Use for design tasks, contract changes and architecture fitness checks.",
       "capabilities": [
@@ -9477,7 +9477,7 @@
       "name": "UX Designer",
       "class": "delivery",
       "lane": "delivery",
-      "spec": "03-agents/A04-ux-designer.md",
+      "spec": "agents/A04-ux-designer.md",
       "prompt": "prompts/A04-ux-designer.md",
       "description": "Owns design tokens, wireframes, UX specs and accessibility (WCAG) requirements. Use for any UI-facing feature before frontend implementation.",
       "capabilities": [
@@ -11602,7 +11602,7 @@
       "name": "Backend Engineer",
       "class": "build",
       "lane": "code",
-      "spec": "03-agents/A05-backend.md",
+      "spec": "agents/A05-backend.md",
       "prompt": "prompts/A05-backend.md",
       "description": "Implements backend services against A03 contracts and A07 data contracts, with unit tests. Use for server-side code, APIs, business logic and hotfix patches.",
       "capabilities": [
@@ -13371,7 +13371,7 @@
       "name": "Frontend Engineer",
       "class": "build",
       "lane": "code",
-      "spec": "03-agents/A06-frontend.md",
+      "spec": "agents/A06-frontend.md",
       "prompt": "prompts/A06-frontend.md",
       "description": "Implements UI against A04 tokens/UX specs and A03 API contracts, with component tests and a11y checks. Use for client-side code.",
       "capabilities": [
@@ -15402,7 +15402,7 @@
       "name": "Data Engineer",
       "class": "build",
       "lane": "code",
-      "spec": "03-agents/A07-data.md",
+      "spec": "agents/A07-data.md",
       "prompt": "prompts/A07-data.md",
       "description": "Owns data models, schema migrations (expand/contract, reversible) and data contracts. Use for any persistence, migration or pipeline change.",
       "capabilities": [
@@ -17188,7 +17188,7 @@
       "name": "Test Engineer",
       "class": "verify",
       "lane": "verify",
-      "spec": "03-agents/A08-qa.md",
+      "spec": "agents/A08-qa.md",
       "prompt": "prompts/A08-qa.md",
       "description": "Quality gate. Translates acceptance criteria into test suites, runs them, files defects and issues the signed quality gate verdict. Never modifies product code.",
       "capabilities": [
@@ -19067,7 +19067,7 @@
       "class": "verify",
       "lane": "verify",
       "model": "opus",
-      "spec": "03-agents/A09-reviewer.md",
+      "spec": "agents/A09-reviewer.md",
       "prompt": "prompts/A09-reviewer.md",
       "description": "Review gate. Reviews diffs for correctness, standards and contract adherence and issues the signed review verdict with structured findings. Read-only on product code.",
       "capabilities": [
@@ -20852,7 +20852,7 @@
       "class": "verify",
       "lane": "verify",
       "model": "opus",
-      "spec": "03-agents/A10-security.md",
+      "spec": "agents/A10-security.md",
       "prompt": "prompts/A10-security.md",
       "description": "Security gate. Runs SAST/secrets/dependency/IaC checks, threat-models changes, and issues the signed security gate verdict. Fail-closed; can never accept risk itself.",
       "capabilities": [
@@ -22922,7 +22922,7 @@
       "name": "DevOps / Platform Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A11-devops.md",
+      "spec": "agents/A11-devops.md",
       "prompt": "prompts/A11-devops.md",
       "description": "Owns IaC, CI pipelines, build artifacts and environments. Use to provision environments, build/sign artifacts and validate pipeline configuration.",
       "capabilities": [
@@ -24492,7 +24492,7 @@
       "name": "Release Manager",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A12-release.md",
+      "spec": "agents/A12-release.md",
       "prompt": "prompts/A12-release.md",
       "description": "Owns release plans, progressive delivery (canary) and rollback. Use once all gates are green to plan/promote a release, or to freeze/rollback on incident.",
       "capabilities": [
@@ -26304,7 +26304,7 @@
       "name": "Observability / SRE",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A13-observability.md",
+      "spec": "agents/A13-observability.md",
       "prompt": "prompts/A13-observability.md",
       "description": "Owns SLOs, dashboards, alerting and incident declaration. Use to define SLOs for a service, compute error-budget burn, or declare/triage incidents.",
       "capabilities": [
@@ -27887,7 +27887,7 @@
       "name": "Maintenance Engineer",
       "class": "sustain",
       "lane": "sustain",
-      "spec": "03-agents/A14-maintenance.md",
+      "spec": "agents/A14-maintenance.md",
       "prompt": "prompts/A14-maintenance.md",
       "description": "Owns patch tasks, dependency bumps, tech-debt register and EOL tracking. Use for hotfix root-cause analysis, CVE-driven patching and debt triage.",
       "capabilities": [
@@ -29257,7 +29257,7 @@
       "class": "sustain",
       "lane": "sustain",
       "model": "haiku",
-      "spec": "03-agents/A15-docs.md",
+      "spec": "agents/A15-docs.md",
       "prompt": "prompts/A15-docs.md",
       "description": "Owns docs bundles, API references, runbooks and changelogs. Use after design/implementation/release to document artifacts and validate doc links/coverage.",
       "capabilities": [
@@ -31747,7 +31747,7 @@
       "name": "Cloud-Native Architect",
       "class": "delivery",
       "lane": "delivery",
-      "spec": "03-agents/A16-cloud-architect.md",
+      "spec": "agents/A16-cloud-architect.md",
       "prompt": "prompts/A16-cloud-architect.md",
       "description": "Owns the cloud-native deployment architecture: 12-factor conformance, landing zones, regional resilience (failure domains, RTO/RPO, cells), data residency and Well-Architected reviews. Use for multi-cloud or multi-region design after A03 has set the system blueprint.",
       "capabilities": [
@@ -35138,7 +35138,7 @@
       "name": "Platform Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A17-platform-engineer.md",
+      "spec": "agents/A17-platform-engineer.md",
       "prompt": "prompts/A17-platform-engineer.md",
       "description": "Owns the internal developer platform: golden paths, service-catalog entries, composition and claim APIs, self-service guardrails and maturity scorecards. Use to onboard a service to the platform or change a platform API.",
       "capabilities": [
@@ -39287,7 +39287,7 @@
       "name": "Supply-Chain Security Engineer",
       "class": "verify",
       "lane": "verify",
-      "spec": "03-agents/A18-supply-chain.md",
+      "spec": "agents/A18-supply-chain.md",
       "prompt": "prompts/A18-supply-chain.md",
       "description": "Hardens the container and software supply chain: Dockerfile and base-image policy, SBOMs, SLSA provenance, signature policy and VEX triage. Use for image builds, artifact promotion and supply-chain findings. Feeds A10; never issues or waives a gate.",
       "capabilities": [
@@ -42425,7 +42425,7 @@
       "name": "Event-Driven & Serverless Engineer",
       "class": "build",
       "lane": "code",
-      "spec": "03-agents/A19-event-driven.md",
+      "spec": "agents/A19-event-driven.md",
       "prompt": "prompts/A19-event-driven.md",
       "description": "Designs and implements event-driven and serverless systems: broker topology, CloudEvents/AsyncAPI schemas, idempotent consumers, retry and DLQ policy, scale-to-zero. Use for queues, streams, functions and asynchronous integration.",
       "capabilities": [
@@ -45474,7 +45474,7 @@
       "name": "FinOps & GreenOps Analyst",
       "class": "sustain",
       "lane": "sustain",
-      "spec": "03-agents/A20-finops.md",
+      "spec": "agents/A20-finops.md",
       "prompt": "prompts/A20-finops.md",
       "description": "Models, right-sizes and budgets cloud and cluster spend and carbon: unit economics, commitments, anomaly detection, tagging and showback. Use before a launch, on a cost anomaly or for a capacity change. Recommends only; never buys commitments.",
       "capabilities": [
@@ -49176,7 +49176,7 @@
       "name": "Kubernetes Cluster Operator",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A21-cluster-ops.md",
+      "spec": "agents/A21-cluster-ops.md",
       "prompt": "prompts/A21-cluster-ops.md",
       "description": "Owns the Kubernetes cluster lifecycle: version skew and upgrade plans, deprecated-API removal, node pools and autoscaling, capacity, etcd and certificate health and fleet drift. Use for any cluster upgrade, scale or capacity change.",
       "capabilities": [
@@ -52681,7 +52681,7 @@
       "name": "GitOps & Progressive Delivery Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A22-gitops.md",
+      "spec": "agents/A22-gitops.md",
       "prompt": "prompts/A22-gitops.md",
       "description": "Owns the GitOps repository and delivery mechanics: Argo CD/Flux apps, Kustomize and Helm overlays, sync waves, canary and blue-green rollouts, promotion PRs and drift handling. Use to ship a workload to a cluster; A12 still decides what ships.",
       "capabilities": [
@@ -56752,7 +56752,7 @@
       "name": "Service Mesh & Networking Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A23-mesh-network.md",
+      "spec": "agents/A23-mesh-network.md",
       "prompt": "prompts/A23-mesh-network.md",
       "description": "Owns cluster networking and mesh policy: mTLS, authorization policy, Gateway API and ingress, NetworkPolicy, retries and timeouts, egress and multi-cluster connectivity. Use for traffic, ingress or zero-trust network changes.",
       "capabilities": [
@@ -60999,7 +60999,7 @@
       "name": "Cluster Security & Policy Engineer",
       "class": "verify",
       "lane": "verify",
-      "spec": "03-agents/A24-cluster-security.md",
+      "spec": "agents/A24-cluster-security.md",
       "prompt": "prompts/A24-cluster-security.md",
       "description": "Owns cluster policy-as-code: Pod Security, RBAC least privilege, admission policy (Kyverno/Gatekeeper/ValidatingAdmissionPolicy), runtime detection rules, CIS benchmarks and tenant isolation. Reports to A10; never accepts risk.",
       "capabilities": [
@@ -64051,7 +64051,7 @@
       "name": "Resilience & Chaos Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A25-resilience.md",
+      "spec": "agents/A25-resilience.md",
       "prompt": "prompts/A25-resilience.md",
       "description": "Owns workload resilience evidence: PodDisruptionBudgets and topology spread, probes, graceful shutdown, backup and restore, DR drills, chaos experiments and failure-mode analysis. Use before a production launch and after an incident.",
       "capabilities": [
@@ -67879,7 +67879,7 @@
       "name": "Smart Contract Engineer",
       "class": "build",
       "lane": "code",
-      "spec": "03-agents/A26-smart-contract.md",
+      "spec": "agents/A26-smart-contract.md",
       "prompt": "prompts/A26-smart-contract.md",
       "description": "Implements EVM smart contracts (Solidity/Vyper, Foundry/Hardhat): standards conformance, upgrade safety, access control, gas budgets and deployment plans. Simulates only; mainnet deployment and fund movement are human-only.",
       "capabilities": [
@@ -71006,7 +71006,7 @@
       "name": "Smart Contract Auditor",
       "class": "verify",
       "lane": "verify",
-      "spec": "03-agents/A27-contract-audit.md",
+      "spec": "agents/A27-contract-audit.md",
       "prompt": "prompts/A27-contract-audit.md",
       "description": "Audits smart contracts: static-analysis triage, invariant and fuzz adequacy, reentrancy, oracle and economic attack modelling, upgrade and access-control review, structured findings and fix verification. Reports to A10 and A26; never signs a gate.",
       "capabilities": [
@@ -74459,7 +74459,7 @@
       "name": "Blockchain Infrastructure Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A28-chain-infra.md",
+      "spec": "agents/A28-chain-infra.md",
       "prompt": "prompts/A28-chain-infra.md",
       "description": "Owns blockchain infrastructure: node and validator operations, client diversity, RPC provider failover, reorg and finality policy, indexers and backfills, L2 and bridge monitoring, with a testnet-first network guard.",
       "capabilities": [
@@ -77889,7 +77889,7 @@
       "name": "dApp & Wallet Integration Engineer",
       "class": "build",
       "lane": "code",
-      "spec": "03-agents/A29-dapp-wallet.md",
+      "spec": "agents/A29-dapp-wallet.md",
       "prompt": "prompts/A29-dapp-wallet.md",
       "description": "Implements wallet and chain integration in web frontends: EIP-1193/6963 wallets, chain switching, transaction lifecycle UX, EIP-712 and SIWE signing, ERC-4337 flows, approval hygiene and RPC fallbacks. Never handles keys.",
       "capabilities": [
@@ -81278,7 +81278,7 @@
       "name": "Web3 Custody & Compliance Engineer",
       "class": "operate",
       "lane": "ops",
-      "spec": "03-agents/A30-custody-compliance.md",
+      "spec": "agents/A30-custody-compliance.md",
       "prompt": "prompts/A30-custody-compliance.md",
       "description": "Designs custody and compliance controls: multisig and MPC policy, key ceremonies and rotation, timelocks, signer and transaction policy, sanctions screening and Travel Rule evidence. Policy and evidence only: never touches key material or moves funds.",
       "capabilities": [

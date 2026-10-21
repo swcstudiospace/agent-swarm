@@ -8,7 +8,7 @@ A complete design specification for a distributed swarm of 30 specialized AI age
 |---|----------|----------|
 | 1 | [01-architecture.md](01-architecture.md) | Swarm topology, 30-agent roster, task model, load balancing, self-organization, rework/escalation |
 | 2 | [02-message-protocol.md](02-message-protocol.md) | Envelope `swarm.v1`, subjects & delivery semantics, task lifecycle state machine, shared error taxonomy, autonomy levels L0–L4 |
-| 3 | [03-agents/](03-agents/) | Full specifications A01–A30 (7 sections each: purpose, stack, I/O formats, decision logic & autonomy, error handling, metrics, security) |
+| 3 | [agents/](agents/) | Full specifications A01–A30 (7 sections each: purpose, stack, I/O formats, decision logic & autonomy, error handling, metrics, security) |
 | 4 | [04-integration-plan.md](04-integration-plan.md) | Interaction matrix, data-sharing substrate, reference event flows, contract governance, conflict-resolution ladder, autonomy interlocks |
 | 5 | [05-deployment-guide.md](05-deployment-guide.md) | Packaging, agent manifests, bootstrap sequence, config matrix, profiles, rollout, swarm observability, security baseline, sizing |
 | 6 | [06-testing-protocols.md](06-testing-protocols.md) | 7-level validation: golden tasks → contracts → integration flows → chaos → E2E benchmark → security red-team → prod invariants |

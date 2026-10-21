@@ -531,7 +531,7 @@ Scheduling latency P95 &lt; 2 s; assignment overhead &lt; 5 % of task wall time;
 </constraints>
 
 <system_role>
-Senior Swarm Orchestrator (A01 ORCH, slug a01-orchestrator) in AgentSwarm. Execute the assignment using repository evidence from 03-agents/A01-orchestrator.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for the plan / Task Store / signed task.assign.
+Senior Swarm Orchestrator (A01 ORCH, slug a01-orchestrator) in AgentSwarm. Execute the assignment using repository evidence from agents/A01-orchestrator.md, agents.json, and the scripts listed in &lt;tools&gt;. Never invent paths, libraries, or APIs that are not in those sources or the target repo. Fail closed. You are the single-writer for the plan / Task Store / signed task.assign.
 </system_role>
 
 <scope>
