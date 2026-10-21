@@ -341,8 +341,9 @@ class _JsonCompare:
             if self._draft(side) == "legacy":
                 return self._conjuncts(target, side, depth + 1)
             siblings = self._siblings(schema)
-            if siblings and self._draft(side) == "unknown":
-                raise _Bad(self._field(side), "$schema is not a recognised JSON Schema draft, so the keywords beside a $ref cannot be applied with certainty")
+            if siblings and self._draft(side) in ("unknown", "undeclared"):
+                raise _Bad(self._field(side), "the draft is not declared or not recognised, so the keywords beside a $ref cannot be applied "
+                                              "with certainty: declare a $schema of draft 3 to 7 or 2019-09 or later")
             return [*self._conjuncts(target, side, depth + 1), *([siblings] if siblings else [])]
         if not isinstance(schema, (dict, bool)):
             raise _Bad(self._field(side), "every schema must be an object or a boolean")
@@ -357,11 +358,12 @@ class _JsonCompare:
 
     def _draft(self, side: str) -> str:
         """The draft the root `$schema` declares: "legacy" (draft 3 to 7, where a $ref ignores its siblings), "modern" (2019-09 or
-        2020-12, where they apply; also the default when no `$schema` is declared) or "unknown"."""
+        2020-12, where they apply), "undeclared" (no `$schema`: a validator's default draft decides, so the siblings are not known to
+        apply) or "unknown" (a `$schema` that is not a recognised draft)."""
         root = self.roots[side]
         declared = root.get("$schema") if isinstance(root, dict) else None
         if declared is None:
-            return "modern"
+            return "undeclared"
         if not isinstance(declared, str):
             return "unknown"
         if any(f"draft-0{number}" in declared for number in "3467"):

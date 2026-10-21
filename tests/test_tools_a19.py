@@ -127,6 +127,7 @@ def obj_schema(props, required=(), **extra):
 
 
 STR, INT = {"type": "string"}, {"type": "integer"}
+MODERN = "https://json-schema.org/draft/2020-12/schema"  # declared draft where a $ref's sibling keywords apply
 
 
 def test_schema_compat_optional_property_added_to_closed_schema_is_backward_only():
@@ -1295,7 +1296,7 @@ def test_schema_compat_oneof_target_must_stay_exclusive():
 
 def test_schema_compat_target_siblings_of_anyof_and_ref_still_apply():
     assert _backward(INT, {"type": "string", "anyOf": [{"minLength": 1}]})["backward_compatible"] is False
-    defs = {"$defs": {"s": STR}}
+    defs = {"$schema": MODERN, "$defs": {"s": STR}}
     base = {"$ref": "#/$defs/s", **defs}
     head = {"$ref": "#/$defs/s", "maxLength": 3, **defs}
     assert fx(_backward(base, head)) == [("major", "[backward] $: maxLength is above the target maximum 3 (string length)")]
@@ -1520,22 +1521,21 @@ def _tuple_items(*entries):
 
 def test_schema_compat_ref_siblings_apply_in_addition_to_the_target():
     # the sibling `minimum: 0` must not replace the target's `minimum: 5`: the head still loosens the source's bound
-    base = {"type": "number", "minimum": 1}
-    head = {"$defs": {"P": {"type": "number", "minimum": 5}}, "$ref": "#/$defs/P", "minimum": 0}
+    base = {"$schema": MODERN, "type": "number", "minimum": 1}
+    head = {"$schema": MODERN, "$defs": {"P": {"type": "number", "minimum": 5}}, "$ref": "#/$defs/P", "minimum": 0}
     result = compat(base, head)
     assert (result["backward_compatible"], result["verdict"]) == (False, "fail")
     assert fx(result) == [("major", "[backward] $: numeric lower bound loosened (target >= 5)")]
-    # the target's required `a` is still required when the sibling adds `b`
-    base = obj_schema({"a": STR, "b": STR}, ["b"], additionalProperties=False)
-    head = {"$defs": {"P": obj_schema({"a": STR, "b": STR}, ["a"], additionalProperties=False)}, "$ref": "#/$defs/P",
+    base = {"$schema": MODERN, **obj_schema({"a": STR, "b": STR}, ["b"], additionalProperties=False)}
+    head = {"$schema": MODERN, "$defs": {"P": obj_schema({"a": STR, "b": STR}, ["a"], additionalProperties=False)}, "$ref": "#/$defs/P",
             "required": ["b"]}
     assert fx(compat(base, head)) == [
         ("blocker", "[backward] $.a: required by the target but optional or undeclared in the source")]
 
 
 def test_schema_compat_ref_siblings_on_the_source_side_are_applied_too():
-    base = obj_schema({"a": STR, "b": STR}, ["b"])
-    head = {"$defs": {"P": obj_schema({"a": STR, "b": STR}, ["a"])}, "$ref": "#/$defs/P", "required": ["b"]}
+    base = {"$schema": MODERN, **obj_schema({"a": STR, "b": STR}, ["b"])}
+    head = {"$schema": MODERN, "$defs": {"P": obj_schema({"a": STR, "b": STR}, ["a"])}, "$ref": "#/$defs/P", "required": ["b"]}
     result = compat(base, head, "full")
     assert (result["backward_compatible"], result["forward_compatible"]) == (False, True)
 
@@ -1550,7 +1550,7 @@ def test_schema_compat_tuple_form_items_are_compared_position_by_position():
 
 
 def test_schema_compat_ref_siblings_follow_the_declared_draft():
-    # drafts 3 to 7 ignore the keywords beside a $ref, 2019-09 and later apply them, and an unrecognised draft is refused
+    # drafts 3 to 7 ignore the keywords beside a $ref, 2019-09 and later apply them; an undeclared or unrecognised draft is refused
     draft7 = "http://json-schema.org/draft-07/schema#"
     base = {"$schema": draft7, "$ref": "#/definitions/n", "minimum": 10, "definitions": {"n": {"type": "number"}}}
     assert _backward(base, {"$schema": draft7, "type": "number", "minimum": 10})["backward_compatible"] is False
@@ -1558,6 +1558,9 @@ def test_schema_compat_ref_siblings_follow_the_declared_draft():
     assert _backward(modern, {"type": "number", "minimum": 10})["backward_compatible"] is True
     unknown = {"$schema": "urn:example:draft", "$ref": "#/$defs/n", "minimum": 10, "$defs": {"n": {"type": "number"}}}
     invalid("event_schema_compat", {"format": "json-schema", "mode": "backward", "base_schema": json.dumps(unknown), "head_schema": "{}"}, "base_schema")
+    undeclared = {"$ref": "#/$defs/n", "minimum": 10, "$defs": {"n": {"type": "number"}}}  # a validator's default draft decides
+    invalid("event_schema_compat", {"format": "json-schema", "mode": "backward", "base_schema": json.dumps(undeclared), "head_schema": "{}"}, "base_schema")
+    assert _backward({"$ref": "#/$defs/n", "$defs": {"n": {"type": "number"}}}, {"type": "number"})["backward_compatible"] is True  # no siblings: no question
 
 
 def test_schema_compat_tuple_positions_past_the_source_maxitems_never_occur():
