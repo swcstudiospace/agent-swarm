@@ -2090,11 +2090,17 @@ describe("stack order with a rank-20 peer bar (restack protocol)", () => {
 });
 
 describe("footer status stays absent", () => {
-  test("no footer status with a `swarm:` prefix is ever written, across idle, running, completed and telemetry-error bars", () => {
+  test("no footer status with a `swarm:` prefix is ever written, across idle, loading, running, completed and telemetry-error bars", () => {
     const errorDir = join(tmpDir("swarm-footer-"), ".swarm");
     mkdirSync(errorDir, { recursive: true });
     writeFileSync(join(errorDir, "live.json"), "{ not json");
     const states: Record<string, { swarmDir?: string; setup: (h: Harness) => void; rows: (lines: string[]) => boolean }> = {
+      loading: {
+        setup: (h) => {
+          h.fire("tool_call", { toolName: "task", toolCallId: "call-1", input: { tasks: [{ id: "a", agent: "a05-backend" }] } });
+        },
+        rows: (lines) => lines.join("\n").includes("start"),
+      },
       idle: { setup: () => {}, rows: (lines) => lines.join("\n") === IDLE.join("\n") },
       running: {
         setup: (h) => {

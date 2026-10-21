@@ -873,6 +873,8 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     ["argocd app sync prod-api --dry-run=false", A22, "argocd-change"],
     ["argocd app sync prod-api --helm-set --dry-run", A22, "argocd-change"],
     ["argocd app sync prod-api -- --dry-run", A22, "argocd-change"],
+    // argocd's own `--` only ends its options: the operand after it is the application it syncs
+    ["argocd app sync -- prod-api", A22, "argocd-change"],
     ["argocd app sync api --prune --dry-run=none", A22, "argocd-change"],
     ["flux delete helmrelease api -n apps", A22, "flux-change"],
     ["flux uninstall", A22, "flux-change"],
@@ -1211,6 +1213,17 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(call("bash", { command: "hardhat run scripts/deploy.ts", env: { HARDHAT_NETWORK: "hardhat" } }), { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } })).toBeUndefined();
   });
 
+  test("the last HARDHAT_NETWORK prefix assignment is the network the run sees; a HARDHAT_NETWORK argument is not an assignment", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("HARDHAT_NETWORK=localhost HARDHAT_NETWORK=mainnet npx hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash("HARDHAT_NETWORK=mainnet HARDHAT_NETWORK=localhost npx hardhat run scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("hardhat run scripts/deploy.ts HARDHAT_NETWORK=localhost"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
   test("an inherited mainnet is overridden by a local export earlier on the line, so the bare run passes", () => {
     const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
     expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
@@ -1322,9 +1335,9 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     );
   });
 
-  test("the same expanded -v write with an inherited mainnet also needs approval", () => {
+  test("the same expanded -v write, after a local export, with an inherited mainnet also needs approval", () => {
     const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
-    expect(guardToolCall(bash('opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts'), inherited)?.reason).toBe(
+    expect(guardToolCall(bash('export HARDHAT_NETWORK=localhost; opt=-v; printf "$opt" HARDHAT_NETWORK mainnet; hardhat run scripts/deploy.ts'), inherited)?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
     );
   });
@@ -1333,20 +1346,31 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash('printf "%s\\n" "$x"; hardhat test'), insideAs(A26))).toBeUndefined();
   });
 
-  test("fail-closed: a for loop is a non-plain writer, so a bare test run in its body needs approval with no environment network", () => {
-    expect(guardToolCall(bash("for i in 1 2; do hardhat test; done"), insideAs(A26))?.reason).toBe(
+  test("a for loop over a name other than HARDHAT_NETWORK writes no network: a bare test run in its body passes, and for HARDHAT_NETWORK needs approval", () => {
+    expect(guardToolCall(bash("for i in 1 2; do hardhat test; done"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("for HARDHAT_NETWORK in mainnet; do :; done; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
     );
   });
 
-  test("fail-closed: unset of another name is a non-plain writer, so a bare test run needs approval with no environment network", () => {
-    expect(guardToolCall(bash("unset OTHER; hardhat test"), insideAs(A26))?.reason).toBe(
-      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
-    );
+  test("unset and export -p that name no network leave a local run unblocked; an unset of HARDHAT_NETWORK still clears an inherited mainnet", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("unset OTHER; hardhat test"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; unset OTHER; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; export -p >/dev/null; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+    expect(guardToolCall(bash("unset -v HARDHAT_NETWORK; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
   });
 
   test("a single-quoted dollar is literal, not an expansion: a bare test run with no environment network passes", () => {
     expect(guardToolCall(bash("printf 'cost: $5\\n'; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("quoted or literal text is not an expansion: a printf format that starts with text, printed templates and literal (( do not request approval", () => {
+    expect(guardToolCall(bash('printf "cost: $5\\n"; hardhat test'), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash('printf "$%s\\n" 5; hardhat test'), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("printf '%s' '${CONFIG:=value}'; hardhat test"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("hardhat test --grep '((x))'"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash('hardhat test --grep "(("'), insideAs(A26))).toBeUndefined();
   });
 
   test("a -v after the printf format is a value, not an option: a bare test run with no environment network passes", () => {

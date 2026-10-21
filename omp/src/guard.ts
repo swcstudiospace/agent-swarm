@@ -326,6 +326,8 @@ export interface Segment {
   targetWords: string[];
   /** The text with CUT kept (the redirection scan reads it). */
   marked: string;
+  /** The stripped prefix that `marked` starts with: this command's own wrapper words and `NAME=v` assignments. */
+  prefix: string;
   /** The command itself cannot be known (named by an expansion or glob): every operand is a mutate target. */
   opaque: boolean;
   /** Its stdin is a pipe (a pipeline member after the first). */
@@ -960,7 +962,7 @@ function parseSegment(item: Pick<Normalized, "text" | "runtime" | "prefix" | "op
   // a command named by an expansion or a glob (`$RM`, `/bin/r?`, `$(which rm)`) cannot be known: all its operands count
   const opaque = item.opaque || (argv0 !== "[" && argv0 !== "[[" && /[$`\u0001*?[]/.test(argv0));
   const text = item.text.replace(CUT_TOKEN, " ").trim();
-  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined };
+  return { text, words, argv0, targetWords, marked: `${item.prefix} ${item.text}`, opaque, piped: item.piped, cwd: undefined, prefix: item.prefix };
 }
 
 /** git global options that take the next word as their value when written without `=`. */
@@ -2106,12 +2108,15 @@ const NO_VALUE_FLAG = /(?!)/;
  * A CLI's words after its program word, up to a `--` (the words after it are another command's): the positional
  * words, and every flag with its value (`--flag=value`, `-fvalue`, or the next word for a flag `valueFlag` names).
  */
-function cliArgs(rest: string[], valueFlag: RegExp): { positional: string[]; flags: CliFlag[] } {
+function cliArgs(rest: string[], valueFlag: RegExp, operandsAfterDashes = false): { positional: string[]; flags: CliFlag[] } {
   const positional: string[] = [];
   const flags: CliFlag[] = [];
   for (let i = 0; i < rest.length; i++) {
     const w = rest[i];
-    if (w === "--") break;
+    if (w === "--") {
+      if (operandsAfterDashes) positional.push(...rest.slice(i + 1));
+      break;
+    }
     if (!w.startsWith("-") || w === "-") {
       positional.push(w);
       continue;
@@ -2147,8 +2152,9 @@ const eachTool = (words: string[], tools: RegExp, check: (at: number) => boolean
   !INERT_COMMAND.test(words[0] ?? "") && words.some((w, at) => tools.test(posix.basename(w).replace(/@[^/]*$/, "")) && check(at));
 /** `--help` (unless `--help=false`) or a bare `-h` before a `--`: the CLI prints usage and exits, whatever verb it follows. */
 const helpOnly = (flags: CliFlag[]) => flagOn(flags, "--help") || flags.some((f) => f.flag === "-h" && f.value === undefined);
-/** cliArgs of the words after the tool at `at`; a launcher's own `--` right after the tool (`npm exec hardhat -- run …`) is skipped. */
-const argsAfter = (words: string[], at: number, valueFlag: RegExp) => cliArgs(words.slice(words[at + 1] === "--" ? at + 2 : at + 1), valueFlag);
+/** cliArgs of the words after the tool at `at`; a launcher's own `--` right after the tool (`npm exec hardhat -- run …`) is skipped. `operandsAfterDashes`: the words after a `--` are operands too (argocd's `--` only ends its options). */
+const argsAfter = (words: string[], at: number, valueFlag: RegExp, operandsAfterDashes = false) =>
+  cliArgs(words.slice(words[at + 1] === "--" ? at + 2 : at + 1), valueFlag, operandsAfterDashes);
 /**
  * Where a CLI's verb can start among its `positional` words: the first word when the tool is the command itself, and
  * also the second when a launcher put a word before it (`docker run --entrypoint cast img send` names the image first).
@@ -2181,7 +2187,7 @@ const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
  */
 function argocdChange({ words }: Segment): boolean {
   return eachTool(words, /^argocd$/, (at) => {
-    const { positional, flags } = argsAfter(words, at, ARGOCD_VALUE_FLAG);
+    const { positional, flags } = argsAfter(words, at, ARGOCD_VALUE_FLAG, true);
     if (helpOnly(flags)) return false;
     const g = positional.findIndex((w) => ARGOCD_GROUP.test(w));
     const verbs = g === -1 ? undefined : ARGOCD_VERBS[positional[g]];
@@ -2320,8 +2326,16 @@ const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
   brownie: /^(?:run|console|test)(?: |$)/,
 };
 
-/** `HARDHAT_NETWORK=name` assigned on a segment or earlier on the same command line (every assignment is listed). */
-const HARDHAT_ENV = /(?:^|[\s;&|(])HARDHAT_NETWORK=([^\s;&|)]+)/g;
+/**
+ * The `HARDHAT_NETWORK` value a command's own prefix assigns (`HARDHAT_NETWORK=v cmd`, `env HARDHAT_NETWORK=v cmd`): the last
+ * such word wins, as in bash, and an empty value is unnamed. Undefined: the prefix assigns none. Only the prefix counts, so a
+ * `HARDHAT_NETWORK=v` argument of the tool is never the network it runs on.
+ */
+function prefixNetwork(prefix: string): string | undefined {
+  let value: string | undefined;
+  for (const raw of shellWords(prefix)) if (/^HARDHAT_NETWORK=/.test(raw)) value = unquote(raw).slice("HARDHAT_NETWORK=".length);
+  return value;
+}
 
 /** A HARDHAT_NETWORK value a bare run may see; undefined is unnamed, the in-process chain (local). */
 type NetworkValue = string | undefined;
@@ -2344,15 +2358,54 @@ const COMPOUND_KEYWORD = /^(?:if|then|else|elif|do|while|until|!)$/;
 /** Prefix words that run the rest of the line as code: `eval` (its joined words) and `coproc` (it names an array). */
 const CODE_PREFIX = /^(?:eval|coproc)$/;
 /**
- * An expansion that may assign, in any word: arithmetic (`$((`, `$[`, `((`) and a parameter expansion whose body has `=`
- * (`${X:=v}`, `${X=v}`, `${X:-a=b}`). Matched on the whole line, since splitTopLevel cuts `$((` apart at its parentheses.
+ * An expansion that may assign, in any word that expands: arithmetic `$((…))`, `$[…]`, and a parameter expansion whose body
+ * has `=` (`${X:=v}`, `${X=v}`, `${X:-a=b}`). Matched on the active text with double quotes kept (they expand), since
+ * splitTopLevel cuts `$((` apart at its parentheses.
  */
-const ASSIGNING_EXPANSION = /\(\(|\$\[|\$\{[^}]*=/;
+const ASSIGNING_EXPANSION = /\$\(\(|\$\[|\$\{[^}]*=/;
+/** An arithmetic command `((…))` assigns when it is unquoted; `"(("` is a literal. Matched on the active text with double quotes blanked. */
+const ARITHMETIC_COMMAND = /\(\(/;
+
+/**
+ * The text a shell expands. Single-quoted runs and backslash escapes are literal and blanked, so printed text such as
+ * `printf '%s' '${X:=v}'` assigns nothing. Double-quoted runs are blanked too unless `inDoubleQuotes` keeps them: `"$((x=1))"`
+ * expands, `"(("` does not. An unterminated quote keeps the text whole, which fails closed.
+ */
+function activeText(text: string, inDoubleQuotes: boolean): string {
+  let out = "";
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === "'") {
+      if (c === "'") quote = undefined;
+      out += " ";
+      continue;
+    }
+    if (c === "\\") {
+      i++;
+      out += "  ";
+      continue;
+    }
+    if (c === "'" && quote === undefined) {
+      quote = "'";
+      out += " ";
+      continue;
+    }
+    if (c === '"') quote = quote === '"' ? undefined : '"';
+    out += quote === '"' && !inDoubleQuotes ? " " : c;
+  }
+  return quote === undefined ? out : text;
+}
 /** The wrappers that run their operand as the command (`command`, `builtin`, `exec`): what they wrap is classified instead. */
 const WRAPPER_COMMAND = /^(?:command|builtin|exec)$/;
 /**
- * Whether a raw shell word expands: a `$` or backtick outside single quotes (a backslash-escaped one is literal), or a cut
- * substitution. Inside single quotes both are literal.
+ * A `$` that starts an expansion: one before a name, digit, special parameter, `{`, `(`, `[`, or `'` (ANSI-C quoting, read as
+ * an expansion too). Any other `$` is a literal dollar, as in `"$%s"`.
+ */
+const dollarExpands = (raw: string, i: number): boolean => i + 1 < raw.length && /[A-Za-z_0-9{(\[@*#?$!'\-]/.test(raw[i + 1]);
+/**
+ * Whether a raw shell word expands: a `$` that starts an expansion or a backtick outside single quotes (a backslash-escaped
+ * one is literal), or a cut substitution anywhere. Inside single quotes only a cut substitution counts.
  */
 function expandsWord(raw: string): boolean {
   let quote: string | undefined;
@@ -2369,9 +2422,35 @@ function expandsWord(raw: string): boolean {
     }
     if (c === "'" && quote === undefined) quote = "'";
     else if (c === '"') quote = quote === '"' ? undefined : '"';
-    else if (c === "$" || c === "`") return true;
+    else if (c === "`" || (c === "$" && dollarExpands(raw, i))) return true;
   }
   return false;
+}
+/**
+ * The literal text a raw shell word starts with: its unquoted characters before the first expansion (all of them when there
+ * is none). A word that starts with an expansion starts with "".
+ */
+function literalStart(raw: string): string {
+  let out = "";
+  let quote: string | undefined;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quote === "'") {
+      if (c === CUT) break;
+      if (c === "'") quote = undefined;
+      else out += c;
+      continue;
+    }
+    if (c === CUT || c === "`" || (c === "$" && dollarExpands(raw, i))) break;
+    if (c === "\\") {
+      if (i + 1 < raw.length) out += raw[++i];
+      continue;
+    }
+    if (c === "'" && quote === undefined) quote = "'";
+    else if (c === '"') quote = quote === '"' ? undefined : '"';
+    else out += c;
+  }
+  return out;
 }
 
 /** The value of an unquoted `HARDHAT_NETWORK=v` word: empty is unnamed, a value the guard cannot read is UNREAD_NETWORK. */
@@ -2392,6 +2471,15 @@ function assignmentWrites(words: string[], plain: boolean): NetworkWrite[] {
 }
 
 /**
+ * `unset` names plain variables only: bare identifiers, after an optional `-v`. Such an unset writes the names it lists
+ * and no other variable, so `unset OTHER` leaves HARDHAT_NETWORK alone (`-n`, `-f`, subscripts and expansions are not plain).
+ */
+function plainUnset(args: string[]): boolean {
+  const names = args.filter((w, i) => !(i === 0 && w === "-v"));
+  return names.every((w) => /^[A-Za-z_]\w*$/.test(w));
+}
+
+/**
  * The HARDHAT_NETWORK writes of a plain statement: `NAME=v` words, `export NAME=v` and `unset HARDHAT_NETWORK`, each with
  * nothing in front of it but compound keywords. A plain write of another name changes nothing. A prefix assignment
  * (`NAME=v cmd`) is that command's alone and never persists. Every other writer is nonPlainWriter's.
@@ -2406,7 +2494,7 @@ function networkWrites(item: Normalized): NetworkWrite[] {
   if (prefixWords.length > 0 || rest.length !== words.length - at) return [];
   const [name = "", ...args] = rest;
   if (name === "export") return assignmentWrites(args, true);
-  if (name === "unset" && args.length === 1 && args[0] === "HARDHAT_NETWORK") return [{ value: undefined, plain: true }];
+  if (name === "unset" && plainUnset(args)) return args.includes("HARDHAT_NETWORK") ? [{ value: undefined, plain: true }] : [];
   return [];
 }
 
@@ -2422,20 +2510,33 @@ function unwrapCommand(cmd: string[]): string[] {
 
 /**
  * A writer token, over the raw words of a command after its wrappers: a dynamic command name; `printf` that may take `-v`
- * (printfWrites); a WRITER_COMMAND; or any option word holding an expansion. Readers (printenv, echo, printf with a static
- * leading format, test, ls, grep, cat) are not writer tokens, whatever they name or expand.
+ * (printfWrites); a WRITER_COMMAND, unless it is a for or select over another name. Readers (printenv, echo, printf with a
+ * static leading format, test, ls, grep, cat) are not writer tokens, whatever they name or expand.
  */
 function writerToken(raw: string[]): boolean {
   const [head = "", ...args] = raw;
   if (expandsWord(head)) return true;
   const name = unquote(head);
   if (name === "printf") return printfWrites(args);
-  return WRITER_COMMAND.test(name) || args.some((w) => unquote(w).startsWith("-") && expandsWord(w));
+  // a loop names one variable: it writes HARDHAT_NETWORK only when that name is HARDHAT_NETWORK (an alias would need a nameref, a writer on this line)
+  if (name === "for" || name === "select") return !(/^[A-Za-z_]\w*$/.test(args[0] ?? "") && args[0] !== "HARDHAT_NETWORK");
+  return WRITER_COMMAND.test(name);
+}
+
+/** The words of a shell word list without its redirections: each operator word, and the target word a bare operator takes. */
+function commandWords(raw: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const op = REDIRECT_WORD.exec(raw[i]);
+    if (op === null) out.push(raw[i]);
+    else if (op[0] === raw[i]) i++;
+  }
+  return out;
 }
 
 /** An item's prefix words, its command words (raw and unquoted), and the index of its first non-assignment word (-1: none). Only a bare `NAME=` word assigns in command position: a quoted or escaped word (`'HARDHAT_NETWORK=localhost'`, `\HARDHAT_NETWORK=v`) is a command name, so the assignment test runs on the raw word. (`export`/`unset` operands below are still read unquoted: quote removal happens before they assign.) */
 function itemWords(item: Normalized): { prefix: string[]; prefixRaw: string[]; raw: string[]; words: string[]; at: number } {
-  const raw = shellWords(item.text);
+  const raw = commandWords(shellWords(item.text));
   const words = raw.map(unquote);
   const prefixRaw = shellWords(item.prefix);
   return { prefix: prefixRaw.map(unquote), prefixRaw, raw, words, at: raw.findIndex((w) => !ASSIGNMENT_WORD.test(w)) };
@@ -2444,7 +2545,7 @@ function itemWords(item: Normalized): { prefix: string[]; prefixRaw: string[]; r
 /**
  * Whether an item runs a non-plain writer: an opaque command word, a prefix that runs code (`eval`, `coproc`), a writer
  * command, or an export or unset that is not in its plain form. The plain forms are a statement with nothing in front of it
- * but compound keywords (`then`, `do`, `!`): `export` with no flag and no dynamic word, and `unset HARDHAT_NETWORK`.
+ * but compound keywords (`then`, `do`, `!`): `export` with no flag (or `-p`) and no dynamic word, and `unset` of plain names.
  */
 function nonPlainWriter(item: Normalized): boolean {
   if (item.opaque) return true;
@@ -2461,9 +2562,10 @@ function nonPlainWriter(item: Normalized): boolean {
   if (prefixWords.length === 0 && rest.length === words.length - at) {
     const [head = "", ...args] = cmd;
     if (unquote(head) === "export") {
+      if (args.length === 1 && unquote(args[0]) === "-p") return false;
       return args.some((w) => unquote(w).startsWith("-") || (!ASSIGNMENT_WORD.test(unquote(w)) && expandsWord(w)));
     }
-    if (unquote(head) === "unset") return !(args.length === 1 && unquote(args[0]) === "HARDHAT_NETWORK");
+    if (unquote(head) === "unset") return !plainUnset(args.map((w) => unquote(w)));
   }
   return writerToken(cmd);
 }
@@ -2474,16 +2576,17 @@ function hasNonPlainWriter(items: Normalized[]): boolean {
 }
 
 /**
- * printf takes options only before its format word, so only leading words count: a word that expands may be `-v` (a writer
- * token), a word starting with `-v` names a variable, and the format or a `--` ends the options. A `-v` after the format is a
- * value.
+ * printf takes options only before its format word, so only leading words count. A leading word whose literal start is
+ * empty or dashed may expand to `-v` (a writer token). A word whose literal start is other text is the format, and so is
+ * a literal word that does not start with `-`. A literal `-v` names a variable; `--` or the format ends the options, and
+ * a `-v` after the format is a value.
  */
 function printfWrites(args: string[]): boolean {
   for (const w of args) {
-    if (expandsWord(w)) return true;
-    const value = unquote(w);
-    if (value === "--" || !value.startsWith("-")) return false;
-    if (value.startsWith("-v")) return true;
+    const lead = literalStart(w);
+    if (expandsWord(w)) return lead === "" || lead.startsWith("-");
+    if (lead === "--" || !lead.startsWith("-")) return false;
+    if (lead.startsWith("-v")) return true;
   }
   return false;
 }
@@ -2553,7 +2656,8 @@ function scanNetwork(
 function unnamedNetworkRuns(command: string, facts: GuardFacts): Set<string> {
   const items = normalizeSegments(command, 0, []);
   const out = new Set<string>();
-  const unknownWriter = ASSIGNING_EXPANSION.test(command) || hasNonPlainWriter(items);
+  const unknownWriter =
+    ASSIGNING_EXPANSION.test(activeText(command, true)) || ARITHMETIC_COMMAND.test(activeText(command, false)) || hasNonPlainWriter(items);
   scanNetwork(items, { possible: [facts.env.HARDHAT_NETWORK || undefined], unknownWriter }, out, false);
   return out;
 }
@@ -2565,7 +2669,7 @@ function unnamedNetworkRuns(command: string, facts: GuardFacts): Set<string> {
  * the value the line leaves HARDHAT_NETWORK at (unnamedNetworkRuns). A run with none of these is the in-process chain.
  * compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
  */
-function frameworkDeploy({ words, marked }: Segment, facts: GuardFacts, command: string): boolean {
+function frameworkDeploy({ words, marked, prefix }: Segment, facts: GuardFacts, command: string): boolean {
   return eachTool(words, /^(?:hardhat|truffle|brownie)$/, (at) => {
     const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
     const { positional, flags } = argsAfter(words, at, FRAMEWORK_VALUE_FLAG);
@@ -2573,8 +2677,8 @@ function frameworkDeploy({ words, marked }: Segment, facts: GuardFacts, command:
     const named = flags.filter((f) => f.flag === "--network");
     if (named.length > 0) return named.some((f) => f.value !== undefined && !LOCAL_CHAIN_NETWORK.test(f.value));
     if (tool !== "hardhat") return false;
-    const own = [...marked.matchAll(HARDHAT_ENV)][0]?.[1];
-    if (own !== undefined) return !LOCAL_CHAIN_NETWORK.test(unquote(own));
+    const own = prefixNetwork(prefix);
+    if (own !== undefined) return own !== "" && !LOCAL_CHAIN_NETWORK.test(own);
     return unnamedNetworkRuns(command, facts).has(marked);
   });
 }
