@@ -11,13 +11,12 @@ read, symlinks are never followed, binary files are skipped) and reports, per ma
 --target-version defaults to the newest removal in the table, so every API the table knows counts as removed.
 JSON is parsed natively. YAML needs PyYAML; without it YAML files are not read and the result carries
 `skipped:tool-missing`. Read-only: nothing is written. Optional binaries (kubectl, helm) are never required.
-Status is `fail` when any major or worse finding exists. `--dry-run` prints deterministic canned output and reads nothing.
+Status is `fail` when any major or worse finding exists, or when any in-scope input was not analysed (skipped, unreadable, too large, binary, unparsable, symlinked, past the file limit, or none analysed): a major `scan-incomplete` finding then lists the reasons. `--dry-run` prints deterministic canned output and reads nothing.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -25,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a21_tools  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_FILES = 2000
@@ -40,7 +40,6 @@ WORKLOAD_PODS = {  # kind -> path of the pod spec
     "Job": ("spec", "template", "spec"),
     "CronJob": ("spec", "jobTemplate", "spec", "template", "spec"),
 }
-_ALIAS = re.compile(r"(?:^|[\s\[,{:-])\*[A-Za-z0-9_.-]+")
 MAX_ALIASES = 20
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
 
@@ -53,66 +52,82 @@ def _load_yaml():
     return yaml
 
 
-def _candidates(base: Path, counters: dict) -> list[Path]:
-    """Manifest candidates in sorted order; symlinks are never followed or read."""
+def _relative(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def _skip(counters: dict, reasons: list[str], key: str, reason: str):
+    """Count one in-scope input that was not analysed and record why; reasons carry labels and paths, never parsed values."""
+    counters[key] += 1
+    reasons.append(reason)
+    return None
+
+
+def _candidates(base: Path, root: Path, counters: dict, reasons: list[str]) -> list[Path]:
+    """Manifest candidates in sorted order; symlinks are never followed or read, and each one is a skipped input."""
     if base.is_file():
         return [base]
     found: list[Path] = []
     for current, dirs, files in os.walk(base, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not (Path(current) / d).is_symlink())
+        kept = []
+        for d in sorted(dirs):
+            if d in SKIP_DIRS:
+                continue
+            if (Path(current) / d).is_symlink():
+                _skip(counters, reasons, "symlink", f"{_relative(Path(current) / d, root)}: symlink directory not followed")
+            else:
+                kept.append(d)
+        dirs[:] = kept
         for name in sorted(files):
             path = Path(current) / name
             if not name.lower().endswith(SUFFIXES):
                 continue
             if path.is_symlink():
-                counters["symlink"] += 1
+                _skip(counters, reasons, "symlink", f"{_relative(path, root)}: symlink not followed")
             elif len(found) >= MAX_FILES:
                 counters["truncated"] = True
+                reasons.append(f"file limit: stopped after {MAX_FILES} files; narrow --path to scan the rest")
                 return found
             else:
                 found.append(path)
     return found
 
 
-def _documents(path: Path, yaml_module, counters: dict, skipped: dict):
-    """Parsed documents of one file, or None when it was skipped or unreadable."""
+def _alias_count(text: str, yaml_module) -> int:
+    """Alias events of the YAML stream: a comment or plain scalar that merely contains '*name' is not an alias."""
+    return sum(isinstance(event, yaml_module.AliasEvent) for event in yaml_module.parse(text, Loader=yaml_module.SafeLoader))
+
+
+def _documents(path: Path, root: Path, yaml_module, counters: dict, reasons: list[str]):
+    """Parsed documents of one file, or None when it was not analysed (the reason is recorded)."""
+    label = _relative(path, root)
     if not path.is_file():  # a FIFO or device named like a manifest would block the read
-        counters["unreadable"] += 1
-        return None
+        return _skip(counters, reasons, "unreadable", f"{label}: not a readable regular file")
     try:
-        size = path.stat().st_size
-        if size > MAX_FILE_BYTES:
-            counters["too_large"] += 1
-            return None
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return _skip(counters, reasons, "too_large", f"{label}: larger than {MAX_FILE_BYTES} bytes")
         data = path.read_bytes()
     except OSError:
-        counters["unreadable"] += 1
-        return None
+        return _skip(counters, reasons, "unreadable", f"{label}: not a readable regular file")
     if b"\x00" in data[:8192]:
-        counters["binary"] += 1
-        return None
+        return _skip(counters, reasons, "binary", f"{label}: binary file")
     try:
-        text = data.decode("utf-8")
+        text = data.decode("utf-8-sig")  # a byte-order mark is encoding, not content
     except UnicodeDecodeError:
-        counters["binary"] += 1
-        return None
+        return _skip(counters, reasons, "binary", f"{label}: not UTF-8 text")
     if path.suffix.lower() == ".json":
         try:
             return [json.loads(text)]
         except (ValueError, RecursionError):
-            counters["unparsable"] += 1
-            return None
+            return _skip(counters, reasons, "unparsable", f"{label}: not valid JSON")
     if yaml_module is None:
-        skipped["yaml_files"] += 1
-        return None
-    if len(_ALIAS.findall(text)) > MAX_ALIASES:
-        counters["unparsable"] += 1
-        return None
+        return _skip(counters, reasons, "yaml_files", f"{label}: PyYAML is not installed, so YAML is not read (skipped:tool-missing)")
     try:
+        if _alias_count(text, yaml_module) > MAX_ALIASES:
+            return _skip(counters, reasons, "unparsable", f"{label}: more than {MAX_ALIASES} YAML aliases")
         return list(yaml_module.safe_load_all(text))
     except (yaml_module.YAMLError, ValueError, RecursionError):
-        counters["unparsable"] += 1
-        return None
+        return _skip(counters, reasons, "unparsable", f"{label}: not valid YAML")
 
 
 def _expand(document) -> list[dict]:
@@ -204,16 +219,17 @@ def run(args, ctx) -> dict:
     if probe["state"] != "SUCCESS":
         raise SwarmError(ErrorCode.E_INPUT, "--target-version is not a Kubernetes 1.x version")
     target_label = probe["target_version"]
-    counters = {"symlink": 0, "too_large": 0, "binary": 0, "unparsable": 0, "unreadable": 0, "parsed": 0, "truncated": False}
-    skipped_yaml = {"yaml_files": 0}
+    counters = {"symlink": 0, "too_large": 0, "binary": 0, "unparsable": 0, "unreadable": 0, "yaml_files": 0, "parsed": 0, "truncated": False}
+    reasons: list[str] = []
     yaml_module = _load_yaml()
     findings: list[dict] = []
-    files = _candidates(target, counters)
+    files = _candidates(target, ctx.root, counters, reasons)
     manifests = 0
     for path in files:
-        relative = path.relative_to(ctx.root).as_posix()
-        documents = _documents(path, yaml_module, counters, skipped_yaml)
-        counters["parsed"] += documents is not None
+        relative = _relative(path, ctx.root)
+        documents = _documents(path, ctx.root, yaml_module, counters, reasons)
+        if documents is not None:
+            counters["parsed"] += 1
         doc_list = documents or []
         for index, document in enumerate(doc_list):
             for obj in _expand(document):
@@ -222,15 +238,13 @@ def run(args, ctx) -> dict:
                 manifests += 1
                 findings.extend(_scan_object(obj, target_label, f"{relative}#{index}" if len(doc_list) > 1 else relative))
     skipped = []
-    if skipped_yaml["yaml_files"]:
-        skipped.append({"check": "yaml-manifests", "reason": "skipped:tool-missing", "tool": "PyYAML", "files": skipped_yaml["yaml_files"]})
-    if counters["truncated"]:
-        findings.append({"id": "scan/file-limit", "rule": "scan-bound", "severity": "info", "location": target.relative_to(ctx.root).as_posix() or ".",
-                         "summary": f"stopped after {MAX_FILES} files; narrow --path to scan the rest"})
+    if counters["yaml_files"]:
+        skipped.append({"check": "yaml-manifests", "reason": "skipped:tool-missing", "tool": "PyYAML", "files": counters["yaml_files"]})
+    location = target.relative_to(ctx.root).as_posix() or "."
+    findings.extend({**finding, "location": location} for finding in incomplete_findings(reasons, counters["parsed"]))
     findings.sort(key=lambda f: (-SEVERITY_RANK[f["severity"]], f["location"], f["id"]))
-    policy_fail = any(SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"] for f in findings)
     return {
-        "status": "fail" if policy_fail else "ok",
+        "status": scan_status(findings),
         "target_version": target_label,
         "files_scanned": counters["parsed"],
         "manifests_scanned": manifests,

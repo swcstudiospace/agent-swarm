@@ -818,7 +818,7 @@ def test_quota_pods_limits_memory_and_exhausted_quota():
     memory = ok("k8s_quota_fit", {"replicas": 2, "containers": [ctr()], "quota_hard": {"limits_memory_mib": 1000}})
     assert finds(memory) == [("quota/limits.memory/exceeded", "major")] and memory["max_replicas_fit"] == 1
     spent = ok("k8s_quota_fit", {"replicas": 1, "containers": [ctr()], "quota_hard": {"requests_cpu_m": 500}, "quota_used": {"requests_cpu_m": 800}})
-    assert spent["max_replicas_fit"] == 0 and spent["verdict"] == "over_quota" and "only 0 of" in spent["findings"][0]["summary"]
+    assert spent["max_replicas_fit"] == 0 and spent["verdict"] == "over_quota" and "but 800 is already used against the quota's 500, over by 300" in spent["findings"][0]["summary"]
     assert ok("k8s_quota_fit", {"replicas": 9, "containers": [ctr()]})["max_replicas_fit"] == -1
 
 
@@ -1259,9 +1259,10 @@ def test_oracle_node_pool_capacity_matches_exact_rational_arithmetic():
         row = _handlers()._nodepool_capacity({"pools": [pool_doc], "workloads": loads, "tolerated_node_failures": fail, "max_utilization_pct": pct})["pools"][0]
         rc, rm = (sum(w["replicas"] * w[k] for w in loads) for k in ("cpu_request_m", "memory_request_mib"))
         uc, um, survivors = cpu - ds_c, mem - ds_m, max(0, nodes - fail)
+        unschedulable = any(w["replicas"] > 0 and (w["cpu_request_m"] > uc or w["memory_request_mib"] > um) for w in loads)
         if rc == rm == 0:
             status = "ok"
-        elif survivors == 0 or rc > survivors * uc or rm > survivors * um:
+        elif unschedulable or survivors == 0 or rc > survivors * uc or rm > survivors * um:
             status = "at_risk"
         elif Fraction(rc, survivors * uc) > Fraction(pct, 100) or Fraction(rm, survivors * um) > Fraction(pct, 100):
             status = "tight"
@@ -1449,3 +1450,39 @@ def test_review_an_unknown_fleet_environment_is_invalid_input_naming_clusters():
 def test_review_a_zero_etcd_quota_is_invalid_input_not_a_division_error():
     result = _handlers().etcd_health({"db_size_bytes": 1, "quota_bytes": 0, "leader_changes_15m": 0, "wal_fsync_p99_ms": 1, "members": members(True)})
     assert (result["state"], result["field"]) == ("INVALID_INPUT", "quota_bytes")
+
+
+
+def test_review_a_live_addon_failure_with_no_shared_minor_is_blocked_not_upgraded():
+    # installed 1.25-1.27 already fails at the running 1.28 and the candidate 1.28-1.30 shares no minor with it: no swap is supported
+    result = ok("k8s_addon_compatibility", {"current_version": "1.28", "target_version": "1.29", "addons": [addon(lo="1.25", hi="1.27", cand=("1.28", "1.30"))]})
+    assert result["addons"][0] == {"name": "calico", "kind": "cni", "status": "blocked", "upgrade_at": "", "first_incompatible": "1.28"}
+    assert finds(result) == [("addon/calico/blocked", "blocker")] and "migrate the add-on separately" in result["findings"][0]["summary"]
+    assert (result["upgrade_required_count"], result["verdict"]) == (0, "blocked")
+
+
+def test_review_a_live_addon_failure_with_a_shared_minor_is_a_major_finding_for_an_immediate_swap():
+    # installed 1.30-1.32 already fails at the running 1.29; the candidate 1.28-1.31 supports 1.30 and 1.31 on the path
+    result = ok("k8s_addon_compatibility", {"current_version": "1.29", "target_version": "1.31", "addons": [addon(lo="1.30", hi="1.32", cand=("1.28", "1.31"))]})
+    assert result["addons"][0]["status"] == "upgrade_required" and result["addons"][0]["upgrade_at"] == "1.29"
+    assert finds(result) == [("addon/calico/upgrade", "major")] and "already runs at 1.29" in result["findings"][0]["summary"]
+
+
+def test_review_an_unsatisfiable_budget_makes_the_drain_verdict_blocked_even_with_no_pods_on_the_node():
+    result = ok("k8s_drain_feasibility", {"pdbs": [pdb(expected=2, healthy=2, pods=0, min_available=3)]})
+    assert result["results"][0]["status"] == "unaffected"
+    assert finds(result) == [("pdb/shop/web/unsatisfiable", "major")] and (result["blocked_count"], result["verdict"]) == (0, "blocked")
+
+
+def test_review_a_pod_that_fits_no_node_puts_its_pool_at_risk_so_the_row_agrees_with_the_verdict():
+    pools = [{"name": "p", "nodes": 2, "allocatable_cpu_m": 4000, "allocatable_memory_mib": 8192, "max_nodes": 2}]
+    result = ok("k8s_nodepool_capacity", {"pools": pools, "workloads": [wl(1, 7000, 1024, name="w", pool_name="p")], "tolerated_node_failures": 0})
+    assert result["pools"][0]["status"] == "at_risk" and (result["pools_at_risk"], result["verdict"]) == (1, "at_risk")
+    assert finds(result) == [("workload/w/exceeds-node", "blocker"), ("pool/p/max-nodes", "major"), ("pool/p/tight", "minor")]
+
+
+def test_review_a_certificate_that_expired_less_than_a_day_ago_is_not_reported_as_zero_days():
+    result = ok("k8s_cert_expiry", {"now": NOW, "certs": [cert("leaf", "2026-10-19T23:59:59Z")]})
+    assert result["certs"][0]["bucket"] == "expired" and result["findings"][0]["summary"] == "certificate leaf expired less than a day ago"
+    whole = ok("k8s_cert_expiry", {"now": NOW, "certs": [cert("leaf", "2026-10-18T00:00:00Z")]})
+    assert whole["findings"][0]["summary"] == "certificate leaf expired 2.0 day(s) ago"

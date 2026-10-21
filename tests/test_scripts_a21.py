@@ -190,7 +190,8 @@ def test_unparsable_yaml_and_alias_bombs_are_counted_not_fatal(tmp_path):
     put(tmp_path, "bomb.yaml", "a: &a [x]\n" + "".join(f"k{i}: *a\n" for i in range(30)))
     put(tmp_path, "broken.json", "{not json")
     code, result = scan(tmp_path)
-    assert code == 0 and result["files_skipped"]["unparsable"] == 3 and result["files_scanned"] == 0 and result["findings"] == []
+    assert code == 1 and result["status"] == "fail" and result["files_skipped"]["unparsable"] == 3 and result["files_scanned"] == 0
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"]
 
 
 def test_an_unparsable_file_does_not_mask_a_blocking_manifest(tmp_path):
@@ -203,7 +204,7 @@ def test_an_unparsable_file_does_not_mask_a_blocking_manifest(tmp_path):
     assert "Traceback" not in proc.stderr and result["status"] == "fail"
     assert proc.returncode == 1
     assert result["files_skipped"]["unparsable"] == 1 and (result["files_scanned"], result["manifests_scanned"]) == (1, 1)
-    assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "ing.json")]
+    assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "ing.json"), ("scan/incomplete", "major", ".")]
 
 
 def test_without_pyyaml_yaml_files_are_reported_as_skipped_tool_missing_and_json_still_works(tmp_path, monkeypatch, capsys):
@@ -213,7 +214,8 @@ def test_without_pyyaml_yaml_files_are_reported_as_skipped_tool_missing_and_json
     monkeypatch.setitem(sys.modules, "yaml", None)
     code, result = run_in_process(load_module(), tmp_path, capsys, "--target-version", "1.22")
     assert code == 1 and result["skipped"] == [{"check": "yaml-manifests", "reason": "skipped:tool-missing", "tool": "PyYAML", "files": 2}]
-    assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "ing.json")]
+    assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "ing.json"), ("scan/incomplete", "major", ".")]
+    assert "one.yaml" in result["findings"][1]["summary"] and "two.yml" in result["findings"][1]["summary"]
     assert (result["files_scanned"], result["manifests_scanned"]) == (1, 1)
 
 
@@ -227,8 +229,9 @@ def test_large_binary_and_vcs_files_are_skipped(tmp_path):
     put(tmp_path, "node_modules/pkg/x.json", deployment("node"))
     put(tmp_path, "ok/exact.json", json.dumps(deployment("fits", FULL_RESOURCES)) + " " * 100)
     code, result = scan(tmp_path, "--target-version", "1.30")
-    assert code == 0 and result["findings"] == [] and result["files_scanned"] == 1
+    assert code == 1 and result["status"] == "fail" and [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["files_scanned"] == 1
     assert result["files_skipped"] == {"symlink": 0, "too_large": 1, "binary": 1, "unparsable": 0, "unreadable": 0}
+    assert "big.json" in result["findings"][0]["summary"] and "bin.json" in result["findings"][0]["summary"]
 
 
 def test_symlinks_are_never_followed_out_of_the_root(tmp_path):
@@ -239,7 +242,9 @@ def test_symlinks_are_never_followed_out_of_the_root(tmp_path):
     os.symlink(outside / "secret.json", root / "link.json")
     os.symlink(outside, root / "linked-dir")
     code, result = scan(root, "--target-version", "1.30")
-    assert code == 0 and result["findings"] == [] and result["files_scanned"] == 1 and result["files_skipped"]["symlink"] == 1
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 1
+    assert result["files_skipped"]["symlink"] == 2  # the file symlink and the symlinked directory are both unanalysed inputs
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"]
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
@@ -248,9 +253,10 @@ def test_a_named_pipe_named_like_a_manifest_is_not_opened_and_the_scan_completes
     os.mkfifo(tmp_path / "pipe.json")
     proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--json", "--target-version", "1.30"],
                           capture_output=True, text=True, env=_scrubbed_base_env(), cwd=ROOT, timeout=60)
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 1, proc.stderr
     result = json.loads(proc.stdout)
-    assert result["status"] == "ok" and result["files_scanned"] == 1 and result["files_skipped"]["unreadable"] == 1
+    assert result["status"] == "fail" and result["files_scanned"] == 1 and result["files_skipped"]["unreadable"] == 1
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"]
 
 
 def test_scan_stops_at_the_file_limit_and_says_so(tmp_path, capsys):
@@ -259,8 +265,8 @@ def test_scan_stops_at_the_file_limit_and_says_so(tmp_path, capsys):
     module = load_module()
     module.MAX_FILES = 3
     code, result = run_in_process(module, tmp_path, capsys, "--target-version", "1.30")
-    assert code == 0 and result["truncated"] is True and result["files_scanned"] == 3
-    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/file-limit", "info")]
+    assert code == 1 and result["status"] == "fail" and result["truncated"] is True and result["files_scanned"] == 3
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")] and "file limit" in result["findings"][0]["summary"]
 
 
 def test_the_real_file_limit_is_2000():
@@ -292,8 +298,8 @@ def test_pathologically_nested_files_are_counted_unparsable_and_do_not_abort_the
     put(tmp_path, "deep.yaml", "[" * 100_000 + "]" * 100_000)
     put(tmp_path, "good.json", deployment("ok", FULL_RESOURCES))
     code, result = scan(tmp_path, "--target-version", "1.30")
-    assert code == 0 and result["status"] == "ok" and result["files_scanned"] == 1
-    assert result["files_skipped"]["unparsable"] == 2 and result["findings"] == []
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 1
+    assert result["files_skipped"]["unparsable"] == 2 and [f["rule"] for f in result["findings"]] == ["scan-incomplete"]
 
 
 CANARIES = ("ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "AKIAIOSFODNN7EXAMPLE", "https://user:s3cr3t@host.example/x",
@@ -320,3 +326,35 @@ def test_input_errors_do_not_echo_the_rejected_option_values(tmp_path):
         for args in (("--target-version", canary), ("--path", canary)):
             code, result = scan(tmp_path, *args)
             assert code == 2 and result["error"]["code"] == "E-INPUT" and canary not in json.dumps(result)
+
+
+def test_a_yaml_only_tree_without_pyyaml_is_incomplete_not_ok(tmp_path, monkeypatch, capsys):
+    put(tmp_path, "only.yaml", "apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: site\n")
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    code, result = run_in_process(load_module(), tmp_path, capsys, "--target-version", "1.22")
+    assert code == 1 and result["status"] == "fail" and result["files_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "only.yaml" in result["findings"][0]["summary"] and "PyYAML" in result["findings"][0]["summary"]
+
+
+def test_an_empty_scope_is_incomplete_because_nothing_was_analysed(tmp_path):
+    (tmp_path / "notes.txt").write_text("nothing to scan\n", encoding="utf-8")
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and result["manifests_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("scan/incomplete", "major")]
+    assert "no in-scope input was analysed" in result["findings"][0]["summary"]
+
+
+def test_a_byte_order_mark_does_not_hide_a_json_manifest(tmp_path):
+    (tmp_path / "bom.json").write_text("\ufeff" + json.dumps({"apiVersion": "extensions/v1beta1", "kind": "Ingress", "metadata": {"name": "site"}}), encoding="utf-8")
+    code, result = scan(tmp_path, "--target-version", "1.22")
+    assert code == 1 and result["files_skipped"]["unparsable"] == 0 and result["files_scanned"] == 1
+    assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "bom.json")]
+
+
+def test_comments_that_contain_asterisk_names_are_not_yaml_aliases(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "commented.yaml", "".join(f"# note *item{index}\n" for index in range(21)) + "apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: site\n")
+    code, result = scan(tmp_path, "--target-version", "1.22")
+    assert code == 1 and result["files_skipped"]["unparsable"] == 0 and result["files_scanned"] == 1
+    assert rules(result) == [("removed-api/extensions/v1beta1/Ingress/site", "blocker", "commented.yaml")]

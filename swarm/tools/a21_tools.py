@@ -372,6 +372,7 @@ def _nodepool_capacity(payload: dict) -> dict:
     by_name = {pool["name"]: pool for pool in pools}
     requested = {name: [0, 0] for name in by_name}
     findings: list[dict] = []
+    unschedulable: set[str] = set()
     for workload in payload["workloads"]:
         pool = by_name.get(workload["pool"])
         if pool is None:
@@ -381,6 +382,7 @@ def _nodepool_capacity(payload: dict) -> dict:
         usable_cpu = pool["allocatable_cpu_m"] - pool.get("daemonset_cpu_m", 0)
         usable_mem = pool["allocatable_memory_mib"] - pool.get("daemonset_memory_mib", 0)
         if workload["replicas"] > 0 and (workload["cpu_request_m"] > usable_cpu or workload["memory_request_mib"] > usable_mem):
+            unschedulable.add(pool["name"])
             findings.append(_finding(
                 f"workload/{workload['name']}/exceeds-node", "blocker",
                 f"a pod of {workload['name']} requests more than one {pool['name']} node can offer after daemonsets; it can never be scheduled"))
@@ -396,18 +398,21 @@ def _nodepool_capacity(payload: dict) -> dict:
         nodes = pool["nodes"]
         survivors = max(0, nodes - failures)
         if req_cpu == 0 and req_mem == 0:
-            status = "ok"
+            capacity = "ok"
         elif survivors == 0 or req_cpu > survivors * usable_cpu or req_mem > survivors * usable_mem:
-            status = "at_risk"
+            capacity = "at_risk"
         elif req_cpu * 100 > max_pct * survivors * usable_cpu or req_mem * 100 > max_pct * survivors * usable_mem:
-            status = "tight"
+            capacity = "tight"
         else:
-            status = "ok"
+            capacity = "ok"
 
         no_survivor = survivors == 0 and (req_cpu > 0 or req_mem > 0)
         after = -1.0 if no_survivor else max(_utilization(req_cpu, usable_cpu, survivors), _utilization(req_mem, usable_mem, survivors))
         needed = max(_ceil_div(req_cpu * 100, max_pct * usable_cpu), _ceil_div(req_mem * 100, max_pct * usable_mem))
         recommended = needed + failures if needed > 0 else 0
+        over_max = "max_nodes" in pool and recommended > pool["max_nodes"]
+        # A pod that can never be scheduled, or an autoscaler ceiling below the recommended size, puts the pool at risk whatever its arithmetic says.
+        status = "at_risk" if capacity == "at_risk" or pool["name"] in unschedulable or over_max else capacity
         rows.append({
             "name": pool["name"],
             "nodes": nodes,
@@ -419,15 +424,15 @@ def _nodepool_capacity(payload: dict) -> dict:
             "status": status,
             "recommended_nodes": recommended,
         })
-        if status == "at_risk":
+        if capacity == "at_risk":
             findings.append(_finding(
                 f"pool/{pool['name']}/n-plus-{failures}", "major",
                 f"pool {pool['name']} cannot hold its requests after losing {failures} node(s); needs {recommended} nodes at {max_pct}% target utilization"))
-        elif status == "tight":
+        elif capacity == "tight":
             findings.append(_finding(
                 f"pool/{pool['name']}/tight", "minor",
                 f"pool {pool['name']} stays below 100% after losing {failures} node(s) but above the {max_pct}% target; recommended {recommended} nodes"))
-        if "max_nodes" in pool and recommended > pool["max_nodes"]:
+        if over_max:
             findings.append(_finding(
                 f"pool/{pool['name']}/max-nodes", "major",
                 f"pool {pool['name']} max_nodes {pool['max_nodes']} is below the recommended {recommended}"))
@@ -443,7 +448,7 @@ def _nodepool_capacity(payload: dict) -> dict:
 
 
 def nodepool_capacity(payload: dict) -> dict:
-    """Per node pool: requests must fit on (nodes - tolerated failures) nodes; above max_utilization_pct (house default 85) after the loss the pool is tight, above 100% it is at risk. Aggregate requests only: no bin-packing or fragmentation model."""
+    """Per node pool: requests must fit on (nodes - tolerated failures) nodes; above max_utilization_pct (house default 85) after the loss the pool is tight, above 100% it is at risk. A pod that fits no node or a recommended size above max_nodes also puts the pool at risk. Aggregate requests only: no bin-packing or fragmentation model."""
 
     def work() -> dict:
         try:
@@ -599,14 +604,14 @@ def _drain_feasibility(payload: dict) -> dict:
         "blocked_count": blocked,
         "throttled_count": throttled,
         "max_waves": max([r["waves"] for r in rows] + [0]),
-        "verdict": "blocked" if blocked else "throttled" if throttled else "feasible",
+        "verdict": "blocked" if blocked or _worst(findings) >= SEVERITY_RANK["major"] else "throttled" if throttled else "feasible",
         "results": rows,
         "findings": _ordered(findings),
     }
 
 
 def drain_feasibility(payload: dict) -> dict:
-    """disruptionsAllowed = max(0, currentHealthy - desiredHealthy) with percentages rounded up; 0 allowed with pods on the drained nodes blocks the drain."""
+    """disruptionsAllowed = max(0, currentHealthy - desiredHealthy) with percentages rounded up; 0 allowed with pods on the drained nodes blocks the drain; a minAvailable above the expected pods is a major finding and makes the verdict blocked."""
 
     def work() -> dict:
         try:
@@ -821,7 +826,8 @@ def _cert_expiry(payload: dict) -> dict:
         kind = "CA certificate" if is_ca else "certificate"
         days = _days(remaining)
         if bucket == "expired":
-            findings.append(_finding(f"cert/{cert['name']}/expired", "blocker", f"{kind} {cert['name']} expired {abs(days)} day(s) ago"))
+            ago = "less than a day ago" if remaining > -timedelta(days=1) else f"{abs(days)} day(s) ago"
+            findings.append(_finding(f"cert/{cert['name']}/expired", "blocker", f"{kind} {cert['name']} expired {ago}"))
         elif bucket == "critical":
             findings.append(_finding(f"cert/{cert['name']}/critical", "major", f"{kind} {cert['name']} expires in {days} day(s)"))
         elif bucket == "warning":
@@ -919,7 +925,10 @@ def _quota_fit(payload: dict) -> dict:
             max_fit.append(max(0, free // each))
         if replicas * each > free:
             exceeded = True
-            findings.append(_finding(f"quota/{label}/exceeded", "major", f"{replicas} replica(s) need {replicas * each} of {label} but only {max(0, free)} of the quota's {hard[key]} remain"))
+            if free >= 0:
+                findings.append(_finding(f"quota/{label}/exceeded", "major", f"{replicas} replica(s) need {replicas * each} of {label} but only {free} of the quota's {hard[key]} remain"))
+            else:
+                findings.append(_finding(f"quota/{label}/exceeded", "major", f"{replicas} replica(s) need {replicas * each} of {label}, but {used.get(key, 0)} is already used against the quota's {hard[key]}, over by {-free}"))
     return {
         "state": "SUCCESS",
         "verdict": "rejected" if rejected else "over_quota" if exceeded else "fits",
@@ -972,18 +981,22 @@ def _addon_compatibility(payload: dict) -> dict:
             if cand[0] > cand[1]:
                 raise _Bad("addons", f"add-on {name!r}: candidate_min_k8s is above candidate_max_k8s")
         broken = [m for m in path if not lo <= m <= hi]
+        live = not lo <= cur <= hi  # the installed add-on already fails at the running control-plane minor
         status, upgrade_at, needs_migration = "compatible", "", False
         if broken:
             status = "blocked"
             if cand is not None:
+                shared_on_path = any(lo <= m <= hi and cand[0] <= m <= cand[1] for m in path)
                 for switch in path:
                     installed_ok = all(lo <= m <= hi for m in path if m < switch)
                     candidate_ok = all(cand[0] <= m <= cand[1] for m in path if m >= switch)
                     if installed_ok and candidate_ok:
-                        if lo <= cur <= hi and not (lo <= switch <= hi and cand[0] <= switch <= cand[1]):
-                            # The split covers both sides but no control-plane minor supports both
-                            # versions, so the swap cannot run while either is installed: the
-                            # add-on needs an out-of-band migration, not an in-place upgrade.
+                        # A live incompatibility can only be swapped at the current minor; that is allowed only when some
+                        # minor on the path supports both versions. Otherwise the swap needs an out-of-band migration.
+                        swap_ok = shared_on_path if live else lo <= switch <= hi and cand[0] <= switch <= cand[1]
+                        if not swap_ok:
+                            # The split covers both sides but no control-plane minor supports both versions, so the swap
+                            # cannot run while either is installed: the add-on needs an out-of-band migration, not an in-place upgrade.
                             needs_migration = True
                             break
                         status, upgrade_at = "upgrade_required", _label(switch)
@@ -999,7 +1012,9 @@ def _addon_compatibility(payload: dict) -> dict:
             findings.append(_finding(f"addon/{name}/blocked", "blocker", f"{addon['kind']} add-on {name} {addon['version']} supports {_label(lo)}..{_label(hi)} and fails at {first_break}; {reason}"))
         elif status == "upgrade_required":
             when = "before the control-plane upgrade starts" if upgrade_at == _label(cur) else f"while the control plane is at {upgrade_at}"
-            findings.append(_finding(f"addon/{name}/upgrade", "minor", f"upgrade {addon['kind']} add-on {name} to {addon['candidate_version']} {when}; {addon['version']} fails at {first_break}"))
+            if live:
+                when = f"now, while the control plane already runs at {upgrade_at}"
+            findings.append(_finding(f"addon/{name}/upgrade", "major" if live else "minor", f"upgrade {addon['kind']} add-on {name} to {addon['candidate_version']} {when}; {addon['version']} fails at {first_break}"))
         rows.append({"name": name, "kind": addon["kind"], "status": status, "upgrade_at": upgrade_at, "first_incompatible": first_break})
     counts = {s: sum(1 for r in rows if r["status"] == s) for s in ("compatible", "upgrade_required", "blocked")}
     return {
