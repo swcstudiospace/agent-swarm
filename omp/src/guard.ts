@@ -2179,8 +2179,8 @@ const ARGOCD_TARGET_FLAG = /^(?:--server|--argocd-context|--kube-context|--dest-
 const ARGOCD_GROUP = /^(?:app|appset|cluster|repo|repocreds|proj|account|cert|gpg|context|login|logout|relogin|admin|version|notifications|completion|configure|help)$/;
 const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
   app: {
-    change: /^(?:sync|rollback|delete|set|patch|terminate-op|delete-resource)$/,
-    other: /^(?:get|list|ls|diff|history|logs|wait|manifests|resources|actions|create|unset|edit)$/,
+    change: /^(?:sync|create|rollback|delete|set|patch|terminate-op|delete-resource)$/,
+    other: /^(?:get|list|ls|diff|history|logs|wait|manifests|resources|actions|unset|edit)$/,
   },
   appset: { change: /^(?:create|delete)$/, other: /^(?:get|list|generate)$/ },
   cluster: { change: /^(?:add|rm|create|delete|set|rotate-auth)$/, other: /^(?:get|list|role|windows|edit)$/ },
@@ -2189,7 +2189,7 @@ const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
 };
 
 /**
- * `argocd app sync|rollback|delete|set|patch|terminate-op|delete-resource`, `argocd appset create|delete` and `argocd
+ * `argocd app sync|create|rollback|delete|set|patch|terminate-op|delete-resource`, `argocd appset create|delete` and `argocd
  * cluster|repo|proj add|rm|create|delete` (also `cluster set|rotate-auth`, `proj set|add-*|remove-*`) that land in prod
  * (a D-04 marker in an operand or in the value of a destination or selector flag: `--server`, `--dest-namespace`,
  * `--project`, `-l` …) or that prune, force or replace (`--prune`, `--force`, `--replace`, unless `=false`). The verb is

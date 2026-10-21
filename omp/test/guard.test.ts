@@ -927,6 +927,11 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     ["argocd app delete-resource prod-api --kind Pod --name p", A22, "argocd-change"],
     ["argocd appset delete prod-set", A22, "argocd-change"],
     ["argocd appset create prod-set.yaml", A22, "argocd-change"],
+    // creating an app is a write: a production destination, name or server, or a prune, blocks as the sync of the same app does
+    ["argocd app create prod-api --repo https://git.example.com/r --path p --dest-server https://k.example.com --dest-namespace production --sync-policy automated", A22, "argocd-change"],
+    ["argocd app create api --dest-namespace production --sync-policy automated", A22, "argocd-change"],
+    ["argocd app create api --dest-server https://argocd.prod.example.com", A22, "argocd-change"],
+    ["argocd app create api --dest-namespace staging --prune", A22, "argocd-change"],
     ["argocd proj add-destination prod https://k.example.com ns", A22, "argocd-change"],
     ["argocd proj remove-source production https://git.example.com/r", A22, "argocd-change"],
     ["argocd cluster set prod-ctx --namespace x", A21, "argocd-change"],
@@ -988,6 +993,7 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
       "eksctl create cluster --help", "eksctl delete cluster -h", "gcloud container clusters create --help", "az aks create --help", "az aks upgrade -h", "echo eksctl create cluster",
       "kubeadm init --help", "kubeadm reset -h", "kubeadm upgrade apply --help", "echo kubeadm reset",
       "argocd appset list", "argocd appset get prod-set", "argocd proj role create prod r", "argocd cluster get prod-ctx",
+      "argocd app create api --dest-namespace staging --sync-policy automated", "argocd app create api --dest-namespace staging --dry-run", "argocd app create --help",
     ].map((c): [string, string] => [c, A21]),
   ])("cluster read-only or exempt form: %s passes for %s", (command, agent) => {
     expect(guardToolCall(bash(command), insideAs(agent))).toBeUndefined();
