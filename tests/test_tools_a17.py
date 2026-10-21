@@ -560,6 +560,24 @@ def test_claim_number_exponent_beyond_the_decimal_range_is_invalid_input():
         assert result["message"].endswith("value is outside the supported magnitude")
 
 
+@pytest.mark.parametrize("value", ["0E-1000", "-0E-1000", "0E1000", "0E99999999999999999999", "0.0", "0"])
+def test_zero_is_in_range_at_any_exponent(value):
+    result = validate([fld("n", "number", minimum=0, maximum=1)], [cl("n", "number", value)])
+    assert result["valid"] is True and result["findings"] == []
+
+
+def test_non_zero_value_with_a_tiny_exponent_is_still_out_of_magnitude():
+    invalid("plat_claim_validate", {"schema": [fld("n", "number")], "claim": [cl("n", "number", "1E-1000")]}, "claim")
+
+
+def test_integer_text_of_any_width_is_compared_with_the_maximum():
+    schema = [fld("n", "integer", maximum=1000000000000000)]
+    result = validate(schema, [cl("n", "integer", "1" + "0" * 40)])
+    assert result["valid"] is False and result["violation_count"] == 1 and rules(result) == [("above-maximum", "blocker")]
+    assert validate(schema, [cl("n", "integer", "9" * 500)])["findings"][0]["id"] == "above-maximum@n"
+    assert validate([fld("n", "integer", maximum=10**15)], [cl("n", "integer", "1" + "0" * 14)])["valid"] is True
+
+
 @pytest.mark.parametrize("value, rule", [("1", None), ("0", "below-minimum"), ("5", None), ("6", "above-maximum")])
 def test_claim_integer_bounds_are_inclusive(value, rule):
     result = validate(SCHEMA, [cl("parameters.size", "string", "small"), cl("parameters.replicas", "integer", value)])
@@ -1376,6 +1394,23 @@ def test_diff_required_child_of_a_new_optional_parent_is_not_breaking():
     assert has(required_parent, "field-added-required", "major", "backup") and has(required_parent, "field-added-required", "major", "backup.schedule")
     deep = diff([fld("name")], [fld("name"), fld("a", "object"), fld("a.b", "object", True), fld("a.b.c", required=True)])
     assert deep["breaking_count"] == 0 and has(deep, "field-added-under-optional-parent", "info", "a.b") and has(deep, "field-added-under-optional-parent", "info", "a.b.c")
+
+
+def test_required_child_under_a_path_an_existing_claim_can_set_is_breaking():
+    # reporter's shape: old lists a.b as an optional string; new adds a required a.b.c under an optional object a. An old claim that
+    # sets a.b makes a and a.b present, so a.b.c binds and the old claim fails the new schema: breaking, not additive
+    old = [fld("name"), fld("a.b", "string")]
+    new = [fld("name"), fld("a", "object"), fld("a.b", "string"), fld("a.b.c", required=True)]
+    assert [f["id"] for f in validate(new, [cl("name", "string", "x"), cl("a.b", "string", "v")])["findings"]] == ["required-missing@a.b.c"]
+    result = diff(old, new)
+    assert has(result, "field-added-required", "major", "a.b.c") and lacks(result, "field-added-under-optional-parent")
+    assert (result["breaking_count"], result["requires_new_version"], result["verdict"]) == (1, True, "breaking-new-version")
+    # the same break when the old claim reaches a.b through a deeper listed path
+    deeper = diff([fld("name"), fld("a.b.x")], [fld("name"), fld("a.b.x"), fld("a", "object"), fld("a.b", "object"), fld("a.b.c", required=True)])
+    assert has(deeper, "field-added-required", "major", "a.b.c") and deeper["breaking_count"] == 1
+    # controls: a required child whose ancestors no existing claim can set stays additive; a top-level required field stays breaking
+    assert diff([fld("name")], [fld("name"), fld("x", "object"), fld("x.y", required=True)])["breaking_count"] == 0
+    assert has(diff([fld("name")], [fld("name"), fld("top", required=True)]), "field-added-required", "major", "top")
 
 
 def test_rounding_is_half_up_on_the_exact_value_not_to_even():

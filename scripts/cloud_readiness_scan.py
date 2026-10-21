@@ -9,9 +9,11 @@ Terraform and CloudFormation declarations (multi-AZ, backups, encryption, tags, 
 `cloud_wellarch_scorecard` logic the A16 tool uses (swarm/tools/a16_tools.py), so the scan and the tool never disagree.
 
 The scan is a heuristic over text: it can miss signals set through modules, Helm values or generated code, and it reads
-IaC with regular expressions, not an HCL parser. Read-only and bounded: files over 1 MiB, binaries and symlinks are
-skipped, and the walk stops after 2000 files. Kubernetes manifests are parsed structurally when PyYAML imports (JSON
-manifests are always parsed natively); without PyYAML those checks are reported as `skipped:tool-missing`. No external
+IaC with regular expressions, not an HCL parser. Read-only and bounded: files over 1 MiB, binaries, unreadable entries, symlinks and
+symlinked directories are not analysed, and the walk stops after 2000 files. Each such in-scope input, and each Kubernetes manifest
+that is not parsed (PyYAML missing, not valid YAML/JSON, or a malformed workload), is a reason in one major `scan-incomplete` finding,
+so `status` is `fail` until every in-scope input is analysed (swarm/scan_status.py). Kubernetes manifests are parsed structurally when
+PyYAML imports (JSON manifests are always parsed natively). No external
 binary (kubectl, helm, terraform, ...) is looked up or required. Findings carry severities info|minor|major|blocker and
 `status` is `fail` when any major or worse finding exists. The scan reads the working tree, not git: run it on a clean checkout, where a
 `.env` file can only be there because it is tracked. Strings from the scanned files (values, secrets) are never copied into the output;
@@ -29,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.tools import a16_tools  # noqa: E402
 
 try:  # optional: structural Kubernetes parsing
@@ -80,6 +83,7 @@ HELM_SPREAD = re.compile(r"topologySpreadConstraints:|podAntiAffinity:")
 HELM_GRACE = re.compile(r"terminationGracePeriodSeconds:|preStop:")
 HELM_KIND = re.compile(r"^kind:\s*(Deployment|StatefulSet|DaemonSet)\s*$", re.M)
 HELM_REPLICAS = re.compile(r"^\s*replicas:\s*(\d+)\s*$", re.M)
+HELM_DOCUMENT = re.compile(r"^---\s*$", re.M)
 REQUIRED_TAGS = {
     "owner": ("owner", "team", "service-owner", "service_owner"),
     "environment": ("environment", "env", "stage"),
@@ -109,16 +113,30 @@ def _finding(rule: str, fid: str, severity: str, summary: str, location: str = "
     return {"rule": rule, "id": f"cloud.{fid}", "severity": severity, "summary": summary, "location": a16_tools._safe_label(location)}
 
 
-def _read_text(path: Path) -> str | None:
-    """Text of a regular, non-binary file within the size bound; None otherwise."""
+def _relative(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return "(outside the root)"
+
+
+def _reason(kind: str, rel: str, where: str = "") -> str:
+    """One reason an in-scope input was not analysed: the skip kind, its path (through the label rule) and, when given, where in it."""
+    return f"skipped:{kind}: {a16_tools._safe_label(rel)}" + (f" ({where})" if where else "")
+
+
+def _read_text(path: Path) -> tuple[str | None, str]:
+    """(text, ''): the text of a regular, non-binary file within the size bound. Otherwise (None, why), why being the skip kind."""
     try:
         with path.open("rb") as handle:
             data = handle.read(MAX_FILE_BYTES + 1)
     except OSError:
-        return None
-    if len(data) > MAX_FILE_BYTES or b"\0" in data[:4096]:
-        return None
-    return data.decode("utf-8", errors="replace")
+        return None, "unreadable"
+    if len(data) > MAX_FILE_BYTES:
+        return None, "too-large"
+    if b"\0" in data[:4096]:
+        return None, "binary"
+    return data.decode("utf-8", errors="replace"), ""
 
 
 def _instructions(text: str) -> list[tuple[str, str]]:
@@ -181,10 +199,13 @@ def _mapping(value) -> dict:
 
 
 def _workload(doc: dict, path: str) -> dict | None:
-    """Facts of a Deployment, StatefulSet or DaemonSet; None for other kinds. Raises _Malformed when a nested field is not a mapping."""
-    if doc.get("kind") not in WORKLOAD_KINDS or doc.get("spec") is None:
+    """Facts of a Deployment, StatefulSet or DaemonSet; None for other kinds. Raises _Malformed when the workload has no spec mapping
+    (missing, null or another type) or a nested field is not a mapping: the scan records a reason, never a silent skip."""
+    if doc.get("kind") not in WORKLOAD_KINDS:
         return None
-    spec = _mapping(doc["spec"])
+    spec = doc.get("spec")
+    if not isinstance(spec, dict):
+        raise _Malformed
     pod = _mapping(_mapping(spec.get("template")).get("spec"))
     metadata = _mapping(doc.get("metadata"))
     labels = _mapping(metadata.get("labels"))
@@ -210,18 +231,71 @@ def _workload(doc: dict, path: str) -> dict | None:
 
 
 def _helm_workloads(text: str, path: str) -> list[dict]:
-    """Template files cannot be parsed as YAML: use text signals, one workload per kind line."""
-    replicas = HELM_REPLICAS.search(text)
-    return [{
-        "path": path, "kind": kind, "name": "(helm template)", "replicas": int(replicas.group(1)) if replicas else None,
-        "has_probe": bool(HELM_PROBE.search(text)), "no_requests": [] if HELM_REQUESTS.search(text) else ["(helm template)"],
-        "spread": bool(HELM_SPREAD.search(text)), "graceful": bool(HELM_GRACE.search(text)),
-        "labels": [],
-    } for kind in HELM_KIND.findall(text)]
+    """Template files cannot be parsed as YAML: use text signals, one workload per kind line. Each `---` document is read on its own
+    text, so a kind's replicas, probes, requests and spread come from its own document, never from another kind's."""
+    workloads = []
+    for document in HELM_DOCUMENT.split(text):
+        replicas = HELM_REPLICAS.search(document)
+        for kind in HELM_KIND.findall(document):
+            workloads.append({
+                "path": path, "kind": kind, "name": "(helm template)", "replicas": int(replicas.group(1)) if replicas else None,
+                "has_probe": bool(HELM_PROBE.search(document)), "no_requests": [] if HELM_REQUESTS.search(document) else ["(helm template)"],
+                "spread": bool(HELM_SPREAD.search(document)), "graceful": bool(HELM_GRACE.search(document)),
+                "labels": [],
+            })
+    return workloads
 
 
-def _k8s_docs(text: str, suffix: str) -> list[dict] | None:
-    """Parsed manifest documents; None when unparseable. YAML needs PyYAML (the caller checks)."""
+# the Kubernetes List kinds: the exact kind List, and <WorkloadKind>List for each workload kind the scanner judges
+STRICT_LIST_KINDS = frozenset({"List"} | {f"{kind}List" for kind in WORKLOAD_KINDS})
+# a List may hold a List of workloads, and so on: this many List levels are judged, counting the top-level List; deeper is a reason
+MAX_LIST_DEPTH = 3
+
+
+def _is_list(item: dict) -> bool:
+    """Whether a mapping is judged as a List of items, by its kind. A strict List kind (STRICT_LIST_KINDS) always is: its items must be a
+    list, and a missing items value is a reason. Any other kind ending in List (a custom resource such as TodoList) is one only when an
+    items key is present, so a custom kind with a spec and no items is judged as its own kind. A kind-less mapping is a List when its
+    items is a list. Any other kind is judged as that kind, whatever its items value, so a stray items field cannot hide a workload."""
+    kind = item.get("kind")
+    if kind is None:
+        return isinstance(item.get("items"), list)
+    if not isinstance(kind, str):
+        return False
+    if kind in STRICT_LIST_KINDS:
+        return True
+    return kind.endswith("List") and "items" in item
+
+
+def _collect_list(mapping: dict, where: str, depth: int, docs: list[dict], odd: list[tuple[str, str]]) -> None:
+    """Judge the items of a List. Depth 1 is the top-level List. An entry that is itself a list kind is judged the same way one level
+    deeper, up to MAX_LIST_DEPTH levels; past that it is a reason naming its position, never a silent drop. Every other entry is a
+    document, a kind-less mapping is an unkinded-entry reason, and a non-mapping entry is a non-mapping-document reason."""
+    entries = mapping.get("items")
+    if not isinstance(entries, list):
+        odd.append(("non-list-items", f"{where}, List items"))
+        return
+    for position, entry in enumerate(entries):
+        here = f"{where}, List items[{position}]"
+        if isinstance(entry, dict) and isinstance(entry.get("kind"), str):
+            if not _is_list(entry):
+                docs.append(entry)
+            elif depth >= MAX_LIST_DEPTH:
+                odd.append(("list-too-deep", here))
+            else:
+                _collect_list(entry, here, depth + 1, docs, odd)
+        elif isinstance(entry, dict):  # a List item with no kind is invalid Kubernetes: reported, never silently dropped
+            odd.append(("unkinded-entry", here))
+        elif entry is not None and entry != []:
+            odd.append(("non-mapping-document", here))
+
+
+def _k8s_docs(text: str, suffix: str) -> tuple[list[dict], list[tuple[str, str]]] | None:
+    """(documents, reasons), or None when the file is unparseable. Documents are the mappings: each document and each List entry. A
+    reason is a (kind, where) pair: a non-mapping document or List entry, or a List whose items is not a list (its items are then not
+    analysed). A top-level sequence of objects is unparseable (None), because its content cannot be attributed to a document here.
+    Reasons are kept only when the file also holds a Kubernetes document (a mapping with kind, or a List): a file that is not
+    Kubernetes at all is out of scope. Empty documents hold nothing and are skipped. YAML needs PyYAML (the caller checks)."""
     try:
         if suffix == ".json":
             loaded = [json.loads(text)]
@@ -229,31 +303,57 @@ def _k8s_docs(text: str, suffix: str) -> list[dict] | None:
             loaded = list(yaml.safe_load_all(text))
     except (ValueError, yaml.YAMLError if yaml else ValueError):
         return None
-    docs = []
-    for item in loaded:
-        if isinstance(item, dict) and isinstance(item.get("items"), list):
-            docs.extend(i for i in item["items"] if isinstance(i, dict))
-        elif isinstance(item, dict):
+    docs: list[dict] = []
+    odd: list[tuple[str, str]] = []
+    kubernetes = False
+    for index, item in enumerate(loaded):
+        if item is None or item == []:
+            continue
+        if isinstance(item, list):
+            return None
+        if not isinstance(item, dict):
+            odd.append(("non-mapping-document", f"document {index}"))
+            continue
+        if _is_list(item):
+            kubernetes = True
+            _collect_list(item, f"document {index}", 1, docs, odd)
+        else:
+            kubernetes = kubernetes or "kind" in item
             docs.append(item)
-    return docs
+    return docs, (odd if kubernetes else [])
 
 
 def scan_tree(root: Path, target: Path) -> dict:
     """Collect facts from the files under `target` (bounded); every fact keeps the relative path it came from."""
     facts: dict = {
         "files_scanned": 0, "files_skipped": 0, "truncated": False, "ci": [], "env_files": [], "sources": [], "env_reads": [], "sigterm": [],
+        "incomplete": [],
         "dockerfiles": [], "compose_health": [], "workloads": [], "scalers": [], "k8s_labels": [], "yaml_skipped": [], "unparseable": [],
         "iac": [], "iac_compute": [], "iac_database": [], "multi_az": [], "multi_az_off": [], "backup": [], "encryption": [], "autoscaling": [],
         "tags": [], "tag_keys": set(), "efficiency": [], "helm": [], "malformed": [],
     }
     seen = 0
+    reasons: list[str] = facts["incomplete"]  # one reason per in-scope input that was not analysed: a label and a path, never content
 
     def candidates():
         if target.is_file():
             yield target.parent, target.name
             return
-        for current, dirs, names in os.walk(target, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not os.path.islink(os.path.join(current, d)))
+
+        def walk_error(error: OSError) -> None:  # an unreadable directory: its entries are not analysed
+            reasons.append(_reason("unreadable-directory", _relative(root, Path(error.filename or target))))
+
+        for current, dirs, names in os.walk(target, followlinks=False, onerror=walk_error):
+            kept = []
+            for d in sorted(dirs):
+                if d in SKIP_DIRS:
+                    continue
+                child = Path(current) / d
+                if child.is_symlink():  # listed as a directory but never followed, so its tree is not analysed
+                    reasons.append(_reason("symlink-directory", _relative(root, child)))
+                    continue
+                kept.append(d)
+            dirs[:] = kept
             for name in sorted(names):
                 yield Path(current), name
 
@@ -261,16 +361,9 @@ def scan_tree(root: Path, target: Path) -> dict:
         seen += 1
         if seen > MAX_FILES:
             facts["truncated"] = True
+            reasons.append(f"skipped:file-limit: the scan stopped after {MAX_FILES} files, the rest of the tree was not analysed")
             break
         path = directory / name
-        try:
-            mode = os.lstat(path).st_mode
-        except OSError:
-            facts["files_skipped"] += 1
-            continue
-        if not stat.S_ISREG(mode):  # symlinks, sockets, devices
-            facts["files_skipped"] += 1
-            continue
         rel = path.relative_to(root).as_posix()
         lowered, suffix = name.lower(), path.suffix.lower()
         parts = {part.lower() for part in path.relative_to(root).parts[:-1]}
@@ -281,11 +374,25 @@ def scan_tree(root: Path, target: Path) -> dict:
         is_data = suffix in (".yaml", ".yml", ".json", ".template")
         is_ci = (lowered in CI_NAMES or rel.startswith(".github/workflows/") and suffix in (".yml", ".yaml")
                  or rel.startswith(".circleci/") and suffix in (".yml", ".yaml"))
-        if not (is_dockerfile or is_env or is_source or is_tf or is_data or is_ci):
+        in_scope = is_dockerfile or is_env or is_source or is_tf or is_data or is_ci
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:
+            facts["files_skipped"] += 1
+            if in_scope:
+                reasons.append(_reason("unreadable", rel))
             continue
-        text = _read_text(path)
+        if not stat.S_ISREG(mode):  # symlinks, sockets, devices
+            facts["files_skipped"] += 1
+            if in_scope:
+                reasons.append(_reason("symlink" if stat.S_ISLNK(mode) else "not-regular", rel))
+            continue
+        if not in_scope:
+            continue
+        text, why = _read_text(path)
         if text is None:
             facts["files_skipped"] += 1
+            reasons.append(_reason(why, rel))
             continue
         facts["files_scanned"] += 1
         if is_ci:
@@ -327,15 +434,17 @@ def scan_tree(root: Path, target: Path) -> dict:
             if suffix != ".json" and yaml is None:
                 facts["yaml_skipped"].append(rel)
                 continue
-            docs = _k8s_docs(text, suffix)
-            if docs is None:
+            parsed = _k8s_docs(text, suffix)
+            if parsed is None:
                 facts["unparseable"].append(rel)
                 continue
+            docs, odd = parsed
+            facts["incomplete"].extend(_reason(kind, rel, where) for kind, where in odd)
             for doc in docs:
                 try:
                     workload = _workload(doc, rel)
                 except _Malformed:
-                    facts["malformed"].append(rel)
+                    facts["malformed"].append((rel, doc.get("kind")))
                     continue
                 if workload:
                     facts["workloads"].append(workload)
@@ -478,20 +587,18 @@ def run(args, ctx) -> dict:
     facts = scan_tree(root, target)
     findings = evaluate(facts)
     skipped = []
+    reasons = list(facts["incomplete"])
     if facts["yaml_skipped"]:
         skipped.append("skipped:tool-missing: PyYAML (Kubernetes YAML manifests not analysed)")
-        findings.append(_finding("yaml", "yaml-checks-skipped", "info",
-                                 f"skipped:tool-missing: PyYAML is not importable; {len(facts['yaml_skipped'])} Kubernetes YAML manifest(s) were not analysed",
-                                 facts["yaml_skipped"][0]))
-    findings.extend(_finding("scan", "manifest-unparseable", "info", "manifest is not valid YAML/JSON and was not analysed", p) for p in facts["unparseable"])
-    findings.extend(_finding("scan", "workload-malformed", "info", "a workload has a non-mapping metadata, spec, template or container field: not analysed", p) for p in facts["malformed"])
-    if facts["truncated"]:
-        findings.append(_finding("scan", "scan-truncated", "info", f"the scan stopped after {MAX_FILES} files; findings cover the files seen so far"))
+        reasons.extend(_reason("tool-missing: PyYAML not importable, Kubernetes manifest not analysed", p) for p in facts["yaml_skipped"])
+    reasons.extend(_reason("unparseable-manifest", p) for p in facts["unparseable"])
+    reasons.extend(_reason("malformed-workload", rel, kind) for rel, kind in facts["malformed"])
+    findings.extend({**item, "location": ""} for item in incomplete_findings(sorted(set(reasons)), facts["files_scanned"]))
     pillars, overall = score(findings, facts)
     findings = _sorted(findings)
-    failing = any(SEVERITY_RANK[f["severity"]] <= SEVERITY_RANK["major"] for f in findings)
+    status = scan_status(findings)
     return {
-        "status": "fail" if failing else "ok",
+        "status": status,
         "summary": f"{len(findings)} finding(s); overall readiness {overall}%",
         "files_scanned": facts["files_scanned"], "files_skipped": facts["files_skipped"], "truncated": facts["truncated"],
         "signals": {"ci_files": len(facts["ci"]), "dockerfiles": len(facts["dockerfiles"]), "kubernetes_workloads": len(facts["workloads"]),

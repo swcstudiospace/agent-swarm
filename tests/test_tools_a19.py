@@ -1592,3 +1592,269 @@ def test_ordering_without_an_entity_key_is_not_reported_as_ordered():
     result = order(order_required=False, entity_key_fields=[])
     assert (result["ordered"], result["verdict"]) == (False, "pass")
     assert fx(result) == [("info", "entity_key_fields is empty: per-entity order cannot be judged, so ordered is false")]
+
+
+def test_avro_aliases_that_are_not_a_list_are_invalid_input_at_record_and_field_level():
+    # the record and the field form of a non-list aliases used to raise TypeError out of the handler
+    record = {"type": "record", "name": "R", "aliases": 5, "fields": [{"name": "a", "type": "string"}]}
+    field = {"type": "record", "name": "R", "fields": [{"name": "a", "type": "string", "aliases": 5}]}
+    for schema in (record, field):
+        result = invalid("event_schema_compat", {"format": "avro", "mode": "backward", "base_schema": json.dumps(schema),
+                                                 "head_schema": json.dumps(schema)}, "base_schema")
+        assert "must be a list of strings" in result["message"]
+    listed = {"type": "record", "name": "R", "aliases": ["Old"], "fields": [{"name": "a", "type": "string", "aliases": ["b"]}]}
+    assert compat(listed, copy.deepcopy(listed), "full", "avro")["compatible"] is True
+
+
+def test_asyncapi_channel_parameters_must_be_an_object_not_a_string_or_list():
+    def document(parameters):
+        return {"asyncapi": "2.6.0", "info": {"title": "T", "version": "1"},
+                "channels": {"orders/{id}": {"parameters": parameters,
+                                             "publish": {"operationId": "p", "message": MSG}}}}
+    # a non-mapping parameters value is a major finding, not a crash
+    assert ("major", "channels/orders/{id}: parameters must be an object, so no parameter of orders/{id} is declared") in fx(aa(document(5)))
+    # a string is not a mapping: a substring of the string must not count as a declared parameter
+    result = aa(document("id"))
+    assert result["verdict"] == "fail"
+    assert ("major", "channels/orders/{id}: parameter {id} is not declared under parameters") in fx(result)
+    assert aa(document([1, 2]))["verdict"] == "fail"
+    assert aa(document({"id": {"schema": {"type": "string"}}}))["verdict"] == "pass"
+
+
+def test_asyncapi_one_of_chain_with_a_repeated_alternative_is_linear_not_exponential():
+    import time
+
+    # each level lists the next message twice: the unmemoised walk doubled per level and took minutes at depth 26
+    depth = 26
+    components = {f"M{depth}": MSG}
+    for level in range(depth - 1, -1, -1):
+        nxt = {"$ref": f"#/components/messages/M{level + 1}"}
+        components[f"M{level}"] = {"oneOf": [nxt, dict(nxt)]}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
+           "components": {"messages": components}}
+    started = time.monotonic()
+    result = aa(doc)
+    assert time.monotonic() - started < 3
+    assert (result["verdict"], result["findings"], result["messages"]) == ("pass", [], 1)
+
+
+def test_asyncapi_shared_leaf_keeps_its_findings_for_every_path_that_reaches_it():
+    # a memoised walk must still report the leaf's minors under each oneOf path, as the unmemoised walk does
+    doc = {"asyncapi": "3.0.0", "info": {"title": "t", "version": "1"},
+           "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/Top"}}}},
+           "components": {"messages": {"Top": {"oneOf": [{"$ref": "#/components/messages/Leaf"}, {"$ref": "#/components/messages/Leaf"}]},
+                                        "Leaf": {"contentType": None}}}}
+    assert fx(aa(doc)) == [
+        ("minor", "channels/c/messages/m/oneOf/0: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c/messages/m/oneOf/0: no contentType and no defaultContentType"),
+        ("minor", "channels/c/messages/m/oneOf/1: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c/messages/m/oneOf/1: no contentType and no defaultContentType"),
+    ]
+
+
+def test_retention_replay_duration_beyond_the_finite_range_is_invalid_input_not_an_overflow():
+    result = invalid("event_retention_replay", {"retention_s": 1e9, "replay_from_age_s": 1e3, "replay_events": 1e12,
+                                                "replay_rate_per_s": 5e-324, "live_rate_per_s": 0, "consumers_idempotent": True,
+                                                "compacted": False, "environment": "non-prod"}, "replay_events")
+    assert "finite duration" in result["message"]
+
+
+def test_partition_skew_threshold_is_restored_and_drives_the_skew_finding():
+    # SKEW_WARN was lost in a QA-03 edit: the skew branch raised NameError. Its HEAD value is 2 and the branch must run.
+    module = importlib.import_module("swarm.tools.a19_tools")
+    assert str(module.SKEW_WARN) == "2"
+    result = plan(hot_key_share_pct=5)  # skew ratio 2.4 is above SKEW_WARN
+    assert result["skew_ratio"] > 2 and result["partitions_by_skew"] == 29
+    assert fx(result) == [("minor", "key skew: the hottest partition carries 2.4x the mean load")]
+
+
+def test_asyncapi_two_channels_referencing_two_leaf_messages_count_two_messages():
+    # R-3: memoised walks keyed by relative ids collapsed distinct leaves into one message
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {"c1": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/A"}}},
+                        "c2": {"address": "b", "messages": {"m": {"$ref": "#/components/messages/B"}}}},
+           "components": {"messages": {"A": MSG, "B": dict(MSG)}}}
+    result = aa(doc)
+    assert (result["messages"], result["verdict"], result["findings"]) == (2, "pass", [])
+
+
+def _ref_chain(refs: int) -> dict:
+    """A document whose root is `refs` $ref hops away from a string schema."""
+    definitions = {f"d{i}": {"$ref": f"#/definitions/d{i + 1}"} for i in range(refs - 1)}
+    definitions[f"d{refs - 1}"] = STR
+    return {"$ref": "#/definitions/d0", "definitions": definitions}
+
+
+def test_schema_compat_accepts_a_21_hop_ref_chain():
+    # N-G: a 21-hop chain is valid and must not be refused
+    chain = _ref_chain(21)
+    assert compat(chain, copy.deepcopy(chain), "full")["compatible"] is True
+
+
+def test_schema_compat_refuses_a_ref_chain_beyond_64_hops_naming_the_schema():
+    chain = _ref_chain(65)
+    result = invalid("event_schema_compat", {"format": "json-schema", "mode": "backward", "base_schema": json.dumps(chain),
+                                             "head_schema": json.dumps(chain)}, "base_schema")
+    assert "64 hops" in result["message"]
+    assert compat(_ref_chain(64), copy.deepcopy(_ref_chain(64)), "full")["compatible"] is True
+
+
+def test_asyncapi_cyclic_three_channel_document_matches_the_unmemoised_walk():
+    # S-3: a memoised result replayed under a path where an ancestor it was cut by is absent gave 4 messages; HEAD gives 6
+    comps = {"T": {"oneOf": [{"$ref": "#/components/messages/X"}, {"contentType": "i"}]},
+             "X": {"oneOf": [{"$ref": "#/components/messages/T"}, {"contentType": "j"}]}}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {f"c{i}": {"address": f"a{i}", "messages": {"m": {"$ref": f"#/components/messages/{ref}"}}}
+                        for i, ref in enumerate(["T", "X", "X"])},
+           "components": {"messages": comps}}
+    result = aa(doc)
+    assert (result["messages"], result["verdict"]) == (6, "fail")
+    assert fx(result) == [
+        ("major", "channels/c0/messages/m/oneOf/0/oneOf/0: message $ref is cyclic: a oneOf refers back to itself"),
+        ("major", "channels/c1/messages/m/oneOf/0/oneOf/0: message $ref is cyclic: a oneOf refers back to itself"),
+        ("major", "channels/c2/messages/m/oneOf/0/oneOf/0: message $ref is cyclic: a oneOf refers back to itself"),
+        ("minor", "channels/c0/messages/m/oneOf/0/oneOf/1: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c0/messages/m/oneOf/1: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c1/messages/m/oneOf/0/oneOf/1: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c1/messages/m/oneOf/1: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c2/messages/m/oneOf/0/oneOf/1: message has no payload schema, so consumers have no contract"),
+        ("minor", "channels/c2/messages/m/oneOf/1: message has no payload schema, so consumers have no contract"),
+    ]
+
+
+def test_asyncapi_cyclic_document_past_the_step_budget_stops_with_a_reason_in_under_two_seconds():
+    # S-6: every component is a oneOf of all the others plus a leaf; the unbounded walk grows about x14 per component (n=9 took
+    # 16 s). Past its budgets the walk stops, and the document is reported fail with the budget reason.
+    import time
+
+    module = importlib.import_module("swarm.tools.a19_tools")
+    n = 9
+    comps = {f"C{i}": {"oneOf": [{"$ref": f"#/components/messages/C{j}"} for j in range(n) if j != i] + [{"contentType": "x"}]}
+             for i in range(n)}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/C0"}}}},
+           "components": {"messages": comps}}
+    started = time.monotonic()
+    result = aa(doc)
+    assert time.monotonic() - started < 2
+    assert result["verdict"] == "fail"
+    stopped = [summary for severity, summary in fx(result) if severity == "major" and summary.startswith(module.ASYNCAPI_WALK_STOPPED)]
+    assert len(stopped) == 1 and f"after {module.ASYNCAPI_EMIT_BUDGET} findings copied" in stopped[0]
+
+
+def test_asyncapi_acyclic_document_of_500_messages_is_walked_in_full_and_passes():
+    # the budget leaves realistic documents alone: 500 channels, one message each, walked in full and counted
+    n = 500
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {f"c{i}": {"address": f"a{i}", "messages": {"m": {"$ref": f"#/components/messages/M{i}"}}} for i in range(n)},
+           "components": {"messages": {f"M{i}": MSG for i in range(n)}}}
+    result = aa(doc)
+    assert (result["messages"], result["verdict"], result["findings"]) == (500, "pass", [])
+
+
+def test_asyncapi_shared_pool_replayed_by_500_channels_is_warn_with_500_messages_as_at_head():
+    # N-1: 500 channels each refer to one pool of 500 leaves, so the pool's 500 findings are replayed 500 times: 250000 findings,
+    # a legal document. HEAD reports warn, 500 messages and 300 findings. Replays cost one step each, so the budget is not spent here.
+    leaves = {f"L{i}": {"contentType": "x"} for i in range(500)}
+    leaves["P"] = {"oneOf": [{"$ref": f"#/components/messages/L{i}"} for i in range(500)]}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {f"c{i}": {"address": f"a{i}", "messages": {"m": {"$ref": "#/components/messages/P"}}} for i in range(500)},
+           "components": {"messages": leaves}}
+    result = aa(doc)
+    assert (result["messages"], result["verdict"], len(result["findings"])) == (500, "warn", 300)
+    assert all("stopped" not in finding["summary"] for finding in result["findings"])
+
+
+def _message_chain(levels: int) -> dict:
+    """A document whose message at each level is a oneOf of the next level and one inline alternative; the last level is complete."""
+    comps = {f"M{levels}": MSG}
+    for index in range(levels - 1, -1, -1):
+        comps[f"M{index}"] = {"oneOf": [{"$ref": f"#/components/messages/M{index + 1}"}, {"contentType": "x"}]}
+    return {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+            "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
+            "components": {"messages": comps}}
+
+
+def test_asyncapi_chain_of_600_levels_lints_as_at_head_and_a_deeper_chain_is_a_reason_not_an_exception():
+    # N-2: one Python frame per level, so a 600-level chain lints as at HEAD (warn, 601 messages); past the depth limit the walk stops
+    result = aa(_message_chain(600))
+    assert (result["messages"], result["verdict"], len(result["findings"])) == (601, "warn", 300)
+    deep = aa(_message_chain(1500))  # under the handler's 200000-character bound; a chain deeper than 700 levels still stops
+    assert deep["verdict"] == "fail"
+    stops = [summary for severity, summary in fx(deep) if severity == "major" and "deeper than 700 levels" in summary]
+    assert len(stops) == 1 and stops[0].startswith("AsyncAPI message walk stopped under channels/c/messages/m")
+
+
+def test_asyncapi_shared_pool_of_600_channels_lints_as_at_head():
+    # N-4: 600 channels refer to one pool of 600 leaves, so 360000 findings are copied: HEAD gives warn, 600 messages, 300 findings
+    leaves = {f"L{i}": {"contentType": "x"} for i in range(600)}
+    leaves["P"] = {"oneOf": [{"$ref": f"#/components/messages/L{i}"} for i in range(600)]}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {f"c{i}": {"address": f"a{i}", "messages": {"m": {"$ref": "#/components/messages/P"}}} for i in range(600)},
+           "components": {"messages": leaves}}
+    result = aa(doc)
+    assert (result["messages"], result["verdict"], len(result["findings"])) == (600, "warn", 300)
+    assert all("stopped" not in finding["summary"] for finding in result["findings"])
+
+
+def test_asyncapi_stop_survives_truncation_and_says_the_message_count_is_partial():
+    # N-5: 320 blockers would fill the 300 findings and cut the stop; the stop is pinned, so it stays in the output. 298 blockers are
+    # shown with it and the truncation note. That is a choice, not a contract requirement: _MAX_FINDINGS (300) includes the stop and the
+    # note. The registered findings maxItems is 301 (agents.json), so 299 blockers would also have been contract-legal.
+    doc = _message_chain(800)
+    doc["operations"] = {f"o{i}": {"action": "publish", "channel": {"$ref": "#/channels/c"}} for i in range(320)}
+    result = aa(doc)
+    summaries = [summary for _, summary in fx(result)]
+    stops = [summary for summary in summaries if summary.startswith("AsyncAPI message walk stopped under channels/c/messages/m")]
+    assert result["verdict"] == "fail" and len(result["findings"]) == 300
+    assert len(stops) == 1 and stops[0].endswith("the message count and the findings list are both partial")
+    assert sum(1 for severity, _ in fx(result) if severity == "blocker") == 298
+
+
+def test_asyncapi_stopped_cyclic_document_reports_the_messages_reached_not_zero():
+    # N-6: n=9 stops at the replay ceiling; the messages reached before the stop are counted, and the stop says both counts are partial
+    n = 9
+    comps = {f"C{i}": {"oneOf": [{"$ref": f"#/components/messages/C{j}"} for j in range(n) if j != i] + [{"contentType": "x"}]}
+             for i in range(n)}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/C0"}}}},
+           "components": {"messages": comps}}
+    result = aa(doc)
+    stops = [summary for _, summary in fx(result) if summary.startswith("AsyncAPI message walk stopped")]
+    assert len(stops) == 1 and stops[0].endswith("the message count and the findings list are both partial")
+    assert result["messages"] > 0 and result["verdict"] == "fail"
+
+
+def test_stop_summary_with_60_character_names_keeps_the_whole_sentence():
+    # R6-4: 60-character channel and message names push the stop reason past the 300-character summary; the origin is shortened, the
+    # sentence is kept whole
+    module = importlib.import_module("swarm.tools.a19_tools")
+    doc = _message_chain(800)
+    doc["channels"] = {"k" * 60: {"address": "a", "messages": {"j" * 60: {"$ref": "#/components/messages/M0"}}}}
+    result = aa(doc)
+    stops = [summary for _, summary in fx(result) if summary.startswith("AsyncAPI message walk stopped under channels/")]
+    assert len(stops) == 1 and len(stops[0]) <= module._SUMMARY_MAX
+    assert stops[0].endswith("the message count and the findings list are both partial")
+
+
+def _pool(channels: int, leaves: int) -> dict:
+    """`channels` channels, each referring to one pool of `leaves` leaves, every leaf without a payload (one minor per leaf)."""
+    pool = {f"L{i}": {"contentType": "x"} for i in range(leaves)}
+    pool["P"] = {"oneOf": [{"$ref": f"#/components/messages/L{i}"} for i in range(leaves)]}
+    return {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+            "channels": {f"c{i}": {"address": f"a{i}", "messages": {"m": {"$ref": "#/components/messages/P"}}} for i in range(channels)},
+            "components": {"messages": pool}}
+
+
+def test_shared_pool_at_the_copy_ceiling_lints_as_at_head_and_one_channel_more_is_refused():
+    # R7-4: the ceiling is 500,000 copies. 999 channels of a 500-leaf pool copy exactly that many and lint as HEAD does; 1,000 copy
+    # 500,500 and are refused with the stop reason
+    module = importlib.import_module("swarm.tools.a19_tools")
+    assert module.ASYNCAPI_EMIT_BUDGET == 500000
+    at = aa(_pool(999, 500))
+    assert (at["messages"], at["verdict"], len(at["findings"])) == (500, "warn", 300)
+    assert all(not summary.startswith(module.ASYNCAPI_WALK_STOPPED) for _, summary in fx(at))
+    over = aa(_pool(1000, 500))
+    stops = [summary for severity, summary in fx(over) if summary.startswith(module.ASYNCAPI_WALK_STOPPED)]
+    assert over["verdict"] == "fail" and len(stops) == 1 and "after 500000 findings copied" in stops[0]

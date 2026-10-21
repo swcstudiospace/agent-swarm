@@ -642,12 +642,31 @@ def test_path_symlink_leaving_the_root_is_refused(tmp_path):
     assert result.returncode == 2 and "leaves the repository root" in json.loads(result.stdout)["error"]["message"]
 
 
-def test_vendored_and_state_directories_are_skipped(tmp_path):
-    for folder in ("node_modules/pkg", ".git/hooks", ".terraform/modules", ".venv/lib", "dist", "build"):
+def test_silent_directories_are_never_read_and_add_no_reason(tmp_path):
+    silent = (".git/hooks", ".hg/store", ".svn/pristine", "node_modules/pkg", ".venv/lib", "venv/lib", "__pycache__", ".tox/py", ".mypy_cache/x", ".swarm/state", ".terraform/modules")
+    for folder in silent:
         put(tmp_path, f"{folder}/main.tf", 'resource "aws_instance" "x" { instance_type = "m4.16xlarge" }')
     put(tmp_path, "src/main.tf", 'resource "aws_ebs_volume" "v" { type = "gp2" }')
     result = scan(tmp_path)
     assert [f["file"] for f in result["findings"]] == ["src/main.tf"] and result["files_scanned"] == 1
+    assert result["status"] == "ok" and not [f for f in result["findings"] if f["rule"] == "scan-incomplete"]
+
+
+def test_build_dist_and_vendor_directories_are_read_like_any_other(tmp_path):
+    put(tmp_path, "build/main.tf", 'resource "aws_instance" "x" { instance_type = "m4.16xlarge" }\n')
+    put(tmp_path, "dist/main.tf", 'resource "aws_ebs_volume" "d" {\n  type = "gp2"\n}\n')
+    put(tmp_path, "vendor/main.tf", 'resource "aws_ebs_volume" "w" {\n  type = "gp2"\n}\n')
+    result = scan(tmp_path)
+    assert sorted({f["file"] for f in result["findings"]}) == ["build/main.tf", "dist/main.tf", "vendor/main.tf"]
+    assert result["files_scanned"] == 3 and not [f for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert result["status"] == "fail"  # build's m4.16xlarge is a major finding, judged like any other directory
+
+
+def test_a_node_modules_directory_gives_status_ok(tmp_path):
+    put(tmp_path, "package.json", '{"name": "app"}')
+    put(tmp_path, "node_modules/left-pad/main.tf", 'resource "aws_instance" "x" { instance_type = "m4.16xlarge" }\n')
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 1)
 
 
 def test_findings_are_sorted_worst_first_then_by_file_and_capped(tmp_path):
@@ -772,6 +791,711 @@ def test_malformed_manifests_do_not_abort_the_scan(tmp_path, doc):
     result = scan(tmp_path)
     assert ("Pod/good", "major") in hits(result, "k8s-missing-requests")
     assert result["files_scanned"] >= 1 and result["status"] == "fail"
+
+
+@pytest.mark.skipif(not hasattr(os, "scandir"), reason="needs scandir")
+def test_an_unreadable_subtree_is_reported_as_incomplete_not_dropped(tmp_path, monkeypatch):
+    put(tmp_path, "ok/main.tf", 'resource "aws_ebs_volume" "v" {\n  type = "gp2"\n}\n')
+    put(tmp_path, "locked/main.tf", 'resource "aws_ebs_volume" "w" {\n  type = "gp2"\n}\n')
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if os.path.basename(str(path)) == "locked":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert [f["rule"] for f in result["findings"] if f["rule"] == "scan-incomplete"] == ["scan-incomplete"]
+    assert "locked: directory could not be read" in result["findings"][0]["summary"]
+
+
+def test_a_cloudformation_resource_with_a_non_literal_type_is_reported_not_skipped(tmp_path):
+    put(tmp_path, "stack.json", json.dumps({"Resources": {"Q": {"Type": {"Ref": "T"}, "Properties": {"InstanceType": "m4.16xlarge"}}}}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "stack.json::Q: resource Type is not a literal string and the resource was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_quoted_tag_key_with_a_space_is_one_key_not_its_last_word(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  instance_type = "m5.large"\n  tags = {\n    "app environment" = "prod"\n    "cost center" = "x"\n  }\n}\n')
+    result = scan(tmp_path, required=["environment", "center"])
+    assert [f["rule"] for f in result["findings"]] == ["iac-untagged-resource"] and result["status"] == "fail"
+    assert result["findings"][0]["summary"] == "aws_instance.a: missing: center; missing: environment"
+
+
+def test_a_non_literal_hcl_log_group_retention_is_reported_not_read_as_absent(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_cloudwatch_log_group" "g" {\n  retention_in_days = var.days\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "main.tf::aws_cloudwatch_log_group.g: retention_in_days is not a literal and was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_non_literal_json_log_group_retention_is_reported_not_read_as_present(tmp_path):
+    put(tmp_path, "main.tf.json", json.dumps({"resource": {"aws_cloudwatch_log_group": {"g": {"retention_in_days": {"Ref": "D"}}}}}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "main.tf.json::aws_cloudwatch_log_group.g: retention_in_days is not a literal and was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_cloudformation_log_group_retention_intrinsic_is_reported_not_read_as_present(tmp_path):
+    put(tmp_path, "stack.json", json.dumps({"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": {"Ref": "D"}}}}}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "stack.json::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_yaml_short_form_log_group_retention_is_reported_not_read_as_absent(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "stack.yaml", "Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: !Ref Days\n")
+    result = scan(tmp_path)
+    assert "iac-missing-lifecycle" not in [f["rule"] for f in result["findings"]]  # the !Ref is not an absent retention
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "stack.yaml::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_deployment_without_a_pod_template_is_reported_not_counted_silently(tmp_path):
+    put(tmp_path, "d.json", json.dumps({"kind": "Deployment", "metadata": {"name": "d"}, "spec": {}}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "d.json::Deployment/d: pod template or spec is not a mapping and the workload was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_list_item_whose_spec_is_a_string_is_reported_not_counted_silently(tmp_path):
+    put(tmp_path, "l.json", json.dumps({"kind": "List", "items": [{"kind": "Pod", "metadata": {"name": "p"}, "spec": "bad"}]}))
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "l.json::Pod/p: pod template or spec is not a mapping and the workload was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_terraform_file_under_build_is_read_and_judged(tmp_path):
+    put(tmp_path, "src/main.tf", 'resource "aws_ebs_volume" "v" {\n  type = "gp2"\n}\n')
+    put(tmp_path, "build/main.tf", 'resource "aws_instance" "x" { instance_type = "m4.16xlarge" }\n')
+    result = scan(tmp_path)
+    assert sorted(f["file"] for f in result["findings"] if f["rule"] == "iac-oversized-instance") == ["build/main.tf"]
+    assert not [f for f in result["findings"] if f["rule"] == "scan-incomplete"] and result["status"] == "fail"
+
+
+def test_a_cloudformation_resource_whose_body_is_not_a_mapping_is_reported(tmp_path):
+    put(tmp_path, "stack.json", json.dumps({"Resources": {"X": "oops", "Y": None}}))
+    result = scan(tmp_path, required=["owner"])
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    summary = result["findings"][0]["summary"]
+    assert "stack.json::X: resource body is not a mapping and was not evaluated" in summary
+    assert "stack.json::Y: resource body is not a mapping and was not evaluated" in summary
+
+
+def test_an_intrinsic_properties_value_is_reported_and_judges_no_tags_or_type(tmp_path):
+    body = {"Fn::If": ["C", {"InstanceType": "m4.16xlarge", "Tags": [{"Key": "owner", "Value": "x"}]}, {"Ref": "AWS::NoValue"}]}
+    put(tmp_path, "stack.json", json.dumps({"Resources": {"I": {"Type": "AWS::EC2::Instance", "Properties": body}}}))
+    result = scan(tmp_path, required=["owner"])
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"  # no missing-tag or type finding
+    assert "stack.json::AWS::EC2::Instance:I: Properties is an intrinsic function and was not evaluated" in result["findings"][0]["summary"]
+
+
+def test_a_list_item_that_is_not_a_mapping_is_reported_and_the_rest_is_scanned(tmp_path):
+    item = {"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c"}]}}
+    put(tmp_path, "list.json", json.dumps({"kind": "List", "items": ["oops", item]}))
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "list.json::List[0]: List item is not a mapping and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert ("Pod/p", "major") in hits(result, "k8s-missing-requests")
+
+
+def test_a_retention_too_large_for_a_float_fails_only_its_document_and_the_scan_continues(tmp_path):
+    put(tmp_path, "a-huge.json", json.dumps({"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": 10 ** 400}}}}))
+    put(tmp_path, "b-good.json", json.dumps({"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c"}]}}))
+    result = scan(tmp_path)  # must return, not raise OverflowError out of the whole tree
+    assert result["status"] == "fail" and result["files_scanned"] == 2  # both are recognised IaC files; the huge retention is reported, not evaluated
+    assert "a-huge.json::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert ("Pod/p", "major") in hits(result, "k8s-missing-requests")
+
+
+def test_an_interpolated_tag_key_is_reported_by_key_with_no_missing_tag_and_no_value(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  instance_type = "m5.large"\n  tags = {\n    "${var.env}-owner" = "team-a"\n    environment = "prod"\n  }\n}\n')
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"  # no false missing owner
+    summary = result["findings"][0]["summary"]
+    assert 'main.tf::aws_instance.a: tag key "${var.env}-owner" is an interpolation and was not evaluated' in summary
+    assert "team-a" not in summary
+
+
+
+def test_an_interpolated_terraform_json_tag_key_is_reported_by_key_with_no_missing_tag_and_no_value(tmp_path):
+    tags = {"${var.env}-owner": "team-a", "environment": "prod"}
+    put(tmp_path, "main.tf.json", json.dumps({"resource": {"aws_instance": {"a": {"instance_type": "m5.large", "tags": tags}}}}))
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"  # no false missing owner
+    summary = result["findings"][0]["summary"]
+    assert 'main.tf.json::aws_instance.a: tag key "${var.env}-owner" is an interpolation and was not evaluated' in summary
+    assert "team-a" not in summary
+
+
+def test_a_top_level_json_array_is_passed_over_silently_as_not_an_iac_document(tmp_path):
+    put(tmp_path, "list.json", json.dumps([{"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c"}]}}]))
+    result = scan(tmp_path)
+    assert (result["status"], result["files_scanned"], result["findings"]) == ("ok", 0, [])  # no scan-incomplete, no Pod finding
+
+
+def test_a_top_level_json_scalar_is_passed_over_silently_as_not_an_iac_document(tmp_path):
+    put(tmp_path, "scalar.json", "42")
+    result = scan(tmp_path)
+    assert (result["status"], result["files_scanned"], result["findings"]) == ("ok", 0, [])
+
+
+CLEAN_MAIN = 'resource "aws_instance" "ok" {\n  instance_type = "m5.large"\n}\n'
+
+
+@pytest.mark.parametrize("value", ["${var.owner}", "%{if true}p%{endif}"])
+def test_an_interpolated_terraform_json_required_tag_value_is_not_counted_present(tmp_path, value):
+    put(tmp_path, "main.tf.json", json.dumps({"resource": {"aws_instance": {"a": {"instance_type": "m5.large", "tags": {"owner": value, "environment": "prod"}}}}}))
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    summary = result["findings"][0]["summary"]
+    assert "main.tf.json::aws_instance.a: a required tag value is an expression and was not judged" in summary
+    assert value not in summary and "var.owner" not in summary and "endif" not in summary  # the value never appears
+
+
+def test_a_cloudformation_template_file_is_a_candidate_and_its_finding_is_reported(tmp_path):
+    put(tmp_path, "stack.template", json.dumps({"Resources": {"I": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}}}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["files_scanned"] == 2 and result["status"] == "fail"
+    assert [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", "stack.template")]
+
+
+def test_a_yaml_cloudformation_template_file_is_read_too(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "stack.template", "Resources:\n  I:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: c5.18xlarge\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["files_scanned"] == 2 and [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", "stack.template")]
+
+
+def test_a_deployment_list_item_is_judged_by_its_own_kind(tmp_path):
+    item = {"kind": "Deployment", "metadata": {"name": "d"}, "spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}}
+    put(tmp_path, "list.json", json.dumps({"kind": "DeploymentList", "items": [item]}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert ("Deployment/d", "major") in hits(result, "k8s-missing-requests") and result["status"] == "fail"
+    assert result["files_scanned"] == 2
+
+
+def test_a_configmap_list_stays_silent(tmp_path):
+    item = {"kind": "ConfigMap", "metadata": {"name": "c"}, "data": {}}
+    put(tmp_path, "cm.json", json.dumps({"kind": "ConfigMapList", "items": [item]}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)
+
+
+@pytest.mark.parametrize("text", ["# nothing here\n", "---\n"])
+def test_a_yaml_file_with_no_document_is_passed_over_and_not_counted(tmp_path, text):
+    pytest.importorskip("yaml")
+    put(tmp_path, "notes.yaml", text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["files_scanned"], result["findings"]) == ("ok", 1, [])
+
+
+def test_a_template_holding_a_yaml_sequence_is_passed_over_and_not_misread_as_json(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "stack.template", "[a, b]\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 1)  # no could-not-be-parsed reason
+
+
+def test_a_template_holding_a_yaml_flow_mapping_is_read_as_yaml(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "stack.template", "{Resources: {I: {Type: AWS::EC2::Instance, Properties: {InstanceType: c5.18xlarge}}}}\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["files_scanned"] == 2 and [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", "stack.template")]
+
+
+def test_a_json_template_is_still_read_as_json(tmp_path):
+    put(tmp_path, "stack.template", json.dumps({"Resources": {"I": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}}}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["files_scanned"] == 2 and [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", "stack.template")]
+
+
+@pytest.mark.parametrize("text", ["{ not json : [\n", "Resources: [unclosed\n"])
+def test_a_template_that_is_neither_json_nor_yaml_is_reported_as_could_not_be_parsed(tmp_path, text):
+    pytest.importorskip("yaml")
+    put(tmp_path, "stack.template", text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "stack.template: could not be parsed" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def test_a_deployment_list_item_with_no_kind_is_reported_and_a_valid_item_is_still_analysed(tmp_path):
+    no_kind = {"spec": {"containers": [{"name": "c"}]}}
+    valid = {"kind": "Deployment", "metadata": {"name": "d"}, "spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}}
+    put(tmp_path, "list.json", json.dumps({"kind": "DeploymentList", "items": [no_kind, valid]}))
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "list.json::DeploymentList[0]: DeploymentList item has no kind and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert ("Deployment/d", "major") in hits(result, "k8s-missing-requests")
+
+
+@pytest.mark.parametrize("name", ["stack.template", "stack.json"])
+def test_a_non_finite_json_retention_is_not_a_literal_and_fails_the_scan(tmp_path, name):
+    put(tmp_path, name, '{"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": 1e400}}}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert f"{name}::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def test_a_non_finite_yaml_retention_fails_the_scan_like_json(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "stack.yaml", "Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: .inf\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "stack.yaml::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("name", ["dep.yaml", "dep.yml"])
+def test_a_tab_indented_json_deployment_in_a_yaml_file_is_read_as_json(tmp_path, name):
+    pytest.importorskip("yaml")
+    tab_json = '{\n\t"kind": "Deployment",\n\t"metadata": {"name": "d"},\n\t"spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}\n}\n'
+    put(tmp_path, name, tab_json)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert ("Deployment/d", "major") in hits(result, "k8s-missing-requests") and result["files_scanned"] == 2
+
+
+@pytest.mark.parametrize("name", ["bad.yaml", "bad.yml"])
+def test_a_yaml_file_with_neither_yaml_nor_json_syntax_is_reported_as_could_not_be_parsed(tmp_path, name):
+    pytest.importorskip("yaml")
+    put(tmp_path, name, "key: [unclosed\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert f"{name}: could not be parsed" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def _cfn_log_group_json(value: str) -> str:
+    return '{"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": %s}}}}' % value
+
+
+def _cfn_log_group_yaml(value: str) -> str:
+    return "Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: %s\n" % value
+
+
+@pytest.mark.parametrize("name", ["s.template", "s.json", "s.yaml"])
+def test_a_repeated_key_is_reported_as_a_duplicate_and_fails_the_scan(tmp_path, name):
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+        text = 'Resources:\n  A:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: c5.18xlarge\nResources:\n  B:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: m5.large\n'
+    else:
+        text = '{"Resources": {"A": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}}, "Resources": {"B": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "m5.large"}}}}'
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert f'{name}: duplicate key "Resources" in the document: the earlier value was not evaluated' in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("name", ["s.template", "s.json", "s.yaml"])
+def test_a_document_with_no_repeated_key_has_no_duplicate_reason(tmp_path, name):
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+        text = "Resources:\n  A:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: c5.18xlarge\n"
+    else:
+        text = '{"Resources": {"A": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}}}'
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert not [f for f in result["findings"] if "duplicate key" in f["summary"]]
+    assert [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", name)]
+
+
+@pytest.mark.parametrize("name, text", [
+    ("s.json", _cfn_log_group_json("-30")),
+    ("s.json", _cfn_log_group_json("5e-400")),
+    ("s.yaml", _cfn_log_group_yaml("-30")),
+    ("s.yaml", _cfn_log_group_yaml("5.0e-400")),
+])
+def test_a_non_positive_retention_is_not_a_literal_and_fails_the_scan(tmp_path, name, text):
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert f"{name}::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert not [f for f in result["findings"] if f["rule"] == "iac-missing-lifecycle"]  # not the old minor set-retention finding
+
+
+@pytest.mark.parametrize("name, text", [("s.json", _cfn_log_group_json("30")), ("s.yaml", _cfn_log_group_yaml("30"))])
+def test_a_positive_retention_still_passes(tmp_path, name, text):
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)
+
+
+@pytest.mark.parametrize("name", ["s.json", "s.yaml"])
+def test_a_retention_too_large_for_a_float_fails_only_its_value_and_the_rest_is_judged(tmp_path, name):
+    big = "1" * 400
+    other = {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+        text = f"Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: {big}\n  I:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: c5.18xlarge\n"
+    else:
+        text = '{"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": %s}}, "I": %s}}' % (big, json.dumps(other))
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert result["status"] == "fail" and len(summaries) == 1
+    assert f"{name}::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in summaries[0]
+    assert "could not be evaluated" not in summaries[0]  # the document was not lost as a whole
+    assert ("iac-oversized-instance", name) in [(f["rule"], f["file"]) for f in result["findings"]]  # the other resource is still judged
+
+
+@pytest.mark.parametrize("name", ["s.template", "s.json", "s.yaml"])
+def test_a_data_object_with_a_repeated_key_is_passed_over_silently(tmp_path, name):
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+        text = "name: a\nname: b\n"
+    else:
+        text = '{"name": "a", "name": "b"}'
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # no duplicate-key reason for a non-IaC document
+
+
+def test_a_repeated_key_in_a_data_document_beside_an_iac_document_stays_silent(tmp_path):
+    pytest.importorskip("yaml")
+    text = "Resources:\n  A:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: m5.large\n---\nname: a\nname: b\n"
+    put(tmp_path, "stack.yaml", text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)
+
+
+def test_a_json_object_with_a_repeated_data_key_is_passed_over_silently(tmp_path):
+    put(tmp_path, "data.json", '{"data": {"a": 1}, "data": {"b": 2}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # data is not an IaC marker
+
+
+def test_a_terraform_json_document_with_a_repeated_resource_key_is_reported_and_fails(tmp_path):
+    resource = {"aws_instance": {"a": {"instance_type": "m5.large"}}}
+    put(tmp_path, "main.tf.json", '{"resource": %s, "resource": {"aws_instance": {"b": {"instance_type": "m5.large"}}}}' % json.dumps(resource))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert 'main.tf.json: duplicate key "resource" in the document: the earlier value was not evaluated' in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("module", [{"a": 1}, {"net": {"version": "1"}}, {}])
+def test_a_json_module_key_that_is_not_a_terraform_module_block_is_passed_over(tmp_path, module):
+    put(tmp_path, "mod.json", json.dumps({"module": module}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # an ordinary JSON object, not a module
+
+
+def test_a_terraform_shaped_module_block_in_a_json_object_is_reported_not_evaluated(tmp_path):
+    put(tmp_path, "main.tf.json", json.dumps({"module": {"net": {"source": "./net"}}}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "main.tf.json::module.net: module block is not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def test_a_repeated_resource_key_nested_in_a_data_document_is_passed_over(tmp_path):
+    put(tmp_path, "d.json", '{"items": [{"resource": "x", "resource": "y"}]}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # the root is not IaC
+
+
+def test_a_top_level_array_with_a_repeated_resource_key_is_passed_over(tmp_path):
+    put(tmp_path, "d.json", '[{"resource": "x", "resource": "y"}]')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 1)  # the array is out of scope
+
+
+def test_a_repeated_marker_name_nested_in_a_data_object_is_passed_over(tmp_path):
+    put(tmp_path, "d.json", '{"meta": {"Resources": 1, "Resources": 2}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)
+
+
+def test_a_repeated_key_inside_a_terraform_json_module_block_is_reported_and_fails(tmp_path):
+    put(tmp_path, "main.tf.json", '{"module": {"net": {"source": "./net", "count": 3}, "net": {"source": "./net"}}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    summary = next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert 'main.tf.json: duplicate key "net" in the document: the earlier value was not evaluated' in summary
+
+
+def test_a_terraform_json_module_mapping_with_a_non_block_sibling_fails_naming_both(tmp_path):
+    put(tmp_path, "main.tf.json", '{"module": {"net": {"source": "./net"}, "a": 1}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    summary = next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert "main.tf.json::module.net: module block is not evaluated" in summary
+    assert "main.tf.json::module.a: module entry is not a Terraform module block and was not evaluated" in summary
+
+
+def test_a_null_log_group_retention_gives_the_retention_reason_and_fails(tmp_path):
+    put(tmp_path, "s.json", '{"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": null}}}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "s.json::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert not [f for f in result["findings"] if f["rule"] == "iac-missing-lifecycle"]  # null is not the never-set minor finding
+
+
+def test_zero_retention_is_the_same_minor_finding_in_terraform_and_terraform_json(tmp_path):
+    put(tmp_path, "a/main.tf", 'resource "aws_cloudwatch_log_group" "g" {\n  retention_in_days = 0\n}\n')
+    put(tmp_path, "b/main.tf.json", '{"resource": {"aws_cloudwatch_log_group": {"g": {"retention_in_days": 0}}}}')
+    result = scan(tmp_path)
+    assert result["status"] == "ok"
+    minors = [f for f in result["findings"] if f["rule"] == "iac-missing-lifecycle"]
+    assert len(minors) == 2 and {f["severity"] for f in minors} == {"minor"}
+    by_file = {f["file"]: f for f in minors}
+    hcl, json_form = by_file["a/main.tf"], by_file["b/main.tf.json"]
+    assert hcl["summary"] == json_form["summary"]
+    # the finding id is rule:file:ref, so the two differ only by the file path; rule and ref are the same
+    assert hcl["id"].split(":")[0] == json_form["id"].split(":")[0] and hcl["id"].split(":")[-1] == json_form["id"].split(":")[-1] == "aws_cloudwatch_log_group.g"
+
+
+@pytest.mark.parametrize("pair, duplicate", [(("1", '"1"'), False), (("0x1", "1"), True)])
+def test_yaml_keys_are_compared_by_their_constructed_value(tmp_path, pair, duplicate):
+    pytest.importorskip("yaml")
+    first, second = pair
+    put(tmp_path, "s.yaml", f"Resources:\n  G:\n    Type: AWS::EC2::Instance\n    Properties:\n      {first}: a\n      {second}: b\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    if duplicate:
+        assert result["status"] == "fail"
+        assert 's.yaml: duplicate key "1" in the document: the earlier value was not evaluated' in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    else:
+        assert (result["status"], result["findings"]) == ("ok", [])
+
+
+@pytest.mark.parametrize("literal, status", [("1.0e+2", "ok"), ("1e2", "fail")])
+def test_a_yaml_float_retention_with_a_dot_and_signed_exponent_is_read_and_one_without_is_a_string(tmp_path, literal, status):
+    pytest.importorskip("yaml")
+    put(tmp_path, "s.yaml", f"Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: {literal}\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == status
+    if status == "fail":
+        assert "s.yaml::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("text", ["time: 1:30.5\n", "time: 190:20:30.15\n", "time: ._.\n"])
+def test_a_base_60_or_dotted_yaml_value_does_not_abort_the_scan(tmp_path, text):
+    pytest.importorskip("yaml")
+    put(tmp_path, "t.yaml", text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # the document is read, main.tf stays ok
+
+
+def test_a_base_60_retention_is_a_non_literal_and_gives_the_retention_reason(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "s.yaml", "Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: 1:30.5\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "s.yaml::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("name, expected", [("1.0e+2", "100.0"), ("1.50", "1.5")])
+def test_a_yaml_float_name_prints_as_a_float(tmp_path, name, expected):
+    pytest.importorskip("yaml")
+    put(tmp_path, "d.yaml", f"kind: Deployment\nmetadata: {{name: {name}}}\nspec:\n  template:\n    spec:\n      containers:\n      - name: c\n")
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert any(f["summary"].startswith(f"Deployment/{expected} container c has no cpu or memory request") for f in result["findings"])
+
+
+def test_a_json_float_name_prints_as_a_float(tmp_path):
+    put(tmp_path, "d.json", '{"kind": "Deployment", "metadata": {"name": 1E2}, "spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert any(f["summary"].startswith("Deployment/100.0 container c has no cpu or memory request") for f in result["findings"])
+
+
+def test_float_text_decides_zero_underflow_and_a_retention_of_one_hundred(tmp_path):
+    mod = module()
+    assert mod._doc_retention(mod._NumText("1.0e+2")) is True and float(mod._NumText("1.0e+2")) == 100.0  # reads as 100
+    assert mod._doc_retention(mod._NumText("5e-400")) is None  # an underflow, read from the text, is not zero
+    assert mod._doc_retention(mod._NumText("0.0")) is False  # a zero literal
+    put(tmp_path, "s.json", '{"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": 5e-400}}}}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and "retention_in_days is not a literal" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def test_a_module_key_in_a_data_json_file_is_an_ordinary_object(tmp_path):
+    put(tmp_path, "data.json", json.dumps({"name": "app", "module": {"widget": {"source": "docs/widget.md", "title": "Widget"}}}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # Terraform reads only *.tf.json
+
+
+def test_the_same_module_block_in_a_terraform_json_file_is_still_reported(tmp_path):
+    put(tmp_path, "main.tf.json", json.dumps({"module": {"widget": {"source": "docs/widget.md", "title": "Widget"}}}))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "main.tf.json::module.widget: module block is not evaluated" in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("name", ["s.json", "s.yaml"])
+def test_a_retention_longer_than_4000_digits_gives_the_retention_reason_and_judges_the_rest(tmp_path, name):
+    big = "1" * 5000
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+        text = f"Resources:\n  G:\n    Type: AWS::Logs::LogGroup\n    Properties:\n      RetentionInDays: {big}\n  I:\n    Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: c5.18xlarge\n"
+    else:
+        text = '{"Resources": {"G": {"Type": "AWS::Logs::LogGroup", "Properties": {"RetentionInDays": %s}}, "I": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}}}' % big
+    put(tmp_path, name, text)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    summary = next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert result["status"] == "fail"
+    assert f"{name}::AWS::Logs::LogGroup:G: retention_in_days is not a literal and was not evaluated" in summary
+    assert "could not be parsed" not in summary  # the document is not lost as a whole
+    assert ("iac-oversized-instance", name) in [(f["rule"], f["file"]) for f in result["findings"]]  # the other resource is still judged
+
+
+def test_a_long_integer_marker_renders_as_its_text(tmp_path):
+    mod = module()
+    text = "7" * 5000
+    marker = mod._TooLongInt(text)
+    assert str(marker) == text and f"{marker}" == text and repr(marker) == text
+
+
+@pytest.mark.parametrize("digits", [40, 4001])
+def test_a_repeated_explicit_key_of_any_length_in_a_resources_mapping_is_reported(tmp_path, digits):
+    pytest.importorskip("yaml")
+    key = "1" * digits
+    block = f"  ? {key}\n  : Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: m5.large\n"
+    put(tmp_path, "s.yaml", "Resources:\n" + block + block)
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"  # the 40-digit and the 4001-digit key are treated alike
+    assert f's.yaml: duplicate key "{key}" in the document: the earlier value was not evaluated' in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def test_a_long_integer_marker_equals_only_a_marker_with_the_same_text(tmp_path):
+    mod = module()
+    first, second = mod._TooLongInt("7" * 4001), mod._TooLongInt("7" * 4001)
+    assert first == second and hash(first) == hash(second) and len({first, second}) == 1
+    assert first != mod._TooLongInt("8" * 4001)
+    assert first != 7 and first != 7.0 and first != "7" * 4001
+
+
+RESOURCE_DOCUMENT = {"resource": {"aws_instance": {"web": {"instance_type": "c5.18xlarge"}}}}
+
+
+def test_a_terraform_resource_document_in_a_data_json_file_is_an_ordinary_object(tmp_path):
+    put(tmp_path, "data.json", json.dumps(RESOURCE_DOCUMENT))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)  # Terraform reads only *.tf.json
+
+
+def test_the_same_terraform_resource_document_in_a_terraform_json_file_is_still_judged(tmp_path):
+    put(tmp_path, "main.tf.json", json.dumps(RESOURCE_DOCUMENT))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", "main.tf.json")]
+
+
+def test_a_cloudformation_resources_document_in_a_json_file_is_still_judged(tmp_path):
+    put(tmp_path, "stack.json", json.dumps({"Resources": {"I": {"Type": "AWS::EC2::Instance", "Properties": {"InstanceType": "c5.18xlarge"}}}}))
+    result = scan(tmp_path)
+    assert [(f["rule"], f["file"]) for f in result["findings"]] == [("iac-oversized-instance", "stack.json")]
+
+
+def test_a_repeated_resource_key_at_the_root_of_a_data_json_file_is_passed_over(tmp_path):
+    put(tmp_path, "data.json", '{"resource": 1, "resource": 2}')
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], result["findings"], result["files_scanned"]) == ("ok", [], 2)
+
+
+def _resources_with_keys(*keys: str) -> str:
+    return "Resources:\n" + "".join(f"  ? {key}\n  : Type: AWS::EC2::Instance\n    Properties:\n      InstanceType: m5.large\n" for key in keys)
+
+
+@pytest.mark.parametrize("first, second", [("+" + "1" * 4001, "1" * 4001), ("1" * 4001, "+" + "1" * 4001)])
+def test_a_plus_prefixed_long_key_and_a_plain_long_key_of_the_same_value_are_a_duplicate(tmp_path, first, second):
+    pytest.importorskip("yaml")
+    put(tmp_path, "s.yaml", _resources_with_keys(first, second))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert f's.yaml: duplicate key "{second}" in the document: the earlier value was not evaluated' in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+def test_a_long_leading_zero_key_is_octal_as_pyyaml_reads_it_so_it_is_not_its_decimal_twin(tmp_path):
+    pytest.importorskip("yaml")
+    # PyYAML (YAML 1.1) reads a leading zero as octal: 0000000000 followed by 4000 ones is a different integer from 4000 ones in decimal
+    put(tmp_path, "s.yaml", _resources_with_keys("0" * 10 + "1" * 4000, "1" * 4000))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], [f for f in result["findings"] if "duplicate key" in f["summary"]]) == ("ok", [])
+
+
+def test_a_leading_zero_key_equal_to_a_decimal_key_by_pyyaml_octal_reading_is_a_duplicate(tmp_path):
+    pytest.importorskip("yaml")
+    put(tmp_path, "s.yaml", _resources_with_keys("0111", "73"))  # 0111 is octal 73, the same integer as 73
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert 's.yaml: duplicate key "73" in the document' in next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+
+
+@pytest.mark.parametrize("first, second", [("1" * 4001, "2" * 4001), ("+" + "1" * 4001, "-" + "1" * 4001)])
+def test_long_keys_of_different_value_are_not_duplicates(tmp_path, first, second):
+    pytest.importorskip("yaml")
+    put(tmp_path, "s.yaml", _resources_with_keys(first, second))
+    put(tmp_path, "main.tf", CLEAN_MAIN)
+    result = scan(tmp_path)
+    assert (result["status"], [f for f in result["findings"] if "duplicate key" in f["summary"]]) == ("ok", [])
+
+
+def test_a_long_integer_marker_compares_by_its_value_with_a_plain_int(tmp_path):
+    mod = module()
+    plus = mod._TooLongInt("+" + "1" * 4001)
+    assert plus == mod._TooLongInt("1" * 4001) and hash(plus) == hash(mod._TooLongInt("1" * 4001))
+    leading = mod._TooLongInt("0000" + "1" * 4000)
+    assert leading == int("1" * 4000) and hash(leading) == hash(int("1" * 4000))
+    assert mod._TooLongInt("-" + "1" * 4001) != plus
+    assert plus != 7.0 and plus != "1" * 4001
+
+
+def test_interpolated_type_values_still_record_a_reason_after_the_scan_completeness_fixes(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  instance_type = "${var.size}"\n}\n')
+    result = scan(tmp_path)
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"] and result["status"] == "fail"
+    assert "instance_type is an interpolation and was not evaluated" in result["findings"][0]["summary"]
 
 
 def test_a_named_pipe_with_a_manifest_name_is_skipped_instead_of_blocking_the_scan(tmp_path):

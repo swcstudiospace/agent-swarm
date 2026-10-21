@@ -4,7 +4,7 @@
 Scans catalog-info.{yaml,yml,json} (also catalog-info.<name>.yaml, in any letter case) under --root (or the file/directory given by --path), flattens
 every Backstage-style entity and applies the same rules as the registry tool plat_catalog_lint (swarm/tools/a17_tools.py), plus a
 repository-wide dependsOn graph check (cycles, dangling targets, deprecated or experimental dependencies) and an apiVersion check.
-Bounded: files over 1 MiB, binaries and symlinks that leave the root are skipped and listed under `skipped` (at most 100 entries, then
+Bounded: files over 1 MiB, binaries, symlinks that leave the root, symlinked directories (never descended) and directories that cannot be listed are skipped and listed under `skipped` (at most 100 entries, then
 a `skipped:more:<n>` marker); at most 2000 descriptors are read and the dependsOn graph check covers at most 300 entities. YAML needs
 PyYAML: without it a YAML file that is not also valid JSON is reported as `skipped:tool-missing`; JSON descriptors are always handled natively.
 Every skipped file, a truncated scan, a skipped graph check and an empty scan (no descriptor analysed) add a major `scan-incomplete`
@@ -59,21 +59,33 @@ def _string_list(value) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
-def _discover(target: Path) -> tuple[list[Path], bool]:
-    """Descriptor files in deterministic order, and whether a bound cut the walk. Directory symlinks are never descended."""
+def _discover(root: Path, target: Path, skipped: list[str]) -> tuple[list[Path], bool]:
+    """Descriptor files in deterministic order, and whether a bound cut the walk. A directory that cannot be listed and a symlinked
+    directory (never descended) are recorded in `skipped` by name: the descriptors behind them were not analysed."""
     if target.is_file():
         return [target], False
     found: list[Path] = []
     visited = 0
     truncated = False
-    for current, dirs, files in os.walk(target, followlinks=False):
+
+    def unlistable(error: OSError) -> None:
+        directory = Path(error.filename) if error.filename else target
+        skipped.append(f"skipped:unreadable-dir:{_rel(root, directory)}: {error.__class__.__name__}")
+
+    for current, dirs, files in os.walk(target, followlinks=False, onerror=unlistable):
+        for name in dirs:
+            if name not in SKIP_DIRS and (Path(current) / name).is_symlink():
+                skipped.append(f"skipped:symlink-dir:{_rel(root, Path(current) / name)}")
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
         for name in sorted(files):
             visited += 1
-            if visited > MAX_VISITED or len(found) >= MAX_DESCRIPTORS:
+            if visited > MAX_VISITED:  # the file walk is bounded too: files past the bound are unexamined, so the scan is incomplete
                 truncated = True
                 break
             if DESCRIPTOR_NAME.fullmatch(name):
+                if len(found) >= MAX_DESCRIPTORS:  # only a descriptor beyond the bound makes the descriptor scan incomplete
+                    truncated = True
+                    break
                 found.append(Path(current) / name)
         if truncated:
             break
@@ -180,7 +192,7 @@ def _finding(rule: str, subject: str, severity: str, summary: str, location: str
 def lint_tree(root: Path, target: Path, tiers: tuple[str, ...]) -> dict:
     skipped: list[str] = []
     incomplete_reasons: list[str] = []
-    files, truncated = _discover(target)
+    files, truncated = _discover(root, target, skipped)
     yaml_module = _yaml_module()
     findings: list[dict] = []
     entries: list[dict] = []

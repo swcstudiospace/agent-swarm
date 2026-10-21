@@ -155,13 +155,18 @@ def test_file_names_recognised_as_dockerfiles_and_workflows(tmp_path):
     assert code == 0 and out["files_scanned"] == {"dockerfiles": 4, "workflows": 1}
 
 
-def test_vendor_and_state_directories_are_skipped(tmp_path):
+def test_out_of_scope_directories_are_pruned_and_build_dist_vendor_are_scanned(tmp_path):
     repo = tmp_path / "repo"
     put(repo, "Dockerfile", CLEAN_DOCKERFILE)
-    for skipped in ("node_modules/pkg", ".git/hooks", ".venv/lib", "venv", "dist", "build", "__pycache__", ".swarm", ".tox", "vendor"):
+    for skipped in ("node_modules/pkg", ".git/hooks", ".venv/lib", "venv", "__pycache__", ".swarm", ".tox"):
         put(repo, f"{skipped}/Dockerfile", BAD_DOCKERFILE)
     code, out = scan(tmp_path)
-    assert code == 0 and out["files_scanned"]["dockerfiles"] == 1
+    assert code == 0 and out["files_scanned"]["dockerfiles"] == 1 and out["skipped"] == []
+    for scanned in ("build", "dist", "vendor"):  # build outputs and vendored trees can hold real images: never a silent pass
+        put(repo, f"{scanned}/Dockerfile", BAD_DOCKERFILE)
+    code, out = scan(tmp_path)
+    assert code == 1 and out["status"] == "fail" and out["files_scanned"]["dockerfiles"] == 4
+    assert {f["location"].split(":")[0].split("/")[0] for f in out["findings"]} == {"build", "dist", "vendor"}
 
 
 def test_files_over_one_mebibyte_binaries_and_symlinks_are_skipped_not_followed(tmp_path):
@@ -425,3 +430,88 @@ def test_path_through_a_symlink_is_refused_with_an_input_error(tmp_path):
     code, out, _ = run_script(tmp_path, "--root", str(repo), "--path", "link")
     assert code == 2 and out["status"] == "error" and out["error"]["code"] == "E-INPUT"
     assert "symlink" in out["error"]["message"]
+
+
+def test_unparseable_workflow_is_incomplete_and_the_reason_names_the_file(tmp_path):
+    pytest.importorskip("yaml")
+    repo = tmp_path / "repo"
+    put(repo, ".github/workflows/broken.yml", "jobs: [unclosed\n  - x: : :\n")
+    code, out = scan(tmp_path)
+    assert code == 1 and out["status"] == "fail"  # the container-privilege check never ran on this file
+    assert out["skipped"] == [".github/workflows/broken.yml: skipped:unparseable-yaml (container options)"]
+    assert {f["id"] for f in out["findings"]} == {"workflow.unparseable", "scan/incomplete"}
+    assert "broken.yml" in next(f["summary"] for f in out["findings"] if f["id"] == "scan/incomplete")
+
+
+def test_action_metadata_needs_no_pyyaml_and_a_local_dockerfile_image_is_no_finding(tmp_path):
+    module = load_script()
+    module._load_yaml = lambda: None
+    repo = tmp_path / "repo"
+    put(repo, ".github/actions/build/action.yml", "name: build\nruns:\n  using: docker\n  image: Dockerfile\n")
+    result = module.scan(repo.resolve(), repo.resolve())
+    assert result["status"] == "ok" and result["skipped"] == [] and result["findings"] == []
+    assert result["files_scanned"] == {"dockerfiles": 0, "workflows": 1}
+
+
+def test_a_workflow_named_action_yml_is_linted_as_a_workflow(tmp_path):
+    pytest.importorskip("yaml")
+    repo = tmp_path / "repo"
+    put(repo, ".github/workflows/action.yml", "jobs:\n  build:\n    runs-on: ubuntu-latest\n    container:\n      image: alpine:latest\n"
+                                             "      options: --privileged\n    steps:\n      - run: echo hi\n")
+    code, out = scan(tmp_path)
+    assert code == 1 and out["status"] == "fail"
+    found = {(f["id"], f["severity"]) for f in out["findings"]}
+    assert ("pin.image-latest", "major") in found and ("workflow.container-privileged", "major") in found
+
+
+def test_new11_an_unreadable_directory_is_a_redacted_skip_and_no_credential_reaches_the_output(tmp_path, monkeypatch):
+    import types
+
+    module = load_script()
+    repo = tmp_path / "repo"
+    put(repo, "u:hunter2@host/Dockerfile", CLEAN_DOCKERFILE)
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if "hunter2" in str(path):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    out = module.scan(repo.resolve(), repo.resolve())
+    assert out["status"] == "fail"
+    assert "***@host: unreadable:PermissionError" in out["skipped"]
+    assert "hunter2" not in json.dumps(out)
+    result = module.run(types.SimpleNamespace(path="."), types.SimpleNamespace(root=repo.resolve(), dry_run=False))
+    assert result["status"] == "fail" and "hunter2" not in json.dumps(result)
+
+
+def test_new11_any_other_failure_in_run_is_a_redacted_fail_result_not_a_traceback(tmp_path, monkeypatch):
+    import types
+
+    module = load_script()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def boom(root, relative):
+        raise PermissionError(13, "Permission denied", "u:hunter2@host/x")
+
+    monkeypatch.setattr(module, "_no_symlink_on_path", boom)
+    result = module.run(types.SimpleNamespace(path="."), types.SimpleNamespace(root=repo.resolve(), dry_run=False))
+    assert result["status"] == "fail" and "hunter2" not in json.dumps(result)
+    assert [f["id"] for f in result["findings"]] == ["scan/incomplete"] and "PermissionError" in result["summary"]
+
+
+def test_new15_an_invalid_task_id_is_not_echoed_to_stdout_or_the_events_log(tmp_path, monkeypatch, capsys):
+    module = load_script()
+    state = tmp_path / "swarm-state"
+    monkeypatch.setenv("SWARM_DIR", str(state))
+    script = module.AgentScript("A18", "supply_image_lint", module.run, description=module.__doc__, add_args=module.add_args)
+    rc = script.main(["--task-id", "u:hunter2@host", "--root", str(tmp_path / "repo")])
+    shown = capsys.readouterr()
+    assert rc == 2 and "hunter2" not in shown.out + shown.err
+    assert "invalid task id: 14 characters, contains a character outside [A-Za-z0-9._-]" in shown.out
+    events = (state / "events.jsonl").read_text(encoding="utf-8")
+    assert "supply_image_lint.error" in events and "hunter2" not in events
+    rc = script.main(["--json", "--task-id", "u:hunter2@host", "--root", str(tmp_path / "repo")])
+    assert rc == 2 and "hunter2" not in capsys.readouterr().out

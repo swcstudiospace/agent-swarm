@@ -89,7 +89,8 @@ QUOTA_HOT = Fraction(9, 10)  # used / quota >= 90% is hot
 QUOTA_IDLE = Fraction(1, 5)  # used / quota < 20% is idle
 
 _NUMERIC_TEXT = re.compile(r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?")
-_INTEGER_TEXT = re.compile(r"[+-]?[0-9]{1,40}")
+_INTEGER_TEXT = re.compile(r"[+-]?[0-9]+")  # any digit count: compared exactly with the schema bounds
+_ZERO_TEXT = re.compile(r"[+-]?(0+(\.0*)?|\.0+)([eE][+-]?[0-9]+)?")
 _SEMVER = re.compile(r"v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})")
 _NAME = re.compile(r"(?:[A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]")  # upstream isValidObjectName
 _NAMESPACE = re.compile(r"[a-z0-9]+(?:-+[a-z0-9]+)*")  # upstream isValidNamespace (a lowercase DNS label)
@@ -486,16 +487,23 @@ def _limit_change(found: list[dict], stem: str, path: str, old, new, upper: bool
 
 
 def _optional_new_parent(path: str, old: dict[str, dict], new: dict[str, dict]) -> str | None:
-    """The shallowest listed ancestor of `path` that is new in this version and optional, else None.
+    """The shallowest ancestor of `path` that existing claims cannot set and that is new and optional, else None.
 
-    JSON Schema `required` binds a child only when its parent object is present. A claim written against the old schema cannot set
-    a parent that did not exist, so a required child of a new optional parent breaks no existing claim. An ancestor that is
-    listed in neither version is unknown and is conservatively assumed to be settable by existing claims.
+    A claim sets a path with every ancestor present (claim_validate's presence rule), and `required` binds only when all of them are
+    present. An ancestor is settable by existing claims when the old schema lists it or any path under it: `a.b` listed as a string
+    makes `a` and `a.b` present. A required child whose ancestors are all settable, or that has no ancestor, is breaking (None). An
+    unsettable new optional ancestor means the child never binds for an existing claim.
     """
     parts = path.split(".")
-    for depth in range(1, len(parts)):
-        parent = ".".join(parts[:depth])
-        if parent not in old and parent in new and not new[parent]["required"]:
+    ancestors = [".".join(parts[:depth]) for depth in range(1, len(parts))]
+
+    def settable(parent: str) -> bool:
+        return any(listed == parent or listed.startswith(parent + ".") for listed in old)
+
+    if all(settable(parent) for parent in ancestors):
+        return None
+    for parent in ancestors:
+        if not settable(parent) and parent in new and not new[parent]["required"]:
             return parent
     return None
 
@@ -574,7 +582,10 @@ def composition_diff(payload: dict) -> dict:
 
 
 def _decimal(text: str) -> Decimal | None:
-    """The exact Decimal of numeric text, or None when its exponent is outside the Decimal range (the value is then out of range)."""
+    """The exact Decimal of numeric text. Zero is zero at any exponent ("0E-1000", "0E99999999999999999999"), so it is read from its
+    mantissa; a non-zero value whose exponent is outside the Decimal range is None, which the caller reports as out of range."""
+    if _ZERO_TEXT.fullmatch(text):
+        return Decimal(0)
     try:
         return Decimal(text)
     except InvalidOperation:
@@ -588,7 +599,7 @@ def _claim_number(item: dict, index: int) -> Decimal | None:
     if kind == "integer":
         if not _INTEGER_TEXT.fullmatch(text):
             raise _Bad("claim", f"claim[{index}] {_ident(item['path'], 200)}: value ({len(text)} chars) is not an integer")
-        return Decimal(int(text))
+        return Decimal(text)  # exact at any digit count; never int(), which has a digit limit
     if kind == "number":
         if not _NUMERIC_TEXT.fullmatch(text):
             raise _Bad("claim", f"claim[{index}] {_ident(item['path'], 200)}: value ({len(text)} chars) is not a number")

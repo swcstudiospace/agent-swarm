@@ -1287,3 +1287,157 @@ def test_landing_zone_empty_evaluation_scores_zero_and_cannot_pass_without_accou
         assert result["guardrail_coverage_pct"] == 0.0, accounts
         assert severity_of(result, "guardrails-not-evaluated") == "major" and result["verdict"] == "fail", accounts
         assert "guardrails-not-evaluated" in ids(result), accounts
+
+
+# --- QA-03 re-review: availability at 100% and numeric ranges ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("replicas,needed,shared", [(1, 1, False), (3, 2, False), (2, 1, True)])
+def test_composite_availability_of_exactly_100_percent_is_invalid_input_naming_availability_pct(replicas, needed, shared):
+    result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 100, replicas, needed, shared)]})
+    assert result["state"] == "INVALID_INPUT" and result["field"] == "availability_pct"
+
+
+def test_composite_availability_just_below_100_percent_still_computes():
+    assert direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 99.9999, 3, 2)]})["state"] == "SUCCESS"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("startup_seconds", -1), ("startup_seconds", 86401), ("startup_seconds", 10 ** 400), ("startup_seconds", float("nan")),
+    ("startup_seconds", float("inf")), ("deploy_gap_days", -0.5), ("deploy_gap_days", 3651),
+])
+def test_twelve_factor_numeric_outside_the_schema_range_is_invalid_input_naming_the_field(key, value):
+    result = direct("twelve_factor_audit", {"service": {**CONFORMANT, key: value}})
+    assert result["state"] == "INVALID_INPUT" and result["field"] == key
+
+
+def test_twelve_factor_numeric_range_boundaries_are_inclusive_and_a_boolean_is_not_out_of_range():
+    for key, value in (("startup_seconds", 0), ("startup_seconds", 86400), ("deploy_gap_days", 3650)):
+        assert direct("twelve_factor_audit", {"service": {**CONFORMANT, key: value}})["state"] == "SUCCESS", (key, value)
+    result = direct("twelve_factor_audit", {"service": {**CONFORMANT, "startup_seconds": True}})
+    assert result["state"] == "SUCCESS" and "factor-09:startup_seconds" in ids(result)  # a failing check, not a range error
+
+
+# --- QA-03 second re-verification: zero availability with no replica needed, and integers beyond the conversion limit -----
+
+
+def test_zero_availability_with_no_replica_needed_is_invalid_input_naming_availability_pct_on_a_direct_call():
+    # min_required 0 is outside the registered schema (minimum 1), so only a direct call reaches the 0**0 in the k-of-n term
+    result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 0, 1, 0)]})
+    assert result["state"] == "INVALID_INPUT" and result["field"] == "availability_pct"
+    assert "min_required" in result["message"]
+
+
+def test_zero_availability_with_one_replica_needed_still_computes_a_zero_tier():
+    result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 0, 1, 1)]})
+    assert result["state"] == "SUCCESS" and result["composite_pct"] == 0.0 and result["verdict"] == "fail"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("startup_seconds", 10 ** 5000), ("startup_seconds", -(10 ** 5000)), ("deploy_gap_days", 10 ** 5000),
+], ids=["startup-plus", "startup-minus", "deploy-plus"])
+def test_twelve_factor_integer_beyond_the_conversion_limit_is_invalid_input_naming_the_field(key, value):
+    result = direct("twelve_factor_audit", {"service": {**CONFORMANT, key: value}})
+    assert result["state"] == "INVALID_INPUT" and result["field"] == key
+
+
+def test_composite_availability_integer_beyond_the_conversion_limit_is_invalid_input_naming_availability_pct():
+    result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 10 ** 5000, 3, 2)]})
+    assert result["state"] == "INVALID_INPUT" and result["field"] == "availability_pct"
+
+
+def test_cell_capacity_load_beyond_the_conversion_limit_is_invalid_input_naming_load_rps_on_a_direct_call():
+    for load in (10 ** 5000, -(10 ** 5000)):
+        result = direct("cell_capacity", {**CELL, "load_rps": load})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "load_rps", load
+
+
+def test_composite_availability_target_beyond_the_conversion_limit_is_invalid_input_naming_target_pct_on_a_direct_call():
+    for target in (10 ** 5000, -(10 ** 5000)):
+        result = direct("composite_availability", {"target_pct": target, "tiers": [tier("a", 99)]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "target_pct", target
+
+
+def test_cell_capacity_cell_max_rps_beyond_the_conversion_limit_is_invalid_input_on_a_direct_call():
+    for value in (10 ** 5000, -(10 ** 5000)):
+        result = direct("cell_capacity", {**CELL, "cell_max_rps": value})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "cell_max_rps", value
+
+
+def test_cell_capacity_target_utilisation_beyond_the_conversion_limit_is_invalid_input_on_a_direct_call():
+    for value in (10 ** 5000, -(10 ** 5000)):
+        result = direct("cell_capacity", {**CELL, "target_utilisation_pct": value})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "target_utilisation_pct", value
+
+
+def test_cell_capacity_growth_beyond_the_conversion_limit_is_invalid_input_on_a_direct_call():
+    for value in (10 ** 5000, -(10 ** 5000)):
+        result = direct("cell_capacity", {**CELL, "growth_pct": value})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "growth_pct", value
+
+
+# --- QA-03 round two: schema bounds, bool/NaN/inf, target_pct interval, replicas maximum --------------------------------
+
+
+def test_cell_capacity_load_or_growth_outside_the_schema_is_invalid_input_naming_the_field():
+    # schema: load_rps exclusiveMinimum 0 and maximum 1e9; growth_pct 0..1000 (a negative growth gave a negative projected load)
+    for changes, field in (({"load_rps": -5}, "load_rps"), ({"load_rps": 0}, "load_rps"), ({"load_rps": 1000000001}, "load_rps"),
+                           ({"growth_pct": -200}, "growth_pct"), ({"growth_pct": 1001}, "growth_pct")):
+        result = direct("cell_capacity", {**CELL, **changes})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == field, changes
+    assert direct("cell_capacity", {**CELL, "growth_pct": 1000})["state"] == "SUCCESS"  # 1000 is the schema maximum
+
+
+def test_cell_capacity_spare_cells_outside_the_schema_or_the_conversion_limit_is_invalid_input_naming_spare_cells():
+    # schema: spare_cells integer 0..100
+    for value in (10 ** 5000, -(10 ** 5000), 101, -1):
+        result = direct("cell_capacity", {**CELL, "spare_cells": value})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "spare_cells", value
+    assert direct("cell_capacity", {**CELL, "spare_cells": 100})["state"] == "SUCCESS"  # 100 is the schema maximum
+
+
+def test_boolean_nan_and_infinity_on_every_numeric_field_are_invalid_input_naming_the_field():
+    bad = (True, float("nan"), float("inf"))
+    for field in ("load_rps", "cell_max_rps", "target_utilisation_pct", "growth_pct", "spare_cells", "current_cells"):
+        for value in bad:
+            result = direct("cell_capacity", {**CELL, field: value})
+            assert result["state"] == "INVALID_INPUT" and result["field"] == field, (field, value)
+    for value in bad:
+        result = direct("composite_availability", {"target_pct": value, "tiers": [tier("a", 99)]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "target_pct", value
+        result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", value)]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "availability_pct", value
+    for field in ("replicas", "min_required"):
+        result = direct("composite_availability", {"target_pct": 99, "tiers": [{**tier("a", 99, 3, 2), field: True}]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == field, field
+
+
+def test_composite_availability_target_of_0_or_100_is_invalid_input_naming_target_pct_on_a_direct_call():
+    # schema: target_pct exclusiveMinimum 0 and exclusiveMaximum 100; at 0 every chain passed, at 100 every chain failed
+    for target in (0, 100, 0.0, 100.0):
+        result = direct("composite_availability", {"target_pct": target, "tiers": [tier("a", 99)]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "target_pct", target
+    assert direct("composite_availability", {"target_pct": 99.99, "tiers": [tier("a", 99)]})["state"] == "SUCCESS"
+
+
+def test_composite_availability_replicas_beyond_the_schema_maximum_is_invalid_input_naming_replicas():
+    # schema: replicas integer 1..50; the k-of-n sum grows with replicas, so 10**4 took 17 s and 10**7 did not finish
+    for replicas in (51, 1000, 10 ** 4, 10 ** 7):
+        result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 99.9, replicas, 2)]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == "replicas", replicas
+    assert direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 99.9, 50, 2)]})["state"] == "SUCCESS"
+
+
+def test_integer_fields_reject_floats_and_still_accept_integers_and_continuous_fields_still_take_floats():
+    # schema: spare_cells, current_cells, replicas and min_required are integers. 2.0 has an integral value but is not an integer:
+    # it reached Fraction and range() as a float, and current_cells 3.0 returned SUCCESS with a float shortfall
+    for field, value in (("spare_cells", 2.0), ("current_cells", 3.0)):
+        result = direct("cell_capacity", {**CELL, field: value})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == field, field
+    assert direct("cell_capacity", {**CELL, "spare_cells": 2})["state"] == "SUCCESS"
+    assert direct("cell_capacity", {**CELL, "load_rps": 900.0})["state"] == "SUCCESS"  # a continuous field takes a float
+    for field, value in (("replicas", 2.0), ("min_required", 1.0)):
+        replicas, needed = (value, 1) if field == "replicas" else (2, value)
+        result = direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 99.9, replicas, needed)]})
+        assert result["state"] == "INVALID_INPUT" and result["field"] == field, field
+    assert direct("composite_availability", {"target_pct": 99, "tiers": [tier("a", 99.9, 2, 1)]})["state"] == "SUCCESS"

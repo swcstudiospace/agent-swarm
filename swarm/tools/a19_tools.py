@@ -80,7 +80,9 @@ HIGH_RECEIVE_COUNT = 20  # policy default: more attempts than this keeps a poiso
 _NODE_BUDGET = 20000
 _MAX_DEPTH = 150
 _MAX_JSON_DEPTH = 100
+_MAX_REF_HOPS = 64  # a $ref chain is followed this many hops; a longer chain is too long or cyclic
 SKEW_WARN = Decimal(2)  # policy default: the hottest partition carrying more than 2x the mean load is flagged
+_MAX_FINITE_S = Decimal("1e300")  # a duration beyond this cannot be reported as a finite JSON number
 
 
 # --- shared helpers -----------------------------------------------------------------------------------------------
@@ -147,14 +149,17 @@ def _safe(value, limit: int = 80) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _wrap(raw: list[tuple[str, str]], prefix: str) -> tuple[str, list[dict]]:
-    """Sort and number raw (severity, text) findings; the verdict is derived before any truncation."""
+def _wrap(raw: list[tuple[str, str]], prefix: str, pinned=()) -> tuple[str, list[dict]]:
+    """Sort and number raw (severity, text) findings; the verdict is derived before any truncation. `pinned` findings are kept
+    whatever the truncation: they take room from the findings it keeps, so the output never exceeds _MAX_FINDINGS (300)."""
     ordered = sorted(set(raw), key=lambda item: (_SEVERITY_RANK[item[0]], item[1]))
-    severities = {item[0] for item in ordered}
+    severities = {item[0] for item in ordered} | {item[0] for item in pinned}
     verdict = "fail" if severities & {"blocker", "major"} else "warn" if "minor" in severities else "pass"
-    kept = ordered if len(ordered) <= _MAX_FINDINGS else ordered[: _MAX_FINDINGS - 1]
-    items = [{"id": f"{prefix}-{i:03d}", "severity": sev, "summary": text[:_SUMMARY_MAX]} for i, (sev, text) in enumerate(kept, 1)]
-    if len(ordered) > _MAX_FINDINGS:
+    room = _MAX_FINDINGS - len(pinned)
+    kept = ordered if len(ordered) <= room else ordered[: room - 1]
+    chosen = sorted([*kept, *pinned], key=lambda item: (_SEVERITY_RANK[item[0]], item[1]))
+    items = [{"id": f"{prefix}-{i:03d}", "severity": sev, "summary": text[:_SUMMARY_MAX]} for i, (sev, text) in enumerate(chosen, 1)]
+    if len(ordered) > len(kept):
         items.append({"id": f"{prefix}-TRUNC", "severity": "info",
                       "summary": f"{len(ordered) - len(kept)} further findings omitted"})
     return verdict, items
@@ -327,8 +332,8 @@ class _JsonCompare:
     def _conjuncts(self, schema, side: str, depth: int = 0) -> list:
         """The schemas whose conjunction `schema` denotes. A `$ref` contributes its target, and its sibling keywords apply
         in addition (Draft 2019-09 and later, on both sides). Booleans may appear in the list."""
-        if depth > 20:
-            raise _Bad(self._field(side), "$ref chain is too long or cyclic")
+        if depth > _MAX_REF_HOPS:
+            raise _Bad(self._field(side), f"$ref chain exceeds {_MAX_REF_HOPS} hops: too long or cyclic")
         if isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
             target = _pointer(self.roots[side], schema["$ref"])
             if target is None:
@@ -697,6 +702,14 @@ def _avro_logical(schema: dict):
     return (logical, (schema.get("precision"), schema.get("scale", 0))) if logical == "decimal" else (logical, None)
 
 
+def _avro_aliases(node: dict, field: str, label: str) -> list[str]:
+    """The string aliases of a record, enum, fixed or field; a non-list value is INVALID_INPUT, never silently dropped."""
+    raw = node.get("aliases", [])
+    if not isinstance(raw, list) or not all(isinstance(a, str) for a in raw):
+        raise _Bad(field, f"Avro aliases of {label} must be a list of strings")
+    return raw
+
+
 def _avro_normalize(schema, namespace: str, names: dict, field: str) -> dict:
     """Schema JSON -> graph of nodes {k: kind, ...}; named types are shared objects, so recursion is a real cycle."""
     if isinstance(schema, str):
@@ -719,7 +732,7 @@ def _avro_normalize(schema, namespace: str, names: dict, field: str) -> dict:
             raise _Bad(field, f"Avro {kind} needs a non-empty name")
         full = raw if "." in raw else _avro_qualify(raw, schema["namespace"] if isinstance(schema.get("namespace"), str) else namespace)
         own_ns = full.rpartition(".")[0]
-        aliases = [_avro_qualify(a, own_ns) for a in schema.get("aliases", []) if isinstance(a, str)]
+        aliases = [_avro_qualify(a, own_ns) for a in _avro_aliases(schema, field, _safe(full, 60))]
         node: dict = {"k": "record" if kind in ("record", "error") else kind, "n": full, "aliases": aliases, "lt": "", "dec": None}
         names[full] = node
         if node["k"] == "record":
@@ -732,7 +745,7 @@ def _avro_normalize(schema, namespace: str, names: dict, field: str) -> dict:
                     raise _Bad(field, f"every field of record {_safe(full, 60)} needs a name and a type")
                 node["f"].append({"name": entry["name"], "t": _avro_normalize(entry["type"], own_ns, names, field),
                                   "default": "default" in entry,
-                                  "aliases": [a for a in entry.get("aliases", []) if isinstance(a, str)]})
+                                  "aliases": _avro_aliases(entry, field, "field " + _safe(entry.get("name"), 40))})
         elif node["k"] == "enum":
             symbols = schema.get("symbols")
             if not isinstance(symbols, list) or not symbols or any(not isinstance(s, str) for s in symbols):
@@ -1001,31 +1014,156 @@ def _asyncapi_refs(document, raw: list) -> None:
             stack.extend((f"{where}/{i}", v) for i, v in enumerate(node))
 
 
-def _asyncapi_message(message, document, where: str, default_ct: bool, raw: list, counted: set, chain: tuple = ()) -> None:
-    """A message or a oneOf of messages. `chain` holds the ids of the $ref targets already on the walk: meeting one again
-    is a cycle, reported once and not followed."""
+# Budgets of one AsyncAPI message walk (see _AsyncApiWalk). Each is a fail-closed stop: the walk ends, the document is reported
+# fail with the stop reason, and the script records the document as not analysed.
+ASYNCAPI_WALK_BUDGET = 200000  # steps: one per message visit, one per memoised walk compared, one per replay (replays are cheap)
+# Copy ceiling, a documented resource bound: a replay copies the findings of a shared message, and a document whose shared pools copy
+# more than 500,000 findings is reported incomplete with the stop reason ("...findings copied from shared messages"). It is a time
+# bound on this host, set against the handler's 10 s timeout, and a document over it fails closed with that same stop reason. It is a
+# deliberate parity difference, not a non-difference: HEAD lints such documents without the bound. Measured on this host: 999 channels
+# each referencing a 500-leaf pool (500,000 copies) lint in 1.87 s with HEAD's verdict, messages and findings; 1,000 channels (500,500
+# copies) are refused with the stop reason in 2.09 s; the 182 KB document (1,700 channels, a 600-leaf pool, about 1.02 million copies)
+# is refused, where HEAD gives warn, 600 messages and 300 findings; the 3.8 KB shape (built as: messages T14 = {contentType x} and
+# Tk = oneOf[$ref T(k+1), $ref T(k+1)] for k = 13..0; a channel message that is 45 oneOf wrappers over a bare $ref T0, which is 46
+# levels counting the bare reference: 3,853 bytes and 786,430 copies measured; read literally as 46 wrappers over $ref T0 it is 3,904
+# bytes and 802,814 copies) is refused, where HEAD gives warn, 1 message and 300 findings; 600 channels with a
+# 500-leaf pool (300,500 copies) and 500 channels with a 500-leaf pool
+# (250,500 copies) lint with HEAD's output; cyclic n=8 completes (449,513 copies), and n=9 and n=12 stop at this ceiling with the same
+# stop reason. A count-based replay would not reproduce HEAD's set-based dedupe of identical rendered findings (two sites whose rendered
+# texts coincide, such as names cut to 60 characters, names containing '/', or equal-length redactions), so it must not replace this
+# replay without accepting that difference.
+ASYNCAPI_EMIT_BUDGET = 500000
+ASYNCAPI_MAX_CHAIN = 700  # nested $ref levels on one walk; each level is one Python frame, under the interpreter's limit of 1000
+ASYNCAPI_WALK_STOPPED = "AsyncAPI message walk stopped"  # the prefix of every stop finding and reason
+ASYNCAPI_ORIGIN_MAX = 24  # the origin in a stop reason is cut to this: with the file label it keeps the sentence inside 300 characters
+
+
+class _AsyncApiWalk:
+    """The state of the message walk of one AsyncAPI document. `raw`, `keys` and `reach` are where the walk writes now: its
+    findings, its counted message keys and the $ref targets it reached. A fresh walk of a $ref target writes to its own capture,
+    which becomes a memo entry and is replayed under every path that reaches the target. `reason` is set when a stop ends the walk."""
+
+    __slots__ = ("document", "default_ct", "origin", "raw", "keys", "reach", "entries", "steps", "emitted", "exhausted", "reason")
+
+    def __init__(self, document, default_ct: bool, raw: list, keys: set) -> None:
+        self.document, self.default_ct, self.origin = document, default_ct, ""
+        self.raw, self.keys, self.reach = raw, keys, set()
+        self.entries: dict[int, list] = {}
+        self.steps = self.emitted = 0
+        self.exhausted, self.reason = False, ""
+
+    def stop(self, reason: str) -> None:
+        if not self.exhausted:
+            self.exhausted, self.reason = True, reason
+
+    def charge(self, steps: int) -> bool:
+        """Charge `steps` to the step budget. False, with the walk stopped, once the budget is spent."""
+        self.steps += steps
+        if self.steps > ASYNCAPI_WALK_BUDGET:
+            self.stop(f"{ASYNCAPI_WALK_STOPPED} after {ASYNCAPI_WALK_BUDGET} steps: the message references exceed what this lint "
+                      "walks, the document is not fully analysed")
+            return False
+        return True
+
+
+_SELF = ("self", "")  # the message a $ref reached: counted under the $ref string of whichever walk reaches it
+
+
+def _asyncapi_message(message, where: str, chain: tuple, walk: _AsyncApiWalk) -> None:
+    """A message, a $ref to one, or a oneOf of messages, walked from `where`; findings carry `where` as their path prefix. Each
+    distinct message is one counted key: a $ref is ("ref", its absolute $ref string), an inline message is ("path", its path).
+    `chain` holds the ids of the $ref targets on the current walk: meeting one again is a cycle, reported at its own path and not
+    followed. A $ref target is walked once per chain context; later reaches replay the memo entry under their own path. The body is
+    inline, so one $ref level costs one Python frame."""
+    if walk.exhausted or not walk.charge(1):
+        return
+    fresh, own = None, None
     if isinstance(message, dict) and isinstance(message.get("$ref"), str):
-        target = _pointer(document, message["$ref"])
+        ref = message["$ref"]
+        target = _pointer(walk.document, ref)
         if target is None:
             return  # reported by the global $ref walk
-        if id(target) in chain:
-            raw.append(("major", f"{where}: message $ref is cyclic: a oneOf refers back to itself"))
+        target_id = id(target)
+        walk.reach.add(target_id)
+        if target_id in chain:
+            walk.raw.append(("major", f"{where}: message $ref is cyclic: a oneOf refers back to itself"))
             return
-        message, counted_as, chain = target, message["$ref"], (*chain, id(target))
-    else:
-        counted_as = where
+        entry = _memo_entry(walk, target_id, chain)
+        if walk.exhausted:
+            return
+        if entry is not None:
+            _replay(walk, entry, where, ref)
+            return
+        if len(chain) >= ASYNCAPI_MAX_CHAIN:
+            walk.stop(f"{ASYNCAPI_WALK_STOPPED} under {_safe(walk.origin, ASYNCAPI_ORIGIN_MAX)}: a $ref chain is deeper than "
+                      f"{ASYNCAPI_MAX_CHAIN} levels, "
+                      "the document is not fully analysed")
+            return
+        fresh = (where, chain, ref, target_id, walk.raw, walk.keys, walk.reach)
+        walk.raw, walk.keys, walk.reach = [], set(), set()
+        message, where, chain, own = target, "", (*chain, target_id), _SELF
     if not isinstance(message, dict):
-        raw.append(("major", f"{where}: message must be an object"))
-        return
-    if isinstance(message.get("oneOf"), list):
+        walk.raw.append(("major", f"{where}: message must be an object"))
+    elif isinstance(message.get("oneOf"), list):
         for index, alt in enumerate(message["oneOf"]):
-            _asyncapi_message(alt, document, f"{where}/oneOf/{index}", default_ct, raw, counted, chain)
-        return
-    counted.add(counted_as)
-    if "payload" not in message:
-        raw.append(("minor", f"{where}: message has no payload schema, so consumers have no contract"))
-    if not message.get("contentType") and not default_ct:
-        raw.append(("minor", f"{where}: no contentType and no defaultContentType"))
+            _asyncapi_message(alt, f"{where}/oneOf/{index}", chain, walk)
+    else:
+        walk.keys.add(own if own is not None else ("path", where))
+        if "payload" not in message:
+            walk.raw.append(("minor", f"{where}: message has no payload schema, so consumers have no contract"))
+        if not message.get("contentType") and not walk.default_ct:
+            walk.raw.append(("minor", f"{where}: no contentType and no defaultContentType"))
+    if fresh is not None:
+        outer_where, outer_chain, ref, target_id, raw, keys, reach = fresh
+        entry = (frozenset(walk.reach), frozenset(outer_chain).intersection(walk.reach), tuple(walk.raw), frozenset(walk.keys))
+        walk.raw, walk.keys, walk.reach = raw, keys, reach
+        if not walk.exhausted:  # a walk the budget cut short is never replayed
+            walk.entries.setdefault(target_id, []).append(entry)
+        _replay(walk, entry, outer_where, ref)
+
+
+def _memo_entry(walk: _AsyncApiWalk, target_id: int, chain: tuple):
+    """The memoised walk of the target valid under this chain, or None. A walk is valid when the chain holds exactly the targets it
+    walked under, among the targets that walk reached."""
+    chain_set = set(chain)
+    for entry in walk.entries.get(target_id, ()):
+        if not walk.charge(1):
+            return None
+        if chain_set.intersection(entry[0]) == entry[1]:
+            return entry
+    return None
+
+
+def _replay(walk: _AsyncApiWalk, entry, where: str, ref: str) -> None:
+    """Replay a memoised walk under `where`: its findings, its counted keys and its reached targets, as they are found there. A
+    stopped walk copies no more findings, but the messages a replay reaches are still counted, so the message count stays the count
+    analysed up to the stop."""
+    reached, _walked_under, relative, keys = entry
+    if not walk.exhausted and walk.charge(1):  # a replay costs one step, however many findings it copies
+        walk.emitted += len(relative)
+        if walk.emitted > ASYNCAPI_EMIT_BUDGET:
+            walk.stop(f"{ASYNCAPI_WALK_STOPPED} after {ASYNCAPI_EMIT_BUDGET} findings copied from shared messages: the document is "
+                      "not fully analysed")
+        else:
+            walk.reach.update(reached)
+            walk.raw.extend([(sev, where + text) for sev, text in relative])
+    for kind, value in keys:
+        if kind == "self":
+            walk.keys.add(("ref", ref))
+        elif kind == "path":
+            walk.keys.add(("path", where + value))
+        else:
+            walk.keys.add((kind, value))
+
+
+def _walk_top(walk: _AsyncApiWalk, message, where: str) -> None:
+    """One top-level message of the document. The interpreter's recursion limit ends the walk as a stop, never as an exception."""
+    walk.origin = where
+    try:
+        _asyncapi_message(message, where, (), walk)
+    except RecursionError:
+        walk.stop(f"{ASYNCAPI_WALK_STOPPED} under {_safe(where, ASYNCAPI_ORIGIN_MAX)}: the walk exceeded the interpreter's recursion limit, "
+                  "the document is not fully analysed")
 
 
 def asyncapi_lint(payload: dict) -> dict:
@@ -1051,6 +1189,7 @@ def asyncapi_lint(payload: dict) -> dict:
         channels = document.get("channels")
         default_ct = isinstance(document.get("defaultContentType"), str) and bool(document["defaultContentType"])
         operations_seen, messages = 0, set()
+        walk = _AsyncApiWalk(document, default_ct, raw, messages)
         if major not in (2, 3):
             raw.append(("blocker", f"AsyncAPI {_safe(version, 40)} is not supported by this lint (2.x and 3.x)"))
             channels = None
@@ -1066,8 +1205,12 @@ def asyncapi_lint(payload: dict) -> dict:
                 if not isinstance(channel, dict):
                     raw.append(("major", f"channels/{cn}: channel must be an object"))
                     continue
+                declared = channel.get("parameters")
+                if declared is not None and not isinstance(declared, dict):
+                    raw.append(("major", f"channels/{cn}: parameters must be an object, so no parameter of {cn} is declared"))
+                    declared = {}
                 for param in re.findall(r"\{([^{}]+)\}", name):
-                    if param not in (channel.get("parameters") or {}):
+                    if param not in (declared or {}):
                         raw.append(("major", f"channels/{cn}: parameter {{{_safe(param, 40)}}} is not declared under parameters"))
                 ops = [k for k in ("publish", "subscribe") if isinstance(channel.get(k), dict)]
                 if not ops and "$ref" not in channel:
@@ -1087,7 +1230,7 @@ def asyncapi_lint(payload: dict) -> dict:
                         raw.append(("minor", f"{where}: operation has no message (the AsyncAPI 2.x schema does not require one, "
                                              "but consumers get no contract)"))
                     else:
-                        _asyncapi_message(operation["message"], document, f"{where}/message", default_ct, raw, messages)
+                        _walk_top(walk, operation["message"], f"{where}/message")
             servers = document.get("servers")
             for name in sorted(servers) if isinstance(servers, dict) else []:
                 server = servers[name]
@@ -1106,7 +1249,7 @@ def asyncapi_lint(payload: dict) -> dict:
                     raw.append(("minor", f"channels/{cn}: no messages declared"))
                     continue
                 for msg_name in sorted(msgs):
-                    _asyncapi_message(msgs[msg_name], document, f"channels/{cn}/messages/{_safe(msg_name, 60)}", default_ct, raw, messages)
+                    _walk_top(walk, msgs[msg_name], f"channels/{cn}/messages/{_safe(msg_name, 60)}")
             operations = document.get("operations")
             for name in sorted(operations) if isinstance(operations, dict) else []:
                 operations_seen += 1
@@ -1128,8 +1271,12 @@ def asyncapi_lint(payload: dict) -> dict:
                     for key in ("host", "protocol"):
                         if not server.get(key):
                             raw.append(("blocker", f"servers/{_safe(name, 60)}: {key} is required"))
+        if walk.exhausted:  # the stop is pinned: truncation never cuts it, and the message count is said to be partial
+            pinned = [("major", f"{walk.reason}; the message count and the findings list are both partial")]
+        else:
+            pinned = []
         _asyncapi_refs(document, raw)
-        verdict, findings = _wrap(raw, "AA")
+        verdict, findings = _wrap(raw, "AA", pinned)
         return {"state": "SUCCESS", "asyncapi_version": _safe(version, 40),
                 "channels": len(channels) if isinstance(channels, dict) else 0,
                 "operations": operations_seen, "messages": len(messages), "verdict": verdict, "findings": findings}
@@ -1639,6 +1786,8 @@ def retention_replay(payload: dict) -> dict:
         raw: list[tuple[str, str]] = []
         net = rate - live
         duration = events / net if net > 0 else Decimal(-1)
+        if duration > _MAX_FINITE_S:
+            return _invalid("replay_events", "replay_events at replay_rate_per_s takes longer than a finite duration can represent")
         if events > 0 and net <= 0:
             raw.append(("blocker", f"replay rate {_n(rate)} evt/s does not exceed the live rate {_n(live)} evt/s: replay never catches up"))
         elif events == 0:

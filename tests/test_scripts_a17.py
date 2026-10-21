@@ -340,10 +340,40 @@ def test_symlinks_leaving_the_root_are_not_followed(tmp_path, repo):
     write_json(repo, "real/catalog-info.json", descriptor("inside"))
     (repo / "inner-link.json").symlink_to(repo / "real" / "catalog-info.json")
     code, report = run_script(tmp_path)
-    assert code == 1 and report["status"] == "fail" and report["skipped"] == ["skipped:symlink-outside-root:catalog-info.json"]
+    assert code == 1 and report["status"] == "fail" and report["skipped"] == ["skipped:symlink-dir:linked-dir", "skipped:symlink-outside-root:catalog-info.json"]
     assert (report["scanned_files"], report["entity_count"]) == (1, 1)
     code, report = run_script(tmp_path, "--path", "linked-dir")
     assert code == 2 and report["error"]["code"] == "E-INPUT"
+
+
+def test_a_symlinked_directory_is_not_descended_so_it_fails_closed_naming_the_link(tmp_path, repo):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_json(outside, "catalog-info.json", descriptor("outside", spec__owner=None))
+    write_json(repo, "catalog-info.json", descriptor("root-svc"))
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    code, report = run_script(tmp_path)
+    assert code == 1 and report["status"] == "fail" and report["entity_count"] == 1  # the outside descriptor was never analysed
+    assert report["skipped"] == ["skipped:symlink-dir:linked"] and "scan/incomplete" in ids(report)
+    assert not by_rule(report, "owner-missing")
+
+
+def test_a_subdirectory_that_cannot_be_listed_fails_closed_naming_it(tmp_path, repo, monkeypatch):
+    write_json(repo, "catalog-info.json", descriptor("root-svc"))
+    write_json(repo, "locked/catalog-info.json", descriptor("locked-svc", spec__owner=None))
+    real_scandir = os.scandir
+
+    def unlistable(path=".", *args, **kwargs):
+        if str(path).endswith("locked"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", unlistable)
+    module = load_script()
+    result = module.lint_tree(repo, repo, ("tier-0", "tier-1", "tier-2", "tier-3"))
+    assert result["status"] == "fail" and result["entity_count"] == 1 and "scan/incomplete" in ids(result)  # the locked descriptor was not read
+    assert result["skipped"] == ["skipped:unreadable-dir:locked: PermissionError"]
+    assert not by_rule(result, "owner-missing")
 
 
 def test_scan_stops_at_2000_descriptors(tmp_path, repo):
@@ -353,6 +383,21 @@ def test_scan_stops_at_2000_descriptors(tmp_path, repo):
     assert (report["scanned_files"], report["truncated"]) == (2000, True)
     assert [(f["id"], f["severity"]) for f in by_rule(report, "scan-truncated")] == [("scan-truncated", "minor")]
     assert report["entity_count"] == 2000 and code == 1 and report["status"] == "fail" and "scan/incomplete" in ids(report)
+
+
+def test_descriptor_bound_counts_only_descriptors_so_trailing_non_descriptors_leave_the_scan_complete(tmp_path, repo, monkeypatch):
+    module = load_script()
+    monkeypatch.setattr(module, "MAX_DESCRIPTORS", 2)
+    tiers = ("tier-0", "tier-1", "tier-2", "tier-3")
+    write_json(repo, "a/catalog-info.json", descriptor("a-svc"))
+    write_json(repo, "b/catalog-info.json", descriptor("b-svc"))
+    (repo / "z").mkdir()
+    (repo / "z" / "README.md").write_text("notes", encoding="utf-8")  # a non-descriptor after the bound
+    result = module.lint_tree(repo, repo, tiers)
+    assert (result["truncated"], result["status"], result["entity_count"]) == (False, "ok", 2)
+    write_json(repo, "c/catalog-info.json", descriptor("c-svc"))  # a third descriptor really is beyond the bound
+    result = module.lint_tree(repo, repo, tiers)
+    assert (result["truncated"], result["status"]) == (True, "fail") and "scan/incomplete" in ids(result)
 
 
 def test_findings_list_is_cut_but_finding_count_is_the_total(tmp_path, repo):

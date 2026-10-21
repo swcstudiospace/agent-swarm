@@ -121,6 +121,7 @@ def test_dry_run_output_is_deterministic(tmp_path):
 
 
 def test_real_run_json_shape_and_exit_code_zero_on_a_ready_repo(tmp_path):
+    pytest.importorskip("yaml")  # the ready repository's Kubernetes manifests are only judged when PyYAML is present
     repo = good_repo(tmp_path / "repo")
     result = cli("--json", "--root", str(repo), tmp_path=tmp_path)
     assert result.returncode == 0, result.stderr
@@ -162,10 +163,12 @@ def test_ready_repository_has_no_findings_and_scores_100_in_every_pillar(tmp_pat
     assert result["files_scanned"] == 6 and result["files_skipped"] == 0 and result["truncated"] is False
 
 
-def test_empty_repository_reports_minor_gaps_only_and_scores_each_pillar_from_its_always_applicable_question(tmp_path):
+def test_empty_repository_is_incomplete_and_fails_and_scores_each_pillar_from_its_always_applicable_question(tmp_path):
     result = scan(tmp_path)
-    assert result["status"] == "ok"
+    assert result["status"] == "fail" and "no in-scope input was analysed" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
     assert brief(result) == [
+        ("scan/incomplete", "major", ""),
         ("cloud.autoscaling-missing", "minor", ""), ("cloud.ci-pipeline-missing", "minor", ""), ("cloud.efficiency-signals-missing", "minor", ""),
         ("cloud.health-probe-missing", "minor", ""), ("cloud.tags-missing", "minor", "")]
     assert {p["pillar"]: p["score_pct"] for p in result["pillars"]} == {
@@ -348,19 +351,23 @@ def test_missing_pyyaml_reports_skipped_tool_missing_and_keeps_json_manifests(tm
                                                "spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}}))
     result = scan(tmp_path, module=module)
     assert result["skipped"] == ["skipped:tool-missing: PyYAML (Kubernetes YAML manifests not analysed)"]
-    skipped = next(f for f in result["findings"] if f["id"] == "cloud.yaml-checks-skipped")
-    assert skipped["severity"] == "info" and skipped["summary"].startswith("skipped:tool-missing") and "2 Kubernetes YAML" in skipped["summary"]
+    incomplete = next(f for f in result["findings"] if f["id"] == "scan/incomplete")
+    assert incomplete["severity"] == "major" and "k8s/deploy.yaml" in incomplete["summary"] and "k8s/other.yml" in incomplete["summary"]
+    assert "cloud.yaml-checks-skipped" not in [f["id"] for f in result["findings"]]
     assert ("cloud.k8s-probes-missing", "major", "k8s/bad.json") in brief(result)  # JSON is parsed natively
     assert result["signals"]["kubernetes_workloads"] == 1 and result["status"] == "fail"
 
 
-def test_unparseable_manifests_are_reported_as_info_and_do_not_crash(tmp_path):
+def test_unparseable_manifests_are_incomplete_reasons_and_fail_the_scan(tmp_path):
     pytest.importorskip("yaml")
     write(tmp_path, "broken.yaml", "apiVersion: v1\nkind: Deployment\n  bad: [unclosed\n")
     write(tmp_path, "broken.json", '{"apiVersion": "v1", "kind": ')
     result = scan(tmp_path)
-    assert [(f["id"], f["severity"], f["location"]) for f in result["findings"] if f["id"] == "cloud.manifest-unparseable"] == [
-        ("cloud.manifest-unparseable", "info", "broken.json"), ("cloud.manifest-unparseable", "info", "broken.yaml")]
+    incomplete = next(f for f in result["findings"] if f["id"] == "scan/incomplete")
+    assert incomplete["severity"] == "major" and result["status"] == "fail"
+    assert "skipped:unparseable-manifest: broken.json" in incomplete["summary"]
+    assert "skipped:unparseable-manifest: broken.yaml" in incomplete["summary"]
+    assert "cloud.manifest-unparseable" not in [f["id"] for f in result["findings"]]
 
 
 # --- bounds -----------------------------------------------------------------------------------------------------
@@ -371,7 +378,9 @@ def test_oversized_and_binary_files_are_skipped_and_counted(tmp_path):
     (tmp_path / "blob.py").write_bytes(b"\x00\x01os.environ")
     write(tmp_path, "ok.py", "import os\nos.environ\n")
     result = scan(tmp_path)
-    assert result["files_scanned"] == 1 and result["files_skipped"] == 2 and result["signals"]["source_files"] == 1
+    assert result["files_scanned"] == 1 and result["files_skipped"] == 2 and result["signals"]["source_files"] == 1 and result["status"] == "fail"
+    summary = next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert "skipped:too-large: big.py" in summary and "skipped:binary: blob.py" in summary
 
 
 def test_a_file_of_exactly_one_mebibyte_is_still_read(tmp_path):
@@ -392,17 +401,20 @@ def test_symlinks_are_never_followed_out_of_the_root(tmp_path):
     (repo / ".env").symlink_to(outside / ".env")
     result = scan(repo)
     assert "cloud.env-file-committed" not in [f["id"] for f in result["findings"]]
-    assert result["signals"]["source_files"] == 1 and result["files_skipped"] >= 2
+    assert result["signals"]["source_files"] == 1 and result["files_skipped"] >= 2 and result["status"] == "fail"
+    summary = next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert "skipped:symlink-directory: linked-dir" in summary and "skipped:symlink: linked.py" in summary and "skipped:symlink: .env" in summary
 
 
 def test_scan_stops_after_2000_files_and_says_so(tmp_path):
     for i in range(2000):
-        (tmp_path / f"f{i:04d}.txt").write_text("x")
+        (tmp_path / f"f{i:04d}.py").write_text("print(1)\n")
     exact = scan(tmp_path)
-    assert exact["truncated"] is False and "cloud.scan-truncated" not in [f["id"] for f in exact["findings"]]
-    (tmp_path / "f2000.txt").write_text("x")
+    assert exact["status"] == "ok" and exact["truncated"] is False and "skipped:file-limit" not in json.dumps(exact["findings"])
+    (tmp_path / "f2000.py").write_text("print(1)\n")
     result = scan(tmp_path)
-    assert result["truncated"] is True and ("cloud.scan-truncated", "info", "") in brief(result)
+    assert result["truncated"] is True and result["status"] == "fail"
+    assert "skipped:file-limit" in next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
 
 
 def test_skipped_directories_are_not_scanned(tmp_path):
@@ -485,7 +497,8 @@ def test_string_typed_workload_metadata_is_skipped_and_counted_and_the_scan_comp
     assert result.returncode in (0, 1), result.stderr  # the scan completes; 2 would mean it aborted
     data = json.loads(result.stdout)
     assert data["signals"]["kubernetes_workloads"] == 1
-    assert [f for f in brief(data) if f[0] == "cloud.workload-malformed"] == [("cloud.workload-malformed", "info", "k8s/broken.json")]
+    assert "skipped:malformed-workload: k8s/broken.json" in next(f for f in data["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert data["status"] == "fail"
 
 
 # --- QA-03 regressions ------------------------------------------------------------------------------------------
@@ -513,3 +526,268 @@ def test_unparsed_manifest_makes_absence_rules_unknown_not_missing(tmp_path):
     unknown = next(f for f in result["findings"] if f["id"] == "cloud.health-probe-unknown")
     assert unknown["severity"] == "minor" and unknown["summary"].startswith("unknown, not missing: no health check signal found")
     assert unknown["summary"].endswith("Kubernetes YAML was not parsed (PyYAML missing)")
+
+
+def test_a_tree_with_no_in_scope_input_fails_as_incomplete(tmp_path):
+    write(tmp_path, "README.md", "# notes\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["files_scanned"] == 0
+    assert [f["id"] for f in result["findings"] if f["severity"] == "major"] == ["scan/incomplete"]
+
+
+def test_unreadable_subdirectory_is_an_incomplete_reason_not_a_silent_drop(tmp_path, monkeypatch):
+    write(tmp_path, "app.py", "import os\nos.environ\n")
+    write(tmp_path, "locked/.env", "TOKEN=abc\n")
+    real_scandir = os.scandir
+
+    def scandir_denying_locked(path="."):
+        if os.fspath(path).endswith("locked"):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir_denying_locked)
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["files_scanned"] == 1
+    assert "skipped:unreadable-directory: locked" in next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert "cloud.env-file-committed" not in [f["id"] for f in result["findings"]]
+
+
+def test_helm_template_replicas_and_spread_are_judged_per_kind_not_from_the_first_kind(tmp_path):
+    body = ("apiVersion: apps/v1\nkind: {kind}\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  template:\n    spec:\n"
+            "      containers:\n        - name: app\n          image: {{{{ .Values.image }}}}\n          readinessProbe: {{}}\n"
+            "          resources:\n            requests: {{cpu: 1m}}\n")
+    write(tmp_path, "chart/templates/all.yaml", body.format(kind="Deployment", name="web", replicas=1)
+          + "---\n" + body.format(kind="StatefulSet", name="db", replicas=3))
+    result = scan(tmp_path)
+    assert [f["summary"] for f in result["findings"] if f["id"] == "cloud.k8s-single-replica"] == [
+        "Deployment (helm template) runs a single replica"]
+    assert [f["summary"] for f in result["findings"] if f["id"] == "cloud.k8s-no-zone-spread"] == [
+        "StatefulSet (helm template) has 3 replicas but no topology spread or pod anti-affinity"]
+
+
+def test_yaml_top_level_sequence_of_objects_is_an_unparseable_reason_not_a_silent_drop(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "seq.yaml", "- apiVersion: apps/v1\n  kind: Deployment\n  metadata: {name: a}\n"
+                                "  spec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 0
+    assert "skipped:unparseable-manifest: seq.yaml" in next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_json_top_level_array_of_objects_is_an_unparseable_reason_not_a_silent_drop(tmp_path):
+    write(tmp_path, "arr.json", json.dumps([{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "a"},
+                                            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "c"}]}}}}]))
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 0
+    assert "skipped:unparseable-manifest: arr.json" in next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_workload_without_a_spec_mapping_is_a_malformed_reason_naming_path_and_kind(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "nospec.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: nospec\n")
+    write(tmp_path, "nullspec.yaml", "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: nullspec\nspec:\n")
+    result = scan(tmp_path)
+    summary = next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 0
+    assert "skipped:malformed-workload: nospec.yaml (Deployment)" in summary
+    assert "skipped:malformed-workload: nullspec.yaml (StatefulSet)" in summary
+
+
+# --- QA-03 round two: non-mapping YAML documents and List entries --------------------------------------------------------
+
+
+def test_a_scalar_document_before_a_deployment_is_a_reason_naming_the_document_and_fails_the_scan(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/mixed.yaml", "just text\n---\n" + DEPLOYMENT_GOOD)
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 1
+    assert "skipped:non-mapping-document: k8s/mixed.yaml (document 0)" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_a_yaml_file_of_only_scalars_is_not_kubernetes_and_stays_silent(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "notes.yaml", "# apiVersion and kind are only words in this comment\njust text\n---\n42\n")
+    result = scan(tmp_path)
+    assert result["status"] == "ok" and result["files_scanned"] == 1 and result["signals"]["kubernetes_workloads"] == 0
+    assert "scan/incomplete" not in [f["id"] for f in result["findings"]]
+
+
+def test_a_list_with_a_bare_string_item_is_a_reason_naming_the_list_and_the_item_index(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/list.yaml", "apiVersion: v1\nkind: List\nitems:\n  - just-a-string\n  - apiVersion: apps/v1\n"
+                                     "    kind: Deployment\n    metadata: {name: ok}\n"
+                                     "    spec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 1
+    assert "skipped:non-mapping-document: k8s/list.yaml (document 0, List items[0])" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+# --- QA-03 round three: a List whose items is not a list --------------------------------------------------------------
+
+
+def test_a_list_whose_items_is_a_mapping_is_a_reason_naming_the_list_items_and_fails(tmp_path):
+    pytest.importorskip("yaml")
+    bare = ("  apiVersion: apps/v1\n  kind: Deployment\n  metadata: {name: bare}\n"
+            "  spec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n")
+    write(tmp_path, "k8s/list.yaml", "apiVersion: v1\nkind: List\nitems:\n" + bare)
+    write(tmp_path, "k8s/deploylist.yaml", "apiVersion: apps/v1\nkind: DeploymentList\nitems:\n" + bare)
+    result = scan(tmp_path)
+    summary = next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 0
+    assert "skipped:non-list-items: k8s/list.yaml (document 0, List items)" in summary
+    assert "skipped:non-list-items: k8s/deploylist.yaml (document 0, List items)" in summary
+
+
+def test_a_list_whose_items_is_a_scalar_is_a_reason_and_fails(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/scalar.yaml", "apiVersion: v1\nkind: List\nitems: just-text\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 0
+    assert "skipped:non-list-items: k8s/scalar.yaml (document 0, List items)" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_a_valid_list_of_items_still_gets_per_item_treatment(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/list.yaml", "apiVersion: v1\nkind: List\nitems:\n"
+          "  - apiVersion: apps/v1\n    kind: Deployment\n    metadata: {name: good}\n"
+          "    spec: {replicas: 3, template: {spec: {terminationGracePeriodSeconds: 30, containers: [{name: c, "
+          "readinessProbe: {httpGet: {path: /, port: 80}}, resources: {requests: {cpu: 1m}}}]}}}\n"
+          "  - apiVersion: apps/v1\n    kind: Deployment\n    metadata: {name: bare}\n"
+          "    spec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n")
+    result = scan(tmp_path)
+    assert result["signals"]["kubernetes_workloads"] == 2
+    assert ("cloud.k8s-probes-missing", "major", "k8s/list.yaml") in brief(result)  # the bare item is judged on its own
+    assert "scan/incomplete" not in [f["id"] for f in result["findings"]]  # every item is analysed, so no input is incomplete
+
+
+# --- QA-03 round four: a stray items field does not change the kind of a document -----------------------------------------
+
+
+def test_a_deployment_with_a_stray_items_list_is_still_judged_as_a_deployment(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/web.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: web}\n"
+                                    "spec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n"
+                                    "items:\n  - apiVersion: v1\n    kind: Pod\n    metadata: {name: p}\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 1
+    assert ("cloud.k8s-probes-missing", "major", "k8s/web.yaml") in brief(result)
+
+
+def test_a_kind_less_mapping_with_a_list_of_items_still_gets_per_item_treatment(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/kindless.yaml", "items:\n  - apiVersion: apps/v1\n    kind: Deployment\n    metadata: {name: bare}\n"
+                                         "    spec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n")
+    result = scan(tmp_path)
+    assert result["signals"]["kubernetes_workloads"] == 1
+    assert ("cloud.k8s-probes-missing", "major", "k8s/kindless.yaml") in brief(result)
+
+
+# --- QA-03 round five: a custom resource whose kind ends in List is not a Kubernetes List --------------------------------------
+
+
+def test_a_custom_todolist_resource_with_a_spec_and_no_items_is_ok_with_no_reason(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "crd/todo.yaml", "apiVersion: example.com/v1\nkind: TodoList\nmetadata: {name: t}\nspec: {owner: alice}\n")
+    result = scan(tmp_path)
+    assert result["status"] == "ok" and result["signals"]["kubernetes_workloads"] == 0
+    assert "scan/incomplete" not in [f["id"] for f in result["findings"]]
+
+
+def test_a_deployment_list_with_no_items_key_is_a_reason_and_fails_since_it_is_a_strict_kind(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/dl.yaml", "apiVersion: apps/v1\nkind: DeploymentList\nmetadata: {name: d}\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "skipped:non-list-items: k8s/dl.yaml (document 0, List items)" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_a_service_list_with_a_mapping_items_is_a_reason_since_its_items_key_is_present(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/sl.yaml", "apiVersion: v1\nkind: ServiceList\nitems:\n  key: value\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    assert "skipped:non-list-items: k8s/sl.yaml (document 0, List items)" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+# --- QA-03 round six: a kind-less entry inside a List is reported, not dropped --------------------------------------------
+
+
+KIND_LESS_ENTRY = "  - spec:\n      template:\n        spec:\n          containers:\n            - name: web\n"
+VALID_ENTRY = ("  - apiVersion: apps/v1\n    kind: Deployment\n    metadata: {name: ok}\n"
+               "    spec: {replicas: 3, template: {spec: {terminationGracePeriodSeconds: 30, containers: [{name: c, "
+               "readinessProbe: {httpGet: {path: /, port: 80}}, resources: {requests: {cpu: 1m}}}]}}}\n")
+
+
+def test_a_list_whose_only_item_is_kind_less_is_a_reason_and_fails_with_no_workloads(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/list.yaml", "apiVersion: v1\nkind: List\nitems:\n" + KIND_LESS_ENTRY)
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 0
+    assert "skipped:unkinded-entry: k8s/list.yaml (document 0, List items[0])" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_a_deployment_list_with_a_kind_less_item_and_a_valid_item_reports_the_item_and_judges_the_valid_one(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/dl.yaml", "apiVersion: apps/v1\nkind: DeploymentList\nitems:\n" + KIND_LESS_ENTRY + VALID_ENTRY)
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 1
+    assert "skipped:unkinded-entry: k8s/dl.yaml (document 0, List items[0])" in next(
+        f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+
+
+def test_a_list_of_valid_items_still_gives_ok_with_no_reason(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/list.yaml", "apiVersion: v1\nkind: List\nitems:\n" + VALID_ENTRY)
+    result = scan(tmp_path)
+    assert result["status"] == "ok" and result["signals"]["kubernetes_workloads"] == 1
+    assert "scan/incomplete" not in [f["id"] for f in result["findings"]]
+
+
+# --- QA-03 round seven: a list kind nested inside a List is judged per item, under a depth limit -------------------------
+
+
+NESTED_VALID = ("apiVersion: v1\nkind: List\nitems:\n  - apiVersion: apps/v1\n    kind: DeploymentList\n    items:\n"
+                "      - apiVersion: apps/v1\n        kind: Deployment\n        metadata: {name: ok}\n"
+                "        spec: {replicas: 3, template: {spec: {terminationGracePeriodSeconds: 30, containers: [{name: c, "
+                "readinessProbe: {httpGet: {path: /, port: 80}}, resources: {requests: {cpu: 1m}}}]}}}\n")
+
+
+def test_a_list_whose_only_entry_is_a_deployment_list_with_one_valid_deployment_is_ok_with_one_workload(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/nested.yaml", NESTED_VALID)
+    result = scan(tmp_path)
+    assert result["status"] == "ok" and result["signals"]["kubernetes_workloads"] == 1
+    assert "scan/incomplete" not in [f["id"] for f in result["findings"]]
+
+
+def test_an_invalid_deployment_inside_a_nested_deployment_list_gives_the_probes_finding(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/nested.yaml", NESTED_VALID.replace("readinessProbe: {httpGet: {path: /, port: 80}}, resources: {requests: {cpu: 1m}}",
+                                                             "resources: {requests: {cpu: 1m}}"))
+    result = scan(tmp_path)
+    assert result["signals"]["kubernetes_workloads"] == 1
+    assert ("cloud.k8s-probes-missing", "major", "k8s/nested.yaml") in brief(result)
+    assert result["status"] == "fail"
+
+
+def test_a_list_nested_beyond_the_depth_limit_is_a_reason_and_the_rest_of_the_file_is_still_judged(tmp_path):
+    pytest.importorskip("yaml")
+    bare = "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: deep}\nspec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n"
+    write(tmp_path, "k8s/deep.yaml",
+          "apiVersion: v1\nkind: List\nitems:\n"
+          "  - apiVersion: apps/v1\n    kind: DeploymentList\n    items:\n"          # list level 2
+          "      - apiVersion: apps/v1\n        kind: DeploymentList\n        items:\n"  # list level 3
+          "          - apiVersion: apps/v1\n            kind: DeploymentList\n            items:\n"  # list level 4: beyond the limit
+          "              - " + bare.replace("\n", "\n                ").rstrip() + "\n"
+          "  - " + bare.replace("\n", "\n    ").rstrip() + "\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail"
+    summary = next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert "skipped:list-too-deep: k8s/deep.yaml (document 0, List items[0], List items[0], List items[0])" in summary
+    assert ("cloud.k8s-probes-missing", "major", "k8s/deep.yaml") in brief(result)  # the top-level sibling Deployment is still judged

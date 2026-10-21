@@ -186,8 +186,10 @@ def test_dockerfile_lint_final_user_rules():
         result = lint(f"FROM alpine:3@{DIGEST}\nUSER {user}\nHEALTHCHECK CMD true\n")
         assert ids(result) == ["docker.final-user-root"], user
         assert at(result, "docker.final-user-root") == ["line 2"]
-    for user in ("1000", "app:app", "${UID}"):
+    for user in ("1000", "app:app"):
         assert ids(lint(f"FROM alpine:3@{DIGEST}\nUSER {user}\nHEALTHCHECK CMD true\n")) == [], user
+    unresolved = lint(f"FROM alpine:3@{DIGEST}\nUSER ${{UID}}\nHEALTHCHECK CMD true\n")
+    assert ids(unresolved) == ["docker.final-user-unresolved"] and unresolved["verdict"] == "fail"
 
 
 def test_dockerfile_lint_only_the_final_stage_decides_user_and_inherits_from_earlier_stage():
@@ -1867,3 +1869,395 @@ def test_retention_plan_names_the_input_position_of_a_bad_protected_digest():
                "protected_digests": [DIGESTS["a"], DIGESTS["a"], "bad"]}
     bad = call("supply_retention_plan", payload)
     assert bad["state"] == "INVALID_INPUT" and bad["field"] == "protected_digests" and "protected_digests[2]" in bad["message"]
+
+
+def test_dockerfile_lint_final_user_is_expanded_from_build_args():
+    assert ids(lint(f"ARG U=root\nFROM alpine:3@{DIGEST}\nUSER $U\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nARG U=root\nUSER ${{U}}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    unresolved = lint(f"ARG UID\nFROM alpine:3@{DIGEST}\nUSER ${{UID}}\nHEALTHCHECK CMD true\n")
+    assert ids(unresolved) == ["docker.final-user-unresolved"] and severity_of(unresolved, "docker.final-user-unresolved") == "major"
+    assert unresolved["verdict"] == "fail"
+    assert ids(lint(f"ARG UID=1000\nFROM alpine:3@{DIGEST}\nUSER ${{UID}}\nHEALTHCHECK CMD true\n")) == []
+
+
+def test_pin_audit_action_metadata_docker_image_is_pinned_like_a_workflow_docker_action():
+    action = audit((".github/actions/x/action.yml", "runs:\n  using: docker\n  image: 'docker://alpine:3.19'\n"))
+    workflow = audit((".github/workflows/ci.yml", "steps:\n  - uses: docker://alpine:3.19\n"))
+    assert finding_rows(action) == [("pin.action-image-unpinned", "minor", ".github/actions/x/action.yml:3")]
+    assert [(f["id"], f["severity"]) for f in action["findings"]] == [(f["id"], f["severity"]) for f in workflow["findings"]]
+    assert (action["references"], action["unpinned"], action["verdict"]) == (1, 1, "pass")
+
+
+def test_pin_audit_action_metadata_local_dockerfile_image_is_no_registry_reference():
+    result = audit((".github/actions/x/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n  args: []\n"))
+    assert result["findings_total"] == 0 and result["references"] == 0 and result["verdict"] == "pass"
+    assert audit((".github/actions/x/action.yml", "runs:\n  image: ./docker/Dockerfile.prod\n"))["findings_total"] == 0
+
+
+def test_vex_apply_never_echoes_a_credential_that_has_no_scheme():
+    bad = invalid("supply_vex_apply", {"vulnerabilities": [vuln()], "statements": [stmt(justification="u:hunter2@host/x")]}, "statements")
+    assert "hunter2" not in json.dumps(bad) and "not an OpenVEX justification" in bad["message"]
+    unjustified = vex([vuln()], [stmt(vid="u:hunter2@host/x", justification="")])
+    assert "hunter2" not in json.dumps(unjustified) and ids(unjustified) == ["CVE-2026-0001", "vex.not-affected-unjustified"]
+
+
+def test_signature_policy_masks_a_rule_name_that_carries_a_credential():
+    result = ok("supply_signature_policy", {"signatures": [], "rules": [{"name": "u:hunter2@host/x", "issuer": "https://issuer.example",
+                                                                          "identity": "release", "required": True}],
+                                             "min_valid_signatures": 0, "require_transparency_log": False})
+    assert result["required_rules_missing"] == ["(value with an @, not echoed)"] and "hunter2" not in json.dumps(result)
+
+
+def test_sbom_validate_masks_a_spec_version_that_carries_a_credential():
+    spdx_result = validate(spdx(spdxVersion="SPDX-2.3u:hunter2@h"))
+    assert spdx_result["spec_version"] == "(value with an @, not echoed)" and "sbom.unknown-spec-version" in ids(spdx_result)
+    assert "hunter2" not in json.dumps(spdx_result)
+    cdx_result = validate(cdx().replace('"1.5"', '"1.5u:hunter2@h"'))
+    assert cdx_result["spec_version"] == "(value with an @, not echoed)" and "hunter2" not in json.dumps(cdx_result)
+
+
+def test_dockerfile_lint_env_values_expand_in_order_before_user():
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV A=root\nENV B=$A\nUSER $B\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    braced = lint(f"FROM alpine:3@{DIGEST}\nENV A=root\nENV B=${{A}}\nUSER ${{B}}\nHEALTHCHECK CMD true\n")
+    assert ids(braced) == ["docker.final-user-root"] and braced["verdict"] == "fail"
+    # B took A's value when B was set; a later ENV A=app does not change B
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV A=root\nENV B=$A\nENV A=app\nUSER $B\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(f"ARG A=root\nARG B=${{A}}\nFROM alpine:3@{DIGEST}\nUSER $B\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    unresolved = lint(f"ARG X\nFROM alpine:3@{DIGEST}\nENV B=$X\nUSER $B\nHEALTHCHECK CMD true\n")
+    assert ids(unresolved) == ["docker.final-user-unresolved"] and unresolved["verdict"] == "fail"
+
+
+def test_signature_policy_never_echoes_a_credential_without_a_scheme():
+    result = ok("supply_signature_policy", {"signatures": [
+        {"signer": "u:hunter2@host/x", "issuer": "https://issuer.example", "verified": False, "in_transparency_log": True},
+        {"signer": "u:hunter2@host/y", "issuer": "https://issuer.example", "verified": True, "in_transparency_log": True}],
+        "rules": [{"name": "release", "issuer": "https://issuer.example", "identity": "release", "required": False}],
+        "min_valid_signatures": 0, "require_transparency_log": False})
+    assert "hunter2" not in json.dumps(result)
+    assert result["unexpected_signers"] == ["(value with an @, not echoed)"] and "signature.verification-failed" in ids(result)
+
+
+def test_unresolved_base_with_a_credential_is_never_echoed_by_lint_or_audit():
+    result = lint("ARG X\nFROM u:hunter2@host/${X}\nUSER app\nHEALTHCHECK CMD true\n")
+    assert ids(result) == ["docker.base-unresolved-arg"] and "hunter2" not in json.dumps(result)
+    pinned = audit(("Dockerfile", "ARG X\nFROM u:hunter2@host/${X}\nUSER app\n"))
+    assert "hunter2" not in json.dumps(pinned) and finding_rows(pinned) == [("pin.base-unresolved-arg", "major", "Dockerfile:2")]
+
+
+def test_signature_policy_names_ordinary_at_signs_and_masks_only_userinfo():
+    result = sigpolicy([signer(identity="audit@corp")], rules=[rule(name="release@corp", identity="nobody@corp")])
+    assert result["required_rules_missing"] == ["release@corp"] and result["unexpected_signers"] == ["audit@corp"]
+    assert "release@corp" in next(f["summary"] for f in result["findings"] if f["id"] == "signature.required-signer-missing")
+
+
+def test_signature_policy_required_summary_never_echoes_a_credential_in_identity_or_issuer():
+    result = ok("supply_signature_policy", {"signatures": [], "rules": [{"name": "release", "issuer": "https://u:hunter2@h.example",
+                                                                          "identity": "u:hunter2@host/x", "required": True}],
+                                             "min_valid_signatures": 0, "require_transparency_log": False})
+    summary = next(f["summary"] for f in result["findings"] if f["id"] == "signature.required-signer-missing")
+    assert "hunter2" not in json.dumps(result) and "release" in summary
+    bare_issuer = ok("supply_signature_policy", {"signatures": [], "rules": [{"name": "release", "issuer": "u:hunter2@h.example",
+                                                                                "identity": "x", "required": True}],
+                                                  "min_valid_signatures": 0, "require_transparency_log": False})
+    assert "hunter2" not in json.dumps(bare_issuer)
+
+
+def test_dockerfile_lint_env_takes_precedence_over_a_later_arg_of_the_same_name():
+    env_then_arg = lint(f"FROM alpine:3@{DIGEST}\nENV U=root\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")
+    assert ids(env_then_arg) == ["docker.final-user-root"] and env_then_arg["verdict"] == "fail"
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nARG U=app\nENV U=root\nUSER $U\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
+
+
+def test_userinfo_whose_password_holds_a_slash_or_question_mark_is_masked_to_the_last_at():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for bare in ("u:Sup/3r@host", "u:Sup?3r@host", "u:p@ss@host"):
+        assert "Sup" not in a18._echo_value(bare) and "ss@" not in a18._echo_value(bare), bare
+    for url in ("https://u:Sup/3r@h/x", "https://u:Sup?3r@h/x"):
+        assert "Sup" not in a18._scrub(url) and a18._scrub(url).startswith("https://***@h"), url
+    unresolved = lint("ARG X\nFROM u:Sup/3r@host/${X}\nUSER app\nHEALTHCHECK CMD true\n")
+    assert ids(unresolved) == ["docker.base-unresolved-arg"] and "Sup" not in json.dumps(unresolved)
+
+
+def test_uppercase_digest_algorithm_is_displayed_like_the_lowercase_form():
+    upper = f"SHA256:{'a' * 64}"
+    result = lint(f"FROM alpine:3.19@{upper}\nUSER app\nHEALTHCHECK CMD true\n")
+    assert ids(result) == [] and result["final_base"] == f"alpine:3.19@{upper}"
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    assert a18._echo_value(f"alpine:3.19@{upper}") == f"alpine:3.19@{upper}"
+
+
+def test_dockerfile_lint_env_inherited_from_an_in_file_parent_stage_takes_precedence_over_a_child_arg():
+    inherited = lint(f"FROM alpine@{DIGEST} AS base\nENV U=root\nFROM base\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")
+    assert ids(inherited) == ["docker.final-user-root"] and inherited["verdict"] == "fail"
+    two_hops = lint(f"FROM alpine@{DIGEST} AS base\nENV U=root\nFROM base AS mid\nFROM mid\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")
+    assert ids(two_hops) == ["docker.final-user-root"]
+    assert ids(lint(f"FROM alpine@{DIGEST} AS base\nENV U=root\nFROM base\nENV U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
+    assert ids(lint(f"FROM alpine@{DIGEST} AS base\nFROM base\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
+
+
+def test_bare_userinfo_with_an_empty_user_is_masked():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    assert a18._echo_value(":hunter2@host") == "(value with an @, not echoed)"
+    result = ok("supply_signature_policy", {"signatures": [], "rules": [{"name": "release", "issuer": ":hunter2@host", "identity": "x",
+                                                                          "required": True}],
+                                             "min_valid_signatures": 0, "require_transparency_log": False})
+    assert "hunter2" not in json.dumps(result)
+
+
+def test_ecosystem_references_and_ordinary_at_names_stay_visible():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for reference in ("npm:@s/a@1.0.0", "gh:o/r@v1", "pkg:npm/@s/a@1.0.0", "release@corp", "audit@corp",
+                      "https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0", "alpine:3.19@sha256:" + "a" * 64,
+                      "alpine:3.19@SHA256:" + "A" * 64, "ghcr.io/acme/base:1.2@sha256:" + "a" * 64):
+        assert a18._echo_value(reference) == reference, reference
+
+
+def test_bare_userinfo_with_a_password_holding_slash_question_or_at_is_masked():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for credential in ("u:Sup/3r@host", "u:Sup?3r@host", "u:p@ss@host", "ci-user:Zq9canaryPW81@host.example/img", "https://u:Sup/3r@h/x"):
+        assert a18._echo_value(credential) == "(value with an @, not echoed)", credential
+
+
+def test_known_limit_an_ecosystem_user_with_a_slash_in_the_password_displays():
+    # Documented limit of a18_tools._bare_credential: gh:Sup/3r@host is structurally a repository reference, so its secret shows.
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    assert a18._echo_value("gh:Sup/3r@host") == "gh:Sup/3r@host"
+
+
+def test_ecosystem_user_without_a_slash_in_the_password_is_masked():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for credential in ("npm:hunter2@host", "go:hunter2@host"):
+        assert a18._echo_value(credential) == "(value with an @, not echoed)", credential
+
+
+def test_npm_scope_exemption_is_for_the_npm_user_only_and_the_closed_list_holds():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for credential in ("u:@abc/Zq9canaryPW81@host", "ci-user:@svc/Zq9canaryPW81@host.example/img", "u:@scope/x@host",
+                       "gh:hunter2@host", "go:hunter2@host", "oci:hunter2@host", "pkg:hunter2@host"):
+        assert a18._echo_value(credential) == "(value with an @, not echoed)", credential
+    for reference in ("npm:@s/a@1.0.0", "gh:o/r@v1", "pkg:npm/@s/a@1.0.0"):
+        assert a18._echo_value(reference) == reference, reference
+
+
+def _alias_chain(stages: int) -> str:
+    """An ENV at the root, `stages` stages each named by alias and built FROM the previous one, and an ARG and USER at the end."""
+    lines = [f"FROM alpine@{DIGEST} AS s0", "ENV U=root"]
+    lines += [f"FROM s{i - 1} AS s{i}" for i in range(1, stages)]
+    lines += [f"FROM s{stages - 1}", "ARG U=app", "USER $U", "HEALTHCHECK CMD true"]
+    return "\n".join(lines) + "\n"
+
+
+def test_dockerfile_lint_1100_stage_alias_chain_gives_a_verdict_without_recursion():
+    result = lint(_alias_chain(1100))
+    assert ids(result) == ["docker.final-user-root"] and result["verdict"] == "fail"
+
+
+def test_dockerfile_lint_5000_stage_alias_chain_gives_a_verdict_in_linear_time():
+    import time
+
+    started = time.perf_counter()
+    result = lint(_alias_chain(5000))
+    assert time.perf_counter() - started < 5.0
+    assert ids(result) == ["docker.final-user-root"] and result["verdict"] == "fail"
+
+
+def test_closed_list_slash_must_come_before_the_first_at_of_the_password():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for credential in ("gh:hunter2@github.com/o/r@v1", "npm:hunter2@host/x@v1", "oci:hunter2@host"):
+        assert a18._echo_value(credential) == "(value with an @, not echoed)", credential
+    for reference in ("gh:o/r@v1", "pkg:npm/@s/a@1.0.0", "npm:@s/a@1.0.0", "gh:Sup/3r@host"):
+        assert a18._echo_value(reference) == reference, reference
+
+
+# NEW-7: each echo site that used to print a bare user:secret@host in full now goes through the shared _scrub (via _show and _f).
+def test_new7_pin_action_not_sha_from_uses_masks_the_credential():
+    result = audit((".github/workflows/ci.yml", "jobs:\n  a:\n    steps:\n      - uses: u:hunter2@host/x@v1\n"))
+    assert ids(result) == ["pin.action-not-sha"] and "hunter2" not in json.dumps(result)
+
+
+def test_new7_pin_npm_not_exact_masks_the_dependency_name_and_value():
+    result = audit(("package.json", json.dumps({"dependencies": {"u:hunter2@host/x": "^1.0.0", "b": "u:hunter2@host/y"}})), ("package-lock.json", ""))
+    assert "pin.npm-not-exact" in ids(result) and "hunter2" not in json.dumps(result)
+
+
+def test_new7_provenance_masks_the_artifact_name_and_the_matched_subject():
+    mismatch = match(statement(), artifact_name="u:hunter2@host/x")
+    assert "provenance.name-mismatch" in ids(mismatch) and "hunter2" not in json.dumps(mismatch)
+    subject = match(statement(subject=[{"name": "u:hunter2@host/x", "digest": {"sha256": HEX}}]))
+    assert subject["matched"] is True and subject["matched_subject"] == "***@host/x" and "hunter2" not in json.dumps(subject)
+
+
+def test_new7_sbom_diff_masks_an_added_component_name():
+    result = diff(cdx([], root=False), cdx([cdx_component("u:hunter2@host/x", "1", purl=None)], root=False))
+    assert result["added_count"] == 1 and "hunter2" not in json.dumps(result)
+
+
+def test_new7_license_policy_masks_an_unparseable_license():
+    result = licenses("u:hunter2@host/x")
+    assert ids(result) == ["license.unparseable"] and "hunter2" not in json.dumps(result)
+
+
+def test_new7_attestation_bundle_masks_an_unrecognized_predicate_type():
+    result = bundle([att("u:hunter2@host/x"), att("provenance")], ["provenance"])
+    assert "attestation.unrecognized-type" in ids(result) and "hunter2" not in json.dumps(result)
+
+
+def test_new7_vex_apply_masks_an_exposed_product_and_its_message():
+    result = vex([vuln(product="u:hunter2@host/x")], [])
+    assert result["exposed_count"] == 1 and "hunter2" not in json.dumps(result)
+
+
+def test_new7_sbom_validate_masks_a_bad_spdx_creator():
+    result = validate(spdx(creationInfo={"created": "2026-02-01T10:00:00Z", "creators": ["u:hunter2@host/x", "Tool: syft-1.0"]}))
+    assert "sbom.spdx-bad-creator" in ids(result) and "hunter2" not in json.dumps(result)
+
+
+def test_new7_shared_mask_replaces_only_the_credential_span():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    assert a18._scrub("uses: u:hunter2@host/x@v1") == "uses: ***@v1"
+
+
+def test_new7_ordinary_values_pass_the_shared_mask_unchanged():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for ordinary in ("zlib", "pkg:pypi/requests@2.31.0", "pkg:generic/zlib@1.3.1?arch=x86", "MIT OR Apache-2.0",
+                     "GPL-2.0-only WITH Classpath-exception-2.0", "release@corp", "npm:@s/a@1.0.0", "gh:o/r@v1",
+                     "https://github.com/acme/app/.github/workflows/release.yml@refs/tags/v1.0.0", "docker://alpine:3.19",
+                     "alpine:3.19@sha256:" + "a" * 64):
+        assert a18._scrub(ordinary) == ordinary, ordinary
+
+
+def test_new7_known_limits_still_display_through_the_shared_mask():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for value in ("gh:Sup/3r@host", "gh:o/hunter2@host", "bob@example.com"):
+        assert a18._scrub(value) == value, value
+
+
+def test_new8_passwords_longer_than_500_characters_are_masked_in_the_bare_and_scheme_forms():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for secret, template in (("a" * 501, "u:{}@host"), ("a" * 501, "https://u:{}@host/x"), ("b" * 5000, "u:{}@host"),
+                             ("Zq9" * 2000, "https://u:{}@host/x")):
+        value = template.format(secret)
+        assert secret not in a18._scrub(value) and secret not in a18._echo_value(value), (len(secret), template)
+
+
+def test_new8_a_long_ordinary_value_without_an_at_is_unchanged():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    ordinary = "pkg:pypi/" + "a" * 100000
+    assert a18._scrub(ordinary) == ordinary and a18._echo_value(ordinary) == ordinary
+
+
+def test_new8_long_tokens_are_scanned_in_linear_time():
+    import time
+
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    adversarial = ["a:" * 50000 + "h", "a:" * 50000 + "@sha256:" + "0" * 64, "://a" * 25000 + "@h", "a:" * 524288 + "@h"]
+    for value in adversarial:  # a 100,000-character token and a 1 MiB value, with colons and scheme repeats and no usable @
+        started = time.perf_counter()
+        a18._scrub(value)
+        a18._echo_value(value)
+        assert time.perf_counter() - started < 5.0, len(value)
+    assert a18._scrub("a:" * 50000 + "@h") == "***@h"
+
+
+def _load_cli():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_supply_image_lint_for_tools_tests", ROOT / "scripts" / "supply_image_lint.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_new9_a_credential_in_a_directory_name_is_redacted_in_locations_and_skipped_entries(tmp_path):
+    cli = _load_cli()
+    repo = tmp_path / "repo"
+    (repo / "u:hunter2@host").mkdir(parents=True)
+    (repo / "u:hunter2@host" / "Dockerfile").write_text(f"FROM alpine:3@{DIGEST}\nUSER root\nHEALTHCHECK CMD true\n", encoding="utf-8")
+    (repo / "u:hunter2@host" / "Dockerfile.big").write_bytes(b"FROM alpine\n" + b"#" * (1024 * 1024))
+    out = cli.scan(repo, repo)
+    assert [f["location"] for f in out["findings"] if f["id"] == "docker.final-user-root"] == ["***@host/Dockerfile:2"]
+    assert out["skipped"] == ["***@host/Dockerfile.big: over-1MiB"] and out["status"] == "fail"
+    assert "hunter2" not in json.dumps(out)
+
+
+def test_new9_an_ordinary_directory_name_is_unchanged_in_locations_and_skipped_entries(tmp_path):
+    cli = _load_cli()
+    repo = tmp_path / "repo"
+    (repo / "service").mkdir(parents=True)
+    (repo / "service" / "Dockerfile").write_text(f"FROM alpine:3@{DIGEST}\nUSER root\nHEALTHCHECK CMD true\n", encoding="utf-8")
+    (repo / "service" / "Dockerfile.big").write_bytes(b"FROM alpine\n" + b"#" * (1024 * 1024))
+    out = cli.scan(repo, repo)
+    assert [f["location"] for f in out["findings"] if f["id"] == "docker.final-user-root"] == ["service/Dockerfile:2"]
+    assert out["skipped"] == ["service/Dockerfile.big: over-1MiB"]
+
+
+def test_new9_the_path_in_a_missing_path_error_is_redacted(tmp_path):
+    import types
+
+    from swarm.errors import SwarmError
+
+    cli = _load_cli()
+    with pytest.raises(SwarmError) as raised:
+        cli.run(types.SimpleNamespace(path="u:hunter2@host/missing"), types.SimpleNamespace(root=tmp_path, dry_run=False))
+    assert "hunter2" not in str(raised.value) and "does not exist" in str(raised.value)
+
+
+def test_new12_a_reference_does_not_shield_a_credential_later_in_its_token():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    assert a18._scrub("gh:o/r@x:hunter2@host") == "gh:o/r@***@host"
+    assert a18._scrub("npm:@s/a@1.0.0,u:hunter2@host") == "npm:@s/a@1.0.0,***@host"
+    assert a18._scrub("npm:@s/a@u:hunter2@host") == "npm:@s/a@***@host"
+    assert a18._scrub("gh:o/r@v1:hunter2@host") == "gh:o/r@***@host"
+    for value in ("gh:o/r@x:hunter2@host", "npm:@s/a@1.0.0,u:hunter2@host", "npm:@s/a@u:hunter2@host", "gh:o/r@v1:hunter2@host"):
+        assert "hunter2" not in a18._scrub(value) and "hunter2" not in a18._echo_value(value), value
+    assert a18._scrub("gh:o/r@v1") == "gh:o/r@v1" and a18._scrub("npm:@s/a@1.0.0") == "npm:@s/a@1.0.0"
+
+
+def test_new12_a_token_with_two_colons_that_are_both_credentials_is_masked():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    both = a18._scrub("u:hunter2@x:pw@host")
+    assert "hunter2" not in both and "pw" not in both and both == "***@host"
+    assert a18._scrub("https://u:hunter2@x:pw@h/x") == "https://***@h/x"
+
+
+def test_new14_a_user_longer_than_300_characters_is_masked_in_the_bare_and_scheme_forms():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    long_user = "a" * 100000
+    assert "hunter2" not in a18._scrub(long_user + ":hunter2@host") and a18._scrub(long_user + ":hunter2@host") == "***@host"
+    assert a18._scrub("://" + long_user + ":hunter2@host") == "://***@host"
+    assert a18._scrub("://" + long_user + "@host") == "://***@host"
+    assert a18._echo_value("a" * 5000 + ":hunter2@host") == "(value with an @, not echoed)"
+
+
+def test_new14_adversarial_shapes_at_100k_and_1mib_each_finish_in_under_a_second():
+    import time
+
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    for n in (100_000, 1 << 20):
+        shapes = [
+            "a:" * (n // 2),
+            "a:" * (n // 2) + "@",
+            "a" * n + ":hunter2@host",
+            "://" + "a" * n + ":hunter2@host",
+            "://" + "a" * n + "@host",
+            "://a" * (n // 4),
+            "://a" * (n // 4) + "@h",
+            "gh:o/r@" * (n // 7),
+            "npm:@s/a@" * (n // 9),
+            "gh:o/r@x:hunter2@" * (n // 16),
+            "u:@" * (n // 3),
+        ]
+        for value in shapes:
+            for function in (a18._scrub, a18._echo_value):
+                started = time.perf_counter()
+                function(value)
+                assert time.perf_counter() - started < 1.0, (n, value[:20], function.__name__)
+
+
+def test_new16_an_npm_scoped_reference_with_an_at_in_its_version_is_the_documented_class():
+    a18 = importlib.import_module("swarm.tools.a18_tools")
+    assert a18._echo_value("npm:@s/hunter2@host") == "npm:@s/hunter2@host"
+    assert a18._scrub("npm:@s/hunter2@host") == "npm:@s/hunter2@host"
+    assert a18._scrub("npm:@s/x:hunter2@host") == "npm:@s/***@host"
+    assert "hunter2" not in a18._echo_value("npm:@s/x:hunter2@host")

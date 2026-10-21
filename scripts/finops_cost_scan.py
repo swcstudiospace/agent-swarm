@@ -16,11 +16,51 @@ Rules (each finding carries its `rule`):
                              without a lifecycle policy (minor)
   iac-untagged-resource      taggable resource missing a --required-tags key (rules of finops_tag_coverage)
 
-Reads Terraform (.tf, .tf.json), CloudFormation and Kubernetes manifests (.json, and .yaml/.yml when PyYAML imports;
+Reads Terraform (.tf, .tf.json), CloudFormation (.template: JSON when its text is valid JSON, otherwise YAML) and Kubernetes manifests (.json, and .yaml/.yml when PyYAML imports;
 otherwise the YAML-dependent checks are reported as `skipped:tool-missing` and JSON/Terraform keep working). HCL is
 read by a lexer for comments, heredocs and quoted strings with nested `${ }` templates, then regular expressions over
 the resource blocks: variables, `count` and dynamic blocks are not evaluated, a module block is an incomplete input unless its local source directory was analysed, and a resource block whose
 braces do not balance is reported under `skipped` (`terraform-resources`), never dropped silently.
+Directories: .git, .hg, .svn, node_modules, .venv, venv, __pycache__, .tox, .mypy_cache, .swarm and .terraform are never
+read and add no reason: they hold VCS metadata, dependency caches and tool state, not repository IaC. build, dist and vendor
+are read like any other directory, because they can hold real IaC. A directory that cannot be listed, a symlinked
+directory, and the file-count and size limits each add a reason, so the scan never drops input silently.
+Top-level documents: Terraform JSON and CloudFormation both require a top-level object, and a Kubernetes manifest is an object
+too. A JSON or YAML document whose top level is an array or a scalar is therefore not an IaC document: it is passed over with
+no reason, so a JSON data file in a repository does not fail the gate. An empty YAML document holds no content and is passed
+over the same way. A file that is only passed over is not counted in files_scanned, but it was read and found not to be IaC,
+so it counts as analysed for the rule that a run with no analysed input is incomplete. A tree with no candidate files at all
+is still incomplete.
+A top-level array is passed over whatever it contains, because Terraform JSON and CloudFormation both require a top-level
+object, so an array is not an IaC document of either kind: a CloudFormation mapping inside a top-level array is out of scope.
+A .yaml or .yml file that PyYAML rejects is read as JSON when its text is valid JSON, as a .template is.
+A top-level `module` key is a Terraform module block only in a file named *.tf.json, and only when its value has that shape: a mapping
+with at least one entry that is a block (a mapping, or a one-element list holding one, with a string `source`). Each block entry is a
+module block, reported as not evaluated; each other entry of that mapping is named as an unevaluated module entry. In any other .json
+file, and for a module value with no block entry such as {"a": 1}, the key is an ordinary JSON object and gives no reason.
+Duplicate keys: a key written twice in a mapping is compared by its parsed value, so the YAML keys 1 and "1" differ, and 0x1 and 1
+are the same key. A document is IaC when its ROOT mapping says so: a CloudFormation Resources mapping (any file), or in a *.tf.json
+file only a Terraform JSON resource block or a Terraform module (above), a Kubernetes workload, StorageClass or List kind, or a
+repeated Resources key (any file) or resource key (*.tf.json only) at the root. A key nested
+at any depth does not decide it. Once a document is IaC, a repeated key at any depth in it is reported as `duplicate key "<key>"` in
+a scan-incomplete reason, so the status is fail; the parsers keep only the last value, so the earlier value is not evaluated. A
+repeated key in any other document is passed over silently, like the rest of that document.
+A YAML integer longer than MAX_INT_DIGITS digits is compared by its value, so +1... and 1... of the same digits are one key. A YAML
+integer with a leading zero is octal, as PyYAML reads it, so it is compared by that octal value: 0111 and 73 are one key.
+Limitation: a hex or octal literal of more than 4000 decimal digits is not compared with a decimal key of the same value, so a
+repeat of the two is not reported (such a key needs over 3,000 hex digits in an IaC mapping).
+YAML and JSON floats keep the text they were read from, so a float prints as a float (1.0e+2 prints 100.0, 1.50 prints 1.5), and
+5.0e-400 is an underflow, not zero. PyYAML reads YAML 1.1, where a float needs a dot and a signed exponent: a float written without a
+dot, such as 1e2, is read as the string "1e2", so a YAML RetentionInDays of 1e2 is not a literal and fails closed, although JSON reads
+1e2 as the number 100. The remedy is to write 100 or 1.0e+2 (1.0e2, without the sign, is also a string in PyYAML, so it is not a
+remedy). A YAML base-60 value such as 1:30.5 is read exactly as PyYAML reads it (90.5), and as a retention it is not a literal.
+Retention: zero is never-expire in Terraform, so `retention_in_days = 0` in a .tf file, `retention_in_days: 0` in a .tf.json file and
+`RetentionInDays: 0` in a JSON or YAML template each give the same minor set-retention finding, the one HCL gives today. A negative
+number, null, a boolean, a non-literal (a Ref, a Fn:: call, an expression string), NaN or infinity, a value that underflows to zero
+(5e-400), an integer too large for a float, and an integer longer than 4000 digits each give the retention reason and fail the scan.
+A quoted digit string is read as decimal, so "08" is 8 and "0180" is 180; an unquoted YAML integer with a leading zero is read as
+PyYAML reads it, which is octal, so an unquoted 030 is 24. For the same digits the two readings can differ, but both give the same
+zero and positivity result, so the retention verdict does not depend on which reading is used.
 Bounded: files over 1 MiB are skipped, at most 2000 candidate files are read, symlinks are never followed out of
 --root, binary and non-regular files are skipped, a malformed manifest is counted under `parse_error`. It reads files
 under --root and writes nothing; findings carry paths, resource references, container names and instance or volume
@@ -55,7 +95,7 @@ MAX_FILES = 2000
 MAX_FINDINGS = 1000
 TAG_CHUNK = 50  # tag_coverage reports one finding per resource, capped at 100
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
-SKIP_DIRS = {".git", "node_modules", ".terraform", ".venv", "venv", "dist", "build", "__pycache__", ".swarm", ".tox"}
+SILENT_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".swarm", ".terraform"}
 DEFAULT_REQUIRED_TAGS = "owner,environment"
 
 K8S_WORKLOADS = {"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job", "CronJob", "Pod"}
@@ -235,18 +275,140 @@ def _has_top_level_block(skeleton: str, name: str) -> bool:
     return False
 
 
+_HCL_TAG_ENTRY = re.compile(r'(?:"((?:[^"\\]|\\.)*)"|([A-Za-z0-9_.:/-]+))[ \t]*=[ \t]*("(?:[^"\\]|\\.)*"|[^,\n}]+)')
+_HCL_INTERPOLATED = re.compile(r"[$%]\{")
+
+
+def _hcl_tag_entries(raw: str) -> list[tuple[str, str]]:
+    """(key, raw value) of each entry of a literal tags map. A quoted key is taken exactly, so `"app environment"` is one key."""
+    return [(entry.group(1) if entry.group(1) is not None else entry.group(2), entry.group(3)) for entry in _HCL_TAG_ENTRY.finditer(raw[1:-1])]
+
+
 def _hcl_tags(masked: str, skeleton: str) -> dict | None:
-    """Literal tag map of the block, {} when there is no tags attribute, None when it is not a literal map."""
+    """Literal tag map of the block, {} when there is no tags attribute, None when it is not a literal map or a tag key is
+    an interpolation (the key is then unknown, so the map cannot be judged; _hcl_tag_key_reasons names the key)."""
     raw = _top_level_attr(masked, skeleton, "tags")
     if raw is None:
         return {}
     if not raw.startswith("{"):
         return None
+    entries = _hcl_tag_entries(raw)
+    if any(_HCL_INTERPOLATED.search(key) for key, _ in entries):
+        return None
     tags: dict[str, str] = {}
-    for entry in re.finditer(r'"?([A-Za-z0-9_.:/-]+)"?[ \t]*=[ \t]*("(?:[^"\\]|\\.)*"|[^,\n}]+)', raw[1:-1]):
-        quoted = re.fullmatch(r'"(.*)"', entry.group(2))
-        tags[entry.group(1)] = quoted.group(1) if quoted and not re.search(r"[$%]\{", quoted.group(1)) else _UNKNOWN
+    for key, value in entries:
+        quoted = re.fullmatch(r'"(.*)"', value)
+        tags[key] = quoted.group(1) if quoted and not _HCL_INTERPOLATED.search(quoted.group(1)) else _UNKNOWN
     return tags
+
+
+def _hcl_tag_key_reasons(rtype: str, body_m: str, body_s: str) -> list[str]:
+    """One reason per interpolated tag key of a taggable resource, naming the key and never its value."""
+    if rtype not in TAGGABLE_TF:
+        return []
+    raw = _top_level_attr(body_m, body_s, "tags")
+    if raw is None or not raw.startswith("{"):
+        return []
+    return [f'tag key "{key}" is an interpolation and was not evaluated' for key, _ in _hcl_tag_entries(raw) if _HCL_INTERPOLATED.search(key)]
+
+
+
+
+MAX_INT_DIGITS = 4000  # longer integer literals are kept as text: Python's int() rejects more than 4300 digits
+
+
+class _NumText(float):
+    """A float that carries the text it was read from. It compares, orders and hashes as a float, and str() and repr() print the
+    float, so 1.0e+2 prints 100.0 and 1.50 prints 1.5, as they always have. The retention check reads `text` to tell an exact zero
+    (0.0) from an underflow (5e-400)."""
+
+    def __new__(cls, text: str):
+        value = super().__new__(cls, float(text))
+        value.text = text
+        return value
+
+
+class _TooLongInt:
+    """An integer literal longer than MAX_INT_DIGITS, kept as its text. It is never converted to an int and renders as its text;
+    the retention check reads it as a non-literal."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __repr__(self) -> str:
+        return self.text
+
+    def __format__(self, spec: str) -> str:
+        return format(self.text, spec)
+
+    def _normal(self) -> tuple[bool, str]:
+        """(negative, digits) of the integer the text spells: the sign and the leading zeros are stripped, and zero is never negative."""
+        digits = self.text.lstrip("+-").lstrip("0") or "0"
+        return self.text.startswith("-") and digits != "0", digits
+
+    def __eq__(self, other):
+        if isinstance(other, _TooLongInt):
+            return self._normal() == other._normal()
+        if isinstance(other, int) and not isinstance(other, bool):  # a plain int of the same value (up to MAX_INT_DIGITS digits)
+            negative, digits = self._normal()
+            return len(digits) <= MAX_INT_DIGITS and other == int(("-" if negative else "") + digits)
+        return NotImplemented  # a float or a string is never equal to a marker
+
+    def __hash__(self):
+        negative, digits = self._normal()
+        if len(digits) <= MAX_INT_DIGITS:
+            return hash(int(("-" if negative else "") + digits))  # the same hash as the equal int
+        return hash(("_TooLongInt", negative, digits))
+
+
+def _json_int(text: str):
+    """The parse_int hook of json.loads: an integer longer than MAX_INT_DIGITS is a _TooLongInt, so json.loads does not reject it."""
+    return _TooLongInt(text) if len(text.lstrip("-")) > MAX_INT_DIGITS else int(text)
+
+
+def _doc_retention(value) -> bool | None:
+    """The retention of a JSON or YAML log group: True for a positive literal, False for a zero literal (Terraform's never-expire,
+    the same minor finding as HCL's `retention_in_days = 0`), and None for anything else: null, a boolean, a negative number, a
+    value that underflows to zero (5e-400, read from the float's text), NaN or infinity (1e400, .inf), an integer too large for a
+    float, an integer longer than MAX_INT_DIGITS, a plain float (a base-60 YAML value such as 1:30.5), and any non-literal (a Ref,
+    a Fn:: call, an expression string, a list or an object)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, _NumText):  # a float literal, with its text
+        if value != value or abs(value) == float("inf"):
+            return None
+        if value == 0:  # an exact zero, unless the text is a nonzero literal that underflowed
+            return None if re.search(r"[1-9]", re.split(r"[eE]", value.text)[0]) else False
+        return True if value > 0 else None
+    if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        try:
+            value = int(value.strip())
+        except ValueError:  # more digits than Python converts
+            return None
+    if isinstance(value, int):
+        if value == 0:
+            return False
+        if value < 0:
+            return None
+        try:
+            float(value)  # OverflowError: an integer too large for a float
+        except OverflowError:
+            return None
+        return True
+    return None  # a string that is not a digit run, a plain float, a marker, or any other value
+
+
+def _retention_of(mapping: dict, key: str) -> bool | None:
+    """The retention of a log group: False when the key is absent (never set), else _doc_retention of its value."""
+    return _doc_retention(mapping[key]) if key in mapping else False
+
+
+def _retention_reason(kind: str | None, lifecycle) -> list[str]:
+    """One reason when a log group's retention is not a literal: the lifecycle is unknown (None), never read as absent."""
+    return [RETENTION_REASON] if kind == "logs" and lifecycle is None else []
 
 
 def _dir_key(rel: str) -> str:
@@ -308,7 +470,7 @@ def _hcl_facts(path: str, text: str) -> tuple[list[dict], tuple[bool, bool, list
             "tags": _hcl_tags(body_m, body_s) if rtype in TAGGABLE_TF else None,
             "lifecycle": _hcl_lifecycle(rtype, body_m, body_s, retention),
             "body": body_m,
-            "unevaluated": _hcl_unevaluated(rtype, body_m, body_s),
+            "unevaluated": _hcl_unevaluated(rtype, body_m, body_s) + _retention_reason(LIFECYCLE_TF.get(rtype), _hcl_lifecycle(rtype, body_m, body_s, retention)) + _hcl_tag_key_reasons(rtype, body_m, body_s),
         })
     for head in re.finditer(r'^[ \t]*module[ \t]+"([^"]+)"[ \t]*\{', masked, re.M):
         line = bisect_left(newlines, head.start()) + 1
@@ -329,7 +491,12 @@ def _hcl_lifecycle(rtype: str, body_m: str, body_s: str, retention: str | None) 
     if kind == "s3":
         return _has_top_level_block(body_s, "lifecycle_rule")
     if kind == "logs":
-        return retention is not None and retention.strip() not in {"0", ""}
+        if retention is None:
+            return False
+        literal = retention.strip()
+        if re.fullmatch(r"\d+", literal):
+            return int(literal) > 0
+        return None  # a variable, interpolation or expression: unknown, reported by _hcl_unevaluated
     if kind == "ecr":
         return False  # decided by a matching aws_ecr_lifecycle_policy in the same directory
     return None
@@ -395,6 +562,7 @@ def _declared_tags(container: dict, key: str) -> dict | None:
 COUNT_REASON = "count is not evaluated: the instance count is unknown"
 FOR_EACH_REASON = "for_each is not evaluated: the instance count is unknown"
 MODULE_REASON = "module block is not evaluated: the resources it builds and its inputs were not analysed"
+RETENTION_REASON = "retention_in_days is not a literal and was not evaluated"
 TF_VALUE_KEYS = ("instance_type", "instance_class", "node_type", "instance_types", "volume_type")
 CFN_VALUE_KEYS = ("InstanceType", "InstanceTypes", "DBInstanceClass", "CacheNodeType", "VolumeType")
 
@@ -437,6 +605,22 @@ def _doc_unevaluated(node, keys: tuple[str, ...], structural: bool) -> list[str]
     return out
 
 
+def _tf_json_tag_key_reasons(rtype: str, attrs: dict) -> list[str]:
+    """One reason per interpolated key of a Terraform JSON tags object, naming the key and never its value."""
+    tags = attrs.get("tags")
+    if rtype not in TAGGABLE_TF or not isinstance(tags, dict):
+        return []
+    return [f'tag key "{key}" is an interpolation and was not evaluated' for key in tags if _HCL_INTERPOLATED.search(str(key))]
+
+
+def _tf_json_tag_values(tags: dict | None) -> dict | None:
+    """Terraform JSON tag values with an interpolation or template (`${...}`, `%{...}`) are unknown, as the HCL path reads them,
+    so a required tag holding one is never counted as present."""
+    if tags is None:
+        return None
+    return {key: _UNKNOWN if isinstance(value, str) and _HCL_INTERPOLATED.search(value) else value for key, value in tags.items()}
+
+
 def _tf_json_unevaluated(rtype: str, attrs: dict) -> list[str]:
     out = _doc_unevaluated(attrs, TF_VALUE_KEYS, structural=True)
     if rtype == "aws_ebs_volume" and "type" in attrs:
@@ -445,6 +629,7 @@ def _tf_json_unevaluated(rtype: str, attrs: dict) -> list[str]:
         out.append(COUNT_REASON)
     if "for_each" in attrs:
         out.append(FOR_EACH_REASON)
+    out.extend(_tf_json_tag_key_reasons(rtype, attrs))
     return list(dict.fromkeys(out))
 
 
@@ -486,6 +671,12 @@ def _hcl_unevaluated(rtype: str, body_m: str, body_s: str) -> list[str]:
         out.append("dynamic block is not evaluated")
     return list(dict.fromkeys(out))
 
+def _unevaluated_fact(path: str, name: str, reason: str) -> dict:
+    """A resource that could not be evaluated at all: it carries only its reason, so no other check can judge it."""
+    return {"file": path, "line": 0, "ref": name, "type": "unevaluated", "name": name, "source": "cloudformation",
+            "instance_types": [], "volume_types": [], "tags": None, "lifecycle": None, "body": "", "unevaluated": [reason]}
+
+
 
 def _module_fact(path: str, label: str, line: int, child: str | None, constructs: list[str]) -> dict:
     """A module block. The scanner never expands a module call: `child` is the local directory its source names (None for
@@ -505,11 +696,27 @@ def _unevaluated(fact: dict, analysed_dirs: set[str]) -> list[str]:
     return [MODULE_REASON, *fact["unevaluated"]]
 
 
+def _tf_json_modules(value) -> tuple[list[tuple[str, dict]], list[str]]:
+    """(block entries, other entries) of a top-level `module` value. A value is a Terraform module mapping only when at least one
+    entry is a block (a mapping, or a one-element list holding one, with a string `source`): then each block is a module block and
+    each other entry is named as an unevaluated module entry. A value with no block entry, such as {"a": 1}, is an ordinary object."""
+    if not isinstance(value, dict):
+        return [], []
+    blocks, others = [], []
+    for label, body in value.items():
+        block = body[0] if isinstance(body, list) and body else body
+        if isinstance(block, dict) and isinstance(block.get("source"), str):
+            blocks.append((str(label), block))
+        else:
+            others.append(str(label))
+    return (blocks, others) if blocks else ([], [])
+
+
 def _doc_facts(path: str, doc) -> list[dict]:
     facts: list[dict] = []
     if not isinstance(doc, dict):
         return facts
-    if isinstance(doc.get("resource"), dict):  # Terraform JSON
+    if path.lower().endswith(".tf.json") and isinstance(doc.get("resource"), dict):  # Terraform JSON: read only from *.tf.json files
         for rtype, named in doc["resource"].items():
             for name, attrs in (named.items() if isinstance(named, dict) else []):
                 attrs = attrs[0] if isinstance(attrs, list) and attrs else attrs
@@ -524,52 +731,80 @@ def _doc_facts(path: str, doc) -> list[dict]:
                 if kind == "s3":
                     lifecycle = "lifecycle_rule" in attrs
                 elif kind == "logs":
-                    lifecycle = bool(attrs.get("retention_in_days"))
+                    lifecycle = _retention_of(attrs, "retention_in_days")
                 elif kind == "ecr":
                     lifecycle = False
                 tags = None
                 if rtype in TAGGABLE_TF:
-                    tags = _declared_tags(attrs, "tags")
+                    tags = None if _tf_json_tag_key_reasons(rtype, attrs) else _tf_json_tag_values(_declared_tags(attrs, "tags"))
                 facts.append({"file": path, "line": 0, "ref": f"{rtype}.{name}", "type": rtype, "name": name, "source": "terraform",
                               "instance_types": instance_types, "volume_types": volume_types, "tags": tags,
-                              "lifecycle": lifecycle, "body": " ".join(_strings(attrs)), "unevaluated": _tf_json_unevaluated(rtype, attrs)})
-    modules = doc.get("module")
-    if isinstance(modules, dict):  # Terraform JSON module blocks
-        for label, body in modules.items():
-            body = body[0] if isinstance(body, list) and body else body
-            body = body if isinstance(body, dict) else {}
-            source = body.get("source")
-            local = posixpath.normpath(posixpath.join(_dir_key(path), source)) if isinstance(source, str) and re.fullmatch(r"\.\.?/[^$]*", source) else None
+                              "lifecycle": lifecycle, "body": " ".join(_strings(attrs)), "unevaluated": _tf_json_unevaluated(rtype, attrs) + _retention_reason(LIFECYCLE_TF.get(rtype), lifecycle)})
+    if path.lower().endswith(".tf.json"):  # Terraform reads JSON configuration only from *.tf.json files: elsewhere a module key is data
+        blocks, others = _tf_json_modules(doc.get("module"))
+        for label, body in blocks:  # Terraform JSON module blocks: each is not evaluated
+            source = body["source"]
+            local = posixpath.normpath(posixpath.join(_dir_key(path), source)) if re.fullmatch(r"\.\.?/[^$]*", source) else None
             constructs = [reason for key, reason in (("count", COUNT_REASON), ("for_each", FOR_EACH_REASON)) if key in body]
-            facts.append(_module_fact(path, str(label), 0, local, constructs))
+            facts.append(_module_fact(path, label, 0, local, constructs))
+        for label in others:  # a non-block sibling of a Terraform module mapping is named, not silently skipped
+            facts.append(_unevaluated_fact(path, f"module.{label}", "module entry is not a Terraform module block and was not evaluated"))
     resources = doc.get("Resources")
     if isinstance(resources, dict):  # CloudFormation
         for name, res in resources.items():
-            if not isinstance(res, dict) or not isinstance(res.get("Type"), str):
+            if not isinstance(res, dict):
+                facts.append(_unevaluated_fact(path, name, "resource body is not a mapping and was not evaluated"))
                 continue
-            rtype, props = res["Type"], res.get("Properties") if isinstance(res.get("Properties"), dict) else {}
+            if not isinstance(res.get("Type"), str):
+                facts.append(_unevaluated_fact(path, name, "resource Type is not a literal string and the resource was not evaluated"))
+                continue
+            rtype, raw_props = res["Type"], res.get("Properties")
+            if raw_props is None or (isinstance(raw_props, dict) and not _is_intrinsic(raw_props)):
+                props, unknown = raw_props or {}, None
+            elif _is_intrinsic(raw_props):
+                props, unknown = {}, "Properties is an intrinsic function and was not evaluated"
+            else:
+                props, unknown = {}, "Properties is not a mapping and was not evaluated"
             instance_types, volume_types = [], []
             _walk(props, ("InstanceType", "InstanceTypes", "DBInstanceClass", "CacheNodeType"), instance_types)
             _walk(props, ("VolumeType",), volume_types)
             kind = LIFECYCLE_CFN.get(rtype)
-            lifecycle = None
-            if kind == "s3":
-                lifecycle = bool(props.get("LifecycleConfiguration"))
-            elif kind == "logs":
-                lifecycle = bool(props.get("RetentionInDays"))
-            elif kind == "ecr":
-                lifecycle = bool(props.get("LifecyclePolicy"))
-            tags = _declared_tags(props, "Tags") if rtype in TAGGABLE_CFN else None
+            lifecycle, tags = None, None
+            if unknown is None:
+                if kind == "s3":
+                    lifecycle = bool(props.get("LifecycleConfiguration"))
+                elif kind == "logs":
+                    lifecycle = _retention_of(props, "RetentionInDays")
+                elif kind == "ecr":
+                    lifecycle = bool(props.get("LifecyclePolicy"))
+                tags = _declared_tags(props, "Tags") if rtype in TAGGABLE_CFN else None
+                unevaluated = _doc_unevaluated(props, CFN_VALUE_KEYS, structural=False) + _retention_reason(kind, lifecycle)
+            else:
+                unevaluated = [unknown]
             facts.append({"file": path, "line": 0, "ref": f"{rtype}:{name}", "type": rtype, "name": name, "source": "cloudformation",
                           "instance_types": instance_types, "volume_types": volume_types, "tags": tags,
-                          "lifecycle": lifecycle, "body": "", "unevaluated": _doc_unevaluated(props, CFN_VALUE_KEYS, structural=False)})
+                          "lifecycle": lifecycle, "body": "", "unevaluated": unevaluated})
     kind = doc.get("kind")
-    if kind == "List" and isinstance(doc.get("items"), list):
-        for item in doc["items"]:
-            facts.extend(_doc_facts(path, item))
+    if isinstance(kind, str) and kind.endswith("List"):  # List and every *List kind, each item judged by its own kind
+        label = "List" if kind == "List" else kind
+        items = doc.get("items")
+        if not isinstance(items, list) and (kind == "List" or kind[:-4] in K8S_WORKLOADS):
+            facts.append(_unevaluated_fact(path, label, f"{label} items value is not a list and was not evaluated"))
+        for index, item in enumerate(items if isinstance(items, list) else []):
+            if isinstance(item, dict):
+                if not isinstance(item.get("kind"), str):
+                    facts.append(_unevaluated_fact(path, f"{label}[{index}]", f"{label} item has no kind and was not evaluated"))
+                facts.extend(_doc_facts(path, item))
+            else:
+                facts.append(_unevaluated_fact(path, f"{label}[{index}]", f"{label} item is not a mapping and was not evaluated"))
     elif isinstance(kind, str):
         facts.append(_k8s_fact(path, doc))
     return [f for f in facts if f]
+
+
+def _is_intrinsic(value) -> bool:
+    """A JSON or YAML mapping that is a CloudFormation intrinsic (`Ref`, `Fn::...`), not a literal map."""
+    return isinstance(value, dict) and any(key == "Ref" or str(key).startswith("Fn::") for key in value)
 
 
 def _map(value) -> dict:
@@ -588,32 +823,99 @@ def _k8s_fact(path: str, doc: dict) -> dict | None:
                 "instance_types": [], "volume_types": [volume] if ebs and isinstance(volume, str) else [], "tags": None, "lifecycle": None, "body": ""}
     if kind not in K8S_WORKLOADS:
         return None
-    spec = _map(doc.get("spec"))
+    spec = doc.get("spec")
     if kind == "CronJob":
-        spec = _map(_map(spec.get("jobTemplate")).get("spec"))
+        spec = _map(spec).get("jobTemplate")
+        spec = _map(spec).get("spec") if isinstance(spec, dict) else spec
     if kind != "Pod":
-        spec = _map(_map(spec.get("template")).get("spec"))
-    containers = []
+        spec = _map(spec).get("template") if isinstance(spec, dict) else spec
+        spec = spec.get("spec") if isinstance(spec, dict) else spec
+    if not isinstance(spec, dict):
+        return {"file": path, "line": 0, "ref": ref, "type": kind, "name": meta.get("name", "?"), "source": "kubernetes",
+                "instance_types": [], "volume_types": [], "tags": None, "lifecycle": None, "body": "", "containers": [],
+                "unevaluated": ["pod template or spec is not a mapping and the workload was not evaluated"]}
+    containers, bad_entries = [], 0
     for group in ("containers", "initContainers"):
         listed = spec.get(group)
-        for container in listed if isinstance(listed, list) else []:
-            if isinstance(container, dict):
-                resources = _map(container.get("resources"))
-                requests, limits = _map(resources.get("requests")), _map(resources.get("limits"))
-                # A limit with no request is copied into the request by Kubernetes
-                # (https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/).
-                containers.append({"name": str(container.get("name", "?")), "requests": sorted({str(k) for k in requests} | {str(k) for k in limits}),
-                                   "limits": sorted(str(k) for k in limits)})
+        if listed is not None and not isinstance(listed, list):
+            return {"file": path, "line": 0, "ref": ref, "type": kind, "name": meta.get("name", "?"), "source": "kubernetes",
+                    "instance_types": [], "volume_types": [], "tags": None, "lifecycle": None, "body": "", "containers": containers,
+                    "unevaluated": [f"{group} is not a list and the workload was not evaluated"]}
+        for container in listed or []:
+            if not isinstance(container, dict):
+                bad_entries += 1
+                continue
+            resources = _map(container.get("resources"))
+            requests, limits = _map(resources.get("requests")), _map(resources.get("limits"))
+            # A limit with no request is copied into the request by Kubernetes
+            # (https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/).
+            containers.append({"name": str(container.get("name", "?")), "requests": sorted({str(k) for k in requests} | {str(k) for k in limits}),
+                               "limits": sorted(str(k) for k in limits)})
+    unevaluated = [f"{bad_entries} container entr{'y' if bad_entries == 1 else 'ies'} not a mapping and not evaluated"] if bad_entries else []
     return {"file": path, "line": 0, "ref": ref, "type": kind, "name": meta.get("name", "?"), "source": "kubernetes",
-            "instance_types": [], "volume_types": [], "tags": None, "lifecycle": None, "body": "", "containers": containers}
+            "instance_types": [], "volume_types": [], "tags": None, "lifecycle": None, "body": "", "containers": containers,
+            "unevaluated": unevaluated}
 
 
-def _yaml_loader():
+def _yaml_float(loader, node):
+    """A YAML float. A plain decimal is read as a _NumText, which keeps its text; .inf, -.inf and .nan are read as floats; any other
+    float form, such as a base-60 value (1:30.5), is read by PyYAML's own float constructor, exactly as PyYAML reads it."""
+    text = loader.construct_scalar(node).replace("_", "")
+    if text.lower() in _YAML_NONFINITE:
+        return _YAML_NONFINITE[text.lower()]
+    try:
+        return _NumText(text)
+    except ValueError:
+        return yaml.SafeLoader.construct_yaml_float(loader, node)
+
+
+def _yaml_int(loader, node):
+    """A YAML integer. One longer than MAX_INT_DIGITS is kept as its text (_TooLongInt): Python's int() rejects more than 4300
+    digits, which would otherwise lose the whole document. Every other integer form is read by PyYAML's own constructor."""
+    text = loader.construct_scalar(node).replace("_", "")
+    digits = text.lstrip("+-")
+    if len(digits) > MAX_INT_DIGITS and digits.isdigit() and not digits.startswith("0"):  # a decimal literal Python's int() rejects
+        return _TooLongInt(text)  # a leading zero is octal in YAML 1.1: PyYAML's own value, read below, never a decimal marker
+    return yaml.SafeLoader.construct_yaml_int(loader, node)
+
+
+_YAML_NONFINITE = {".inf": float("inf"), "+.inf": float("inf"), "-.inf": float("-inf"), ".nan": float("nan")}
+
+
+def _yaml_loader(found: list):
+    """A SafeLoader that records each mapping key written twice. Keys are compared by their CONSTRUCTED value (1 and "1" differ,
+    0x1 and 1 are the same key). Each repeat is recorded as (key, is_root): is_root says the mapping is the document root."""
+
     class Loader(yaml.SafeLoader):
         pass
 
-    # CloudFormation short-form intrinsics (!Ref, !Sub, ...) are expressions: they are read as unknown, never evaluated
-    Loader.add_multi_constructor("!", lambda loader, suffix, node: None)
+    def construct_document(self, node):
+        self.root_node = node  # the document's root node, so a repeat in the root mapping can be told apart
+        return yaml.SafeLoader.construct_document(self, node)
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            seen = set()
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue  # a `<<` merge is flattened by PyYAML; it is not a key
+                key = self.construct_object(key_node, deep=True)
+                try:
+                    hash(key)
+                except TypeError:
+                    continue  # an unhashable key is rejected by PyYAML itself
+                if key in seen:
+                    found.append((key, node is getattr(self, "root_node", None)))
+                seen.add(key)
+        return yaml.SafeLoader.construct_mapping(self, node, deep=deep)
+
+    Loader.construct_document = construct_document
+    Loader.construct_mapping = construct_mapping
+    Loader.add_constructor("tag:yaml.org,2002:float", _yaml_float)
+    Loader.add_constructor("tag:yaml.org,2002:int", _yaml_int)
+    # CloudFormation short-form intrinsics (!Ref, !Sub, ...) are expressions: they are read as a non-literal intrinsic marker,
+    # never evaluated and never mistaken for an absent (None) value
+    Loader.add_multi_constructor("!", lambda loader, suffix, node: {f"Fn::{suffix}": True})
     return Loader
 
 
@@ -746,14 +1048,20 @@ def _tag_findings(facts: list[dict], required: list[str], inheriting: set[str]) 
 
 
 def _candidates(root: Path, base: Path, counters: dict, reasons: list[str]):
-    """Candidate manifest files below `base`, sorted, never following symlinks, at most MAX_FILES."""
+    """Candidate manifest files below `base`, sorted, never following symlinks, at most MAX_FILES. A directory that cannot
+    be listed, or is a symlink, adds one reason naming its path. SILENT_DIRS are never read and add no reason."""
     seen = 0
-    for folder, dirs, files in os.walk(base, followlinks=False):
+
+    def unreadable(error: OSError) -> None:
+        target = Path(error.filename) if getattr(error, "filename", None) else base
+        reasons.append(f"{target.relative_to(root).as_posix()}: directory could not be read")
+
+    for folder, dirs, files in os.walk(base, followlinks=False, onerror=unreadable):
         kept = []
         for d in sorted(dirs):
-            if d in SKIP_DIRS:
-                continue
             here = os.path.join(folder, d)
+            if d in SILENT_DIRS:
+                continue
             if os.path.islink(here):
                 reasons.append(f"{Path(here).relative_to(root).as_posix()}: symlinked directory not followed")
                 continue
@@ -761,7 +1069,7 @@ def _candidates(root: Path, base: Path, counters: dict, reasons: list[str]):
         dirs[:] = kept
         for name in sorted(files):
             lower = name.lower()
-            if not lower.endswith((".tf", ".json", ".yaml", ".yml")):
+            if not lower.endswith((".tf", ".json", ".yaml", ".yml", ".template")):
                 continue
             full = Path(folder, name)
             if full.is_symlink():
@@ -774,6 +1082,68 @@ def _candidates(root: Path, base: Path, counters: dict, reasons: list[str]):
                 return
             seen += 1
             yield full
+
+
+_NOT_JSON = object()  # sentinel: the text is not valid JSON
+
+
+CFN_IAC_KEY = "Resources"  # a CloudFormation template's top-level mapping: read in any .json or .template file
+TF_JSON_IAC_KEY = "resource"  # a Terraform JSON resource mapping: read only in a *.tf.json file, the only JSON Terraform reads
+
+
+def _is_iac_document(doc: dict, root_repeats: list, terraform_json: bool) -> bool:
+    """Whether the scanner analyses `doc` as IaC, decided from its ROOT mapping only: a CloudFormation Resources mapping (any file),
+    or, in a *.tf.json file only, a Terraform JSON resource mapping or a Terraform-shaped module; a Kubernetes workload, StorageClass
+    or List kind; or a repeated Resources key (any file) or resource key (*.tf.json only) at the root. A key nested at any depth does
+    not decide it."""
+    markers = (CFN_IAC_KEY, TF_JSON_IAC_KEY) if terraform_json else (CFN_IAC_KEY,)
+    if any(isinstance(doc.get(key), dict) for key in markers) or any(key in markers for key in root_repeats):
+        return True
+    if terraform_json and _tf_json_modules(doc.get("module"))[0]:
+        return True
+    kind = doc.get("kind")
+    return isinstance(kind, str) and (kind in K8S_WORKLOADS or kind == "StorageClass" or (kind.endswith("List") and isinstance(doc.get("items"), list)))
+
+
+def _json_load(text: str):
+    """The JSON value of `text`, and its repeated object keys as (all depths, root only). json.loads keeps only the last of a
+    repeated key, so each object's repeats are recorded. Floats are read as _NumText (they keep their text) and integers longer
+    than MAX_INT_DIGITS as _TooLongInt, so no number can lose the document."""
+    objects = []  # (object, its repeated keys) for every object, so the root's own repeats can be told apart
+
+    def pairs(items):
+        obj, found = {}, []
+        for key, value in items:
+            if key in obj:
+                found.append(key)
+            obj[key] = value
+        objects.append((obj, found))
+        return obj
+
+    value = json.loads(text, object_pairs_hook=pairs, parse_float=_NumText, parse_int=_json_int)
+    repeats = [key for _, found in objects for key in found]
+    root = next((found for obj, found in objects if obj is value), [])
+    return value, (repeats, root)
+
+
+def _json_or_sentinel(text: str):
+    """(the parsed JSON value of `text`, its repeated keys), or (_NOT_JSON, ([], [])) when the text is not valid JSON."""
+    try:
+        return _json_load(text)
+    except (ValueError, RecursionError):
+        return _NOT_JSON, ([], [])
+
+
+def _yaml_docs(text: str) -> tuple[list, list[tuple[list, list]]]:
+    """Every YAML document of `text`, and for each one its repeated mapping keys as (all depths, root only). Raises
+    yaml.YAMLError when PyYAML rejects the text."""
+    found: list = []
+    docs, per_doc = [], []
+    for doc in yaml.load_all(text, Loader=_yaml_loader(found)):  # each document is built before it is yielded
+        docs.append(doc)
+        per_doc.append(([key for key, _ in found], [key for key, is_root in found if is_root]))
+        found.clear()
+    return docs, per_doc
 
 
 def _incomplete(reasons: list[str], analysed: int) -> list[dict]:
@@ -789,7 +1159,7 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
     provider_dirs: set[str] = set()  # directories that declare an unaliased provider of their own
     module_calls: dict[str, set[str]] = {}  # directory -> the local child module directories it calls
     unclosed: dict[str, int] = {}
-    scanned = 0
+    scanned, passed = 0, 0
     analysed_dirs: set[str] = set()  # directories that had at least one analysed file
     for path in _candidates(root, base, counters, reasons):
         rel = path.relative_to(root).as_posix()
@@ -819,7 +1189,9 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
             reasons.append(f"{rel}: binary")
             continue
         lower = path.name.lower()
-        if lower.endswith((".yaml", ".yml")) and yaml is None:
+        template_doc, template_dupes = _json_or_sentinel(text) if lower.endswith(".template") else (_NOT_JSON, ([], []))  # a .template is JSON when its text is valid JSON
+        yaml_format = lower.endswith((".yaml", ".yml")) or (lower.endswith(".template") and template_doc is _NOT_JSON)
+        if yaml_format and yaml is None:
             counters["yaml_skipped"] += 1
             reasons.append(f"{rel}: YAML not read, PyYAML is not importable")
             continue
@@ -838,23 +1210,43 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
                 scanned += 1
                 analysed_dirs.add(directory)
                 continue
-            docs = [json.loads(text)] if lower.endswith(".json") else list(yaml.load_all(text, Loader=_yaml_loader()))
+            if lower.endswith(".json"):
+                value, dupes = _json_load(text)
+                docs, doc_dupes = [value], [dupes]
+            elif template_doc is not _NOT_JSON:
+                docs, doc_dupes = [template_doc], [template_dupes]
+            else:
+                try:
+                    docs, doc_dupes = _yaml_docs(text)
+                except yaml.YAMLError:
+                    value, dupes = _json_or_sentinel(text)  # tab-indented JSON is valid JSON that PyYAML rejects
+                    if value is _NOT_JSON:
+                        raise
+                    docs, doc_dupes = [value], [dupes]
         except (ValueError, RecursionError, yaml.YAMLError if yaml else ValueError):
             counters["parse_error"] += 1
             reasons.append(f"{rel}: could not be parsed")
             continue
-        malformed = False
+        for doc, (repeats, root_repeats) in zip(docs, doc_dupes):  # a repeated key is a finding only in a document analysed as IaC
+            if isinstance(doc, dict) and _is_iac_document(doc, root_repeats, lower.endswith(".tf.json")):
+                reasons.extend(f'{rel}: duplicate key "{key}" in the document: the earlier value was not evaluated' for key in dict.fromkeys(repeats))
+        malformed, mapping_docs = False, 0
         for doc in docs:
+            if not isinstance(doc, dict):
+                continue  # a top-level array or scalar is not an IaC document, and an empty YAML document holds no content: passed over
+            mapping_docs += 1
             try:
                 facts.extend(_doc_facts(rel, doc))
-            except (AttributeError, TypeError, KeyError, IndexError, ValueError, RecursionError):
+            except (AttributeError, TypeError, KeyError, IndexError, ValueError, RecursionError, OverflowError):
                 malformed = True  # one malformed document must not abort the scan of the rest of the tree
         if malformed:
             counters["parse_error"] += 1
             reasons.append(f"{rel}: a document could not be evaluated")
-        else:
+        elif mapping_docs:
             scanned += 1
             analysed_dirs.add(_dir_key(rel))
+        else:
+            passed += 1  # no mapping document (an empty file, or only arrays and scalars): passed over, not in files_scanned
     for fact in facts:
         reasons.extend(f"{fact['file']}::{fact['ref']}: {construct}" for construct in _unevaluated(fact, analysed_dirs))
     findings: list[dict] = []
@@ -874,7 +1266,7 @@ def scan(root: Path, base: Path, required_tags: list[str], max_xlarge: int) -> d
         reasons.extend(f"{where}: {count} resource block(s) could not be delimited and were not evaluated" for where, count in sorted(unclosed.items()))
     if counters["yaml_skipped"]:
         skipped.append({"check": "yaml-manifests", "status": "skipped:tool-missing", "detail": f"PyYAML is not importable: {counters['yaml_skipped']} YAML file(s) not read"})
-    findings.extend(_incomplete(reasons, scanned))
+    findings.extend(_incomplete(reasons, scanned + passed))
     findings.sort(key=lambda f: (-SEVERITY_RANK[f["severity"]], f["file"], f["id"]))
     counts = {severity: sum(1 for f in findings if f["severity"] == severity) for severity in SEVERITY_RANK}
     by_rule: dict[str, int] = {}

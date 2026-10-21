@@ -5,6 +5,8 @@ It never holds signing keys, never accepts risk and never signs a gate verdict; 
 the caller passes in and returns a decision-ready result. A10 owns the security gate and vulnerability.report,
 A11 owns the pipeline that builds.
 
+A credential that contains a space is not masked, because the redaction rule works on whitespace-free tokens.
+
 Tools:
   supply_dockerfile_lint      Dockerfile best-practice and hardening rules (tags, digests, USER, ADD, caches, secrets).
   supply_base_image_policy    base image references versus allowed registries, digest pinning, age and end of life.
@@ -52,19 +54,147 @@ _DIGEST_HEX_LEN = {"sha256": 64, "sha384": 96, "sha512": 128}
 # ---- shared helpers -----------------------------------------------------------------------------------------------
 
 
-_URL_USERINFO = re.compile(r"://[^\s/?#@]{1,300}@(?!sha(?:256|384|512):)")
+_NON_CREDENTIAL_USERS = frozenset({"gh", "go", "npm", "oci", "pkg"})  # ecosystem prefixes: one is a reference only when its password holds a /
+_NPM_SCOPE = re.compile(r"@[A-Za-z0-9._-]+/")  # npm:@scope/name@1.0.0: for the npm user, a password that starts with a scope is a package name
+_USER_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+_WORD = re.compile(r"\S+")  # a credential never spans whitespace: each whitespace-free token is scanned on its own
+_SHA_FOLLOW = re.compile(r"(?i:sha(?:256|384|512)):")  # an @ followed by a digest is not userinfo
+_SCHEME_DELIMITER = re.compile(r"[/?#@:]")  # ends the user of a scheme-form credential, which may not hold a colon
+_SCHEME_DELIMITER_NO_COLON = re.compile(r"[/?#@]")  # ends the user of the colon-less scheme form
+
+
+def _bare_reference(user: str, token: str, colon: int, first: int) -> bool:
+    """True when a bare `user:password@` is a reference, not a credential, and so stays visible. `token[colon + 1:first]` is the segment
+    between the colon and the first @. Two shapes:
+    (a) a user from _NON_CREDENTIAL_USERS whose segment contains a `/`: gh:o/r@v1 and pkg:npm/@s/a@1.0.0. The segment stops at the first @,
+    so a `/` in a host path after it does not count: gh:hunter2@github.com/o/r@v1 is masked. The same user with no `/` before its first @
+    (npm:hunter2@host, go:hunter2@host, gh:hunter2@github.com/o/r@v1) is masked.
+    (b) the npm user whose password starts with a scope: npm:@s/a@1.0.0. Any other user with a password that starts with `@name/`
+    (u:@abc/x@host, ci-user:@svc/x@host) is masked.
+    Documented class, not masked: an npm scoped reference whose password begins with an npm scope (`@name/`) is a reference, so any text
+    after that scope is taken as the reference, as in npm:@s/hunter2@host, which displays as it is.
+    Clause (a) does not cover it: for npm:@s/... the segment before the first @ is empty, because that @ is the scope's own. The exemption
+    stays because the name and version after an npm scope are free-form (ranges, dist-tags and prereleases), and npm credentials live in .npmrc,
+    not in package references. A credential after the scope and a colon is still masked: npm:@s/x:hunter2@host gives
+    npm:@s/***@host.
+    Limits: gh:Sup/3r@host displays, since it is structurally a repository reference (its / is before its first @); a credential whose
+    `/` comes before its first @ under one of the listed users (gh, go, npm, oci, pkg) is not masked. A value with a scheme
+    (https://u:p@h) is caught by _bare_spans too, because the user follows the `//`."""
+    if user.lower() in _NON_CREDENTIAL_USERS and "/" in token[colon + 1:first]:
+        return True
+    return user.lower() == "npm" and _NPM_SCOPE.match(token, colon + 1) is not None
+
+
+def _last_userinfo_at(token: str) -> int:
+    """Index of the last @ of a whitespace-free token that does not introduce a digest (sha256: and kin), or -1. A password runs to it."""
+    at = token.rfind("@")
+    while at >= 0 and _SHA_FOLLOW.match(token, at + 1):
+        at = token.rfind("@", 0, at)
+    return at
+
+
+def _bare_spans(text: str) -> list[tuple[int, int, bool]]:
+    """(start, end, is_reference) of each bare `user:password@` in `text`. The user is the run of user characters before a colon, of
+    any length; the password of a credential runs to the last non-digest @ of the same whitespace-free token and may hold any other
+    character, / ? and : included. Every colon of a token is judged, not only the first: a reference ends at its own first @ and the
+    scan resumes at the next colon after it, so a reference never shields a credential that follows it; a credential covers the rest
+    of the token up to its last @ and ends the scan. Linear: each colon costs a back-scan that stops at the previous colon (a colon is
+    not a user character), and each reference's forward search stops at its own first @, so no two scans overlap."""
+    spans: list[tuple[int, int, bool]] = []
+    for word in _WORD.finditer(text):
+        token, base = word.group(), word.start()
+        last = _last_userinfo_at(token)
+        colon = token.find(":")
+        while colon != -1 and colon + 2 <= last:  # the password needs at least one character before that @
+            if token[colon + 1:colon + 3] == "//":  # a scheme, handled by _url_spans
+                colon = token.find(":", colon + 1)
+                continue
+            start = colon
+            while start > 0 and token[start - 1] in _USER_CHARS:
+                start -= 1
+            first = token.find("@", colon + 1)  # the first @ after the colon: at most `last`, since `last` is an @
+            if _bare_reference(token[start:colon], token, colon, first):
+                spans.append((base + start, base + first + 1, True))
+                colon = token.find(":", first + 1)
+            else:
+                spans.append((base + start, base + last + 1, False))
+                break
+    return spans
+
+
+def _url_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) of each `://user:password@` and `://user@` in `text`. The password may hold / ? or :, up to the last non-digest @ of
+    its whitespace-free token; the user of the colon form holds no colon, and that of the colon-less form is any run before the @.
+    Linear: each `://` costs a search to the next delimiter, and the next `://` always holds a delimiter, so the searches do not overlap."""
+    spans: list[tuple[int, int]] = []
+    for word in _WORD.finditer(text):
+        token, base = word.group(), word.start()
+        last = _last_userinfo_at(token)
+        scheme = token.find("://")
+        while scheme != -1:
+            after = scheme + 3
+            end = None
+            delimiter = _SCHEME_DELIMITER.search(token, after)
+            if delimiter and token[delimiter.start()] == ":" and last >= delimiter.start() + 2:
+                end = last + 1
+            else:
+                at = _SCHEME_DELIMITER_NO_COLON.search(token, after)
+                if at and token[at.start()] == "@" and at.start() - after >= 1 and not _SHA_FOLLOW.match(token, at.start() + 1):
+                    end = at.start() + 1
+            if end is not None:
+                spans.append((base + scheme, base + end))
+                scheme = token.find("://", end)
+            else:
+                scheme = token.find("://", scheme + 1)
+    return spans
+
+
+def _replace_url_spans(value: str) -> str:
+    out, previous = [], 0
+    for start, end in _url_spans(value):
+        out.append(value[previous:start])
+        out.append("://***@")
+        previous = end
+    out.append(value[previous:])
+    return "".join(out)
+
+
+def _replace_bare_spans(value: str) -> str:
+    out, previous = [], 0
+    for start, end, reference in _bare_spans(value):
+        out.append(value[previous:start])
+        out.append(value[start:end] if reference else "***@")  # a reference is kept; a credential keeps its @ and host
+        previous = end
+    out.append(value[previous:])
+    return "".join(out)
+
+
+def _bare_credential(text: str) -> bool:
+    """True when `text` holds a bare `user:secret@host` (no scheme) that must not be echoed, by the rule of _bare_reference."""
+    return any(not reference for _start, _end, reference in _bare_spans(text))
+
+
 _TOKEN_SHAPES = re.compile(
     r"\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\bxox[abprs]-[A-Za-z0-9-]{10,}"
     r"|\bglpat-[A-Za-z0-9_-]{16,}|\bsk-[A-Za-z0-9_-]{20,}|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"
     r"|\b(?:[a-z]{3,8} ){11,23}[a-z]{3,8}\b"  # a recovery phrase: 12 to 24 lowercase words
 )
 
-
 def _scrub(text) -> str:
-    """A string that is echoed in a result with whatever could be a credential removed: the user:password part of a URL and
-    well-known token shapes (GitHub, AWS, Slack, GitLab, JWT) and runs of 12-24 lowercase words (a recovery phrase). Digests, names and ids pass unchanged. A tool must still not
-    echo a value it only knows to be malformed (an invalid digest, tag or reference): this is the second line of defence."""
-    return _TOKEN_SHAPES.sub("***", _URL_USERINFO.sub("://***@", str(text)))
+    """Every string a finding, output field, skipped entry or location echoes passes through here, so a credential cannot reach a result.
+    The echo sites are: _show, _f, _clip and the echo helpers, which all call this; and the CLI scripts/supply_image_lint.py, which calls
+    it in scan() on every skipped entry, every reason handed to swarm/scan_status.py:incomplete_findings and every finding location
+    (one output boundary, so the walk's paths in _scan_dockerfile and _scan_workflow cannot leak), and in run() on the --path it echoes
+    in its errors. What is
+    removed: the user:password of a URL (the host stays), each bare `user:password@` that is not a reference (_bare_reference; the host
+    after the @ stays), and well-known token shapes (GitHub, AWS, Slack, GitLab, JWT) and runs of 12-24 lowercase words (a recovery
+    phrase). Digests, names and ids pass unchanged. A value that is only known to be malformed (an invalid digest, tag or reference) is
+    not echoed at all by _echo_value and _echo_ref, the stricter helpers."""
+    value = str(text)
+    if "@" in value:  # every credential shape holds an @: a value without one is only checked for token shapes
+        value = _replace_url_spans(value)
+        value = _replace_bare_spans(value)
+    return _TOKEN_SHAPES.sub("***", value)
 
 
 def _show(text, limit: int) -> str:
@@ -151,10 +281,20 @@ def _valid_digest(value) -> tuple[str, str] | None:
 def _echo_ref(ref: str) -> str:
     """An image reference for a message. An `@` that does not introduce a valid digest may be `user:password@host`, so such a
     reference is not echoed at all."""
+    if _bare_credential(ref):  # `user:secret@host/${X}`: the $ exemption below must not let a credential through
+        return "(value with an @, not echoed)"
     sep, digest = ref.partition("@")[1:]
     if sep and "$" not in digest and _valid_digest(digest) is None:
         return "(reference with a malformed digest)"
     return _scrub(ref)
+
+
+def _echo_value(text: str) -> str:
+    """A caller-supplied string for a message or an output field. A value shaped like userinfo (`name:secret@host`: a colon before the
+    @, the host after it) is not echoed at all, since `_scrub` only strips userinfo that follows a scheme. An ordinary name with an @
+    (release@corp) is named as it is; any other value goes through `_scrub`."""
+    value = str(text)
+    return "(value with an @, not echoed)" if _bare_credential(value) else _scrub(value)
 
 
 _COMPONENT = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")
@@ -332,6 +472,13 @@ def _expand(text: str, variables: dict) -> tuple[str, bool]:
     return _VAR.sub(replace, text), resolved
 
 
+def _bind(variables: dict, name: str, value: str) -> None:
+    """Bind one ARG or ENV value in instruction order. `$NAME` and `${NAME}` in it expand through the variables bound so far, as Docker
+    expands them at build time. A value that stays unresolved binds empty, so a later use of it is unresolved too, never a literal `$X`."""
+    expanded, resolved = _expand(value, variables)
+    variables[name] = expanded if resolved else ""
+
+
 def _stages(instructions: list[dict]) -> tuple[list[dict], dict]:
     stages: list[dict] = []
     global_args: dict = {}
@@ -349,7 +496,10 @@ def _stages(instructions: list[dict]) -> tuple[list[dict], dict]:
             if ins["kw"] == "ARG":
                 for token in _tokens(ins["args"]):
                     key, eq, value = token.partition("=")
-                    global_args[key] = value if eq else global_args.get(key, "")
+                    if eq:
+                        _bind(global_args, key, value)
+                    else:
+                        global_args.setdefault(key, "")
         else:
             stages[-1]["instructions"].append(ins)
     return stages, global_args
@@ -366,6 +516,68 @@ def _last_in_chain(stages: list[dict], index: int, keyword: str) -> dict | None:
                 return ins
         current = stages[current]["parent"]
     return None
+
+
+def _env_pairs(args: str) -> list[tuple[str, str]]:
+    """(name, value) of an ENV instruction: the legacy `ENV NAME value` form or `NAME=value` words."""
+    tokens = _tokens(args)
+    if tokens and "=" not in tokens[0]:
+        return [(tokens[0], " ".join(tokens[1:]))]
+    return [tuple(t.partition("=")[::2]) for t in tokens]
+
+
+def _run_stage(stage: dict, global_args: dict, inherited: dict, before: int) -> tuple[dict, dict]:
+    """(variables, env) at position `before` of one stage. `inherited` is the ENV its in-file parent hands down (empty for an external
+    base image: that image's ENV is not known to the scanner, see dockerfile_lint). `variables` maps each name to its build-time value:
+    global ARG defaults, the inherited ENV, then the stage's own ARG and ENV in order. `env` holds the names bound by an ENV, inherited or
+    the stage's own, with their values: an ENV overrides an ARG of the same name whatever the order, so no later ARG rebinds such a name.
+    An ARG with no value and no global default stays empty, which _expand reads as unresolved."""
+    variables = dict(global_args)
+    variables.update(inherited)
+    env = dict(inherited)
+    for ins in stage["instructions"][:before]:
+        if ins["kw"] == "ARG":
+            for token in _tokens(ins["args"]):
+                key, eq, value = token.partition("=")
+                if key in env:
+                    continue
+                if eq:
+                    _bind(variables, key, value)
+                else:
+                    variables.setdefault(key, "")
+        elif ins["kw"] == "ENV":
+            for name, value in _env_pairs(ins["args"]):
+                _bind(variables, name, value)
+                env[name] = variables[name]
+    return variables, env
+
+
+def _stage_env_table(stages: list[dict], global_args: dict) -> list[dict]:
+    """The ENV each stage hands to its children, indexed by stage. A parent always precedes its child, so one pass in stage order
+    computes every entry from finished entries: no recursion, and each stage runs once, so the cost is linear in the instructions."""
+    table: list[dict] = []
+    for stage in stages:
+        parent = stage["parent"]
+        inherited = table[parent] if parent is not None else {}
+        table.append(_run_stage(stage, global_args, inherited, len(stage["instructions"]))[1])
+    return table
+
+
+def _effective_user(stages: list[dict], table: list[dict], global_args: dict, index: int) -> tuple[dict | None, dict]:
+    """The USER instruction effective in stage `index` (inherited through FROM) and the build variables visible to it."""
+    seen: set[int] = set()
+    current: int | None = index
+    while current is not None and current not in seen:
+        seen.add(current)
+        instructions = stages[current]["instructions"]
+        for position in range(len(instructions) - 1, -1, -1):
+            if instructions[position]["kw"] == "USER":
+                parent = stages[current]["parent"]
+                inherited = table[parent] if parent is not None else {}
+                return instructions[position], _run_stage(stages[current], global_args, inherited, position)[0]
+        current = stages[current]["parent"]
+    return None, dict(global_args)
+
 
 
 def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin: bool) -> tuple[dict | None, list[dict]]:
@@ -386,7 +598,7 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
         else:
             text, resolved = _expand(base, global_args)
             if not resolved:
-                findings.append(_f("docker.base-unresolved-arg", "major", f"base image {_scrub(base)!r} depends on a build argument without default; the image cannot be checked", at))
+                findings.append(_f("docker.base-unresolved-arg", "major", f"base image {_echo_value(base)!r} depends on a build argument without default; the image cannot be checked", at))
                 continue
             parsed, reason = _parse_ref(text)
             if parsed is None:
@@ -399,12 +611,16 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
                 severity = "major" if require_digest_pin else "minor"
                 findings.append(_f("docker.base-not-digest-pinned", severity, f"base image {text!r} is pinned by tag only; add @sha256:<digest>", at))
 
-    user = _last_in_chain(stages, final, "USER")
-    user_name = user["args"].split(":", 1)[0].strip() if user else ""
+    table = _stage_env_table(stages, global_args)
+    user, user_variables = _effective_user(stages, table, global_args, final)
+    user_text, user_resolved = _expand(user["args"], user_variables) if user else ("", True)
+    user_name = user_text.split(":", 1)[0].strip()
     if user is None:
         findings.append(_f("docker.final-user-missing", "major", "final stage has no USER instruction; the container runs as root unless the base image sets a non-root user", f"line {stages[final]['line']}"))
+    elif not user_resolved:
+        findings.append(_f("docker.final-user-unresolved", "major", f"final stage USER {_echo_value(user['args'])} depends on a build argument without default; the user cannot be checked", f"line {user['line']}"))
     elif user_name in ("root", "0"):
-        findings.append(_f("docker.final-user-root", "major", f"final stage ends with USER {user['args']}; run as a non-root user", f"line {user['line']}"))
+        findings.append(_f("docker.final-user-root", "major", f"final stage ends with USER {_echo_value(user['args'])}; run as a non-root user", f"line {user['line']}"))
 
     health = _last_in_chain(stages, final, "HEALTHCHECK")
     has_health = health is not None and not health["args"].upper().startswith("NONE")
@@ -419,8 +635,7 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
             at = f"line {ins['line']}"
             kw, text = ins["kw"], ins["text"]
             if kw == "ENV":
-                tokens = _tokens(ins["args"])
-                pairs = [(tokens[0], " ".join(tokens[1:]))] if tokens and "=" not in tokens[0] else [tuple(t.partition("=")[::2]) for t in tokens]
+                pairs = _env_pairs(ins["args"])
                 for name, value in pairs:
                     env[name] = value
                     if _secret_name(name) and value and value.lower() not in _BOOLEAN_VALUES:
@@ -485,7 +700,11 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
 
 
 def dockerfile_lint(payload: dict) -> dict:
-    """Lint one Dockerfile: mutable or unpinned bases, root user, ADD misuse, package caches, pipe-to-shell, secrets."""
+    """Lint one Dockerfile: mutable or unpinned bases, root user, ADD misuse, package caches, pipe-to-shell, secrets.
+
+    Scope of the ARG and ENV analysis: values come from this file only, that is its global ARG, its stage ARG and ENV, and the ENV of an
+    in-file parent stage named with `FROM <alias>`. The ENV of an external base image (for example `FROM alpine`) is NOT known to the
+    scanner, so a USER that only the image's own ENV sets is not analysed; the scanner does not guess it."""
 
     def work() -> dict:
         content = payload["content"]
@@ -750,7 +969,7 @@ def sbom_validate(payload: dict) -> dict:
         if kind == "cyclonedx":
             spec_version = _text(doc.get("specVersion"))
             if spec_version not in ("1.2", "1.3", "1.4", "1.5", "1.6", "1.7"):
-                findings.append(_f("sbom.unknown-spec-version", "minor", f"specVersion {spec_version!r} is not one of 1.2-1.7", "specVersion"))
+                findings.append(_f("sbom.unknown-spec-version", "minor", f"specVersion {_echo_value(spec_version)!r} is not one of 1.2-1.7", "specVersion"))
             components, facts = _cdx_components(doc)
             known = {c["ref"] for c in components if c["ref"]}
             seen: set[str] = set()
@@ -774,7 +993,7 @@ def sbom_validate(payload: dict) -> dict:
         else:
             spec_version = doc["spdxVersion"][len("SPDX-"):]
             if spec_version not in ("2.2", "2.3"):
-                findings.append(_f("sbom.unknown-spec-version", "minor", f"spdxVersion {doc['spdxVersion']!r} is not SPDX-2.2 or SPDX-2.3", "spdxVersion"))
+                findings.append(_f("sbom.unknown-spec-version", "minor", f"spdxVersion {_echo_value(doc['spdxVersion'])!r} is not SPDX-2.2 or SPDX-2.3", "spdxVersion"))
             if doc.get("dataLicense") != "CC0-1.0":
                 findings.append(_f("sbom.spdx-data-license", "major", "dataLicense must be CC0-1.0", "dataLicense"))
             if doc.get("SPDXID") != "SPDXRef-DOCUMENT":
@@ -847,7 +1066,7 @@ def sbom_validate(payload: dict) -> dict:
         return {
             "state": "SUCCESS",
             "format": kind,
-            "spec_version": _clip(spec_version, 40),
+            "spec_version": _clip(_echo_value(spec_version), 40),
             "component_count": len(subjects),
             "ntia_compliant": all(e["satisfied"] for e in elements),
             "ntia_elements": elements,
@@ -1165,12 +1384,12 @@ def signature_policy(payload: dict) -> dict:
         counted: list[dict] = []
         unverified = 0
         for s in payload["signatures"]:
-            who = _show(f"{s['signer']} ({s['issuer']})", 200)
+            who = _echo_value(f"{s['signer']} ({s['issuer']})")
             if not s["verified"]:
                 unverified += 1
-                findings.append(_f("signature.verification-failed", "blocker", f"signature by {who} did not verify", s["signer"]))
+                findings.append(_f("signature.verification-failed", "blocker", f"signature by {who} did not verify", _echo_value(s["signer"])))
             elif require_log and not s["in_transparency_log"]:
-                findings.append(_f("signature.not-in-transparency-log", "major", f"signature by {who} has no transparency-log entry", s["signer"]))
+                findings.append(_f("signature.not-in-transparency-log", "major", f"signature by {who} has no transparency-log entry", _echo_value(s["signer"])))
             else:
                 counted.append(s)
         missing: list[str] = []
@@ -1182,9 +1401,9 @@ def signature_policy(payload: dict) -> dict:
             if hits:
                 satisfied += 1
             elif r["required"]:
-                missing.append(r["name"])
-                findings.append(_f("signature.required-signer-missing", "blocker", f"no verified signature matches rule {r['name']!r} (issuer {_show(r['issuer'], 80)}, identity {_show(r['identity'], 80)})", r["name"]))
-        unexpected = sorted({_scrub(counted[i]["signer"]) for i in range(len(counted)) if i not in used})
+                missing.append(_echo_value(r["name"]))
+                findings.append(_f("signature.required-signer-missing", "blocker", f"no verified signature matches rule {_echo_value(r['name'])!r} (issuer {_echo_value(r['issuer'])}, identity {_echo_value(r['identity'])})", _echo_value(r["name"])))
+        unexpected = sorted({_echo_value(counted[i]["signer"]) for i in range(len(counted)) if i not in used})
         for signer in unexpected:
             findings.append(_f("signature.unexpected-signer", "minor", f"verified signer {_show(signer, 120)!r} matches no rule", signer))
         distinct = len({(s["issuer"], s["signer"]) for s in counted})
@@ -1251,10 +1470,10 @@ def vex_apply(payload: dict) -> dict:
                 return _invalid("statements", f"statements[{index}].timestamp must be ISO-8601 with an explicit offset")
             justification = s.get("justification", "")
             if justification and justification not in _VEX_JUSTIFICATIONS:
-                return _invalid("statements", f"statements[{index}].justification {justification!r} is not an OpenVEX justification")
+                return _invalid("statements", f"statements[{index}].justification {_echo_value(justification)!r} is not an OpenVEX justification")
             if s["status"] == "not_affected" and not justification and not _text(s.get("impact_statement")):
                 ignored += 1
-                findings.append(_f("vex.not-affected-unjustified", "major", f"{s['vulnerability']}: not_affected needs a justification or impact statement; statement ignored", s["vulnerability"]))
+                findings.append(_f("vex.not-affected-unjustified", "major", f"{_echo_value(s['vulnerability'])}: not_affected needs a justification or impact statement; statement ignored", _echo_value(s["vulnerability"])))
                 continue
             parts = [_purl_parts(p.strip()) for p in s["products"]]
             statements.append({**s, "moment": moment, "vulnerability": s["vulnerability"].strip().upper(), "parts": parts})
@@ -1357,7 +1576,26 @@ def _pin_kind(path: str) -> str:
     return ""
 
 
+def _is_action_metadata(path: str) -> bool:
+    """action.yml / action.yaml under .github/actions/: an action's metadata, whose `image:` is a docker:// reference or a Dockerfile.
+    A workflow file that happens to be named action.yml is a workflow: the path decides, not the basename alone."""
+    low = "/" + path.replace("\\", "/").lower()
+    return "/.github/actions/" in low and low.rsplit("/", 1)[-1] in ("action.yml", "action.yaml")
+
+
+def _docker_action_pin(value: str, at: str) -> list[dict]:
+    """A `docker://` reference (a `uses:` or action-metadata `image:`) must be pinned by digest: the same rule for both places."""
+    ref = value[len("docker://"):]
+    parsed, _reason = _parse_ref(ref)
+    pinning = _ref_pinning(parsed) if parsed else "tag"
+    if pinning == "digest":
+        return []
+    return [_f("pin.action-image-unpinned", "major" if pinning == "latest" or parsed is None else "minor", f"docker://{_echo_ref(ref)} is not pinned by digest", at)]
+
+
+
 def _audit_workflow(path: str, content: str) -> tuple[int, list[dict]]:
+    action_metadata = _is_action_metadata(path)
     refs, findings = 0, []
     for number, line in enumerate(content.split("\n"), 1):
         at = f"{path}:{number}"
@@ -1370,10 +1608,7 @@ def _audit_workflow(path: str, content: str) -> tuple[int, list[dict]]:
                 continue
             refs += 1
             if value.startswith("docker://"):
-                parsed, reason = _parse_ref(value[len("docker://"):])
-                pinning = _ref_pinning(parsed) if parsed else "tag"
-                if pinning != "digest":
-                    findings.append(_f("pin.action-image-unpinned", "major" if pinning == "latest" or parsed is None else "minor", f"docker://{_echo_ref(value[len('docker://'):])} is not pinned by digest", at))
+                findings += _docker_action_pin(value, at)
                 continue
             name, at_sign, ref = value.rpartition("@")
             if not at_sign:
@@ -1388,6 +1623,11 @@ def _audit_workflow(path: str, content: str) -> tuple[int, list[dict]]:
         if match:
             value = _uncomment(match.group(1))
             if "${{" in value or "${" in value or value in ("{", "|", ">"):
+                continue
+            if action_metadata:  # action.yml: `image: docker://ref` is a registry image; any other value names a Dockerfile of the action
+                if value.startswith("docker://"):
+                    refs += 1
+                    findings += _docker_action_pin(value, at)
                 continue
             parsed, reason = _parse_ref(value)
             refs += 1
@@ -1413,7 +1653,7 @@ def _audit_dockerfile(path: str, content: str) -> tuple[int, list[dict]]:
             continue
         text, resolved = _expand(base, global_args)
         if not resolved:
-            findings.append(_f("pin.base-unresolved-arg", "major", f"FROM {_scrub(base)} depends on a build argument without default; the image cannot be checked", location))
+            findings.append(_f("pin.base-unresolved-arg", "major", f"FROM {_echo_value(base)} depends on a build argument without default; the image cannot be checked", location))
             continue
         parsed, reason = _parse_ref(text)
         if parsed is None:

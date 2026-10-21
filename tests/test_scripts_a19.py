@@ -138,7 +138,7 @@ def test_cloudevent_batch_array_is_validated_per_element(repo):
     code, result = cli(repo)
     assert code == 1
     assert [(f["severity"], f["location"], f["summary"]) for f in result["findings"]] == [
-        ("blocker", "events/batch.json[1]", "required attribute 'id' must not be empty")]
+        ("blocker", "events/batch.json#/1", "required attribute 'id' must not be empty")]
     assert result["scanned"]["cloudevents"] == 2
 
 
@@ -449,3 +449,483 @@ def test_avro_is_detected_in_json_files_and_list_typed_json_schema_does_not_cras
     put(repo, "typed-head.json", {"type": ["string", "null"]})
     code, result = cli(repo, "--base", "typed-base.json", "--head", "typed-head.json")
     assert code == 0 and result["status"] == "ok" and result["comparison"]["format"] == "json-schema"
+
+
+def test_json_schema_tuple_and_type_lists_are_never_detected_as_avro(repo):
+    # N-A: a tuple `items` and a `type` list are JSON Schema; auto must agree with --format json-schema
+    put(repo, "tuple-base.json", {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]})
+    put(repo, "tuple-head.json", {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]})
+    code, auto = cli(repo, "--base", "tuple-base.json", "--head", "tuple-head.json")
+    _, explicit = cli(repo, "--base", "tuple-base.json", "--head", "tuple-head.json", "--format", "json-schema")
+    assert auto["comparison"]["format"] == "json-schema" and auto["status"] == explicit["status"] == "ok"
+    assert auto["comparison"] == explicit["comparison"]
+    # a tuple entry that moves changes what position 0 accepts: a real JSON Schema backward break, not an avro-compatible pass
+    put(repo, "null-base.json", {"type": "array", "items": [{"type": "string"}, {"type": "null"}]})
+    put(repo, "null-head.json", {"type": "array", "items": [{"type": "null"}, {"type": "string"}]})
+    code, auto = cli(repo, "--base", "null-base.json", "--head", "null-head.json")
+    _, explicit = cli(repo, "--base", "null-base.json", "--head", "null-head.json", "--format", "json-schema")
+    assert code == 1 and auto["status"] == "fail" and auto["comparison"]["format"] == "json-schema"
+    assert auto["comparison"]["backward_compatible"] is explicit["comparison"]["backward_compatible"] is False
+    assert ("blocker", "schema-compat") in [(f["severity"], f["rule"]) for f in auto["findings"]]
+    assert auto["comparison"] == explicit["comparison"]
+
+
+def test_candidates_that_are_not_analysed_name_the_file_and_fail_the_scan(repo):
+    # N-B: each of these is a candidate the scanner does not analyse; none may leave the scan reported as ok
+    put(repo, "events/null.json", {"asyncapi": None})
+    put(repo, "events/version-only.json", {"asyncapi": {"version": "3.0.0"}})
+    put(repo, "events/mixed.json", [{**EVENT}, 5])
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    incomplete = [f for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert len(incomplete) == 1 and incomplete[0]["severity"] == "major"
+    summary = incomplete[0]["summary"]
+    assert len(summary) <= 300
+    candidates = ("events/null.json", "events/version-only.json", "events/mixed.json")
+    named = [name for name in candidates if name in summary]
+    omitted = len(candidates) - len(named)
+    assert named, summary
+    if omitted:
+        assert summary.endswith(f"and {omitted} more"), summary
+
+
+def test_deeply_nested_descriptor_is_a_reason_not_a_crash(repo):
+    # N-B: 5000 nested brackets used to raise RecursionError out of the encoder and take the whole scan down
+    put(repo, "events/deep.json", '{"asyncapi": "3.0.0", "x": ' + "[" * 5000 + "]" * 5000 + "}")
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert any(f["rule"] == "scan-incomplete" and "events/deep.json" in f["summary"] for f in result["findings"])
+
+
+def test_root_array_is_an_avro_union_and_a_nested_tuple_stays_json_schema(repo):
+    # R-1: a JSON Schema root is an object or a boolean, so a root array is an Avro union; inside a schema it is a tuple
+    put(repo, "union-base.json", ["null", "string"])
+    put(repo, "union-head.json", ["null", "string"])
+    code, result = cli(repo, "--base", "union-base.json", "--head", "union-head.json")
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+    assert result["comparison"]["format"] == "avro" and result["comparison"]["compatible"] is True
+    put(repo, "tuple-base.json", {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]})
+    put(repo, "tuple-head.json", {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]})
+    code, result = cli(repo, "--base", "tuple-base.json", "--head", "tuple-head.json")
+    assert code == 0 and result["status"] == "ok" and result["comparison"]["format"] == "json-schema"
+
+
+def test_non_descriptor_files_that_mention_the_words_are_silent_and_a_null_asyncapi_is_a_reason(repo):
+    # R-2: package.json names the parser and config.json has the word in a string: neither is a candidate's structure
+    put(repo, "package.json", {"name": "app", "dependencies": {"@asyncapi/parser": "3.0.0"}})
+    put(repo, "config.json", {"note": "specversion is documented here", "n": 1})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+    put(repo, "events/null.json", {"asyncapi": None})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert [f["rule"] for f in result["findings"]] == ["scan-incomplete"]
+    assert "events/null.json" in result["findings"][0]["summary"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+def test_a_non_regular_base_or_head_is_an_unanalysed_input_not_an_input_error(repo):
+    # N-H: a FIFO is never opened; it is recorded as not analysed, so the run fails with exit 1 instead of an E-INPUT exit 2
+    os.mkfifo(repo / "fifo.json")
+    put(repo, "head.json", CLOSED_HEAD)
+    code, result = cli(repo, "--base", "fifo.json", "--head", "head.json")
+    assert code == 1 and result["status"] == "fail" and result["comparison"]["performed"] is False
+    assert ("major", "scan-incomplete", ".") in rules(result)
+    assert "fifo.json: not a regular file, not analysed" in result["findings"][0]["summary"]
+    code, result = cli(repo, "--base", "head.json", "--head", "fifo.json")
+    assert code == 1 and result["status"] == "fail" and result["comparison"]["performed"] is False
+
+
+def test_root_string_and_array_items_holding_a_string_are_avro_as_at_head(repo):
+    # S-1, S-2: a string root, an items string and an items list holding a string are Avro evidence; HEAD detected them as Avro
+    for index, schema in enumerate(("string", {"type": "array", "items": "string"}, {"type": "array", "items": ["null", "string"]})):
+        put(repo, f"base{index}.json", json.dumps(schema))
+        put(repo, f"head{index}.json", json.dumps(schema))
+        code, result = cli(repo, "--base", f"base{index}.json", "--head", f"head{index}.json")
+        assert code == 0 and result["status"] == "ok" and result["findings"] == [], schema
+        assert result["comparison"]["format"] == "avro" and result["comparison"]["compatible"] is True, schema
+
+
+def test_cloudevent_nested_under_a_wrapper_is_linted_at_its_json_pointer(repo):
+    # S-4: a CloudEvent under a wrapper used to pass the prefilter and be skipped; it is linted at the pointer of the event
+    put(repo, "wrap.json", {"event": {"specversion": "1.0", "id": "", "source": "s", "type": "t"}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert [(f["severity"], f["location"], f["summary"]) for f in result["findings"] if f["severity"] == "blocker"] == [
+        ("blocker", "wrap.json#/event", "required attribute 'id' must not be empty")]
+    assert result["scanned"]["cloudevents"] == 1
+
+
+def test_a_document_with_no_specversion_key_stays_silent_and_a_json_schema_property_is_not_an_event(repo):
+    # S-4 keeps R-2: the word in a string is out of scope, and a schema property named specversion is not a CloudEvent
+    put(repo, "silent.json", {"a": {"b": [1, {"c": "specversion"}]}})
+    put(repo, "ceschema.json", {"title": "CloudEvent", "properties": {"specversion": {"type": "string"}, "id": {"type": "string"}}})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+
+
+def test_a_nested_specversion_must_be_a_string_to_be_an_event_so_a_schema_property_is_not_a_false_blocker(repo):
+    # S-5: a JSON Schema whose properties map has specversion true is not a CloudEvent (HEAD passes it); a nested CloudEvent with a
+    # string specversion is still checked at its pointer
+    put(repo, "schema.json", {"type": "object", "properties": {"specversion": True, "id": {"type": "string"}}})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+    put(repo, "wrap.json", {"event": {"specversion": "1.0", "id": "", "source": "s", "type": "t"}})
+    code, result = cli(repo)
+    blockers = [(f["location"], f["summary"]) for f in result["findings"] if f["severity"] == "blocker"]
+    assert code == 1 and blockers == [("wrap.json#/event", "required attribute 'id' must not be empty")]
+
+
+def test_an_asyncapi_walk_past_its_budget_is_an_unanalysed_input_naming_the_file(repo):
+    # S-6: the cyclic n=9 document stops at its replay budget: a reason naming the file, status fail, exit 1, and no walk beyond it
+    n = 9
+    comps = {f"C{i}": {"oneOf": [{"$ref": f"#/components/messages/C{j}"} for j in range(n) if j != i] + [{"contentType": "x"}]}
+             for i in range(n)}
+    put(repo, "events/cyclic.json", {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+                                     "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/C0"}}}},
+                                     "components": {"messages": comps}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    incomplete = [f for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert len(incomplete) == 1 and incomplete[0]["severity"] == "major"
+    assert "events/cyclic.json: AsyncAPI message walk stopped after 500000 findings copied from shared messages" in incomplete[0]["summary"]
+
+
+def test_a_numeric_nested_cloudevent_is_linted_at_its_pointer(repo):
+    # N-3: a nested mapping whose specversion is a numeric scalar, with source and type, is a CloudEvent candidate: the core attribute
+    # finding applies there as at the root, so the file fails instead of passing silently
+    put(repo, "n3.json", {"wrap": {"specversion": 1.0, "id": "", "source": "s", "type": "t"}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    found = [(f["severity"], f["location"], f["summary"]) for f in result["findings"]]
+    assert ("major", "n3.json#/wrap", "core attribute 'specversion' must be a string") in found
+    assert ("blocker", "n3.json#/wrap", "required attribute 'id' must not be empty") in found
+
+
+def test_a_ref_chain_deeper_than_700_levels_is_a_reason_naming_the_file_and_the_chain(repo):
+    # N-2: a chain past the walk's depth limit (its text stays under the size bound) stops the walk: a reason naming the file and
+    # the chain, status fail, and no exception
+    comps = {"M800": {"payload": {"type": "object"}, "contentType": "application/json"}}
+    for index in range(799, -1, -1):
+        comps[f"M{index}"] = {"oneOf": [{"$ref": f"#/components/messages/M{index + 1}"}, {"contentType": "x"}]}
+    put(repo, "events/chain.json", {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+                                    "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
+                                    "components": {"messages": comps}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    incomplete = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert len(incomplete) == 1
+    assert ("events/chain.json: AsyncAPI message walk stopped under channels/c/messages/m: a $ref chain is deeper than 700 levels"
+            in incomplete[0])
+
+
+def test_a_stop_survives_truncation_and_the_scanner_still_reports_the_file_incomplete(repo):
+    # N-5: 320 blockers would push the walk-stop finding out of the handler's output; the stop is pinned, so the file is incomplete
+    comps = {"M800": {"payload": {"type": "object"}, "contentType": "application/json"}}
+    for index in range(799, -1, -1):
+        comps[f"M{index}"] = {"oneOf": [{"$ref": f"#/components/messages/M{index + 1}"}, {"contentType": "x"}]}
+    doc = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+           "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
+           "components": {"messages": comps},
+           "operations": {f"o{i}": {"action": "publish", "channel": {"$ref": "#/channels/c"}} for i in range(320)}}
+    put(repo, "events/ops.json", doc)
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    incomplete = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert len(incomplete) == 1
+    assert "events/ops.json: AsyncAPI message walk stopped under channels/c/messages/m: a $ref chain is deeper than 700 levels" in incomplete[0]
+
+
+def test_a_numeric_nested_event_with_no_source_is_a_candidate_and_gets_the_core_attribute_finding(repo):
+    # N-7: {wrap: {specversion: 1.0, id, type}} is a candidate, as the string form is: its numeric specversion is a core violation
+    put(repo, "n7.json", {"wrap": {"specversion": 1.0, "id": "1", "type": "t"}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    found = [(f["severity"], f["location"], f["summary"]) for f in result["findings"]]
+    assert ("major", "n7.json#/wrap", "core attribute 'specversion' must be a string") in found
+
+
+def test_json_schema_property_maps_are_never_events_whatever_their_values(repo):
+    # N-8: a properties map with specversion true and schema mappings for source and type gives six false blockers before; it is ok now,
+    # and so is a properties map of scalars
+    put(repo, "n8.json", {"properties": {"specversion": True, "source": {"type": "string"}, "type": {"type": "string"},
+                                         "id": {"type": "string"}}})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+    put(repo, "n8b.json", {"properties": {"specversion": True, "id": True, "type": True}})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+
+
+def test_a_nested_string_specversion_is_a_candidate_even_without_id_type_or_source(repo):
+    # S-4 restored: a nested mapping whose specversion is a string is a CloudEvent candidate whatever else it has, so a missing id is
+    # the id blocker at its pointer and the file is not silent
+    put(repo, "wrap.json", {"wrap": {"specversion": "1.0", "id": ""}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert ("blocker", "wrap.json#/wrap", "required attribute 'id' must not be empty") in [
+        (f["severity"], f["location"], f["summary"]) for f in result["findings"]]
+
+
+def test_event_data_under_a_keyword_named_key_is_linted_and_only_schema_maps_are_skipped(repo):
+    # R6-2: a key named like a JSON Schema keyword (properties, definitions) that holds event data is linted at the event's pointer;
+    # the exclusion applies only to schema maps, whose entries are booleans or schema objects
+    put(repo, "env.json", {"envelope": {"properties": {"specversion": "1.0", "id": "", "source": "s", "type": "t"}}})
+    put(repo, "defs.json", {"definitions": {"ev1": {"specversion": "1.0", "id": "", "source": "s", "type": "t"}}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    blockers = sorted((f["location"], f["summary"]) for f in result["findings"] if f["severity"] == "blocker")
+    assert blockers == [("defs.json#/definitions/ev1", "required attribute 'id' must not be empty"),
+                        ("env.json#/envelope/properties", "required attribute 'id' must not be empty")]
+
+
+def test_numeric_nested_specversion_with_one_scalar_attribute_is_a_candidate(repo):
+    # R6-3: a numeric specversion with a scalar type and no id, or with a mapping id, is a candidate: the core-attribute major is at
+    # its pointer and the file fails
+    put(repo, "no-id.json", {"wrap": {"specversion": 1.0, "type": "t"}})
+    put(repo, "mapping-id.json", {"wrap": {"specversion": 1.0, "id": {"x": 1}, "type": "t"}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    found = [(f["location"], f["summary"]) for f in result["findings"]]
+    assert ("no-id.json#/wrap", "core attribute 'specversion' must be a string") in found
+    assert ("mapping-id.json#/wrap", "core attribute 'specversion' must be a string") in found
+
+
+def test_keyword_named_maps_are_schema_maps_whatever_keywords_their_entries_use(repo):
+    # R7-1: an object entry is event data only when one of its CloudEvents attributes holds a string or a number; these maps are schema
+    put(repo, "pattern.json", {"properties": {"specversion": True, "id": True, "type": {"pattern": "^t$"}}})
+    put(repo, "empty.json", {"properties": {"specversion": True, "id": True, "type": {}}})
+    put(repo, "source-pattern.json", {"properties": {"specversion": True, "id": True, "source": {"pattern": "x"}}})
+    put(repo, "n8.json", {"properties": {"specversion": True, "source": {"type": "string"}, "type": {"type": "string"}, "id": {"type": "string"}}})
+    put(repo, "s5.json", {"type": "object", "properties": {"specversion": True, "id": {"type": "string"}}})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+
+
+def test_scan_incomplete_summary_keeps_the_whole_stop_sentence_with_long_names_and_paths(repo):
+    # R7-2: the summary is capped at 300 characters, the registered findings maxLength, so a long path is labelled by its head and tail
+    # and the origin is bounded; the stop sentence stays whole. The full path is the asyncapi finding's location.
+    comps = {"M800": {"payload": {"type": "object"}, "contentType": "application/json"}}
+    for index in range(799, -1, -1):
+        comps[f"M{index}"] = {"oneOf": [{"$ref": f"#/components/messages/M{index + 1}"}, {"contentType": "x"}]}
+    chain = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"}, "components": {"messages": comps}}
+    put(repo, "long.json", {**chain, "channels": {"k" * 60: {"address": "a", "messages": {"j" * 60: {"$ref": "#/components/messages/M0"}}}}})
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert summaries[0].endswith("the message count and the findings list are both partial")
+    (repo / "long.json").unlink()
+    path = "events/" + "e" * 101 + ".json"  # 113 characters
+    assert len(path) == 113
+    put(repo, path, {**chain, "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}}})
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert summaries[0].endswith("the message count and the findings list are both partial")
+    assert "events/" in summaries[0] and "…" in summaries[0]  # the head of the path labels the file; the sentence stays whole
+    assert any(f["rule"] == "asyncapi" and f["location"] == path for f in result["findings"])  # the full path is the finding's location
+
+
+def test_present_attribute_with_a_non_scalar_value_is_never_reported_as_missing(repo):
+    # R7-3: an id present with a mapping value gets its type message only; the source that is absent is still reported as missing
+    put(repo, "wrap.json", {"wrap": {"specversion": 1.0, "id": {"x": 1}, "type": "t"}})
+    code, result = cli(repo)
+    at_wrap = [(f["severity"], f["summary"]) for f in result["findings"] if f["location"] == "wrap.json#/wrap"]
+    assert ("blocker", "attribute 'id' must be a string, boolean or number, not dict") in at_wrap
+    assert all(summary != "required attribute 'id' is missing" for _, summary in at_wrap)
+    assert ("blocker", "required attribute 'source' is missing") in at_wrap
+
+
+def test_json_schema_type_names_are_schema_keywords_and_reverse_dns_event_types_stay_event_data(repo):
+    # R7-1: a `type` holding a JSON Schema type name is a schema keyword, so these valid schemas give ok; a reverse-DNS event type is still
+    # event data, so an invalid event under a keyword-named key is linted at its pointer
+    put(repo, "type-name.json", {"properties": {"specversion": True, "id": True, "type": {"type": "string"}}})
+    put(repo, "source-name.json", {"properties": {"specversion": True, "id": True, "source": {"type": "string"}}})
+    code, result = cli(repo)
+    assert code == 0 and result["status"] == "ok" and result["findings"] == []
+    put(repo, "event.json", {"definitions": {"ev1": {"specversion": "1.0", "id": "", "source": "s", "type": "com.example.order"}}})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert [(f["severity"], f["location"], f["summary"]) for f in result["findings"] if f["severity"] == "blocker"] == [
+        ("blocker", "event.json#/definitions/ev1", "required attribute 'id' must not be empty")]
+
+
+def _chain_document(levels: int = 800, channel: str = "c") -> dict:
+    comps = {f"M{levels}": {"payload": {"type": "object"}, "contentType": "application/json"}}
+    for index in range(levels - 1, -1, -1):
+        comps[f"M{index}"] = {"oneOf": [{"$ref": f"#/components/messages/M{index + 1}"}, {"contentType": "x"}]}
+    return {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+            "channels": {channel: {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
+            "components": {"messages": comps}}
+
+
+CHAIN_SENTENCE = "a $ref chain is deeper than 700 levels, the document is not fully analysed"
+
+
+def test_an_oversize_file_before_a_chain_stop_keeps_the_stop_sentence_whole(repo):
+    # R8-1: the oversize reason sorts first; the stop reason keeps its whole sentence and the summary stays at 300 characters
+    put(repo, "a_oversize.json", '{"asyncapi": "3.0.0", "pad": "' + "x" * (1024 * 1024 + 10) + '"}')
+    put(repo, "b_chain.json", _chain_document())
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+
+
+def test_an_unparseable_file_before_a_chain_stop_keeps_the_stop_sentence_whole(repo):
+    # R8-1: the unparseable reason sorts first; the chain stop keeps its whole sentence and the summary stays at 300 characters
+    put(repo, "a_unparseable.json", '{"asyncapi": "3.0.0", broken')
+    put(repo, "b_chain.json", _chain_document())
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+
+
+def test_a_stop_is_named_within_the_first_five_reasons_even_after_five_unparseable_files(repo):
+    # R8-2: five unparseable files a0 to a4 sort before the stop file z.json; the stop is shown and the status is still fail
+    for index in range(5):
+        put(repo, f"a{index}.json", '{"asyncapi": "3.0.0", broken')
+    put(repo, "z.json", _chain_document())
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and result["status"] == "fail" and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert "z.json" in summaries[0] and CHAIN_SENTENCE in summaries[0]
+
+
+MORE_STOPS = "and 1 more"
+CLAUSE = "the message count and the findings list are both partial"
+
+
+def test_a_file_name_with_a_colon_space_keeps_the_stop_sentence_and_the_clause_whole(repo):
+    # R9-1: the label comes from the scanned file's name, not from splitting the reason text on ': ', so a name that holds ': ' is measured
+    # as the name and the clause after the chain sentence stays whole
+    name = "x" * 60 + ": " + "y" * 60 + ".json"
+    put(repo, name, _chain_document(channel="k" * 60))
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0] and CLAUSE in summaries[0]
+
+
+def test_two_chain_stops_with_60_character_names_both_fit_or_are_named_and_the_first_stays_whole(repo):
+    # R9-2: two stops in one scan; the first keeps its whole sentence, and the second is named by its file and kind, or counted
+    put(repo, "first_name_" + "a" * 50 + ".json", _chain_document(channel="k" * 60))
+    put(repo, "second_name_" + "b" * 50 + ".json", _chain_document(channel="j" * 60))
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+    assert "second_name_" in summaries[0] or summaries[0].endswith(MORE_STOPS)
+
+
+def test_two_chain_stops_with_113_character_paths_name_the_second_or_count_it(repo):
+    # R9-2: two 113-character paths; the first stop is whole, and the second is not dropped silently
+    first, second = "events/" + "e" * 101 + ".json", "events/" + "f" * 101 + ".json"
+    put(repo, first, _chain_document())
+    put(repo, second, _chain_document())
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+    assert "ffff" in summaries[0] or summaries[0].endswith(MORE_STOPS)
+
+
+def _count_clauses(summary: str) -> list:
+    """Every 'and N more' clause in a summary (R10-2, R10-3, R11-2)."""
+    return [part for part in summary.split("; ") if part.startswith("and ") and part.endswith(" more")]
+
+
+def test_three_stops_keep_the_first_sentence_whole_and_a_complete_count_clause(repo):
+    # R10-1: three chain stops; the first keeps its sentence, and the count clause is complete, never cut to 'and 1 more stop '
+    for index in range(3):
+        put(repo, f"z{index}_" + "q" * 40 + ".json", _chain_document())
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+    assert summaries[0].endswith("and 2 more")
+
+
+def test_omitted_per_file_reasons_are_counted_not_dropped_with_long_and_short_names(repo):
+    # R10-2: one chain stop and four unparseable files; the per-file reasons that do not fit are counted, so no reason is lost without a count
+    put(repo, "stop.json", _chain_document())
+    for index in range(4):
+        put(repo, f"b{index}_" + "b" * 100 + ".json", '{"asyncapi": "3.0.0", broken')
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+    assert summaries[0].endswith("and 4 more") and _count_clauses(summaries[0]) == ["and 4 more"]
+
+
+def test_omitted_per_file_reasons_with_113_character_paths_are_counted(repo):
+    # R10-2: the same with 113-character paths, where the per-file reasons used to be cut entirely with no count
+    put(repo, "events/stop" + "s" * 101 + ".json", _chain_document())
+    for index in range(4):
+        put(repo, f"events/{'c' * 103}{index}.json", '{"asyncapi": "3.0.0", broken')
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert CHAIN_SENTENCE in summaries[0]
+    assert summaries[0].endswith("and 4 more") and _count_clauses(summaries[0]) == ["and 4 more"]
+
+
+def test_one_omitted_item_is_counted_as_and_1_more(repo):
+    # R11-2: one omitted item gives 'and 1 more' in full, for stops and per-file reasons alike
+    put(repo, "z0.json", _chain_document())
+    put(repo, "z1.json", _chain_document())
+    code, result = cli(repo)
+    summaries = [f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete"]
+    assert code == 1 and len(summaries) == 1 and len(summaries[0]) <= 300
+    assert summaries[0].endswith("and 1 more")
+
+
+def _recursion_stop(monkeypatch, channel: str) -> str:
+    """The recursion stop the handler produces, forced in-process at chain depth 3 (no network, no keys)."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from swarm.tools import a19_tools
+    original = a19_tools._asyncapi_message
+
+    def stop_at_depth_three(message, where, chain, walk):
+        if len(chain) >= 3:
+            raise RecursionError("forced")
+        return original(message, where, chain, walk)
+
+    monkeypatch.setattr(a19_tools, "_asyncapi_message", stop_at_depth_three)
+    document = {"asyncapi": "3.0.0", "info": {"title": "T", "version": "1"},
+                "channels": {channel: {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M0"}}}},
+                "components": {"messages": {"M0": {"oneOf": [{"$ref": "#/components/messages/M1"}]},
+                                            "M1": {"oneOf": [{"$ref": "#/components/messages/M2"}]},
+                                            "M2": {"oneOf": [{"$ref": "#/components/messages/M3"}]},
+                                            "M3": {"contentType": "x"}}}}
+    result = a19_tools.asyncapi_lint({"document": json.dumps(document)})
+    return next(f["summary"] for f in result["findings"] if f["summary"].startswith(a19_tools.ASYNCAPI_WALK_STOPPED))
+
+
+def _summary_of_stops(module, stops: list) -> str:
+    """The summary the shared rule gives these walk stops, through the scanner's own render (R10-1)."""
+    return module.incomplete_findings(module._stops_first(stops), 1)[0]["summary"]
+
+
+def test_three_recursion_stops_with_60_character_names_keep_the_sentence_whole_and_the_count_complete(monkeypatch):
+    # R10-1: the recursion sentence is 207 characters; three of them must keep the first whole and end on a complete 'and 2 more'
+    module = load_module()
+    sentence = _recursion_stop(monkeypatch, "k" * 60)
+    stops = [module._Stop(f"z{index}_" + "q" * 40 + ".json", sentence) for index in range(3)]
+    summary = _summary_of_stops(module, stops)
+    assert len(summary) <= 300
+    assert sentence in summary
+    assert summary.endswith("and 2 more")
+
+
+def test_three_recursion_stops_with_113_character_paths_keep_the_sentence_whole_and_the_count_complete(monkeypatch):
+    # R10-1: the same with 113-character paths
+    module = load_module()
+    sentence = _recursion_stop(monkeypatch, "k" * 60)
+    stops = [module._Stop(f"events/{index}_" + "p" * 100 + ".json", sentence) for index in range(3)]
+    summary = _summary_of_stops(module, stops)
+    assert len(summary) <= 300
+    assert sentence in summary
+    assert summary.endswith("and 2 more")

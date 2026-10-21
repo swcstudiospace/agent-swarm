@@ -46,6 +46,9 @@ MINUTES_PER_YEAR = 525600  # 365 days, the convention behind "99.9% = 8.76 h/yea
 # twelve-factor: judgement thresholds
 STARTUP_MAX_S = Decimal("30")
 DEPLOY_GAP_MAX_DAYS = Decimal("1")
+# the registered schema bounds: a value outside them is INVALID_INPUT, never a conformant or a failing answer
+STARTUP_RANGE_S = (Decimal("0"), Decimal("86400"))
+DEPLOY_GAP_RANGE_DAYS = (Decimal("0"), Decimal("3650"))
 
 # disaster recovery: ordered from least to most ready (and least to most costly)
 DR_STRATEGIES = ("backup_restore", "pilot_light", "warm_standby", "active_active")
@@ -199,9 +202,50 @@ def _is_int(value, expected: int) -> bool:
     return type(value) is int and value == expected
 
 
+def _real(value) -> bool:
+    """A real number that is not a boolean: an int, or a finite float. NaN and infinity are not real."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, int)
+
+
+def _huge(value) -> bool:
+    """An integer larger than any float (over 1024 bits), so out of range for every bound here. It is judged before any conversion:
+    Decimal(repr(value)) raises ValueError past the integer string limit, so an integer such as 10**5000 cannot be converted at all."""
+    return isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 1024
+
+
+def _number_error(value, low, high, *, low_open: bool = False, high_open: bool = False, integer: bool = False) -> bool:
+    """True when value is not a usable number within the range: a boolean, NaN or infinity, an integer beyond the conversion limit, a
+    float where an integer is required (an integer field takes an int only), or a value outside [low, high] (an open end excludes its
+    bound). The checks run before any conversion, so a value that cannot be converted is reported as out of range instead of raising."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return True
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    if _huge(value) or (integer and not isinstance(value, int)):
+        return True
+    exact = _dec(value)
+    if exact < low or exact > high:
+        return True
+    return (low_open and exact == low) or (high_open and exact == high)
+
+
 def _at_most(value, limit: Decimal) -> bool:
-    """True when value is a finite real number no greater than limit. Any other type, booleans included, does not pass."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and _dec(value) <= limit
+    """True when value is a real number no greater than limit. Any other type, booleans included, does not pass."""
+    return _real(value) and not _huge(value) and _dec(value) <= limit
+
+
+def _outside_range(value, low: Decimal, high: Decimal) -> bool:
+    """True when value is a number outside [low, high], including NaN, infinity and an integer too large to convert. Other types are
+    not judged here: their own check fails, so a boolean is never reported as out of range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if _huge(value):
+        return True
+    return not _real(value) or not low <= _dec(value) <= high
 
 
 # (factor, descriptor key, passes(value), severity when failing, summary). Booleans are listed with the passing value.
@@ -251,6 +295,9 @@ def twelve_factor_audit(payload: dict) -> dict:
 
     def work() -> dict:
         service = payload["service"]
+        for key, (low, high) in (("startup_seconds", STARTUP_RANGE_S), ("deploy_gap_days", DEPLOY_GAP_RANGE_DAYS)):
+            if key in service and _outside_range(service[key], low, high):
+                return _invalid(key, f"{key} must be a number from {low} to {high}")
         passed = dict.fromkeys(FACTOR_NAMES, 0)
         total = dict.fromkeys(FACTOR_NAMES, 0)
         findings: list[dict] = []
@@ -317,8 +364,22 @@ def composite_availability(payload: dict) -> dict:
         if dupes:
             return _invalid("tiers", f"tier ids must be unique: {', '.join(dupes)}")
         for tier in tiers:
+            if _number_error(tier["replicas"], 1, 50, integer=True):
+                return _invalid("replicas", f"tier {tier['id']}: replicas must be an integer from 1 to 50")
+            if _number_error(tier["min_required"], 0, 50, integer=True):
+                return _invalid("min_required", f"tier {tier['id']}: min_required must be an integer from 0 to 50")
+        for tier in tiers:
             if tier["min_required"] > tier["replicas"]:
                 return _invalid("tiers", f"tier {tier['id']}: min_required {tier['min_required']} exceeds replicas {tier['replicas']}")
+        for tier in tiers:
+            # 100 gives 0**0 in the k-of-n term (no replica down), and so does 0 when no replica is needed (no replica up)
+            if _number_error(tier["availability_pct"], 0, 100, high_open=True):
+                return _invalid("availability_pct", f"tier {tier['id']}: availability_pct must be at least 0 and below 100")
+            if _dec(tier["availability_pct"]) == 0 and tier["min_required"] == 0:
+                return _invalid("availability_pct", f"tier {tier['id']}: availability_pct 0 needs min_required of at least 1")
+        # the target is an open interval: 0 makes every chain pass and 100 makes every chain fail
+        if _number_error(payload["target_pct"], 0, 100, low_open=True, high_open=True):
+            return _invalid("target_pct", "target_pct must be above 0 and below 100")
         with localcontext() as ctx:
             ctx.prec = COMPOSITE_PRECISION
             target = _dec(payload["target_pct"]) / 100
@@ -783,17 +844,29 @@ def blast_radius(payload: dict) -> dict:
 # --- 8. cell capacity ------------------------------------------------------------------------------------------
 
 
+# cell capacity: the registered input schema (cloud_cell_capacity). Each entry is (low, high, low_open, integer). A value outside it,
+# or a boolean, NaN, infinity or an integer beyond the conversion limit, is INVALID_INPUT naming the field, never a computed answer.
+CELL_BOUNDS = {
+    "load_rps": (0, 1000000000, True, False),
+    "cell_max_rps": (1, 1000000000, False, False),
+    "target_utilisation_pct": (1, 100, False, False),
+    "growth_pct": (0, 1000, False, False),
+    "spare_cells": (0, 100, False, True),
+    "current_cells": (0, 1000000, False, True),
+}
+
+
 @_safe
 def cell_capacity(payload: dict) -> dict:
     """Cells for a projected load at a target utilisation, plus spare cells (N+1 style), the per-cell blast radius and the gap to the deployed count."""
 
     def work() -> dict:
+        for field, (low, high, low_open, integer) in CELL_BOUNDS.items():
+            if _number_error(payload[field], low, high, low_open=low_open, integer=integer):
+                kind = "an integer" if integer else "a number"
+                return _invalid(field, f"{field} must be {kind} from {low} to {high}" + (", with 0 excluded" if low_open else ""))
         usable = Fraction(_dec(payload["cell_max_rps"])) * Fraction(_dec(payload["target_utilisation_pct"])) / 100
         projected = Fraction(_dec(payload["load_rps"])) * (100 + Fraction(_dec(payload["growth_pct"]))) / 100
-        if usable == 0:  # the schema keeps both positive; a direct call must not divide by zero
-            return _invalid("target_utilisation_pct", "cell_max_rps and target_utilisation_pct must both be positive")
-        if projected == 0:  # headroom is relative to the projected load, so it is undefined at zero load
-            return _invalid("load_rps", "the projected load is zero, so headroom is undefined: load_rps must be positive")
         for_load = max(1, math.ceil(projected / usable))  # exact rational ceil: a load of exactly k cells needs k, not k+1
         required = for_load + payload["spare_cells"]
         provisioned = usable * required
