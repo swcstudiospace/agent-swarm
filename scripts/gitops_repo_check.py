@@ -15,8 +15,8 @@ check} with severity info|minor|major|blocker. Checks:
              (gitops_secret_scan)
 `status` is "fail" when any major or blocker finding exists. The rules are the handlers of swarm/tools/a22_tools.py, so the
 script and the registry tools never disagree. Read-only and bounded: files over 1 MiB, binaries and symlinks are skipped and
-at most 2000 files are read. YAML needs PyYAML; without it YAML files are reported as `skipped:tool-missing` (JSON is always
-read). No external binary is used. `--dry-run` prints deterministic canned output and reads nothing.
+at most 2000 files are read. YAML needs PyYAML; without it YAML files are not read, so the scan reports `scan/incomplete`
+(major, status "fail") while JSON is still read. No external binary is used. `--dry-run` prints deterministic canned output and reads nothing.
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a22_tools as rules  # noqa: E402
 
@@ -86,19 +87,25 @@ class Repo:
         self.truncated = False
         self.examined = 0
         self.findings: list[dict] = []
+        self.reasons: list[str] = []  # one label and path per in-scope input or check that was not analysed; never a value
 
     def add(self, check: str, file: str, fid: str, severity: str, summary: str) -> None:
         scrub = rules._scrub  # findings never quote a credential-shaped value
         self.findings.append({"id": scrub(f"{check}:{fid}"), "severity": severity, "summary": scrub(summary), "file": file, "location": file, "check": check})
 
+    def skip(self, kind: str, path: str) -> None:
+        """Count an input that was not read and name its path as a reason the status cannot be ok."""
+        self.skipped[kind] += 1
+        self.reasons.append(f"{Path(path).relative_to(self.root).as_posix()}: {kind}, not analysed")
+
     def from_tool(self, check: str, file: str, result: dict) -> None:
-        """Take a handler's findings (info dropped as noise); an INVALID_INPUT answer becomes a minor finding."""
+        """Take a handler's findings (info dropped as noise). A check that did not run is a reason, never a silent pass."""
         if result.get("state") == "SUCCESS":
             for item in result["findings"]:
                 if item["severity"] != "info":
                     self.add(check, file, item["id"], item["severity"], item["summary"])
-        elif result.get("state") == "INVALID_INPUT":
-            self.add(check, file, "check-skipped", "minor", f"{result.get('field')}: {result.get('message')}")
+        else:
+            self.reasons.append(f"{check} check did not run on {file} ({result.get('state', 'no result')})")
 
     def production(self, rel: str) -> bool:
         return any(token in self.prod_markers for token in re.split(r"[^a-z0-9]+", rel.lower()))
@@ -144,7 +151,7 @@ def _scan(repo: Repo, base: Path, yaml_mod) -> None:
             if name in SKIP_DIRS:
                 continue
             if os.path.islink(os.path.join(current, name)):
-                repo.skipped["symlink"] += 1
+                repo.skip("symlink", os.path.join(current, name))
                 continue
             kept.append(name)
         dirnames[:] = kept
@@ -153,51 +160,51 @@ def _scan(repo: Repo, base: Path, yaml_mod) -> None:
                 continue
             path = os.path.join(current, name)
             if os.path.islink(path):
-                repo.skipped["symlink"] += 1
+                repo.skip("symlink", path)
                 continue
             repo.examined += 1
             if repo.examined > MAX_FILES:
                 repo.truncated = done = True
+                repo.reasons.append(f"scan stopped after {MAX_FILES} files; the rest of the tree was not scanned")
                 break
             rel = Path(path).relative_to(repo.root).as_posix()
             try:
                 info = os.stat(path)
                 if not stat.S_ISREG(info.st_mode):  # FIFOs, sockets and devices are never opened: open() on a FIFO blocks forever
-                    repo.skipped["unreadable"] += 1
+                    repo.skip("unreadable", path)
                     continue
                 if info.st_size > MAX_FILE_BYTES:
-                    repo.skipped["too-large"] += 1
+                    repo.skip("too-large", path)
                     continue
                 # O_NONBLOCK stops a FIFO swapped in after the stat from blocking the open; the fstat below rejects it
                 fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
                 with os.fdopen(fd, "rb") as handle:
                     if not stat.S_ISREG(os.fstat(fd).st_mode):
-                        repo.skipped["unreadable"] += 1
+                        repo.skip("unreadable", path)
                         continue
                     data = handle.read(MAX_FILE_BYTES + 1)
             except OSError:
-                repo.skipped["unreadable"] += 1
+                repo.skip("unreadable", path)
                 continue
             if b"\0" in data[:8192]:
-                repo.skipped["binary"] += 1
+                repo.skip("binary", path)
                 continue
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError:
-                repo.skipped["binary"] += 1
+                repo.skip("binary", path)
                 continue
             documents, problem = _parse(text, name, yaml_mod)
             if problem == "yaml-missing":
                 repo.yaml_missing_files += 1
-            elif problem == "templated":
-                repo.skipped["templated"] += 1
-            elif problem == "too-complex":
-                repo.skipped["too-complex"] += 1
+                repo.reasons.append(f"{rel}: YAML not read, PyYAML is not installed")
+            elif problem in ("templated", "too-complex"):
+                repo.skip(problem, path)
             elif problem == "error":
                 repo.add("parse", rel, rel, "major", f"{rel} is not valid YAML/JSON; GitOps controllers cannot render it")
             else:
                 repo.raw[rel] = documents
-                repo.docs[rel] = [d for d in documents if isinstance(d, dict)]
+                repo.docs[rel] = [d for d in rules._expand_lists(documents) if isinstance(d, dict)]  # a kind: List stands for its items: the objects it holds
         if done:
             break
 
@@ -230,6 +237,18 @@ def _strings(value) -> list[str]:
 def _annotated(doc: dict, key: str) -> bool:
     annotations = doc["metadata"].get("annotations")
     return isinstance(annotations, dict) and key in annotations
+
+
+def _defines_a_kind_here(manifests: list[dict]) -> bool:
+    """Whether a CustomResourceDefinition of the unit defines the kind of another object in it: their order matters without annotations too."""
+    crds = set()
+    for manifest in manifests:
+        spec = manifest.get("spec")
+        names = spec.get("names") if isinstance(spec, dict) else None
+        if manifest["kind"] == "CustomResourceDefinition" and isinstance(spec, dict) and isinstance(names, dict):
+            if isinstance(spec.get("group"), str) and isinstance(names.get("kind"), str):
+                crds.add((spec["group"], names["kind"]))
+    return any(m["kind"] != "CustomResourceDefinition" and (rules._group(m["apiVersion"]), m["kind"]) in crds for m in manifests)
 
 
 def _file_references(kust: dict) -> list[tuple[str, str]]:
@@ -413,6 +432,9 @@ def _check_kustomize(repo: Repo) -> dict[str, tuple[str, dict]]:
         result = rules.kustomize_check({"kustomization": _inline_patches(repo, directory, kust), "resources": items})
         if result.get("state") == "SUCCESS" and _opaque(kusts, directory):
             # remote bases, components, Helm charts and generators add objects this scan cannot see: a patch target that matches none of the visible ones is unproven, not missing
+            hidden = [f for f in result["findings"] if f["id"].startswith("patch-target-not-found")]
+            if hidden:
+                repo.reasons.append(f"{rel}: {len(hidden)} patch target(s) unproven, the tree renders objects this scan cannot see")
             result["findings"] = [f for f in result["findings"] if not f["id"].startswith("patch-target-not-found")]
         repo.from_tool("kustomize", rel, result)
         for generator in kust.get("secretGenerator") or []:
@@ -440,8 +462,6 @@ def _check_apps(repo: Repo) -> None:
             environment = "prod" if repo.production(rel) else "nonprod"
             if group == "argoproj.io" and kind == "ApplicationSet":
                 result = rules.appset_check({"applicationset": doc, "clusters": [], "environment": environment})
-                if result.get("state") == "SUCCESS":
-                    result["findings"] = [f for f in result["findings"] if f["id"] != "clusters-not-supplied"]
                 repo.from_tool("apps", rel, result)
             elif (group, kind) in (("argoproj.io", "Application"), ("kustomize.toolkit.fluxcd.io", "Kustomization"), ("helm.toolkit.fluxcd.io", "HelmRelease")):
                 repo.from_tool("apps", rel, rules.app_sync_policy({"resource": doc, "environment": environment}))
@@ -481,10 +501,10 @@ def _check_waves(repo: Repo, kusts: dict) -> None:
     units += [((directory or ".") + "/", files) for directory, files in sorted(loose.items())]
     for label, files in units:
         manifests = [d for rel in files for d in repo.docs.get(rel, []) if _is_object(d) and not d["apiVersion"].startswith("kustomize.config.k8s.io/")]
-        if not any(_annotated(m, rules.WAVE_ANNOTATION) or _annotated(m, rules.HOOK_ANNOTATION) for m in manifests):
+        if not any(_annotated(m, rules.WAVE_ANNOTATION) or _annotated(m, rules.HOOK_ANNOTATION) for m in manifests) and not _defines_a_kind_here(manifests):
             continue
         if len(manifests) > UNIT_LIMIT:
-            repo.add("waves", label, "unit-truncated", "minor", f"{label} renders {len(manifests)} objects; only the first {UNIT_LIMIT} were checked for sync order")
+            repo.reasons.append(f"{label}: sync order checked for the first {UNIT_LIMIT} of {len(manifests)} objects only")
         repo.from_tool("waves", label, rules.sync_wave_check({"manifests": manifests[:UNIT_LIMIT]}))
 
 
@@ -550,28 +570,29 @@ def _check_images(repo: Repo, kusts: dict) -> None:
 
 
 def _check_secrets(repo: Repo) -> None:
-    for rel in sorted(repo.docs):
-        objects = [d for d in repo.docs[rel] if _is_object(d)]
+    for rel in sorted(repo.raw):
+        expanded = rules._expand_lists(repo.raw[rel])  # kubectl get -o yaml emits a kind: List whose items are the objects
+        objects = [d for d in expanded if _is_object(d)]
         for start in range(0, len(objects), 200):
             repo.from_tool("secrets", rel, rules.secret_scan({"manifests": objects[start:start + 200]}))
-    for rel in sorted(repo.raw):
         # kustomization.yaml, Helm values and every other document that is not a Kubernetes object: credential formats and URL passwords only
-        others = [{"apiVersion": "v1", "kind": "Document", "metadata": {"name": rel}, "content": doc} for doc in repo.raw[rel] if not _is_object(doc)]
+        others = [{"apiVersion": "v1", "kind": "Document", "metadata": {"name": rel}, "content": doc} for doc in expanded if not _is_object(doc)]
         for start in range(0, len(others), 200):
             repo.from_tool("secrets", rel, rules.secret_scan({"manifests": others[start:start + 200]}))
 
 
 def _result(repo: Repo, scanned: int) -> dict:
-    ordered = sorted(repo.findings, key=lambda f: (SEVERITY_RANK[f["severity"]], f["file"], f["id"]))
-    counts = {name: sum(1 for f in ordered if f["severity"] == name) for name in SEVERITY_RANK}
-    checks = {name: sum(1 for f in ordered if f["check"] == name) for name in CHECKS}
     skipped = []
     if repo.yaml_missing_files:
         skipped.append({"check": "kustomize, apps, waves, images, secrets (YAML files)", "reason": "skipped:tool-missing", "tool": "PyYAML",
                         "files": repo.yaml_missing_files})
-    failing = counts["blocker"] + counts["major"]
+    incomplete = [{"id": f["id"], "severity": f["severity"], "summary": f["summary"], "file": ".", "location": ".", "check": "scan"}
+                  for f in incomplete_findings(repo.reasons, scanned)]
+    ordered = sorted(repo.findings + incomplete, key=lambda f: (SEVERITY_RANK[f["severity"]], f["file"], f["id"]))
+    counts = {name: sum(1 for f in ordered if f["severity"] == name) for name in SEVERITY_RANK}
+    checks = {name: sum(1 for f in ordered if f["check"] == name) for name in CHECKS}
     return {
-        "status": "fail" if failing else "ok",
+        "status": scan_status(ordered),
         "summary": f"{len(ordered)} finding(s) in {scanned} file(s): {counts['blocker']} blocker, {counts['major']} major, {counts['minor']} minor, {counts['info']} info",
         "findings": ordered[:MAX_FINDINGS], "finding_count": len(ordered), "severity_counts": counts, "checks": checks,
         "files_scanned": scanned, "files_skipped": dict(repo.skipped), "files_skipped_yaml_missing": repo.yaml_missing_files,

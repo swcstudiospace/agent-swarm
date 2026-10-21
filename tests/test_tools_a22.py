@@ -1374,7 +1374,7 @@ def test_drift_server_populated_fields_are_benign(path):
 @pytest.mark.parametrize("path", ["spec.template.spec.containers[0].terminationMessagePath", "spec.template.spec.containers[name=app].terminationMessagePolicy",
                                   "spec.template.spec.containers[0].imagePullPolicy", "spec.template.spec.containers[0].ports[0].protocol",
                                   "spec.template.spec.dnsPolicy", "spec.template.spec.restartPolicy", "spec.template.spec.schedulerName",
-                                  "spec.template.spec.securityContext", "spec.template.spec.terminationGracePeriodSeconds", "spec.revisionHistoryLimit",
+                                  "spec.template.spec.terminationGracePeriodSeconds", "spec.revisionHistoryLimit",
                                   "spec.progressDeadlineSeconds", "spec.strategy", "spec.clusterIP", "spec.clusterIPs", "spec.ipFamilies", "spec.ipFamilyPolicy",
                                   "spec.internalTrafficPolicy", "spec.sessionAffinity"])
 def test_drift_api_defaults_are_benign_only_when_the_live_object_added_them(path):
@@ -1763,7 +1763,8 @@ def test_layout_cluster_registration():
 
 
 @pytest.mark.parametrize("name,major", [(".env", True), ("id_rsa", True), ("id_ed25519", True), ("id_ecdsa", True), ("kubeconfig", True), ("tls.key", True),
-                                        ("cert.pfx", True), ("cert.p12", True), ("prod.env", True), ("ca.pem", False), ("id_rsa.pub", False), ("keys.md", False)])
+                                        ("cert.pfx", True), ("cert.p12", True), ("prod.env", True), ("ca.pem", False), ("id_rsa.pub", False), ("keys.md", False),
+                                        ("id_dsa", True), ("server.jks", True), ("gcp-sa.p8", True), ("kubeconfig.yaml", True)])
 def test_layout_private_key_files(name, major):
     result = layout(GOOD + [f"deploy/{name}"], codeowners="* @a\n")
     expected = {"secret-like-file:deploy/" + name: "major"} if major and name != "ca.pem" else {}
@@ -2290,3 +2291,86 @@ def test_secret_scan_pass_is_a_secret_word_only_as_a_whole_word(name, flagged):
     result = scan(deployment_with_env({"name": name, "value": "hunter2hunter2"}))
     expected = {"plaintext-env:Deployment/app/d:spec.template.spec.containers[0].env[0]": "major"} if flagged else {}
     assert severities(result) == expected and result["exposure_count"] == int(flagged)
+
+
+def test_drift_pod_security_context_added_outside_git_is_dangerous_at_any_granularity():
+    # Changed from benign: a non-default pod security context added outside Git is dangerous at every diff granularity.
+    assert klass("spec.template.spec.securityContext", "added") == "dangerous"
+    assert klass("spec.template.spec.securityContext", "added", kind="StatefulSet") == "dangerous"
+    assert klass("spec.template.spec.securityContext.runAsUser", "added") == "dangerous"
+
+
+@pytest.mark.parametrize("kind", ["NetworkPolicy", "ClusterRole", "ValidatingWebhookConfiguration"])
+def test_drift_guardrail_additions_are_dangerous_even_for_api_default_fields(kind):
+    assert klass("spec.ingress[0].ports[0].protocol", "added", kind=kind) == "dangerous"
+    assert klass("spec.ingress[0].ports[0].protocol", "changed", kind=kind) == "dangerous"
+
+
+def test_drift_whole_secret_changed_outside_git_is_dangerous():
+    assert klass("$", "changed", kind="Secret") == "dangerous" and klass("$", "removed", kind="Secret") == "dangerous"
+    assert classify(diff("$", "changed", kind="Secret"))["recommended_action"] == "investigate"
+    assert klass("$", "changed", kind="ConfigMap") == "drift"
+
+
+def test_sync_wave_digit_runs_are_bounded_and_leading_zeros_are_not_significant():
+    huge = obj("ConfigMap", "c", annotations={WAVE: "1" * 5000})
+    assert severities(waves([huge])) == {"wave-invalid:ConfigMap/app/c": "major"}
+    padded = obj("ConfigMap", "c", annotations={WAVE: "0" * 5000 + "7"})
+    assert waves([padded])["findings"] == []
+
+
+def test_skipped_objects_satisfy_no_dependency_and_no_namespace():
+    skipped_cfg = obj("ConfigMap", "cfg", annotations={HOOK: "Skip"})
+    deploy = obj("Deployment", "web", "apps/v1", spec=pod_template(container={"envFrom": [{"configMapRef": {"name": "cfg"}}]}))
+    assert severities(waves([deploy, skipped_cfg])) == {"dependency-skipped:Deployment/app/web:ConfigMap/cfg": "major"}
+    skipped_ns = obj("Namespace", "shop", ns=None, annotations={HOOK: "Skip"})
+    assert severities(waves([obj("ConfigMap", "c", ns="shop"), skipped_ns])) == {"namespace-skipped:ConfigMap/shop/c": "major"}
+
+
+def test_out_of_range_current_tag_is_flagged_when_the_policy_would_downgrade_it():
+    result = image("app:2.1.0", ["1.5.0", "2.1.0"], {"type": "semver", "range": "<2.0.0"})
+    assert result["selected_tag"] == "1.5.0" and severities(result)["selected-older-than-current"] == "minor"
+
+
+def test_match_all_selector_is_flagged_even_when_the_cluster_list_is_not_supplied():
+    assert severities(check_appset(appset([{"clusters": {}}]), clusters=[]))["all-clusters-selected:generators[0]"] == "major"
+
+
+@pytest.mark.parametrize("name,flagged", [("ENCRYPTION_KEY", True), ("signingKey", True), ("MONKEY", False), ("KEYBOARD_LAYOUT", False)])
+def test_secret_scan_key_is_a_secret_word_only_as_a_whole_word(name, flagged):
+    result = scan(deployment_with_env({"name": name, "value": "hunter2hunter2"}))
+    expected = {"plaintext-env:Deployment/app/d:spec.template.spec.containers[0].env[0]": "major"} if flagged else {}
+    assert severities(result) == expected and result["exposure_count"] == int(flagged)
+
+
+def test_review_secret_annotations_and_labels_are_scanned_but_base64_data_is_not():
+    annotated = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "s", "namespace": "shop", "annotations": {"note": "ghp_" + "a" * 36}}}
+    assert severities(scan(annotated)) == {"secret-pattern:github-token:Secret/shop/s:metadata.annotations.note": "blocker"}
+    assert severities(scan(secret(data={"p": "ghp_" + "a" * 36}))) == {"plaintext-secret:Secret/app/s": "blocker"}
+
+
+@pytest.mark.parametrize("url", ["https://svc:pa:ss-S3cr3tValue@git.example.com/acme/deploy.git", "https://:S3cr3tPassw0rdValue@git.example.com/acme/deploy.git",
+                                 "https://glpat-S3cr3tTokenValue123@gitlab.example.com/acme/deploy.git"])
+def test_review_url_credentials_with_colons_empty_user_or_bare_token_are_blockers(url):
+    result = scan({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}, "data": {"repo": url}})
+    assert severities(result) == {"credentials-in-url:ConfigMap/c:data.repo": "blocker"}
+    assert "S3cr3t" not in json.dumps(result)
+
+
+def test_review_plain_user_names_in_urls_are_not_credentials():
+    for url in ("ssh://git@git.example.com/acme/z.git", "https://deploy-bot@git.example.com/x.git"):
+        assert scan({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}, "data": {"repo": url}})["findings"] == [], url
+
+
+def test_review_helm_parameters_with_literal_secret_values_are_flagged():
+    app = {"apiVersion": "argoproj.io/v1alpha1", "kind": "Application", "metadata": {"name": "a", "namespace": "argocd"},
+           "spec": {"source": {"helm": {"parameters": [{"name": "db.password", "value": "hunter2hunter2"}, {"name": "db.passwordFile", "value": "/etc/pw"}]}}}}
+    result = scan(app)
+    assert severities(result) == {"plaintext-parameter:Application/argocd/a:spec.source.helm.parameters[0]": "major"}
+    assert "hunter2" not in json.dumps(result)
+
+
+def test_helm_drift_literal_dotted_keys_do_not_collide_with_nested_paths():
+    assert severities(hdrift([("s", {"a.b": 1}), ("p", {"a": {"b": 1}})], invariant=["a.b"]))["invariant-key-differs:a.b"] == "major"
+    literal = hdrift([("s", {"a.b": 1}), ("p", {"a.b": 1})], invariant=["a\\.b"])
+    assert literal["findings"] == [] and literal["verdict"] == "pass"

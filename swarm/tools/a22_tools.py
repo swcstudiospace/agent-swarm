@@ -473,14 +473,19 @@ def kustomize_check(payload: dict) -> dict:
 # --- gitops_helm_values_drift ----------------------------------------------------------------------------------------
 
 
+def _segment(key: str) -> str:
+    """One path segment of a key: each backslash or dot inside it gets a backslash in front, so the literal key a.b never collides with a nested a -> b."""
+    return key.replace("\\", "\\\\").replace(".", "\\.")
+
+
 def _flatten(values) -> dict:
-    """Dotted-path leaves of a values tree; scalars, lists and empty maps are leaves (a dot inside a key is not escaped)."""
+    """Dotted-path leaves of a values tree; scalars, lists and empty maps are leaves. Keys are escaped by _segment."""
     flat: dict = {}
     stack = [("", values)]
     while stack:
         prefix, node = stack.pop()
         if isinstance(node, dict) and node:
-            stack.extend((f"{prefix}.{key}" if prefix else key, child) for key, child in node.items())
+            stack.extend((f"{prefix}.{_segment(key)}" if prefix else _segment(key), child) for key, child in node.items())
         elif prefix:
             flat[prefix] = node
     return flat
@@ -519,7 +524,7 @@ def helm_values_drift(payload: dict) -> dict:
     """Compare Helm values across environments: `required_keys` must exist and be non-empty (null and "" count as empty,
     because Helm treats a null override as an unset key), `invariant_keys` must be identical everywhere, and every
     environment is diffed against `reference` (default: the first) for missing keys, extra keys and type changes.
-    A key matches a leaf exactly or as a prefix of leaves (`resources` covers `resources.limits.cpu`)."""
+    A key matches a leaf exactly or as a prefix of leaves (`resources` covers `resources.limits.cpu`); a dot that belongs to one key is written with a backslash in front."""
 
     def work() -> dict:
         envs, required, invariant = payload["environments"], payload["required_keys"], payload["invariant_keys"]
@@ -933,6 +938,9 @@ def _appset_generator(gen, ctx: dict, path: str, depth: int):
             keys |= {f"values.{k}" for k in body["values"]}
         if not ctx["clusters"]:
             ctx["cluster_unknown"] = True
+            if match_all:
+                findings.append(_finding(f"all-clusters-selected:{path}", "major",
+                                         f"{path} has no selector: it selects every cluster registered in Argo CD (the cluster list was not supplied)"))
             return keys, True, None
         try:
             matched = [c for c in ctx["clusters"] if match_all or _selector_hit(selector, c["labels"])]
@@ -1138,6 +1146,21 @@ _DELETE_PHASES = frozenset({"PreDelete", "PostDelete"})
 _HOOK_TYPES = frozenset(_PHASE_ORDER) | {"Skip"}
 _HOOK_DELETE_POLICIES = frozenset({"HookSucceeded", "HookFailed", "BeforeHookCreation"})
 _WAVE_VALUE = re.compile(r"^[+-]?[0-9]+$")
+_INT64_DIGITS = 19  # an int64 has at most 19 significant digits: longer runs are refused before int() can convert them
+
+
+def _wave_number(raw) -> int | None:
+    """The int64 that a sync-wave annotation written as a string holds, None when it holds none. Leading zeros are not significant
+    (Argo CD parses the value as an integer), so only the digits after them are converted, and only when there are at most 19."""
+    if not isinstance(raw, str) or not _WAVE_VALUE.fullmatch(raw):
+        return None
+    digits = raw.lstrip("+-").lstrip("0") or "0"
+    if len(digits) > _INT64_DIGITS:
+        return None
+    value = -int(digits) if raw.startswith("-") else int(digits)
+    return value if -(1 << 63) <= value < (1 << 63) else None
+
+
 _POD_OWNERS = frozenset(WORKLOAD_KINDS | {"CronJob", "Pod", "Rollout"})
 
 
@@ -1202,14 +1225,17 @@ def sync_wave_check(payload: dict) -> dict:
             return problem
         findings: list[dict] = []
         entries = []
+        skipped_keys: set[tuple[str, str, str]] = set()  # objects with hook Skip: never applied, so nothing can depend on them
+        skipped_namespaces: set[str] = set()
         for manifest in manifests:
             label, notes = _label(manifest), _annotations(manifest)
             wave = 0
             raw_notes = _dig(manifest, "metadata", "annotations")
             raw = raw_notes.get(WAVE_ANNOTATION) if isinstance(raw_notes, dict) else None
             if raw is not None:
-                if isinstance(raw, str) and _WAVE_VALUE.fullmatch(raw) and -(1 << 63) <= int(raw) < (1 << 63):
-                    wave = int(raw)
+                number = _wave_number(raw)
+                if number is not None:
+                    wave = number
                 else:
                     findings.append(_finding(f"wave-invalid:{label}", "major",
                                              f"{label} has sync-wave {_echo(raw)}, which is not an int64 written as a string; Argo CD treats it as 0 "
@@ -1222,6 +1248,9 @@ def sync_wave_check(payload: dict) -> dict:
                     findings.append(_finding(f"hook-unknown-type:{label}:{_redact(token)}", "major",
                                              f"{label} has hook type {_echo(token)}; use PreSync, Sync, PostSync, SyncFail, PreDelete, PostDelete or Skip"))
                 if "Skip" in tokens:
+                    skipped_keys.add((manifest["kind"], _namespace(manifest), manifest["metadata"]["name"]))
+                    if manifest["kind"] == "Namespace":
+                        skipped_namespaces.add(manifest["metadata"]["name"])
                     continue
                 valid = sorted({t for t in tokens if t in _PHASE_ORDER}, key=_PHASE_ORDER.__getitem__)
                 phases = valid or ["Sync"]
@@ -1251,6 +1280,9 @@ def sync_wave_check(payload: dict) -> dict:
                 if position < namespaces[ns]["position"]:
                     findings.append(_finding(f"namespace-after-use:{label}", "blocker",
                                              f"{label} syncs (phase/wave {position}) before Namespace {ns} (phase/wave {namespaces[ns]['position']})"))
+            if manifest["kind"] != "Namespace" and manifest["kind"] not in CLUSTER_SCOPED_KINDS and ns in skipped_namespaces and ns not in namespaces:
+                findings.append(_finding(f"namespace-skipped:{label}", "major",
+                                         f"{label} lives in Namespace {ns}, which carries hook Skip and is never applied by this sync; it must already exist"))
             crd = crds.get((_group(manifest["apiVersion"]), manifest["kind"]))
             if crd is not None and manifest["kind"] != "CustomResourceDefinition":
                 if position < crd["position"]:
@@ -1267,6 +1299,9 @@ def sync_wave_check(payload: dict) -> dict:
                     findings.append(_finding(f"dependency-after-workload:{label}:{kind}/{name}", "blocker",
                                              f"{label} syncs (phase/wave {position}) before the {kind} {name} it needs (phase/wave {target['position']}); "
                                              "it cannot become healthy before that object exists, so the sync stalls or fails"))
+                elif target is None and (kind, ns, name) in skipped_keys:
+                    findings.append(_finding(f"dependency-skipped:{label}:{kind}/{name}", "major",
+                                             f"{label} needs the {kind} {name}, which carries hook Skip and is never applied by this sync; it must already exist in the cluster"))
         groups: dict[tuple[int, str, int], list[str]] = {}
         for entry in entries:
             for phase in entry["phases"]:
@@ -1833,7 +1868,7 @@ _SERVER_SET_ANNOTATIONS = ("metadata.annotations.kubectl.kubernetes.io/last-appl
 # live object has the field and Git does not (change == added).
 _API_DEFAULTED_SUFFIXES = (
     "terminationMessagePath", "terminationMessagePolicy", "imagePullPolicy", "protocol", "spec.dnsPolicy", "spec.restartPolicy",
-    "spec.schedulerName", "spec.securityContext", "spec.terminationGracePeriodSeconds", "spec.revisionHistoryLimit",
+    "spec.schedulerName", "spec.terminationGracePeriodSeconds", "spec.revisionHistoryLimit",
     "spec.progressDeadlineSeconds", "spec.strategy", "spec.clusterIP", "spec.clusterIPs", "spec.ipFamilies",
     "spec.ipFamilyPolicy", "spec.internalTrafficPolicy", "spec.sessionAffinity",
 )
@@ -1862,16 +1897,17 @@ def _classify_diff(diff: dict, ignored: list[str]) -> tuple[str, str]:
     if any(_path_under(path, prefix) for prefix in ignored):
         return "benign", "covered by ignore_differences"
     if path == "":
-        return ("dangerous", f"{kind} {change} outside Git") if kind in _GUARDRAIL_KINDS else (
-            "drift", "resource " + ("exists only in the cluster" if change == "added" else "is missing from the cluster" if change == "removed" else "differs"))
+        if kind in _GUARDRAIL_KINDS or kind == "Secret":  # a whole Secret is secret material: a self-heal would overwrite its only live copy
+            return "dangerous", f"{kind} {change} outside Git"
+        return "drift", "resource " + ("exists only in the cluster" if change == "added" else "is missing from the cluster" if change == "removed" else "differs")
     if path == "status" or path.startswith("status.") or any(_path_under(path, f) for f in _SERVER_SET_FIELDS + _SERVER_SET_ANNOTATIONS):
         return "benign", "server-populated field"
     if path == "spec.replicas" and kind in _REPLICA_OWNERS and manager == "kube-controller-manager":
         return "benign", "replica count written by the HPA through the scale subresource"
+    if kind in _GUARDRAIL_KINDS:  # before the defaults: a guardrail added outside Git is never a default
+        return "dangerous", f"{kind} (access control, admission or network guardrail) changed outside Git"
     if change == "added" and any(path == s or path.endswith("." + s) for s in _API_DEFAULTED_SUFFIXES):
         return "benign", "default applied by the API server"
-    if kind in _GUARDRAIL_KINDS:
-        return "dangerous", f"{kind} (access control, admission or network guardrail) changed outside Git"
     if kind == "Secret" and (path == "data" or path == "stringData" or path.startswith(("data.", "stringData."))):
         return "dangerous", "secret material changed outside Git"
     if kind == "Service" and path in ("spec.type", "spec.externalIPs", "spec.loadBalancerSourceRanges"):
@@ -2166,7 +2202,7 @@ def image_policy(payload: dict) -> dict:
                     findings.append(_finding("current-tag-not-semver", "info", f"current tag {shown_tag or '<none>'} is not a semantic version"))
                 else:
                     in_range = allows(current)
-                    if selected and in_range and _version_key(versions[selected]) < _version_key(current):
+                    if selected and _version_key(versions[selected]) < _version_key(current):
                         findings.append(_finding("selected-older-than-current", "minor", f"the policy selects {_redact(selected)}, older than the current {shown_tag}"))
                 if allows((999_999, 0, 0, "")):
                     findings.append(_finding("range-unbounded-major", "minor", f"range {_echo(policy.get('range', '*'))} also accepts future major versions"))
@@ -2204,7 +2240,7 @@ _SECRET_PATTERNS = (
     ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
     ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
 )
-_URL_PASSWORD_AT = re.compile(r"[^/\s:@]+:([^/\s:@]+)")
+_URL_PASSWORD_AT = re.compile(r"[^:]*:(.+)")  # the userinfo of a URL: the user, then the password, which may itself hold colons
 _URL_USERINFO_AT = re.compile(r"[^/\s@]+@")
 _EXTERNAL_SECRET_GROUPS = ("external-secrets.io",)
 
@@ -2235,12 +2271,20 @@ def _userinfo_spans(text: str):
             position = match.end()
 
 
+def _bare_token(userinfo: str) -> bool:
+    """A userinfo with no colon that looks like a token: 16 or more characters with letters and digits (a plain user name such as git is not)."""
+    return ":" not in userinfo and len(userinfo) >= 16 and any(c.isdigit() for c in userinfo) and any(c.isalpha() for c in userinfo)
+
+
 def _url_passwords(text: str):
-    """The password of every `scheme://user:password@host` in text."""
+    """The password of every `scheme://user[:password]@host` in text, or the whole userinfo when it is a bare token."""
     for start, end in _userinfo_spans(text):
-        match = _URL_PASSWORD_AT.fullmatch(text, start, end)
+        userinfo = text[start:end]
+        match = _URL_PASSWORD_AT.fullmatch(userinfo)
         if match:
             yield match.group(1)
+        elif _bare_token(userinfo):
+            yield userinfo
 
 
 def _blank_token_run(match) -> str:
@@ -2275,7 +2319,7 @@ def _echo(value) -> str:
 
 
 _NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")  # words of a name: split on _ . - and camelCase boundaries
-_WHOLE_WORD_SECRETS = frozenset({"pass"})  # matched as a whole word only: DB_PASS and dbPass are secrets, passport is not
+_WHOLE_WORD_SECRETS = frozenset({"pass", "key"})  # matched as a whole word only: DB_PASS, dbPass and ENCRYPTION_KEY are secrets, passport and monkey are not
 
 
 def _secret_like_name(name: str) -> bool:
@@ -2417,14 +2461,18 @@ def secret_scan(payload: dict) -> dict:
                 elif isinstance(node, list):
                     for index, item in enumerate(node):
                         stack.append((f"{path}[{index}]", item))
-                        if path.endswith("env") and isinstance(item, dict) and isinstance(item.get("name"), str) \
+                        if path.endswith(("env", "parameters")) and isinstance(item, dict) and isinstance(item.get("name"), str) \
                                 and "value" in item and "valueFrom" not in item and _secret_like_name(item["name"]) and _real_value(item["value"]):
                             exposures += 1
-                            findings.append(_finding(f"plaintext-env:{label}:{_redact(path)}[{index}]", "major",
-                                                     f"{label} sets env {_redact(item['name'])} to a literal value; use secretKeyRef or an external secret"))
-            if skip_patterns:
-                continue
+                            if path.endswith("env"):
+                                findings.append(_finding(f"plaintext-env:{label}:{_redact(path)}[{index}]", "major",
+                                                         f"{label} sets env {_redact(item['name'])} to a literal value; use secretKeyRef or an external secret"))
+                            else:
+                                findings.append(_finding(f"plaintext-parameter:{label}:{_redact(path)}[{index}]", "major",
+                                                         f"{label} sets Helm parameter {_redact(item['name'])} to a literal value; take it from a secret reference"))
             for path, text in _leaves(manifest):
+                if skip_patterns and path.split(".", 1)[0] in ("data", "stringData"):
+                    continue  # base64 data is not literal text; the rest of a Secret (annotations, labels, type) is still scanned
                 for name, pattern in _SECRET_PATTERNS:
                     if pattern.search(text):
                         exposures += 1
@@ -2443,8 +2491,9 @@ def secret_scan(payload: dict) -> dict:
 _ENV_ROOTS = frozenset({"overlays", "environments", "envs", "env"})
 _KUSTOMIZATION_FILES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 _CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS", ".gitlab/CODEOWNERS")
-_PRIVATE_FILE_SUFFIXES = (".key", ".pfx", ".p12", ".env")
-_PRIVATE_FILE_NAMES = frozenset({"id_rsa", "id_ed25519", "id_ecdsa", "kubeconfig", ".env"})
+_PRIVATE_FILE_SUFFIXES = (".key", ".pfx", ".p12", ".jks", ".keystore", ".p8", ".ppk", ".env")
+_PRIVATE_FILE_NAMES = frozenset({".netrc", ".pgpass"})  # dotfiles with no suffix; .env is covered by _PRIVATE_FILE_SUFFIXES
+_PRIVATE_FILE_STEMS = frozenset({"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "kubeconfig"})  # the name up to its first dot: kubeconfig.yaml, id_dsa
 _OWNER = re.compile(r"^(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9_.-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)$")
 _MAX_OWNER_LENGTH = 254
 _MAX_DOUBLE_STAR = 2
@@ -2612,7 +2661,8 @@ def repo_layout(payload: dict) -> dict:
         for path in sorted(files):
             name = path.rsplit("/", 1)[-1]
             shown = _redact(path)
-            if name in _PRIVATE_FILE_NAMES or name.endswith(_PRIVATE_FILE_SUFFIXES):
+            stem = name.split(".", 1)[0]
+            if name in _PRIVATE_FILE_NAMES or name.endswith(_PRIVATE_FILE_SUFFIXES) or (stem in _PRIVATE_FILE_STEMS and not name.endswith(".pub")):
                 findings.append(_finding(f"secret-like-file:{shown}", "major", f"{shown} looks like a private key or credential file"))
             elif name.endswith(".pem"):
                 findings.append(_finding(f"pem-file:{shown}", "minor", f"{shown} is a PEM file; make sure it holds no private key"))

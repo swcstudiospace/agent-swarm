@@ -307,11 +307,11 @@ def test_sync_waves_are_checked_per_kustomize_tree_and_per_plain_directory(tmp_p
 
 
 @needs_yaml
-def test_sync_waves_are_only_checked_where_annotations_are_used(tmp_path):
+def test_a_crd_and_its_custom_resource_are_checked_even_when_nothing_is_annotated(tmp_path):
     put(tmp_path, "d/crd.yaml", "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata: {name: w.acme.io}\nspec: {group: acme.io, names: {kind: W}}\n")
     put(tmp_path, "d/cr.yaml", "apiVersion: acme.io/v1\nkind: W\nmetadata: {name: w}\n")
     code, result = scan(tmp_path)
-    assert code == 0 and result["findings"] == []
+    assert code == 1 and ids(result) == {"waves:cr-with-crd-same-wave:W/w"}  # was code 0 and no findings: the unannotated unit was never checked
     put(tmp_path, "d/cr.yaml", f"apiVersion: acme.io/v1\nkind: W\nmetadata:\n  name: w\n  annotations: {{{WAVE}: '0'}}\n")
     code, result = scan(tmp_path)
     assert code == 1 and ids(result) == {"waves:cr-with-crd-same-wave:W/w"}
@@ -403,7 +403,7 @@ def test_invalid_yaml_and_json_are_major_but_templated_files_are_skipped(tmp_pat
     put(tmp_path, "chart/templates/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ .Release.Name }}\n")
     put(tmp_path, "ok.json", {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c"}})
     code, result = scan(tmp_path)
-    assert code == 1 and sorted(found(result)) == [("parse:broken.json", "major", "broken.json"), ("parse:broken.yaml", "major", "broken.yaml")]
+    assert code == 1 and sorted(found(result)) == sorted([("parse:broken.json", "major", "broken.json"), ("parse:broken.yaml", "major", "broken.yaml"), ("scan/incomplete", "major", ".")])
     assert result["files_scanned"] == 1 and result["files_skipped"]["templated"] == 1 and result["checks"]["parse"] == 2
 
 
@@ -427,10 +427,10 @@ def test_large_binary_symlinked_and_vcs_files_are_skipped(tmp_path):
     os.symlink(outside, repo / "linked-dir")
     put(repo, "ok.yaml", DEPLOYMENT)
     code, result = scan(repo)
-    assert code == 0 and result["findings"] == [] and result["files_scanned"] == 1 and result["files_skipped"]["symlink"] == 2
+    assert code == 1 and ids(result) == {"scan/incomplete"} and result["files_scanned"] == 1 and result["files_skipped"]["symlink"] == 2
     code, result = scan(tmp_path)
     assert (result["files_skipped"]["too-large"], result["files_skipped"]["binary"], result["files_skipped"]["symlink"]) == (1, 1, 2)
-    assert result["findings"] == [] and result["files_scanned"] == 1  # .git, node_modules and everything behind symlinks stay unread
+    assert ids(result) == {"scan/incomplete"} and result["files_scanned"] == 1  # the unread big, binary and symlinked inputs fail the scan; .git and node_modules are out of scope
 
 
 @needs_yaml
@@ -438,7 +438,7 @@ def test_at_most_2000_files_are_read(tmp_path):
     for index in range(2005):
         put(tmp_path, f"f/{index:04d}.yaml", f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{index}}}\n")
     code, result = scan(tmp_path)
-    assert code == 0 and result["files_scanned"] == 2000 and result["truncated"] is True
+    assert code == 1 and result["files_scanned"] == 2000 and result["truncated"] is True and ids(result) == {"scan/incomplete"}
 
 
 @needs_yaml
@@ -447,7 +447,7 @@ def test_alias_bombs_are_skipped_not_fatal(tmp_path):
     put(tmp_path, "bomb.yaml", bomb)
     put(tmp_path, "ok.yaml", DEPLOYMENT)
     code, result = scan(tmp_path)
-    assert code == 0 and result["files_skipped"]["too-complex"] == 1 and result["files_scanned"] == 1
+    assert code == 1 and result["files_skipped"]["too-complex"] == 1 and result["files_scanned"] == 1 and ids(result) == {"scan/incomplete"}
 
 
 def test_without_pyyaml_yaml_files_are_reported_as_skipped_tool_missing_and_json_still_works(tmp_path, monkeypatch, capsys):
@@ -457,7 +457,7 @@ def test_without_pyyaml_yaml_files_are_reported_as_skipped_tool_missing_and_json
     monkeypatch.setitem(sys.modules, "yaml", None)
     code, result = run_in_process(load_module(), tmp_path, capsys)
     assert code == 1 and result["skipped"] == [{"check": "kustomize, apps, waves, images, secrets (YAML files)", "reason": "skipped:tool-missing", "tool": "PyYAML", "files": 2}]
-    assert found(result) == [("secrets:plaintext-secret:Secret/j", "blocker", "s.json")]
+    assert sorted(found(result)) == sorted([("secrets:plaintext-secret:Secret/j", "blocker", "s.json"), ("scan/incomplete", "major", ".")])
     assert (result["files_scanned"], result["files_skipped_yaml_missing"]) == (1, 2)
 
 
@@ -510,6 +510,7 @@ def test_review_patch_targets_in_remote_or_component_bases_are_unproven_not_miss
     _, result = scan(tmp_path)
     missing = {f["file"] for f in result["findings"] if f["id"].startswith("kustomize:patch-target-not-found")}
     assert missing == {"local/kustomization.yaml"}
+    assert "scan/incomplete" in ids(result)  # the remote-base patch target is unproven, and the scan now says so instead of dropping it silently
 
 
 @needs_yaml
@@ -579,7 +580,7 @@ def test_deeply_nested_valid_yaml_is_too_complex_not_invalid(tmp_path):
     put(tmp_path, "deep.yaml", "[" * 5000 + "]" * 5000 + "\n")
     put(tmp_path, "ok.yaml", DEPLOYMENT)
     code, result = scan(tmp_path)
-    assert code == 0 and result["files_skipped"]["too-complex"] == 1 and result["checks"]["parse"] == 0 and result["files_scanned"] == 1
+    assert code == 1 and result["files_skipped"]["too-complex"] == 1 and result["checks"]["parse"] == 0 and result["files_scanned"] == 1 and ids(result) == {"scan/incomplete"}
 
 
 @needs_yaml
@@ -592,4 +593,102 @@ def test_fifos_named_like_config_files_are_skipped_and_never_opened(tmp_path):
                           env=_scrubbed_base_env(), cwd=ROOT, timeout=60)
     assert "Traceback" not in proc.stderr, proc.stderr
     result = json.loads(proc.stdout)
-    assert proc.returncode == 0 and result["files_scanned"] == 1 and result["files_skipped"]["unreadable"] == 1 and result["findings"] == []
+    assert proc.returncode == 1 and result["files_scanned"] == 1 and result["files_skipped"]["unreadable"] == 1 and ids(result) == {"scan/incomplete"}
+
+
+@needs_yaml
+def test_a_list_of_plaintext_secrets_is_read_item_by_item(tmp_path):
+    put(tmp_path, "l.yaml", 'apiVersion: v1\nkind: List\nmetadata: {resourceVersion: ""}\nitems:\n- apiVersion: v1\n  kind: Secret\n  metadata: {name: db}\n  data: {password: aHVudGVyMmh1bnRlcjI=}\n')
+    code, result = scan(tmp_path)
+    assert code == 1 and ids(result) == {"secrets:plaintext-secret:Secret/db"} and "aHVudGVyMmh1bnRlcjI" not in json.dumps(result)
+
+
+@needs_yaml
+def test_a_match_all_applicationset_fails_the_scan_without_a_cluster_list(tmp_path):
+    put(tmp_path, "prod/appset.yaml", "apiVersion: argoproj.io/v1alpha1\nkind: ApplicationSet\nmetadata: {name: x, namespace: argocd}\nspec:\n  generators:\n  - clusters: {}\n"
+                                      "  template:\n    metadata: {name: 'x-{{name}}'}\n    spec:\n      project: shop\n"
+                                      "      source: {repoURL: 'https://x/y.git', path: p, targetRevision: v1}\n      destination: {server: '{{server}}', namespace: shop}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and "apps:all-clusters-selected:generators[0]" in ids(result)
+
+
+@needs_yaml
+def test_a_repository_with_more_than_300_objects_in_one_annotated_unit_is_incomplete(tmp_path):
+    put(tmp_path, "big/many.yaml", "".join(f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{index}, annotations: {{{WAVE}: '0'}}}}\n---\n" for index in range(301)))
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and ids(result) == {"scan/incomplete"}
+
+
+def test_a_tree_with_no_config_files_is_not_ok(tmp_path):
+    put(tmp_path, "README.md", "# nothing to lint\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and ids(result) == {"scan/incomplete"}
+
+
+def test_a_check_that_did_not_run_fails_the_scan_instead_of_passing_it():
+    module = load_module()
+    repo = module.Repo(Path("."), list(module.DEFAULT_PROD_MARKERS), False)
+    repo.from_tool("waves", "x.yaml", {"state": "DEPENDENCY_UNAVAILABLE"})
+    repo.from_tool("waves", "y.yaml", {"state": "INVALID_INPUT", "field": "manifests", "message": "manifests: bad"})
+    result = module._result(repo, 2)
+    assert result["status"] == "fail" and [f["id"] for f in result["findings"]] == ["scan/incomplete"]
+    assert "manifests: bad" not in json.dumps(result) and "y.yaml" in result["findings"][0]["summary"]
+
+
+def kind_list(*documents: str) -> str:
+    """A kubectl `kind: List` whose items are the given single-document YAML texts."""
+    body = ""
+    for document in documents:
+        lines = document.rstrip("\n").splitlines()
+        body += "".join(("- " if index == 0 else "  ") + line + "\n" for index, line in enumerate(lines))
+    return "apiVersion: v1\nkind: List\nmetadata: {resourceVersion: ''}\nitems:\n" + body
+
+
+@needs_yaml
+def test_a_prod_application_inside_a_kind_list_gets_the_same_findings_as_the_bare_document(tmp_path):
+    put(tmp_path, "bare/prod/app.yaml", ARGO_APP)
+    put(tmp_path, "list/prod/app.yaml", kind_list(ARGO_APP))
+    bare_code, bare = scan(tmp_path / "bare")
+    list_code, wrapped = scan(tmp_path / "list")
+    assert bare_code == list_code == 1
+    assert ids(bare) == {"apps:prod-auto-prune", "apps:prod-auto-sync", "apps:no-retry"}  # was: a List passed with status ok and no apps findings
+    assert sorted(found(wrapped)) == sorted(found(bare))
+
+
+@needs_yaml
+def test_wave_order_inside_a_kind_list_is_checked_like_the_bare_documents(tmp_path):
+    namespace = "apiVersion: v1\nkind: Namespace\nmetadata: {name: shop, annotations: {" + WAVE + ": '1'}}\n"
+    deployment = DEPLOYMENT.replace("  namespace: shop\n", f"  namespace: shop\n  annotations: {{{WAVE}: '0'}}\n")
+    put(tmp_path, "bare/loose/objs.yaml", namespace + "---\n" + deployment)
+    put(tmp_path, "list/loose/objs.yaml", kind_list(namespace, deployment))
+    bare_code, bare = scan(tmp_path / "bare")
+    list_code, wrapped = scan(tmp_path / "list")
+    assert bare_code == list_code == 1
+    assert ids(bare) == {"waves:namespace-after-use:Deployment/shop/web"}  # was: the blocker was lost inside the List
+    assert sorted(found(wrapped)) == sorted(found(bare))
+
+
+@needs_yaml
+def test_images_inside_a_kind_list_are_found_like_the_bare_document(tmp_path):
+    put(tmp_path, "bare/web.yaml", deployment_with("app:latest"))
+    put(tmp_path, "list/web.yaml", kind_list(deployment_with("app:latest")))
+    bare_code, bare = scan(tmp_path / "bare")
+    list_code, wrapped = scan(tmp_path / "list")
+    assert bare_code == list_code == 1
+    assert ids(bare) == {"images:floating-tag:app:latest"}
+    assert sorted(found(wrapped)) == sorted(found(bare))
+
+
+@needs_yaml
+def test_a_kustomize_patch_target_inside_a_kind_list_is_found_like_the_bare_document(tmp_path):
+    kustomization = "resources:\n  - objs.yaml\npatches:\n  - target: {kind: Deployment, name: %s}\n    patch: |-\n      - op: replace\n        path: /spec/replicas\n        value: 3\n"
+    for name in ("web", "gone"):
+        put(tmp_path, f"bare-{name}/k/kustomization.yaml", kustomization % name)
+        put(tmp_path, f"bare-{name}/k/objs.yaml", DEPLOYMENT)
+        put(tmp_path, f"list-{name}/k/kustomization.yaml", kustomization % name)
+        put(tmp_path, f"list-{name}/k/objs.yaml", kind_list(DEPLOYMENT))
+        _, bare = scan(tmp_path / f"bare-{name}")
+        _, wrapped = scan(tmp_path / f"list-{name}")
+        assert sorted(found(wrapped)) == sorted(found(bare)), name
+        # was: a target inside a List was never seen, so "web" reported a false patch-target-not-found
+        assert ("kustomize:patch-target-not-found:patches[0]" in ids(wrapped)) is (name == "gone"), name
