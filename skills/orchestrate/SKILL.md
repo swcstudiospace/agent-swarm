@@ -29,7 +29,7 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency|cloud-native|cluster|web3 --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency|cloud-native|cluster|web3|parallel --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: a01-orchestrator, a02-requirements, a03-architect, a04-ux-designer, a05-backend, a06-frontend, a07-data, a08-qa, a09-reviewer, a10-security, a11-devops, a12-release, a13-observability, a14-maintenance, a15-docs, a16-cloud-architect, a17-platform-engineer, a18-supply-chain, a19-event-driven, a20-finops, a21-cluster-ops, a22-gitops, a23-mesh-network, a24-cluster-security, a25-resilience, a26-smart-contract, a27-contract-audit, a28-chain-infra, a29-dapp-wallet, a30-custody-compliance.

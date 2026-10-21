@@ -122,6 +122,8 @@ auto-load private references. OMP uses normal `write` approvals (or `--approval-
 Grok headless dispatch currently fails closed because its installed interface does not support
 the old stdin transport. Start a fresh OMP process after updating the extension.
 
+The omp `tool_call` guard (`omp/src/guard.ts`) covers every swarm session. It blocks with `BLOCKED needs: human-approval` the Web3 rows `chain-broadcast` and `chain-key-material` and the cluster lifecycle rows under `prod_infra` (`argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle`, `kubeadm-lifecycle`). Its per-agent lists are documentation, not an allow list. See [AGENTS.md](AGENTS.md) (HOOK-02).
+
 Or, inside Claude Code, ask for the `a01-orchestrator` subagent: it plans, then delegates each ready task to
 `a02-requirements` … `a30-custody-compliance` via the Agent tool. See [CLAUDE.md](CLAUDE.md) for the full layout and rules.
 

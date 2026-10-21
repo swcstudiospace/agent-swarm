@@ -76,7 +76,7 @@ Precede it with a short markdown summary (scan and tool verdicts, blocker and ma
 </output_format>
 
 <tools>
-<script path="scripts/kpol_manifest_scan.py" purpose="Scan Kubernetes manifests for Pod Security Standards violations, wildcard or cluster-admin RBAC and risky service-account settings; read-only, bounded, JSON only (YAML needs PyYAML).">
+<script path="scripts/kpol_manifest_scan.py" purpose="Scan Kubernetes manifests for Pod Security Standards violations, wildcard or cluster-admin RBAC and risky service-account settings; read-only, bounded, JSON only (YAML needs PyYAML). A JSON or YAML document with neither apiVersion nor kind is passed over; a document with kind but no apiVersion is a malformed-object reason and is still analysed.">
   python3 scripts/kpol_manifest_scan.py
   bun scripts/ts/kpol_manifest_scan.ts --task-id T-884 --path deploy --level restricted --json
 </script>

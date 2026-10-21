@@ -344,70 +344,27 @@ swarm_tool_call {name, input}  ->  call --name --input     -> call_tool(name, ca
 
 ### 9.1 Add a subagent
 
-The roster is data in `agents.json`, but several places list the agents by id and several tests pin the count, so a new
-agent is a deliberate change across all of the places below, not a config edit. v2.3 took the swarm from 15 to 30 agents
-(A16 to A30) through this list. Grep for `range(1, 31)`, `== 30` and `A30` to find a place a thirty-first agent would
-miss (a count that is only a number in a test is listed in step 8).
+The roster is the `agents` array in `agents.json`: 30 entries, A01 to A30. A01 to A15 are the core SDLC agents; A16 to A20 (cloud-native), A21 to A25 (cluster) and A26 to A30 (Web3) are the three domains added in v2.3. Each agent has 10 to 15 registered lane tools and 10 to 15 skills, enforced by `capability_policy` in `agents.json`. Several code paths list the agents by id, so a new agent is a change across all of them. Grep for `range(1, 31)`, `!= 30`, `== 30` and `A30` to find them.
 
-1. **Spec and prompt.** `03-agents/A31-<name>.md`: the seven-section spec. `prompts/A31-<name>.md`: the XML prompt with
-   `<agent id="A31"`, the 20 tag pairs listed in `AGENTS.md` (Testing & QA), `<script path=`, `python3 scripts/` and
-   `scripts/ts/`, ending with `</agent>`. Size: keep the prompt body to about 52 KB. `prompts/A01-orchestrator.md` is the
-   largest prompt at 52781 bytes and its omp render, `omp/agents/a01-orchestrator.md`, 60569 bytes; every
-   omp agent file must stay at or under `OMP_AGENT_MAX_BYTES` (64 KiB) and `a01-orchestrator` must remain the largest
-   (`test_omp_size_bound` in `tests/test_omp_agents.py`, `test_omp_agent_files_fit_and_the_orchestrator_is_largest` in
-   `tests/test_capability_acceptance.py`). The omp render adds a preamble to the prompt, so a body near A01's size would
-   overtake it.
-2. **Roster entry.** `agents.json`, in `agents`: `id`, `code`, `slug`, `name`, `class` (`control`, `delivery`, `build`,
-   `verify`, `operate` or `sustain`), `lane`, `model` (optional: only A01, A03, A09, A10 and A15 set it), `spec`, `prompt`,
-   `description`, `capabilities` (use ids no other agent offers: `orch_plan.py` and `blast_radius.py` take the first agent
-   that offers a capability, and `code.patch`, offered by A05 and A06, is the one shared id), `consumes`, `produces`, `max_parallel`, `autonomy_ceiling` (capability to `L2`..`L4`),
-   `tools`, `scripts`, `registered_tools`. Nobody hand-edits `registered_tools`: use the intake flow of 9.2. If the new
-   agent produces an artifact type that an existing agent takes, add it to that agent's `consumes`: the ACP routing
-   table and `shared_route_check` derive from `consumes` and `produces` and there is no peer list.
-3. **Code that lists the agents.**
-   - `PREFIX` in `swarm/tool_registry.py`: the owner prefix of the agent's tool names.
-   - `AGENT_SURFACES` in `swarm/substrate_tee.py` (`swarm-<id>-<code>`, lower case) and `SWARM_SURFACES` in
-     `swarm/memory.py`; `tests/test_substrate_tee.py` and `tests/test_swarm_memory.py` pin them against `agents.json` and
-     each other. The surface must also exist on the agent-substrate server, and a workspace install with substrate tokens
-     needs `SUBSTRATE_TOKEN_<SURFACE>` for it ([substrate-workspace.md](substrate-workspace.md)).
-   - `SWARM_SLUGS` in `omp/src/guard.ts` (pinned against `agents.json` by `omp/test/guard.test.ts`).
-   - In `scripts/build_agents.py`: `SWARM_TOOLS` (`range(1, 31)`), `_ROLE_HOME` (the grokbot seat map: `render_grokbot`
-     raises unless the manifest is exactly the 30 roles) and, where the agent owns desk path families, `_DESK_GLOBS`
-     (optional: script paths from `agents.json` are added for every role).
-   - `DONT` in `scripts/_write_skills.py`: the "Don't use for" line of the agent's generated skills (a missing id is a
-     `KeyError`).
-   - `_LANE_AGENTS` and `_DEFAULT_CAPABILITY` in `swarm/blast_radius.py`: a lane agent may own a parallel lane; the default
-     capability must be one of the agent's own. A01 and the four gate agents are not lane agents.
-   - `scripts/orch_from_graph.py`: the manifest-size check (`len(agents) != 30`), the file-path rules in `_owner` (an
-     agent that owns a path family, for example `.sol` to A26 or `charts/` to A22), `_OWNER_CAPABILITY` and `_MEDIUM`
-     (implementers that get a quality gate as well as a review gate).
-   - `PATTERNS` in `scripts/orch_plan.py` if the agent takes part in a DAG. v2.3 added `cloud-native` (15 tasks),
-     `cluster` (12) and `web3` (14); `cluster` and `web3` mark their implementer rows `risk_class` high, which selects
-     all four gates. A new agent does not own a gate: A08, A09, A10 and A12 stay the only gate owners.
-   - `RULES` in `omp/src/guard.ts` when the agent's work could reach production or move funds (section 12). A row needs
-     a `capability`, a `pattern` and `samples` that `guard.test.ts` runs; its `agents` field is documentation only, every
-     swarm session is blocked.
-4. **Shared baseline grants.** Every `shared_baseline` tool must permit every agent (the registry check names the
-   missing ids). Add the new id to those tools' `permitted_callers` with `registry/intake/grants.json`
-   (`{tool_name: [agent ids to add]}`, 9.2).
-5. **Tools.** A fragment `registry/intake/<slug>.tools.json` with 10 to 15 READ tools (9.2), handlers in
-   `swarm/tools/aNN_tools.py`. Intake fragments are merged and deleted by `scripts/_registry_intake.py --apply`.
-6. **Skills.** 10 to 15 sources in `prompts/skills/<slug>/` (9.3). The per-agent index skill is generated.
-7. **Scripts.** The agent's CLI tools `scripts/<lane>_<verb>.py` and their Bun twins `scripts/ts/<stem>.ts`, named in the
-   prompt's `<script path=` entries and in `agents.json` `scripts`.
-8. **Tests that pin the count and must change with it:** `tests/test_capability_acceptance.py`, `tests/test_swarm.py`,
-   `tests/test_lane_tools.py`, `tests/test_tool_registry.py`, `tests/test_acp.py`, `tests/test_render_rules.py`,
-   `tests/test_cursor_agents.py`, `tests/test_grokbot_export.py`, `tests/test_substrate_tee.py`,
-   `tests/test_swarm_memory.py`, `tests/test_orch_from_graph.py`, `tests/test_roster_routing.py`,
-   `tests/test_shared_handover.py`, `tests/test_shared_runtime.py`, `tests/test_omp_agents.py`,
-   `tests/test_e2e_swarm.py`; add `tests/test_tools_a31.py` for the new tools. In `omp/`, `test/guard.test.ts` pins
-   `SWARM_SLUGS` and the new guard rows.
-9. **Regenerate** (never hand-edit the output): `python3 scripts/build_agents.py` (`.claude`, `.grok`, `.cursor`,
-   `omp/agents`, `omp/skills`, `grokbot`), `python3 scripts/_write_skills.py` (`skills/**`),
-   `python3 -m swarm.tool_registry docs` and `gen-tests` (`docs/tools/**`, `tests/generated/**`),
-   `python3 -m swarm.skill_registry docs` (`docs/skills/**`).
-10. **Gates:** `python3 scripts/build_agents.py --check`, `python3 -m swarm.tool_registry check`,
-    `python3 -m swarm.skill_registry check`, `python3 -m pytest`, `cd omp && bun run test`.
+1. **Spec and prompt.** `03-agents/A31-<name>.md` and `prompts/A31-<name>.md` (A31 is the next free id). The XML prompt has `<agent id="A31"` and ends with `</agent>`. Every omp agent file stays at or under `OMP_AGENT_MAX_BYTES` (64 KiB), and `a01-orchestrator` stays the largest (`test_omp_size_bound` in `tests/test_omp_agents.py`).
+2. **Roster entry.** Add an object to `agents` in `agents.json` with `id`, `code`, `slug`, `name`, `class`, `lane`, `spec`, `prompt`, `description`, `capabilities`, `consumes`, `produces`, `max_parallel`, `autonomy_ceiling`, `tools` and `scripts`. Use capability ids no other agent offers (`code.patch`, offered by A05 and A06, is the one shared id). `registered_tools` is filled by the tool intake in 9.2, never by hand. ACP routing derives from `consumes` and `produces`: if an existing agent takes the new artifact type, add it to that agent's `consumes`.
+3. **Tools.** Handler in `swarm/tools/aNN_tools.py` and fragment `registry/intake/<slug>.tools.json` (9.2). Every `shared_baseline` tool must permit all agents, so add the new id to each of them in `registry/intake/grants.json`.
+4. **Skills.** Sources `prompts/skills/<slug>/<short>.md` (9.3). They are not intake fragments. The owner stays within `capability_policy.skills` (10 to 15).
+5. **Code that lists the agents.**
+   - `PREFIX` in `swarm/tool_registry.py`; `AGENT_SURFACES` in `swarm/substrate_tee.py` and `SWARM_SURFACES` in `swarm/memory.py` (`swarm-<id>-<code>`, lower case); `SWARM_SLUGS` in `omp/src/guard.ts`, which `omp/test/guard.test.ts` pins to `agents.json`.
+   - `SWARM_TOOLS`, `_ROLE_HOME` and `_DESK_GLOBS` in `scripts/build_agents.py`; `DONT` in `scripts/_write_skills.py`.
+   - `_LANE_AGENTS` and `_DEFAULT_CAPABILITY` in `swarm/blast_radius.py`. A01, A08, A09, A10 and A12 are not lane agents.
+   - `scripts/orch_from_graph.py`: the manifest count check (`len(agents) != 30`), `_owner`, `_OWNER_CAPABILITY` and `_MEDIUM`.
+   - `PATTERNS` in `scripts/orch_plan.py` if the agent takes part in a DAG, and `RULES` in `omp/src/guard.ts` if its work can reach production or move funds (section 12). A08, A09, A10 and A12 stay the only gate owners.
+6. **Scripts.** `scripts/<lane>_<verb>.py` and `scripts/ts/<stem>.ts`, named in the prompt's `<script path=` entries and in `agents.json` `scripts`.
+7. **Tests.** A per-agent suite `tests/test_tools_aNN.py`, and the tests that pin the count: `tests/test_capability_acceptance.py` (`len(AGENTS) == 30`), `tests/test_omp_agents.py`, `tests/test_roster_routing.py`, `tests/test_tool_registry.py`, `tests/test_acp.py`, `tests/test_render_rules.py`, `tests/test_cursor_agents.py`, `tests/test_grokbot_export.py`, `tests/test_substrate_tee.py`, `tests/test_swarm_memory.py`, `tests/test_orch_from_graph.py`, `tests/test_shared_handover.py`, `tests/test_shared_runtime.py`, `tests/test_swarm.py`, `tests/test_lane_tools.py` and `tests/test_e2e_swarm.py`. `omp/test/guard.test.ts` pins `SWARM_SLUGS` and the guard rows.
+8. **Merge tool fragments.** `python3 scripts/_registry_intake.py --check`, then `--apply`, which merges the fragments into `agents.json` and deletes them. Run this before generating.
+9. **Generate** (never hand-edit the output):
+   - `python3 scripts/build_agents.py`: `.claude`, `.grok`, `.cursor`, `omp/agents`, `omp/skills` and `grokbot`.
+   - `python3 scripts/_write_skills.py`: `omp/skills/**`.
+   - `python3 -m swarm.tool_registry docs` and `gen-tests`: `docs/tools/**` and `tests/generated/**`.
+   - `python3 -m swarm.skill_registry docs`: `docs/skills/**`.
+10. **Checks.** `python3 scripts/_registry_intake.py --check`, `python3 scripts/build_agents.py --check`, `python3 -m swarm.tool_registry check`, `python3 -m swarm.tool_registry docs --check`, `python3 -m swarm.tool_registry gen-tests --check`, `python3 -m swarm.skill_registry check`, `python3 -m swarm.skill_registry docs --check`, then `python3 -m pytest` and `cd omp && bun run test`. `_write_skills.py` has no `--check` mode.
 
 ### 9.2 Add a tool
 
@@ -724,11 +681,9 @@ per streak (section 4); `.md` result evidence is redacted; the cancel flag path 
 
 ## 16. Changelog v2.3
 
-The v2.3 changes, in the order of the layers. The runtime of sections 2 to 8 is unchanged.
+v2.3 takes the swarm from 15 agents to 30. The runtime of sections 2 to 8 is unchanged.
 
-**Roster** (`agents.json`): 15 agents became 30. A16 to A30 form three domains of five. Each new agent has
-12 to 13 registered READ tools and 12 to 14 skills of its own on top of the shared baseline (21 tools and 12
-skills, unchanged); the roster now holds 369 lane tools and 364 agent skills.
+**Roster** (`agents.json`): 30 agents, A01 to A30. A16 to A30 form three domains of five. Each of A16 to A30 has 12 or 13 registered READ tools and 12 to 14 skills of its own, on top of the shared baseline (21 tools and 12 skills). The roster holds 369 lane tools and 364 agent skills.
 
 | Domain | Agents |
 |---|---|
@@ -738,37 +693,10 @@ skills, unchanged); the roster now holds 369 lane tools and 364 agent skills.
 
 The new agents' L4 ceilings (a human decides) are: A16 `commitment_or_exit_plan`; A18 `signing_key_change`; A20 `commitment_purchase`; A21 `cluster_delete`; A22 `prod_prune`; A24 `exception_grant`; A25 `dr_failover_prod`; A26 `mainnet_deploy` and `fund_moving`; A27 `accept_risk`; A28 `validator_key_ops`; A30 `key_ceremony` and `fund_moving`.
 
-**Gates unchanged.** No new agent owns a gate: A08, A09, A10 and A12 are still the only gate owners, and the work of the
-new agents flows through them.
+**Patterns** (`scripts/orch_plan.py`): three new `PATTERNS`, `cloud-native` (15 tasks), `cluster` (12) and `web3` (14), selectable with `--pattern`. The `cluster` and `web3` implementer rows (A22, A26 and A29) are `risk_class` high, so all four gates apply. Blast-radius lanes (`_LANE_AGENTS`) cover 25 agents: every agent except A01, A08, A09, A10 and A12. No new agent owns a gate.
 
-**Plans** (`scripts/orch_plan.py`, `scripts/orch_from_graph.py`, `swarm/blast_radius.py`): three new `PATTERNS`,
-`cloud-native` (15 tasks), `cluster` (12) and `web3` (14), selectable with `--pattern`. The `cluster` and `web3` rows that
-implement (A22 manifests, A26, A29) are `risk_class` high, so all four gates apply; `cloud-native` follows the plan's risk
-class. `orch_from_graph.py` routes a graph step to an owner by file path: `*.sol`, `*.vy`, `contracts/`, `foundry.toml`
-and `hardhat.config.*` to A26; `web3/`, `wallet/` and `wagmi/` to A29; `charts/`, `helm/`, `k8s/`, `kubernetes/`,
-`manifests/`, `overlays/` and `kustomization.yaml` to A22; `Dockerfile*` to A18; `asyncapi.*` and `serverless.*` to A19;
-`catalog-info.yaml` to A17. Blast-radius lanes (`_LANE_AGENTS`) cover 25 agents: every one except A01, A08, A09, A10 and
-A12.
+**Guard** (`omp/src/guard.ts`): six `prod_infra` rows for the cluster tooling (`argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle`, `kubeadm-lifecycle`) and two chain rows (`chain-broadcast`, capability `chain_broadcast`; `chain-key-material`, capability `chain_key_material`). Section 12 lists what each blocks and passes.
 
-**Registry and ACP:** owner prefixes `cloud_`, `plat_`, `supply_`, `event_`, `finops_`, `k8s_`, `gitops_`, `mesh_`,
-`kpol_`, `resil_`, `sol_`, `audit_`, `chain_`, `dapp_` and `custody_`; the 21 baseline tools permit all 30 agents. The
-new artifact types are in the new agents' `produces`; 11 existing agents (A03, A04, A05, A06, A08, A10, A11, A12, A13, A14, A15) gained them in `consumes`, so the ACP routing
-table gives them routes without a peer list.
-
-**Guard** (`omp/src/guard.ts`): rows `argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`,
-`managed-cluster-lifecycle` and `kubeadm-lifecycle` (capability `prod_infra`) and `chain-broadcast` and
-`chain-key-material` (capabilities `chain_broadcast` and `chain_key_material`); what each blocks and passes is in
-section 12.
-
-**Bar** (`omp/src/swarm_bar.ts`): the footer status text `swarm: <counts>` (`setStatus`) is removed. The bar above the
-editor is unchanged and is the one place the counts appear; `SWARM_BAR=off` disables the bar and its token chips
-([swarm-bar.md](swarm-bar.md)).
-
-**Substrate:** `AGENT_SURFACES` (`swarm/substrate_tee.py`) and `SWARM_SURFACES` (`swarm/memory.py`) gain A16 to A30 as
-`swarm-<id>-<code>`; a workspace install with substrate tokens needs `SUBSTRATE_TOKEN_<SURFACE>` for all 30
-([substrate-workspace.md](substrate-workspace.md)).
-
-**omp skills:** 30 per-agent index skills plus `swarm-orchestrate` are visible (31); every omp agent file stays at or
-under 64 KiB, with `a01-orchestrator` the largest.
+**Footer:** the footer status text `swarm: <counts>` (`setStatus`) is removed. The bar above the editor is the one place the counts appear; `SWARM_BAR=off` disables it ([swarm-bar.md](swarm-bar.md)).
 
 **Scanners and test isolation:** the A16–A30 scanners fail closed on in-scope input (section 12). `tests/conftest.py` points each test's GSD and Claude state mirrors away from the checkout with `SWARM_GSD_STATE_FILE` (empty) and `SWARM_CLAUDE_STATE_DIR` (section 10).

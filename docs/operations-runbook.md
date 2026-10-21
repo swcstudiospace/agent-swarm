@@ -23,6 +23,8 @@ From `omp/`, run `bun run test`, not a bare full `bun test`: the extension regis
 
 The raw shell scanners retain literal spans by index, and plain unquoted words are reused instead of rebuilt character by character. Quote, escape, comment, heredoc and operator handling is unchanged. The WR-09 regression still checks the original million-byte inputs, the 40× differential cap, and the 3× cap for doubling the same input shape from 400 KB to 800 KB.
 
+The v2.3 guard rows for the Web3 and cluster domains are `chain-broadcast` and `chain-key-material` (capabilities `chain_broadcast` and `chain_key_material`), plus `argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle` and `kubeadm-lifecycle` under `prod_infra`. A matching command in a swarm session is blocked with `BLOCKED needs: human-approval (<capability>: <rule id>)`.
+
 ## Private signer bootstrap
 
 Use an existing operator-provisioned signer; never print it or paste it into an agent prompt.
