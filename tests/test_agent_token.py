@@ -11,7 +11,6 @@ import pytest
 
 from conftest import ROOT, omp_calls, run_script, stub_omp
 from swarm import workspace
-from swarm.errors import SwarmError
 
 A05_TOKEN = "p14-a05-own-token-0123456789"
 RUNNER_TOKENS = {"SUBSTRATE_TOKEN": "p14-runner-a01-token-0123456789",
@@ -106,7 +105,7 @@ def test_grok_refuses_unsupported_transport_before_dispatch(sr, ws, tmp_path, mo
         raise AssertionError("unsupported Grok transport must not spawn a specialist")
 
     monkeypatch.setattr(sr.subprocess, "Popen", refuse_spawn)
-    with pytest.raises(SwarmError) as e:
+    with pytest.raises(sr.SwarmError) as e:
         sr.run_agent_headless(A05, "test-owned assignment", ws, _args(runtime="grok"))
     assert e.value.code.value == "E-DEP"
     assert "stdin assignment transport" in str(e.value)

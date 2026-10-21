@@ -198,6 +198,7 @@ def test_android_ios_and_desktop_route_to_their_seats():
 
 
 def test_render_is_deterministic_sorted_and_leaves_dispatch_and_grok_alone():
+    dispatch_before = DISPATCH.read_bytes()
     first = _rendered()
     second = _rendered()
     assert first == second
@@ -223,11 +224,7 @@ def test_render_is_deterministic_sorted_and_leaves_dispatch_and_grok_alone():
                 assert f"$SWARM_ROOT/{agent['prompt']}" in text
     control = first["grokbot/skills/swarm-control/SKILL.md"]
     assert "swarm_run.py" not in control
-    diff = subprocess.run(
-        ["git", "diff", "--exit-code", "HEAD", "--", "grokbot/skills/swarm-cloud-dispatch/SKILL.md"],
-        cwd=ROOT, capture_output=True,
-    )
-    assert diff.returncode == 0
+    assert DISPATCH.read_bytes() == dispatch_before
     assert DISPATCH.is_file()
 
 
