@@ -386,7 +386,7 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
         else:
             text, resolved = _expand(base, global_args)
             if not resolved:
-                findings.append(_f("docker.base-unresolved-arg", "info", f"base image {_scrub(base)!r} depends on a build argument without default; not checked", at))
+                findings.append(_f("docker.base-unresolved-arg", "major", f"base image {_scrub(base)!r} depends on a build argument without default; the image cannot be checked", at))
                 continue
             parsed, reason = _parse_ref(text)
             if parsed is None:
@@ -569,7 +569,7 @@ def base_image_policy(payload: dict) -> dict:
                 findings.append(_f("image.not-digest-pinned", "major" if require_digest else "minor", "pinned by tag only; a tag can be re-pointed", ref))
             if max_age is not None:
                 if created_at is None:
-                    findings.append(_f("image.age-unknown", "info", "no created_at supplied; the age limit was not checked", ref))
+                    findings.append(_f("image.age-unknown", "major", "no created_at supplied; the age limit cannot be checked", ref))
                 elif (as_of - created_at).total_seconds() > max_age * 86400:
                     age_days = int(-(-(as_of - created_at).total_seconds() // 86400))  # rounded up: always above max_age here
                     findings.append(_f("image.too-old", "major", f"image is {age_days} days old (rounded up), over the {max_age} day limit", ref))
@@ -707,7 +707,7 @@ def _spdx_components(doc: dict) -> list[dict]:
         found.append({
             "name": _text(package.get("name")),
             "group": "",
-            "version": _text(package.get("versionInfo")),
+            "version": "" if _text(package.get("versionInfo")).upper() == "NOASSERTION" else _text(package.get("versionInfo")),
             "purl": purl,
             "supplier": bool(supplier) and not supplier.upper().startswith("NOASSERTION"),
             "identified": any(isinstance(r.get("referenceType"), str) and r["referenceType"] in _SPDX_ID_REFS and _text(r.get("referenceLocator")) for r in refs),
@@ -858,13 +858,20 @@ def sbom_validate(payload: dict) -> dict:
     return respond(payload, work)
 
 
+def _split_purl_version(base: str) -> tuple[str, str]:
+    """(identity, version) of a package URL without subpath or qualifiers. The version follows the last `@` that is not the scope
+    marker of a namespace: `pkg:npm/@scope/name` has no version, `pkg:npm/@scope/name@1.0.0` has one."""
+    at = base.rfind("@")
+    if at > 0 and base[at - 1] != "/" and "/" in base[:at]:
+        return base[:at], base[at + 1:]
+    return base, ""
+
+
 def _component_key(c: dict) -> str:
     """Identity of a component across versions: purl without version/qualifiers, else lowercase group/name."""
     purl = c["purl"]
     if purl.startswith("pkg:"):
-        base = purl.split("#", 1)[0].split("?", 1)[0]
-        head, at, _ = base.rpartition("@")
-        return (head if at and "/" in head else base).lower()
+        return _split_purl_version(purl.split("#", 1)[0].split("?", 1)[0])[0].lower()
     return f"{c['group']}/{c['name']}".strip("/").lower()
 
 
@@ -1215,9 +1222,7 @@ def _purl_parts(product: str) -> tuple[str, str, frozenset]:
         return product, "", frozenset()
     base, _, query = product.split("#", 1)[0].partition("?")
     qualifiers = frozenset((key.lower(), value) for key, _eq, value in (item.partition("=") for item in query.split("&")) if key and value)
-    head, at, version = base.rpartition("@")
-    if not at or "/" not in head:
-        head, version = base, ""
+    head, version = _split_purl_version(base)
     scheme_type, slash, rest = head[4:].partition("/")
     return f"pkg:{scheme_type.lower()}{slash}{rest}", version, qualifiers
 
@@ -1384,10 +1389,11 @@ def _audit_workflow(path: str, content: str) -> tuple[int, list[dict]]:
             value = _uncomment(match.group(1))
             if "${{" in value or "${" in value or value in ("{", "|", ">"):
                 continue
-            parsed, _reason = _parse_ref(value)
-            if parsed is None:
-                continue
+            parsed, reason = _parse_ref(value)
             refs += 1
+            if parsed is None:
+                findings.append(_f("pin.image-invalid-reference", "major", f"image {_echo_ref(value)} is not a valid reference: {reason}", at))
+                continue
             pinning = _ref_pinning(parsed)
             if pinning != "digest":
                 findings.append(_f("pin.image-latest" if pinning == "latest" else "pin.image-tag-only", "major" if pinning == "latest" else "minor", f"image {value} is not pinned by digest", at))
@@ -1398,18 +1404,25 @@ def _audit_dockerfile(path: str, content: str) -> tuple[int, list[dict]]:
     stages, global_args = _stages(_parse_dockerfile(content))
     refs, findings = 0, []
     for stage in stages:
-        base = stage["base"]
-        if not base or base.lower() == "scratch" or stage["parent"] is not None:
+        base, location = stage["base"], f"{path}:{stage['line']}"
+        if base and (base.lower() == "scratch" or stage["parent"] is not None):
+            continue  # scratch and earlier-stage bases are not registry references
+        refs += 1
+        if not base:
+            findings.append(_f("pin.base-invalid-reference", "major", "FROM has no image", location))
             continue
         text, resolved = _expand(base, global_args)
-        parsed, _reason = _parse_ref(text) if resolved else (None, "")
-        if parsed is None:
+        if not resolved:
+            findings.append(_f("pin.base-unresolved-arg", "major", f"FROM {_scrub(base)} depends on a build argument without default; the image cannot be checked", location))
             continue
-        refs += 1
+        parsed, reason = _parse_ref(text)
+        if parsed is None:
+            findings.append(_f("pin.base-invalid-reference", "major", f"FROM {_echo_ref(text)} is not a valid reference: {reason}", location))
+            continue
         pinning = _ref_pinning(parsed)
         if pinning != "digest":
             findings.append(_f("pin.image-latest" if pinning == "latest" else "pin.image-tag-only", "major" if pinning == "latest" else "minor",
-                               f"FROM {text} is not pinned by digest", f"{path}:{stage['line']}"))
+                               f"FROM {text} is not pinned by digest", location))
     return refs, findings
 
 
@@ -1753,10 +1766,10 @@ def retention_plan(payload: dict) -> dict:
         if as_of is None:
             return _invalid("as_of", "as_of must be an ISO-8601 timestamp with an explicit offset")
         protected_digests = set()
-        for digest in payload["protected_digests"]:
+        for index, digest in enumerate(payload["protected_digests"]):
             parsed = _valid_digest(digest)
             if parsed is None:
-                return _invalid("protected_digests", f"protected_digests[{len(protected_digests)}] is not a valid OCI digest (algorithm:hex)")
+                return _invalid("protected_digests", f"protected_digests[{index}] is not a valid OCI digest (algorithm:hex)")
             protected_digests.add(f"{parsed[0]}:{parsed[1]}")
         tags = []
         seen: set[str] = set()

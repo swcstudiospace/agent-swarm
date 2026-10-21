@@ -178,10 +178,11 @@ def test_files_over_one_mebibyte_binaries_and_symlinks_are_skipped_not_followed(
     put(repo, "ok/Dockerfile", CLEAN_DOCKERFILE)
     code, out = scan(tmp_path)
     assert (repo / "big" / "Dockerfile").stat().st_size > 1024 * 1024 and (repo / "edge" / "Dockerfile").stat().st_size == 1024 * 1024
-    assert out["skipped"] == ["big/Dockerfile: over-1MiB", "bin/Dockerfile: binary", "file/Dockerfile: symlink"]
+    assert out["skipped"] == ["big/Dockerfile: over-1MiB", "bin/Dockerfile: binary", "file/Dockerfile: symlink", "link: symlink"]
     assert out["files_scanned"] == {"dockerfiles": 2, "workflows": 0}  # edge/ (exactly 1 MiB) and ok/ are read
     assert not any("outside" in f["location"] for f in out["findings"])
-    assert code == 1 and {f["location"].split(":")[0] for f in out["findings"]} == {"edge/Dockerfile"}
+    # skipped inputs make the scan incomplete: its finding carries no location, so the location set gains the empty string
+    assert code == 1 and {f["location"].split(":")[0] for f in out["findings"]} == {"edge/Dockerfile", ""}
 
 
 def test_scan_stops_after_2000_files_and_says_so(tmp_path):
@@ -189,8 +190,8 @@ def test_scan_stops_after_2000_files_and_says_so(tmp_path):
     for i in range(2001):
         put(repo, f"d{i // 100:02d}/Dockerfile.{i:04d}", CLEAN_DOCKERFILE)
     code, out = scan(tmp_path)
-    assert out["files_scanned"]["dockerfiles"] == 2000 and out["truncated"] is True and code == 0
-    assert rows(out) == [("scan.truncated", "info", "")]
+    assert out["files_scanned"]["dockerfiles"] == 2000 and out["truncated"] is True and code == 1  # a truncated scan is incomplete, never ok
+    assert rows(out) == [("scan/incomplete", "major", ""), ("scan.truncated", "info", "")]
 
 
 def test_exactly_2000_files_are_not_a_truncation(tmp_path):
@@ -221,10 +222,11 @@ def test_path_outside_root_or_missing_is_an_input_error_with_exit_code_two(tmp_p
     assert "does not exist" in out["error"]["message"]
 
 
-def test_empty_repository_is_clean(tmp_path):
+def test_empty_repository_is_incomplete_not_clean(tmp_path):
     (tmp_path / "repo").mkdir()
     code, out = scan(tmp_path)
-    assert code == 0 and out["status"] == "ok" and out["files_scanned"] == {"dockerfiles": 0, "workflows": 0} and out["findings_total"] == 0
+    assert code == 1 and out["status"] == "fail" and out["files_scanned"] == {"dockerfiles": 0, "workflows": 0} and out["findings_total"] == 1
+    assert rows(out) == [("scan/incomplete", "major", "")] and "no in-scope input was analysed" in out["findings"][0]["summary"]
 
 
 # --- workflow rules (in-process) --------------------------------------------------------------------------------
@@ -365,7 +367,7 @@ def test_fifo_named_dockerfile_is_skipped_and_the_valid_dockerfile_is_still_lint
     proc = subprocess.run([sys.executable, str(SCRIPT), "--json", "--root", str(repo), "--path", "img"], capture_output=True, text=True,
                           env=env, cwd=ROOT, check=False, timeout=60)
     out = json.loads(proc.stdout)
-    assert proc.returncode == 0 and out["status"] == "ok" and out["findings"] == []
+    assert proc.returncode == 1 and out["status"] == "fail" and [f["id"] for f in out["findings"]] == ["scan/incomplete"]  # unreadable is incomplete
     assert out["files_scanned"] == {"dockerfiles": 1, "workflows": 0}
     assert out["skipped"] == ["img/Dockerfile: unreadable"]
 
@@ -377,3 +379,49 @@ def test_inline_build_args_secret_gives_the_same_finding_as_the_block_form():
     assert [(f["id"], f["severity"], f["summary"]) for f in inline] == [(f["id"], f["severity"], f["summary"]) for f in block]
     assert [(f["id"], f["severity"], f["location"]) for f in inline] == [("workflow.secret-in-build-arg", "blocker", "w.yml:1")]
     assert module.workflow_build_arg_findings("          build-args: VERSION=1\n", "w.yml") == []
+
+
+def test_workflow_named_with_dot_dot_segments_is_linted_not_a_crash(tmp_path):
+    repo = tmp_path / "repo"
+    name = ".github/workflows/a\\..\\b.yml"  # a legal Linux file name; the CLI must not route it through pin_audit's payload-path rule
+    put(repo, name, BAD_WORKFLOW)
+    code, out = scan(tmp_path)
+    assert code == 1 and out["files_scanned"] == {"dockerfiles": 0, "workflows": 1}
+    assert {f["location"].split(":")[0] for f in out["findings"]} == {name}
+
+
+def test_a_path_with_no_dockerfile_or_workflow_is_incomplete_not_clean(tmp_path):
+    repo = tmp_path / "repo"
+    put(repo, "README.md", "# hi\n")
+    code, out, _ = run_script(tmp_path, "--root", str(repo), "--path", "README.md")
+    assert code == 1 and out["status"] == "fail" and out["files_scanned"] == {"dockerfiles": 0, "workflows": 0}
+    assert rows(out) == [("scan/incomplete", "major", "")]
+
+
+def test_clean_workflow_without_pyyaml_is_incomplete_not_ok(tmp_path):
+    module = load_script()
+    module._load_yaml = lambda: None
+    repo = tmp_path / "repo"
+    put(repo, ".github/workflows/ci.yml", CLEAN_WORKFLOW)
+    result = module.scan(repo.resolve(), repo.resolve())
+    assert result["status"] == "fail" and [f["id"] for f in result["findings"]] == ["scan/incomplete"]
+    assert "skipped:tool-missing:pyyaml" in result["findings"][0]["summary"]
+
+
+def test_dockerfile_findings_beyond_the_listing_cap_are_flagged_not_silently_dropped(tmp_path):
+    repo = tmp_path / "repo"
+    put(repo, "Dockerfile", CLEAN_DOCKERFILE + "ADD src /a\n" * 250)
+    code, out = scan(tmp_path)
+    assert code == 0 and out["status"] == "ok"
+    marker = [f for f in out["findings"] if f["id"] == "docker.findings-unlisted"]
+    assert len(marker) == 1 and marker[0]["severity"] == "info" and "50 further finding(s)" in marker[0]["summary"]
+
+
+def test_path_through_a_symlink_is_refused_with_an_input_error(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    put(tmp_path / "outside", "Dockerfile", BAD_DOCKERFILE)
+    (repo / "link").symlink_to(tmp_path / "outside", target_is_directory=True)
+    code, out, _ = run_script(tmp_path, "--root", str(repo), "--path", "link")
+    assert code == 2 and out["status"] == "error" and out["error"]["code"] == "E-INPUT"
+    assert "symlink" in out["error"]["message"]

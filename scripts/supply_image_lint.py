@@ -8,8 +8,9 @@ secrets and `container.options` that run as root or privileged are checked here.
 
 Read-only: it reads files under --root and writes nothing but the run log. Stdlib only, bounded (files over 1 MiB are skipped,
 the scan stops after 2000 files, symlinks are never followed, binary files are skipped). Workflow `container.options` need
-PyYAML: without it that check is reported as `skipped:tool-missing:pyyaml`; every other check is text based and always runs.
-Findings use severity info|minor|major|blocker and the status is `fail` when any major or worse finding exists.
+PyYAML: without it that check is skipped and reported. Every input the scan did not analyse (a skip, a bound, a missing tool, or
+no input at all) makes the status `fail` as a `scan/incomplete` finding (see swarm/scan_status.py); an `ok` status means every
+in-scope file was read. Findings use severity info|minor|major|blocker and the status is `fail` when any major or worse finding exists.
 `--dry-run` prints deterministic canned output and touches nothing.
 """
 from __future__ import annotations
@@ -22,8 +23,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
-from swarm.tools.a18_tools import _BOOLEAN_VALUES, _f, _pin_kind, _secret_name, dockerfile_lint, pin_audit  # noqa: E402
+from swarm.tools.a18_tools import _BOOLEAN_VALUES, _audit_workflow, _f, _pin_kind, _secret_name, dockerfile_lint  # noqa: E402
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_YAML_BYTES = 256 * 1024
@@ -147,11 +149,15 @@ def _scan_dockerfile(rel: str, text: str) -> list[dict]:
     for f in result["findings"]:
         number = f["location"].removeprefix("line ")
         findings.append({**f, "location": f"{rel}:{number}" if number.isdigit() else rel})
+    unlisted = result["findings_total"] - len(result["findings"])  # dockerfile_lint lists at most 200: say so, never undercount silently
+    if unlisted > 0:
+        findings.append(_f("docker.findings-unlisted", "info", f"{unlisted} further finding(s) are not listed; the listing cap was reached", rel))
     return findings
 
 
 def _scan_workflow(rel: str, text: str, yaml_module, skipped: list[str]) -> list[dict]:
-    findings = [dict(f) for f in pin_audit({"files": [{"path": rel, "content": text}]})["findings"]]
+    # Called directly, not through pin_audit: its payload-path check rejects '..' segments, which a repository filename may hold.
+    findings = _audit_workflow(rel, text)[1]
     findings += workflow_build_arg_findings(text, rel)
     if yaml_module is None:
         skipped.append(f"{rel}: skipped:tool-missing:pyyaml (container options)")
@@ -170,9 +176,16 @@ def scan(root: Path, target: Path) -> dict:
     counts = {"dockerfiles": 0, "workflows": 0}
     scanned = visited = 0
     truncated = False
-    walker = [(str(target.parent), [], [target.name])] if target.is_file() else os.walk(target, followlinks=False)
+
+    def unreadable_directory(error: OSError) -> None:
+        skipped.append(f"{Path(error.filename or target).relative_to(root).as_posix()}: unreadable")
+
+    walker = [(str(target.parent), [], [target.name])] if target.is_file() else os.walk(target, followlinks=False, onerror=unreadable_directory)
     for base, dirnames, filenames in walker:
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in dirnames:  # os.walk lists a symlinked directory without descending into it: its files are unseen, so say so
+            if Path(base, name).is_symlink():
+                skipped.append(f"{Path(base, name).relative_to(root).as_posix()}: symlink")
         for name in sorted(filenames):
             visited += 1
             if visited > MAX_ENTRIES:
@@ -213,12 +226,16 @@ def scan(root: Path, target: Path) -> dict:
                 findings += _scan_workflow(rel, text, yaml_module, skipped)
         if truncated:
             break
+    reasons = list(skipped)
+    bound = f"scan stopped at its bounds ({MAX_FILES} files, {MAX_ENTRIES} entries)"
     if truncated:
-        findings.append(_f("scan.truncated", "info", f"scan stopped at its bounds ({MAX_FILES} files, {MAX_ENTRIES} entries)", ""))
+        reasons.append(bound)
+        findings.append(_f("scan.truncated", "info", bound, ""))
+    findings += [{**f, "location": ""} for f in incomplete_findings(reasons, scanned)]
     findings.sort(key=lambda f: (RANK[f["severity"]], f["location"], f["id"], f["summary"]))
     blocking = sum(1 for f in findings if RANK[f["severity"]] <= RANK["major"])
     return {
-        "status": "fail" if blocking else "ok",
+        "status": scan_status(findings),
         "files_scanned": {**counts},
         "findings_total": len(findings),
         "blocking_count": blocking,
@@ -230,6 +247,15 @@ def scan(root: Path, target: Path) -> dict:
     }
 
 
+def _no_symlink_on_path(root: Path, relative: str) -> None:
+    """Symlinks are never followed: refuse a --path whose own components cross one, as the walk does not follow them either."""
+    current = root
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {relative!r} crosses a symlink; symlinks are never followed")
+
+
 def run(args, ctx) -> dict:
     if ctx.dry_run:
         return {
@@ -237,6 +263,7 @@ def run(args, ctx) -> dict:
             "findings": [], "skipped": [], "truncated": False, "tools": {"pyyaml": "not-checked"},
             "summary": "dry-run: supply_image_lint would scan Dockerfiles and workflow files under --root",
         }
+    _no_symlink_on_path(ctx.root, args.path)
     target = (ctx.root / args.path).resolve()
     if not target.is_relative_to(ctx.root):
         raise SwarmError(ErrorCode.E_INPUT, f"--path {args.path!r} leaves the repository root")

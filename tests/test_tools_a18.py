@@ -169,7 +169,7 @@ def test_dockerfile_lint_resolves_global_arg_defaults_in_from():
     assert ids(lint(content)) == ["docker.latest-tag"]
     assert ids(lint("ARG TAG=3.20\nFROM alpine:$TAG\nUSER app\nHEALTHCHECK CMD true\n")) == ["docker.base-not-digest-pinned"]
     unresolved = lint("ARG BASE\nFROM ${BASE}\nUSER app\nHEALTHCHECK CMD true\n")
-    assert ids(unresolved) == ["docker.base-unresolved-arg"] and unresolved["verdict"] == "pass"
+    assert ids(unresolved) == ["docker.base-unresolved-arg"] and unresolved["verdict"] == "fail"  # an unchecked base is not a pass
     assert lint("ARG BASE\nFROM ${BASE:-alpine:latest}\nUSER app\nHEALTHCHECK CMD true\n")["findings"][0]["id"] == "docker.latest-tag"
 
 
@@ -358,7 +358,7 @@ def test_base_image_policy_age_limit_boundary_is_strictly_greater():
     zero = policy([{"ref": f"alpine:3@{DIGEST}", "created_at": AS_OF}], max_age_days=0)
     assert zero["findings_total"] == 0
     unknown = policy([{"ref": f"alpine:3@{DIGEST}"}], max_age_days=30)
-    assert ids(unknown) == ["image.age-unknown"] and unknown["verdict"] == "pass"
+    assert ids(unknown) == ["image.age-unknown"] and unknown["verdict"] == "fail"  # the requested age check did not run
     assert policy([{"ref": f"alpine:3@{DIGEST}", "created_at": "2020-01-01T00:00:00+00:00"}])["findings_total"] == 0
 
 
@@ -1096,8 +1096,9 @@ def test_pin_audit_dockerfile_from_lines():
     content = f"ARG BASE\nFROM node:latest AS build\nFROM alpine:3 AS mid\nFROM build AS again\nFROM ${{BASE}}\nFROM scratch\nFROM debian@{DIGEST}\nFROM ubuntu\n"
     result = audit(("svc/Dockerfile", content))
     assert finding_rows(result) == [
-        ("pin.image-latest", "major", "svc/Dockerfile:2"), ("pin.image-latest", "major", "svc/Dockerfile:8"), ("pin.image-tag-only", "minor", "svc/Dockerfile:3")]
-    assert (result["references"], result["unpinned"]) == (4, 3)
+        ("pin.base-unresolved-arg", "major", "svc/Dockerfile:5"), ("pin.image-latest", "major", "svc/Dockerfile:2"),
+        ("pin.image-latest", "major", "svc/Dockerfile:8"), ("pin.image-tag-only", "minor", "svc/Dockerfile:3")]
+    assert (result["references"], result["unpinned"]) == (5, 4)  # the unresolved FROM is a reference that cannot be shown pinned
     for name in ("Dockerfile", "api.Dockerfile", "Dockerfile.prod", "Containerfile"):
         assert audit((f"x/{name}", "FROM node\n"))["files_audited"] == 1, name
 
@@ -1830,3 +1831,39 @@ def test_dockerfile_lint_heredoc_terminators_are_bisected_not_rescanned_per_mark
     result = lint(content)
     assert time.perf_counter() - started < 5.0  # was quadratic: about 10 s just to parse 20000 RUN lines
     assert result["instructions"] == 20003 and ids(result) == []
+
+
+def test_sbom_validate_spdx_noassertion_version_is_not_a_present_version():
+    doc = json.loads(spdx())
+    doc["packages"][1]["versionInfo"] = "NOASSERTION"
+    result = validate(json.dumps(doc))
+    assert element(result, "component_version")["covered"] == 1 and result["ntia_compliant"] is False
+    assert ids(result) == ["ntia.component_version"] and result["verdict"] == "fail"
+
+
+def test_sbom_diff_removed_versionless_scoped_npm_component_is_seen():
+    before = cdx([cdx_component("@s/a", "", purl="pkg:npm/@s/a"), cdx_component("@s/b", "", purl="pkg:npm/@s/b")], root=False)
+    after = cdx([cdx_component("@s/a", "", purl="pkg:npm/@s/a")], root=False)
+    result = diff(before, after)
+    assert result["removed_count"] == 1 and result["removed"][0]["name"] == "@s/b" and result["verdict"] == "changed"
+
+
+def test_vex_apply_scoped_npm_product_matches_its_versioned_vulnerability_both_ways():
+    versionless_statement = vex([vuln(product="pkg:npm/@s/a@1.0.0")], [stmt(products=["pkg:npm/@s/a"], status="not_affected")])
+    assert versionless_statement["verdict"] == "clear" and versionless_statement["suppressed_count"] == 1
+    assert versionless_statement["unmatched_statements"] == 0
+    versioned_statement = vex([vuln(product="pkg:npm/@s/a")], [stmt(products=["pkg:npm/@s/a@1.0.0"], status="not_affected")])
+    assert versioned_statement["verdict"] == "exposed" and versioned_statement["unmatched_statements"] == 1
+
+
+def test_pin_audit_unverifiable_workflow_image_is_a_finding_not_skipped():
+    result = audit((".github/workflows/ci.yml", "jobs:\n  a:\n    container:\n      image: Node:20\n"))
+    assert finding_rows(result) == [("pin.image-invalid-reference", "major", ".github/workflows/ci.yml:4")]
+    assert (result["references"], result["unpinned"]) == (1, 1)
+
+
+def test_retention_plan_names_the_input_position_of_a_bad_protected_digest():
+    payload = {"tags": [tag("a")], "keep_latest": 0, "min_age_days": 0, "protected_prefixes": [], "max_delete_pct": 100, "as_of": AS_OF,
+               "protected_digests": [DIGESTS["a"], DIGESTS["a"], "bad"]}
+    bad = call("supply_retention_plan", payload)
+    assert bad["state"] == "INVALID_INPUT" and bad["field"] == "protected_digests" and "protected_digests[2]" in bad["message"]
