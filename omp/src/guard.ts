@@ -271,7 +271,7 @@ const KUBECTL_VERB: Record<string, true> = {
  * it, with a marker in the value of `-n`/`--namespace`/`--context`/`--cluster`/`--kubeconfig`/`--server` (`-n prod`,
  * `-nprod`, `-n=prod`, `--namespace=prod`) or a `KUBECONFIG=` prefix, or — when nothing names the destination — in a
  * positional word after the verb (resource, name; `k=v` words such as `set image` and label values aside). File,
- * selector and output values never count, and `--dry-run[=client|server]` never matches (WR-08).
+ * selector and output values never count, and `--dry-run[=client|server]` never matches (WR-08). A `--` ends the flags; the words after it are positional too, except the pod command of exec, run, debug and attach.
  */
 function kubectlProdChange({ words, marked }: Segment): boolean {
   const k = words.findIndex((w) => w === "kubectl" || w === "oc" || w === "kubecolor");
@@ -279,9 +279,13 @@ function kubectlProdChange({ words, marked }: Segment): boolean {
   const targets: string[] = [];
   const positional: string[] = [];
   let dryRun = false; // only kubectl's own flag counts: not a flag value, not the pod command after `--`
+  let afterDashes: string[] = []; // the words after a `--`: operands, unless the verb runs them as the pod command
   for (let i = k + 1; i < words.length; i++) {
     const w = words[i];
-    if (w === "--") break; // the command `exec`/`debug` run in the pod
+    if (w === "--") {
+      afterDashes = words.slice(i + 1);
+      break;
+    }
     if (!w.startsWith("-") || w === "-") {
       positional.push(w);
       continue;
@@ -300,6 +304,7 @@ function kubectlProdChange({ words, marked }: Segment): boolean {
   const at = positional.findIndex((w) => Object.hasOwn(KUBECTL_VERB, w));
   if (dryRun || at === -1 || !Object.hasOwn(KUBECTL_CHANGE, positional[at])) return false;
   const [verb, sub] = [positional[at], positional[at + 1]];
+  if (!/^(?:exec|run|debug|attach)$/.test(verb)) positional.push(...afterDashes);
   if (verb === "rollout" && (sub === "status" || sub === "history")) return false;
   if (verb === "apply" && sub === "view-last-applied") return false;
   if (verb === "certificate" && sub !== "approve" && sub !== "deny") return false;
@@ -2213,11 +2218,11 @@ const FLUX_OTHER =
 
 /**
  * `flux delete|uninstall|bootstrap` always, `flux suspend|resume` with a D-04 marker in an operand or in the value of
- * `-n`/`--namespace`/`--context`/`--kubeconfig`. The verb is the first positional that is a flux command.
+ * `-n`/`--namespace`/`--context`/`--kubeconfig`. The verb is the first positional that is a flux command. A `--` ends the flags; the words after it are operands (`flux suspend kustomization -- prod`).
  */
 function fluxChange({ words }: Segment): boolean {
   return eachTool(words, /^flux$/, (at) => {
-    const { positional, flags } = argsAfter(words, at, FLUX_VALUE_FLAG);
+    const { positional, flags } = argsAfter(words, at, FLUX_VALUE_FLAG, true);
     if (helpOnly(flags)) return false;
     const v = positional.findIndex((w) => FLUX_ALWAYS.test(w) || FLUX_PROD.test(w) || FLUX_OTHER.test(w));
     if (v === -1) return false;

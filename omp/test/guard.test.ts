@@ -770,6 +770,14 @@ describe("HOOK-02", () => {
     expect(guardToolCall(bash(command), inside(agent))).toBeUndefined();
   });
 
+  test("a `--` operand names the target: flux suspend|resume and kubectl change verbs block on a prod name after it, exec|run|debug|attach keep their pod command", () => {
+    expect(guardToolCall(bash("flux suspend kustomization -- prod"), inside("a22-gitops"))?.reason).toBe("BLOCKED needs: human-approval (prod_infra: flux-change)");
+    expect(guardToolCall(bash("flux resume helmrelease -- prod-api"), inside("a22-gitops"))?.reason).toBe("BLOCKED needs: human-approval (prod_infra: flux-change)");
+    expect(guardToolCall(bash("flux suspend kustomization -- dev"), inside("a22-gitops"))).toBeUndefined();
+    expect(guardToolCall(bash("kubectl delete -- deployment/prod-api"), inside(A11))?.reason).toBe("BLOCKED needs: human-approval (prod_infra: kubectl-prod-change)");
+    expect(guardToolCall(bash("kubectl exec pod -- ls prod"), inside(A11))).toBeUndefined();
+  });
+
   /** Every exemption token counts only in its own syntactic slot: never as a flag value, a later positional, or after `--`. */
   test.each<[string, string, string]>([
     ["kubectl -n production exec pod -- python3 -c 'x' --dry-run=client", A11, "kubectl-prod-change"],
@@ -1256,6 +1264,14 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
     );
     expect(guardToolCall(bash('printf $"cost\\n"; hardhat test'), insideAs(A26))).toBeUndefined();
+  });
+
+  test("an assigning expansion in a printf argument is a write: export HARDHAT_NETWORK=; printf ${HARDHAT_NETWORK:=mainnet} needs approval, a plain or default expansion does not", () => {
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=; printf '%s' \"${HARDHAT_NETWORK:=mainnet}\"; hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost; printf '%s' \"$HARDHAT_NETWORK\"; hardhat run scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("printf '%s' \"${HARDHAT_NETWORK:-mainnet}\"; hardhat test"), insideAs(A26))).toBeUndefined();
   });
 
   test("the last export on the line decides: a mainnet export after a local one still needs approval", () => {
