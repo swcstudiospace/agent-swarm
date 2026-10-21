@@ -18,7 +18,7 @@ GATE_OWNERS = {"quality": "A08", "review": "A09", "security": "A10", "release": 
 
 # pattern -> (task count, implementer suffixes that the gate tasks target, implementer suffixes pinned to risk high)
 PATTERN_SHAPE = {
-    "cloud-native": (15, {"be", "events"}, set()),
+    "cloud-native": (16, {"be", "events"}, set()),
     "cluster": (12, {"gitops"}, {"gitops"}),
     "web3": (14, {"sol", "dapp"}, {"sol", "dapp"}),
 }
@@ -146,10 +146,12 @@ def test_domain_owners_sit_upstream_of_the_rows_that_consume_them(tmp_path):
     assert web3["P-sol"]["depends_on"] == ["P-arch", "P-cust"] and web3["P-sec"]["depends_on"] == ["P-sol", "P-dapp", "P-aud"]
     assert web3["P-qa"]["depends_on"] == ["P-sol", "P-dapp", "P-aud"]
     assert web3["P-rel"]["depends_on"] == ["P-build", "P-chain"]
+    assert web3["P-dapp"]["depends_on"] == ["P-arch", "P-sol", "P-chain"]
     cloud = {t["task_id"]: t for t in _plan(tmp_path / "k", "cloud-native")}
     assert cloud["P-be"]["depends_on"] == ["P-arch", "P-cloud", "P-events", "P-plat"]
     assert cloud["P-events"]["depends_on"] == ["P-arch", "P-cloud", "P-plat"]
-    assert cloud["P-rel"]["depends_on"] == ["P-build", "P-plat", "P-cost"]
+    assert cloud["P-img"]["depends_on"] == ["P-be"] and cloud["P-prov"]["depends_on"] == ["P-build"]
+    assert cloud["P-rel"]["depends_on"] == ["P-build", "P-prov", "P-plat", "P-cost"]
 
 
 def _ancestors(by_id: dict[str, dict], task_id: str) -> set[str]:

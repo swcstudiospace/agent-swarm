@@ -26,7 +26,7 @@ flowchart LR
 ```
 
 **1. Plan** — `orch_plan.py`
-- Turns a brief into a DAG, either from `PATTERNS` (feature = 13 tasks, hotfix = 8, dependency = 8, cloud-native = 15, cluster = 12, web3 = 14) or from `--pattern custom --plan plan.json`.
+- Turns a brief into a DAG, either from `PATTERNS` (feature = 13 tasks, hotfix = 8, dependency = 8, cloud-native = 16, cluster = 12, web3 = 14) or from `--pattern custom --plan plan.json`.
   - The domain patterns put the specialists in the DAG: `cloud-native` (A02, A03, A16, A19, A05, A17, A20, A18, the four gates, A11, A13, A15), `cluster` (A21, A23, A24, A22, A25, A08/A09/A10, the A22 rollout, A12, A13, A15) and `web3` (A02, A03, A30, A26, A29, A27, A28, A08/A09/A10, A11, A12, A13, A15). The gate tasks target the implementer rows (`events`/`be`, `gitops`, `sol`/`dapp`) and stay with A08, A09, A10 and A12. The `cluster` and `web3` implementer rows pin `risk_class` high (all four gates) at any plan risk; `cloud-native` follows `--risk-class`.
   - `scripts/orch_from_graph.py` routes a graph node's files to their owning specialist (e.g. `*.sol` to A26, `charts/` to A22, `Dockerfile*` to A18), and every agent A16–A30 can hold a `--pattern parallel` lane (`_LANE_AGENTS` in `swarm/blast_radius.py`).
 - `--pattern parallel`, or a blast-radii JSON block / `--slices` on any non-custom plan, makes one short lane per disjoint path set. The same agent can own several lanes. Each lane is a branch `swarm/<prefix>/<id>` and a worktree. A join merges those branches, then one Greptile review (`review_source: greptile` on the single review gate) covers the merged tree. Lanes are not reviewed one by one.
