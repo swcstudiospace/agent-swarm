@@ -5,7 +5,7 @@ Walks --path under --root for .json, .yaml and .yml files and runs the same rule
 kpol_rbac_risk_scan and kpol_sa_token_audit over every Kubernetes object it finds. Bounded: files over 1 MiB, binaries,
 symlinks and non-UTF-8 files are skipped, at most 2000 files are examined, symlinks are never followed out of the root.
 JSON is read natively; YAML needs PyYAML and is reported as `skipped:tool-missing` when it does not import. No external
-binary is required or looked for. Findings use info|minor|major|blocker and `status` is `fail` when any is major or worse.
+binary is required or looked for. Findings use info|minor|major|blocker and `status` is `fail` when any is major or worse, or when any in-scope input was skipped, truncated by a limit or not analysed (a `scan-incomplete` finding lists why).
 Read-only: it writes nothing. `--dry-run` prints deterministic canned output and reads nothing.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools.a24_tools import pss_check, rbac_risk_scan, sa_token_audit  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_FILES = 2000
@@ -46,20 +47,28 @@ def _object_key(manifest: dict) -> str:
     return f"{manifest['kind']}/{namespace}/{name}" if namespace else f"{manifest['kind']}/{name}"
 
 
-def _flatten(doc, depth: int = 0) -> list[dict]:
-    """Kubernetes objects of one parsed document: dicts with a string kind; kind List / <Kind>List items are expanded."""
+def _flatten(doc, rel: str, skipped: list[str], depth: int = 0) -> list[dict]:
+    """Kubernetes objects of one parsed document: dicts with a string kind; kind List / <Kind>List items are expanded.
+    A List nested at depth 2 or deeper, or a List item that is not an object, is never dropped silently: its path and label go
+    to skipped, so the scan reports it incomplete."""
     if not isinstance(doc, dict) or not isinstance(doc.get("kind"), str) or not doc["kind"]:
         return []
     kind = doc["kind"]
     if kind.endswith("List") and isinstance(doc.get("items"), list):
+        if not doc["items"]:
+            return []
         if depth >= 2:
+            skipped.append(f"{rel}: list-nesting-limit:2")
             return []
         inner = kind[: -len("List")]
         out: list[dict] = []
         for item in doc["items"]:
-            if isinstance(item, dict) and "kind" not in item and inner:
+            if not isinstance(item, dict):
+                skipped.append(f"{rel}: list-item-not-object")
+                continue
+            if "kind" not in item and inner:
                 item = {**item, "kind": inner}
-            out.extend(_flatten(item, depth + 1))
+            out.extend(_flatten(item, rel, skipped, depth + 1))
         return out
     return [doc]
 
@@ -198,14 +207,14 @@ def _add(findings: list[dict], result: dict, location: str, key_to_file: dict[st
 
 
 def _call(handler, payload: dict, label: str, skipped: list[str]) -> dict:
-    """Run a tool handler in-process; a rejected input is recorded as skipped, never raised."""
+    """Run a tool handler in-process; a rejected input is recorded as skipped, never raised. The reason carries the state and field only: a message can echo input."""
     try:
         result = handler(payload)
     except (TypeError, AttributeError, ValueError, KeyError, RecursionError) as exc:  # one odd manifest must not end the whole scan
         skipped.append(f"{label}: handler-error {type(exc).__name__}")
         return {}
     if result.get("state") != "SUCCESS":
-        skipped.append(f"{label}: {result.get('state')} {result.get('field', '')} {result.get('message', '')}".strip())
+        skipped.append(f"{label}: {result.get('state')} {result.get('field', '')}".strip())
         return {}
     return result
 
@@ -235,7 +244,7 @@ def scan(root: Path, target: Path, level: str) -> dict:
             continue
         scanned += 1
         for document in (item for doc in documents for item in (doc if isinstance(doc, list) else [doc])):
-            for manifest in _flatten(document):
+            for manifest in _flatten(document, rel, skipped):
                 kind = manifest["kind"]
                 key_to_file.setdefault(_object_key(manifest), set()).add(rel)
                 if kind in WORKLOAD_KINDS:
@@ -258,6 +267,8 @@ def scan(root: Path, target: Path, level: str) -> dict:
     for rel, manifest in workloads:
         _add(findings, _call(pss_check, {"workloads": [manifest], "level": level}, f"{rel} pss", problems), rel)
         _add(findings, _call(sa_token_audit, {"workloads": [manifest], "service_accounts": shared_accounts}, f"{rel} sa", problems), rel)
+    if len(token_secrets) > MAX_SERVICE_ACCOUNTS:
+        limits.append(f"max-token-secrets:{MAX_SERVICE_ACCOUNTS}")
     if token_secrets:
         _add(findings, _call(sa_token_audit, {"workloads": [], "service_accounts": token_secrets[:MAX_SERVICE_ACCOUNTS]}, "secrets sa", problems), "", key_to_file)
     if roles or bindings:
@@ -266,11 +277,12 @@ def scan(root: Path, target: Path, level: str) -> dict:
         payload = {"roles": roles[:MAX_RBAC_OBJECTS], "bindings": bindings[:MAX_RBAC_OBJECTS]}
         _add(findings, _call(rbac_risk_scan, payload, "rbac", problems), "", key_to_file)
     skipped = sorted(set(skipped + problems))
-    unique = {(f["id"], f["severity"], f["summary"], f["location"]): f for f in findings}
+    incomplete = [{**finding, "location": ""} for finding in incomplete_findings(skipped + limits, scanned)]
+    unique = {(f["id"], f["severity"], f["summary"], f["location"]): f for f in findings + incomplete}
     ordered = sorted(unique.values(), key=lambda f: (-SEVERITY_RANK[f["severity"]], f["location"], f["id"], f["summary"]))
     failing = sum(1 for f in ordered if SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"])
     return {
-        "status": "fail" if failing else "ok", "level": level, "files_scanned": scanned, "files_skipped": len(skipped),
+        "status": scan_status(ordered), "level": level, "files_scanned": scanned, "files_skipped": len(skipped),
         "manifest_count": len(workloads) + len(roles) + len(bindings) + len(accounts) + len(token_secrets),
         "tools": {"yaml": "available" if yaml is not None else "skipped:tool-missing"},
         "skipped": skipped[:MAX_SKIPPED_LISTED], "limits_hit": sorted(set(limits)), "findings": ordered,

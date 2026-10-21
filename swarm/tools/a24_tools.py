@@ -415,7 +415,7 @@ def pss_check(payload: dict) -> dict:
     Controls and allowed values are the tables of the Pod Security Standards page. Restricted includes every baseline
     control. spec.os.name == windows relaxes only the Linux-only restricted controls (privilege escalation, seccomp,
     capabilities), as that page says. Not modelled: the user-namespace (hostUsers: false) relaxations behind a feature
-    gate, and per-version pinning of the sysctl list (the full current safe list is accepted).
+    gate, and per-version pinning of the sysctl list (the full current safe list is accepted). highest_compliant_level is absent when no pod spec was checked.
     """
 
     def work() -> dict:
@@ -433,36 +433,47 @@ def pss_check(payload: dict) -> dict:
                     continue
                 severity = "blocker" if control in _PSS_BLOCKERS else "major"
                 findings.append(_finding(f"pss.{control}", severity, workload["loc"], f"{message} (violates {control_level})"))
-        return {"state": "SUCCESS", "level": level, "workload_count": len(workloads), "highest_compliant_level": highest,
-                **_report(findings)}
+        result = {"state": "SUCCESS", "level": level, "workload_count": len(workloads), **_report(findings)}
+        if workloads:  # with no pod spec checked there is no compliance level to claim, so the key is omitted rather than set
+            result["highest_compliant_level"] = highest
+        return result
 
     return respond(payload, _guarded(work))
 
 
 # --- RBAC shared helpers ----------------------------------------------------------------------------------------
 
-_DEFAULT_ROLE_NAMES = frozenset({"cluster-admin", "admin", "edit", "view"})
+_BOOTSTRAP_ROLE_NAMES = frozenset({"admin", "edit", "view"})  # ClusterRoles the API server creates; trusted only with the label (see _is_builtin)
 _BOOTSTRAP_LABEL = "kubernetes.io/bootstrapping"
 _READ_VERBS = frozenset({"get", "list", "watch"})
 # rbac.authorization.k8s.io/v1beta1 stopped being served in Kubernetes 1.22 (deprecation guide, v1.22 removals).
 _REMOVED_RBAC_API = "rbac.authorization.k8s.io/v1beta1"
 
 
-def _is_builtin(manifest: dict) -> bool:
-    """Objects the API server bootstraps and the cluster-admin role.
+def _has_wildcard(role: dict) -> bool:
+    """True when any rule of the role names a wildcard verb, resource or API group."""
+    return any("*" in _strings(_dict(rule).get(field)) for rule in _list(role.get("rules")) for field in ("verbs", "resources", "apiGroups"))
 
-    A bootstrap object carries the label kubernetes.io/bootstrapping=rbac-defaults, but anyone can set a label, so the label
-    only counts on the names the API server really creates: cluster-admin, admin, edit, view and the system: namespace.
-    Without that, a hostile binding could hide from the scan by wearing the label.
+
+def _is_builtin(manifest: dict) -> bool:
+    """A bootstrap object the scan leaves alone: the exact built-in ClusterRoles admin, edit and view that carry no wildcard,
+    and the cluster-admin ClusterRoleBinding while it binds exactly the system:masters group.
+
+    The label kubernetes.io/bootstrapping=rbac-defaults is never trusted alone: whoever writes a manifest can set it, and a
+    `system:` prefix names no fixed set of objects. A role with any wildcard in its rules is never skipped, label or not, since
+    a label cannot suppress a wildcard grant. The cluster-admin ClusterRole is never skipped, whatever it is named.
     """
     meta = _meta(manifest)
     name = meta.get("name")
-    if not isinstance(name, str):
+    if not isinstance(name, str) or _dict(meta.get("labels")).get(_BOOTSTRAP_LABEL) != "rbac-defaults":
         return False
-    labels = _dict(meta.get("labels"))
-    if labels.get(_BOOTSTRAP_LABEL) == "rbac-defaults" and (name in _DEFAULT_ROLE_NAMES or name.startswith("system:")):
-        return True
-    return manifest["kind"] == "ClusterRole" and name == "cluster-admin"
+    if manifest["kind"] == "ClusterRole":
+        return name in _BOOTSTRAP_ROLE_NAMES and not _has_wildcard(manifest)
+    if manifest["kind"] == "ClusterRoleBinding" and name == "cluster-admin":
+        ref, subjects = _dict(manifest.get("roleRef")), _list(manifest.get("subjects"))
+        return (ref.get("kind") == "ClusterRole" and ref.get("name") == "cluster-admin" and len(subjects) == 1
+                and _dict(subjects[0]).get("kind") == "Group" and _dict(subjects[0]).get("name") == "system:masters")
+    return False
 
 
 def _rules_of(role: dict, field: str) -> list[dict]:
@@ -594,7 +605,7 @@ def _rule_risks(rule: dict) -> list[tuple[str, str, str]]:
     """(rule id, severity, text) for one normalised PolicyRule."""
     verbs, resources, groups, names = set(rule["verbs"]), set(rule["resources"]), set(rule["apiGroups"]), rule["resourceNames"]
     star_verb, star_resource = "*" in verbs, "*" in resources
-    if star_verb and star_resource and "*" in groups:
+    if star_verb and star_resource and "*" in groups and not names:  # resourceNames narrows the grant: not admin-equivalent
         return [("rbac.admin-equivalent", "blocker", "grants every verb on every resource in every API group")]
     out: list[tuple[str, str, str]] = []
     shown = ",".join(sorted(resources)) or "(none)"
@@ -644,14 +655,16 @@ def _worst(severities: list[str]) -> str:
 def rbac_risk_scan(payload: dict) -> dict:
     """Scan Roles, ClusterRoles and their bindings for privilege-escalation risk.
 
-    Rules: admin-equivalent (verbs, resources and API groups all *), wildcard verbs/resources/API groups (a read-only `*`
+    Rules: admin-equivalent (verbs, resources and API groups all *, not narrowed by resourceNames), wildcard verbs/resources/API groups (a read-only `*`
     resource still reads secrets), the escalate, bind and impersonate verbs on the resources and API groups the RBAC docs name,
     secret read without resourceNames, pods/exec, nodes/proxy, serviceaccounts/token (also through `*/exec`-style
     subresource wildcards), pod creation; bindings to cluster-admin, the default admin or edit role cluster-wide,
     system:masters, anonymous or system:authenticated subjects, the default service account, and bindings whose referenced
-    role carries a major or blocker rule. Bootstrap roles and bindings (label kubernetes.io/bootstrapping=rbac-defaults on
-    cluster-admin, admin, edit, view or a system: name, a label anyone can set, so only those names are trusted) and the
-    cluster-admin ClusterRole are not scanned. Aggregated ClusterRoles are judged on the rules they aggregate (their own
+    role carries a major or blocker rule. Bootstrap objects (label kubernetes.io/bootstrapping=rbac-defaults on the exact names
+    admin, edit or view as ClusterRoles without any wildcard in their rules, or the cluster-admin ClusterRoleBinding while it binds
+    only system:masters) are not scanned: the label alone, or a system: prefix, is never trusted, since a manifest can set both. A
+    role with a wildcard in its rules is always scanned, label or not. The cluster-admin ClusterRole
+    is always scanned, whatever its name. Aggregated ClusterRoles are judged on the rules they aggregate (their own
     rules only when no supplied role matches). Severities are this tool's house judgement, not a Kubernetes standard.
     rbac.authorization.k8s.io/v1beta1 was removed in Kubernetes 1.22.
     """
@@ -901,7 +914,9 @@ def _lint_webhooks(manifest: dict, findings: list[dict]) -> None:
         webhook = _dict(webhook)
         name = webhook.get("name") if isinstance(webhook.get("name"), str) and webhook.get("name") else f"webhooks[{index}]"
         where = f"{location}#{name}"
-        policy = webhook.get("failurePolicy", "Fail")  # v1 default is Fail
+        policy = webhook.get("failurePolicy")
+        if policy is None:
+            policy = "Fail"  # v1 default is Fail; a null field is unset, and the API server defaults it
         if policy == "Ignore":
             severity = "major" if kind == "ValidatingWebhookConfiguration" else "minor"
             findings.append(_finding("admission.fail-open", severity, where, "failurePolicy Ignore admits requests when the webhook is unreachable or times out"))
@@ -998,7 +1013,9 @@ def _admission_point(entry: dict) -> bool:
 def _lint_gatekeeper(manifest: dict, findings: list[dict]) -> str:
     """Lint a Gatekeeper constraint. Returns enforce | audit | other."""
     location, spec = _loc(manifest), _dict(manifest.get("spec"))
-    action = spec.get("enforcementAction", "deny")  # Gatekeeper default is deny
+    action = spec.get("enforcementAction")
+    if action is None:
+        action = "deny"  # Gatekeeper default is deny; a null field is unset
     if action == "deny":
         return "enforce"
     if action in ("dryrun", "warn"):
@@ -1238,7 +1255,7 @@ def secret_exposure_check(payload: dict) -> dict:
 
     Per workload: secrets injected as environment variables (secretKeyRef, envFrom secretRef) are visible to child
     processes, /proc and crash dumps (minor); a secret volume mode (defaultMode or items[].mode) that grants other users
-    read is major, an unset mode (default 0644) is info; a subPath mount of a secret never receives secret updates
+    read or write is major (secret.world-readable, secret.world-writable), an unset mode (default 0644) is info; a subPath mount of a secret never receives secret updates
     (minor). Optional `encryption_config` is an apiserver EncryptionConfiguration: the first resources entry naming `secrets` or a
     `*.` or `*.*` wildcard (a specific entry must precede a wildcard, as the docs require) is judged by its first provider; identity
     first or no covering entry is a blocker.
@@ -1254,8 +1271,11 @@ def secret_exposure_check(payload: dict) -> dict:
                 if default_mode is None:
                     findings.append(_finding("secret.default-mode-unset", "info", location, f"{kind} volume uses the default file mode 0644"))
                 for mode in [default_mode, *item_modes]:
-                    if isinstance(mode, int) and not isinstance(mode, bool) and mode & 0o007:
-                        findings.append(_finding("secret.world-readable", "major", location, f"file mode {mode & 0o777:04o} lets other users read the secret"))
+                    if isinstance(mode, int) and not isinstance(mode, bool):
+                        if mode & 0o004:
+                            findings.append(_finding("secret.world-readable", "major", location, f"file mode {mode & 0o777:04o} lets other users read the secret"))
+                        if mode & 0o002:
+                            findings.append(_finding("secret.world-writable", "major", location, f"file mode {mode & 0o777:04o} lets other users write the secret"))
             for section, name, container in _containers(workload, "workloads"):
                 location = f"{workload['loc']}#{_cname(section, name)}"
                 env_names, secret_names = [], set()
@@ -1642,9 +1662,8 @@ def _policy_types(spec: dict) -> set[str]:
 
 
 def _matches_all_peers(rule, side: str) -> bool:
-    """A NetworkPolicy rule with no from/to and no ports allows every peer on every port."""
-    rule = _dict(rule)
-    return not _list(rule.get(side)) and not _list(rule.get("ports"))
+    """A NetworkPolicy rule with no from/to matches every peer; ports, when named, only narrow the ports it admits."""
+    return not _list(_dict(rule).get(side))
 
 
 def tenant_isolation_check(payload: dict) -> dict:
@@ -1719,7 +1738,7 @@ def tenant_isolation_check(payload: dict) -> dict:
                     egress_deny = True
                 if empty and "Ingress" in types and any(_matches_all_peers(r, "from") for r in ingress):
                     allow_all_ingress = True
-                    add(namespace, "tenant.netpol-allow-all-ingress", "major", location, "allow-all ingress on every pod cancels any default-deny (policies are additive)")
+                    add(namespace, "tenant.netpol-allow-all-ingress", "major", location, "ingress with no from admits every source (on every port unless ports are named) and cancels any default-deny (policies are additive)")
                 if empty and "Egress" in types and any(_matches_all_peers(r, "to") for r in egress):
                     allow_all_egress = True
                 if "Ingress" in types:
@@ -1821,11 +1840,11 @@ def _audit_matches(rule: dict, verb: str, group: str, resource: str, subresource
         for entry in rule["resources"]:
             if entry["group"] not in (group, "*"):
                 continue
+            if entry["names"]:
+                continue  # the probes name no object, so a resourceNames restriction never matches them
             if not entry["resources"]:
                 return True
             for name in entry["resources"]:
-                if entry["names"]:
-                    continue  # the probes name no object, so a resourceNames restriction never matches them
                 if name in ("*", combined):
                     return True
                 if subresource and name == f"*/{subresource}":

@@ -462,11 +462,27 @@ def test_rbac_scan_other_escalation_primitives():
     assert role_rules(["create"], ["pods/exec"], names=["x"]) == []
 
 
-def test_rbac_scan_skips_bootstrap_roles_and_the_cluster_admin_role():
-    labelled = role("system:thing", [rule(["*"], ["*"], ["*"])])
+def test_rbac_scan_skips_only_named_bootstrap_roles_and_checks_cluster_admin_by_its_rules():
+    wildcard = [rule(["*"], ["*"], ["*"])]
+    labelled = role("system:thing", wildcard)
     labelled["metadata"]["labels"] = {"kubernetes.io/bootstrapping": "rbac-defaults"}
-    assert scan([labelled, role("cluster-admin", [rule(["*"], ["*"], ["*"])])])["finding_count"] == 0
-    assert scan([role("cluster-admin", [rule(["*"], ["*"], ["*"])], kind="Role", namespace="x")])["finding_count"] == 1
+    assert rules_of(scan([labelled])) == [("rbac.admin-equivalent", "blocker")]  # a system: prefix is not a trusted name
+    assert rules_of(scan([role("cluster-admin", wildcard)])) == [("rbac.admin-equivalent", "blocker")]  # checked whatever its name
+    assert scan([role("cluster-admin", wildcard, kind="Role", namespace="x")])["finding_count"] == 1
+    bootstrap_admin = role("admin", [rule(["get"], ["pods"])])
+    bootstrap_admin["metadata"]["labels"] = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    assert scan([bootstrap_admin])["finding_count"] == 0
+
+
+def test_a_bootstrap_label_never_hides_a_wildcard_role_under_a_built_in_name():
+    labels = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    for name in ("admin", "edit", "view"):
+        wildcard = role(name, [rule(["*"], ["*"], ["*"])])
+        wildcard["metadata"]["labels"] = labels
+        assert rules_of(scan([wildcard])) == [("rbac.admin-equivalent", "blocker")], name
+        narrow = role(name, [rule(["get"], ["pods"])])
+        narrow["metadata"]["labels"] = labels
+        assert scan([narrow])["finding_count"] == 0, name
 
 
 def test_rbac_scan_cluster_admin_bindings():
@@ -932,8 +948,8 @@ def test_secret_env_injection_is_minor_and_volumes_are_preferred():
 
 
 @pytest.mark.parametrize("mode, expected", [(None, ("secret.default-mode-unset", "info")), (0o400, None), (0o440, None), (0o640, None),
-                                            (0o644, ("secret.world-readable", "major")), (0o601, ("secret.world-readable", "major")),
-                                            (0o602, ("secret.world-readable", "major")), (0o604, ("secret.world-readable", "major")),
+                                            (0o644, ("secret.world-readable", "major")), (0o601, None), (0o001, None),
+                                            (0o602, ("secret.world-writable", "major")), (0o604, ("secret.world-readable", "major")),
                                             (0o660, None), (0, None)])
 def test_secret_volume_modes(mode, expected):
     volume = {"name": "s", "secret": {"secretName": "db", **({"defaultMode": mode} if mode is not None else {})}}
@@ -1410,7 +1426,9 @@ def test_tenant_allow_all_ingress_cancels_default_deny():
     scoped = netpol("allow", podSelector={"matchLabels": {"app": "web"}}, policyTypes=["Ingress"], ingress=[{}])
     assert tenants([*isolated_tenant(), scoped])["finding_count"] == 0
     ported = netpol("allow", policyTypes=["Ingress"], ingress=[{"ports": [{"port": 80}]}])
-    assert tenants([*isolated_tenant(), ported])["finding_count"] == 0
+    cancelled = tenants([*isolated_tenant(), ported])  # a rule with no from admits every source on port 80: not isolated
+    assert sorted(rules_of(cancelled)) == [("tenant.ingress-default-deny-missing", "major"), ("tenant.netpol-allow-all-ingress", "major")]
+    assert cancelled["isolated_count"] == 0
     assert allow_all["spec"]["ingress"] == [{}]
     allow_egress = netpol("allow-egress", policyTypes=["Egress"], egress=[{}])
     assert rules_of(tenants([*isolated_tenant(), allow_egress])) == [("tenant.egress-default-deny-missing", "minor")]
@@ -2074,3 +2092,47 @@ def test_no_tool_echoes_a_canary_secret_placed_in_a_free_text_or_secret_bearing_
     ]
     for result in results:
         assert canary not in json.dumps(result), result
+
+
+def test_rbac_bootstrap_label_on_a_system_name_or_a_cluster_admin_binding_suppresses_nothing():
+    labels = {"kubernetes.io/bootstrapping": "rbac-defaults"}
+    assert rules_of(scan(bindings=[binding("system:debug-binding", "cluster-admin", [USER], **{"labels": labels})])) == [("rbac.cluster-admin-binding", "blocker")]
+    assert rules_of(scan(bindings=[binding("cluster-admin", "cluster-admin", [USER], **{"labels": labels})])) == [("rbac.cluster-admin-binding", "blocker")]
+    genuine = [{"kind": "Group", "name": "system:masters"}]
+    assert scan(bindings=[binding("cluster-admin", "cluster-admin", genuine, **{"labels": labels})])["finding_count"] == 0
+
+
+def test_rbac_resource_names_narrow_admin_equivalence_to_a_wildcard_verb():
+    narrow = role("narrow", [rule(["*"], ["*"], ["*"], names=["only-this"])])
+    assert rules_of(scan([narrow])) == [("rbac.wildcard-verb", "major")]
+    assert rules_of(scan([role("open", [rule(["*"], ["*"], ["*"])])])) == [("rbac.admin-equivalent", "blocker")]
+
+
+def test_audit_rule_naming_objects_with_no_resource_list_matches_no_probe():
+    named = {"level": "None", "resources": [{"group": "", "resourceNames": ["x"]}]}
+
+    def probes(*rules):
+        findings = audit(audit_policy(*rules, {"level": "Metadata"}))["findings"]
+        return sorted(f["id"].split(".")[1] for f in findings if f["id"].count(".") == 2)
+
+    assert probes(named) == probes()
+
+
+def test_pss_reports_no_compliance_level_when_no_pod_spec_was_checked():
+    service = {"kind": "Service", "apiVersion": "v1", "metadata": {"name": "s", "namespace": "p"}, "spec": {"ports": [{"port": 80}]}}
+    result = pss([service])
+    assert (result["workload_count"], result["verdict"]) == (0, "pass") and "highest_compliant_level" not in result
+
+
+def test_pss_empty_workload_list_is_refused_by_the_registry_as_invalid_input_on_workloads():
+    result = call("kpol_pss_check", {"workloads": [], "level": "restricted"})
+    assert (result["state"], result["field"]) == ("INVALID_INPUT", "workloads")
+    assert "highest_compliant_level" not in result
+
+
+def test_null_failure_policy_and_enforcement_action_read_as_their_api_defaults():
+    assert lint(vwc(hook(failurePolicy=None)))["finding_count"] == 0
+    assert lint(vwc(hook(failurePolicy="Maybe")))["finding_count"] == 1
+    nulled = {"apiVersion": "constraints.gatekeeper.sh/v1beta1", "kind": "K8sRequiredLabels", "metadata": {"name": "c"},
+              "spec": {"enforcementAction": None}}
+    assert (lint(nulled)["finding_count"], lint(nulled)["enforcing"]) == (0, 1)

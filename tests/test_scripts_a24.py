@@ -141,7 +141,7 @@ def test_rejected_manifests_are_listed_as_skipped_not_fatal(tmp_path):
     write_json(tmp_path / "broken.json", {"kind": "Deployment", "metadata": {"name": "d"}, "spec": {}})
     write_json(tmp_path / "other.json", {"kind": "ConfigMap", "metadata": {"name": "c"}})
     result, payload = scan(tmp_path)
-    assert result.returncode == 0 and payload["status"] == "ok"
+    assert result.returncode == 1 and payload["status"] == "fail" and "scan/incomplete" in {f["id"] for f in payload["findings"]}
     assert payload["skipped"][0].startswith("broken.json pss: INVALID_INPUT workloads")
     assert payload["files_scanned"] == 2 and payload["files_skipped"] == len(payload["skipped"])
 
@@ -160,7 +160,7 @@ def test_oversized_binary_non_utf8_and_unparseable_files_are_skipped_with_reason
     (tmp_path / "bad.json").write_text("{not json")
     (tmp_path / "deep.json").write_text("[" * 100000 + "]" * 100000)
     result, payload = scan(tmp_path)
-    assert result.returncode == 0
+    assert result.returncode == 1 and payload["status"] == "fail"
     assert payload["skipped"] == ["bad.json: parse-error", "big.json: too-large", "bin.json: binary", "deep.json: parse-error", "latin.json: not-utf8"]
     assert payload["files_scanned"] == 1 and payload["files_skipped"] == 5
 
@@ -175,7 +175,7 @@ def test_symlinks_are_never_followed(tmp_path):
     os.symlink(outside / "evil.json", root / "link.json")
     os.symlink(outside, root / "linkdir")
     result, payload = scan(root)
-    assert result.returncode == 0 and payload["findings"] == []
+    assert result.returncode == 1 and payload["status"] == "fail" and [f["id"] for f in payload["findings"]] == ["scan/incomplete"]
     assert payload["skipped"] == ["link.json: symlink"] and payload["files_scanned"] == 1
     escaped = run_script(SCRIPT, "--root", str(root), "--path", "link.json", "--json")
     assert escaped.returncode == 2 and json.loads(escaped.stdout)["status"] == "error"
@@ -193,7 +193,8 @@ def test_file_count_is_capped_at_2000(tmp_path):
     for index in range(2003):
         (tmp_path / f"f{index:04d}.json").write_text('{"kind": "ConfigMap", "metadata": {"name": "c"}}')
     result, payload = scan(tmp_path)
-    assert result.returncode == 0 and payload["files_scanned"] == 2000 and payload["limits_hit"] == ["max-files:2000"]
+    assert result.returncode == 1 and payload["files_scanned"] == 2000 and payload["limits_hit"] == ["max-files:2000"]
+    assert payload["status"] == "fail" and [f["id"] for f in payload["findings"]] == ["scan/incomplete"]
     (tmp_path / "f2002.json").unlink()
     (tmp_path / "f2001.json").unlink()
     (tmp_path / "f2000.json").unlink()
@@ -271,12 +272,12 @@ def test_yaml_is_scanned_when_pyyaml_imports_and_reported_as_tool_missing_otherw
         assert payload["status"] == "fail" and payload["files_scanned"] == 1
 
 
-def test_yaml_only_tree_without_pyyaml_stays_ok(tmp_path, monkeypatch):
+def test_yaml_only_tree_without_pyyaml_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "yaml", None)
     (tmp_path / "a.yml").write_text(YAML_DOC)
     payload = scan_in_process(tmp_path)
-    assert payload["status"] == "ok" and payload["files_scanned"] == 0
-    assert [f["id"] for f in payload["findings"]] == ["skipped:tool-missing"]
+    assert payload["status"] == "fail" and payload["files_scanned"] == 0
+    assert sorted(f["id"] for f in payload["findings"]) == ["scan/incomplete", "skipped:tool-missing"]
 
 
 def test_invalid_yaml_is_skipped_as_a_parse_error(tmp_path):
@@ -285,7 +286,7 @@ def test_invalid_yaml_is_skipped_as_a_parse_error(tmp_path):
     (tmp_path / "empty.yaml").write_text("")
     (tmp_path / "scalar.yaml").write_text("just text")
     result, payload = scan(tmp_path)
-    assert result.returncode == 0 and payload["skipped"] == ["helm.yaml: parse-error"] and payload["files_scanned"] == 2
+    assert result.returncode == 1 and payload["skipped"] == ["helm.yaml: parse-error"] and payload["files_scanned"] == 2
 
 
 # --- independent review: regressions ----------------------------------------------------------------------------------
@@ -308,7 +309,7 @@ def test_yaml_alias_bomb_and_recursive_anchor_are_refused_before_anything_is_bui
     write_json(tmp_path / "ok.json", pod("ok"))
     assert (tmp_path / "bomb.yaml").stat().st_size < 1024
     result, payload = scan(tmp_path)
-    assert result.returncode == 0 and payload["skipped"] == ["bomb.yaml: parse-error", "loop.yaml: parse-error"]
+    assert result.returncode == 1 and payload["skipped"] == ["bomb.yaml: parse-error", "loop.yaml: parse-error"]
     assert payload["files_scanned"] == 1 and payload["files_skipped"] == len(payload["skipped"]) == 2
 
 
@@ -350,7 +351,7 @@ def test_a_fifo_named_like_a_manifest_is_skipped_not_read(tmp_path):
     os.mkfifo(tmp_path / "pipe.yaml")
     write_json(tmp_path / "pod.json", pod())
     result, payload = scan(tmp_path)
-    assert result.returncode == 0 and payload["skipped"] == ["pipe.yaml: not-a-regular-file"] and payload["files_scanned"] == 1
+    assert result.returncode == 1 and payload["skipped"] == ["pipe.yaml: not-a-regular-file"] and payload["files_scanned"] == 1
 
 
 def test_an_object_defined_in_two_files_lists_both_files(tmp_path):
@@ -372,3 +373,52 @@ def test_findings_never_echo_secret_values_found_in_manifests(tmp_path):
                                           "data": {"token": canary}, "stringData": {"token": canary}})
     result, payload = scan(tmp_path)
     assert canary not in result.stdout and canary not in result.stderr and payload["findings"]
+
+
+def test_a_workload_the_tool_rejects_fails_the_scan_and_its_message_is_not_echoed(tmp_path):
+    document = pod("p")
+    document["spec"]["containers"] = [{"name": f"c{i}", "image": "x"} for i in range(201)]
+    document["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+    write_json(tmp_path / "pod.json", document)
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"][0] == "pod.json pss: INVALID_INPUT workloads"
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+    assert "more than" not in json.dumps(payload)
+
+
+def test_a_scan_that_analysed_nothing_is_incomplete_not_ok(tmp_path):
+    (tmp_path / "README.txt").write_text("not a manifest")
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail" and payload["files_scanned"] == 0
+    assert [(f["id"], f["severity"]) for f in payload["findings"]] == [("scan/incomplete", "major")]
+    assert payload["findings"][0]["summary"].endswith("no in-scope input was analysed")
+
+
+def test_the_incomplete_finding_names_each_skipped_input_by_label_and_path(tmp_path):
+    write_json(tmp_path / "pod.json", pod())
+    (tmp_path / "bad.json").write_text("{not json")
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    incomplete = next(f for f in payload["findings"] if f["id"] == "scan/incomplete")
+    assert (incomplete["severity"], incomplete["location"]) == ("major", "")
+    assert incomplete["summary"].endswith("bad.json: parse-error")
+
+
+def test_a_list_nested_too_deep_is_reported_not_silently_dropped(tmp_path):
+    innermost = {"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "p", "namespace": "prod"},
+                 "spec": {"containers": [{"name": "app", "image": "x", "securityContext": {"privileged": True}}]}}
+    write_json(tmp_path / "nested.json", {"kind": "List", "items": [{"kind": "List", "items": [{"kind": "List", "items": [innermost]}]}]})
+    write_json(tmp_path / "pod.json", pod())
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["nested.json: list-nesting-limit:2"] and payload["files_scanned"] == 2
+    assert not [f for f in payload["findings"] if f["id"].endswith("Pod/prod/p")]
+    assert "scan/incomplete" in {f["id"] for f in payload["findings"]}
+
+
+def test_a_list_item_that_is_not_an_object_is_reported_not_silently_dropped(tmp_path):
+    write_json(tmp_path / "items.json", {"kind": "List", "items": ["just text", pod("ok")]})
+    result, payload = scan(tmp_path)
+    assert result.returncode == 1 and payload["status"] == "fail"
+    assert payload["skipped"] == ["items.json: list-item-not-object"] and payload["files_scanned"] == 1
