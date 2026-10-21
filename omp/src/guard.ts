@@ -2715,9 +2715,12 @@ function scanNetwork(
     const may = groups.length > 0 || prev === "&&" || prev === "||" || prev === "|" || prev === "&" || item.end === "|" || item.end === "&";
     let done = state.possible;
     for (const write of statementWrites(item)) done = write.plain && !may ? [write.value] : [...new Set([...done, write.value])];
-    succeeded = done;
+    // `!` inverts the status its successor sees, so the successor runs on the path where this statement's write may not have
+    // happened: a negated statement's writes stay possible, and no successor trusts its success path
+    const negated = shellWords(item.prefix).some((w) => unquote(w) === "!");
+    succeeded = negated ? undefined : done;
     // a redirection that may fail may skip the statement's write: then the earlier network stays possible as well
-    state.possible = redirectMayFail(marked) ? [...new Set([...state.possible, ...done])] : done;
+    state.possible = negated || redirectMayFail(marked) ? [...new Set([...state.possible, ...done])] : done;
     enterLeave(groups, item);
     prev = item.end;
   }

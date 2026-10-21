@@ -1551,6 +1551,29 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("truffle migrate --network development"), insideAs(A26))).toBeUndefined();
     expect(guardToolCall(bash("brownie run scripts/deploy.py --network development"), insideAs(A26))).toBeUndefined();
   });
+
+  test("a negated export's successor sees both paths: ! export before &&, ; or || leaves inherited mainnet possible, so the run blocks", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("! export HARDHAT_NETWORK=localhost >/dev/null/not-a-directory && hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("! export HARDHAT_NETWORK=localhost >/dev/null && hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("! export HARDHAT_NETWORK=localhost; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("! export HARDHAT_NETWORK=localhost || hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+  });
+
+  test("a negated export of a local network still passes a local test run when no network is inherited", () => {
+    expect(guardToolCall(bash("! export HARDHAT_NETWORK=localhost >/dev/null && hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("! hardhat test with inherited mainnet blocks on the inherited network, as before the negation fix", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("! hardhat test"), { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } })?.reason).toBe(CHAIN);
+  });
+
+  test("a plain export that writes through /dev/null still decides the && run: local passes even with inherited mainnet", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost >/dev/null && hardhat test"), inherited)).toBeUndefined();
+  });
 });
 
 describe("HOOK-03 shell twin and D-08", () => {
