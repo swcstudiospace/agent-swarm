@@ -122,6 +122,20 @@ def test_path_can_name_a_single_file(tmp_path):
     assert code == 1 and out["files_scanned"] == 1 and {f["file"] for f in out["findings"]} == {"a/bad.json"}
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes need os.mkfifo")
+def test_a_named_pipe_named_like_a_chain_config_is_refused_and_never_opened(tmp_path):
+    os.mkfifo(tmp_path / "chains.json")
+    write(tmp_path, "ok.json", net(1, allowMainnet=True))
+    env = {**os.environ, "SWARM_DIR": str(tmp_path.parent / f"{tmp_path.name}-state")}
+    # a read of the FIFO would block forever; the timeout turns that regression into a failure instead of a hang
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--json", "--root", str(tmp_path)], capture_output=True, text=True, env=env,
+                          cwd=ROOT, timeout=60)
+    out = json.loads(proc.stdout)
+    assert proc.returncode == 1 and out["status"] == "fail"
+    assert out["skipped"]["unparsed"] == 1 and out["files_scanned"] == 1
+    assert [f["rule"] for f in out["findings"]] == ["scan-incomplete"]
+
+
 def test_output_is_deterministic_and_sorted_by_severity_then_file(tmp_path):
     write(tmp_path, "b.json", net(1, "https://u:p@x.example/"))
     write(tmp_path, "a.json", net(1))

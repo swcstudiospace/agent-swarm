@@ -42,6 +42,7 @@ MAX_FILES = 2000
 MAX_VISITED = 50_000  # directory entries looked at, so a huge tree without manifests still ends
 MAX_DOCUMENTS = 5000
 MAX_FINDINGS = 500
+MAX_EXPANSIONS = 200_000  # list items visited while expanding one parsed file, aliases included: a shared list costs per path it is reached by
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".swarm", ".tox"}
 SUFFIXES = (".yaml", ".yml", ".json")
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
@@ -130,23 +131,41 @@ def _walk(root: Path, start: Path, labels) -> tuple[list[Path], dict]:
     return files, stats
 
 
-def _expand(value, ancestors: set[int] | None = None) -> list[dict]:
-    """Documents of one parsed file; a `kind: List` wrapper contributes its items. Lists are cycle-checked on the current path only,
-    so a self-referencing list (`&x [*x]`) contributes nothing past the point where it closes its own path."""
+class _ExpansionLimit(Exception):
+    """One parsed file expands to more list items than MAX_EXPANSIONS (aliases shared through many lists)."""
+
+
+def _expand(value, budget: list[int], ancestors: set[int] | None = None) -> list[dict]:
+    """Documents of one parsed value; a `kind: List` wrapper contributes its items. Lists are cycle-checked on the current path only,
+    so a self-referencing list (`&x [*x]`) contributes nothing past the point where it closes its own path. Every list item visited,
+    aliases included, is charged to budget; _ExpansionLimit is raised when it runs out."""
     ancestors = set() if ancestors is None else ancestors
     if isinstance(value, list):
         if id(value) in ancestors:
             return []
         ancestors.add(id(value))
         try:
-            return [d for item in value for d in _expand(item, ancestors)]
+            out: list[dict] = []
+            for item in value:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise _ExpansionLimit()
+                out.extend(_expand(item, budget, ancestors))
+            return out
         finally:
             ancestors.discard(id(value))
     if not isinstance(value, dict):
         return []
     if value.get("kind") == "List" and isinstance(value.get("items"), list):
-        return _expand(value["items"], ancestors)
+        return _expand(value["items"], budget, ancestors)
     return [value]
+
+
+def _expand_file(parsed: list) -> list[dict]:
+    """Documents of every parsed value of one file, sharing one expansion budget: an alias reached through many lists is expanded per
+    path, so a few kilobytes of YAML can otherwise expand exponentially."""
+    budget = [MAX_EXPANSIONS]
+    return [doc for value in parsed for doc in _expand(value, budget)]
 
 
 def _load(root: Path, files: list[Path], yaml_module, labels) -> tuple[list[tuple[str, dict]], dict, list[dict]]:
@@ -201,14 +220,19 @@ def _load(root: Path, files: list[Path], yaml_module, labels) -> tuple[list[tupl
             findings.append({"id": "MESH-SCAN-UNPARSABLE", "severity": "info", "summary": f"{rel}: not parsed ({type(exc).__name__})",
                              "location": rel})
             continue
+        try:
+            expanded = _expand_file(parsed)
+        except (_ExpansionLimit, RecursionError):  # too many list items, or nested deeper than the interpreter's stack: not analysed
+            stats["unparsable"] += 1
+            stats["reasons"].append(f"{rel}: list expansion exceeds {MAX_EXPANSIONS} items or its nesting; not analysed")
+            continue
         stats["parsed"] += 1
-        for value in parsed:
-            for doc in _expand(value):
-                if len(docs) >= MAX_DOCUMENTS:
-                    stats["truncated_documents"] = True
-                    stats["reasons"].append(f"document limit of {MAX_DOCUMENTS} reached; the rest of the documents were not read")
-                    return docs, stats, findings
-                docs.append((rel, doc))
+        for doc in expanded:
+            if len(docs) >= MAX_DOCUMENTS:
+                stats["truncated_documents"] = True
+                stats["reasons"].append(f"document limit of {MAX_DOCUMENTS} reached; the rest of the documents were not read")
+                return docs, stats, findings
+            docs.append((rel, doc))
     return docs, stats, findings
 
 

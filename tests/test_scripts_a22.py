@@ -600,6 +600,24 @@ def test_a_shared_component_reached_by_many_paths_is_walked_once_and_still_judge
     assert [(f["id"], f["file"]) for f in result["findings"] if f["check"] == "images"] == [("images:floating-tag:r.io/leaf:latest", "leaf/deploy.yaml")]
 
 
+@needs_yaml
+def test_a_base_reached_by_many_resource_paths_is_rendered_once_and_still_judged(tmp_path):
+    """The same ladder as above, linked through resources: rendering each path separately is 2**30 walks. The timeout turns a regression
+    into a failure instead of a hung suite."""
+    levels = 30
+    for i in range(levels - 1):
+        for side in "ab":
+            put(tmp_path, f"lvl{i}{side}/kustomization.yaml", f"resources:\n  - ../lvl{i + 1}a\n  - ../lvl{i + 1}b\n")
+    for side in "ab":
+        put(tmp_path, f"lvl{levels - 1}{side}/kustomization.yaml", "resources:\n  - ../leaf\n")
+    put(tmp_path, "leaf/kustomization.yaml", "resources:\n  - deploy.yaml\n")
+    put(tmp_path, "leaf/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: leaf\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/leaf:latest\n")
+    put(tmp_path, "overlay/kustomization.yaml", "resources:\n  - ../lvl0a\n  - ../lvl0b\n")
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--json"], capture_output=True, text=True, cwd=ROOT, timeout=60)
+    result = json.loads(proc.stdout)
+    assert [(f["id"], f["file"]) for f in result["findings"] if f["check"] == "images"] == [("images:floating-tag:r.io/leaf:latest", "leaf/deploy.yaml")]
+
+
 
 @needs_yaml
 def test_a_pin_in_an_overlay_covers_the_images_of_the_components_it_includes(tmp_path):

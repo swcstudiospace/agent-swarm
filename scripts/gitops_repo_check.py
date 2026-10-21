@@ -41,6 +41,8 @@ MAX_FINDINGS = 500
 MAX_DEPTH = 60
 MAX_NODES = 200_000
 UNIT_LIMIT = 300  # gitops_sync_wave_check bound
+ITEM_LIMIT = 500  # rendered objects per Kustomize tree that the kustomize check judges; _items_of keeps one more, to tell that the render is longer
+RENDER_DEPTH = 20  # kustomization levels the render follows below a root
 SKIP_DIRS = frozenset({".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".swarm", ".terraform"})
 # Kept on purpose: VCS metadata (.git, .hg, .svn) and the package or tool caches of a checkout (node_modules, .venv, venv, __pycache__,
 # .terraform, .swarm), which hold no repository manifests. build/ and dist/ are NOT skipped: build tools write rendered manifests there,
@@ -366,19 +368,27 @@ def _minimal(doc: dict, name: str | None = None, namespace: str | None = None) -
 
 
 
-def _items_of(repo: Repo, kusts: dict, directory: str, trail: tuple = ()) -> list[dict]:
-    """Objects this kustomization renders before its own patches; children arrive transformed by their prefix, suffix and namespace."""
+def _items_of(repo: Repo, kusts: dict, directory: str, memo: dict, active: frozenset = frozenset()) -> list[dict]:
+    """Objects this kustomization renders before its own patches; children arrive transformed by their prefix, suffix and namespace.
+    A kustomization that several paths reach is rendered once and memoised, so the work is linear in the graph however many paths lead
+    through it. At most ITEM_LIMIT + 1 objects are kept per kustomization. active holds the kustomizations on the current path: a cycle
+    is cut where it closes."""
+    if directory in memo:
+        return memo[directory]
     rel, kust = kusts[directory]
+    path = active | {directory}
     items: list[dict] = []
     for field in ("resources", "bases"):
         for entry in _strings(kust.get(field)):
             target = None if _remote(entry) else _join(directory, entry)
             if target is None:
                 continue
-            if target in kusts and target not in trail and len(trail) < 20:
+            if target in kusts and target not in path and len(active) < RENDER_DEPTH:
                 child_rel, child = kusts[target]
                 prefix, suffix, namespace = (child.get(k) if isinstance(child.get(k), str) else "" for k in ("namePrefix", "nameSuffix", "namespace"))
-                for item in _items_of(repo, kusts, target, trail + (directory,)):
+                for item in _items_of(repo, kusts, target, memo, path):
+                    if len(items) > ITEM_LIMIT:
+                        break
                     cluster = item["kind"] in rules.CLUSTER_SCOPED_KINDS
                     real = item["metadata"].get("name")
                     named = isinstance(real, str) and bool(real)
@@ -387,12 +397,18 @@ def _items_of(repo: Repo, kusts: dict, directory: str, trail: tuple = ()) -> lis
                     new_name = (prefix + real + suffix if renamed else real) if named else None
                     items.append(_minimal(item, new_name, namespace if namespace and not cluster else None) if changes else item)
             elif target in repo.docs:
-                items += [_minimal(d) for d in repo.docs[target] if _is_object(d) and not d["apiVersion"].startswith("kustomize.config.k8s.io/")]
+                for doc in repo.docs[target]:
+                    if len(items) > ITEM_LIMIT:
+                        break
+                    if _is_object(doc) and not doc["apiVersion"].startswith("kustomize.config.k8s.io/"):
+                        items.append(_minimal(doc))
     for field, kind in (("configMapGenerator", "ConfigMap"), ("secretGenerator", "Secret")):
         for generator in kust.get(field) or []:
             if isinstance(generator, dict) and isinstance(generator.get("name"), str) and generator["name"]:
                 namespace = generator.get("namespace")
                 items.append({"apiVersion": "v1", "kind": kind, "metadata": {"name": generator["name"], **({"namespace": namespace} if isinstance(namespace, str) and namespace else {})}})
+    del items[ITEM_LIMIT + 1:]
+    memo[directory] = items
     return items
 
 
@@ -430,31 +446,39 @@ def _inline_patches(repo: Repo, directory: str, kust: dict) -> dict:
     return inlined
 
 
-def _opaque(kusts: dict, directory: str, trail: tuple = ()) -> bool:
-    """Whether the tree under a kustomization renders objects that are not in the scanned files."""
+def _opaque(kusts: dict, directory: str, memo: dict, active: frozenset = frozenset()) -> bool:
+    """Whether the tree under a kustomization renders objects that are not in the scanned files. Each kustomization is judged once (memo),
+    and a cycle is cut on the current path as in _items_of."""
+    if directory in memo:
+        return memo[directory]
     _, kust = kusts[directory]
-    if kust.get("components") or kust.get("helmCharts") or kust.get("generators") or kust.get("transformers"):
-        return True
+    result = bool(kust.get("components") or kust.get("helmCharts") or kust.get("generators") or kust.get("transformers"))
+    path = active | {directory}
     for field in ("resources", "bases"):
         for entry in _strings(kust.get(field)):
+            if result:
+                break
             if _remote(entry):
-                return True
+                result = True
+                continue
             child = _join(directory, entry)
-            if child in kusts and child not in trail and len(trail) < 20 and _opaque(kusts, child, trail + (directory,)):
-                return True
-    return False
+            result = child in kusts and child not in path and len(active) < RENDER_DEPTH and _opaque(kusts, child, memo, path)
+    memo[directory] = result
+    return result
 
 
 def _check_kustomize(repo: Repo) -> dict[str, tuple[str, dict]]:
     kusts = _kustomizations(repo)
     _check_references(repo, kusts)
+    rendered: dict[str, list[dict]] = {}  # memo of _items_of: each kustomization is rendered once
+    opaque: dict[str, bool] = {}  # memo of _opaque
     for directory, (rel, kust) in sorted(kusts.items()):
-        every = _items_of(repo, kusts, directory)
-        items = every[:500]
-        if len(every) > 500:
-            repo.reasons.append(f"{rel}: kustomize checked the first 500 of {len(every)} rendered objects for duplicate ids and patch targets")
+        every = _items_of(repo, kusts, directory, rendered)
+        items = every[:ITEM_LIMIT]
+        if len(every) > ITEM_LIMIT:
+            repo.reasons.append(f"{rel}: kustomize checked the first {ITEM_LIMIT} of more than {ITEM_LIMIT} rendered objects for duplicate ids and patch targets")
         result = rules.kustomize_check({"kustomization": _inline_patches(repo, directory, kust), "resources": items})
-        if result.get("state") == "SUCCESS" and _opaque(kusts, directory):
+        if result.get("state") == "SUCCESS" and _opaque(kusts, directory, opaque):
             # remote bases, components, Helm charts and generators add objects this scan cannot see: a patch target that matches none of the visible ones is unproven, not missing
             hidden = [f for f in result["findings"] if f["id"].startswith("patch-target-not-found")]
             if hidden:
@@ -568,11 +592,10 @@ def _kust_pins(kust: dict) -> frozenset[str]:
                      and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float))))
 
 
-def _reached(repo: Repo, kusts: dict, roots: list[str], name: str | None = None) -> set[str]:
+def _reached(repo: Repo, kusts: dict, roots: list[str], pins: dict[str, frozenset[str]], name: str | None = None) -> set[str]:
     """Files the trees rooted at roots render. With a name, only the files rendered through a path on which no kustomization pins that
     image name: a kustomization that pins it blocks its own files and everything below it. Each kustomization is entered once, so the
     walk is linear in the graph however many paths lead through a shared component."""
-    pins = {directory: _kust_pins(kust) for directory, (_, kust) in kusts.items()}
 
     def blocked(directory: str) -> bool:
         return name is not None and name in pins[directory]
@@ -599,8 +622,9 @@ def _reached(repo: Repo, kusts: dict, roots: list[str], name: str | None = None)
 def _check_images(repo: Repo, kusts: dict) -> None:
     where: dict[str, list[str]] = {}
     roots = sorted(set(kusts) - _referenced(kusts))
-    rendered = _reached(repo, kusts, roots)
-    pinned_names = {name for _, kust in kusts.values() for name in _kust_pins(kust)}
+    pins = {directory: _kust_pins(kust) for directory, (_, kust) in kusts.items()}
+    rendered = _reached(repo, kusts, roots, pins)
+    pinned_names = {name for names in pins.values() for name in names}
     occurrences: dict[str, list[tuple[str, str]]] = {}  # image name -> (file, image reference) of each occurrence
     for rel in sorted(repo.docs):
         for doc in repo.docs[rel]:
@@ -609,7 +633,7 @@ def _check_images(repo: Repo, kusts: dict) -> None:
     for name in sorted(occurrences):
         # a name that no kustomization pins blocks nothing, so the plain reach answers for it and no set is built; a pinned name gets its own
         # walk, and that set is dropped once its occurrences are judged. Every render that includes a file is judged, whatever another pins.
-        unpinned = _reached(repo, kusts, roots, name) if name in pinned_names else rendered
+        unpinned = _reached(repo, kusts, roots, pins, name) if name in pinned_names else rendered
         for rel, image in occurrences.pop(name):
             if rel not in rendered or rel in unpinned:
                 where.setdefault(image, []).append(rel)

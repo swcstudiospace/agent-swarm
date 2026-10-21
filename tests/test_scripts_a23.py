@@ -262,6 +262,26 @@ def test_list_kind_and_json_arrays_are_expanded(repo):
     assert rc == 0 and data["counts"]["workloads"] == 2 and data["counts"]["NetworkPolicy"] == 2 and data["counts"]["documents"] == 4
 
 
+def test_alias_fan_out_is_bounded_and_only_the_fanned_out_file_is_reported(repo, tmp_path):
+    """Each list holds the next one twice, so expanding every alias once per path would visit 2**40 items. The file is reported as not
+    analysed, and the other file of the tree is still scanned; the timeout turns a regression into a failure instead of a hang."""
+    pytest.importorskip("yaml")
+    levels = 40
+    netpol_item = "{kind: NetworkPolicy, apiVersion: networking.k8s.io/v1, metadata: {name: x, namespace: shop}, spec: {}}"
+    lines = [f"l{levels}: &l{levels} [{netpol_item}]"]
+    lines += [f"l{i}: &l{i} [*l{i + 1}, *l{i + 1}]" for i in range(levels - 1, -1, -1)]
+    lines += ["kind: List", "apiVersion: v1", "items: *l0"]
+    put(repo, "fan.yaml", "\n".join(lines) + "\n")
+    put(repo, "deploy.json", deployment("api", "shop"))
+    env = {**os.environ, "SWARM_DIR": str(tmp_path / "swarm-state")}
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--json", "--root", str(repo)], capture_output=True, text=True, env=env,
+                          cwd=repo, timeout=60)
+    data = json.loads(proc.stdout)
+    assert proc.returncode == 1 and data["status"] == "fail"
+    assert data["counts"]["workloads"] == 1
+    assert "list expansion exceeds" in " ".join(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
+
+
 def test_namespace_objects_and_missing_namespaces_default_sensibly(repo):
     put(repo, "ns.json", {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "payments"}})
     rc, data = run(repo)

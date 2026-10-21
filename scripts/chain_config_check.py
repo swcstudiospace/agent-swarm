@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from collections import namedtuple
@@ -1060,11 +1061,20 @@ def scan(root: Path, base: Path) -> dict:
             reasons.append(f"{rel}: not checked, no TOML parser is available")
             continue
         try:
-            if path.stat().st_size > MAX_FILE_BYTES:
-                skipped["too_large"] += 1
-                reasons.append(f"{rel}: larger than 1 MiB, not checked")
-                continue
-            raw = path.read_bytes()
+            # the type is checked on the open descriptor: a FIFO named like a config file is refused before a read, and O_NONBLOCK makes
+            # the open of a FIFO with no writer return at once instead of waiting for one
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    skipped["unparsed"] += 1
+                    reasons.append(f"{rel}: not a regular file, not checked")
+                    continue
+                if info.st_size > MAX_FILE_BYTES:
+                    skipped["too_large"] += 1
+                    reasons.append(f"{rel}: larger than 1 MiB, not checked")
+                    continue
+                raw = handle.read()
         except OSError:
             skipped["unparsed"] += 1
             reasons.append(f"{rel}: could not be read, not checked")
