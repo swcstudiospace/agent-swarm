@@ -757,6 +757,25 @@ def test_a_nested_endpoint_of_a_testnet_item_is_judged_by_that_item_not_an_inher
     assert (code, out["status"]) == (0, "ok") and [f for f in out["findings"] if f["rule"] == "rpc-host-chain-mismatch"] == []
 
 
+SEPOLIA = "https://rpc.sepolia.org"
+
+
+@pytest.mark.parametrize("doc", [
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "rpcUrls": [SEPOLIA]}]},
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "rpcs": [SEPOLIA]}]},
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "endpoints": [SEPOLIA]}]},
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "urls": [SEPOLIA]}]},
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "rpc": {"urls": [SEPOLIA]}}]},
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [{"chainId": 11155111, "rpcUrl": [SEPOLIA]}]},
+    {"allowMainnet": True, "source": {"chainId": 1}, "networks": [
+        {"chainId": 11155111, "rpcUrl": SEPOLIA}, {"chainId": 1, "rpcUrl": "https://eth.llamarpc.com"}, {"chainId": 84532, "rpcUrl": "https://sepolia.base.org"}]},
+], ids=["rpcUrls", "rpcs", "endpoints", "urls", "rpc-urls", "rpcUrl-list", "several-networks"])
+def test_valid_testnet_endpoints_under_their_own_network_items_are_not_blocked(tmp_path, doc):
+    write(tmp_path, "networks.json", doc)
+    code, out = cli(tmp_path)
+    assert (code, out["status"]) == (0, "ok") and [f for f in out["findings"] if f["rule"] == "rpc-host-chain-mismatch"] == []
+
+
 def test_a_host_under_a_directed_key_still_blocks_on_its_own_mainnet_source(tmp_path):
     write(tmp_path, "scoped.json", {"source_chain_id": 1, "destination_chain_id": 8453, "source_rpc_url": "https://rpc.sepolia.org", "allowMainnet": True})
     code, out = cli(tmp_path)
