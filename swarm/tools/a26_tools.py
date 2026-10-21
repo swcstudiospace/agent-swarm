@@ -319,7 +319,7 @@ def selector_check(payload: dict) -> dict:
                 findings.append(_finding("SEL-CONSTANT-MISMATCH", "blocker",
                                          f"declared selector {item['selector'].lower()} for {item['signature']} is wrong, the real selector is 0x{actual}"))
         interface_id = 0
-        for sel in by_selector:
+        for sel in selector_of.values():  # one term per unique signature: two signatures that share a selector both count
             interface_id ^= int(sel, 16)
         unique_events = sorted(set(events))
         listed, total = _finish(findings)
@@ -532,7 +532,7 @@ def storage_layout(payload: dict) -> dict:
             elif ng["end"] > g["end"]:
                 findings.append(_finding("STORAGE-GAP-GREW", "blocker", f"{g['label']} now ends at byte {ng['end']} instead of {g['end']}: inheriting contracts shift"))
             elif ng["end"] < g["end"]:
-                findings.append(_finding("STORAGE-GAP-SHRUNK", "minor", f"{g['label']} now ends {(g['end'] - ng['end'])} bytes earlier than before"))
+                findings.append(_finding("STORAGE-GAP-SHRUNK", "blocker", f"{g['label']} now ends {(g['end'] - ng['end'])} bytes earlier than before: inheriting contracts shift"))
             elif ng["start"] > g["start"]:
                 findings.append(_finding("STORAGE-GAP-CONSUMED", "info", f"{(ng['start'] - g['start'])} bytes of {g['label']} were used by new variables, its end is unchanged"))
         for n in new:
@@ -552,6 +552,8 @@ def storage_layout(payload: dict) -> dict:
             hits = sorted(o["label"] for o in old if not o["gap"] and o["start"] < n["end"] and n["start"] < o["end"])
             if hits:
                 findings.append(_finding("STORAGE-COLLISION", "blocker", f"{n['label']} at {_where(n)} overlaps existing variable(s) {', '.join(hits)}"))
+            elif n["end"] > old_end:  # it begins inside the old layout and ends past its end: inheriting contracts shift
+                findings.append(_finding("STORAGE-PAST-OLD-END", "blocker", f"{n['label']} at {_where(n)} runs past the old layout end (byte {old_end}): inheriting contracts shift"))
             else:
                 findings.append(_finding("STORAGE-FILLED-FREE-SPACE", "minor",
                                          f"{n['label']} was placed in unused space inside the old layout at {_where(n)}: contracts inheriting this one may already use it"))
@@ -793,11 +795,11 @@ def upgrade_safety(payload: dict) -> dict:
         parsed, chosen = picked
         L = _lint()
         pattern = payload["pattern"]
-        index = L._callable_index(parsed)
         by_name = {c["name"]: c for c in parsed}
         immutable_allowed = bool(re.search(r"@custom:oz-upgrades-unsafe-allow[^\n]*state-variable-immutable", payload["source"]))
         findings: list[dict] = []
         for contract in chosen:
+            index = L.visible_index(contract, parsed)
             name = contract["name"]
             fns = contract["functions"]
             state_vars = [v for v in contract["state_vars"] if not v["constant"] and not v["immutable"]]
@@ -828,7 +830,7 @@ def upgrade_safety(payload: dict) -> dict:
                     findings.append(_finding("UPG-INIT-HELPER-UNGUARDED", "minor", f"{name}.{fn['signature']} is an init helper without onlyInitializing"))
                 if re.search(r"\b(selfdestruct|suicide)\s*\(", fn["body"]):
                     findings.append(_finding("UPG-SELFDESTRUCT", "blocker", f"{name}.{fn['signature']} can selfdestruct: before EIP-6780 (Cancun) a destroyed implementation bricks every proxy, since Cancun it only deletes code created in the same transaction; the OpenZeppelin Upgrades plugin still rejects it"))
-                if re.search(r"\.delegatecall\s*\(|\bfunctionDelegateCall\s*\(", fn["body"]):
+                if re.search(r"(?<![\w$])delegatecall\s*\(|\bfunctionDelegateCall\s*\(", fn["body"]):
                     findings.append(_finding("UPG-DELEGATECALL", "major", f"{name}.{fn['signature']} delegatecalls: a malicious target can selfdestruct or overwrite proxy storage"))
             for var in contract["state_vars"]:
                 if var["initial_value"] and not var["constant"] and not var["immutable"]:
@@ -860,8 +862,30 @@ def upgrade_safety(payload: dict) -> dict:
     return respond(payload, work)
 
 
-_BLOCKER_NAMES = re.compile(r"(mint|upgrade|selfdestruct|destroy|kill|pause|unpause|transferOwnership|renounceOwnership|grantRole|revokeRole|sweep|rescue|drain|setOwner|setAdmin|authorize|setImplementation|setProxy|emergency)", re.IGNORECASE)
-_MAJOR_NAMES = re.compile(r"(set|update|add|remove|change|enable|disable|configure|withdraw|execute|migrate|register|revoke|whitelist|blacklist|freeze|seize)(?![a-z])")
+# privileged operations: a run of whole words of the function name equals one of these terms (`setSkillLevel` is not `kill`)
+_PRIVILEGED_TERMS = frozenset({"mint", "upgrade", "selfdestruct", "destroy", "kill", "pause", "unpause", "transferownership",
+                               "renounceownership", "grantrole", "revokerole", "sweep", "rescue", "drain", "setowner", "setadmin",
+                               "authorize", "setimplementation", "setproxy", "emergency"})
+_ADMIN_VERBS = frozenset({"set", "update", "add", "remove", "change", "enable", "disable", "configure", "withdraw", "execute",
+                          "migrate", "register", "revoke", "whitelist", "blacklist", "freeze", "seize"})
+# a fallback or receive that writes an owner, admin or role variable hands the contract to any caller
+_ROLE_WRITE = re.compile(r"(?<![\w$.])\w*(?:owner|admin|role|governor|guardian|operator|minter|manager|keeper|implementation)\w*\s*=(?!=)",
+                         re.IGNORECASE)
+
+
+def _name_words(name: str) -> list[str]:
+    """Lower-case words of a camelCase, PascalCase or snake_case identifier."""
+    return [word.lower() for word in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", name)]
+
+
+def _is_privileged(name: str) -> bool:
+    words = _name_words(name)
+    return any("".join(words[i:j]) in _PRIVILEGED_TERMS for i in range(len(words)) for j in range(i + 1, min(len(words), i + 3) + 1))
+
+
+def _is_admin_verb(name: str) -> bool:
+    words = _name_words(name)
+    return bool(words) and words[0] in _ADMIN_VERBS
 
 
 def access_matrix(payload: dict) -> dict:
@@ -871,7 +895,8 @@ def access_matrix(payload: dict) -> dict:
     internal callees. Not access control: tx.origin, a comparison with address(0), `!=` inside require, an `if` that only
     branches, nonReentrant, whenNotPaused and initializer. An unguarded writer is a blocker when its name is privileged (mint,
     upgrade, pause, ownership, role, sweep ...), major for admin verbs (set, update, withdraw ...), minor otherwise;
-    `public_by_design` names are skipped. Heuristic: reads text, resolves no imports."""
+    `public_by_design` names are skipped. A fallback or receive is an entry point too: one that writes an owner, admin or role
+    variable without access control is a blocker. Heuristic: reads text, resolves no imports."""
 
     def work() -> dict:
         picked = _selected_contracts(payload)
@@ -879,14 +904,14 @@ def access_matrix(payload: dict) -> dict:
             return picked
         parsed, chosen = picked
         L = _lint()
-        index = L._callable_index(parsed)
         by_design = set(payload.get("public_by_design", []))
         findings: list[dict] = []
         roles: dict[str, list[str]] = {}
         state_changing = guarded = unprotected = 0
         for contract in chosen:
+            index = L.visible_index(contract, parsed)
             for fn in contract["functions"]:
-                if not (fn["kind"] == "function" and fn["visibility"] in ("public", "external") and fn["mutability"] in ("nonpayable", "payable") and fn["has_body"]):
+                if not (fn["kind"] in L.ENTRY_KINDS and fn["visibility"] in ("public", "external") and fn["mutability"] in ("nonpayable", "payable") and fn["has_body"]):
                     continue
                 label = _short(f"{contract['name']}.{fn['signature']}")
                 state_changing += 1
@@ -901,9 +926,11 @@ def access_matrix(payload: dict) -> dict:
                 unprotected += 1
                 if any(m in ("initializer", "reinitializer") for m, _ in fn["modifiers"]):
                     findings.append(_finding("ACCESS-INITIALIZER-OPEN", "minor", f"{label} can be called by anyone once (initializer): deploy and initialize atomically"))
-                elif _BLOCKER_NAMES.search(fn["name"]):
+                elif fn["kind"] in ("fallback", "receive") and _ROLE_WRITE.search(fn["body"]):
+                    findings.append(_finding("ACCESS-UNPROTECTED-FALLBACK", "blocker", f"{label} writes an owner or role variable with no access control: any caller can take over the contract"))
+                elif _is_privileged(fn["name"]):
                     findings.append(_finding("ACCESS-UNPROTECTED-PRIVILEGED", "blocker", f"{label} is a privileged operation with no access control"))
-                elif _MAJOR_NAMES.match(fn["name"]):
+                elif _is_admin_verb(fn["name"]):
                     findings.append(_finding("ACCESS-UNPROTECTED-ADMIN", "major", f"{label} looks like an admin operation and has no access control"))
                 else:
                     findings.append(_finding("ACCESS-UNPROTECTED-WRITER", "minor", f"{label} changes state and is callable by anyone; list it in public_by_design if intended"))
@@ -1100,7 +1127,15 @@ _CHAINS = {
     168587773: ("Blast Sepolia", "testnet"),
     1337: ("Local development chain", "local"), 31337: ("Hardhat/Anvil", "local"),
 }
-_SECRET_QUERY = re.compile(r"(key|token|secret|auth|sig|password|passwd|pwd|apikey)", re.IGNORECASE)
+_SECRET_WORDS = frozenset({"key", "keys", "token", "secret", "auth", "sig", "signature", "password", "passwd", "pwd", "apikey"})
+
+
+def _is_secret_name(name: str) -> bool:
+    """A query parameter name that carries a credential: one of its words (split at separators and camel case) is a secret
+    word, so `monkey` or `keyword` is not one."""
+    return any(word.lower() in _SECRET_WORDS for word in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", name))
+
+
 _ZERO_ADDRESS = "0x" + "0" * 40
 
 
@@ -1196,20 +1231,23 @@ def deploy_plan_check(payload: dict) -> dict:
             findings.append(_finding("DEPLOY-RAW-KEY", "info" if local else "blocker", "the plan signs with a raw private key: use a hardware wallet, keystore or remote signer"))
         rpc = payload.get("rpc_url", "")
         if rpc:
-            m = re.fullmatch(r"(https?)://([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#.*)?", rpc)
+            m = re.fullmatch(r"(https?)://([^?#]*)(?:\?([^#]*))?(?:#.*)?", rpc)
             if not m:
                 return _invalid("rpc_url", "rpc_url must be an http(s) URL")
-            scheme, authority, path, query = m.group(1), m.group(2), m.group(3), m.group(4) or ""
-            host = authority.rsplit("@", 1)[-1].lower()
+            scheme, target, query = m.group(1), m.group(2), m.group(3) or ""
+            # the authority ends at the first '/', but userinfo may hold an unencoded '/': any '@' before the query is a credential
+            slash = target.find("/")
+            path = target[slash:] if slash >= 0 else ""
+            host = target[target.rfind("@") + 1:].split("/", 1)[0].lower()
             host_only = re.sub(r":\d+\Z", "", host)
-            if "@" in authority:
+            if "@" in target:
                 findings.append(_finding("DEPLOY-RPC-CREDENTIAL", "blocker", "rpc_url embeds user:password in its authority"))
             for position, pair in enumerate(query.split("&") if query else [], 1):
                 key, equals, value = pair.partition("=")
                 # the parameter name is quoted only when it is a plain short identifier; otherwise the report gives its position
                 where = f"query parameter {key!r}" if equals and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}", key) else f"query parameter #{position}"
                 carried = value if equals else pair  # `?v=<key>` carries the key in its value, `?<key>` is the key
-                if _SECRET_QUERY.search(key):
+                if _is_secret_name(key):
                     findings.append(_finding("DEPLOY-RPC-CREDENTIAL", "blocker", f"rpc_url {where} looks like a credential"))
                 elif len(carried) >= 24 and re.fullmatch(r"[A-Za-z0-9_.~%-]+", carried) and re.search(r"\d", carried):
                     findings.append(_finding("DEPLOY-RPC-PATH-KEY", "major", f"rpc_url {where} carries {len(carried)} characters that look like an API key: use a keyless endpoint or inject it at runtime"))
@@ -1474,13 +1512,14 @@ def eip712_typehash(payload: dict) -> dict:
             separator_status = "not_declared" if declared_separator is None else "match" if declared_separator.lower() == "0x" + separator else "mismatch"
             if separator_status == "mismatch":
                 findings.append(_finding("EIP712-DOMAIN-MISMATCH", "blocker", "declared_domain_separator differs from the recomputed domain_separator"))
-            kinds = {part[1] for part in domain_parts}
-            if "chain" not in kinds:
-                findings.append(_finding("EIP712-DOMAIN-NO-CHAIN-ID", "major", "the domain has no chainId: signatures replay across chains"))
-            if "contract" not in kinds:
-                findings.append(_finding("EIP712-DOMAIN-NO-CONTRACT", "major", "the domain has no verifyingContract: signatures replay across contracts"))
-            elif contract is not None and contract.lower() == _ZERO_ADDRESS:
-                findings.append(_finding("EIP712-DOMAIN-ZERO-CONTRACT", "major", "verifyingContract is the zero address"))
+        # the binding policy holds with or without domain fields: a domain with neither chain nor contract replays everywhere
+        kinds = {part[1] for part in domain_parts}
+        if "chain" not in kinds:
+            findings.append(_finding("EIP712-DOMAIN-NO-CHAIN-ID", "major", "the domain has no chainId: signatures replay across chains"))
+        if "contract" not in kinds:
+            findings.append(_finding("EIP712-DOMAIN-NO-CONTRACT", "major", "the domain has no verifyingContract: signatures replay across contracts"))
+        elif contract is not None and contract.lower() == _ZERO_ADDRESS:
+            findings.append(_finding("EIP712-DOMAIN-ZERO-CONTRACT", "major", "verifyingContract is the zero address"))
         listed, total = _finish(findings)
         return {"state": "SUCCESS", "primary_type": primary, "canonical_encode_type": canonical, "type_hash": "0x" + type_hash,
                 "canonical_type_hash": "0x" + canonical_hash, "type_hash_status": type_status, "domain_type_string": domain_type,

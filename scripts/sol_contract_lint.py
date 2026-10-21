@@ -21,11 +21,13 @@ import re
 import shutil
 import stat
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 
 MAX_FILE_BYTES = 1 << 20  # 1 MiB
 MAX_FILES = 2000
@@ -327,17 +329,21 @@ def parse_source(raw: str) -> list[dict]:
             doc = parse_natspec(_doc_before(lines, idx, col)) if header else None
             fm = re.match(r"function\s+(" + _IDENT + r")\s*\(", header)
             sm = re.match(r"(constructor|fallback|receive)\s*\(", header)
+            um = re.match(r"function\s*\(", header)  # `function () external payable`: the fallback of solc before 0.6
             mm = re.match(r"modifier\s+(" + _IDENT + r")", header)
             em = re.match(r"event\s+(" + _IDENT + r")\s*\(", header)
             rm = re.match(r"error\s+(" + _IDENT + r")\s*\(", header)
-            if fm or sm:
+            if fm or sm or um:
                 if fm:
                     kind, name = "function", fm.group(1)
                     open_paren = fm.end() - 1
-                else:
-                    assert sm is not None
+                elif sm:
                     kind, name = sm.group(1), sm.group(1)
                     open_paren = sm.end() - 1
+                else:
+                    assert um is not None
+                    kind, name = "fallback", "fallback"
+                    open_paren = um.end() - 1
                 parsed = _parse_function_header(kind, name, header, open_paren)
                 body = clean[body_range[0]:body_range[1]] if body_range else ""
                 if contract["kind"] == "interface" and not parsed["visibility"]:
@@ -393,12 +399,30 @@ _ACCESS_NAMES = frozenset({"auth", "requiresAuth", "restricted", "authorized", "
 _ROLE_WORDS = r"(?:admin|owner|operator|minter|authori[sz]ed|whitelist|allow|role|governor|guardian|manager|keeper)"
 
 
-def _callable_index(contracts: list[dict]) -> dict[str, list[dict]]:
+ENTRY_KINDS = ("function", "fallback", "receive")  # externally callable entry points: a fallback or receive can write state too
+
+
+def visible_index(contract: dict, contracts: list[dict]) -> dict[str, list[dict]]:
+    """Functions and modifiers `contract` can call or apply: its own and those of its bases defined in this source, the most
+    derived first. A name defined by a more derived contract hides the base's, and a same-named callable of an unrelated
+    contract is never visible: a guard belongs to the contract that defines it."""
+    by_name: dict[str, dict] = {}
+    for c in contracts:
+        by_name.setdefault(c["name"], c)
     index: dict[str, list[dict]] = {}
-    for contract in contracts:
-        for fn in contract["functions"]:
-            if fn["kind"] in ("function", "modifier"):
+    hidden: set[str] = set()
+    queue, seen = [contract], {id(contract)}
+    for current in queue:  # the list grows while it is walked: a breadth-first walk up the bases
+        own = [fn for fn in current["functions"] if fn["kind"] in ("function", "modifier")]
+        for fn in own:
+            if fn["name"] not in hidden:
                 index.setdefault(fn["name"], []).append(fn)
+        hidden.update(fn["name"] for fn in own)
+        for base in current["bases"]:
+            parent = by_name.get(base)
+            if parent is not None and id(parent) not in seen:
+                seen.add(id(parent))
+                queue.append(parent)
     return index
 
 
@@ -429,18 +453,20 @@ def _reachable(fn: dict, index: dict[str, list[dict]]) -> list[dict]:
 
 
 def emission_status(contracts: list[dict]) -> dict[int, str]:
-    """id(function) -> 'emits' | 'delegated' | 'missing' for every state-changing public/external function with a body.
+    """id(function) -> 'emits' | 'delegated' | 'missing' for every state-changing entry point with a body: a public or external
+    function, a fallback or a receive.
 
-    'emits': the body, a modifier named initializer/reinitializer, or an internal function it calls (same source,
-    followed transitively) contains `emit`. 'delegated': it emits nothing visible but calls an underscore-prefixed
-    internal function or `super.` that this source does not define (inherited code may emit). 'missing': neither."""
-    index = _callable_index(contracts)
+    'emits': the body, a modifier named initializer/reinitializer, or an internal function it calls (the callables its own
+    contract can see, followed transitively) contains `emit`. 'delegated': it emits nothing visible but calls an
+    underscore-prefixed internal function or `super.` that this source does not define (inherited code may emit).
+    'missing': neither."""
     result: dict[int, str] = {}
     for contract in contracts:
         if contract["kind"] != "contract":
             continue
+        index = visible_index(contract, contracts)
         for fn in contract["functions"]:
-            if not (fn["kind"] == "function" and fn["visibility"] in ("public", "external") and fn["mutability"] in ("nonpayable", "payable")
+            if not (fn["kind"] in ENTRY_KINDS and fn["visibility"] in ("public", "external") and fn["mutability"] in ("nonpayable", "payable")
                     and fn["has_body"] and fn["body"].strip()):
                 continue
             reach = _reachable(fn, index)
@@ -460,8 +486,14 @@ _RHS = r"(address\s*\(\s*this\s*\)|[A-Za-z_$][\w$]{0,63}(?:\.[A-Za-z_$][\w$]{0,6
 _LHS = r"(?<![\w$.])" + _RHS.replace("(?![\\w$.(])", "")
 _AND_PREFIX = r"(?:[^;{|]{0,160}?&&\s*)?"  # `require(amount > 0 && msg.sender == owner)`: earlier conjuncts do not matter
 _REQ = r"\b(?:require|assert)\s*\(\s*" + _AND_PREFIX
+_REQ_END = r"(?=\s*[),&])"  # a sender check is a whole conjunct: a `||` after it leaves the other branch unguarded
 _IF_REVERT = r"\)\s*\{?\s*(?:revert|return)\b"
 _NOT_A_PRINCIPAL = frozenset({"tx.origin", "address(0)"})
+# a sender equality in either order, the principal in group 1 (`msg.sender == X`) or group 2 (`X == msg.sender`)
+_SENDER_EQ = r"(?:" + _SENDER + r"\s*==\s*" + _RHS + r"|" + _LHS + r"\s*==\s*" + _SENDER + r")"
+_SENDER_EQ_RE = re.compile(_SENDER_EQ)
+# a require/assert whose whole condition is two or more sender equalities joined by `||`; nothing else may precede or follow it
+_SENDER_OR_CHAIN = re.compile(r"\b(?:require|assert)\s*\(\s*(" + _SENDER_EQ + r"(?:\s*\|\|\s*" + _SENDER_EQ + r")+)(?=\s*[),])")
 
 
 def _inline_guards(body: str) -> set[str]:
@@ -473,7 +505,7 @@ def _inline_guards(body: str) -> set[str]:
         found.add("owner")
     for m in re.finditer(r"\b_checkRole\s*\(\s*([^,)]{1,120})", body):
         found.add(m.group(1).strip())
-    for lead, end in ((_REQ, ""), (r"\bif\s*\(\s*!\s*", r"\s*" + _IF_REVERT)):
+    for lead, end in ((_REQ, _REQ_END), (r"\bif\s*\(\s*!\s*", r"\s*" + _IF_REVERT)):
         for m in re.finditer(lead + r"hasRole\s*\(\s*([^,]{1,120}),\s*" + _SENDER + r"\s*\)" + end, body):
             found.add(m.group(1).strip())
         for m in re.finditer(lead + r"(" + _NAME + r")\s*\[\s*" + _SENDER + r"\s*\]" + end, body):
@@ -482,13 +514,19 @@ def _inline_guards(body: str) -> set[str]:
         for m in re.finditer(lead + r"(" + _NAME + r")\s*\(\s*" + _SENDER + r"\s*\)" + end, body):
             if m.group(1) != "hasRole" and re.search(_ROLE_WORDS, m.group(1), re.I):
                 found.add(f"{m.group(1)}(msg.sender)")
-    for pattern in (_REQ + _SENDER + r"\s*==\s*" + _RHS, _REQ + _LHS + r"\s*==\s*" + _SENDER,
+    for pattern in (_REQ + _SENDER + r"\s*==\s*" + _RHS + _REQ_END, _REQ + _LHS + r"\s*==\s*" + _SENDER + _REQ_END,
                     r"\bif\s*\(\s*" + _SENDER + r"\s*!=\s*" + _RHS + r"\s*" + _IF_REVERT,
                     r"\bif\s*\(\s*" + _LHS + r"\s*!=\s*" + _SENDER + r"\s*" + _IF_REVERT):
         for m in re.finditer(pattern, body):
             who = re.sub(r"\s+", "", m.group(1))
             if who not in _NOT_A_PRINCIPAL:
                 found.add(f"msg.sender=={who}")
+    # `require(msg.sender == A || msg.sender == B)`: every disjunct is a sender check against a principal, so the chain guards each
+    # of them. One non-sender term (`msg.sender == owner || open`) leaves its branch open: the chain is then no guard at all.
+    for chain in _SENDER_OR_CHAIN.finditer(body):
+        whos = [re.sub(r"\s+", "", p.group(1) or p.group(2)) for p in _SENDER_EQ_RE.finditer(chain.group(1))]
+        if len(whos) == chain.group(1).count("||") + 1 and not any(who in _NOT_A_PRINCIPAL for who in whos):
+            found.update(f"msg.sender=={who}" for who in whos)
     return found
 
 
@@ -508,14 +546,17 @@ def _is_access_modifier(name: str, defined: list[dict]) -> bool:
 
 
 def _direct_guards(fn: dict, index: dict[str, list[dict]]) -> set[str]:
-    cached = fn.get("_guards")
-    if cached is not None:
-        return cached
+    """Access labels from fn's own body and modifiers, resolved against `index` (the callables its contract can see). The
+    result is kept per index object: the same function reached through another contract may resolve its names differently."""
+    cached = fn.setdefault("_guards", [])
+    for held, found in cached:
+        if held is index:
+            return found
     found = _inline_guards(fn["body"])
     for name, args in fn["modifiers"]:
         if _is_access_modifier(name, [t for t in index.get(name, []) if t["kind"] == "modifier"]):
             found.add(args.strip() if name == "onlyRole" and args.strip() else name)
-    fn["_guards"] = found
+    cached.append((index, found))
     return found
 
 
@@ -717,9 +758,25 @@ def pragma_findings(expr: str, *, min_version: Version, floating_severity: str, 
 # Lint
 # --------------------------------------------------------------------------------------------------------------------
 
-_PRAGMA = re.compile(r"\bpragma\s+solidity\s+([^;]{1,200});")
+_PRAGMA_KEYWORD = re.compile(r"\bpragma\s+solidity\s*")
 _LOW_LEVEL = re.compile(r"\.(call|delegatecall|staticcall|send)\s*(?:\{[^}]{0,400}\})?\s*\(")
 _LAYOUT_AT = re.compile(r"\blayout\s+at\b")
+
+
+def _pragma_directives(clean: str) -> list[tuple[int, str]]:
+    """(offset, text) of each `pragma solidity <text>;` directive in the stripped source, in order. Linear in the source size:
+    each directive's terminating ';' is found once and the next search resumes after it, so the scanned spans never overlap.
+    A keyword with no ';' after it ends the scan, because no later keyword can have one either: that tail is one unterminated
+    pragma, which is not a directive (a text over the length bound of a terminated one is still reported as INVALID)."""
+    directives: list[tuple[int, str]] = []
+    pos = 0
+    while (keyword := _PRAGMA_KEYWORD.search(clean, pos)) is not None:
+        end = clean.find(";", keyword.end())
+        if end < 0:
+            break
+        directives.append((keyword.start(), clean[keyword.end():end]))
+        pos = end + 1
+    return directives
 
 
 _CONTROL_HEAD = re.compile(r"\s*(?:else\b|(?:if|for|while)\s*\()")
@@ -763,31 +820,109 @@ def _enclosing_function(contracts: list[dict], pos: int) -> dict | None:
     return None
 
 
+_ASM_DELEGATECALL = re.compile(r"(?<![\w$.])delegatecall\s*\(")  # inline assembly: `delegatecall(gas(), target, ...)`
+_ORIGIN = re.compile(r"\btx\s*\.\s*origin\b")
+_OPERAND = r"(?:address\s*\([^()]*\)|0[xX][0-9a-fA-F]*|\d+|[A-Za-z_$][\w$.]*(?:\s*\(\s*\))?)"
+_OPERAND_AFTER = re.compile(r"\s*[!=]=\s*(" + _OPERAND + r")")
+_OPERAND_BEFORE = re.compile(r"(" + _OPERAND + r")\s*[!=]=\s*$")
+_RESULT_TESTED = re.compile(r"\b(?:require|assert|if|return)\b")
+
+
+def _is_principal(operand: str) -> bool:
+    """A named account or role getter: not a literal and not an address(...) cast such as address(0)."""
+    return bool(re.match(r"[A-Za-z_$]", operand)) and not operand.startswith("address")
+
+
+def _compared_with_principal(clean: str, start: int, end: int) -> bool:
+    """clean[start:end] is compared with `==` or `!=` to a named principal on either side."""
+    after = _OPERAND_AFTER.match(clean, end)
+    if after and _is_principal(after.group(1)):
+        return True
+    before = _OPERAND_BEFORE.search(clean[max(0, start - 96):start])
+    return bool(before and _is_principal(before.group(1)))
+
+
+def _origin_is_authorization(clean: str, origin: re.Match) -> bool:
+    """tx.origin compared with a principal, directly or through a local name that holds it (`address o = tx.origin;` then
+    `require(o == owner)`)."""
+    if _compared_with_principal(clean, origin.start(), origin.end()):
+        return True
+    assigned = re.search(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*$", clean[max(0, origin.start() - 64):origin.start()])
+    if not assigned:
+        return False
+    name = re.escape(assigned.group(1))
+    return any(_compared_with_principal(clean, use.start(), use.end()) for use in re.finditer(r"(?<![\w$.])" + name + r"\b", clean))
+
+
+_TOKEN_COUNTS: tuple[str, Counter] = ("", Counter())  # the last body counted: a function with many call sites is counted once
+
+
+def _token_count(body: str, name: str) -> int:
+    """Occurrences of identifier `name` in `body` that are not member accesses (`x.name` is another variable)."""
+    global _TOKEN_COUNTS
+    cached = _TOKEN_COUNTS
+    if cached[0] is not body:
+        cached = _TOKEN_COUNTS = (body, Counter(re.findall(r"(?<![\w$.])[A-Za-z_$][\w$]*", body)))
+    return cached[1].get(name, 0)
+
+
+def _result_checked(prefix: str, body: str) -> bool:
+    """The success flag of a low-level call is tested: a require, assert, if or return precedes the call in its statement, or
+    the flag it is bound to (`bool ok = `, `(bool ok, ) = `, `ok = `) is read again in the same function body."""
+    if _RESULT_TESTED.search(prefix):
+        return True
+    assignments = [m.start() for m in re.finditer(r"(?<![=!<>])=(?!=)", prefix)]
+    if not assignments:
+        return False
+    lhs = prefix[:assignments[-1]].strip()
+    if lhs.startswith("(") and lhs.endswith(")"):
+        lhs = lhs[1:-1]
+    parts = split_top(lhs)
+    flags: list[str] = []
+    for part in parts:
+        tokens = re.findall(_IDENT, part)
+        if len(tokens) >= 2 and tokens[0] == "bool":
+            flags.append(tokens[-1])
+    if not flags and len(parts) == 1 and re.fullmatch(_IDENT, parts[0]):
+        flags.append(parts[0])
+    return any(_token_count(body, name) >= 2 for name in flags)
+
+
+def _exposed_ids(contracts: list[dict]) -> set[int]:
+    """id() of every function that a public or external entry point without access control reaches, in any contract that
+    can see it: its body can run for an arbitrary caller."""
+    exposed: set[int] = set()
+    for contract in contracts:
+        index = visible_index(contract, contracts)
+        for entry in contract["functions"]:
+            if entry["kind"] in ENTRY_KINDS and entry["visibility"] in ("public", "external") and entry["has_body"] and not guards(entry, index):
+                exposed.update(id(fn) for fn in _reachable(entry, index))
+    return exposed
+
+
 def lint_source(rel: str, raw: str) -> list[dict]:
-    """Findings {id, severity, summary, location} for one Solidity file."""
+    """Findings {id, severity, summary, location} for one Solidity file. Pragma findings are the pragma_policy findings."""
     clean = strip_source(raw)
     out: list[dict] = []
 
     def add(rule: str, severity: str, summary: str, pos: int) -> None:
         out.append({"id": rule, "severity": severity, "summary": redact(summary), "location": f"{rel}:{line_of(clean, pos)}"})
 
-    pragmas = list(_PRAGMA.finditer(clean))
+    pragmas = _pragma_directives(clean)
     uses_layout_at = bool(_LAYOUT_AT.search(clean))
     if not pragmas and _DECL_HEAD.search(clean):
         add("SOL-PRAGMA-MISSING", "minor", "no `pragma solidity` directive: the compiler version is unconstrained", 0)
-    for m in pragmas:
+    for start, expr in pragmas:
         try:
-            review = pragma_findings(m.group(1), min_version=(0, 8, 0), floating_severity="minor", via_ir=False, optimizer=True,
+            review = pragma_findings(expr, min_version=(0, 8, 0), floating_severity="minor", via_ir=False, optimizer=True,
                                      layout_at=uses_layout_at)
         except ValueError as exc:
-            add("SOL-PRAGMA-INVALID", "minor", f"unparseable pragma: {exc}", m.start())
+            add("SOL-PRAGMA-INVALID", "minor", f"unparseable pragma: {exc}", start)
             continue
         for f in review["findings"]:
-            if f["id"] in ("PRAGMA-NOT-PINNED", "PRAGMA-KNOWN-BUG"):
-                add("SOL-" + f["id"], f["severity"], f["summary"], m.start())
-    for m in re.finditer(r"\btx\s*\.\s*origin\b", clean):
-        window = clean[max(0, m.start() - 40):m.end() + 40]
-        authz = re.search(r"tx\s*\.\s*origin\s*[!=]=|[!=]=\s*tx\s*\.\s*origin", window)
+            add("SOL-" + f["id"], f["severity"], f["summary"], start)
+    for m in _ORIGIN.finditer(clean):
+        authz = _origin_is_authorization(clean, m)
         add("SOL-TX-ORIGIN", "major" if authz else "minor",
             "tx.origin used in an authorization comparison (phishable through any contract the user calls; use msg.sender)"
             if authz else "tx.origin read: never use it for authorization", m.start())
@@ -795,21 +930,28 @@ def lint_source(rel: str, raw: str) -> list[dict]:
         add("SOL-SELFDESTRUCT", "major", "selfdestruct: deprecated, since EIP-6780 (Cancun) it only deletes code in the creating "
             "transaction, and it breaks proxy implementations", m.start())
     contracts = parse_source(raw)
-    index = _callable_index(contracts)
+    exposed: set[int] | None = None  # computed on the first delegatecall only: most sources have none and guard analysis is not free
+
+    def delegatecall(pos: int) -> None:
+        nonlocal exposed
+        if exposed is None:
+            exposed = _exposed_ids(contracts)
+        fn = _enclosing_function(contracts, pos)
+        public = fn is None or id(fn) in exposed
+        add("SOL-DELEGATECALL", "major" if public else "minor",
+            "delegatecall in a public/external function with no access control: the callee runs with this contract's storage"
+            if public else "delegatecall: callee code runs with this contract's storage and balance; confirm the target is trusted",
+            pos)
+
     for m in _LOW_LEVEL.finditer(clean):
-        kind = m.group(1)
+        if m.group(1) == "delegatecall":
+            delegatecall(m.start())
         fn = _enclosing_function(contracts, m.start())
-        if kind == "delegatecall":
-            exposed = fn is None or (fn["visibility"] in ("public", "external") and not guards(fn, index))
-            add("SOL-DELEGATECALL", "major" if exposed else "minor",
-                "delegatecall in a public/external function with no access control: the callee runs with this contract's storage"
-                if exposed else "delegatecall: callee code runs with this contract's storage and balance; confirm the target is trusted",
-                m.start())
-        prefix = _statement_prefix(clean, m.start())
-        checked = bool(re.search(r"(?<![=!<>])=(?!=)|\b(?:require|assert|if|return)\b|\(\s*bool\b", prefix))
-        if not checked:
+        if not _result_checked(_statement_prefix(clean, m.start()), fn["body"] if fn is not None else clean):
             add("SOL-UNCHECKED-LOW-LEVEL-CALL", "major",
-                f".{kind}(...) result is discarded: a failed call goes unnoticed (check the returned bool)", m.start())
+                f".{m.group(1)}(...) result is discarded: a failed call goes unnoticed (check the returned bool)", m.start())
+    for m in _ASM_DELEGATECALL.finditer(clean):
+        delegatecall(m.start())
     status = emission_status(contracts)
     for contract in contracts:
         for fn in contract["functions"]:
@@ -820,44 +962,69 @@ def lint_source(rel: str, raw: str) -> list[dict]:
     return out
 
 
-def _collect(root: Path, start: Path) -> tuple[list[tuple[str, str]], dict]:
-    """[(relative path, text)] of the .sol files under start plus skip counters."""
-    skipped = {"symlinks": 0, "test_files": 0, "too_large": 0, "binary": 0, "unreadable": 0, "limit_reached": False}
+def _collect(root: Path, start: Path) -> tuple[list[tuple[str, str]], dict, list[str]]:
+    """[(relative path, text)] of the .sol files under start, the skip counters, and one reason (a label and a path) per
+    in-scope input that was not analysed: a symlink, a file over the size limit, a binary or unreadable file, the file limit.
+    Foundry test and script files are out of scope by design and only counted. Dependency and build directories (SKIP_DIRS, such
+    as lib/ and out/) are out of scope by design: they are listed by relative path under `excluded_dirs` and never make the
+    status fail. Only in-scope input that was not analysed, or no in-scope input at all, fails closed."""
+    skipped = {"symlinks": 0, "test_files": 0, "too_large": 0, "binary": 0, "unreadable": 0, "excluded_dirs": [], "limit_reached": False}
+    reasons: list[str] = []
     files: list[tuple[str, str]] = []
+
+    def rel(path: Path) -> str:
+        return path.relative_to(root).as_posix()
+
     if start.is_file():
         candidates = [start]
     else:
         candidates = []
         for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not os.path.islink(os.path.join(dirpath, d)))
+            kept = []
+            for name in sorted(dirnames):
+                child = Path(dirpath) / name
+                if child.is_symlink():
+                    skipped["symlinks"] += 1
+                    reasons.append(f"symlinked directory skipped: {rel(child)}")
+                elif name in SKIP_DIRS:
+                    skipped["excluded_dirs"].append(rel(child))
+                else:
+                    kept.append(name)
+            dirnames[:] = kept
             candidates.extend(Path(dirpath) / name for name in sorted(filenames) if name.endswith(".sol"))
-    for path in sorted(candidates, key=lambda p: p.relative_to(root).as_posix()):
+    for path in sorted(candidates, key=rel):
         if path.is_symlink():
             skipped["symlinks"] += 1
+            reasons.append(f"symlink skipped: {rel(path)}")
             continue
         if path.name.endswith((".t.sol", ".s.sol")):
             skipped["test_files"] += 1
             continue
         if len(files) >= MAX_FILES:
             skipped["limit_reached"] = True
+            reasons.append(f"file limit of {MAX_FILES} reached, further .sol files not scanned")
             break
         try:
             info = path.stat()
             if not stat.S_ISREG(info.st_mode):  # a FIFO or device blocks the read (or never ends): not a source file
                 skipped["unreadable"] += 1
+                reasons.append(f"not a regular file, skipped: {rel(path)}")
                 continue
             if info.st_size > MAX_FILE_BYTES:
                 skipped["too_large"] += 1
+                reasons.append(f"over {MAX_FILE_BYTES} bytes, skipped: {rel(path)}")
                 continue
             data = path.read_bytes()
         except OSError:
             skipped["unreadable"] += 1
+            reasons.append(f"unreadable, skipped: {rel(path)}")
             continue
         if b"\0" in data:
             skipped["binary"] += 1
+            reasons.append(f"binary, skipped: {rel(path)}")
             continue
-        files.append((path.relative_to(root).as_posix(), data.decode("utf-8", errors="replace")))
-    return files, skipped
+        files.append((rel(path), data.decode("utf-8", errors="replace")))
+    return files, skipped, reasons
 
 
 def _tool_status(binary: str) -> str:
@@ -867,7 +1034,7 @@ def _tool_status(binary: str) -> str:
 def run(args, ctx) -> dict:
     if ctx.dry_run:
         return {"status": "ok", "dry_run": True, "files_scanned": 0,
-                "skipped": {"symlinks": 0, "test_files": 0, "too_large": 0, "binary": 0, "unreadable": 0, "limit_reached": False},
+                "skipped": {"symlinks": 0, "test_files": 0, "too_large": 0, "binary": 0, "unreadable": 0, "excluded_dirs": [], "limit_reached": False},
                 "counts": {name: 0 for name in SEVERITIES}, "findings": [], "findings_total": 0,
                 "tools": {"slither": "skipped:dry-run", "forge": "skipped:dry-run"},
                 "summary": "dry-run: sol_contract_lint would scan *.sol files under --path within --root"}
@@ -877,14 +1044,17 @@ def run(args, ctx) -> dict:
         raise SwarmError(ErrorCode.E_INPUT, f"--path {args.path!r} leaves the repository root")
     if not target.exists():
         raise SwarmError(ErrorCode.E_INPUT, f"--path {args.path!r} does not exist under {root}")
-    files, skipped = _collect(root, target)
+    files, skipped, reasons = _collect(root, target)
     findings: list[dict] = []
     for rel, text in files:
         findings.extend(lint_source(rel, text))
+    # fail closed: an in-scope input that was not analysed, or no in-scope input at all, must not read as ok
+    for item in incomplete_findings([redact(reason) for reason in reasons], len(files)):
+        findings.append({"id": item["id"], "severity": item["severity"], "summary": item["summary"], "location": ".:0"})
     findings.sort(key=lambda f: (f["location"].rsplit(":", 1)[0], int(f["location"].rsplit(":", 1)[1]), -SEV_RANK[f["severity"]], f["id"]))
     counts = {name: sum(1 for f in findings if f["severity"] == name) for name in SEVERITIES}
     failing = counts["major"] + counts["blocker"]
-    return {"status": "fail" if failing else "ok", "files_scanned": len(files), "skipped": skipped, "counts": counts,
+    return {"status": scan_status(findings), "files_scanned": len(files), "skipped": skipped, "counts": counts,
             "findings": findings[:MAX_FINDINGS], "findings_total": len(findings),
             "tools": {"slither": _tool_status("slither"), "forge": _tool_status("forge")},
             "summary": f"{len(files)} file(s) scanned, {len(findings)} finding(s), {failing} major or worse"}

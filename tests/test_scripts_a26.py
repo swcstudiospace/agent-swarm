@@ -133,9 +133,9 @@ def test_clean_tree_exits_zero_and_minor_findings_alone_do_not_fail(tmp_path):
     assert result.returncode == 0 and data["status"] == "ok" and [f["id"] for f in data["findings"]] == ["SOL-PRAGMA-NOT-PINNED"]
 
 
-def test_empty_tree_scans_nothing_and_passes(tmp_path):
+def test_empty_tree_scans_nothing_and_is_incomplete(tmp_path):
     result, data = lint(tmp_path)
-    assert result.returncode == 0 and data["files_scanned"] == 0 and data["findings"] == []
+    assert result.returncode == 1 and data["files_scanned"] == 0 and [f["id"] for f in data["findings"]] == ["scan/incomplete"]
 
 
 def test_dependency_build_and_test_directories_and_foundry_files_are_skipped(tmp_path):
@@ -190,8 +190,9 @@ def test_large_binary_and_symlinked_files_are_skipped(tmp_path):
     (tmp_path / "src" / "Link.sol").symlink_to(outside)
     (tmp_path / "linkdir").symlink_to(outside.parent, target_is_directory=True)
     result, data = lint(tmp_path)
-    assert result.returncode == 0 and data["files_scanned"] == 1 and data["findings"] == []
-    assert data["skipped"]["too_large"] == 1 and data["skipped"]["binary"] == 1 and data["skipped"]["symlinks"] == 1
+    assert result.returncode == 1 and data["status"] == "fail" and data["files_scanned"] == 1
+    assert [f["id"] for f in data["findings"]] == ["scan/incomplete"]  # skipped in-scope inputs are never reported as ok
+    assert data["skipped"]["too_large"] == 1 and data["skipped"]["binary"] == 1 and data["skipped"]["symlinks"] == 2  # file + directory link
 
 
 def test_file_exactly_at_the_size_limit_is_scanned(tmp_path):
@@ -207,7 +208,8 @@ def test_scan_stops_at_two_thousand_files(tmp_path):
     for i in range(2001):
         write(tmp_path, f"src/C{i:04d}.sol", "pragma solidity 0.8.28;\n")
     result, data = lint(tmp_path)
-    assert result.returncode == 0 and data["files_scanned"] == 2000 and data["skipped"]["limit_reached"] is True
+    assert result.returncode == 1 and data["status"] == "fail" and data["files_scanned"] == 2000 and data["skipped"]["limit_reached"] is True
+    assert [f["id"] for f in data["findings"]] == ["scan/incomplete"]  # 1 file over the limit was not analysed: incomplete, not ok
     exact = tmp_path / "exact"
     for i in range(1999):
         write(exact, f"C{i:04d}.sol", "pragma solidity 0.8.28;\n")
@@ -507,7 +509,7 @@ def test_contract_after_a_long_comment_block_is_still_checked():
     assert contracts[1]["bases"] == ["Ownable"]
     mint = next(f for f in contracts[1]["functions"] if f["name"] == "mint")
     assert mint["visibility"] == "external" and mint["has_body"] and mint["body"].strip()
-    assert module.guards(mint, module._callable_index(contracts)) == []  # unguarded: the access matrix must flag it
+    assert module.guards(mint, module.visible_index(contracts[1], contracts)) == []  # unguarded: the access matrix must flag it
 
 
 def test_contract_with_a_header_past_the_old_length_bound_is_still_checked():
@@ -525,3 +527,77 @@ def test_lint_redaction_of_a_long_unbroken_run_is_linear_and_normal_tokens_are_u
     assert time.perf_counter() - started < 2
     assert clipped == "g" * 72 + "..." and module.redact("g" * 40000 + "1") == "<redacted 40001 chars>"
     assert module.redact(CANARY_TOKEN) == "<redacted 40 chars>"
+
+
+# --- QA-03 remediation: lint rules shared with the tools (one regression per fixed defect) ----------------------------------
+
+
+@pytest.mark.parametrize("pragma, expected", [
+    ("pragma solidity ^0.7.6;", [("SOL-PRAGMA-BELOW-MIN", "major"), ("SOL-PRAGMA-NOT-PINNED", "minor")]),
+    ("pragma solidity >=0.9.0 <0.8.0;", [("SOL-PRAGMA-EMPTY-RANGE", "major")]),
+    ("pragma solidity " + ">=0.8.0 " * 30 + ";", [("SOL-PRAGMA-INVALID", "minor")]),  # over-long: invalid, not missing
+])
+def test_lint_reports_every_pragma_policy_finding_and_an_overlong_pragma_as_invalid(pragma, expected):
+    assert sorted((r, s) for r, s, _ in findings(pragma + "\ncontract C { }\n")) == sorted(expected)
+
+
+@pytest.mark.parametrize("snippet, severity", [
+    ("    function f(address owner) external { emit E(); address o = tx.origin; require(o == owner); }", "major"),
+    ("    function f() external view returns (bool) { return tx.origin != address(0); }", "minor"),  # zero is not a principal
+])
+def test_tx_origin_is_major_only_when_compared_with_a_principal(snippet, severity):
+    assert [(r, s) for r, s, _ in findings(body(snippet)) if r == "SOL-TX-ORIGIN"] == [("SOL-TX-ORIGIN", severity)]
+
+
+@pytest.mark.parametrize("snippet, flagged", [
+    ('    function f(address t) external { emit E(); (bool ok, ) = t.call(""); }', True),  # bound to ok, never read
+    ('    function f(address t) external { emit E(); bool ok = payable(t).send(1); if (ok) emit E(); }', False),
+])
+def test_a_bound_low_level_result_must_be_read(snippet, flagged):
+    assert bool([r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"]) is flagged
+
+
+@pytest.mark.parametrize("snippet, severity", [
+    # reached from an unguarded public function: the callee runs for any caller
+    ('    function execute(address t, bytes memory d) public { emit E(); _run(t, d); }\n'
+     '    function _run(address t, bytes memory d) internal { (bool ok, ) = t.delegatecall(d); require(ok); }', "major"),
+    # inline assembly is a delegatecall too
+    ('    function f(address t, bytes memory d) public { emit E(); assembly { let ok := delegatecall(gas(), t, add(d, 32), mload(d), 0, 0) } }', "major"),
+    ('    function f(address t, bytes memory d) external onlyOwner { emit E(); assembly { let ok := delegatecall(gas(), t, add(d, 32), mload(d), 0, 0) } }', "minor"),
+])
+def test_delegatecall_exposure_follows_reachability_and_assembly(snippet, severity):
+    assert [(r, s) for r, s, _ in findings(body(snippet)) if r == "SOL-DELEGATECALL"] == [("SOL-DELEGATECALL", severity)]
+
+
+def test_an_unnamed_fallback_that_writes_state_is_examined_for_its_event():
+    assert ("SOL-MISSING-EVENT", "minor", 6) in findings(body("    function () external payable { x = 1; }"))
+
+
+def test_a_dependency_directory_is_excluded_by_design_listed_by_name_and_never_fails(tmp_path):
+    write(tmp_path, "contracts/lib/Vault.sol", VAULT)
+    write(tmp_path, "contracts/Ok.sol", CLEAN)
+    result, data = lint(tmp_path)
+    assert result.returncode == 0 and data["status"] == "ok" and data["files_scanned"] == 1
+    assert data["skipped"]["excluded_dirs"] == ["contracts/lib"] and data["findings"] == []  # by design: not unanalysed input
+
+
+def guards_of(condition: str) -> list[str]:
+    """The access labels the lint derives for `f()` whose body starts with `condition` (a sender check on state variables)."""
+    module = load_module()
+    source = ("pragma solidity 0.8.28;\ncontract C { address adminA; address adminB; address adminC; address owner; bool open; uint256 v;\n"
+              f"    function f() external {{ {condition} v = 1; }} }}")
+    contracts = module.parse_source(source)
+    fn = next(f for f in contracts[0]["functions"] if f["name"] == "f")
+    return module.guards(fn, module.visible_index(contracts[0], contracts))
+
+
+def test_an_or_chain_of_sender_checks_against_principals_is_a_guard_for_each_principal():
+    assert guards_of("require(msg.sender == adminA || msg.sender == adminB);") == ["msg.sender==adminA", "msg.sender==adminB"]
+    assert guards_of("require(msg.sender == adminA || msg.sender == adminB || msg.sender == adminC);") == [
+        "msg.sender==adminA", "msg.sender==adminB", "msg.sender==adminC"]
+
+
+def test_an_or_with_a_non_sender_term_is_not_a_guard():
+    assert guards_of("require(msg.sender == owner || open);") == []  # D1: the `open` branch reaches the write unchecked
+    assert guards_of("require(msg.sender == adminA || msg.sender == adminB || open);") == []
+    assert guards_of("require(open || msg.sender == adminA || msg.sender == adminB);") == []

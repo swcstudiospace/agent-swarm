@@ -408,7 +408,7 @@ def test_storage_layout_gap_resizes():
     grew = layout(base, [OWNER, var("__gap", 1, 0, "t_array(t_uint256)60_storage", 1920)])
     assert severity_of(grew, "STORAGE-GAP-GREW") == "blocker"
     shrunk = layout(base, [OWNER, var("__gap", 1, 0, "t_array(t_uint256)40_storage", 1280)])
-    assert ids(shrunk) == ["STORAGE-GAP-SHRUNK"] and severity_of(shrunk, "STORAGE-GAP-SHRUNK") == "minor"
+    assert ids(shrunk) == ["STORAGE-GAP-SHRUNK"] and severity_of(shrunk, "STORAGE-GAP-SHRUNK") == "blocker" and shrunk["verdict"] == "incompatible"
     gone = layout(base, [OWNER])
     assert ids(gone) == ["STORAGE-GAP-REMOVED"] and severity_of(gone, "STORAGE-GAP-REMOVED") == "major"
     after = layout(base, base + [var("late", 51, 0, "t_uint256", 32)])
@@ -821,17 +821,18 @@ def test_access_matrix_roles_and_unprotected_writers():
         "Vault.deposit(uint256)": "ACCESS-UNPROTECTED-WRITER", "Vault.mint(address,uint256)": "ACCESS-UNPROTECTED-PRIVILEGED",
         "Vault.setFee(uint256)": "ACCESS-UNPROTECTED-ADMIN", "Vault.poke()": "ACCESS-UNPROTECTED-WRITER",
         "Vault.viaOrigin()": "ACCESS-UNPROTECTED-WRITER", "Vault.guarded()": "ACCESS-UNPROTECTED-WRITER",
-        "Vault.initialize()": "ACCESS-INITIALIZER-OPEN",
+        "Vault.initialize()": "ACCESS-INITIALIZER-OPEN", "Vault.receive()": "ACCESS-UNPROTECTED-WRITER",
     }
     assert severity_of(result, "ACCESS-UNPROTECTED-PRIVILEGED") == "blocker" and severity_of(result, "ACCESS-UNPROTECTED-ADMIN") == "major"
     assert severity_of(result, "ACCESS-INITIALIZER-OPEN") == "minor"
-    assert result["verdict"] == "fail" and result["state_changing"] == 15 and result["guarded"] == 8 and result["unprotected"] == 7
+    assert result["verdict"] == "fail" and result["state_changing"] == 16 and result["guarded"] == 8 and result["unprotected"] == 8
     assert result["contracts_checked"] == 1
 
 
 def test_access_matrix_internal_and_view_functions_are_not_listed_and_public_by_design_is_skipped():
     result = ok("sol_access_matrix", {"source": ACCESS_SRC, "public_by_design": ["deposit", "mint", "setFee", "poke", "viaOrigin", "guarded", "initialize"]})
-    assert result["findings"] == [] and result["verdict"] == "pass" and result["unprotected"] == 0 and result["guarded"] == 8
+    assert [(f["id"], f["severity"]) for f in result["findings"]] == [("ACCESS-UNPROTECTED-WRITER", "minor")]  # receive() is not in public_by_design
+    assert result["findings"][0]["summary"].split()[0] == "Vault.receive()" and result["verdict"] == "pass" and result["unprotected"] == 1 and result["guarded"] == 8
     assert all("show" not in f for r in result["roles"] for f in r["functions"])
 
 
@@ -1514,7 +1515,8 @@ def test_eip712_domain_replay_fields():
     only_contract = typed(encode_type=PERMIT, verifying_contract="0x" + "00" * 20)
     assert only_contract["domain_separator"] == "0x27e52f026ec8d00b61942e6f2cb4b35d2e6a75e8c0db26bde0b4946d885d8e87"
     no_domain = typed(encode_type=PERMIT)
-    assert (no_domain["domain_separator"], no_domain["domain_type_string"], no_domain["domain_separator_status"], no_domain["findings"]) == ("", "", "not_declared", [])
+    assert (no_domain["domain_separator"], no_domain["domain_type_string"], no_domain["domain_separator_status"]) == ("", "", "not_declared")
+    assert set(ids(no_domain)) == {"EIP712-DOMAIN-NO-CHAIN-ID", "EIP712-DOMAIN-NO-CONTRACT"} and no_domain["verdict"] == "fail"  # D21: no binding at all
 
 
 def test_eip712_declared_hashes_that_do_not_match_are_blockers():
@@ -1528,31 +1530,31 @@ def test_eip712_declared_hashes_that_do_not_match_are_blockers():
 
 
 def test_eip712_referenced_structs_must_be_sorted_after_the_primary():
-    unsorted = typed(encode_type="Mail(Person p,Zed z)Zed(uint256 a)Person(uint256 b)")
+    unsorted = typed(encode_type="Mail(Person p,Zed z)Zed(uint256 a)Person(uint256 b)", domain_chain_id=1, verifying_contract=VC)
     assert ids(unsorted) == ["EIP712-TYPE-ORDER"] and severity_of(unsorted, "EIP712-TYPE-ORDER") == "blocker" and unsorted["verdict"] == "fail"
     assert unsorted["canonical_encode_type"] == "Mail(Person p,Zed z)Person(uint256 b)Zed(uint256 a)"
     assert unsorted["type_hash"] != unsorted["canonical_type_hash"]
-    sorted_ok = typed(encode_type="Mail(Person p,Zed z)Person(uint256 b)Zed(uint256 a)")
+    sorted_ok = typed(encode_type="Mail(Person p,Zed z)Person(uint256 b)Zed(uint256 a)", domain_chain_id=1, verifying_contract=VC)
     assert sorted_ok["findings"] == [] and sorted_ok["type_hash"] == sorted_ok["canonical_type_hash"]
     # the primary type stays first even when it sorts last
-    assert typed(encode_type="Zed(Alpha a)Alpha(uint256 x)")["findings"] == []
+    assert typed(encode_type="Zed(Alpha a)Alpha(uint256 x)", domain_chain_id=1, verifying_contract=VC)["findings"] == []
 
 
 def test_eip712_whitespace_and_closure():
-    spaced = typed(encode_type="Permit(address owner, address spender)")
+    spaced = typed(encode_type="Permit(address owner, address spender)", domain_chain_id=1, verifying_contract=VC)
     assert ids(spaced) == ["EIP712-NON-CANONICAL-WHITESPACE"] and spaced["canonical_encode_type"] == "Permit(address owner,address spender)"
     assert spaced["type_hash"] != spaced["canonical_type_hash"]
-    unreferenced = typed(encode_type="A(uint256 x)B(uint256 y)")
+    unreferenced = typed(encode_type="A(uint256 x)B(uint256 y)", domain_chain_id=1, verifying_contract=VC)
     assert ids(unreferenced) == ["EIP712-UNREFERENCED-TYPE"] and unreferenced["canonical_encode_type"] == "A(uint256 x)"
-    undefined = typed(encode_type="A(Foo f)")
+    undefined = typed(encode_type="A(Foo f)", domain_chain_id=1, verifying_contract=VC)
     assert ids(undefined) == ["EIP712-UNDEFINED-TYPE"] and severity_of(undefined, "EIP712-UNDEFINED-TYPE") == "blocker"
-    arrays = typed(encode_type="A(B[] bs,uint256[3] xs,bytes32 h,string s)B(uint256 x)")
+    arrays = typed(encode_type="A(B[] bs,uint256[3] xs,bytes32 h,string s)B(uint256 x)", domain_chain_id=1, verifying_contract=VC)
     assert arrays["findings"] == [] and arrays["verdict"] == "pass"
-    chained = typed(encode_type="A(B b)B(C c)C(uint8 v)")
+    chained = typed(encode_type="A(B b)B(C c)C(uint8 v)", domain_chain_id=1, verifying_contract=VC)
     assert chained["findings"] == []
-    duplicate = typed(encode_type="A(uint256 x,uint256 x)")
+    duplicate = typed(encode_type="A(uint256 x,uint256 x)", domain_chain_id=1, verifying_contract=VC)
     assert ids(duplicate) == ["EIP712-DUPLICATE-FIELD"] and severity_of(duplicate, "EIP712-DUPLICATE-FIELD") == "major"
-    assert typed(encode_type="Empty()")["findings"] == []
+    assert typed(encode_type="Empty()", domain_chain_id=1, verifying_contract=VC)["findings"] == []
 
 
 @pytest.mark.parametrize("payload, field", [
@@ -1949,3 +1951,97 @@ def test_redaction_of_a_long_unbroken_run_is_linear_and_normal_tokens_are_unchan
     assert clipped == "g" * 72 + "..." and tools._text("g" * 40000 + "1") == "<redacted 40001 chars>"
     assert tools._text("a" * 200 + "1") == "<redacted 201 chars>"
     assert tools._text("ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8") == "<redacted 40 chars>"
+
+
+# --- QA-03 remediation: guards, scope, entry points, binding policy (one regression per fixed blocker and major) --------------
+
+
+@pytest.mark.parametrize("guard, flagged", [
+    ("require(msg.sender == owner || open);", True),  # the `open` branch reaches the write without a sender check
+    ("require(whitelist[msg.sender] || publicSale);", True),
+    ("require(msg.sender == owner && open);", False),  # both conjuncts hold: a real guard
+    ("require(msg.sender == owner);", False),
+])
+def test_an_or_ed_sender_check_is_not_an_access_guard(guard, flagged):
+    source = (f"contract S {{ address owner; bool open; bool publicSale; mapping(address => bool) whitelist; uint256 fee;\n"
+              f"    function setFee(uint256 f) external {{ {guard} fee = f; }} }}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert (result["unprotected"] == 1) is flagged and result["state_changing"] == 1
+    if flagged:
+        assert result["verdict"] == "fail" and ids(result) == ["ACCESS-UNPROTECTED-ADMIN"]
+
+
+def test_a_guard_belongs_to_the_contract_that_defines_it():
+    source = ("pragma solidity 0.8.20;\n"
+              "contract Vault { address owner; uint256 x; modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+              "    function setX(uint256 v) external onlyOwner { x = v; } }\n"
+              "contract Token { uint256 supply; modifier onlyOwner() { _; }\n"
+              "    function mint(uint256 v) external onlyOwner { supply += v; } }")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["verdict"] == "fail" and result["guarded"] == 1
+    assert severity_of(result, "ACCESS-UNPROTECTED-PRIVILEGED") == "blocker" and "Token.mint" in result["findings"][0]["summary"]
+
+
+def test_an_internal_helper_of_another_contract_does_not_guard_a_function():
+    source = ("pragma solidity 0.8.20;\n"
+              "contract Treasury { address owner; uint256 bal; function _sweep() internal { require(msg.sender == owner); bal = 0; } }\n"
+              "contract Pool { uint256 bal; function _sweep() internal { bal = 0; }\n"
+              "    function drainAll() external { _sweep(); } }")
+    result = ok("sol_access_matrix", {"source": source})
+    assert severity_of(result, "ACCESS-UNPROTECTED-PRIVILEGED") == "blocker" and "Pool.drainAll" in result["findings"][0]["summary"]
+
+
+@pytest.mark.parametrize("entry", ["fallback() external { owner = msg.sender; }", "receive() external payable { owner = msg.sender; }"])
+def test_an_unguarded_fallback_or_receive_that_writes_an_owner_is_a_blocker(entry):
+    result = ok("sol_access_matrix", {"source": f"contract W {{ address public owner; {entry} }}"})
+    assert result["state_changing"] == 1 and result["unprotected"] == 1 and result["verdict"] == "fail"
+    assert severity_of(result, "ACCESS-UNPROTECTED-FALLBACK") == "blocker"
+    assert result["findings"][0]["summary"].split()[0] in ("W.fallback()", "W.receive()")
+
+
+def test_assembly_delegatecall_is_a_delegatecall_for_upgrade_safety():
+    source = ("pragma solidity 0.8.28;\ncontract Impl { address impl;\n"
+              "    function forward(bytes calldata d) external { address t = impl; assembly { let ok := delegatecall(gas(), t, add(d, 32), mload(d), 0, 0) } }\n}")
+    result = upgrade(source, "transparent")
+    assert severity_of(result, "UPG-DELEGATECALL") == "major" and result["verdict"] == "unsafe"
+
+
+def test_selector_check_interface_id_xors_every_unique_signature():
+    result = ok("sol_selector_check", {"functions": ["collate_propagate_storage(bytes16)", "burn(uint256)"]})
+    assert result["verdict"] == "conflict" and ids(result) == ["SEL-COLLISION"] and result["interface_id"] == "0x00000000"
+
+
+def test_event_coverage_judges_each_function_by_its_own_callees():
+    source = ("pragma solidity 0.8.20;\n"
+              "contract Logger { event Ev(uint256 v); function _log(uint256 v) internal { emit Ev(v); } }\n"
+              "contract Vault { uint256 x; function set(uint256 v) external { x = v; _log(v); } function _log(uint256 v) internal {} }")
+    result = ok("sol_event_coverage", {"source": source, "min_coverage_pct": 100})
+    assert result["verdict"] == "fail" and result["coverage_pct"] == 0 and severity_of(result, "EVENT-MISSING") == "minor"
+
+
+def test_a_new_variable_running_past_the_old_layout_end_is_a_blocker():
+    base = [var("a", 0, 0, "t_uint256", 32), var("__gap", 1, 0, "t_array(t_uint256)50_storage", 1600)]
+    straddle = layout(base, [var("a", 0, 0, "t_uint256", 32), var("__gap", 1, 0, "t_array(t_uint256)49_storage", 1568),
+                             var("b", 50, 0, "t_array(t_uint256)2_storage", 64)])
+    assert severity_of(straddle, "STORAGE-PAST-OLD-END") == "blocker" and straddle["verdict"] == "incompatible"
+
+
+def test_deploy_rpc_userinfo_behind_a_raw_slash_is_a_credential_and_is_not_echoed():
+    result = plan(rpc_url="https://user:pa/ss@rpc.example.org/")
+    assert severity_of(result, "DEPLOY-RPC-CREDENTIAL") == "blocker" and result["verdict"] == "fail"
+    assert "pa/ss" not in json.dumps(result)
+
+
+def test_a_benign_query_parameter_with_a_secret_substring_is_not_a_credential():
+    assert "DEPLOY-RPC-CREDENTIAL" not in ids(plan(rpc_url="https://rpc.example.org/?monkey=1"))
+    assert severity_of(plan(rpc_url="https://rpc.example.org/?api_key=abcdef"), "DEPLOY-RPC-CREDENTIAL") == "blocker"
+
+
+def test_a_signature_domain_with_no_chain_and_no_contract_fails_without_any_field():
+    result = typed(encode_type=PERMIT)
+    assert set(ids(result)) == {"EIP712-DOMAIN-NO-CHAIN-ID", "EIP712-DOMAIN-NO-CONTRACT"} and result["verdict"] == "fail"
+
+
+def test_a_name_that_only_contains_a_privileged_word_is_not_privileged():
+    result = ok("sol_access_matrix", {"source": "contract S { uint256 total; function setSkillLevel(uint256 v) external { total = v; } }"})
+    assert ids(result) == ["ACCESS-UNPROTECTED-ADMIN"] and severity_of(result, "ACCESS-UNPROTECTED-ADMIN") == "major"
