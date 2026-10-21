@@ -281,7 +281,7 @@ export function buildTools(bridge: Bridge): SwarmTool[] {
           type: "string",
           enum: PATTERNS,
           description:
-            "DAG pattern: feature (13 tasks), hotfix (8), dependency (8), cloud-native (15: cloud architecture, events, golden path, cost, image), cluster (12: capacity, traffic, admission policy, GitOps, resilience; manifests are risk high), web3 (14: custody policy, contracts, audit, dapp; contracts and dapp are risk high), parallel (one lane per slices[] entry, then one Greptile review). parallel requires slices.",
+            "DAG pattern: feature (13 tasks), hotfix (8), dependency (8), cloud-native (16: cloud architecture, events, golden path, cost, image policy before the build and image evidence after it), cluster (14: capacity, traffic, admission policy, GitOps, network and policy scans after the manifests, resilience; manifests are risk high), web3 (15: custody policy, contracts, audit, custody compliance, dapp; contracts and dapp are risk high), parallel (one lane per slices[] entry, then one Greptile review). parallel requires slices.",
         },
         slices: {
           type: "array",

@@ -344,6 +344,7 @@ def _ref_pinning(parsed: dict) -> str:
 
 _HEREDOC = re.compile(r"<<-?\s*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _VAR = re.compile(r"\$\{(\w+)(?::?-([^}]*))?\}|\$(\w+)")
+_UNSUPPORTED_VAR = re.compile(r"\$\{(?!\w+(?::?-[^}]*)?\})")
 _URL_CREDENTIALS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,20}://[^\s/:@]{1,200}:[^\s/@]{1,200}@")
 _SECRET_WORDS = {"PASSWORD", "PASSWD", "PASSPHRASE", "SECRET", "SECRETS", "TOKEN", "TOKENS", "CREDENTIAL", "CREDENTIALS", "APIKEY"}
 _SECRET_PAIRS = {("API", "KEY"), ("PRIVATE", "KEY"), ("ACCESS", "KEY"), ("SECRET", "KEY"), ("AUTH", "KEY")}
@@ -456,8 +457,9 @@ def _parse_dockerfile(content: str) -> list[dict]:
 
 
 def _expand(text: str, variables: dict) -> tuple[str, bool]:
-    """Substitute ${V}, $V and ${V:-default} from `variables`; the flag is False when something stayed unresolved."""
-    resolved = True
+    """Substitute ${V}, $V and ${V:-default} from `variables`; the flag is False when something stayed unresolved, including a form this
+    reader does not evaluate (`${V:+word}`, `${V#pattern}`, ...), which Docker may expand to a different value."""
+    resolved = not _UNSUPPORTED_VAR.search(text)
 
     def replace(match: re.Match) -> str:
         nonlocal resolved
@@ -531,16 +533,18 @@ def _env_pairs(args: str) -> list[tuple[str, str]]:
     return [tuple(t.partition("=")[::2]) for t in tokens]
 
 
-def _run_stage(stage: dict, global_args: dict, inherited: dict, before: int) -> tuple[dict, dict]:
-    """(variables, env) at position `before` of one stage. `inherited` is the ENV its in-file parent hands down (empty for an external
-    base image: that image's ENV is not known to the scanner, see dockerfile_lint). `variables` maps each name to its build-time value
-    inside the stage: the inherited ENV, then the stage's own ARG and ENV in order. A global ARG (before the first FROM) is not visible
-    here: Docker makes it available to a stage only when the stage redeclares it, and then a bare `ARG NAME` takes the global default.
-    `env` holds the names bound by an ENV, inherited or the stage's own, with their values: an ENV overrides an ARG of the same name
-    whatever the order, so no later ARG rebinds such a name. An ARG with no value and no default stays empty, which _expand reads as
-    unresolved."""
-    variables = dict(inherited)
-    env = dict(inherited)
+def _run_stage(stage: dict, global_args: dict, inherited: tuple[dict, dict], before: int) -> tuple[dict, dict]:
+    """(variables, env) at position `before` of one stage. `inherited` is the (variables, env) pair its in-file parent ends with, both empty
+    for an external base image: that image's ENV is not known to the scanner, see dockerfile_lint. Docker carries a parent stage's build
+    arguments into a child stage through FROM as well as its ENV, so `variables` starts from the parent's build-time variables, which
+    already hold the parent's ENV. Each name maps to its build-time value inside the stage: the inherited values, then the stage's own ARG
+    and ENV in order. A global ARG (before the first FROM) is not visible here: Docker makes it available to a stage only when the stage
+    redeclares it, and then a bare `ARG NAME` takes the global default. `env` holds the names bound by an ENV, inherited or the stage's
+    own, with their values: an ENV overrides an ARG of the same name whatever the order, so no later ARG rebinds such a name. An ARG with
+    no value and no default stays empty, which _expand reads as unresolved."""
+    inherited_variables, inherited_env = inherited
+    variables = dict(inherited_variables)
+    env = dict(inherited_env)
     for ins in stage["instructions"][:before]:
         if ins["kw"] == "ARG":
             for token in _tokens(ins["args"]):
@@ -560,18 +564,19 @@ def _run_stage(stage: dict, global_args: dict, inherited: dict, before: int) -> 
     return variables, env
 
 
-def _stage_env_table(stages: list[dict], global_args: dict) -> list[dict]:
-    """The ENV each stage hands to its children, indexed by stage. A parent always precedes its child, so one pass in stage order
-    computes every entry from finished entries: no recursion, and each stage runs once, so the cost is linear in the instructions."""
-    table: list[dict] = []
+def _stage_scopes(stages: list[dict], global_args: dict) -> list[tuple[dict, dict]]:
+    """(variables, env) at the end of each stage, indexed by stage: what its in-file children inherit through FROM. A parent always
+    precedes its child, so one pass in stage order computes every entry from finished entries: no recursion, and each stage runs once,
+    so the cost is linear in the instructions."""
+    table: list[tuple[dict, dict]] = []
     for stage in stages:
         parent = stage["parent"]
-        inherited = table[parent] if parent is not None else {}
-        table.append(_run_stage(stage, global_args, inherited, len(stage["instructions"]))[1])
+        inherited = table[parent] if parent is not None else ({}, {})
+        table.append(_run_stage(stage, global_args, inherited, len(stage["instructions"])))
     return table
 
 
-def _effective_user(stages: list[dict], table: list[dict], global_args: dict, index: int) -> tuple[dict | None, dict]:
+def _effective_user(stages: list[dict], table: list[tuple[dict, dict]], global_args: dict, index: int) -> tuple[dict | None, dict]:
     """The USER instruction effective in stage `index` (inherited through FROM) and the build variables visible to it."""
     seen: set[int] = set()
     current: int | None = index
@@ -581,7 +586,7 @@ def _effective_user(stages: list[dict], table: list[dict], global_args: dict, in
         for position in range(len(instructions) - 1, -1, -1):
             if instructions[position]["kw"] == "USER":
                 parent = stages[current]["parent"]
-                inherited = table[parent] if parent is not None else {}
+                inherited = table[parent] if parent is not None else ({}, {})
                 return instructions[position], _run_stage(stages[current], global_args, inherited, position)[0]
         current = stages[current]["parent"]
     return None, dict(global_args)
@@ -619,7 +624,7 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
                 severity = "major" if require_digest_pin else "minor"
                 findings.append(_f("docker.base-not-digest-pinned", severity, f"base image {text!r} is pinned by tag only; add @sha256:<digest>", at))
 
-    table = _stage_env_table(stages, global_args)
+    table = _stage_scopes(stages, global_args)
     user, user_variables = _effective_user(stages, table, global_args, final)
     user_text, user_resolved = _expand(user["args"], user_variables) if user else ("", True)
     user_name = user_text.split(":", 1)[0].strip()
@@ -638,7 +643,7 @@ def _lint_dockerfile(content: str, require_healthcheck: bool, require_digest_pin
 
     toolchain_line = 0
     for stage_index, stage in enumerate(stages):
-        env: dict[str, str] = {}
+        env: dict[str, str] = dict(table[stage["parent"]][1]) if stage["parent"] is not None else {}
         for ins in stage["instructions"]:
             at = f"line {ins['line']}"
             kw, text = ins["kw"], ins["text"]

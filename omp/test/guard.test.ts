@@ -927,6 +927,8 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     ["argocd app delete-resource prod-api --kind Pod --name p", A22, "argocd-change"],
     ["argocd appset delete prod-set", A22, "argocd-change"],
     ["argocd appset create prod-set.yaml", A22, "argocd-change"],
+    // `app actions run` changes the app's workloads: the production checks apply, while `actions list` only reads
+    ["argocd app actions run prod-api restart --kind Deployment", A22, "argocd-change"],
     // creating an app is a write: a production destination, name or server, or a prune, blocks as the sync of the same app does
     ["argocd app create prod-api --repo https://git.example.com/r --path p --dest-server https://k.example.com --dest-namespace production --sync-policy automated", A22, "argocd-change"],
     ["argocd app create api --dest-namespace production --sync-policy automated", A22, "argocd-change"],
@@ -963,6 +965,7 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
       "argocd app sync prod-api --dry-run", "argocd app sync prod-api --dry-run=client", "argocd app sync prod-api --prune --dry-run",
       "argocd app sync api --prune=false", "argocd app sync api --server argocd.staging.example.com", "argocd cluster list", "argocd cluster get prod-ctx",
       "argocd repo list", "argocd proj get production", "argocd cluster add staging-ctx", "argocd version", "argocd login argocd.prod.example.com",
+      "argocd app actions list prod-api", "argocd app actions run staging-api restart --kind Deployment",
     ].map((c): [string, string] => [c, A22]),
     ...[
       "flux get kustomizations -n production", "flux check", "flux get helmreleases --context prod", "flux suspend kustomization apps -n flux-system",
@@ -1022,6 +1025,8 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     ["yarn hardhat deploy --network=arbitrum", "chain-broadcast"],
     ["hardhat ignition deploy ignition/modules/C.ts --network mainnet", "chain-broadcast"],
     ["HARDHAT_NETWORK=mainnet npx hardhat run scripts/deploy.ts", "chain-broadcast"],
+    // an env prefix on a shell -c wrapper is the network its child runs with
+    ['HARDHAT_NETWORK=mainnet bash -c "hardhat run scripts/deploy.ts"', "chain-broadcast"],
     ["truffle migrate --network mainnet", "chain-broadcast"],
     ["truffle deploy --network goerli", "chain-broadcast"],
     ["brownie run scripts/deploy.py --network mainnet", "chain-broadcast"],

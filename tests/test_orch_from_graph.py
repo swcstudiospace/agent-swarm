@@ -345,6 +345,20 @@ def test_contracts_dir_routes_only_smart_contracts_to_a26(tmp_path, step, owner)
     assert [task["agent"] for task in tasks] == [owner]
 
 
+def test_a_dockerfile_edit_goes_to_the_builder_because_the_supply_agent_never_edits_one(tmp_path):
+    """A18 is report-only and sends Dockerfile fixes to A11, so the edit is A11's iac.change task."""
+    step = "Edit Dockerfile to run the service as non-root"
+    tasks = _plan(tmp_path, _write_summary(tmp_path, [_node("n1", "generate", [step])]))["tasks"]
+    assert [(task["agent"], task["capability"]) for task in tasks] == [("A11", "iac.change")]
+
+
+def test_a_vyper_step_never_reaches_the_solidity_only_contract_owner(tmp_path):
+    """A26's required checks read Solidity only and fail on Vyper source, so .vy has no A26 route."""
+    step = "Edit src/Token.vy to add a fee"
+    tasks = _plan(tmp_path, _write_summary(tmp_path, [_node("n1", "generate", [step])]))["tasks"]
+    assert [task["agent"] for task in tasks] == ["A03"]
+
+
 def test_node_id_leaves_room_for_prefix_and_owner_suffix(tmp_path):
     """orch_plan's default prefix is six characters ("T" + 4 hex + "-") and a split adds "-aNN"."""
     legal = "n" + "x" * 117  # 118: 128 - 6 - 4

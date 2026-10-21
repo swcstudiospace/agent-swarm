@@ -7,10 +7,12 @@ Patterns encode the reference event flows of 04-integration-plan.md §3:
   dependency  SEC scan → MAINT patch.task → BE bumps → gates → REL
   cloud-native  brief → REQ → ARCH → cloud architecture → (event topology → BE ∥ golden path ∥ cost model) → image
               evidence → (QA ∥ REV ∥ SEC gates) → DEVOPS → REL → (OBS ∥ DOC); gates follow the plan risk class
-  cluster     capacity review → (traffic ∥ admission policy) → GitOps manifests → resilience → (QA ∥ REV ∥ SEC gates)
-              → rollout plan → REL → (OBS ∥ runbook); the manifest row is risk high, so all four gates apply
-  web3        REQ → ARCH → custody policy → smart contracts → (dapp ∥ audit ∥ chain infra) → (QA ∥ REV ∥ SEC gates)
-              → DEVOPS → REL → (OBS ∥ DOC); contract and dapp rows are risk high, mainnet stays human-approved
+  cluster     capacity review → (traffic ∥ admission policy) → GitOps manifests → (mesh and policy scans of the
+              manifests ∥ resilience) → (QA ∥ REV ∥ SEC gates) → rollout plan → REL → (OBS ∥ runbook); the manifest
+              row is risk high, so all four gates apply
+  web3        REQ → ARCH → custody policy draft → smart contracts → (dapp ∥ audit ∥ chain infra) → custody compliance
+              after the audit → (QA ∥ REV ∥ SEC gates) → DEVOPS → REL → (OBS ∥ DOC); contract and dapp rows are risk
+              high, mainnet stays human-approved
   parallel    one short lane per disjoint blast radius (same agent allowed more than once, each on its own
               branch and worktree) → join merges the branches → one Greptile review of the merged branch,
               plus the rest of the risk-class gates once. Slices come from a ```blast-radii``` block, --slices,
@@ -105,12 +107,14 @@ PATTERNS: dict[str, list[tuple]] = {
         ("net", "mesh.traffic", "A23", "Traffic, ingress and NetworkPolicy design", ["cap"], []),
         ("pol", "kpol.admission", "A24", "Pod Security, RBAC and admission policy set", ["cap"], []),
         ("gitops", "gitops.manifest", "A22", "Manifests, overlays and sync policy for the workload", ["cap", "net", "pol"], None, "high", []),
+        ("netchk", "mesh.netpol", "A23", "NetworkPolicy and mesh coverage scan of the rendered manifests", ["gitops"], []),
+        ("polchk", "kpol.admission", "A24", "Pod Security, RBAC and admission scan of the rendered manifests", ["gitops"], []),
         ("res", "resilience.backup", "A25", "PDB, spread, probes, backup and DR evidence", ["gitops"], []),
         ("qa", "gate.quality", "A08", "Quality gate: tests + verdict", ["gitops"], {"gate": "quality", "for": ["gitops"]}),
         ("rev", "gate.review", "A09", "Review gate: manifest and policy review", ["gitops"], {"gate": "review", "for": ["gitops"]}),
-        ("sec", "gate.security", "A10", "Security gate: manifest, policy and supply-chain verdict", ["gitops", "pol"],
+        ("sec", "gate.security", "A10", "Security gate: manifest, policy and supply-chain verdict", ["gitops", "polchk"],
          {"gate": "security", "for": ["gitops"]}),
-        ("roll", "gitops.rollout", "A22", "Progressive-delivery and promotion plan", ["qa", "rev", "sec", "res"], []),
+        ("roll", "gitops.rollout", "A22", "Progressive-delivery and promotion plan", ["qa", "rev", "sec", "res", "netchk"], []),
         ("rel", "release.plan", "A12", "Release gate + canary plan", ["roll"], {"gate": "release", "for": ["gitops"]}),
         ("obs", "obs.slo", "A13", "SLOs, alerts, deploy telemetry guardrails", ["rel"], []),
         ("docs", "docs.runbook", "A15", "Runbook and changelog", ["rel"], []),
@@ -118,17 +122,18 @@ PATTERNS: dict[str, list[tuple]] = {
     "web3": [
         ("req", "req.spec", "A02", "Requirements spec + acceptance criteria", [], []),
         ("arch", "design.blueprint", "A03", "Protocol architecture, interfaces, ADRs", ["req"], []),
-        ("cust", "custody.policy", "A30", "Signer, multisig, timelock and key-ceremony policy", ["arch"], []),
+        ("cust", "custody.policy", "A30", "Signer, multisig, timelock and key-ceremony policy draft, before the audit", ["arch"], []),
         ("sol", "web3.contract", "A26", "Smart contracts, tests, gas report and deployment plan", ["arch", "cust"], None, "high", []),
         ("chain", "chain.node", "A28", "Network guard, RPC policy and indexer plan", ["sol", "cust"], []),
         ("dapp", "dapp.wallet", "A29", "Wallet and chain integration against the ABI", ["arch", "sol", "chain"], None, "high", []),
         ("aud", "audit.static", "A27", "Contract audit findings and invariant suite", ["sol"], []),
+        ("comp", "custody.compliance", "A30", "Post-audit custody evidence: privileged roles, timelock band, compliance pack", ["cust", "aud"], []),
         ("qa", "gate.quality", "A08", "Quality gate: tests + verdict", ["sol", "dapp", "aud"], {"gate": "quality", "for": ["sol", "dapp"]}),
         ("rev", "gate.review", "A09", "Review gate: code review verdict", ["sol", "dapp"], {"gate": "review", "for": ["sol", "dapp"]}),
         ("sec", "gate.security", "A10", "Security gate: includes the audit findings", ["sol", "dapp", "aud"],
          {"gate": "security", "for": ["sol", "dapp"]}),
         ("build", "build.artifact", "A11", "CI validation + build artifact record", ["qa", "rev", "sec"], []),
-        ("rel", "release.plan", "A12", "Release gate; mainnet deployment stays human-approved", ["build", "chain"],
+        ("rel", "release.plan", "A12", "Release gate; mainnet deployment stays human-approved", ["build", "chain", "comp"],
          {"gate": "release", "for": ["sol", "dapp"]}),
         ("obs", "obs.slo", "A13", "SLOs, alerts, chain and indexer monitoring guardrails", ["rel"], []),
         ("docs", "docs.bundle", "A15", "Docs bundle, API reference, runbook, changelog", ["rel"], []),

@@ -422,8 +422,12 @@ def _items_of(repo: Repo, kusts: dict, directory: str, memo: dict, active: froze
                     real = item["metadata"].get("name")
                     named = isinstance(real, str) and bool(real)
                     renamed = item["kind"] not in PREFIX_EXEMPT_KINDS
-                    changes = bool((renamed and named and (prefix or suffix)) or (namespace and not cluster))
-                    new_name = (prefix + real + suffix if renamed else real) if named else None
+                    namespace_object = bool(namespace) and named and item["apiVersion"] == "v1" and item["kind"] == "Namespace"  # kustomize's namespace transformer renames it
+                    changes = bool((renamed and named and (prefix or suffix)) or (namespace and not cluster) or namespace_object)
+                    if namespace_object:
+                        new_name = namespace
+                    else:
+                        new_name = (prefix + real + suffix if renamed else real) if named else None
                     items.append(_minimal(item, new_name, namespace if namespace and not cluster else None) if changes else item)
             elif target in kusts and target not in path:  # the render is cut here: the child is not part of this render
                 _depth_cut(repo, rel, kusts[target][0])
@@ -518,12 +522,17 @@ def _check_kustomize(repo: Repo) -> dict[str, tuple[str, dict]]:
         if len(every) > ITEM_LIMIT:
             repo.reasons.append(f"{rel}: kustomize checked the first {ITEM_LIMIT} of more than {ITEM_LIMIT} rendered objects for duplicate ids and patch targets")
         result = rules.kustomize_check({"kustomization": _inline_patches(repo, directory, kust), "resources": items})
-        if result.get("state") == "SUCCESS" and _opaque(repo, kusts, directory, opaque):
-            # remote bases, components, Helm charts and generators add objects this scan cannot see: a patch target that matches none of the visible ones is unproven, not missing
-            hidden = [f for f in result["findings"] if f["id"].startswith("patch-target-not-found")]
-            if hidden:
-                repo.reasons.append(f"{rel}: {len(hidden)} patch target(s) unproven, the tree renders objects this scan cannot see")
-            result["findings"] = [f for f in result["findings"] if not f["id"].startswith("patch-target-not-found")]
+        if result.get("state") == "SUCCESS":
+            causes = ["the tree renders objects this scan cannot see"] if _opaque(repo, kusts, directory, opaque) else []
+            if len(every) > ITEM_LIMIT:
+                causes.append(f"the scan judges only the first {ITEM_LIMIT} rendered objects")
+            if causes:
+                # objects this scan does not judge (beyond the limit, or remote bases, components, Helm charts, generators): a patch target
+                # that matches none of the judged objects is unproven, not missing
+                hidden = [f for f in result["findings"] if f["id"].startswith("patch-target-not-found")]
+                if hidden:
+                    repo.reasons.append(f"{rel}: {len(hidden)} patch target(s) unproven, {' and '.join(causes)}")
+                result["findings"] = [f for f in result["findings"] if not f["id"].startswith("patch-target-not-found")]
         repo.from_tool("kustomize", rel, result)
         for generator in kust.get("secretGenerator") or []:
             if not isinstance(generator, dict):
@@ -555,49 +564,67 @@ def _check_apps(repo: Repo) -> None:
                 repo.from_tool("apps", rel, rules.app_sync_policy({"resource": doc, "environment": environment}))
 
 
-def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set, fields: tuple = ("resources", "bases")) -> list[str]:
-    """Files whose objects belong to the Kustomize tree rooted at directory, in the order a depth-first walk meets them. Iterative, so a long
-    chain of kustomizations cannot exhaust the interpreter's recursion limit."""
+def _in_namespace(doc: dict, namespace: str) -> dict:
+    """The object as the kustomization namespace transformer leaves it: a namespaced object moves to the namespace, and a v1 Namespace takes
+    it as its name. Everything else, annotations included, is kept, so the sync order sees the namespace the object will have."""
+    if not namespace:
+        return doc
+    if doc["apiVersion"] == "v1" and doc["kind"] == "Namespace":
+        return {**doc, "metadata": {**doc["metadata"], "name": namespace}}
+    if doc["kind"] in rules.CLUSTER_SCOPED_KINDS:
+        return doc
+    return {**doc, "metadata": {**doc["metadata"], "namespace": namespace}}
+
+
+def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set, fields: tuple = DIRECTORY_FIELDS) -> list[tuple[str, str]]:
+    """(file, namespace) of the objects that belong to the Kustomize tree rooted at directory, in the order a depth-first walk meets them.
+    namespace is the one kustomize leaves on the object: that of the outermost kustomization on the walk which sets one, "" when none does.
+    Components are part of the tree, so their objects are ordered with the objects that use them. Iterative, so a long chain of
+    kustomizations cannot exhaust the interpreter's recursion limit."""
     if directory in seen:
         return []
-    files: list[str] = []
+    files: list[tuple[str, str]] = []
     end = object()
 
-    def enter(node: str):
+    def enter(node: str, outer: str):
         seen.add(node)
-        files.append(kusts[node][0])
         kust = kusts[node][1]
-        return iter([None if _remote(entry) else _join(node, entry) for field in fields for entry in _strings(kust.get(field))])
+        own = kust.get("namespace")
+        space = outer or (own if isinstance(own, str) else "")
+        files.append((kusts[node][0], space))
+        return space, iter([None if _remote(entry) else _join(node, entry) for field in fields for entry in _strings(kust.get(field))])
 
-    stack = [(directory, enter(directory))]
+    stack = [enter(directory, "")]
     while stack:
-        target = next(stack[-1][1], end)
+        space, targets = stack[-1]
+        target = next(targets, end)
         if target is end:
             stack.pop()
         elif target in kusts:
             if target not in seen:
-                stack.append((target, enter(target)))
+                stack.append(enter(target, space))
         elif target in repo.docs:
-            files.append(target)
+            files.append((target, space))
     return files
 
 
 def _check_waves(repo: Repo, kusts: dict) -> None:
     referenced = _referenced(kusts)
-    units: list[tuple[str, list[str]]] = []
+    units: list[tuple[str, list[tuple[str, str]]]] = []
     covered: set[str] = set()
     for directory in sorted(kusts):
         if directory not in referenced:
             files = _tree_files(repo, kusts, directory, set())
-            covered.update(files)
+            covered.update(rel for rel, _ in files)
             units.append((kusts[directory][0], files))
     loose: dict[str, list[str]] = {}
     for rel in sorted(repo.docs):
         if rel not in covered and any(_is_object(d) for d in repo.docs[rel]):
             loose.setdefault(posixpath.dirname(rel), []).append(rel)
-    units += [((directory or ".") + "/", files) for directory, files in sorted(loose.items())]
+    units += [((directory or ".") + "/", [(rel, "") for rel in files]) for directory, files in sorted(loose.items())]
     for label, files in units:
-        manifests = [d for rel in files for d in repo.docs.get(rel, []) if _is_object(d) and not d["apiVersion"].startswith("kustomize.config.k8s.io/")]
+        manifests = [_in_namespace(d, space) for rel, space in files for d in repo.docs.get(rel, [])
+                     if _is_object(d) and not d["apiVersion"].startswith("kustomize.config.k8s.io/")]
         if not any(_annotated(m, rules.WAVE_ANNOTATION) or _annotated(m, rules.HOOK_ANNOTATION) for m in manifests) and not _defines_a_kind_here(manifests):
             continue
         if len(manifests) > UNIT_LIMIT:

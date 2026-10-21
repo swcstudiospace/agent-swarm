@@ -19,8 +19,8 @@ GATE_OWNERS = {"quality": "A08", "review": "A09", "security": "A10", "release": 
 # pattern -> (task count, implementer suffixes that the gate tasks target, implementer suffixes pinned to risk high)
 PATTERN_SHAPE = {
     "cloud-native": (16, {"be", "events"}, set()),
-    "cluster": (12, {"gitops"}, {"gitops"}),
-    "web3": (14, {"sol", "dapp"}, {"sol", "dapp"}),
+    "cluster": (14, {"gitops"}, {"gitops"}),
+    "web3": (15, {"sol", "dapp"}, {"sol", "dapp"}),
 }
 
 
@@ -141,17 +141,35 @@ def test_cloud_native_follows_the_plan_risk_class(tmp_path, plan_risk):
 def test_domain_owners_sit_upstream_of_the_rows_that_consume_them(tmp_path):
     cluster = {t["task_id"]: t for t in _plan(tmp_path / "c", "cluster")}
     assert cluster["P-gitops"]["depends_on"] == ["P-cap", "P-net", "P-pol"]
-    assert cluster["P-roll"]["depends_on"] == ["P-qa", "P-rev", "P-sec", "P-res"]
+    assert cluster["P-roll"]["depends_on"] == ["P-qa", "P-rev", "P-sec", "P-res", "P-netchk"]
     web3 = {t["task_id"]: t for t in _plan(tmp_path / "w", "web3")}
     assert web3["P-sol"]["depends_on"] == ["P-arch", "P-cust"] and web3["P-sec"]["depends_on"] == ["P-sol", "P-dapp", "P-aud"]
     assert web3["P-qa"]["depends_on"] == ["P-sol", "P-dapp", "P-aud"]
-    assert web3["P-rel"]["depends_on"] == ["P-build", "P-chain"]
+    assert web3["P-rel"]["depends_on"] == ["P-build", "P-chain", "P-comp"]
     assert web3["P-dapp"]["depends_on"] == ["P-arch", "P-sol", "P-chain"]
     cloud = {t["task_id"]: t for t in _plan(tmp_path / "k", "cloud-native")}
     assert cloud["P-be"]["depends_on"] == ["P-arch", "P-cloud", "P-events", "P-plat"]
     assert cloud["P-events"]["depends_on"] == ["P-arch", "P-cloud", "P-plat"]
     assert cloud["P-img"]["depends_on"] == ["P-be"] and cloud["P-prov"]["depends_on"] == ["P-build"]
     assert cloud["P-rel"]["depends_on"] == ["P-build", "P-prov", "P-plat", "P-cost"]
+
+
+def test_post_manifest_scans_run_after_the_manifests_they_audit(tmp_path):
+    """A23 and A24 audit the manifests A22 renders, so their scans follow gitops and gate the rollout."""
+    cluster = {t["task_id"]: t for t in _plan(tmp_path, "cluster")}
+    assert cluster["P-netchk"]["agent_id"] == "A23" and cluster["P-netchk"]["capability"] == "mesh.netpol"
+    assert cluster["P-polchk"]["agent_id"] == "A24" and cluster["P-polchk"]["capability"] == "kpol.admission"
+    assert cluster["P-netchk"]["depends_on"] == ["P-gitops"] and cluster["P-polchk"]["depends_on"] == ["P-gitops"]
+    assert cluster["P-sec"]["depends_on"] == ["P-gitops", "P-polchk"]
+
+
+def test_custody_compliance_waits_for_the_audit_and_feeds_the_release(tmp_path):
+    """custody.policy needs audit.report for its thresholds, so the evidence pack is a row after the audit."""
+    web3 = {t["task_id"]: t for t in _plan(tmp_path, "web3")}
+    assert web3["P-cust"]["depends_on"] == ["P-arch"]
+    assert web3["P-comp"]["agent_id"] == "A30" and web3["P-comp"]["capability"] == "custody.compliance"
+    assert web3["P-comp"]["depends_on"] == ["P-cust", "P-aud"]
+    assert "P-comp" in web3["P-rel"]["depends_on"]
 
 
 def _ancestors(by_id: dict[str, dict], task_id: str) -> set[str]:
@@ -195,7 +213,6 @@ def test_an_unknown_pattern_is_refused_by_the_planner(tmp_path):
 # --- (c) file paths route to the owning agent --------------------------------------------------------------------------
 ROUTES = [
     ("contracts/Vault.sol", "A26", "web3.contract"),
-    ("src/Token.vy", "A26", "web3.contract"),
     ("foundry.toml", "A26", "web3.contract"),
     ("hardhat.config.ts", "A26", "web3.contract"),
     ("contracts/script/Deploy.s.sol", "A26", "web3.contract"),
@@ -210,8 +227,8 @@ ROUTES = [
     ("deploy/overlays/prod/patch.yaml", "A22", "gitops.manifest"),
     ("kustomization.yaml", "A22", "gitops.manifest"),
     ("infra/k8s/ingress.yaml", "A22", "gitops.manifest"),
-    ("Dockerfile", "A18", "supply.image"),
-    ("services/api/Dockerfile.prod", "A18", "supply.image"),
+    ("Dockerfile", "A11", "iac.change"),
+    ("services/api/Dockerfile.prod", "A11", "iac.change"),
     ("asyncapi.yaml", "A19", "event.topology"),
     ("asyncapi.json", "A19", "event.topology"),
     ("serverless.yml", "A19", "event.topology"),

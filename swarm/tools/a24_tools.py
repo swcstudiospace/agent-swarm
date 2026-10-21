@@ -29,6 +29,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
+from swarm.redact import redact_text
 from swarm.tools.support import respond
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
@@ -69,7 +70,19 @@ def _dec(value) -> Decimal:
     return Decimal(repr(value))
 
 
+def _public(text: str) -> str:
+    """`text` with each credential-shaped word replaced by swarm.redact's `[REDACTED]`. A string with no such word comes back
+    unchanged. When one is found, the words are checked one at a time: the key-value rule would otherwise cut a phrase such as
+    `automountServiceAccountToken: false` at its colon."""
+    if redact_text(text) == text:
+        return text
+    return "".join(redact_text(part) if i % 2 == 0 else part for i, part in enumerate(re.split(r"(\s+)", text)))
+
+
 def _finding(rule: str, severity: str, location: str, summary: str) -> dict:
+    """A finding. Its location and summary copy names from the manifest, and a name can hold a pasted credential, so both pass
+    through `_public`. The rule id is a fixed identifier and is left as written."""
+    location, summary = _public(location), _public(summary)
     return {"id": f"{rule}:{location}" if location else rule, "severity": severity, "summary": summary}
 
 

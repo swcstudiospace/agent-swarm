@@ -417,28 +417,82 @@ def _hiding_key(fn: dict) -> tuple:
     return ("function", fn["name"], tuple(_TYPE_SPELLING_RE.sub(lambda m: _TYPE_SPELLING[m.group(1)], t) for t, _ in fn["params"]))
 
 
+def _direct_parents(contract: dict, by_name: dict[str, dict]) -> list[dict]:
+    """The bases of `contract` defined in this source, in the order written (`is A, B` gives A, B)."""
+    parents: list[dict] = []
+    for base in contract["bases"]:
+        parent = by_name.get(base)
+        if parent is not None and parent is not contract and all(parent is not p for p in parents):
+            parents.append(parent)
+    return parents
+
+
+def _c3(name: str, parents: list[dict]) -> list[str]:
+    """C3 merge of the parents' linearizations and of the parents themselves, last-written first: Solidity's order. An
+    inconsistent order (solc rejects it) keeps the leftover names in the order they were listed."""
+    sequences = [list(p["_linearization"]) for p in parents] + [[p["name"] for p in reversed(parents)]]
+    sequences = [s for s in sequences if s]
+    pos = [0] * len(sequences)
+    in_tail: dict[str, int] = {}  # how many sequences hold a name after their head
+    for s in sequences:
+        for item in s[1:]:
+            in_tail[item] = in_tail.get(item, 0) + 1
+    order = [name]
+    while True:
+        chosen = next((s[pos[i]] for i, s in enumerate(sequences) if pos[i] < len(s) and in_tail.get(s[pos[i]], 0) == 0), None)
+        if chosen is None:
+            break
+        order.append(chosen)
+        for i, s in enumerate(sequences):
+            if pos[i] < len(s) and s[pos[i]] == chosen:
+                pos[i] += 1
+                if pos[i] < len(s):
+                    in_tail[s[pos[i]]] -= 1
+    for i, s in enumerate(sequences):
+        order.extend(s[pos[i]:])
+    return list(dict.fromkeys(order))
+
+
+def _linearization(contract: dict, by_name: dict[str, dict]) -> list[str]:
+    """Solidity's linearization of `contract` over the bases defined in this source, as contract names, most derived first: in
+    `contract C is A, B` the base written last (B) comes before A, so B's override of a function of A is the one C sees. Cached on
+    each contract as names (no reference cycles). Iterative, so an inheritance chain of any depth is safe; the edge that closes a
+    cycle (rejected by solc) is left out."""
+    if "_linearization" in contract:
+        return contract["_linearization"]
+    stack = [(contract, iter(_direct_parents(contract, by_name)))]
+    on_path = {id(contract)}
+    while stack:
+        node, parents = stack[-1]
+        parent = next(parents, None)
+        if parent is not None:
+            if "_linearization" not in parent and id(parent) not in on_path:
+                on_path.add(id(parent))
+                stack.append((parent, iter(_direct_parents(parent, by_name))))
+            continue
+        stack.pop()
+        on_path.discard(id(node))
+        node["_linearization"] = _c3(node["name"], [p for p in _direct_parents(node, by_name) if "_linearization" in p])
+    return contract["_linearization"]
+
+
 def visible_index(contract: dict, contracts: list[dict]) -> dict[str, list[dict]]:
     """Functions and modifiers `contract` can call or apply: its own and those of its bases defined in this source, the most
-    derived first. A definition hides only the base definitions it overrides (see _hiding_key), so an inherited overload the child
-    does not redefine stays callable; a same-named callable of an unrelated contract is never visible: a guard belongs to the
-    contract that defines it."""
+    derived first (Solidity's linearization, see _linearization). A definition hides only the base definitions it overrides (see
+    _hiding_key), so an inherited overload the child does not redefine stays callable; a same-named callable of an unrelated
+    contract is never visible: a guard belongs to the contract that defines it."""
     by_name: dict[str, dict] = {}
     for c in contracts:
         by_name.setdefault(c["name"], c)
     index: dict[str, list[dict]] = {}
     hidden: set[tuple] = set()
-    queue, seen = [contract], {id(contract)}
-    for current in queue:  # the list grows while it is walked: a breadth-first walk up the bases
+    ordered = [contract] + [by_name[name] for name in _linearization(contract, by_name)[1:]]
+    for current in ordered:
         own = [fn for fn in current["functions"] if fn["kind"] in ("function", "modifier")]
         for fn in own:
             if _hiding_key(fn) not in hidden:
                 index.setdefault(fn["name"], []).append(fn)
         hidden.update(_hiding_key(fn) for fn in own)
-        for base in current["bases"]:
-            parent = by_name.get(base)
-            if parent is not None and id(parent) not in seen:
-                seen.add(id(parent))
-                queue.append(parent)
     return index
 
 
@@ -1580,9 +1634,9 @@ class _CallSites:
         return False
 
     def _is_check_read(self, flag: str, p: int) -> bool:
-        """Whether the read of `flag` at `p` checks the call that bound it: a require or assert argument, a return expression, or an
-        if whose condition is exactly the flag or its negation and whose failure path reverts or returns (D-B). A read that only
-        stores, logs or assigns the flag is not a check."""
+        """Whether the read of `flag` at `p` checks the call that bound it: a require or assert condition that tests the flag, a
+        return expression, or an if whose condition is exactly the flag or its negation and whose failure path reverts or returns
+        (D-B). A read that only stores, logs or assigns the flag, or sits in the message of a require, is not a check."""
         clean = self.clean
         i = bisect.bisect_left(self.seps, p)
         s = self.seps[i - 1] + 1 if i else 0
@@ -1598,7 +1652,9 @@ class _CallSites:
             if close is None or close <= p:
                 continue  # the read is not in this condition
             if kind != "if":
-                return True  # the read is an argument of a require or assert
+                if self._requires_flag(flag, open_, close, p):
+                    return True  # the read is in the condition of a require or assert that tests the flag
+                continue
             cond = clean[open_ + 1:close].strip()
             then_start = _WS.match(clean, close + 1).end()
             escaped = re.escape(flag)
@@ -1610,6 +1666,38 @@ class _CallSites:
                 if re.match(r"else\b", clean[else_at:else_at + 5]) and self._branch_exits(else_at + 4):
                     return True  # `if (ok) ... else revert ...`: the else-branch is the failure path
         return False
+
+    def _requires_flag(self, flag: str, open_: int, close: int, p: int) -> bool:
+        """Whether the read at `p` is in the condition of the require or assert whose '(' is at `open_`, and that condition tests
+        `flag`: the flag is one conjunct of its top-level `&&` chain (`ok`, `(ok)`, `ok == true`). The first top-level argument is the
+        condition; a message argument (`require(x, ok ? "a" : "b")`) and a disjunct (`x || ok`) do not test the flag."""
+        clean = self.clean
+        end, depth = close, 0
+        for j in range(open_ + 1, close):
+            if clean[j] in "([{":
+                depth += 1
+            elif clean[j] in ")]}":
+                depth -= 1
+            elif clean[j] == "," and depth == 0:
+                end = j
+                break
+        if p >= end:
+            return False
+        cond, parts, depth, start, j = clean[open_ + 1:end], [], 0, 0, 0
+        while j < len(cond):
+            if cond[j] in "([{":
+                depth += 1
+            elif cond[j] in ")]}":
+                depth -= 1
+            elif depth == 0 and cond.startswith("&&", j):
+                parts.append(cond[start:j])
+                start = j + 2
+                j += 2
+                continue
+            j += 1
+        parts.append(cond[start:])
+        conjunct = re.compile(r"\(*\s*" + re.escape(flag) + r"\s*(?:==\s*true\s*)?\)*")
+        return any(conjunct.fullmatch(part.strip()) for part in parts)
 
     def _is_tuple_target(self, p: int) -> bool:
         """Whether the name at `p` is a slot of a tuple assignment target, `(x, name) = ...`: the nearest '(' around it, in its
