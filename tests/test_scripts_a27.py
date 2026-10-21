@@ -220,7 +220,7 @@ def test_serious_fix_without_regression_test_or_reaudit_is_major(repo):
     rc, data, _ = repo.check([good(reaudited=None)])
     assert rc == 1 and kinds(data) == {"fix-unverified": "major"}
     rc, data, _ = repo.check([good(severity="medium", regression_test=False, reaudited=False)])
-    assert rc == 0 and data["findings"] == []
+    assert rc == 0 and data["status"] == "ok" and kinds(data) == {"fix-unverified": "minor"}
 
 
 def test_open_critical_is_a_blocker_and_open_high_is_major(repo):
@@ -255,7 +255,16 @@ def test_possible_duplicates_are_minor(repo):
 def test_duplicate_detection_notes_when_it_only_covered_the_first_200(repo):
     findings = [good(id=f"F-{i:03d}", title=f"unique title number {i} alpha{i}", location=f"src/F{i}.sol:1", severity="low", status="open", poc=None, fix_commit=None) for i in range(201)]
     rc, data, _ = repo.check(findings)
-    assert kinds(data) == {"dedupe-truncated": "info"} and data["findings_total"] == 201
+    assert rc == 1 and kinds(data) == {"dedupe-truncated": "info", "scan-incomplete": "major"} and data["findings_total"] == 201  # a truncated comparison is unanalysed input
+
+
+def test_a_duplicate_pair_beyond_the_dedupe_window_is_reported_not_silently_missed(repo):
+    findings = [good(id="F-000", title="shared title", location="src/Vault.sol:1", severity="low", status="open", poc=None, fix_commit=None)]
+    findings += [good(id=f"F-{i:03d}", title=f"unique title number {i} alpha{i}", location=f"src/F{i}.sol:1", severity="low", status="open", poc=None, fix_commit=None) for i in range(1, 200)]
+    findings.append(good(id="F-200", title="shared title", location="src/Vault.sol:2", severity="low", status="open", poc=None, fix_commit=None))
+    rc, data, _ = repo.check(findings)
+    assert rc == 1 and data["status"] == "fail" and kinds(data) == {"dedupe-truncated": "info", "scan-incomplete": "major"}
+    assert "dedupe-truncated: audit/findings.json" in next(f["summary"] for f in data["findings"] if f["kind"] == "scan-incomplete")
 
 
 # --- malformed documents --------------------------------------------------------------------------------------
@@ -475,3 +484,78 @@ def test_a_named_pipe_named_like_a_findings_file_is_skipped_and_the_valid_file_i
     )
     data = json.loads(result.stdout)
     assert result.returncode == 1 and data["files_checked"] == 1 and data["findings_total"] == 1 and {f["kind"] for f in data["findings"]} == {"scan-incomplete"}  # the FIFO is skipped, so the scan is incomplete
+
+
+def test_an_unlistable_subdirectory_is_an_incomplete_scan_that_names_it(repo, monkeypatch):
+    import importlib
+    import types
+
+    repo.write("audit/findings.json", {"findings": [good()]})
+    repo.write("locked/findings.json", {"findings": [good(id="C-1", severity="critical", status="open", fix_commit=None)]})
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    afc = importlib.import_module("audit_findings_check")
+    real_scandir = os.scandir
+
+    def unlistable(path="."):
+        if str(path).endswith("locked"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", unlistable)
+    result = afc.run(types.SimpleNamespace(path="."), types.SimpleNamespace(root=repo.root, dry_run=False))
+    assert result["status"] == "fail" and result["files_checked"] == 1
+    assert {f["kind"]: f["severity"] for f in result["findings"]} == {"scan-incomplete": "major"}  # the critical in locked/ is never read, and the scan says so
+    assert "scan-error: locked (PermissionError)" in result["findings"][0]["summary"]
+
+
+def test_a_mitigated_critical_with_a_verified_fix_is_residual_risk_that_fails_like_fix_verification(repo):
+    from swarm.tools import a27_tools
+
+    rc, data, _ = repo.check([good(id="M-1", severity="critical", status="mitigated", fix_commit=COMMIT, regression_test=True, reaudited=True)])
+    assert rc == 1 and data["status"] == "fail" and kinds(data) == {"residual-risk": "major"}
+    tool = a27_tools.fix_verification({"findings": [{"id": "M-1", "severity": "critical", "fix_status": "mitigated", "fix_commit": COMMIT, "regression_test": True, "reaudited": True}]})
+    assert tool["verdict"] == "fail" and {f["id"]: f["severity"] for f in tool["findings"]} == {"FIX-M-1": "critical"}
+
+
+def test_a_path_that_climbs_out_of_an_in_root_symlink_is_refused_not_read(repo):
+    (repo.root / "sub").mkdir()
+    repo.write("findings.json", {"findings": [good(id="C-1", severity="critical", status="open", fix_commit=None)]})
+    (repo.root / "linkdir").symlink_to(repo.root / "sub", target_is_directory=True)
+    result = run_script(SCRIPT, "--root", str(repo.root), "--json", "--path", "linkdir/../findings.json", env={"SWARM_DIR": str(repo.state)})
+    assert result.returncode == 2 and json.loads(result.stdout)["error"]["code"] == "E-INPUT"
+
+
+def test_build_and_dist_are_scanned_while_silent_cache_directories_stay_silent(repo):
+    repo.write("audit/findings.json", {"findings": [good()]})
+    for name in ("build", "dist"):
+        repo.write(f"{name}/findings.json", {"findings": [good(id=f"{name.upper()}-1", severity="critical", status="open", fix_commit=None)]})
+    silent = (".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".swarm", ".terraform")
+    for index, name in enumerate(silent):
+        repo.write(f"{name}/findings.json", {"findings": [good(id=f"SILENT-{index}", severity="critical", status="open", fix_commit=None)]})
+    rc, data, _ = repo.run()
+    assert rc == 1 and data["status"] == "fail" and data["files_checked"] == 3
+    assert {f["id"] for f in data["findings"]} == {"open-blocking:build/findings.json:BUILD-1", "open-blocking:dist/findings.json:DIST-1"}
+    assert "scan-incomplete" not in kinds(data)  # build and dist are analysed, so nothing is incomplete
+    assert not any("SILENT-" in f["id"] or "SILENT-" in f["summary"] for f in data["findings"])  # the silent trees are never read
+
+
+def test_a_symlink_named_like_a_silent_directory_is_still_a_reason(repo, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "findings.json").write_text(json.dumps({"findings": [good(id="O-1", severity="critical", status="open", fix_commit=None)]}), encoding="utf-8")
+    repo.write("audit/findings.json", {"findings": [good()]})
+    (repo.root / "node_modules").symlink_to(outside, target_is_directory=True)
+    rc, data, _ = repo.run()
+    reason = next(f["summary"] for f in data["findings"] if f["kind"] == "scan-incomplete")
+    assert rc == 1 and data["status"] == "fail" and data["files_checked"] == 1
+    assert "skipped:symlink: node_modules" in reason
+    assert not any("O-1" in f["id"] or "O-1" in f["summary"] for f in data["findings"])
+
+
+def test_an_unverified_medium_fix_is_a_finding_in_the_cli_as_in_fix_verification(repo):
+    from swarm.tools import a27_tools
+
+    rc, data, _ = repo.check([good(id="M-2", severity="medium", poc=None, regression_test=False, reaudited=False)])
+    assert rc == 0 and data["status"] == "ok" and kinds(data) == {"fix-unverified": "minor"}
+    tool = a27_tools.fix_verification({"findings": [{"id": "M-2", "severity": "medium", "fix_status": "fixed", "fix_commit": COMMIT, "regression_test": False, "reaudited": False}]})
+    assert tool["verdict"] == "warn" and {f["id"]: f["severity"] for f in tool["findings"]} == {"FIX-M-2": "medium"}

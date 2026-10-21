@@ -801,7 +801,7 @@ def msg(mid, sent_min_ago, delivered_after_min=None) -> dict:
 def test_bridge_healthy_values():
     result = bridge(messages=[msg("m-1", 60, 10), msg("m-2", 5)])
     assert result == {"state": "SUCCESS", "message_count": 2, "delivered_count": 1, "pending_count": 1, "overdue_count": 0, "late_delivered_count": 0,
-                      "p95_delivery_lag_min": 10.0, "max_pending_age_min": 5.0, "collateral_surplus": 100.5, "undercollateralized": False,
+                      "p95_delivery_lag_min": 10.0, "max_pending_age_min": 5.0, "collateral_surplus": 100.5, "collateral_surplus_exact": "100.5", "undercollateralized": False,
                       "pause_recommended": False, "verdict": "pass", "findings": []}
 
 
@@ -1169,3 +1169,24 @@ def test_a_private_route_is_never_moved_to_the_public_mempool():
     low = mempool(max_acceptable_loss_usd=500, submitted_route="private")  # sandwich loss equal to tolerance: low exposure
     assert (low["route"], low["exposure"], low["route_change_required"]) == ("public_mempool", "low", False)
     assert mempool(submitted_route="public")["route_change_required"] is True
+
+
+def test_non_hex_key_labels_compare_case_insensitively_so_a_double_sign_is_seen():
+    result = slashing(inst(key="Validator-A", host="h1"), inst(key="validator-a", host="h2"))
+    assert result["double_sign_keys"] == ["validator-a"] and result["slashing_exposed"] is True and result["key_count"] == 1
+    assert ids(result) == {"double-sign:validator-a": "blocker"}
+
+
+def test_a_surplus_a_float_cannot_carry_is_reported_exactly_in_a_finding():
+    result = bridge(locked_amount="1234567890123456789.25", minted_amount="0")
+    assert isinstance(result["collateral_surplus"], float) and result["verdict"] == "pass"
+    assert ids(result) == {"surplus-not-exact-in-number": "info"}
+    assert "1234567890123456789.25" in result["findings"][0]["summary"]
+    assert bridge(locked_amount="1000.5", minted_amount="900")["findings"] == []
+
+
+def test_the_exact_surplus_text_is_carried_beside_the_number_on_every_success():
+    assert bridge(locked_amount="1234567890123456789.25", minted_amount="0")["collateral_surplus_exact"] == "1234567890123456789.25"
+    assert bridge(locked_amount="1000000000000000000000000000000", minted_amount="0")["collateral_surplus_exact"] == "1000000000000000000000000000000"
+    assert bridge(locked_amount="1000", minted_amount="1000.0")["collateral_surplus_exact"] == "0"
+    assert bridge(locked_amount="1000", minted_amount="1000.1")["collateral_surplus_exact"] == "-0.1"

@@ -6,6 +6,7 @@ output: findings carry locations and lengths only.
 """
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import os
@@ -201,7 +202,7 @@ def test_missing_chain_check_and_missing_simulation(tmp_path):
 
 
 def test_comment_lines_and_declaration_files_are_ignored(tmp_path):
-    write(tmp_path, "src/notes.ts", '// await provider.request({ method: "eth_sign" });\n/* token.approve(s, MaxUint256) */\n * eth_sign "eth_sign"\n')
+    write(tmp_path, "src/notes.ts", '// await provider.request({ method: "eth_sign" });\n/* token.approve(s, MaxUint256)\n * eth_sign "eth_sign"\n */\n')  # the middle line is inside an open block comment
     write(tmp_path, "src/types.d.ts", 'declare const x: "eth_sign";\nawait y.request({ method: "eth_sign" });\n')
     _, report, _ = scan(tmp_path)
     assert report["findings"] == [] and report["files_scanned"] == 1
@@ -623,3 +624,954 @@ def test_env_references_type_names_and_nullish_values_are_not_incomplete(tmp_pat
     write(tmp_path, "src/ok.ts", "const privateKey = process.env.PRIVATE_KEY;\nconst mnemonic = null;\ninterface W { privateKey: string; mnemonic?: string }\n")
     code, report, _ = scan(tmp_path)
     assert code == 0 and report["status"] == "ok" and report["findings"] == []
+
+
+# --- QA-03 re-review: N1 to N8 ----------------------------------------------------------------------------------------------
+
+KEY_HEX = "0x" + "ab" * 32
+
+
+def test_key_literal_after_a_leading_block_or_html_comment_is_scanned(tmp_path):  # N1
+    write(tmp_path, "src/block.ts", f'/*! lib */ var cfg = {{privateKey: "{KEY_HEX}"}};\n')
+    write(tmp_path, "src/page.html", f'<!-- note --> <script>const privateKey = "{KEY_HEX}";</script>\n')
+    write(tmp_path, "src/only-comment.ts", f'/* const privateKey = "{KEY_HEX}"; */\n')  # still inside the comment: not code
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/block.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/page.html:1")}
+    assert KEY_HEX not in text
+
+
+def test_json_key_with_digits_and_dotted_key_name_are_checked(tmp_path):  # N2 and N3
+    write(tmp_path, "config/keys.json", json.dumps({"deployerPrivateKey2026": KEY_HEX, "privateKey.dev": KEY_HEX}))
+    write(tmp_path, "src/keys.ts", f'const deployerPrivateKey2026 = "{KEY_HEX}";\n')  # the source path agrees with the JSON path
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "config/keys.json"), ("DAPP-KEY-MATERIAL", "blocker", "src/keys.ts:1")}
+    assert report["counts"]["blocker"] == 3 and report["status"] == "fail"
+    assert KEY_HEX not in text and "deployerPrivateKey2026" not in text  # the rendered path shows the length, not the name
+
+
+@pytest.mark.parametrize("source", [
+    "export function make(seed: number) {}\n",  # N4: a type annotation
+    "const seed = 42;\n",  # N4: a number
+    "const secret = getSecret();\n",  # N4: a call
+])
+def test_key_named_non_literal_values_give_no_reason(tmp_path, source):  # N4
+    write(tmp_path, "src/a.ts", source)
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == []
+
+
+def test_seed_named_phrase_is_a_mnemonic_blocker(tmp_path):  # N5
+    write(tmp_path, "src/seed.ts", f'const seed = "{MNEMONIC}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/seed.ts:1")} and MNEMONIC not in text
+
+
+def test_secret_named_hex_key_is_a_key_blocker(tmp_path):  # N5
+    write(tmp_path, "src/secret.ts", f'const secret = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/secret.ts:1")} and KEY_HEX not in text
+
+
+def test_unlistable_directory_is_recorded_as_incomplete(tmp_path, monkeypatch):  # N6
+    loaded = module()
+    write(tmp_path, "src/ok.ts", "const a = 1;\n")
+    write(tmp_path, "locked/k.ts", f'const privateKey = "{KEY_HEX}";\n')
+    locked = str(tmp_path / "locked")
+    real_scandir = os.scandir
+
+    def refusing_scandir(path="."):
+        if os.fspath(path) == locked:
+            raise PermissionError(13, "Permission denied", locked)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", refusing_scandir)  # in-process: the subprocess CLI would not see the patch
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert report["status"] == "fail" and found(report) == {("scan/incomplete", "major", ".")}
+    assert "locked: skipped:unlistable-directory (PermissionError)" in report["skipped"]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_symlinked_directory_is_recorded_as_skipped(tmp_path):  # N7
+    outside, root = tmp_path / "outside", tmp_path / "root"
+    write(outside, "s.ts", f'const privateKey = "{KEY_HEX}";\n')
+    write(root, "src/ok.ts", "const a = 1;\n")
+    os.symlink(outside, root / "linked")
+    code, report, text = scan(root)
+    assert code == 1 and report["status"] == "fail" and found(report) == {("scan/incomplete", "major", ".")}
+    assert "linked: skipped:symlink-directory" in report["skipped"]
+    assert KEY_HEX not in text
+
+
+def test_symlink_loop_is_recorded_and_the_other_files_are_scanned(tmp_path):  # N8
+    write(tmp_path, "src/real.ts", 'x.request({ method: "eth_sign" });\n')
+    os.symlink(tmp_path / "src" / "b.ts", tmp_path / "src" / "a.ts")
+    os.symlink(tmp_path / "src" / "a.ts", tmp_path / "src" / "b.ts")
+    code, report, _ = scan(tmp_path)  # exit 1 with a report: a loop is not an E-error exit 2
+    assert code == 1 and report["status"] == "fail" and report["files_scanned"] == 1
+    assert found(report) == {("DAPP-ETH-SIGN", "blocker", "src/real.ts:1"), ("scan/incomplete", "major", ".")}
+    assert {"src/a.ts: skipped:symlink-loop", "src/b.ts: skipped:symlink-loop"} <= set(report["skipped"])
+
+
+# --- JSON and source agree on key names and length rules ------------------------------------------------------------------
+
+TWELVE_WORD_PHRASE = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+
+def test_json_seed_holding_a_twelve_word_phrase_is_a_mnemonic_blocker(tmp_path):
+    write(tmp_path, "config/seed.json", json.dumps({"seed": TWELVE_WORD_PHRASE}))
+    write(tmp_path, "config/numbers.json", json.dumps({"seed": 42, "secret": None}))  # non-string values are not key material
+    code, report, text = scan(tmp_path)
+    assert code == 1 and found(report) == {("DAPP-KEY-MATERIAL", "blocker", "config/seed.json")}
+    assert f"({len(TWELVE_WORD_PHRASE)} chars" in report["findings"][0]["summary"] and TWELVE_WORD_PHRASE not in text
+    assert report["skipped"] == [] and report["status"] == "fail"
+
+
+def test_json_secret_holding_a_hex_key_is_a_key_blocker(tmp_path):
+    write(tmp_path, "config/secret.json", json.dumps({"secret": KEY_HEX}))
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "config/secret.json")} and KEY_HEX not in text
+
+
+# --- re-review: ND1 to ND4 and ND6 ----------------------------------------------------------------------------------------------
+
+
+def test_key_looking_locators_and_collections_are_not_key_material(tmp_path):  # ND1
+    locators = ["privateKeyPath", "seedNodes", "secretName", "seedUrls", "PRIVATE_KEY_URL", "seedUrl"]
+    write(tmp_path, "src/locators.ts", "".join(f'const {name} = "{KEY_HEX}";\n' for name in locators))
+    write(tmp_path, "config/locators.json", json.dumps({name: KEY_HEX for name in locators}))
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == []
+    flagged = {"privateKey": KEY_HEX, "deployerPrivateKey2026": KEY_HEX, "MY_PRIVATE_KEY": KEY_HEX, "seed": KEY_HEX, "secret": KEY_HEX,
+               "seedPhrase": MNEMONIC}
+    write(tmp_path, "src/flagged.ts", "".join(f'const {name} = "{value}";\n' for name, value in flagged.items()))
+    write(tmp_path, "config/flagged.json", json.dumps(flagged))
+    _, report, text = scan(tmp_path)
+    assert report["counts"]["blocker"] == 2 * len(flagged) and report["status"] == "fail"
+    assert KEY_HEX not in text and MNEMONIC not in text
+
+
+def test_string_under_a_nested_object_is_checked_against_its_own_key_only(tmp_path):  # ND2
+    client = {"clientId": "a1b2c3d4e5f6a7b8c9", "redirectUri": "https://app.example.com/callback"}
+    write(tmp_path, "config/oauth.json", json.dumps({"secret": client}))
+    write(tmp_path, "src/oauth.ts", f"const secret = {json.dumps(client)};\n")  # the source shape of the same object
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_generator_method_line_is_code_not_a_comment_continuation(tmp_path):  # ND3
+    write(tmp_path, "src/gen.ts", f'class Store {{\n  *gen() {{ const privateKey = "{KEY_HEX}"; }}\n}}\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/gen.ts:2")} and KEY_HEX not in text
+
+
+def test_call_argument_fragments_are_not_part_of_the_value(tmp_path):  # ND4
+    write(tmp_path, "src/call.ts", 'const secret = getSecret("api-" + env);\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["skipped"] == [] and report["findings"] == []
+
+
+def test_top_level_fragment_still_gives_the_reason(tmp_path):  # ND4
+    write(tmp_path, "src/top.ts", 'const secret = "api-" + env;\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail" and [f["id"] for f in report["findings"]] == ["scan/incomplete"]
+    assert "src/top.ts:1" in report["findings"][0]["summary"]
+
+
+def test_path_to_a_symlink_loop_is_recorded_as_not_analysed(tmp_path):  # ND6
+    os.symlink(tmp_path / "a.ts", tmp_path / "b.ts")
+    os.symlink(tmp_path / "b.ts", tmp_path / "a.ts")
+    code, report, _ = scan(tmp_path, "--path", "a.ts")  # exit 1 with a report, not an internal error (exit 2)
+    assert code == 1 and report["status"] == "fail" and "error" not in report
+    assert found(report) == {("scan/incomplete", "major", ".")} and report["skipped"] == ["a.ts: skipped:symlink-loop"]
+
+
+# --- ND1 follow-up: plural, Key-suffixed and underscore names are key material; locator and collection names are not -------------
+LITERAL_16 = "abcdef0123456789"  # 16 characters, no whitespace: a key-length literal under a bare seed or secret name
+
+def test_plural_key_suffixed_and_underscore_names_with_a_literal_are_flagged(tmp_path):
+    write(tmp_path, "src/suffix.ts", f'const privateKeys = "{KEY_HEX}";\nconst seedKey = "{LITERAL_16}";\n'
+                                     f'const secrets = "{LITERAL_16}";\nconst seed_key = "{LITERAL_16}";\n')
+    write(tmp_path, "config/suffix.json", json.dumps({"privateKeys": [KEY_HEX], "seedKey": LITERAL_16, "secrets": LITERAL_16, "seed_key": LITERAL_16}))
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", f"src/suffix.ts:{n}") for n in (1, 2, 3, 4)} | {
+        ("DAPP-KEY-MATERIAL", "blocker", "config/suffix.json")}
+    assert report["counts"]["blocker"] == 8 and report["status"] == "fail"  # four source lines, four JSON keys
+    assert KEY_HEX not in text and LITERAL_16 not in text
+
+
+def test_locator_and_collection_names_are_not_flagged(tmp_path):
+    names = ["seedNodes", "seedUrls", "secretName", "privateKeyPath"]
+    write(tmp_path, "src/locators.ts", "".join(f'const {name} = "{KEY_HEX}";\n' for name in names))
+    write(tmp_path, "config/locators.json", json.dumps({name: KEY_HEX for name in names}))
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_plain_key_names_stay_flagged(tmp_path):
+    names = {"privateKey": KEY_HEX, "deployerPrivateKey2026": KEY_HEX, "MY_PRIVATE_KEY": KEY_HEX, "seed": KEY_HEX}
+    write(tmp_path, "src/plain.ts", "".join(f'const {name} = "{value}";\n' for name, value in names.items()))
+    write(tmp_path, "config/plain.json", json.dumps(names))
+    _, report, text = scan(tmp_path)
+    assert report["counts"]["blocker"] == 2 * len(names) and report["status"] == "fail"
+    assert KEY_HEX not in text
+
+
+# --- source lists under key names: each element gets the scalar rule ---------------------------------------------------------------
+
+
+def test_key_named_source_list_of_hex_literals_is_flagged(tmp_path):
+    write(tmp_path, "src/list.ts", f'const privateKeys = ["{KEY_HEX}"];\n')
+    write(tmp_path, "src/typed.ts", f'const privateKeys: string[] = ["{KEY_HEX}"];\n')  # a TypeScript annotation before the list
+    write(tmp_path, "src/multi.ts", f'const privateKeys = [\n  // "{KEY_HEX}" retired\n  "{KEY_HEX}", // primary\n];\n')  # multi-line, comments
+    write(tmp_path, "config/list.json", json.dumps({"privateKeys": [KEY_HEX]}))  # the JSON array form, unchanged
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/list.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/typed.ts:1"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/multi.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "config/list.json")}
+    assert report["counts"]["blocker"] == 4 and report["status"] == "fail" and KEY_HEX not in text
+
+
+def test_key_named_list_of_calls_stays_ok(tmp_path):
+    write(tmp_path, "src/calls.ts", "const privateKeys = [getKey(1)];\n")  # non-literal elements: no finding, no reason
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_string_list_under_a_non_key_name_is_not_checked(tmp_path):
+    write(tmp_path, "src/nodes.ts", 'const seedNodes = ["https://node.example.org/abcdef0123456789abcdef"];\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_joinable_fragment_element_gives_the_scalar_reason(tmp_path):  # the element is a concatenation, not a plain literal
+    write(tmp_path, "src/fragment.ts", 'const privateKeys = ["0x" + "ab"*32];\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"] and "src/fragment.ts:1" in report["skipped"][0]
+
+
+def test_key_named_list_not_closed_within_the_window_gives_a_reason(tmp_path):  # fail closed rather than read past the window
+    write(tmp_path, "src/long.ts", "const privateKeys = [\n" + "".join(f"  getKey({index}),\n" for index in range(210)) + "];\n")
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"]
+    assert "src/long.ts:1: key-named list is not closed within 200 lines" in report["skipped"][0]
+
+
+# --- round three: NX1 to NX7 ------------------------------------------------------------------------------------------------------
+
+
+def test_list_element_type_assertions_are_stripped_before_the_literal_is_read(tmp_path):  # NX1
+    write(tmp_path, "src/as-hex.ts", f'const privateKeys = ["{KEY_HEX}" as Hex];\n')
+    write(tmp_path, "src/as-const.ts", f'const privateKeys = ["{KEY_HEX}" as const];\n')
+    write(tmp_path, "src/junk.ts", f'const privateKeys = ["{KEY_HEX}" junk];\n')  # anything else after the literal: a reason, never silence
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/as-hex.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/as-const.ts:1"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/junk.ts:1"), ("scan/incomplete", "major", ".")}  # round six: the key literal blocks even before junk
+    assert [s.split(":")[0] for s in report["skipped"]] == ["src/junk.ts"] and KEY_HEX not in text
+
+
+def test_block_comment_between_separator_and_value_is_skipped(tmp_path):  # NX2, both forms
+    write(tmp_path, "src/list.ts", f'const privateKeys = /* prod */ ["{KEY_HEX}"];\n')
+    write(tmp_path, "src/scalar.ts", f'const secret = /* x */ "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/list.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/scalar.ts:1")}
+    assert KEY_HEX not in text
+
+
+def test_value_after_a_closed_multi_line_comment_or_on_the_next_line_is_flagged(tmp_path):  # decision 2: the value is read, not refused
+    write(tmp_path, "src/open.ts", f'const secret = /* x\n */ "{KEY_HEX}";\n')  # the comment is closed on the next line
+    write(tmp_path, "src/next.ts", f'const secret =\n  "{KEY_HEX}";\n')
+    write(tmp_path, "src/slashes.ts", f'const secret = // note\n  "{KEY_HEX}";\n')  # a // comment does not end the search
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/open.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/next.ts:1"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/slashes.ts:1")}
+    assert KEY_HEX not in text
+
+
+def test_list_on_the_next_line_is_flagged(tmp_path):  # decision 2
+    write(tmp_path, "src/list.ts", f'const secrets =\n  ["{KEY_HEX}"];\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/list.ts:1")} and KEY_HEX not in text
+
+
+def test_value_after_an_unclosed_block_comment_gives_a_reason(tmp_path):  # decision 2: where the comment ends is unknown
+    write(tmp_path, "src/unclosed.ts", f'const secret = /* open\n  "{KEY_HEX}";\n')
+    code, report, text = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"]
+    assert "src/unclosed.ts:1: key-named assignment's value follows a block comment that is not closed" in report["skipped"][0]
+    assert KEY_HEX not in text
+
+
+def test_url_values_are_locators_whatever_the_name(tmp_path):  # NX3
+    url = "https://example.org/some/long/path/value"
+    write(tmp_path, "src/urls.ts", f'const secrets = ["{url}"];\n')
+    write(tmp_path, "src/seeds.ts", f'const seeds = ["{url}", "{KEY_HEX}"];\n')  # the hex key in the same list still gives one
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/seeds.ts:1")}
+    assert url not in text and KEY_HEX not in text
+
+
+def test_dotted_keys_are_judged_whole_in_source_and_json(tmp_path):  # NX4
+    write(tmp_path, "src/path.ts", 'const x = { "privateKey.path": "./keys/deployer.json" };\n')  # a locator suffix: not key material
+    write(tmp_path, "src/dev.ts", f'const y = {{ "privateKey.dev": "{KEY_HEX}" }};\n')  # a non-locator segment: key material
+    write(tmp_path, "config/path.json", json.dumps({"privateKey.path": "./keys/deployer.json"}))
+    write(tmp_path, "config/dev.json", json.dumps({"privateKey.dev": KEY_HEX}))
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/dev.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "config/dev.json")}
+    assert KEY_HEX not in text
+
+
+def test_hyphenated_key_names_match_in_source_and_json(tmp_path):  # NX5
+    write(tmp_path, "src/hyphen.ts", f"const x = {{ 'private-key': \"{KEY_HEX}\" }};\n")
+    write(tmp_path, "config/hyphen.json", json.dumps({"private-key": KEY_HEX}))
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/hyphen.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "config/hyphen.json")}
+    assert KEY_HEX not in text
+
+
+def test_clean_link_with_a_trailing_newline_passes_and_an_inner_newline_is_flagged(tmp_path):  # NX6 (tool-level, spec-based)
+    tools = importlib.import_module("swarm.tools.a29_tools")
+
+    def links(*values):
+        return tools.signing_request_scan({"requests": [], "known_contracts": [], "expected_domains": ["app.example.com"],
+                                           "link_urls": list(values), "hardcoded_addresses": []})
+
+    clean = links("https://app.example.com/login\n")
+    assert clean["verdict"] == "pass" and clean["findings"] == []
+    inner = links("https://app.example.com\n.evil.io/x")
+    assert inner["verdict"] == "block" and {(f["id"], f["severity"]) for f in inner["findings"]} == {
+        ("LINK-SPOOF", "blocker"), ("LINK-CONTROL-CHARACTER", "major")}
+
+
+def test_nested_key_named_list_element_is_read_as_a_list(tmp_path):  # NX7
+    write(tmp_path, "src/nested.ts", f'const privateKeys = [["{KEY_HEX}"]];\n')
+    write(tmp_path, "src/nested-call.ts", "const privateKeys = [[getKey(1)]];\n")  # a call inside a nested list: nothing
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/nested.ts:1")} and KEY_HEX not in text
+    assert report["skipped"] == []
+
+
+def test_scalar_type_assertions_are_stripped_before_the_literal_is_read(tmp_path):  # decision 1
+    write(tmp_path, "src/label.ts", 'const secret = "a plain label" as const;\n')  # a plain label: nothing
+    write(tmp_path, "src/hex.ts", f'const privateKey = "{KEY_HEX}" as Hex;\n')  # a hex key: the blocker
+    write(tmp_path, "src/junk.ts", 'const secret = "abc" junk;\n')  # anything else after the literal: the reason, never silence
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/hex.ts:1"), ("scan/incomplete", "major", ".")}
+    assert [s.split(":")[0] for s in report["skipped"]] == ["src/junk.ts"] and KEY_HEX not in text
+
+
+def test_typed_scalar_value_is_read(tmp_path):  # `privateKey: string = "…"` was silent before the value search followed annotations
+    write(tmp_path, "src/typed.ts", f'const privateKey: string = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/typed.ts:1")} and KEY_HEX not in text
+
+
+# --- round four: NV1 to NV6 ----------------------------------------------------------------------------------------------------
+
+
+def test_key_split_across_lines_by_plus_is_read_as_one_literal(tmp_path):  # NV1: a continuation is part of the expression
+    write(tmp_path, "src/end.ts", f'const privateKey = "0x" +\n  "{KEY_HEX[2:]}";\n')
+    write(tmp_path, "src/start.ts", f'const privateKey = "0x"\n  + "{KEY_HEX[2:]}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/end.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/start.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX[2:] not in text
+
+
+def test_split_expression_containing_a_call_gives_the_reason(tmp_path):  # NV1: a non-literal part gives the reason
+    write(tmp_path, "src/split-call.ts", 'const privateKey = "0x" +\n  getKey();\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"]
+    assert "src/split-call.ts:1: key-named assignment is not a plain string literal" in report["skipped"][0]
+
+
+def test_concatenation_with_a_call_across_lines_gives_the_reason(tmp_path):  # NV2: the whole top-level expression is read
+    write(tmp_path, "src/concat.ts", 'const secret = getKey() +\n  "api-";\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"]
+    assert "src/concat.ts:1" in report["skipped"][0]
+
+
+def test_typed_declarations_with_complex_types_are_read(tmp_path):  # NV3
+    write(tmp_path, "src/newline.ts", f'const privateKey: Hex\n  = "{KEY_HEX}";\n')  # the `=` is on the next line
+    write(tmp_path, "src/parens.ts", f'const privateKey: (Hex) = "{KEY_HEX}";\n')
+    write(tmp_path, "src/generic.ts", f"const privateKey: Foo<'x'> = \"{KEY_HEX}\";\n")
+    write(tmp_path, "src/member.ts", "interface Wallet {\n  privateKey: string;\n}\n")  # an interface member has no value: silent
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/newline.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/parens.ts:1"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/generic.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_sentences_and_lowercase_placeholders_are_not_key_material(tmp_path):  # NV4
+    write(tmp_path, "src/sentence.ts", 'const secret = "the quick brown fox jumps over";\n')  # six words: not a mnemonic
+    write(tmp_path, "src/label.ts", 'const secret = "Your secret is safe with us here";\n')
+    write(tmp_path, "src/placeholder.ts", 'const secret = "your-private-key-here-placeholder";\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_mnemonic_hex_and_mixed_case_keys_are_still_blockers(tmp_path):  # NV4
+    mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    write(tmp_path, "src/seed.ts", f'const seed = "{mnemonic}";\n')  # twelve lowercase words under a bare name
+    write(tmp_path, "src/hex.ts", f'const secret = "{KEY_HEX}";\n')
+    write(tmp_path, "src/mixed.ts", 'const secret = "Qz8fLk3mNp0aRt7vXy2bWc9dEf4gHj1k";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/seed.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/hex.ts:1"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/mixed.ts:1")}
+    assert mnemonic not in text and KEY_HEX not in text
+
+
+def test_literal_followed_by_a_method_call_gives_nothing(tmp_path):  # NV6: a non-literal expression, as a call is
+    write(tmp_path, "src/trim.ts", 'const privateKeys = ["abc".trim()];\n')
+    write(tmp_path, "src/junk.ts", 'const privateKeys = ["abc" junk];\n')  # junk after the literal still gives the reason
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and [f["id"] for f in report["findings"]] == ["scan/incomplete"]
+    assert [s.split(":")[0] for s in report["skipped"]] == ["src/junk.ts"]
+
+
+def test_unclosed_list_openers_each_give_one_reason_within_the_window(tmp_path):  # NV5: the window bound holds per opener
+    write(tmp_path, "src/openers.ts", "".join(f"const privateKeys{index} = [\n" for index in range(40)))
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail"
+    assert len(report["skipped"]) == 40
+    assert all("is not closed within 200 lines" in reason for reason in report["skipped"])
+
+
+# --- round five: decision 3, the scan-wide window-line budget -----------------------------------------------------------------------
+
+
+def test_scan_line_budget_stops_the_key_line_readers_and_skips_later_files(tmp_path, monkeypatch):  # decision 3
+    loaded = module()
+    monkeypatch.setattr(loaded, "SCAN_LINE_BUDGET", 200)  # round six: units are characters read plus window lines; a.ts costs 78 of them
+    write(tmp_path, "a.ts", f'const privateKeys = [\n  "{KEY_HEX}",\n];\n')  # two window lines: fits, and is analysed
+    write(tmp_path, "b.ts", "const privateKeys = [\n" + "".join('  "x",\n' for _ in range(100)) + "];\n")  # needs 100 lines: runs out
+    write(tmp_path, "c.ts", f'const secret = "{KEY_HEX}";\n')  # read after the budget ran out: not read
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "a.ts:1"), ("scan/incomplete", "major", ".")}
+    assert report["skipped"] == ["scan-line-budget-spent:b.ts", "not-read-after-scan-line-budget:1-files"]
+    assert report["files_scanned"] == 2 and report["status"] == "fail" and KEY_HEX not in json.dumps(report)
+
+
+def test_skipped_reasons_are_listed_to_fifty_with_an_exact_remainder(tmp_path):  # the listing cap; the status counts every reason
+    write(tmp_path, "src/many.ts", "".join(f"const privateKeys{index} = [\n" for index in range(120)))
+    code, report, _ = scan(tmp_path)
+    assert code == 1 and report["status"] == "fail"
+    assert len(report["skipped"]) == 51
+    assert all("key-named list is not closed within 200 lines" in reason for reason in report["skipped"][:50])
+    assert report["skipped"][50] == "… and 70 more not listed"
+    assert report["summary"].startswith("1 file(s) scanned")
+
+
+# --- round six: NW1 to NW6 -----------------------------------------------------------------------------------------------------
+
+
+def test_separator_on_a_following_line_is_matched_in_both_forms(tmp_path):  # NW1
+    write(tmp_path, "src/scalar.ts", f'const secret\n  = "{KEY_HEX}";\n')
+    write(tmp_path, "src/object.ts", f'const cfg = {{\n  secret\n  : "{KEY_HEX}"\n}};\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/scalar.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/object.ts:2")}
+    assert KEY_HEX not in text
+
+
+def test_key_literal_as_fallback_in_parentheses_after_a_cast_or_before_an_operator_is_key_material(tmp_path):  # NW2
+    write(tmp_path, "src/or.ts", f'const privateKey = "{KEY_HEX}" || process.env.PK;\n')
+    write(tmp_path, "src/nullish.ts", f'const privateKey = "{KEY_HEX}" ?? "";\n')
+    write(tmp_path, "src/paren.ts", f'const privateKey = ("{KEY_HEX}");\n')
+    write(tmp_path, "src/cast.ts", f'const privateKey = <Hex>"{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", f"src/{name}.ts:1") for name in ("or", "nullish", "paren", "cast")}
+    assert KEY_HEX not in text
+
+
+def test_key_literal_followed_by_a_member_call_is_key_material_and_a_plain_string_is_not(tmp_path):  # NW3
+    write(tmp_path, "src/slice.ts", f'const privateKey = "{KEY_HEX}".slice(2);\n')
+    write(tmp_path, "src/trim.ts", 'const privateKeys = ["abc".trim()];\n')  # NV6: an ordinary string and a method call give nothing
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/slice.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_key_names_with_value_suffixes_are_matched_and_locators_are_not(tmp_path):  # NW4
+    write(tmp_path, "src/suffix.ts", "".join(f'const {name} = "{KEY_HEX}";\n' for name in ("privateKeyHex", "privateKeyBytes", "secretHex")))
+    write(tmp_path, "config/suffix.json", json.dumps({"privateKeyHex": KEY_HEX, "privateKeyBytes": KEY_HEX, "secretHex": KEY_HEX}))
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/suffix.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/suffix.ts:2"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/suffix.ts:3"), ("DAPP-KEY-MATERIAL", "blocker", "config/suffix.json")}
+    assert KEY_HEX not in text
+    locators = tmp_path / "locators"
+    names = ["seedNodes", "seedUrls", "secretName", "privateKeyPath", "PRIVATE_KEY_URL", "seedUrl"]
+    write(locators, "src/locators.ts", "".join(f'const {name} = "{KEY_HEX}";\n' for name in names))
+    write(locators, "config/locators.json", json.dumps({name: KEY_HEX for name in names}))
+    code, report, _ = scan(locators)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_mnemonic_shape_needs_a_seed_mnemonic_or_phrase_name(tmp_path):  # NW5
+    sentence = "please do not share this value with anyone at all day long"
+    mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    write(tmp_path, "src/secret.ts", f'const secret = "{sentence}";\n')  # twelve lowercase words under a bare name: nothing
+    write(tmp_path, "src/seed.ts", f'const seed = "{mnemonic}";\n')  # the same shape under a seed name: a blocker
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/seed.ts:1")} and mnemonic not in text
+
+
+def test_line_with_twenty_thousand_key_matches_is_read_once_and_the_budget_bounds_it(tmp_path, monkeypatch):  # NW6
+    import time
+    loaded = module()
+    write(tmp_path, "src/many.ts", "secret=a " * 20000 + "\n")
+    start = time.monotonic()
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert time.monotonic() - start < 2.0  # linear in the line: each key name reads only up to the next one
+    assert report["status"] == "ok" and report["skipped"] == []
+    monkeypatch.setattr(loaded, "SCAN_LINE_BUDGET", 1000)  # the budget bounds the work: a low budget gives the budget reason
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert report["status"] == "fail" and report["skipped"] == ["scan-line-budget-spent:src/many.ts"]
+
+
+# --- round seven: ND1 to ND5 ---------------------------------------------------------------------------------------------------------
+
+
+def test_key_names_inside_template_literals_are_not_occurrences(tmp_path):  # ND1: a template is a string, its key names open nothing
+    write(tmp_path, "src/templates.ts", "const hint = `Enter your secret:`;\n"
+                                        "const msg = `Your secret: ${value} is ready`;\n"
+                                        "const s = `privateKey: stored locally`;\n")
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+    write(tmp_path, "src/real.ts", "const hint = `Enter your secret:`;\n" f'const secret = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/real.ts:2")} and KEY_HEX not in text
+
+
+def test_trailing_comment_does_not_hide_a_separator_on_the_next_line(tmp_path):  # ND2: the comment is stripped before the line ends
+    write(tmp_path, "src/line.ts", f'const secret // note\n  = "{KEY_HEX}";\n')
+    write(tmp_path, "src/block.ts", f'const secret /* note */\n  = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/line.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/block.ts:1")}
+    assert KEY_HEX not in text
+
+
+def test_commented_out_assignments_after_code_are_silent(tmp_path):  # ND3: text inside a comment is never code
+    write(tmp_path, "src/comments.ts", f'const a = 1; // privateKey: "{KEY_HEX}";\n'
+                                       f'const a = 1; /* privateKey: "{KEY_HEX}" */\n'
+                                       f'const privateKey = "{KEY_HEX}";\n')  # the same assignment outside a comment still blocks
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/comments.ts:3")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_mnemonic_is_key_material_under_key_kind_names_but_a_bare_sentence_is_not(tmp_path):  # ND4
+    mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    write(tmp_path, "src/key.ts", f'const privateKey = "{mnemonic}";\n')
+    write(tmp_path, "src/secret-key.ts", f'const secretKey = "{mnemonic}";\n')
+    write(tmp_path, "src/list.ts", f'const privateKeys = ["{mnemonic}"];\n')
+    write(tmp_path, "src/sentence.ts", 'const secret = "please do not share this value with anyone at all day long";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/key.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/secret-key.ts:1"),
+                             ("DAPP-KEY-MATERIAL", "blocker", "src/list.ts:1")}
+    assert mnemonic not in text and report["skipped"] == []
+
+
+def test_plural_key_with_a_value_suffix_matches_like_the_singular(tmp_path):  # ND5
+    write(tmp_path, "src/plural.ts", f'const privateKeysHex = "{KEY_HEX[2:]}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/plural.ts:1")} and KEY_HEX[2:] not in text
+    locators = tmp_path / "locators"
+    names = ["seedNodes", "seedUrls", "secretName", "privateKeyPath", "PRIVATE_KEY_URL", "seedUrl"]
+    write(locators, "src/locators.ts", "".join(f'const {name} = "{KEY_HEX}";\n' for name in names))
+    code, report, _ = scan(locators)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_an_unclosed_apostrophe_in_prose_does_not_mask_a_key_assignment_on_its_line(tmp_path):  # the residual: an unclosed quote is text
+    write(tmp_path, "src/prose.html", f'<p>Don\'t</p> const secret = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/prose.html:1")} and KEY_HEX not in text
+
+
+def test_a_closed_string_containing_an_apostrophe_still_masks_its_own_contents(tmp_path):  # a closed string is a string
+    write(tmp_path, "src/closed.ts", 'const msg = "Don\'t share your secret: now";\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+# --- round seven: D1 to D8 -----------------------------------------------------------------------------------------------------------
+
+
+def test_quotes_in_prose_do_not_mask_a_key_assignment_after_them(tmp_path):  # D1: a quote after a word is text, not a literal
+    write(tmp_path, "src/prose.html", f'<p>Don\'t</p> const privateKey = "{KEY_HEX}";\n'
+                                      f'<p>He said "hi</p> const privateKey2 = "{KEY_HEX}";\n')
+    write(tmp_path, "src/tail.ts", f'const privateKey = "{KEY_HEX}" and it\'s fine\n')
+    write(tmp_path, "src/press.html", "<p>Press ` to copy</p>\n" + "".join(f'const privateKey{i} = "{KEY_HEX}";\n' for i in range(3)))
+    _, report, text = scan(tmp_path)
+    blockers = {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"}  # the tail's reason is a scan/incomplete finding, not a blocker
+    assert blockers == {("DAPP-KEY-MATERIAL", "blocker", "src/prose.html:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/prose.html:2"),
+                        ("DAPP-KEY-MATERIAL", "blocker", "src/tail.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/press.html:2"),
+                        ("DAPP-KEY-MATERIAL", "blocker", "src/press.html:3"), ("DAPP-KEY-MATERIAL", "blocker", "src/press.html:4")}
+    assert KEY_HEX not in text
+
+
+def test_a_backtick_after_an_equals_sign_still_opens_a_template(tmp_path):  # D1: the key inside the template is text, not an assignment
+    write(tmp_path, "src/tpl.ts", f'const x = `\nprivateKey: "{KEY_HEX}"\n`;\n')
+    code, report, text = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == [] and KEY_HEX not in text  # no markup: the key is template text
+
+
+def test_a_slash_slash_after_a_colon_is_a_url_and_a_comment_after_code_is_still_one(tmp_path):  # D2
+    write(tmp_path, "src/page.html", f'<p>See https://docs.example.com</p><script>const privateKey = "{KEY_HEX}";</script>\n')
+    write(tmp_path, "src/comment.ts", f'const a = 1; // privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/page.html:1")} and KEY_HEX not in text
+
+
+def test_a_key_assignment_inside_a_template_substitution_is_code(tmp_path):  # D4: the braces of ${...} are balanced and read as code
+    write(tmp_path, "src/sub.ts", f'const x = `${{ (privateKey = "{KEY_HEX}") }}`;\n'
+                                  f'const y = `${{ {{ a: 1 }}.a }}`;\n'
+                                  f'const privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/sub.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/sub.ts:3")}
+    assert KEY_HEX not in text
+
+
+def test_the_trailing_type_assertion_is_stripped_in_one_pass(tmp_path, monkeypatch):  # D6: a strip that does not backtrack
+    loaded = module()
+    assert loaded._strip_type_assertion('"0x" as const') == '"0x"'
+    assert loaded._strip_type_assertion('"0x" satisfies Hex') == '"0x"'
+    assert loaded._strip_type_assertion('"0x" as a as b!') == '"0x" as a as b!'
+    assert loaded._strip_type_assertion('"0x" as ') == '"0x" as '
+
+
+def test_a_list_nested_to_depth_eight_is_read_and_its_reads_are_charged(tmp_path, monkeypatch):  # D7
+    loaded = module()
+    write(tmp_path, "src/nested.ts", "const privateKeys = " + "[" * 8 + f'"{KEY_HEX}"' + "]" * 8 + ";\n")
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/nested.ts:1")} and report["skipped"] == []
+    monkeypatch.setattr(loaded, "SCAN_LINE_BUDGET", 300)  # the flat read costs 71 units, the nested reads 617 in all: the budget runs out
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert report["status"] == "fail" and report["skipped"] == ["scan-line-budget-spent:src/nested.ts"]
+
+
+def test_an_html_comment_is_a_comment_only_in_markup_files(tmp_path):  # D8
+    line = f'const a = b <!-- c; const privateKey = "{KEY_HEX}";\n'
+    write(tmp_path, "src/code.ts", line)
+    write(tmp_path, "src/page.html", line)
+    _, report, text = scan(tmp_path)
+    assert found(report) == {("DAPP-KEY-MATERIAL", "blocker", "src/code.ts:1")} and KEY_HEX not in text
+
+
+def test_a_jsx_tag_close_does_not_open_a_literal_so_a_key_between_quotes_still_blocks(tmp_path):  # bare > is not an opener
+    write(tmp_path, "src/jsx.html", f'<p>"a</p> <p>"b</p> const privateKey = "{KEY_HEX}";\n')
+    write(tmp_path, "src/jsx-between.html", f'<p>"a</p> const privateKey = "{KEY_HEX}"; <p>"b</p>\n')
+    _, report, text = scan(tmp_path)
+    blockers = {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"}
+    assert blockers == {("DAPP-KEY-MATERIAL", "blocker", "src/jsx.html:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/jsx-between.html:1")}
+    assert KEY_HEX not in text
+
+
+def test_an_arrow_before_a_quote_still_opens_a_literal(tmp_path):  # the arrow => is an opener; a key-named arrow value keeps its result
+    write(tmp_path, "src/get.ts", f'const get = () => "secret: {KEY_HEX}";\n')  # the literal is masked: no key occurrence inside it
+    write(tmp_path, "src/arrow.ts", f'const privateKey = () => "{KEY_HEX}";\n')  # unchanged by the opener rule: still a blocker
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {("DAPP-KEY-MATERIAL", "blocker", "src/arrow.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_key_assignment_inside_a_quote_that_prose_opened_is_reported_not_hidden(tmp_path):  # NX-M1: fail closed, no value shown
+    write(tmp_path, "src/prose.html", f'<p>x = "y</p> const privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set()
+    assert "src/prose.html:1: possible key assignment inside a quoted span at line 1: not analysed" in report["skipped"]
+    assert KEY_HEX not in text
+
+
+def test_ui_text_that_names_a_key_word_still_passes(tmp_path):  # NX-M1: the text after the key name is not a quoted key-shaped literal
+    write(tmp_path, "src/ui.ts", 'const msg = "Missing seed: set SEED";\nconst s = "privateKey: stored locally";\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_a_slash_slash_after_a_colon_that_is_not_a_scheme_starts_a_comment(tmp_path):  # NX-M2: `c://` is a comment, `https://` a URL
+    write(tmp_path, "src/label.ts", f'const label = b ? c:// note privateKey = "{KEY_HEX}";\n')
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_a_regex_literal_hides_its_slashes_from_the_comment_rule(tmp_path):  # NX-M3: the // and /* in a regex are not comments
+    write(tmp_path, "src/url.ts", f'const isUrl = /^https?:\\/\\//.test(s); const privateKey = "{KEY_HEX}";\n')
+    write(tmp_path, "src/star.ts", f'const r = /a\\/*b/; const privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/url.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/star.ts:1")}
+    assert KEY_HEX not in text
+
+
+def test_a_division_is_not_a_regex_and_a_comment_after_code_is_still_blanked(tmp_path):  # NX-M3: the slash after a word divides
+    write(tmp_path, "src/half.ts", f'const half = total / 2; const privateKey = "{KEY_HEX}";\n')
+    write(tmp_path, "src/note.ts", f'const a = 1; // note privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {("DAPP-KEY-MATERIAL", "blocker", "src/half.ts:1")}
+    assert KEY_HEX not in text
+
+
+def test_a_plain_string_or_template_that_names_a_key_is_not_reported(tmp_path):  # NM1b: no markup inside the literal, so no reason
+    write(tmp_path, "src/plain.ts", f"const s = \"privateKey: '{KEY_HEX}'\";\n"
+                                    f'const doc = `{{"privateKey": "{KEY_HEX}"}}`;\n'
+                                    f'const note = `Your secret = "{KEY_HEX}"\n`;\n')
+    code, report, text = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_spaced_less_than_before_a_slash_starts_a_regex_and_a_closing_tag_does_not(tmp_path):  # NM3b
+    write(tmp_path, "src/ok.ts", f'const ok = x < /https?:\\/\\//.test(s); const privateKey = "{KEY_HEX}";\n')
+    write(tmp_path, "src/tags.html", f'<p>a</p> const privateKey = "{KEY_HEX}"; <p>b</p>\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/ok.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/tags.html:1")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_slash_after_an_increment_or_decrement_divides(tmp_path):  # NM3c: ++ and -- end an operand, so the / that follows is division
+    write(tmp_path, "src/inc.ts", f'let n = count++ / 2; const privateKey = "{KEY_HEX}"; const r = a / b;\n')
+    write(tmp_path, "src/dec.ts", f'let m = count-- / 2; const privateKey = "{KEY_HEX}"; const q = a / b;\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/inc.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/dec.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_stray_quote_with_markup_elsewhere_on_the_line_is_reported_not_hidden(tmp_path):  # NX-M1c: markup anywhere on the line counts
+    write(tmp_path, "src/tag.html", f'<p>Note</p>: "hi const privateKey = "{KEY_HEX}";\n')
+    write(tmp_path, "src/fragment.tsx", f'<>Note: "hi const privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set()
+    assert "src/tag.html:1: possible key assignment inside a quoted span at line 1: not analysed" in report["skipped"]
+    assert "src/fragment.tsx:1: possible key assignment inside a quoted span at line 1: not analysed" in report["skipped"]
+    assert KEY_HEX not in text
+
+
+def test_the_suspect_reason_fires_once_per_markup_line_and_a_plain_line_gives_none(tmp_path):  # NX-M1d: the line's markup is read once
+    write(tmp_path, "src/tag.html", f'<p>x = "y</p> const privateKey = "{KEY_HEX}";\n' f'<p>x = "y</p> const privateKey = "{KEY_HEX}";\n')
+    write(tmp_path, "src/plain.ts", f'const s = "privateKey: \'{KEY_HEX}\'";\n')
+    _, report, text = scan(tmp_path)
+    assert sum(s.startswith("src/tag.html:1:") for s in report["skipped"]) == 1
+    assert sum(s.startswith("src/tag.html:2:") for s in report["skipped"]) == 1
+    assert not any(s.startswith("src/plain.ts:") for s in report["skipped"]) and KEY_HEX not in text
+
+
+def test_a_long_line_of_keys_inside_one_literal_is_scanned_in_linear_time(tmp_path, monkeypatch):  # NX-M1d: was quadratic
+    import time
+    loaded = module()
+    write(tmp_path, "src/many.ts", 'const s = "' + "secret: a " * 32000 + '"\n')
+    start = time.monotonic()
+    report = loaded.scan_tree(tmp_path, tmp_path)
+    assert time.monotonic() - start < 3.0  # about 0.2 s when linear; the quadratic form took 8 s at this size
+    assert report["status"] == "ok" and report["skipped"] == []
+
+
+def test_a_value_ending_in_a_closing_angle_at_end_of_file_is_closed(tmp_path):  # NX-M1e: > is not a binary operator, so the value closes
+    write(tmp_path, "src/cast.ts", f'const privateKey = "{KEY_HEX}" as Hex >\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {("DAPP-KEY-MATERIAL", "blocker", "src/cast.ts:1")}
+    assert not any("not closed" in s for s in report["skipped"]) and KEY_HEX not in text
+
+
+def test_a_value_ending_in_a_binary_operator_at_end_of_file_stays_open(tmp_path):  # NX-M1e: fail closed, as before
+    write(tmp_path, "src/plus.ts", f'const privateKey = "{KEY_HEX}" +\n')
+    _, report, text = scan(tmp_path)
+    assert [s for s in report["skipped"] if s.startswith("src/plus.ts:1:")] == [
+        "src/plus.ts:1: key-named assignment's value is not closed within 200 lines (value not checked)"]
+    assert KEY_HEX not in text
+
+
+def test_a_complete_jsx_last_line_gives_no_reason(tmp_path):  # NX-M1e: a closing /> at end of file is complete
+    write(tmp_path, "src/view.tsx", "<Input secret={s} />\n")
+    code, report, _ = scan(tmp_path)
+    assert code == 0 and report["status"] == "ok" and report["findings"] == [] and report["skipped"] == []
+
+
+def test_a_jsx_self_closing_tag_at_a_line_break_does_not_join_the_next_line(tmp_path):  # NX-M1f: the blocker is on the literal's own line
+    write(tmp_path, "src/view.tsx", f'<Input secret={{s}} />\nconst privateKey = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {("DAPP-KEY-MATERIAL", "blocker", "src/view.tsx:2")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_bare_greater_than_at_a_line_break_ends_the_value(tmp_path):  # NX-M1f: one blocker per literal, each at its own line
+    write(tmp_path, "src/gt.ts", f'const privateKey = "{KEY_HEX}" >\nconst secret = "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/gt.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/gt.ts:2")}
+    assert KEY_HEX not in text
+
+
+def test_an_arrow_at_a_line_break_still_joins_the_next_literal(tmp_path):  # NX-M1f: the arrow continues, so the value is judged once
+    write(tmp_path, "src/arrow.ts", f'const privateKey = () =>\n  "{KEY_HEX}";\n')
+    _, report, text = scan(tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {("DAPP-KEY-MATERIAL", "blocker", "src/arrow.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in text
+
+
+def test_a_cast_before_a_literal_on_the_next_line_is_judged_on_line_one(tmp_path):  # NX-M1g: <Hex> continues into the literal
+    write(tmp_path, "src/cast.ts", f'const privateKey = <Hex>\n"{KEY_HEX}";\n')
+    write(tmp_path, "src/spaced.ts", f'const privateKey = <Hex> \n"{KEY_HEX}" ;\n')
+    write(tmp_path, "src/nested.ts", f'const privateKey = <Array<Hex>>\n"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/cast.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/spaced.ts:1"),
+        ("DAPP-KEY-MATERIAL", "blocker", "src/nested.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_a_generic_call_before_a_parenthesised_literal_stays_silent(tmp_path):  # NX-M1g: call arguments are not read by design
+    write(tmp_path, "src/call.ts", f'const privateKey = Foo<Bar>\n("{KEY_HEX}");\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert report["findings"] == [] and report["skipped"] == []
+
+
+def test_an_attribute_tag_before_a_literal_still_ends_the_value(tmp_path):  # NX-M1g: an attribute tag is not a cast
+    write(tmp_path, "src/tag.tsx", f'const privateKey = <Input secret={{s}}>\n"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert report["findings"] == [] and report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_an_angle_value_of_another_shape_before_a_literal_is_reported_not_silent(tmp_path):  # NX-M1g: fail closed, no value shown
+    write(tmp_path, "src/union.ts", f'const privateKey = <Hex | Foo>\n"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set()
+    assert report["skipped"] == ["src/union.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_generic_close_forms_before_a_literal_on_the_next_line_are_unchanged(tmp_path):  # NX-M1g: (a) to (d) keep their round-fourteen results
+    index = 0
+    for generic in ("Map<string, string>", "Hex<T>", "Array<Hex>"):
+        for text in (f'const privateKey = {generic}\n"{KEY_HEX}";\n',
+                     f'const privateKey = {generic} as Hex\n"{KEY_HEX}";\n',
+                     f'const privateKey = {generic} satisfies Hex\n"{KEY_HEX}";\n',
+                     f'const privateKey = {generic}\n("{KEY_HEX}");\n',
+                     f'const privateKey = {generic}\n("{KEY_HEX}" as Hex);\n'):
+            index += 1
+            write(tmp_path, f"src/generic{index}.ts", text)
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set()  # the literal after a generic type is a statement, not the value
+    assert report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_a_double_cast_on_the_literal_line_is_judged_on_line_one(tmp_path):  # NX-M1h: a second cast operand joins the first
+    write(tmp_path, "src/double.ts", f'const privateKey = <Hex>\n<Hex>"{KEY_HEX}" as Hex;\n')
+    write(tmp_path, "src/indented.ts", f'const privateKey = <Hex>\n  <Hex>"{KEY_HEX}" as Hex;\n')
+    write(tmp_path, "src/semi.ts", f'const privateKey = <Hex>\n<Hex>"{KEY_HEX}";\n')
+    write(tmp_path, "src/spaced.ts", f'const privateKey = <Hex>\n"{KEY_HEX}" as Hex ;\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/double.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/indented.ts:1"),
+        ("DAPP-KEY-MATERIAL", "blocker", "src/semi.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/spaced.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_a_jsx_element_then_a_self_closing_tag_holds_no_literal_and_gives_no_reason(tmp_path):  # NX-M1h: the joined value has no literal
+    write(tmp_path, "src/div.tsx", "const privateKey = <div>\n  <span/>\n")
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert report["findings"] == [] and report["skipped"] == []
+
+
+def test_an_angle_value_of_another_shape_before_a_double_cast_is_reported_not_silent(tmp_path):  # NX-M1h: fail closed, no value shown
+    write(tmp_path, "src/union.ts", f'const privateKey = <Hex | Foo>\n<Hex>"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set()
+    assert report["skipped"] == ["src/union.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_an_identifier_led_continuation_of_a_cast_is_reported_not_silent(tmp_path):  # NX-M1i: getKey() + "0x…" is part of the value
+    write(tmp_path, "src/cont.ts", f'const privateKey = <Hex>\n  getKey() + "{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set() and report["status"] == "fail"
+    assert report["skipped"] == ["src/cont.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_a_triple_cast_before_a_literal_is_judged_on_line_one(tmp_path):  # NX-M1i: two joins give <Hex> <Hex>, which is still a cast chain
+    write(tmp_path, "src/triple.ts", f'const privateKey = <Hex>\n<Hex>\n<Hex>"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {("DAPP-KEY-MATERIAL", "blocker", "src/triple.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_repeated_casts_across_blank_lines_are_judged_on_line_one(tmp_path):  # NX-M1i: blank lines between the casts and before the literal do not stop the join
+    write(tmp_path, "src/blank.ts", f'const privateKey = <Hex>\n<Hex>\n\n"{KEY_HEX}";\n')
+    write(tmp_path, "src/between.ts", f'const privateKey = <Hex>\n\n<Hex>\n"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/blank.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/between.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_a_cast_then_a_keyword_led_line_ends_the_value(tmp_path):  # NX-M1i: a statement keyword ends the value, so nothing is reported
+    write(tmp_path, "src/kw.ts", "const privateKey = <Hex>\nconst other = 1;\n")
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert report["findings"] == [] and report["skipped"] == []
+
+
+def test_a_cast_then_a_digit_led_line_is_reported_not_silent(tmp_path):  # NX-M1i: 1 + 2 continues the value
+    write(tmp_path, "src/digit.ts", "const privateKey = <Hex>\n1 + 2;\n")
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert report["status"] == "fail" and report["skipped"] == ["src/digit.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"]
+
+
+def test_an_angle_union_then_an_identifier_led_line_is_reported_not_silent(tmp_path):  # NX-M1i: <Hex | Foo>getKey() is an assertion too
+    write(tmp_path, "src/union.ts", f'const privateKey = <Hex | Foo>\ngetKey() + "{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set()
+    assert report["skipped"] == ["src/union.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_a_contextual_word_starting_the_next_line_after_a_cast_is_an_operand(tmp_path):  # NX-M1j: type, declare, namespace, import are not statements
+    lines = {"type": f'  type + "{KEY_HEX}";\n', "declare": f'  declare + "{KEY_HEX}";\n', "namespace": f'  namespace + "{KEY_HEX}";\n',
+             "importmeta": f'  import.meta.env.X + "{KEY_HEX}";\n'}
+    for name, tail in lines.items():
+        write(tmp_path, f"src/{name}.ts", "const privateKey = <Hex>\n" + tail)
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set() and report["status"] == "fail"
+    assert sorted(report["skipped"]) == [f"src/{name}.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"
+                                         for name in sorted(lines)]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_a_leading_operator_after_a_cast_is_reported_not_silent(tmp_path):  # NX-M1j: the value continues with an operator, so it is not analysed
+    lines = {"plus": f'  + "{KEY_HEX}";\n', "minus": f'  - "{KEY_HEX}";\n', "and": f'  && "{KEY_HEX}";\n',
+             "ternary": f'  ? "{KEY_HEX}" : "a";\n', "concat": '  .concat("x");\n'}
+    for name, tail in lines.items():
+        write(tmp_path, f"src/{name}.ts", "const privateKey = <Hex>\n" + tail)
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set() and report["status"] == "fail"
+    assert sorted(report["skipped"]) == [f"src/{name}.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"
+                                         for name in sorted(lines)]
+    assert KEY_HEX not in json.dumps(report)
+
+
+def test_a_statement_word_starting_the_next_line_after_a_cast_ends_the_value(tmp_path):  # NX-M1j: a statement word is not an operand
+    lines = {"const": "const other = 1;\n", "var": "var other = 1;\n", "return": "return 1;\n",
+             "if": "if (x) y();\n", "export": "export const z = 1;\n", "function": "function f() {}\n", "class": "class A {}\n",
+             "interface": "interface I {}\n", "enum": "enum E {}\n", "break": "break;\n", "continue": "continue;\n"}
+    for name, tail in lines.items():
+        write(tmp_path, f"src/{name}.ts", "const privateKey = <Hex>\n" + tail)
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert report["findings"] == [] and report["skipped"] == []
+
+
+def test_a_comment_line_between_a_cast_and_a_literal_is_skipped(tmp_path):  # NX-M1j: a comment-only line does not end the value
+    write(tmp_path, "src/line.ts", f'const privateKey = <Hex>\n// note\n<Hex>"{KEY_HEX}";\n')
+    write(tmp_path, "src/block.ts", f'const privateKey = <Hex>\n/* note */\n<Hex>"{KEY_HEX}";\n')
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == {
+        ("DAPP-KEY-MATERIAL", "blocker", "src/line.ts:1"), ("DAPP-KEY-MATERIAL", "blocker", "src/block.ts:1")}
+    assert report["skipped"] == [] and KEY_HEX not in json.dumps(report)
+
+
+def test_a_let_line_after_a_cast_is_reported_not_silently_ended(tmp_path):  # NX-M1k: let is not a statement word, so the value is not silently ended
+    write(tmp_path, "src/operand.ts", f'const privateKey = <Hex>\n  let + "{KEY_HEX}";\n')
+    write(tmp_path, "src/declaration.ts", "const privateKey = <Hex>\nlet x = 1;\n")
+    report = module().scan_tree(tmp_path, tmp_path)
+    assert {item for item in found(report) if item[0] == "DAPP-KEY-MATERIAL"} == set() and report["status"] == "fail"
+    assert sorted(report["skipped"]) == ["src/declaration.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed",
+                                         "src/operand.ts:1: key-named assignment's angle-bracket value continues into a literal on the next line: not analysed"]
+    assert KEY_HEX not in json.dumps(report)

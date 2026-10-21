@@ -551,7 +551,7 @@ def test_tx_origin_is_major_only_when_compared_with_a_principal(snippet, severit
 
 @pytest.mark.parametrize("snippet, flagged", [
     ('    function f(address t) external { emit E(); (bool ok, ) = t.call(""); }', True),  # bound to ok, never read
-    ('    function f(address t) external { emit E(); bool ok = payable(t).send(1); if (ok) emit E(); }', False),
+    ('    function f(address t) external { emit E(); bool ok = payable(t).send(1); if (ok) emit E(); }', True),  # D-B: no revert on the false path
 ])
 def test_a_bound_low_level_result_must_be_read(snippet, flagged):
     assert bool([r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"]) is flagged
@@ -601,3 +601,177 @@ def test_an_or_with_a_non_sender_term_is_not_a_guard():
     assert guards_of("require(msg.sender == owner || open);") == []  # D1: the `open` branch reaches the write unchecked
     assert guards_of("require(msg.sender == adminA || msg.sender == adminB || open);") == []
     assert guards_of("require(open || msg.sender == adminA || msg.sender == adminB);") == []
+
+
+# --- QA-03 re-review (N1, N2, N5, N7): path-aware guards, OR conditions, linear scans, unparseable input -----------------------
+
+
+@pytest.mark.parametrize("guard, severity", [
+    ("require(msg.sender == owner && open || a);", "major"),  # the `a` branch reaches the delegatecall with no sender check
+    ("require(msg.sender == owner && open);", "minor"),  # both conjuncts must hold: a real guard, the call is only minor
+])
+def test_an_or_around_a_sender_check_leaves_its_branch_open(guard, severity):
+    snippet = f"    function f(address t, bytes memory d, bool a) external {{ emit E(); {guard} (bool ok, ) = t.delegatecall(d); require(ok); }}"
+    assert [(r, s) for r, s, _ in findings(body(snippet)) if r == "SOL-DELEGATECALL"] == [("SOL-DELEGATECALL", severity)]
+
+
+@pytest.mark.parametrize("snippet", [
+    # a guard inside an if without an else does not guard the call after the if
+    "    function f(address t, bytes memory d, bool c) external { emit E(); if (c) { require(msg.sender == owner); } (bool ok, ) = t.delegatecall(d); require(ok); }",
+    # nothing after an unconditional return runs, so a guard placed after it is dead
+    "    function f(address t, bytes memory d) external { emit E(); return; require(msg.sender == owner); (bool ok, ) = t.delegatecall(d); require(ok); }",
+])
+def test_a_guard_on_a_conditional_or_dead_path_does_not_guard_the_delegatecall(snippet):
+    assert [(r, s) for r, s, _ in findings(body(snippet)) if r == "SOL-DELEGATECALL"] == [("SOL-DELEGATECALL", "major")]
+
+
+@pytest.mark.parametrize("make", [
+    lambda: "pragma solidity 0.8.20;\ncontract C { address owner; function f() external { " + "address o = tx.origin; " * 2800 + "} }",  # 64 KiB
+    lambda: "pragma solidity 0.8.28;\ncontract C { function f(address t) external { " + 't.call("") ' * 6000 + "} }",  # 64 KiB of call sites
+])
+def test_a_64_kib_source_of_repeated_origin_or_call_sites_is_scanned_in_seconds(make):
+    import time
+    module = load_module()
+    source = make()
+    assert len(source) >= 60000
+    started = time.perf_counter()
+    module.lint_source("a.sol", source)
+    assert time.perf_counter() - started < 5, len(source)
+
+
+def test_a_truncated_source_fails_closed_as_an_incomplete_scan(tmp_path):
+    write(tmp_path, "src/Cut.sol", "pragma solidity 0.8.28;\ncontract S { uint256 x; function f(uint256 a")
+    result, data = lint(tmp_path)
+    assert result.returncode == 1 and data["status"] == "fail" and data["files_scanned"] == 1
+    assert [(f["id"], f["severity"]) for f in data["findings"]] == [("scan/incomplete", "major")]
+
+
+def test_a_function_after_the_closing_brace_fails_closed_as_an_incomplete_scan(tmp_path):
+    write(tmp_path, "src/Late.sol", "pragma solidity 0.8.28;\ncontract S { uint256 x; }\nfunction f() external { x = 1; }\n")
+    result, data = lint(tmp_path)
+    assert result.returncode == 1 and data["status"] == "fail"
+    assert [(f["id"], f["severity"]) for f in data["findings"]] == [("scan/incomplete", "major")]
+
+
+# --- statement boundary (residual 2): a call is judged by its statement, not by a fixed window before it -----------------------
+
+
+def test_a_result_check_is_found_for_a_call_behind_a_statement_head_longer_than_512_characters():
+    long_args = ", ".join(["x"] * 150)  # 600 characters of arguments
+    long_head = " + ".join(["x"] * 150)  # 600 characters before the call, in the same require
+    checked_by_binding = f"    function f(address t) external {{ emit E(); (bool ok, ) = t.call({long_args}); require(ok); }}"
+    checked_in_require = f"    function f(address t) external {{ emit E(); require({long_head} > 0 && t.call(\"\")); }}"
+    for snippet in (checked_by_binding, checked_in_require):
+        assert [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == [], snippet[:60]
+
+
+def test_a_long_statement_whose_call_result_is_never_tested_is_still_flagged():
+    long_args = ", ".join(["x"] * 150)
+    snippet = f"    function f(address t) external {{ emit E(); t.call({long_args}); }}"
+    assert [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == ["SOL-UNCHECKED-LOW-LEVEL-CALL"]
+
+
+# --- re-verification round two (NEW-6, NEW-7, NEW-8): for headers, callee guards at their call site, stored success flags ---------
+
+
+@pytest.mark.parametrize("statement", [
+    "for (uint i; i < 1; require(true)) (bool ok, ) = a.call(\"\");",
+    "for (uint i; i < 1; assert(true)) (bool ok, ) = a.call(\"\");",
+])
+def test_a_semicolon_in_a_for_header_is_not_a_statement_boundary_so_the_call_is_still_judged(statement):  # NEW-6
+    snippet = f"    function f(address a) external {{ {statement} }}"
+    assert [(r, s) for r, s, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == [("SOL-UNCHECKED-LOW-LEVEL-CALL", "major")]
+
+
+@pytest.mark.parametrize("snippet, flagged", [
+    ('    function f(address t) external { (bool ok, ) = t.call(""); emit R(ok); }', True),  # stored in an event: not a test
+    ('    bool lastOk; function f(address t) external { (bool ok, ) = t.call(""); lastOk = ok; }', True),  # assigned on: not a test
+    ('    function f(address t) external { (bool ok, ) = t.call(""); require(ok); }', False),
+    ('    function f(address t) external { (bool ok, ) = t.call(""); if (!ok) revert(); }', False),
+])
+def test_a_success_flag_counts_as_checked_only_when_a_condition_reads_it(snippet, flagged):  # NEW-8
+    rules = [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert bool(rules) is flagged
+
+
+@pytest.mark.parametrize("call, severity", [
+    ("if (f > 0) { _auth(); }", "major"),  # the guard runs on one path only: the delegatecall is exposed
+    ("_auth();", "minor"),  # the guard runs on every path: the delegatecall is guarded
+])
+def test_a_callee_guard_counts_for_a_delegatecall_only_when_its_call_is_unconditional(call, severity):  # NEW-7
+    snippet = ("    function _auth() internal view { require(msg.sender == owner); }\n"
+               f"    function pay(address t, bytes memory d, uint f) external {{ {call} (bool ok, ) = t.delegatecall(d); require(ok); }}")
+    assert [(r, s) for r, s, _ in findings(body(snippet)) if r == "SOL-DELEGATECALL"] == [("SOL-DELEGATECALL", severity)]
+
+
+def test_a_call_chain_past_the_recursion_limit_is_a_scan_incomplete_major_in_the_lint(tmp_path):  # recursion backstop
+    depth = 1200  # past the interpreter's limit of 1000 frames and the guard walk's measured limit of about 494 levels
+    lines = ["    function f0(address t, bytes memory d, uint v) external { f1(v); (bool ok, ) = t.delegatecall(d); require(ok); }"]
+    lines += [f"    function f{i}(uint v) internal {{ f{i + 1}(v); }}" for i in range(1, depth)]
+    lines.append(f"    function f{depth}(uint v) internal {{ x = v; }}")
+    write(tmp_path, "src/Deep.sol", "pragma solidity 0.8.28;\ncontract S { uint256 x;\n" + "\n".join(lines) + "\n}\n")
+    result, data = lint(tmp_path)
+    assert result.returncode == 1 and data["status"] == "fail" and data["files_scanned"] == 1
+    assert [(f["id"], f["severity"]) for f in data["findings"]] == [("scan/incomplete", "major")]
+    assert "recursion limit" in data["findings"][0]["summary"]
+
+
+# --- round three (D-A, D-B): a success flag is checked only by its next read in scope, and an if checks only when its failure path
+# reverts or returns --------------------------------------------------------------------------------------------------------------
+
+
+def test_a_flag_overwritten_by_a_later_call_before_any_read_checks_nothing_for_the_earlier_call():  # D-A
+    snippet = ("    function f(address a, address b) external {\n"
+               "        (bool ok, ) = a.call(\"\");\n"
+               "        (bool ok2, ) = b.call(\"\");\n"
+               "        require(ok);\n"
+               "    }")
+    lines = [line for rule, _, line in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert lines == [7, 8]  # the first call (line 7) is unchecked; the second is never read either
+
+
+def test_a_read_of_a_flag_in_another_scope_checks_nothing_for_the_call_in_its_own_block():  # D-A
+    snippet = ("    function f(address a, address b) external {\n"
+               "        { (bool ok, ) = a.call(\"\"); }\n"
+               "        { (bool ok, ) = b.call(\"\"); require(ok); }\n"
+               "    }")
+    lines = [line for rule, _, line in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert lines == [7]  # the first block's flag is out of scope before the second block reads its own flag
+
+
+@pytest.mark.parametrize("snippet, flagged", [
+    ('    function f(address a) external { (bool ok, ) = a.call(""); if (ok) { lastOk = true; } }', True),  # no revert on the false path
+    ('    function f(address a) external { (bool ok, ) = a.call(""); if (!ok) revert(); }', False),
+    ('    function f(address a) external { (bool ok, ) = a.call(""); if (ok) { lastOk = true; } else { revert(); } }', False),
+])
+def test_an_if_checks_the_call_only_when_its_failure_path_reverts_or_returns(snippet, flagged):  # D-B
+    rules = [rule for rule, _, _ in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert bool(rules) is flagged
+
+
+# --- round four (N-2): a failure branch that reverts as one of its top-level statements checks the call -------------------------
+
+
+@pytest.mark.parametrize("branch, flagged", [
+    ("if (!ok) { emit E(); revert(); }", False),  # the revert is reached on every path of the failure branch
+    ("if (!ok) { emit E(); }", True),  # nothing in the failure branch stops the call
+    ("if (!ok) { if (c) revert(); }", True),  # the revert is conditional, so it does not stop the call on every path
+])
+def test_a_failure_branch_checks_the_call_when_a_top_level_statement_of_it_reverts(branch, flagged):  # N-2
+    snippet = f"    function f(address t, bool c) external {{ (bool ok, ) = t.call(\"\"); {branch} }}"
+    rules = [rule for rule, _, _ in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert bool(rules) is flagged
+
+
+# --- round five (N-5): a brace inside call arguments is part of an expression, so it neither opens a block nor ends a statement ---
+
+
+@pytest.mark.parametrize("branch, flagged", [
+    ("if (!ok) { return S({a: 1}); }", False),  # the failure branch exits through the return; the struct-literal brace is no block
+    ("if (!ok) { revert E({a: 1}); }", False),  # the failure branch exits through the revert, whose argument is a struct literal
+    ("if (!ok) { emit E({a: 1}); }", True),  # an emit is not an exit, however its arguments are written
+])
+def test_a_brace_inside_call_arguments_is_an_expression_not_a_block(branch, flagged):  # N-5
+    snippet = f"    function f(address t) external {{ (bool ok, ) = t.call(\"\"); {branch} }}"
+    rules = [rule for rule, _, _ in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert bool(rules) is flagged

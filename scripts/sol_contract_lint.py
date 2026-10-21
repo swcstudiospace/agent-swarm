@@ -21,7 +21,6 @@ import re
 import shutil
 import stat
 import sys
-from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -382,6 +381,10 @@ def parse_source(raw: str) -> list[dict]:
                                                    "initial_value": bool(init.strip()), "line": line_no})
         contracts.append(contract)
         pos = close + 1
+    declared = frozenset(m.group(1) for m in _TYPE_DECL.finditer(clean))  # the names of this source's structs, enums and contracts
+    for contract in contracts:
+        for fn in contract["functions"]:
+            fn["types"] = declared
     return contracts
 
 
@@ -496,79 +499,644 @@ _SENDER_EQ_RE = re.compile(_SENDER_EQ)
 _SENDER_OR_CHAIN = re.compile(r"\b(?:require|assert)\s*\(\s*(" + _SENDER_EQ + r"(?:\s*\|\|\s*" + _SENDER_EQ + r")+)(?=\s*[),])")
 
 
-def _inline_guards(body: str) -> set[str]:
-    """Sender checks that stop an unauthorised caller. `require`/`assert` need `msg.sender == X`, `X == msg.sender`,
-    hasRole(X, msg.sender) or a role-named allow-list lookup; `if` needs the negated form followed by revert/return.
-    A comparison with address(0) or tx.origin, `!=` inside require, and an `if` that merely branches are not guards."""
-    found: set[str] = set()
-    if re.search(r"\b_checkOwner\s*\(\s*\)", body):
-        found.add("owner")
-    for m in re.finditer(r"\b_checkRole\s*\(\s*([^,)]{1,120})", body):
-        found.add(m.group(1).strip())
-    for lead, end in ((_REQ, _REQ_END), (r"\bif\s*\(\s*!\s*", r"\s*" + _IF_REVERT)):
+_CONTROL_OPEN = re.compile(r"\b(?:if|for|while)\s*\(")
+_HEAD_AT = re.compile(r"(?:if|for|while)\s*\(|else\b")  # a control head, or `else`, that starts a brace-less statement
+_ELSE = re.compile(r"\belse\b")
+_WS = re.compile(r"\s*")
+_BLOCK_KEYWORD = re.compile(r"\b(?:unchecked|assembly)$")  # a block after these runs as often as the code around it
+# an unconditional exit: `_;` is a modifier's placeholder, so a guard after it never precedes the function body
+_TERMINATOR = re.compile(r"\b(?:return|revert|throw)\b|(?<![\w$])_\s*;")
+
+
+class _Profile:
+    """Control-flow facts of one body (see _body_profile): cond[i] is 1 when offset i may not run on every call; terminator is
+    the offset of the first unconditional return, revert, throw or `_;` (len(body) when none); paren_match pairs each '(' with
+    its ')'; or_top[open] is True when the parenthesis opened at `open` has a top-level `||` before its first comma; brace_match
+    pairs each '{' with its '}'; for_spans lists (open, close, end) of each for header, where end is the end of the loop."""
+
+    __slots__ = ("cond", "terminator", "paren_match", "or_top", "brace_match", "for_spans")
+
+    def __init__(self, cond, terminator: int, paren_match: dict[int, int], or_top: dict[int, bool], brace_match: dict[int, int],
+                 for_spans: list[tuple[int, int, int]]):
+        self.cond = cond
+        self.terminator = terminator
+        self.paren_match = paren_match
+        self.or_top = or_top
+        self.brace_match = brace_match
+        self.for_spans = for_spans
+
+
+class _Ends:
+    """Offset just past the statement that starts at a given offset of a body. A chain of brace-less control heads (`if (c)`,
+    `for (...)`, `else`) is followed once and memoised, so nested heads cost one pass in all."""
+
+    def __init__(self, body: str, paren_match: dict[int, int], brace_match: dict[int, int]):
+        self.body = body
+        self.paren = paren_match
+        self.brace = brace_match
+        self.semis = [m.start() for m in re.finditer(r";", body)]
+        self.memo: dict[int, int] = {}
+
+    def end_from(self, start: int) -> int:
+        body, n = self.body, len(self.body)
+        chain: list[int] = []
+        j = _WS.match(body, start).end()
+        while True:
+            if j in self.memo:
+                result = self.memo[j]
+                break
+            m = _HEAD_AT.match(body, j)
+            if m is None:
+                result = self._statement(j)
+                break
+            chain.append(j)
+            if m.group(0) == "else":
+                j = _WS.match(body, m.end()).end()
+                continue
+            close = self.paren.get(m.end() - 1)
+            if close is None:
+                result = n
+                break
+            j = _WS.match(body, close + 1).end()
+        for head in chain:
+            self.memo[head] = result
+        return result
+
+    def _statement(self, j: int) -> int:
+        n = len(self.body)
+        if j >= n:
+            return n
+        if self.body[j] == "{":
+            return self.brace.get(j, n - 1) + 1
+        k = bisect.bisect_left(self.semis, j)
+        return self.semis[k] + 1 if k < len(self.semis) else n
+
+
+def _body_profile(body: str) -> _Profile:
+    """The control-flow profile of a function or modifier body, computed in one pass over its brackets and control heads.
+    A block after an if, else, loop, try or catch, and a brace-less statement under one, may not run on every call; so may
+    code after a return, revert or throw that sits in such a block, and the post clause of a for header, which runs after each
+    iteration and maybe never (NEW-5). Blocks that always run are bare, unchecked and assembly."""
+    n = len(body)
+    paren_match: dict[int, int] = {}
+    brace_match: dict[int, int] = {}
+    or_top: dict[int, bool] = {}
+    stack: list[list] = []  # [opener, offset, a top-level || seen, a comma seen] for each open bracket
+    for m in re.finditer(r"[(){}\[\]]|\|\||,", body):
+        token = m.group()
+        if token in ("(", "[", "{"):
+            stack.append([token, m.start(), False, False])
+        elif token in (")", "]", "}"):
+            if not stack:
+                continue
+            opener, start, has_or, _ = stack.pop()
+            if token == ")" and opener == "(":
+                paren_match[start] = m.start()
+                or_top[start] = has_or
+            elif token == "}" and opener == "{":
+                brace_match[start] = m.start()
+        elif token == "||":
+            if stack and stack[-1][0] == "(" and not stack[-1][3]:
+                stack[-1][2] = True
+        elif stack and stack[-1][0] == "(":  # a comma
+            stack[-1][3] = True
+    spans: list[tuple[int, int]] = []
+    for open_, close in brace_match.items():
+        tail = body[max(0, open_ - 200):open_].rstrip()
+        if (not tail and open_ < 200) or tail.endswith((";", "{", "}")) or _BLOCK_KEYWORD.search(tail):
+            continue  # a bare block: it always runs, as the code around it does
+        spans.append((open_, close + 1))
+    ends = _Ends(body, paren_match, brace_match)
+    for m in _CONTROL_OPEN.finditer(body):
+        close = paren_match.get(m.end() - 1)
+        if close is None:
+            continue
+        after = _WS.match(body, close + 1).end()
+        if after < n and body[after] != "{":
+            spans.append((after, ends.end_from(after)))
+    for m in _ELSE.finditer(body):
+        after = _WS.match(body, m.end()).end()
+        if after < n and body[after] != "{":
+            spans.append((after, ends.end_from(after)))
+    for_spans: list[tuple[int, int, int]] = []
+    for m in re.finditer(r"\bfor\s*\(", body):
+        open_ = m.end() - 1
+        close = paren_match.get(open_)
+        if close is None:
+            continue
+        semi1 = body.find(";", open_ + 1, close)
+        semi2 = body.find(";", semi1 + 1, close) if semi1 >= 0 else -1
+        if semi2 >= 0:
+            spans.append((semi2 + 1, close))  # the post clause: runs after each iteration, and maybe never
+        after = _WS.match(body, close + 1).end()
+        for_spans.append((open_, close, ends.end_from(after) if after < n else n))
+    diff = [0] * (n + 1)
+    for a, b in spans:
+        diff[a] += 1
+        diff[b] -= 1
+    cond = bytearray(n)
+    run = 0
+    for i in range(n):
+        run += diff[i]
+        cond[i] = 1 if run > 0 else 0
+    terminator = n
+    for m in _TERMINATOR.finditer(body):
+        if not cond[m.start()]:
+            terminator = m.start()
+            break
+    return _Profile(cond, terminator, paren_match, or_top, brace_match, for_spans)
+
+
+def _profile_of(fn: dict) -> _Profile:
+    """The body profile of a function or modifier, computed once and kept on the dict."""
+    profile = fn.get("_profile")
+    if profile is None:
+        profile = fn["_profile"] = _body_profile(fn["body"])
+    return profile
+
+
+def _guard_sites(body: str, profile: _Profile) -> list[tuple[int, int, str, str]]:
+    """(pos, end, label, helper name or "") of every inline sender check in `body`, before the path and helper filters. `pos` is
+    where the check's text starts (the path filters use it); `end` is where that text ends."""
+    sites: list[tuple[int, int, str, str]] = []
+
+    def single(m: re.Match, label: str, helper: str, require: bool) -> None:
+        if require:  # `require(x || msg.sender == a)`: the disjunct that holds lets the call through with no sender check
+            open_ = body.find("(", m.start())
+            if open_ not in profile.paren_match or profile.or_top.get(open_, False):
+                return
+        sites.append((m.start(), m.end(), label, helper))
+
+    for m in re.finditer(r"\b_checkOwner\s*\(\s*\)", body):
+        sites.append((m.start(), m.end(), "owner", "_checkOwner"))
+    for m in re.finditer(r"\b_checkRole\s*\(", body):
+        close = profile.paren_match.get(m.end() - 1)
+        if close is None:
+            continue
+        args = split_top(body[m.end():close])
+        # `_checkRole(ROLE)` checks msg.sender itself (the OpenZeppelin convention); `_checkRole(ROLE, msg.sender)` checks the caller;
+        # `_checkRole(ROLE, user)` with another account is not the caller's check and gets no credit (N-1)
+        if len(args) == 1 or (len(args) == 2 and _SENDER_ACCOUNT.fullmatch(args[1]) is not None):
+            sites.append((m.start(), close + 1, args[0], "_checkRole"))
+    for lead, end, require in ((_REQ, _REQ_END, True), (r"\bif\s*\(\s*!\s*", r"\s*" + _IF_REVERT, False)):
         for m in re.finditer(lead + r"hasRole\s*\(\s*([^,]{1,120}),\s*" + _SENDER + r"\s*\)" + end, body):
-            found.add(m.group(1).strip())
+            single(m, m.group(1).strip(), "hasRole", require)
         for m in re.finditer(lead + r"(" + _NAME + r")\s*\[\s*" + _SENDER + r"\s*\]" + end, body):
             if re.search(_ROLE_WORDS, m.group(1), re.I):
-                found.add(f"{m.group(1)}[msg.sender]")
+                single(m, f"{m.group(1)}[msg.sender]", "", require)
         for m in re.finditer(lead + r"(" + _NAME + r")\s*\(\s*" + _SENDER + r"\s*\)" + end, body):
             if m.group(1) != "hasRole" and re.search(_ROLE_WORDS, m.group(1), re.I):
-                found.add(f"{m.group(1)}(msg.sender)")
-    for pattern in (_REQ + _SENDER + r"\s*==\s*" + _RHS + _REQ_END, _REQ + _LHS + r"\s*==\s*" + _SENDER + _REQ_END,
-                    r"\bif\s*\(\s*" + _SENDER + r"\s*!=\s*" + _RHS + r"\s*" + _IF_REVERT,
-                    r"\bif\s*\(\s*" + _LHS + r"\s*!=\s*" + _SENDER + r"\s*" + _IF_REVERT):
+                single(m, f"{m.group(1)}(msg.sender)", m.group(1), require)
+    for pattern, require in ((_REQ + _SENDER + r"\s*==\s*" + _RHS + _REQ_END, True),
+                             (_REQ + _LHS + r"\s*==\s*" + _SENDER + _REQ_END, True),
+                             (r"\bif\s*\(\s*" + _SENDER + r"\s*!=\s*" + _RHS + r"\s*" + _IF_REVERT, False),
+                             (r"\bif\s*\(\s*" + _LHS + r"\s*!=\s*" + _SENDER + r"\s*" + _IF_REVERT, False)):
         for m in re.finditer(pattern, body):
             who = re.sub(r"\s+", "", m.group(1))
             if who not in _NOT_A_PRINCIPAL:
-                found.add(f"msg.sender=={who}")
+                single(m, f"msg.sender=={who}", "", require)
     # `require(msg.sender == A || msg.sender == B)`: every disjunct is a sender check against a principal, so the chain guards each
     # of them. One non-sender term (`msg.sender == owner || open`) leaves its branch open: the chain is then no guard at all.
     for chain in _SENDER_OR_CHAIN.finditer(body):
         whos = [re.sub(r"\s+", "", p.group(1) or p.group(2)) for p in _SENDER_EQ_RE.finditer(chain.group(1))]
         if len(whos) == chain.group(1).count("||") + 1 and not any(who in _NOT_A_PRINCIPAL for who in whos):
-            found.update(f"msg.sender=={who}" for who in whos)
+            sites.extend((chain.start(), chain.end(), f"msg.sender=={who}", "") for who in whos)
+    return sites
+
+
+def _helper_checks_sender(index: dict[str, list[dict]], name: str, visiting: frozenset) -> bool:
+    """Whether the helper `name` is a sender check. A helper this source defines counts only when its own body holds a sender
+    check (an empty or no-op helper guards nothing); a helper defined outside this source (inherited) is taken as the library's."""
+    if name in visiting:
+        return False
+    defs = [d for d in index.get(name, []) if d["kind"] == "function"]
+    if not defs:
+        return True
+    for d in defs:
+        cached = d.get("_sender_check")
+        if cached is None:
+            cached = d["_sender_check"] = bool(_guard_labels(d["body"], index, _profile_of(d), visiting | {name}))
+        if cached:
+            return True
+    return False
+
+
+def _guard_labels(body: str, index: dict[str, list[dict]] | None, profile: _Profile,
+                   visiting: frozenset = frozenset()) -> list[tuple[int, int, str]]:
+    """(pos, end, label) of the sender checks that hold on every path through `body`. A check inside an if, loop or other conditional
+    body guards nothing after it; nothing after an unconditional return, revert, throw or `_;` runs. A helper check (_checkOwner(),
+    _checkRole(X), hasRole(X, msg.sender), name(msg.sender)) counts only when the source's own helper checks the sender."""
+    found: list[tuple[int, int, str]] = []
+    for pos, end, label, helper in _guard_sites(body, profile):
+        if pos >= profile.terminator or profile.cond[pos]:
+            continue
+        if helper and index is not None and not _helper_checks_sender(index, helper, visiting):
+            continue
+        found.append((pos, end, label))
     return found
+
+
+def _unconditional_calls(fn: dict) -> list[tuple[str, int]]:
+    """(name, offset) of each same-source call name that `fn` makes at a point that always runs, at its first such call;
+    cached on the function."""
+    cached = fn.get("_uncalls")
+    if cached is None:
+        profile = _profile_of(fn)
+        first: dict[str, int] = {}
+        for m in _CALL.finditer(fn["body"]):
+            name = m.group(1)
+            if name in _NOT_CALLS or name in first:
+                continue
+            if m.start() < profile.terminator and not profile.cond[m.start()]:
+                first[name] = m.start()
+        cached = fn["_uncalls"] = list(first.items())
+    return cached
 
 
 _SENDER_AWARE = re.compile(r"msg\.sender|_msgSender\s*\(|\b_?check\w*\s*\(|\b_only\w*\s*\(|\bhasRole\b|\bisOwner\b|\bowner\s*\(|\bauth\w*\s*\(")
 
 
-def _is_access_modifier(name: str, defined: list[dict]) -> bool:
-    """A modifier named like an access check (only*, auth, restricted, ...) is access control, unless this source defines it
-    and its body never looks at the caller (onlyWhileOpen, onlyAfter(time)); a modifier defined here that checks the sender is
-    access control whatever it is called."""
-    named = name in _ACCESS_NAMES or (name.startswith("only") and name not in _NON_ACCESS_ONLY)
-    if not defined:
-        return named
-    if any(_inline_guards(t["body"]) for t in defined):
-        return True
-    return named and any(_SENDER_AWARE.search(t["body"]) for t in defined)
+_PLACEHOLDER = re.compile(r"(?<![\w$])_\s*;")  # a modifier's placeholder: the function body runs there
+_MODIFIER_UNIT = 1 << 24  # offsets of one applied modifier's own text; the modifiers of a chain occupy consecutive units before the body
+_POST = 1 << 40  # a write after a modifier's `_;`: it runs after the function body, so any guard before the body covers it
+_ASSEMBLY_OPEN = re.compile(r"\bassembly\s*(?:\"[^\"]*\"\s*)?\{")
+_GUARD_HELPERS = frozenset({"hasRole", "_checkOwner", "_checkRole", "_msgSender", "isOwner"})
+_ELEMENTARY_CALL = re.compile(r"(?:u?int\d*|bytes\d*|address|bool|string|byte|u?fixed\d*)\Z")
+_ASSIGN = re.compile(r"(?<![=!<>])(?:<<|>>|[-+*/%&|^:])?=(?![=>])")  # `=`, compound assignments and Yul `:=`; not `==`, `!=`, `<=`, `>=`, `=>`
+_INCDEC = re.compile(r"\+\+|--")
+_DELETE = re.compile(r"\bdelete\s+([A-Za-z_$][\w$]*)")
+_PUSH_POP = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)(?:\s*\.\s*[A-Za-z_$][\w$]*|\s*\[[^\[\]\n]{0,160}\])*\s*\.\s*(?:push|pop)\s*\(")
+_SSTORE = re.compile(r"(?<![\w$.])sstore\s*\(")
+_LHS_TAIL = re.compile(r"([A-Za-z_$][\w$]*)(?:\s*\[[^\[\]]*\]|\s*\.\s*[A-Za-z_$][\w$]*)*\s*$")  # the root of an assigned place
+_IDENT_AT = re.compile(r"[A-Za-z_$][\w$]*")
+# a declaration: a type, an optional `payable` and array brackets, an optional `storage`/`memory`/`calldata`, then the name, followed
+# by `=`, `,`, `;` or `)`. Any identifier can match the type; `_is_type` keeps only real type names.
+_DECL = re.compile(r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)(?:\s+payable)?"
+                   r"(?:\s*\[[^\]\n]{0,40}\])*\s+(memory|storage|calldata)?\s*([A-Za-z_$][\w$]*)(?=\s*(?:=(?![=>])|[,;)]))")
+_ELEMENTARY_TYPE = re.compile(r"(?:address|bool|string|bytes\d*|u?int\d*|byte|u?fixed\d*)\Z")
+_TYPE_DECL = re.compile(r"\b(?:struct|enum|contract|interface|library|type)\s+([A-Za-z_$][\w$]*)")  # the type names a source declares
 
 
-def _direct_guards(fn: dict, index: dict[str, list[dict]]) -> set[str]:
-    """Access labels from fn's own body and modifiers, resolved against `index` (the callables its contract can see). The
-    result is kept per index object: the same function reached through another contract may resolve its names differently."""
-    cached = fn.setdefault("_guards", [])
-    for held, found in cached:
+def _is_type(name: str, declared: frozenset) -> bool:
+    """Whether `name` is a type: an elementary type, an upper-case name (an imported contract or library), or a struct, enum,
+    contract or other type the source declares (a lower-case name counts only when the source declares it, D-D)."""
+    head = name.split(".")[0]
+    return bool(_ELEMENTARY_TYPE.match(name)) or head[:1].isupper() or name in declared or head in declared
+_YUL_LET = re.compile(r"\blet\s+([A-Za-z_$][\w$]*(?:\s*,\s*[A-Za-z_$][\w$]*)*)")
+_NAME_AT = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def _placeholder(body: str) -> int:
+    """Offset of a modifier's `_;` placeholder; 0 when it has none, so nothing before it counts as a check (fail closed)."""
+    m = _PLACEHOLDER.search(body)
+    return m.start() if m else 0
+
+
+def _chain_key(k: int, n: int, off: int) -> int:
+    """Position of offset `off` in the text of applied modifier k of n: the modifiers run in order, all before the body."""
+    return (k - n) * _MODIFIER_UNIT + off
+
+
+def _per_index(fn: dict, key: str, index: dict[str, list[dict]], compute):
+    """`compute()` kept on the function per index object: the same function reached through another contract may resolve its names
+    differently."""
+    entries = fn.setdefault("_per_index", {}).setdefault(key, [])
+    for held, value in entries:
         if held is index:
-            return found
-    found = _inline_guards(fn["body"])
-    for name, args in fn["modifiers"]:
-        if _is_access_modifier(name, [t for t in index.get(name, []) if t["kind"] == "modifier"]):
-            found.add(args.strip() if name == "onlyRole" and args.strip() else name)
-    cached.append((index, found))
-    return found
+            return value
+    value = compute()
+    entries.append((index, value))
+    return value
+
+
+def _modifier_site(name: str, args: str, index: dict[str, list[dict]]) -> tuple[int, str] | None:
+    """(offset in the modifier's text, label) of the access check that applied modifier `name` makes, or None. A check counts only
+    when it runs before the modifier's `_;`: the code after it runs after the function body (NEW-4). A modifier this source does not
+    define is taken as access control at offset 0 when its name says so."""
+    defined = [t for t in index.get(name, []) if t["kind"] == "modifier"]
+    named = name in _ACCESS_NAMES or (name.startswith("only") and name not in _NON_ACCESS_ONLY)
+    label = args.strip() if name == "onlyRole" and args.strip() else name
+    if not defined:
+        return (0, label) if named else None
+    best: int | None = None
+    for t in defined:
+        ph = _placeholder(t["body"])
+        for pos, _, _ in _guard_labels(t["body"], index, _profile_of(t)):
+            if pos < ph and (best is None or pos < best):
+                best = pos
+        if best is None and named:
+            m = _SENDER_AWARE.search(t["body"], 0, ph)
+            if m:
+                best = m.start()
+    return None if best is None else (best, label)
+
+
+def _own_guards(fn: dict, index: dict[str, list[dict]]) -> list[tuple[int, int, str]]:
+    """(pos, end, label) of the checks fn makes itself: its body's unconditional checks, and its applied access modifiers at their
+    place in the modifier run (see _chain_key)."""
+
+    def compute() -> list[tuple[int, int, str]]:
+        out = list(_guard_labels(fn["body"], index, _profile_of(fn)))
+        n = len(fn["modifiers"])
+        for k, (name, args) in enumerate(fn["modifiers"]):
+            site = _modifier_site(name, args, index)
+            if site is not None:
+                key = _chain_key(k, n, site[0])
+                out.append((key, key, site[1]))
+        return out
+
+    return _per_index(fn, "own_guards", index, compute)
+
+
+def _scope_ends(body: str, offsets: list[int], profile: _Profile) -> list[int]:
+    """For each offset, the end of its scope: the `}` that closes the innermost block holding it, the end of the body at top level,
+    or, inside a for header, the end of that loop statement."""
+    n = len(body)
+    events = [(o, 0, o) for o in profile.brace_match]
+    events += [(c, 1, o) for o, c in profile.brace_match.items()]
+    events += [(d, 2, i) for i, d in enumerate(offsets)]
+    events.sort()
+    stack: list[int] = []
+    holder = [-1] * len(offsets)
+    for _, kind, val in events:
+        if kind == 0:
+            stack.append(val)
+        elif kind == 1:
+            if stack and stack[-1] == val:
+                stack.pop()
+        else:
+            holder[val] = stack[-1] if stack else -1
+    starts = [span[0] for span in profile.for_spans]
+    ends: list[int] = []
+    for i, d in enumerate(offsets):
+        end = profile.brace_match[holder[i]] if holder[i] >= 0 else n
+        j = bisect.bisect_right(starts, d) - 1
+        if j >= 0 and d < profile.for_spans[j][1]:
+            end = profile.for_spans[j][2]
+        ends.append(end)
+    return ends
+
+
+def _scoped_locals(fn: dict) -> dict[str, list[tuple[int, int]]]:
+    """name -> [(declared offset, end of its scope)] for the locals of fn that are not storage pointers: parameters and named returns
+    (the whole body), Solidity declarations and Yul `let`s, each visible to the end of the block that holds it (NEW-2, NEW-3, NEW-9)."""
+    cached = fn.get("_scoped")
+    if cached is not None:
+        return cached
+    body = fn["body"]
+    n = len(body)
+    scoped: dict[str, list[tuple[int, int]]] = {}
+    for _, name in list(fn["params"]) + list(fn["returns"]):
+        if name:
+            scoped.setdefault(name, []).append((-1, n + 1))
+    decls: list[tuple[str, int]] = []
+    declared = fn.get("types", frozenset())
+    for m in _DECL.finditer(body):
+        if m.group(2) != "storage" and _is_type(m.group(1), declared):
+            decls.append((m.group(3), m.start(3)))
+    for m in _YUL_LET.finditer(body):
+        for nm in _NAME_AT.finditer(m.group(1)):
+            decls.append((nm.group(0), m.start(1) + nm.start()))
+    for (name, d), end in zip(decls, _scope_ends(body, [d for _, d in decls], _profile_of(fn))):
+        scoped.setdefault(name, []).append((d, end))
+    fn["_scoped"] = scoped
+    return scoped
+
+
+def _is_local(scoped: dict[str, list[tuple[int, int]]], name: str, p: int) -> bool:
+    """Whether `name` names a local at offset `p`: some declaration of it is before `p` and its scope has not ended."""
+    return any(d < p < e for d, e in scoped.get(name, ()))
+
+
+def _assigned_roots(body: str, end: int) -> list[tuple[str, int | None]] | None:
+    """The (root name, offset) of each place that the assignment operator at `end` writes: one for `x[k].f =`, one per bare
+    name of a tuple `(a, b) =`; a declaration is no place. None when the target has no recognisable root (fail closed)."""
+    window_start = max(0, end - 200)
+    window = body[window_start:end].rstrip()
+    if window.endswith(")"):
+        open_ = window.rfind("(")
+        if open_ < 0:
+            return None
+        roots: list[tuple[str, int | None]] = []
+        for part in window[open_ + 1:-1].split(","):
+            tokens = part.split()
+            if len(tokens) >= 2:  # `bool ok`: a declaration
+                continue
+            if not tokens:
+                continue
+            m = _LHS_TAIL.search(tokens[0])
+            if m is None:
+                return None
+            roots.append((m.group(1), None))
+        return roots
+    m = _LHS_TAIL.search(window)
+    if m is None:
+        return None
+    return [(m.group(1), window_start + m.start(1))]
+
+
+def _incdec_root(body: str, m: re.Match) -> str | None:
+    """The variable that `++` or `--` changes: the name after a prefix operator, else the place before a postfix one."""
+    ahead = _IDENT_AT.match(body, _WS.match(body, m.end()).end())
+    if ahead:
+        return ahead.group(0)
+    before = _LHS_TAIL.search(body[max(0, m.start() - 200):m.start()].rstrip())
+    return before.group(1) if before else None
+
+
+def _direct_writes(fn: dict) -> list[int]:
+    """Offsets in fn's own text that write state: assignments, compound assignments and Yul `:=`, `++`, `--`, `delete`, `push`,
+    `pop` and `sstore`. A place is not state when a visible local of that name holds it; an assignment whose target has no
+    recognisable root counts as a write (fail closed)."""
+    cached = fn.get("_writes")
+    if cached is None:
+        body = fn["body"]
+        scoped = _scoped_locals(fn)
+        found: list[int] = []
+        for m in _ASSIGN.finditer(body):
+            roots = _assigned_roots(body, m.start())
+            if roots is None or any(not _is_local(scoped, name, m.start()) for name, _ in roots):
+                found.append(m.start())
+        found.extend(m.start() for m in _DELETE.finditer(body) if not _is_local(scoped, m.group(1), m.start()))
+        found.extend(m.start() for m in _PUSH_POP.finditer(body) if not _is_local(scoped, m.group(1), m.start()))
+        for m in _INCDEC.finditer(body):
+            root = _incdec_root(body, m)
+            if root is None or not _is_local(scoped, root, m.start()):
+                found.append(m.start())
+        found.extend(m.start() for m in _SSTORE.finditer(body))
+        cached = fn["_writes"] = sorted(found)
+    return cached
+
+
+def _own_writes(fn: dict, index: dict[str, list[dict]]) -> list[int]:
+    """Positions of the state writes of fn: its own, and those of its applied modifiers, placed in the modifier run before the body
+    (before their `_;`) or after the body (after it)."""
+
+    def compute() -> list[int]:
+        writes = list(_direct_writes(fn))
+        n = len(fn["modifiers"])
+        for k, (name, _) in enumerate(fn["modifiers"]):
+            for t in index.get(name, []):
+                if t["kind"] != "modifier":
+                    continue
+                ph = _placeholder(t["body"])
+                writes.extend(_chain_key(k, n, w) if w < ph else _POST for w in _direct_writes(t))
+        return writes
+
+    return _per_index(fn, "own_writes", index, compute)
+
+
+_NO_GUARD = (sys.maxsize, sys.maxsize)
+
+
+def _first(fn: dict, index: dict[str, list[dict]], memo: dict) -> tuple[int, int]:
+    """(pos, end) of the first check that every run of `fn` certainly executes: its own (see _own_guards), or an unconditional call
+    to a same-source function that certainly executes one, placed at the call. _NO_GUARD when there is none."""
+    key = ("first", id(fn))
+    if key in memo:
+        return memo[key]
+    memo[key] = _NO_GUARD  # a cycle contributes no guard of its own
+    best = min(((pos, end) for pos, end, _ in _own_guards(fn, index)), default=_NO_GUARD)
+    for name, pos in _unconditional_calls(fn):
+        if pos < best[0] and any(t["kind"] == "function" and t is not fn and _first(t, index, memo)[0] < sys.maxsize
+                                 for t in index.get(name, [])):
+            best = (pos, pos + 1)
+    memo[key] = best
+    return best
+
+
+def _covered(fn: dict, entered: bool, index: dict[str, list[dict]], memo: dict) -> bool:
+    """Whether every write reachable from `fn` comes after a check on its path. `entered` says a check certainly ran before the call
+    into `fn`. A write is covered when such a check ran before it: on entry, or earlier in `fn` (see _first). A call passes that state
+    on: the callee is entered checked when `entered`, or when a check certainly ran before the call."""
+    key = ("covered", id(fn), entered)
+    if key in memo:
+        return memo[key]
+    memo[key] = True  # a re-entry into the same state is judged by the frame that is already judging it
+    first = _first(fn, index, memo)[0]
+    ok = all(entered or first < w for w in _own_writes(fn, index))
+    if ok:
+        for m in _CALL.finditer(fn["body"]):
+            name = m.group(1)
+            if name in _NOT_CALLS:
+                continue
+            entry = entered or first < m.start()
+            if any(t["kind"] == "function" and not _covered(t, entry, index, memo) for t in index.get(name, [])):
+                ok = False
+                break
+    memo[key] = ok
+    return ok
+
+
+def _certain(fn: dict, index: dict[str, list[dict]], memo: dict) -> set[str]:
+    """Labels of the checks that certainly run on every path through `fn`: its own, and those of the same-source functions it calls
+    unconditionally. A check in a conditional call is not certain (NEW-7)."""
+    key = ("certain", id(fn))
+    if key in memo:
+        return memo[key]
+    memo[key] = set()
+    labels = {label for _, _, label in _own_guards(fn, index)}
+    for name, _ in _unconditional_calls(fn):
+        for t in index.get(name, []):
+            if t["kind"] == "function" and t is not fn:
+                labels |= _certain(t, index, memo)
+    memo[key] = labels
+    return labels
 
 
 def guards(fn: dict, index: dict[str, list[dict]]) -> list[str]:
-    """Sorted access-control labels protecting `fn`: access modifiers (onlyRole(X) -> X, onlyOwner, auth, restricted, or a
-    modifier defined in this source that checks the sender), inline checks (_checkOwner, _checkRole(X), hasRole(X,
-    msg.sender), msg.sender == X, allow-list[msg.sender]) and the guards of same-source functions it calls. tx.origin never
-    counts; initializer / nonReentrant / whenNotPaused / onlyProxy are not access control. [] means unprotected."""
-    found: set[str] = set()
-    for f in _reachable(fn, index):
-        found |= _direct_guards(f, index)
-    return sorted(found)
+    """Sorted access-control labels that certainly protect `fn`, or [] when some write `fn` makes is not preceded by a check on its
+    path. Access modifiers (onlyRole(X) -> X, onlyOwner, auth, restricted, or a modifier defined in this source that checks the
+    sender before its `_;`) and inline checks (_checkOwner, _checkRole(X), hasRole(X, msg.sender), msg.sender == X, allow-list[
+    msg.sender]) count when they run on every path. A check after a write guards nothing for that write (write order). A check in a
+    same-source callee counts only through an unconditional call. tx.origin never counts; initializer / nonReentrant /
+    whenNotPaused / onlyProxy are not access control."""
+    memo: dict = {}
+    if not _covered(fn, False, index, memo):
+        return []
+    return sorted(_certain(fn, index, memo))
+
+
+def _assembly_spans(body: str, profile: _Profile) -> list[tuple[int, int]]:
+    """(open, close) offsets of each `assembly { }` block of a body: its calls are EVM opcodes, not functions of this source."""
+    spans: list[tuple[int, int]] = []
+    for m in _ASSEMBLY_OPEN.finditer(body):
+        open_ = m.end() - 1
+        if open_ in profile.brace_match:
+            spans.append((open_, profile.brace_match[open_]))
+    return spans
+
+
+_SENDER_ACCOUNT = re.compile(r"msg\.sender|_msgSender\s*\(\s*\)")  # an account argument that is the caller
+
+
+def _helper_exempt(name: str, body: str, open_: int, pairs: dict[int, int], guard_starts: set[int], p: int) -> bool:
+    """Whether the call `name(` at `p` is not unverified: it is the check itself (it starts a recognised guard), or it is a guard
+    helper whose account is msg.sender (its last argument) or that takes no argument. `hasRole(ROLE, user)` is judged (D-C)."""
+    if p in guard_starts:
+        return True
+    if name not in _GUARD_HELPERS:
+        return False
+    close = pairs.get(open_)
+    if close is None:
+        return False
+    parts = split_top(body[open_ + 1:close])
+    return not parts or _SENDER_ACCOUNT.fullmatch(parts[-1]) is not None
+
+
+def _unverified_names(body: str, profile: _Profile, limit: int, index: dict[str, list[dict]], declared: frozenset) -> list[str]:
+    """Names of the unqualified calls of `body` that start before `limit` and name no function this source defines, no declared
+    struct or contract (a constructor, D-D), no builtin, elementary type or upper-case name (a type conversion), and no call inside
+    assembly."""
+    spans = _assembly_spans(body, profile)
+    pairs = _paren_pairs(body)
+    guard_starts = {pos for pos, _, _ in _guard_labels(body, index, profile)}
+    names: list[str] = []
+    for m in _CALL.finditer(body):
+        p = m.start()
+        if p >= limit:
+            break
+        name = m.group(1)
+        if name in _NOT_CALLS or _ELEMENTARY_CALL.match(name) or name[0].isupper() or name in declared:
+            continue
+        if any(t["kind"] == "function" for t in index.get(name, [])):
+            continue
+        if any(o < p < c for o, c in spans):
+            continue
+        if _helper_exempt(name, body, m.end() - 1, pairs, guard_starts, p):
+            continue
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def unverified_calls(fn: dict, index: dict[str, list[dict]]) -> list[str]:
+    """Names of unqualified calls that run before the first check of `fn` (all calls when no check certainly runs) and that name no
+    function this source defines. Such a callee is unverified: the check cannot be said to precede its effects. An applied modifier
+    the source defines is judged the same way up to its first check or its `_;`, since its calls run before the body. Once an
+    earlier applied modifier has checked the sender, the later modifiers are no longer judged. Not counted: builtins, type
+    conversions (upper-case names, elementary types, declared struct and contract names), calls inside assembly, a call on
+    msg.sender as a receiver, a named guard helper called with no argument or with msg.sender or _msgSender() as its last
+    argument, and a one-argument _checkRole(ROLE), which is exempt as a recognised guard on the OpenZeppelin convention since
+    that helper checks msg.sender itself (hasRole(msg.sender, ROLE) is judged)."""
+    declared = fn.get("types", frozenset())
+    names = _unverified_names(fn["body"], _profile_of(fn), _first(fn, index, {})[1], index, declared)
+    checked = False  # an earlier applied modifier checks the sender: the later modifiers and the body run after that guard
+    for name, args in fn["modifiers"]:
+        if checked:
+            break
+        for t in index.get(name, []):
+            if t["kind"] != "modifier":
+                continue
+            profile = _profile_of(t)
+            ph = _placeholder(t["body"])
+            limit = min([ph] + [end for pos, end, _ in _guard_labels(t["body"], index, profile) if pos < ph])
+            for found in _unverified_names(t["body"], profile, limit, index, t.get("types", declared)):
+                if found not in names:
+                    names.append(found)
+        if _modifier_site(name, args, index) is not None:
+            checked = True
+    return names
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -782,42 +1350,194 @@ def _pragma_directives(clean: str) -> list[tuple[int, str]]:
 _CONTROL_HEAD = re.compile(r"\s*(?:else\b|(?:if|for|while)\s*\()")
 
 
-def _matching_close(text: str, open_at: int) -> int:
-    """Index of the ')' that closes the '(' at `open_at`, or -1 when `text` ends first."""
-    depth = 0
-    for i in range(open_at, len(text)):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
+def _paren_pairs(clean: str) -> dict[int, int]:
+    """Offset of each '(' mapped to its ')', by one stack pass; a bracket that never closes has no entry."""
+    pairs: dict[int, int] = {}
+    stack: list[int] = []
+    for m in re.finditer(r"[()]", clean):
+        if m.group() == "(":
+            stack.append(m.start())
+        elif stack:
+            pairs[stack.pop()] = m.start()
+    return pairs
 
 
-def _statement_prefix(clean: str, pos: int) -> str:
-    """Source of the statement holding offset `pos`, up to `pos`, minus leading if/else/for/while headers: a bare body
-    (`if (c) a.call(...)`) is not checked, while a call inside a condition (`if (a.call(...))`) still is."""
-    start = max(clean.rfind(";", 0, pos), clean.rfind("{", 0, pos), clean.rfind("}", 0, pos)) + 1
-    prefix = clean[start:pos]
-    while head := _CONTROL_HEAD.match(prefix):
-        if not head.group(0).endswith("("):
-            prefix = prefix[head.end():]
-            continue
-        close = _matching_close(prefix, head.end() - 1)
-        if close < 0:
-            break
-        prefix = prefix[close + 1:]
-    return prefix
+class _CallSites:
+    """The statement context of every low-level call in one source. A call's statement starts after the nearest `{`, `}` or `;`
+    that is outside parentheses before it: the semicolons of a for header do not end a statement (NEW-6). Found by binary search
+    over the sorted separators, so each test costs O(log n) however long the statement."""
 
+    def __init__(self, clean: str):
+        self.clean = clean
+        self.paren = _paren_pairs(clean)
+        expression = self._expression_braces()  # a brace inside a matched parenthesis is part of an expression, not a block
+        self.seps: list[int] = []
+        depth = 0
+        for m in re.finditer(r"[(){};]", clean):
+            c = m.group()
+            if m.start() in expression:
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth = max(depth - 1, 0)
+            elif c in "{}":
+                depth = 0  # a brace ends any open parenthesis, so an unmatched '(' cannot merge the statements after it
+                self.seps.append(m.start())
+            elif depth == 0:
+                self.seps.append(m.start())
+        self.keywords = [m.start() for m in re.finditer(r"\b(?:require|assert|if|return)\b", clean)]
+        self.assigns = [m.start() for m in re.finditer(r"(?<![=!<>])=(?![=>])", clean)]
+        # the block structure: each matched '{' with its '}', and each '{' with the '{' that encloses it
+        self.brace_close: dict[int, int] = {}
+        self.enclosing: dict[int, int] = {}
+        stack: list[int] = []
+        for m in re.finditer(r"[{}]", clean):
+            if m.start() in expression:
+                continue
+            if m.group() == "{":
+                self.enclosing[m.start()] = stack[-1] if stack else -1
+                stack.append(m.start())
+            elif stack:
+                self.brace_close[stack.pop()] = m.start()
+        self.opens = sorted(self.brace_close)
+        self.lowlevel = [m.start() for m in _LOW_LEVEL.finditer(clean)]
 
-def _enclosing_function(contracts: list[dict], pos: int) -> dict | None:
-    """The function or modifier whose body contains offset `pos` of the stripped source, else None."""
-    for contract in contracts:
-        for fn in contract["functions"]:
-            if fn["has_body"] and fn["body_span"][0] <= pos < fn["body_span"][1]:
-                return fn
-    return None
+    def _expression_braces(self) -> set[int]:
+        """The '{' and '}' offsets that sit inside a matched parenthesis: part of an expression such as the struct literal in
+        S({a: 1}), so they open no block and end no statement."""
+        events = sorted([(o, 1) for o in self.paren] + [(c, -1) for c in self.paren.values()])
+        out: set[int] = set()
+        depth = k = 0
+        for m in re.finditer(r"[{}]", self.clean):
+            while k < len(events) and events[k][0] < m.start():
+                depth += events[k][1]
+                k += 1
+            if depth > 0:
+                out.add(m.start())
+        return out
+
+    def _scope_close(self, pos: int) -> int:
+        """Offset of the '}' closing the innermost block that holds `pos`: the scope of a local bound there (the end of the source
+        when none holds it)."""
+        i = bisect.bisect_left(self.opens, pos) - 1
+        o = self.opens[i] if i >= 0 else -1
+        while o >= 0 and (o not in self.brace_close or self.brace_close[o] < pos):
+            o = self.enclosing[o]
+        return self.brace_close[o] if o >= 0 else len(self.clean)
+
+    def _branch_end(self, i: int) -> int:
+        """Offset just past the statement or block that starts at `i`."""
+        clean = self.clean
+        if clean[i:i + 1] == "{":
+            return self.brace_close.get(i, len(clean) - 1) + 1
+        k = clean.find(";", i)
+        return len(clean) if k < 0 else k + 1
+
+    def _branch_exits(self, i: int) -> bool:
+        """Whether the statement or block that starts at `i` leaves the call: a revert, return or throw that is one of its top-level
+        statements (a brace-less branch is that statement). A statement inside a nested if or block is not reached on every path."""
+        clean = self.clean
+        j = _WS.match(clean, i).end()
+        if clean[j:j + 1] == "{":
+            close = self.brace_close.get(j)
+            return close is not None and self._block_exits(j + 1, close)
+        return _REVERT_OR_RETURN.match(clean, j) is not None
+
+    def _block_exits(self, start: int, end: int) -> bool:
+        """Whether one statement directly in the block [start, end) is a revert, return or throw. Nested blocks are jumped over whole:
+        the statements inside an if or a loop are not reached on every path of the branch."""
+        clean = self.clean
+        k = bisect.bisect_left(self.seps, start)
+        stmt = start
+        while k < len(self.seps) and self.seps[k] < end:
+            q = self.seps[k]
+            if clean[q] == "{":
+                close = self.brace_close.get(q)
+                if close is None:
+                    return False
+                stmt = close + 1
+                k = bisect.bisect_left(self.seps, close + 1)
+                continue
+            if clean[q] == ";":
+                head = _WS.match(clean, stmt).end()
+                if head < q and _REVERT_OR_RETURN.match(clean, head) is not None:
+                    return True
+            stmt = q + 1
+            k += 1
+        return False
+
+    def _is_check_read(self, flag: str, p: int) -> bool:
+        """Whether the read of `flag` at `p` checks the call that bound it: a require or assert argument, a return expression, or an
+        if whose condition is exactly the flag or its negation and whose failure path reverts or returns (D-B). A read that only
+        stores, logs or assigns the flag is not a check."""
+        clean = self.clean
+        i = bisect.bisect_left(self.seps, p)
+        s = self.seps[i - 1] + 1 if i else 0
+        prefix = clean[s:p]
+        for m in re.finditer(r"\b(?:require|assert)\s*\(", prefix):
+            close = self.paren.get(s + m.end() - 1)
+            if close is not None and close > p:
+                return True
+        if re.search(r"\breturn\b", prefix):
+            return True
+        escaped = re.escape(flag)
+        for m in _IF_HEAD.finditer(prefix):
+            open_ = s + m.end() - 1
+            close = self.paren.get(open_)
+            if close is None or close <= p:
+                continue  # the read is not in this condition
+            cond = clean[open_ + 1:close].strip()
+            then_start = _WS.match(clean, close + 1).end()
+            if re.fullmatch(r"!\s*\(?\s*" + escaped + r"\s*\)?", cond):
+                if self._branch_exits(then_start):
+                    return True  # `if (!ok) revert ...`: the then-branch is the failure path
+            elif re.fullmatch(r"\(?\s*" + escaped + r"\s*\)?", cond):
+                else_at = _WS.match(clean, self._branch_end(then_start)).end()
+                if re.match(r"else\b", clean[else_at:else_at + 5]) and self._branch_exits(else_at + 4):
+                    return True  # `if (ok) ... else revert ...`: the else-branch is the failure path
+        return False
+
+    def _flag_checked(self, flag: str, start: int, limit: int) -> bool:
+        """The first read of `flag` after `start`, before `limit` (the end of its scope), before any reassignment or redeclaration of
+        the name and before the next low-level call, is a check. A value overwritten by a later call, or read only outside its scope,
+        checks nothing (D-A)."""
+        clean = self.clean
+        k = bisect.bisect_right(self.lowlevel, start)
+        stop = min(limit, self.lowlevel[k] if k < len(self.lowlevel) else len(clean))
+        m = _name_pattern(flag).search(clean, start, stop)
+        if m is None:
+            return False
+        p = m.start()
+        if _ASSIGN_AFTER.match(clean, m.end()) or _DECL_BEFORE.search(clean, max(0, p - 64), p):
+            return False  # the name is overwritten or redeclared before it is read
+        return self._is_check_read(flag, p)
+
+    def checked(self, pos: int) -> bool:
+        """The result of the call at `pos` is tested when, within its statement before the call, a require, assert, if or return
+        appears, or the call sits in the condition of an if, for or while, or its success flag is bound and its next read in the
+        scope is a check (see _flag_checked). A bare body (`if (c) a.call(...)`) is not a test: the leading control heads of the
+        statement are skipped first."""
+        clean = self.clean
+        i = bisect.bisect_left(self.seps, pos)
+        s = self.seps[i - 1] + 1 if i else 0
+        while head := _CONTROL_HEAD.match(clean, s, pos):
+            if not head.group(0).endswith("("):
+                s = head.end()
+                continue
+            close = self.paren.get(head.end() - 1)
+            if close is None or close >= pos:
+                return True  # the call is inside the head's condition
+            s = close + 1
+        k = bisect.bisect_left(self.keywords, s)
+        if k < len(self.keywords) and self.keywords[k] < pos:
+            return True
+        j = bisect.bisect_left(self.assigns, pos) - 1
+        if j >= 0 and self.assigns[j] >= s:
+            lhs = clean[max(s, self.assigns[j] - _BINDING_CAP):self.assigns[j]]
+            limit = self._scope_close(pos)
+            return any(self._flag_checked(flag, pos + 1, limit) for flag in _bound_flags(lhs))
+        return False
 
 
 _ASM_DELEGATECALL = re.compile(r"(?<![\w$.])delegatecall\s*\(")  # inline assembly: `delegatecall(gas(), target, ...)`
@@ -825,7 +1545,6 @@ _ORIGIN = re.compile(r"\btx\s*\.\s*origin\b")
 _OPERAND = r"(?:address\s*\([^()]*\)|0[xX][0-9a-fA-F]*|\d+|[A-Za-z_$][\w$.]*(?:\s*\(\s*\))?)"
 _OPERAND_AFTER = re.compile(r"\s*[!=]=\s*(" + _OPERAND + r")")
 _OPERAND_BEFORE = re.compile(r"(" + _OPERAND + r")\s*[!=]=\s*$")
-_RESULT_TESTED = re.compile(r"\b(?:require|assert|if|return)\b")
 
 
 def _is_principal(operand: str) -> bool:
@@ -838,43 +1557,45 @@ def _compared_with_principal(clean: str, start: int, end: int) -> bool:
     after = _OPERAND_AFTER.match(clean, end)
     if after and _is_principal(after.group(1)):
         return True
-    before = _OPERAND_BEFORE.search(clean[max(0, start - 96):start])
+    window = clean[max(0, start - 96):start].rstrip()
+    before = _OPERAND_BEFORE.search(window) if window.endswith(("==", "!=")) else None  # most windows are not comparisons: skip the search
     return bool(before and _is_principal(before.group(1)))
 
 
-def _origin_is_authorization(clean: str, origin: re.Match) -> bool:
+def _origin_is_authorization(clean: str, origin: re.Match, positions: dict[str, list[int]], compared: dict[str, bool]) -> bool:
     """tx.origin compared with a principal, directly or through a local name that holds it (`address o = tx.origin;` then
-    `require(o == owner)`)."""
+    `require(o == owner)`). `positions` is the one-pass index of identifier offsets and `compared` caches each name's verdict,
+    so a name is searched once and not once per tx.origin read."""
     if _compared_with_principal(clean, origin.start(), origin.end()):
         return True
     assigned = re.search(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*$", clean[max(0, origin.start() - 64):origin.start()])
     if not assigned:
         return False
-    name = re.escape(assigned.group(1))
-    return any(_compared_with_principal(clean, use.start(), use.end()) for use in re.finditer(r"(?<![\w$.])" + name + r"\b", clean))
+    name = assigned.group(1)
+    if name not in compared:
+        compared[name] = any(_compared_with_principal(clean, use, use + len(name)) for use in positions.get(name, ()))
+    return compared[name]
 
 
-_TOKEN_COUNTS: tuple[str, Counter] = ("", Counter())  # the last body counted: a function with many call sites is counted once
+_BINDING_CAP = 256  # characters before the `=` of a call's binding that are read for the bound flag: a longer target is cut short
+_ASSIGN_AFTER = re.compile(r"\s*(?:<<|>>|[-+*/%&|^])?=(?![=>])")  # a write to the name: `ok = `, `ok += `; not `ok == `
+_DECL_BEFORE = re.compile(r"\b(?:bool|address|string|bytes\d*|u?int\d*|byte|[A-Z]\w*)\s+(?:(?:memory|storage|calldata)\s+)?\Z")
+_REVERT_OR_RETURN = re.compile(r"(?:revert|return|throw)\b")
+_IF_HEAD = re.compile(r"\bif\s*\(")
+_NAME_PATTERNS: dict[str, re.Pattern] = {}
 
 
-def _token_count(body: str, name: str) -> int:
-    """Occurrences of identifier `name` in `body` that are not member accesses (`x.name` is another variable)."""
-    global _TOKEN_COUNTS
-    cached = _TOKEN_COUNTS
-    if cached[0] is not body:
-        cached = _TOKEN_COUNTS = (body, Counter(re.findall(r"(?<![\w$.])[A-Za-z_$][\w$]*", body)))
-    return cached[1].get(name, 0)
+def _name_pattern(name: str) -> re.Pattern:
+    """Whole-identifier match of `name`: a member `x.name` is another variable."""
+    pattern = _NAME_PATTERNS.get(name)
+    if pattern is None:
+        pattern = _NAME_PATTERNS[name] = re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
+    return pattern
 
 
-def _result_checked(prefix: str, body: str) -> bool:
-    """The success flag of a low-level call is tested: a require, assert, if or return precedes the call in its statement, or
-    the flag it is bound to (`bool ok = `, `(bool ok, ) = `, `ok = `) is read again in the same function body."""
-    if _RESULT_TESTED.search(prefix):
-        return True
-    assignments = [m.start() for m in re.finditer(r"(?<![=!<>])=(?!=)", prefix)]
-    if not assignments:
-        return False
-    lhs = prefix[:assignments[-1]].strip()
+def _bound_flags(lhs: str) -> list[str]:
+    """The success flags a low-level call's binding names: `bool ok` in `(bool ok, ) =`, or the bare name in `ok =`."""
+    lhs = lhs.strip()
     if lhs.startswith("(") and lhs.endswith(")"):
         lhs = lhs[1:-1]
     parts = split_top(lhs)
@@ -885,7 +1606,7 @@ def _result_checked(prefix: str, body: str) -> bool:
             flags.append(tokens[-1])
     if not flags and len(parts) == 1 and re.fullmatch(_IDENT, parts[0]):
         flags.append(parts[0])
-    return any(_token_count(body, name) >= 2 for name in flags)
+    return flags
 
 
 def _exposed_ids(contracts: list[dict]) -> set[int]:
@@ -898,6 +1619,31 @@ def _exposed_ids(contracts: list[dict]) -> set[int]:
             if entry["kind"] in ENTRY_KINDS and entry["visibility"] in ("public", "external") and entry["has_body"] and not guards(entry, index):
                 exposed.update(id(fn) for fn in _reachable(entry, index))
     return exposed
+
+
+_IDENT_TOKEN = re.compile(r"(?<![\w$.])[A-Za-z_$][\w$]*")
+
+
+def _identifier_positions(clean: str) -> dict[str, list[int]]:
+    """Offsets of every identifier token of the stripped source, by name, from one pass."""
+    out: dict[str, list[int]] = {}
+    for m in _IDENT_TOKEN.finditer(clean):
+        out.setdefault(m.group(0), []).append(m.start())
+    return out
+
+
+def _function_lookup(contracts: list[dict]):
+    """A function(offset) -> the function or modifier whose body contains the offset, or None. Bodies do not overlap, so one
+    binary search over their start offsets answers each query (a file with many call sites must not rescan its functions)."""
+    bodies = sorted(((fn["body_span"][0], fn["body_span"][1], fn) for c in contracts for fn in c["functions"] if fn["has_body"]),
+                    key=lambda item: item[0])
+    starts = [item[0] for item in bodies]
+
+    def lookup(pos: int) -> dict | None:
+        i = bisect.bisect_right(starts, pos) - 1
+        return bodies[i][2] if i >= 0 and pos < bodies[i][1] else None
+
+    return lookup
 
 
 def lint_source(rel: str, raw: str) -> list[dict]:
@@ -921,8 +1667,11 @@ def lint_source(rel: str, raw: str) -> list[dict]:
             continue
         for f in review["findings"]:
             add("SOL-" + f["id"], f["severity"], f["summary"], start)
-    for m in _ORIGIN.finditer(clean):
-        authz = _origin_is_authorization(clean, m)
+    origins = list(_ORIGIN.finditer(clean))
+    positions = _identifier_positions(clean) if origins else {}
+    compared: dict[str, bool] = {}  # a name's uses are judged once, however many tx.origin reads it holds
+    for m in origins:
+        authz = _origin_is_authorization(clean, m, positions, compared)
         add("SOL-TX-ORIGIN", "major" if authz else "minor",
             "tx.origin used in an authorization comparison (phishable through any contract the user calls; use msg.sender)"
             if authz else "tx.origin read: never use it for authorization", m.start())
@@ -930,24 +1679,25 @@ def lint_source(rel: str, raw: str) -> list[dict]:
         add("SOL-SELFDESTRUCT", "major", "selfdestruct: deprecated, since EIP-6780 (Cancun) it only deletes code in the creating "
             "transaction, and it breaks proxy implementations", m.start())
     contracts = parse_source(raw)
+    function_at = _function_lookup(contracts)
     exposed: set[int] | None = None  # computed on the first delegatecall only: most sources have none and guard analysis is not free
 
     def delegatecall(pos: int) -> None:
         nonlocal exposed
         if exposed is None:
             exposed = _exposed_ids(contracts)
-        fn = _enclosing_function(contracts, pos)
+        fn = function_at(pos)
         public = fn is None or id(fn) in exposed
         add("SOL-DELEGATECALL", "major" if public else "minor",
             "delegatecall in a public/external function with no access control: the callee runs with this contract's storage"
             if public else "delegatecall: callee code runs with this contract's storage and balance; confirm the target is trusted",
             pos)
 
+    sites = _CallSites(clean)
     for m in _LOW_LEVEL.finditer(clean):
         if m.group(1) == "delegatecall":
             delegatecall(m.start())
-        fn = _enclosing_function(contracts, m.start())
-        if not _result_checked(_statement_prefix(clean, m.start()), fn["body"] if fn is not None else clean):
+        if not sites.checked(m.start()):
             add("SOL-UNCHECKED-LOW-LEVEL-CALL", "major",
                 f".{m.group(1)}(...) result is discarded: a failed call goes unnoticed (check the returned bool)", m.start())
     for m in _ASM_DELEGATECALL.finditer(clean):
@@ -1027,6 +1777,43 @@ def _collect(root: Path, start: Path) -> tuple[list[tuple[str, str]], dict, list
     return files, skipped, reasons
 
 
+_OPENER = {")": "(", "]": "[", "}": "{"}
+# a visibility-bearing function, or a modifier, constructor, receive or fallback, at file level: no contract body holds it
+_TOP_LEVEL_DECL = re.compile(r"\bfunction\b[^;{]*?\b(?:external|public|internal|private)\b|\b(?:modifier|constructor|receive|fallback)\s*\(")
+
+
+def source_problems(raw: str) -> list[str]:
+    """Labels of what makes a Solidity source unparseable, never its text: unbalanced brackets (a truncated file always has them)
+    and a declaration outside every contract body. Linear in the source size; [] means the source parses."""
+    clean = strip_source(raw)
+    problems: list[str] = []
+    stack: list[str] = []
+    balanced = True
+    for m in re.finditer(r"[()\[\]{}]", clean):
+        c = m.group()
+        if c in "([{":
+            stack.append(c)
+        elif not stack or stack.pop() != _OPENER[c]:
+            balanced = False
+            break
+    if stack:
+        balanced = False
+    if not balanced:
+        problems.append("unbalanced brackets: the source is truncated or malformed")
+    top: list[str] = []  # the text outside every brace pair, where only file-level declarations may appear
+    depth = last = 0
+    for m in re.finditer(r"[{}]", clean):
+        if depth == 0:
+            top.append(clean[last:m.start()])
+        depth = max(depth + (1 if m.group() == "{" else -1), 0)
+        last = m.end()
+    if depth == 0:
+        top.append(clean[last:])
+    if _TOP_LEVEL_DECL.search(" ".join(top)):
+        problems.append("a function, modifier, constructor, receive or fallback outside any contract body")
+    return problems
+
+
 def _tool_status(binary: str) -> str:
     return "available:not-invoked" if shutil.which(binary) else "skipped:tool-missing"
 
@@ -1047,7 +1834,14 @@ def run(args, ctx) -> dict:
     files, skipped, reasons = _collect(root, target)
     findings: list[dict] = []
     for rel, text in files:
-        findings.extend(lint_source(rel, text))
+        try:
+            findings.extend(lint_source(rel, text))
+        except RecursionError:  # the call walk of the guard analysis is deeper than the interpreter allows: the file is not analysed
+            reasons.append(f"{rel}: call depth exceeds the call-depth limit (the interpreter's recursion limit, "
+                           f"{sys.getrecursionlimit()}), the call walk stopped")
+            continue
+        # an unparseable file (truncated, or a declaration outside every contract) is not fully analysed: it fails closed
+        reasons.extend(f"{rel}: {problem}" for problem in source_problems(text))
     # fail closed: an in-scope input that was not analysed, or no in-scope input at all, must not read as ok
     for item in incomplete_findings([redact(reason) for reason in reasons], len(files)):
         findings.append({"id": item["id"], "severity": item["severity"], "summary": item["summary"], "location": ".:0"})

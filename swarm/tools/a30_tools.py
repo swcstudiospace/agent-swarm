@@ -267,6 +267,52 @@ _TOKEN_RES = (
     ("bearer-credential", re.compile(
         r"(?i)\bbearer\s+(?=[A-Za-z._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{20,}|\bauthorization\s*[:=]\s*(?:basic|bearer|token)\s+\S{8,}")),
 )
+# A key-name assignment whose value is key-shaped. The name is found wherever it starts (no lookbehind: seed=<a's>secret=<hex>
+# reports the second name). The value is captured by a zero-width lookahead, so the run is not consumed and a name inside it is
+# still found. _key_shaped then tests each form on its own: a value of 32 or more characters with no placeholder.
+_ASSIGNMENT_RE = re.compile(
+    r"(?i:(?:[a-z0-9]+[_.-])*(?:private[_-]?key|priv[_-]?key|signing[_-]?key|secret|seed|mnemonic|passw(?:or)?d"
+    r"|passwd|token|api[_-]?key|access[_-]?key|pkey|pk))(?![a-zA-Z0-9])[\w.-]{0,40}\s*(?:[\"'`]\s*)?(?:=>|[:=])\s*[\"'`]?(?:0[xX])?"
+    r"(?=(?P<value>(?i:[a-z0-9+/_-])+={0,2}))"
+)
+_HEX_DIGITS_RE = re.compile(r"[0-9a-fA-F]+")
+
+
+def _has_letter_and_digit(text: str) -> bool:
+    return any(c.isalpha() for c in text) and any(c.isdigit() for c in text)
+
+
+def _mixes_case(text: str) -> bool:
+    return any(c.islower() for c in text) and any(c.isupper() for c in text)
+
+
+def _key_shaped(value: str) -> bool:
+    """Key material among the value after a credential label (the trailing '=' padding is not counted):
+    - 32 or more characters in all, and not one repeated character (a placeholder, as in _HEX_KEY_RE);
+    - hex of 32 or more digits once '-' and '_' are removed, grouped or not;
+    - with no '-' or '_': a letter and a digit, or both upper and lower case letters;
+    - with '-' or '_': the value with them removed has 32 or more characters and both upper and lower case letters, or its
+      first segment (the run before the first separator) is hex of 32 or more digits and not one repeated character, so a
+      key followed by a suffix such as -missing or _old is still key material."""
+    core = value.rstrip("=")
+    if len(core) < 32:
+        return False
+    bare = core.replace("-", "").replace("_", "")
+    if len(set(bare.lower())) <= 1:
+        return False
+    if _HEX_DIGITS_RE.fullmatch(bare) and len(bare) >= 32:
+        return True
+    if "-" not in core and "_" not in core:
+        return _has_letter_and_digit(bare) or _mixes_case(bare)
+    first = re.split(r"[-_]", core, maxsplit=1)[0]
+    if len(first) >= 32 and _HEX_DIGITS_RE.fullmatch(first) and len(set(first.lower())) > 1:
+        return True
+    return len(bare) >= 32 and _mixes_case(bare)
+
+
+def _assignment_hit(text: str) -> bool:
+    """True when `text` holds a credential label whose value is key material (see _key_shaped)."""
+    return any(_key_shaped(match.group("value")) for match in _ASSIGNMENT_RE.finditer(text))
 
 
 def _b58check(text: str) -> bytes | None:
@@ -311,7 +357,8 @@ def _mnemonic_matches(text: str):
 
 def _secret_kind(text: str, strict: bool = True) -> str:
     """Kind of secret-shaped material in a short free-text value, else ''. A key (PEM, BIP32, WIF), a credential (cloud key
-    id, API token, JWT, URL with a password, bearer value) or a mnemonic. `strict` (identifiers, which results echo) also
+    id, API token, JWT, URL with a password, bearer value), a key-name assignment whose value is key-shaped (see _ASSIGNMENT_RE:
+    a path component such as secret=<64 hex> is refused whole) or a mnemonic. `strict` (identifiers, which results echo) also
     refuses a bare 64-digit hex value; it is never flagged otherwise because it is also a transaction hash or a digest."""
     if _PEM_RE.search(text):
         return "pem-private-key"
@@ -322,6 +369,8 @@ def _secret_kind(text: str, strict: bool = True) -> str:
     for kind, pattern in _TOKEN_RES:
         if pattern.search(text):
             return kind
+    if _assignment_hit(text):
+        return "key-assignment"
     squeezed = " ".join(text.lower().split())
     if (_MNEMONIC_SHAPE_RE.fullmatch(squeezed) and len(squeezed.split(" ")) in _MNEMONIC_WORDS) or next(_mnemonic_matches(text), None):
         return "mnemonic-phrase"
@@ -840,10 +889,10 @@ def _sanctions_screening(payload: dict) -> dict:
         if result == "error":
             if action == "released":
                 findings.append(_finding(f"released-on-error:{tag}", "blocker", "released although the screening errored: fail closed"))
-            elif action == "none":
-                findings.append(_finding(f"error-unactioned:{tag}", "major", "screening errored and nothing was held or retried"))
-            else:
+            elif action in ("held", "blocked"):
                 findings.append(_finding(f"error-retry-pending:{tag}", "minor", "screening errored: retry before releasing"))
+            else:
+                findings.append(_finding(f"error-unactioned:{tag}", "major", f"screening errored and the action is {action}: hold it and retry the screen"))
         elif result == "potential_match":
             if action == "released":
                 findings.append(_finding(f"potential-match-released:{tag}", "blocker", "released while the potential match is unresolved"))
@@ -1090,7 +1139,8 @@ def _scan_content(path: str, content: str) -> list[dict]:
     for start, length in _mnemonic_matches(content):
         hits.append(("mnemonic-phrase", "blocker", start, length))
     if re.search(r'"ciphertext"\s*:', content) and re.search(r'"kdf"\s*:', content):
-        hits.append(("encrypted-keystore", "major", content.index('"ciphertext"'), len(content)))
+        start = content.index('"ciphertext"')
+        hits.append(("encrypted-keystore", "major", start, len(content) - start))
     if not hits:
         return []
     newlines = [m.start() for m in re.finditer("\n", content)]
@@ -1105,9 +1155,9 @@ def _scan_content(path: str, content: str) -> list[dict]:
 
 
 def _path_label(path: str, ordinal: int) -> str:
-    """The path as findings show it. A path is user data too: when it is itself secret-shaped (a cloud key id, token,
-    credentialed URL, key or phrase; a bare 64-digit hex file name is a content-addressed artifact and stays), results name
-    the file by its 1-based position instead."""
+    """The path as findings and reasons show it. A path is user data too: when any part of it is secret-shaped (a cloud key id,
+    token, credentialed URL, key, phrase, or a key-name assignment with a key-shaped value such as secret=<64 hex>), the whole
+    path is replaced by its 1-based position label. A bare 64-digit hex file name is a content-addressed artifact and stays."""
     return f"<redacted-path-{ordinal}>" if _secret_kind(path, strict=False) else path
 
 

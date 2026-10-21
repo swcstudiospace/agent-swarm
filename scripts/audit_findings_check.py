@@ -5,7 +5,12 @@ Scans `*findings*.json|yaml|yml` under --root (or the one file given with --path
 findings with severity info|minor|major|blocker; the run status is "fail" when any major or blocker exists. The audit severity
 scale inside a findings file is info|low|medium|high|critical (see swarm/tools/a27_tools.py, which supplies the shared rules).
 Read-only and bounded: files over 1 MiB are skipped, at most 2000 files are visited, symlinks are never followed (a --path that is
-or passes through one is refused), binaries are skipped, YAML needs PyYAML (otherwise `skipped:tool-missing`; JSON is always native).
+or passes through one, including through `..` after a symlink, is refused), binaries are skipped, YAML needs PyYAML (otherwise
+`skipped:tool-missing`; JSON is always native). Silent by design: the directories .git, .hg, .svn, node_modules, .venv, venv, __pycache__,
+.tox, .mypy_cache, .swarm and .terraform are tool caches, vendored dependencies or runtime state, not repository content; they are pruned by
+name at every depth and never walked, so a findings file inside one is neither read nor reported. Every other directory, build and dist
+included, is walked and read. The only walk-level reasons are a directory that cannot be listed, a symlinked directory and the size or file
+limits; each one makes the scan incomplete, so the status is fail until the input is analysed.
 Every input that is skipped, truncated, unreadable or unparseable, and a run that analysed no input at all, adds a major
 `scan-incomplete` finding (swarm/scan_status.py), so the status is "fail" until every in-scope input is analysed.
 `--dry-run` prints deterministic canned output and reads nothing. Stdlib only.
@@ -29,11 +34,12 @@ MAX_FILE_BYTES = 1 << 20
 MAX_FILES = 2000
 MAX_REPORTED = 1000
 MAX_DEDUPE = 200
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".swarm"}
+SILENT_SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".swarm", ".terraform"}  # tool caches, vendored dependencies and runtime state, not repository content
 SUFFIXES = {".json", ".yaml", ".yml"}
 REQUIRED = ("id", "title", "severity", "category", "location", "description", "recommendation", "status")
 SERIOUS = ("critical", "high")
 LEVELS = ("low", "medium", "high")
+_FIX_LEVEL = {"critical": "major", "high": "major", "medium": "minor"}  # an unverified or mitigated fix is a finding at the tool's severity: critical and high fail, medium is minor, the rest info
 
 
 def _blank(value) -> bool:
@@ -68,10 +74,20 @@ def _rel(root: Path, path: Path) -> str:
     return _clean(path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name)
 
 
+def _unlistable(root: Path, reasons: list[str]):
+    """os.walk onerror: a directory that cannot be listed is a reason naming it, never a silent skip."""
+
+    def handle(error: OSError) -> None:
+        name = _rel(root, Path(error.filename)) if error.filename else "(unnamed directory)"
+        reasons.append(f"scan-error: {name} ({type(error).__name__})")
+
+    return handle
+
+
 def _discover(root: Path, target: Path) -> tuple[list[Path], list[str], bool]:
     """Candidate findings files: the target itself, or `*findings*` json/yaml files below it. (files, reasons, truncated)
 
-    A symlink is never followed and a non-regular file is never opened; each one is a reason the scan is incomplete.
+    A symlink is never followed, whatever its name, and a non-regular file is never opened. A directory that cannot be listed, a symlinked directory, a non-regular file and the file limit are each a reason the scan is incomplete. A real directory with a silent name is pruned without a reason; every other directory, build and dist included, is walked.
     """
     if not target.is_dir():
         if _regular(target):
@@ -80,14 +96,13 @@ def _discover(root: Path, target: Path) -> tuple[list[Path], list[str], bool]:
     found: list[Path] = []
     reasons: list[str] = []
     visited = 0
-    for current, dirs, names in os.walk(target, followlinks=False):
+    for current, dirs, names in os.walk(target, followlinks=False, onerror=_unlistable(root, reasons)):
         kept = []
         for d in sorted(dirs):
-            if d in SKIP_DIRS:
-                continue
-            if os.path.islink(os.path.join(current, d)):
-                reasons.append(f"skipped:symlink: {_rel(root, Path(current) / d)}")
-            else:
+            path = Path(current) / d
+            if path.is_symlink():
+                reasons.append(f"skipped:symlink: {_rel(root, path)}")
+            elif d not in SILENT_SKIP_DIRS:
                 kept.append(d)
         dirs[:] = kept
         for name in sorted(names):
@@ -215,8 +230,10 @@ def _check_finding(root: Path, rel: str, index: int, item, seen: set[str], out: 
             add("fix-commit-missing", "major", f"{label}: status {status} but no fix_commit")
         elif not a27_tools._is_commit(commit.strip()):
             add("fix-commit-invalid", "major", f"{label}: fix_commit {_shown(commit)} is not a git object id (7-40 or 64 hex characters)")
-        if serious and not (item.get("regression_test") is True and item.get("reaudited") is True):
-            add("fix-unverified", "major", f"{label}: {severity} fix lacks a regression test or a re-audit (regression_test, reaudited)")
+        if _blank(commit) or not (item.get("regression_test") is True and item.get("reaudited") is True):
+            add("fix-unverified", _FIX_LEVEL.get(severity, "info") if isinstance(severity, str) else "info", f"{label}: {severity} fix lacks a fix commit, a regression test or a re-audit (fix_commit, regression_test, reaudited)")
+        if status == "mitigated":
+            add("residual-risk", _FIX_LEVEL.get(severity, "info") if isinstance(severity, str) else "info", f"{label}: mitigated, not fixed: residual risk remains at {severity} severity")
     elif status == "open":
         if severity == "critical":
             add("open-blocking", "blocker", f"{label}: critical finding is still open")
@@ -229,7 +246,7 @@ def _check_finding(root: Path, rel: str, index: int, item, seen: set[str], out: 
             add("risk-accepted", "info", f"{label}: {status} {severity} finding carries risk acceptance {_shown(item['risk_acceptance'])}")
 
 
-def _duplicates(rel: str, items: list, out: list[dict]) -> None:
+def _duplicates(rel: str, items: list, out: list[dict], reasons: list[str]) -> None:
     rows = []
     for item in items:
         if not isinstance(item, dict) or any(_blank(item.get(k)) for k in ("id", "title", "category", "location")) or item.get("severity") not in a27_tools.SEVERITIES:
@@ -244,6 +261,7 @@ def _duplicates(rel: str, items: list, out: list[dict]) -> None:
     rows = [row for index, row in enumerate(rows) if row["id"] not in ids[:index]]  # first occurrence wins; duplicate ids are reported separately
     if len(rows) > MAX_DEDUPE:
         out.append(make_finding(f"dedupe-truncated:{rel}", "info", "dedupe-truncated", f"duplicate detection ran on the first {MAX_DEDUPE} of {len(rows)} findings", location=rel))
+        reasons.append(f"dedupe-truncated: {rel} (only the first {MAX_DEDUPE} of {len(rows)} findings were compared)")
         rows = rows[:MAX_DEDUPE]
     if not rows:
         return
@@ -267,11 +285,17 @@ def run(args, ctx) -> dict:
     target = (root / args.path).resolve()
     if not target.is_relative_to(root):
         raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} leaves the repository root")
-    probe = Path(os.path.normpath(root / args.path))
-    while probe != root and probe.is_relative_to(root):
-        if probe.is_symlink():
+    cur = Path((root / args.path).anchor)
+    for part in (root / args.path).parts[1:]:
+        if part == "..":
+            cur = cur.parent
+            continue
+        if part == ".":
+            continue
+        nxt = cur / part
+        if nxt != root and nxt.is_relative_to(root) and nxt.is_symlink():
             raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} is or passes through a symbolic link; symlinks are never followed")
-        probe = probe.parent
+        cur = nxt
     if not target.exists():
         raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} does not exist under {root}")
     files, reasons, truncated = _discover(root, target)
@@ -304,7 +328,7 @@ def run(args, ctx) -> dict:
         for index, item in enumerate(items):
             _check_finding(root, rel, index, item, seen, out, stats)
         total += len(items)
-        _duplicates(rel, items, out)
+        _duplicates(rel, items, out, reasons)
     reasons.extend(skipped)
     if not files:
         out.append(make_finding("no-findings-file", "info", "no-findings-file", f"no *findings*.json|yaml|yml file found under {_clean(args.path)}"))

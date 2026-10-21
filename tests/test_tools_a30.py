@@ -777,6 +777,7 @@ def test_sanctions_screening_age_boundary_applies_to_clear_results():
 @pytest.mark.parametrize(("result", "action", "rule", "severity"), [
     ("error", "released", "released-on-error", "blocker"),
     ("error", "none", "error-unactioned", "major"),
+    ("error", "reported", "error-unactioned", "major"),
     ("error", "held", "error-retry-pending", "minor"),
     ("error", "blocked", "error-retry-pending", "minor"),
     ("potential_match", "released", "potential-match-released", "blocker"),
@@ -1148,11 +1149,22 @@ def test_secret_scan_mnemonic_assignments_need_a_valid_word_count_and_word_shape
     assert ok("custody_secret_scan", scan(("w", f'mnemonic = "{thirteen}"')))["findings"] == []
 
 
-def test_secret_scan_encrypted_keystore_is_major_with_the_file_length():
+def test_secret_scan_encrypted_keystore_is_major_with_the_span_inside_the_file():
     content = '{"version": 3, "crypto": {"cipher": "aes-128-ctr", "ciphertext": "00", "kdf": "scrypt"}}'
     result = ok("custody_secret_scan", scan(("ks.json", content)))
-    assert kinds(result) == [("encrypted-keystore", "ks.json:1", len(content), "major")]
+    start = content.index('"ciphertext"')
+    assert kinds(result) == [("encrypted-keystore", "ks.json:1", len(content) - start, "major")]
     assert ok("custody_secret_scan", scan(("x.json", '{"ciphertext": "00"}')))["findings"] == []
+
+
+def test_secret_scan_keystore_span_never_runs_past_a_short_file():
+    # a keystore that starts near the head of a 46-character file: the reported span must end at the file end, not beyond it
+    head = '{"ciphertext":"00","kdf":"s","p":"'
+    content = head + "a" * (46 - len(head) - 2) + '"}'
+    assert len(content) == 46 and content.index('"ciphertext"') == 1
+    (finding,) = ok("custody_secret_scan", scan(("k.json", content)))["findings"]
+    assert finding["id"] == "encrypted-keystore:k.json:1" and finding["length"] == len(content) - 1
+    assert 1 + finding["length"] <= len(content)
 
 
 def test_secret_scan_orders_findings_and_caps_the_list():

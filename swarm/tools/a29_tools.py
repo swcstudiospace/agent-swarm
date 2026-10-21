@@ -1596,6 +1596,18 @@ def _scheme_of(url: str) -> str:
     return support.script("dapp_wallet_check").url_scheme_userinfo(url)[0]
 
 
+_TAB_OR_NEWLINE = re.compile(r"[\t\r\n]")
+_C0_OR_SPACE = "".join(chr(code) for code in range(0x21))  # U+0000 to U+0020
+
+
+def _whatwg_strip(text: str) -> tuple[str, bool]:
+    """A link or origin as the WHATWG URL parser reads it (spec-based; not run in a browser): leading and trailing C0 controls and spaces are
+    removed, then every ASCII tab and newline. Returns the stripped text and whether a tab or newline lies inside it, which is a look-alike
+    signal in itself; surrounding controls and spaces are not."""
+    trimmed = text.strip(_C0_OR_SPACE)
+    return _TAB_OR_NEWLINE.sub("", trimmed), _TAB_OR_NEWLINE.search(trimmed) is not None  # only an inner tab or newline is a look-alike signal
+
+
 def _userinfo_findings(prefix: str, tag: str, url: str, findings: list[dict]) -> None:
     """Userinfo in a displayed link or origin. Never echoes it: `app.example.com@evil.com` is the classic look-alike, `user:pw@host` a credential."""
     kind = support.script("dapp_wallet_check").url_scheme_userinfo(url)[1]
@@ -1681,6 +1693,9 @@ def signing_request_scan(payload: dict) -> dict:
                     findings.append(_f("SIGN-VERIFYING-UNKNOWN", "major", f"{tag}: typed data is bound to a contract that is not a known contract of this app"))
             origin = request.get("origin")
             if origin:
+                origin, control = _whatwg_strip(origin)
+                if control:
+                    findings.append(_f("ORIGIN-CONTROL-CHARACTER", "major", f"{tag} origin contains a tab or newline, which the browser removes before it reads the host: a look-alike construction"))
                 origin_url = origin if "://" in origin else f"https://{origin}"
                 _userinfo_findings("ORIGIN", f"{tag} origin", origin_url, findings)
                 host = inspect(origin_url)
@@ -1733,6 +1748,9 @@ def signing_request_scan(payload: dict) -> dict:
                     findings.append(_f("SIGN-ASSET-MOVEMENT", "info", f"{tag}: {signature} moves assets out of the connected account"))
         for index, link in enumerate(payload["link_urls"]):
             tag = f"link_urls[{index}]"
+            link, control = _whatwg_strip(link)
+            if control:
+                findings.append(_f("LINK-CONTROL-CHARACTER", "major", f"{tag} contains a tab or newline, which the browser removes before it reads the host: a look-alike construction"))
             scheme = _scheme_of(link)
             if scheme in DANGEROUS_SCHEMES:
                 findings.append(_f("LINK-DANGEROUS-SCHEME", "blocker", f"{tag} uses the {scheme}: scheme, which runs or embeds content instead of opening a page"))

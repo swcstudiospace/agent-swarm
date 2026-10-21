@@ -1969,3 +1969,38 @@ def test_urls_that_urlsplit_rejects_never_echo_the_scheme_text():
     assert ids(result)["CHAIN-RPC-1-SCHEME"] == "blocker" and token.lower() not in json.dumps(result)
     link = scan(links=[f"{token}://app.example.com"], domains=())
     assert ids(link) == {"LINK-SCHEME": "major"} and token.lower() not in json.dumps(link) and token not in json.dumps(link)
+
+
+# --- QA-03 re-review: N9 and N10 ----------------------------------------------------------------------------------------------
+
+
+def test_link_with_an_embedded_newline_or_tab_is_read_as_the_browser_reads_it():  # N9 (WHATWG parser; spec-based, not run in a browser)
+    newline = scan(links=["https://app.example.com\n.evil.io"], domains=("app.example.com",))
+    assert ids(newline) == {"LINK-SPOOF": "blocker", "LINK-CONTROL-CHARACTER": "major"} and newline["verdict"] == "block"
+    tab = scan(links=["https://app.example\t.com/"], domains=("app.example.com",))
+    assert ids(tab) == {"LINK-CONTROL-CHARACTER": "major"} and tab["verdict"] == "review"  # the stripped host is the expected one
+    origin = scan({"method": "personal_sign", "origin": "https://app.example.com\n.evil.io"}, domains=("app.example.com",))
+    assert ids(origin) == {"ORIGIN-SPOOF": "blocker", "ORIGIN-CONTROL-CHARACTER": "major"}
+
+
+def test_single_label_rpc_host_is_shown_by_length_only():  # N10
+    host = "localnode-private-host"
+    result = ok("dapp_chain_config_check", chain(rpc_urls=[f"http://{host}:8545"]))
+    assert ids(result) == {"CHAIN-RPC-1-LOCAL": "major"}
+    assert "host of 22 chars" in next(f["summary"] for f in result["findings"] if f["id"] == "CHAIN-RPC-1-LOCAL")
+    assert host not in json.dumps(result)
+
+
+# --- re-review: ND5 (WHATWG parser strips leading and trailing C0 controls and spaces; spec-based, not run in a browser) -------------
+
+
+def test_link_with_a_leading_space_still_has_its_host_checked():
+    result = scan(links=[" https://app.example.com.evil.io/x"], domains=("app.example.com",))
+    assert ids(result) == {"LINK-SPOOF": "blocker"} and result["verdict"] == "block"
+    origin = scan({"method": "personal_sign", "origin": " https://app.example.com.evil.io"}, domains=("app.example.com",))
+    assert ids(origin) == {"ORIGIN-SPOOF": "blocker"} and origin["verdict"] == "block"
+
+
+def test_link_with_a_trailing_space_still_has_its_host_checked():
+    result = scan(links=["https://app.example.com.evil.io/x "], domains=("app.example.com",))
+    assert ids(result) == {"LINK-SPOOF": "blocker"} and result["verdict"] == "block"

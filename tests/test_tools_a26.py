@@ -2045,3 +2045,256 @@ def test_a_signature_domain_with_no_chain_and_no_contract_fails_without_any_fiel
 def test_a_name_that_only_contains_a_privileged_word_is_not_privileged():
     result = ok("sol_access_matrix", {"source": "contract S { uint256 total; function setSkillLevel(uint256 v) external { total = v; } }"})
     assert ids(result) == ["ACCESS-UNPROTECTED-ADMIN"] and severity_of(result, "ACCESS-UNPROTECTED-ADMIN") == "major"
+
+
+# --- QA-03 re-review (N1 to N4, N6, N7): path-aware guards, helper checks, fallback writes, credentials, unparseable input ---
+
+
+def test_an_or_around_a_sender_check_leaves_the_execute_path_unguarded():  # N1
+    source = ("pragma solidity 0.8.28;\ncontract S { address owner; bool open; uint256 x;\n"
+              "    function execute(address t, bytes memory d, bool a) external {\n"
+              "        require(msg.sender == owner && open || a);\n        x = 1;\n"
+              "        (bool ok, ) = t.delegatecall(d);\n        require(ok);\n    }\n}")
+    access = ok("sol_access_matrix", {"source": source})
+    assert access["guarded"] == 0 and access["verdict"] == "fail" and severity_of(access, "ACCESS-UNPROTECTED-ADMIN") == "major"
+    proxy = upgrade(source, "transparent")
+    assert severity_of(proxy, "UPG-DELEGATECALL") == "major" and proxy["verdict"] == "unsafe"
+
+
+def test_a_guard_inside_an_if_without_else_guards_nothing():  # N2
+    source = ("pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+              "    function setX(bool c) external { if (c) { require(msg.sender == owner); } x = 1; }\n}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["guarded"] == 0 and result["unprotected"] == 1 and result["verdict"] == "fail"
+
+
+def test_a_guard_after_an_unconditional_return_guards_nothing():  # N2
+    source = ("pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+              "    function setX() external { return; require(msg.sender == owner); x = 1; }\n}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["guarded"] == 0 and result["unprotected"] == 1 and result["verdict"] == "fail"
+
+
+def test_a_guard_before_a_conditional_write_still_guards_the_write():  # N2: the positive shape stays guarded
+    source = ("pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+              "    function setX(bool c) external { require(msg.sender == owner); if (c) { x = 2; } x = 1; }\n}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["guarded"] == 1 and result["unprotected"] == 0 and result["verdict"] == "pass"
+
+
+def test_an_empty_access_helper_and_a_no_op_has_role_guard_nothing():  # N3
+    source = ("pragma solidity 0.8.28;\ncontract S { uint256 x;\n"
+              "    function _checkOwner() internal { }\n"
+              "    function hasRole(bytes32 role, address account) internal view returns (bool) { }\n"
+              "    function mint(uint256 v) external { _checkOwner(); require(hasRole(ADMIN, msg.sender)); x = v; }\n}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["guarded"] == 0 and result["unprotected"] == 1
+    assert severity_of(result, "ACCESS-UNPROTECTED-PRIVILEGED") == "blocker" and result["verdict"] == "fail"
+
+
+@pytest.mark.parametrize("decl, entry, write", [
+    ("mapping(address => bool) roles;", "fallback() external payable", "roles[msg.sender] = true;"),
+    ("mapping(address => bool) isAdmin;", "receive() external payable", "isAdmin[msg.sender] = true;"),
+    ("bool isAdmin;", "fallback() external", "isAdmin = true;"),
+    ("mapping(address => bool) roles;", "receive() external payable", "roles[msg.sender] += true;"),
+])
+def test_an_admin_or_role_write_in_fallback_or_receive_is_an_unprotected_fallback_blocker(decl, entry, write):  # N4
+    result = ok("sol_access_matrix", {"source": f"contract W {{ {decl} {entry} {{ {write} }} }}"})
+    assert ids(result) == ["ACCESS-UNPROTECTED-FALLBACK"] and severity_of(result, "ACCESS-UNPROTECTED-FALLBACK") == "blocker"
+    assert result["verdict"] == "fail"
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:s3cr3t?x@rpc.example.org/",  # the userinfo ends before a query
+    "https://user:s3cr3t#x@rpc.example.org/",  # ... before a fragment
+    "https://user:s3cr3t/x@rpc.example.org/",  # ... before a path separator
+])
+def test_a_credential_before_a_query_fragment_or_path_separator_is_a_blocker_and_is_not_echoed(url):  # N6
+    result = plan(rpc_url=url)
+    assert severity_of(result, "DEPLOY-RPC-CREDENTIAL") == "blocker" and result["verdict"] == "fail"
+    assert "s3cr3t" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("source", [
+    "pragma solidity 0.8.28;\ncontract S { uint256 x; function f(uint256 a",  # cut mid-signature
+    "pragma solidity 0.8.28;\ncontract S { uint256 x; } function f() external { x = 1; }",  # function after the closing brace
+])
+def test_unparseable_source_is_a_major_incomplete_scan_that_fails_the_access_matrix(source):  # N7
+    result = ok("sol_access_matrix", {"source": source})
+    assert ids(result) == ["scan/incomplete"] and severity_of(result, "scan/incomplete") == "major"
+    assert result["verdict"] == "fail" and result["state_changing"] == 0
+
+
+# --- write order (residual 1): a guard counts for a state write only when it runs before that write -------------------------
+
+
+def test_a_write_before_its_guard_is_unguarded():
+    source = ("pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+              "    function setX(uint256 v) external { x = v; require(msg.sender == owner); }\n}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["guarded"] == 0 and result["unprotected"] == 1 and result["verdict"] == "fail"
+    assert severity_of(result, "ACCESS-UNPROTECTED-ADMIN") == "major"
+
+
+def test_the_same_statements_with_the_guard_first_are_guarded():
+    source = ("pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+              "    function setX(uint256 v) external { require(msg.sender == owner); x = v; }\n}")
+    result = ok("sol_access_matrix", {"source": source})
+    assert result["guarded"] == 1 and result["unprotected"] == 0 and result["verdict"] == "pass"
+
+
+def test_a_helper_guard_after_a_write_in_the_caller_guards_nothing_for_that_write():
+    before = ("pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+              "    function _onlyOwner() internal view { require(msg.sender == owner); }\n"
+              "    function setX(uint256 v) external { x = v; _onlyOwner(); }\n}")
+    result = ok("sol_access_matrix", {"source": before})
+    assert result["guarded"] == 0 and result["unprotected"] == 1 and result["verdict"] == "fail"
+    after = before.replace("x = v; _onlyOwner();", "_onlyOwner(); x = v;")
+    assert ok("sol_access_matrix", {"source": after})["guarded"] == 1
+
+
+# --- re-verification round two (NEW-1 to NEW-5, NEW-7, NEW-9, W5): modifier order, named returns, Yul locals, placeholder,
+# for post clause, callee guards, block scope and unverified calls ----------------------------------------------------------
+
+_CHAIN_MODIFIERS = ("address owner; uint256 x; uint256 _status;\n"
+                    "    modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+                    "    modifier nonReentrant() { require(_status != 2); _status = 2; _; _status = 1; }\n")
+
+
+def test_onlyowner_before_nonreentrant_is_guarded_and_nonreentrant_before_onlyowner_fails():  # NEW-1
+    passes = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { " + _CHAIN_MODIFIERS +
+                                      "    function set(uint f) external onlyOwner nonReentrant { x = f; }\n}"})
+    assert passes["guarded"] == 1 and passes["unprotected"] == 0 and passes["verdict"] == "pass"
+    fails = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { " + _CHAIN_MODIFIERS +
+                                     "    function set2(uint f) external nonReentrant onlyOwner { x = f; }\n}"})
+    assert fails["guarded"] == 0 and fails["verdict"] == "fail" and severity_of(fails, "ACCESS-UNPROTECTED-ADMIN") == "major"
+
+
+def test_a_named_return_is_a_local_so_writing_it_before_the_guard_is_not_a_state_write():  # NEW-2
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; address admin;\n"
+                                                "    function setAdmin(address a) external returns (bool ok) { ok = true; require(msg.sender == owner); admin = a; }\n}"})
+    assert result["guarded"] == 1 and result["unprotected"] == 0 and result["verdict"] == "pass"
+
+
+def test_a_yul_let_and_its_assignment_are_locals_so_they_do_not_break_the_guard_before_a_state_write():  # NEW-3
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; address admin;\n"
+                                                "    function setAdmin(address a) external { assembly { let t := a } require(msg.sender == owner); admin = a; }\n}"})
+    assert result["guarded"] == 1 and result["unprotected"] == 0 and result["verdict"] == "pass"
+
+
+def test_a_modifier_check_after_its_placeholder_guards_nothing_and_one_before_it_guards():  # NEW-4
+    after = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                               "    modifier onlyOwner() { _; require(msg.sender == owner); }\n"
+                                               "    function setX(uint f) external onlyOwner { x = f; }\n}"})
+    assert after["guarded"] == 0 and after["verdict"] == "fail" and severity_of(after, "ACCESS-UNPROTECTED-ADMIN") == "major"
+    before = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+                                                "    function setX(uint f) external onlyOwner { x = f; }\n}"})
+    assert before["guarded"] == 1 and before["verdict"] == "pass"
+
+
+def test_a_for_header_post_clause_guards_nothing_because_the_loop_may_run_zero_times():  # NEW-5
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    function setX(uint v) external { for (uint i = 0; i < 0; require(msg.sender == owner)) {} x = v; }\n}"})
+    assert result["guarded"] == 0 and result["verdict"] == "fail" and severity_of(result, "ACCESS-UNPROTECTED-ADMIN") == "major"
+
+
+def test_a_guard_in_a_conditional_callee_guards_nothing_and_an_unconditional_one_guards():  # NEW-7
+    base = "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n    function _auth() internal view { require(msg.sender == owner); }\n"
+    conditional = ok("sol_access_matrix", {"source": base + "    function setFee(uint f) external { if (f > 0) { _auth(); } x = f; }\n}"})
+    assert conditional["guarded"] == 0 and conditional["verdict"] == "fail"
+    unconditional = ok("sol_access_matrix", {"source": base + "    function setFee(uint f) external { _auth(); x = f; }\n}"})
+    assert unconditional["guarded"] == 1 and unconditional["verdict"] == "pass"
+
+
+def test_a_write_to_a_state_variable_after_a_block_that_declares_the_same_name_is_still_a_state_write():  # NEW-9
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    function setX(uint v) external { { uint x = 1; } x = v; require(msg.sender == owner); }\n}"})
+    assert result["guarded"] == 0 and result["verdict"] == "fail" and severity_of(result, "ACCESS-UNPROTECTED-ADMIN") == "major"
+
+
+def test_a_call_before_the_first_guard_to_an_undefined_function_is_an_unverified_call_and_fails():  # W5
+    before = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    function set(uint f) external { _ext(f); require(msg.sender == owner); x = f; }\n}"})
+    assert ids(before) == ["ACCESS-UNVERIFIED-CALL-BEFORE-GUARD"] and severity_of(before, "ACCESS-UNVERIFIED-CALL-BEFORE-GUARD") == "major"
+    assert before["verdict"] == "fail" and "_ext" in before["findings"][0]["summary"]
+    after = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                               "    function set(uint f) external { require(msg.sender == owner); _ext(f); x = f; }\n}"})
+    assert after["findings"] == [] and after["verdict"] == "pass"
+
+
+def test_a_call_chain_past_the_recursion_limit_is_a_scan_incomplete_major_not_an_exception():  # recursion backstop
+    depth = 1200  # past the interpreter's limit of 1000 frames and the guard walk's measured limit of about 494 levels
+    lines = ["    function f0(uint v) external { f1(v); }"]
+    lines += [f"    function f{i}(uint v) internal {{ f{i + 1}(v); }}" for i in range(1, depth)]
+    lines.append(f"    function f{depth}(uint v) internal {{ x = v; }}")
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { uint256 x;\n" + "\n".join(lines) + "\n}"})
+    assert ids(result) == ["scan/incomplete"] and severity_of(result, "scan/incomplete") == "major"
+    assert result["verdict"] == "fail" and "recursion limit" in result["findings"][0]["summary"]
+
+
+# --- round three (D-C, D-D, helper narrowing, modifier item): msg.sender arguments, declared struct constructors, guard helpers
+# whose account is not the caller, and calls in a modifier before its check
+
+
+def test_a_call_taking_msg_sender_as_an_argument_is_an_unverified_call_before_the_guard():  # D-C
+    for call in ("_mint(msg.sender)", "_mint(msg.sender, f)"):
+        result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                    f"    function set(uint f) external {{ {call}; require(msg.sender == owner); x = f; }}\n}}"})
+        assert ids(result) == ["ACCESS-UNVERIFIED-CALL-BEFORE-GUARD"] and severity_of(result, "ACCESS-UNVERIFIED-CALL-BEFORE-GUARD") == "major"
+        assert result["verdict"] == "fail" and "_mint" in result["findings"][0]["summary"], call
+
+
+def test_a_declared_struct_is_a_type_and_its_constructor_is_not_an_unverified_call():  # D-D
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    struct position { uint256 a; }\n"
+                                                "    function f(uint v) external { position memory p = position({a: v}); require(msg.sender == owner); x = p.a; }\n}"})
+    assert result["findings"] == [] and result["verdict"] == "pass" and result["guarded"] == 1
+
+
+def test_a_guard_helper_is_exempt_only_when_its_account_is_the_caller_or_it_takes_no_argument():  # helper narrowing
+    judged = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    function set(uint f, address user) external { hasRole(ROLE, user); require(msg.sender == owner); x = f; }\n}"})
+    assert ids(judged) == ["ACCESS-UNVERIFIED-CALL-BEFORE-GUARD"] and judged["verdict"] == "fail"
+    exempt = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    function set(uint f) external { hasRole(ROLE, msg.sender); require(msg.sender == owner); x = f; }\n}"})
+    assert exempt["findings"] == [] and exempt["verdict"] == "pass"
+
+
+def test_a_modifier_call_to_an_undefined_function_before_its_check_is_an_unverified_call():  # modifier item
+    result = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    modifier onlyOwner() { _audit(); require(msg.sender == owner); _; }\n"
+                                                "    function set(uint f) external onlyOwner { x = f; }\n}"})
+    assert ids(result) == ["ACCESS-UNVERIFIED-CALL-BEFORE-GUARD"] and severity_of(result, "ACCESS-UNVERIFIED-CALL-BEFORE-GUARD") == "major"
+    assert result["verdict"] == "fail" and "_audit" in result["findings"][0]["summary"]
+    checked_first = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                       "    modifier onlyOwner() { require(msg.sender == owner); _audit(); _; }\n"
+                                                       "    function set(uint f) external onlyOwner { x = f; }\n}"})
+    assert checked_first["findings"] == [] and checked_first["verdict"] == "pass"
+
+
+# --- round four (N-1, N-3): a _checkRole credited by its account, and applied modifiers judged in the order they are applied
+
+
+def test_a_check_role_is_credited_only_for_one_argument_or_for_the_callers_account():  # N-1
+    other = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                "    function set(uint f, address user) external { _checkRole(bytes32(0), user); x = f; }\n}"})
+    assert severity_of(other, "ACCESS-UNPROTECTED-ADMIN") == "major" and other["verdict"] == "fail"
+    assert other["guarded"] == 0
+    caller = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                                 "    function set(uint f) external { _checkRole(bytes32(0), msg.sender); x = f; }\n}"})
+    assert caller["findings"] == [] and caller["verdict"] == "pass" and caller["guarded"] == 1
+    one = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n"
+                                             "    function set(uint f) external { _checkRole(ROLE); x = f; }\n}"})
+    assert one["findings"] == [] and one["verdict"] == "pass" and one["guarded"] == 1
+
+
+def test_an_earlier_modifier_that_checks_the_sender_stops_the_judging_of_a_later_modifier():  # N-3
+    modifiers = ("    modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+                 "    modifier whenActive() { _checkActive(); _; }\n")
+    after_owner = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n" + modifiers +
+                                                     "    function set(uint f) external onlyOwner whenActive { x = f; }\n}"})
+    assert after_owner["findings"] == [] and after_owner["verdict"] == "pass"
+    before_owner = ok("sol_access_matrix", {"source": "pragma solidity 0.8.28;\ncontract S { address owner; uint256 x;\n" + modifiers +
+                                                      "    function set(uint f) external whenActive onlyOwner { x = f; }\n}"})
+    assert ids(before_owner) == ["ACCESS-UNVERIFIED-CALL-BEFORE-GUARD"] and before_owner["verdict"] == "fail"

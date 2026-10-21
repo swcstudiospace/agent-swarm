@@ -18,7 +18,7 @@ import hashlib
 import math
 import re
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, localcontext
 
 from swarm.tools.support import respond
 
@@ -807,9 +807,11 @@ def stuck_transactions(payload: dict) -> dict:
 
 
 def _key_identity(ref: str) -> str:
-    """A hex key reference is compared and shown as 0x plus lowercase hex, so case and the optional prefix do not split one key; any other label compares as given."""
+    """A key reference compares as one identity: hex is 0x plus lowercase hex (optional prefix, any case); any other label is lowercase."""
     body = ref[2:] if ref[:2].lower() == "0x" else ref
-    return "0x" + body.lower() if re.fullmatch(r"[0-9A-Fa-f]+", body) else ref
+    if re.fullmatch(r"[0-9A-Fa-f]+", body):
+        return "0x" + body.lower()
+    return ref.lower()
 
 
 def validator_slashing_risk(payload: dict) -> dict:
@@ -885,8 +887,22 @@ def _amount(field: str, text: str) -> Decimal:
 
 
 def _exact_number(value: Decimal) -> int | float:
-    """An integral amount as an exact int, which JSON carries without float rounding; any other amount as a float to 6 places."""
+    """An integral amount as an exact int; any other amount as a float to 6 places (the exact text goes in a finding when they differ)."""
     return int(value) if value == value.to_integral_value() else round(float(value), 6)
+
+
+def _surplus(locked: Decimal, minted: Decimal) -> Decimal:
+    """The exact difference: each amount is at most 40 characters, so 120 digits of working precision cannot round it."""
+    with localcontext() as ctx:
+        ctx.prec = 120
+        return locked - minted
+
+
+def _exact_text(value: Decimal) -> str:
+    """The exact decimal text of an amount, without exponent and without trailing zeros."""
+    with localcontext() as ctx:
+        ctx.prec = 120
+        return format(value.normalize(), "f")
 
 
 def bridge_monitor(payload: dict) -> dict:
@@ -925,6 +941,10 @@ def bridge_monitor(payload: dict) -> dict:
             findings.append(_finding("pause-recommended", "blocker", "pause conditions are met and the bridge is not paused: escalate for a human pause decision"))
         if payload["paused"] and not pause:
             findings.append(_finding("paused-without-trigger", "info", "the bridge is paused while collateral and lag are healthy: review whether to resume"))
+        surplus = _surplus(locked, minted)
+        surplus_number = _exact_number(surplus)
+        if isinstance(surplus_number, float) and Decimal(repr(surplus_number)) != surplus:
+            findings.append(_finding("surplus-not-exact-in-number", "info", f"the collateral surplus is exactly {_exact_text(surplus)}; collateral_surplus holds the nearest float, which does not carry every digit"))
         if overdue:
             findings.append(_finding("messages-overdue", "major", f"{overdue} of {len(pending_ages)} in-flight message(s) are older than {payload['max_lag_minutes']} minutes"))
         if late:
@@ -939,7 +959,8 @@ def bridge_monitor(payload: dict) -> dict:
             "late_delivered_count": late,
             "p95_delivery_lag_min": round(float(p95 / 60), 2),
             "max_pending_age_min": round(float(max(pending_ages, default=Decimal(0)) / 60), 2),
-            "collateral_surplus": _exact_number(locked - minted),
+            "collateral_surplus": surplus_number,
+            "collateral_surplus_exact": _exact_text(surplus),
             "undercollateralized": under,
             "pause_recommended": pause,
             "verdict": _verdict(findings),

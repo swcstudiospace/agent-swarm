@@ -15,8 +15,10 @@ The Solidity source reader, guard/event analysis and pragma rules are shared wit
 from __future__ import annotations
 
 import re
+import sys
 from decimal import Decimal
 
+from swarm.scan_status import incomplete_findings
 from swarm.tools.support import respond, script
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
@@ -133,6 +135,29 @@ def _dec(value) -> Decimal:
 
 def _finding(rule: str, severity: str, summary: str) -> dict:
     return {"id": rule, "severity": severity, "summary": _text(summary)}
+
+
+def _incomplete_source(source: str, analysed: int) -> list[dict]:
+    """A major scan/incomplete finding when the Solidity source does not parse (truncated, or a declaration outside every contract
+    body): the handler then reads only part of it, so the verdict fails. Only labels are reported, never the source text."""
+    problems = _lint().source_problems(source)
+    return [_finding(item["id"], item["severity"], item["summary"]) for item in incomplete_findings(problems, analysed)] if problems else []
+
+
+def _call_depth_bounded(work, stopped: dict):
+    """`work`, with the interpreter's recursion limit turned into a stop: a call walk past the limit returns `stopped` (its verdict
+    fails) with a scan-incomplete major finding naming the limit, as a19's $ref walk stops, never as an exception."""
+
+    def bounded() -> dict:
+        try:
+            return work()
+        except RecursionError:
+            reason = (f"call depth exceeds the call-depth limit (the interpreter's recursion limit, {sys.getrecursionlimit()}): "
+                      "the call walk stopped and the source is not fully analysed")
+            findings = [_finding(item["id"], item["severity"], item["summary"]) for item in incomplete_findings([reason], 0)]
+            return {**stopped, "state": "SUCCESS", "findings": findings, "findings_total": len(findings)}
+
+    return bounded
 
 
 def _finish(findings: list[dict]) -> tuple[list[dict], int]:
@@ -855,11 +880,13 @@ def upgrade_safety(payload: dict) -> dict:
             for fn in (f for f in fns if f["name"] == "_authorizeUpgrade"):
                 if not L.guards(fn, index):
                     findings.append(_finding("UPG-UUPS-UNPROTECTED", "blocker", f"{name}._authorizeUpgrade has no access control: anyone can replace the implementation"))
+        findings += _incomplete_source(payload["source"], len(chosen))
         listed, total = _finish(findings)
         return {"state": "SUCCESS", "pattern": pattern, "contracts_checked": len(chosen),
                 "verdict": "unsafe" if _worst(findings) >= SEVERITY_RANK["major"] else "safe", "findings": listed, "findings_total": total}
 
-    return respond(payload, work)
+    return respond(payload, _call_depth_bounded(work, {"pattern": payload.get("pattern", ""), "contracts_checked": 0,
+                                                       "verdict": "unsafe"}))
 
 
 # privileged operations: a run of whole words of the function name equals one of these terms (`setSkillLevel` is not `kill`)
@@ -869,8 +896,8 @@ _PRIVILEGED_TERMS = frozenset({"mint", "upgrade", "selfdestruct", "destroy", "ki
 _ADMIN_VERBS = frozenset({"set", "update", "add", "remove", "change", "enable", "disable", "configure", "withdraw", "execute",
                           "migrate", "register", "revoke", "whitelist", "blacklist", "freeze", "seize"})
 # a fallback or receive that writes an owner, admin or role variable hands the contract to any caller
-_ROLE_WRITE = re.compile(r"(?<![\w$.])\w*(?:owner|admin|role|governor|guardian|operator|minter|manager|keeper|implementation)\w*\s*=(?!=)",
-                         re.IGNORECASE)
+_ROLE_WRITE = re.compile(r"(?<![\w$.])\w*(?:owner|admin|role|governor|guardian|operator|minter|manager|keeper|implementation)\w*"
+                         r"(?:\s*\[[^\]\n]{0,120}\])*\s*[-+*/%&|^]?=(?!=)", re.IGNORECASE)
 
 
 def _name_words(name: str) -> list[str]:
@@ -890,13 +917,34 @@ def _is_admin_verb(name: str) -> bool:
 
 def access_matrix(payload: dict) -> dict:
     """State-changing public/external functions by access guard. Guards: access modifiers (onlyOwner, onlyRole(X), auth,
-    restricted; a modifier defined in the source counts only when its body checks the caller), inline checks (_checkOwner,
-    _checkRole, hasRole, `require(msg.sender == X)`, `if (msg.sender != X) revert`, role-named allow-list lookups) and guarded
-    internal callees. Not access control: tx.origin, a comparison with address(0), `!=` inside require, an `if` that only
-    branches, nonReentrant, whenNotPaused and initializer. An unguarded writer is a blocker when its name is privileged (mint,
-    upgrade, pause, ownership, role, sweep ...), major for admin verbs (set, update, withdraw ...), minor otherwise;
-    `public_by_design` names are skipped. A fallback or receive is an entry point too: one that writes an owner, admin or role
-    variable without access control is a blocker. Heuristic: reads text, resolves no imports."""
+    restricted; a modifier defined in the source counts only when its body checks the caller before its `_;`), inline checks
+    (_checkOwner, _checkRole, hasRole, `require(msg.sender == X)`, `if (msg.sender != X) revert`, role-named allow-list lookups)
+    and the checks of internal callees reached by an unconditional call. A check counts only on the path that runs it before the
+    write it guards: a check after a write guards nothing for that write, and a check inside an `if` branch guards nothing
+    outside that branch. Applied modifiers run in the order listed, before the body: `onlyOwner nonReentrant` guards the body,
+    while `nonReentrant onlyOwner` does not, because nonReentrant writes its lock before the owner check runs. Code after a
+    modifier's `_;` runs after the body, so a check placed there guards nothing. Not access control: tx.origin, a comparison with
+    address(0), `!=` inside require, an `if` that only branches, nonReentrant, whenNotPaused and initializer. An unguarded writer
+    is a blocker when its name is privileged (mint, upgrade, pause, ownership, role, sweep ...), major for admin verbs (set,
+    update, withdraw ...), minor otherwise; `public_by_design` names are skipped. A fallback or receive is an entry point too: one
+    that writes an owner, admin or role variable without access control is a blocker. An unqualified call that runs before the
+    first check and names no function this source defines is an unverified call (ACCESS-UNVERIFIED-CALL-BEFORE-GUARD, major).
+    Applied modifiers are judged in the order they are applied: once an earlier one checks the sender, the later modifiers and the
+    body run after that guard and are not judged. Not judged: a call on msg.sender as a receiver, upper-case names (taken as type
+    conversions or constructors), declared struct and contract names (constructors), elementary types and builtins, calls inside
+    assembly, external calls with a receiver, and a call that is itself the recognised check. A call that takes msg.sender as an
+    argument is exempt only when it is a named guard helper whose account is the sender: its last argument is msg.sender or
+    _msgSender(), or it takes no argument, or it is a recognised guard call with one argument, _checkRole(ROLE), which is exempt on
+    the OpenZeppelin convention since that helper checks msg.sender itself. hasRole(msg.sender, ROLE) is judged, since the sender
+    is not its last argument. A guard
+    helper with no argument (isOwner(), hasRole()) is exempt from the unverified finding but earns no guard credit. Credit is given
+    by name and form. _checkOwner(), _checkRole(ROLE) and _checkRole(ROLE, msg.sender) are credited as statements. hasRole(ROLE,
+    msg.sender) and isOwner(msg.sender) are credited inside require(...) or if (!...) revert(), and so is an undefined name that
+    contains a role word (owner, admin, operator, minter, authorized, whitelist, allow, role, governor, guardian, manager, keeper)
+    and takes msg.sender as its last argument, in the same forms; that undefined call is still reported as unverified, so the
+    verdict still fails. _checkRole(ROLE, user) with another account earns none. An entry point with
+    no check at all judges every such call as before the check.
+    Heuristic: reads text, resolves no imports."""
 
     def work() -> dict:
         picked = _selected_contracts(payload)
@@ -916,6 +964,12 @@ def access_matrix(payload: dict) -> dict:
                 label = _short(f"{contract['name']}.{fn['signature']}")
                 state_changing += 1
                 found = L.guards(fn, index)
+                if fn["name"] not in by_design:
+                    unverified = L.unverified_calls(fn, index)
+                    if unverified:
+                        callees = ", ".join(_short(name) for name in unverified)
+                        findings.append(_finding("ACCESS-UNVERIFIED-CALL-BEFORE-GUARD", "major",
+                                                 f"{label} calls {callees} before its access guard, and no function of that name is defined in this source: unverified call before guard"))
                 if found:
                     guarded += 1
                     for role in found:
@@ -934,6 +988,7 @@ def access_matrix(payload: dict) -> dict:
                     findings.append(_finding("ACCESS-UNPROTECTED-ADMIN", "major", f"{label} looks like an admin operation and has no access control"))
                 else:
                     findings.append(_finding("ACCESS-UNPROTECTED-WRITER", "minor", f"{label} changes state and is callable by anyone; list it in public_by_design if intended"))
+        findings += _incomplete_source(payload["source"], len(chosen))
         listed, total = _finish(findings)
         matrix, budget = [], 300
         for role in sorted(roles):
@@ -945,7 +1000,8 @@ def access_matrix(payload: dict) -> dict:
                 "unprotected": unprotected, "roles": matrix,
                 "verdict": "fail" if _worst(findings) >= SEVERITY_RANK["major"] else "pass", "findings": listed, "findings_total": total}
 
-    return respond(payload, work)
+    return respond(payload, _call_depth_bounded(work, {"contracts_checked": 0, "state_changing": 0, "guarded": 0, "unprotected": 0,
+                                                       "roles": [], "verdict": "fail"}))
 
 
 def event_coverage(payload: dict) -> dict:
@@ -980,9 +1036,11 @@ def event_coverage(payload: dict) -> dict:
         below = coverage < _dec(payload["min_coverage_pct"])
         if below:
             findings.append(_finding("EVENT-COVERAGE-BELOW-MIN", "major", f"event coverage {round(float(coverage), 2)}% is below the required {payload['min_coverage_pct']}%"))
+        findings += _incomplete_source(payload["source"], len(chosen))
         listed, total = _finish(findings)
         return {"state": "SUCCESS", "functions_checked": emits + delegated + missing, "emitting": emits, "delegated": delegated, "missing": missing,
-                "coverage_pct": round(float(coverage), 2), "verdict": "fail" if below else "pass", "findings": listed, "findings_total": total}
+                "coverage_pct": round(float(coverage), 2), "verdict": "fail" if below or _worst(findings) >= SEVERITY_RANK["major"] else "pass",
+                "findings": listed, "findings_total": total}
 
     return respond(payload, work)
 
@@ -1034,6 +1092,7 @@ def natspec_coverage(payload: dict) -> dict:
         below = coverage < _dec(payload["min_coverage_pct"])
         if below:
             findings.append(_finding("NATSPEC-COVERAGE-BELOW-MIN", "major", f"NatSpec coverage {round(float(coverage), 2)}% is below the required {payload['min_coverage_pct']}%"))
+        findings += _incomplete_source(payload["source"], len(parsed))
         listed, total = _finish(findings)
         return {"state": "SUCCESS", "items_total": total_items, "items_documented": documented, "coverage_pct": round(float(coverage), 2),
                 "verdict": "fail" if below or _worst(findings) >= SEVERITY_RANK["major"] else "pass", "findings": listed, "findings_total": total}
@@ -1235,12 +1294,14 @@ def deploy_plan_check(payload: dict) -> dict:
             if not m:
                 return _invalid("rpc_url", "rpc_url must be an http(s) URL")
             scheme, target, query = m.group(1), m.group(2), m.group(3) or ""
-            # the authority ends at the first '/', but userinfo may hold an unencoded '/': any '@' before the query is a credential
+            rest = rpc.split("://", 1)[1]
+            # a password may hold an unencoded '/', '?' or '#', so the '@' that ends the userinfo can follow any of them: an '@'
+            # anywhere after the scheme is taken as that delimiter, and the value is never echoed
             slash = target.find("/")
             path = target[slash:] if slash >= 0 else ""
-            host = target[target.rfind("@") + 1:].split("/", 1)[0].lower()
+            host = re.split(r"[/?#]", rest.rsplit("@", 1)[-1], 1)[0].lower()
             host_only = re.sub(r":\d+\Z", "", host)
-            if "@" in target:
+            if "@" in rest:
                 findings.append(_finding("DEPLOY-RPC-CREDENTIAL", "blocker", "rpc_url embeds user:password in its authority"))
             for position, pair in enumerate(query.split("&") if query else [], 1):
                 key, equals, value = pair.partition("=")
