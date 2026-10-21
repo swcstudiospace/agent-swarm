@@ -434,6 +434,30 @@ def test_provider_default_tags_skip_the_terraform_tag_check_and_say_so(tmp_path)
     assert [(s["check"], s["status"]) for s in result["skipped"]] == [("iac-untagged-resource", "skipped:provider-default-tags")]
 
 
+def test_computed_tag_maps_are_not_judged_and_never_count_as_missing_tags(tmp_path):
+    put(tmp_path, "main.tf", 'resource "aws_instance" "a" {\n  tags = { for k, v in local.common : k => v }\n}\n')
+    result = scan(tmp_path, required=["owner", "environment"])
+    assert hits(result, "iac-untagged-resource") == [] and [f["rule"] for f in result["findings"]] == ["scan-incomplete"]
+
+
+def test_a_data_source_reference_does_not_cover_a_managed_bucket_or_repository(tmp_path):
+    put(tmp_path, "s3/main.tf", 'data "aws_s3_bucket" "logs" { bucket = "shared" }\nresource "aws_s3_bucket" "logs" { bucket = "mine" }\n'
+                                'resource "aws_s3_bucket_lifecycle_configuration" "x" {\n  bucket = data.aws_s3_bucket.logs.id\n  rule { id = "r" }\n}\n')
+    put(tmp_path, "ecr/main.tf", 'resource "aws_ecr_repository" "api" { name = "api" }\n'
+                                 'resource "aws_ecr_lifecycle_policy" "p" {\n  repository = data.aws_ecr_repository.api.name\n  policy = "{}"\n}\n')
+    result = scan(tmp_path)
+    assert sorted(hits(result, "iac-missing-lifecycle")) == [("aws_ecr_repository.api", "minor"), ("aws_s3_bucket.logs", "minor")]
+
+
+def test_default_tags_exempt_only_through_an_unaliased_provider(tmp_path):
+    put(tmp_path, "vars/main.tf", 'variable "default_tags" { default = {} }\nresource "aws_instance" "a" { instance_type = "m5.large" }\n')
+    put(tmp_path, "west/main.tf", 'provider "aws" {\n  alias = "west"\n  default_tags {\n    tags = { owner = "x" }\n  }\n}\n'
+                                  'resource "aws_instance" "b" { instance_type = "m5.large" }\n')
+    result = scan(tmp_path, required=["owner"])
+    assert sorted(hits(result, "iac-untagged-resource")) == [("aws_instance.a", "major"), ("aws_instance.b", "major")]
+    assert not any(s["status"] == "skipped:provider-default-tags" for s in result["skipped"])
+
+
 def test_provider_default_tags_in_one_terraform_root_do_not_hide_untagged_resources_in_another(tmp_path):
     put(tmp_path, "dev/main.tf", 'provider "aws" {\n  default_tags {\n    tags = { owner = "x" }\n  }\n}\nresource "aws_instance" "a" {\n  instance_type = "m5.large"\n}\n')
     put(tmp_path, "prod/main.tf", 'resource "aws_instance" "b" {\n  instance_type = "m5.large"\n}\n')

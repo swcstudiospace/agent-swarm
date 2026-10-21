@@ -175,6 +175,19 @@ def test_strict_mtls_and_authz_default_deny_pass(repo):
     assert rc == 0 and data["findings"] == [] and [c["status"] for c in data["checks"]] == ["ran", "ran", "ran", "skipped:no-input"]
 
 
+def test_mesh_wide_policies_apply_from_the_root_namespace_that_is_passed(repo):
+    put(repo, "deploy.json", deployment("api", "shop"))
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+    put(repo, "mesh/pa.json", peer_auth("default", "mesh-root", "STRICT"))
+    put(repo, "mesh/authz.json", authz("deny-all", "mesh-root"))
+    rc, data = run(repo, "--root-namespace", "mesh-root")
+    assert [f["id"] for f in data["findings"] if f["id"].startswith(("AUTHZ", "MTLS"))] == []
+    rc, data = run(repo)  # the default root is istio-system, so mesh-root policies are namespace-only here
+    assert {"AUTHZ-NO-DEFAULT-DENY", "MTLS-COVERAGE-BELOW-TARGET"} <= set(ids(data))
+    rc, data = run(repo, "--root-namespace", "Bad_Name!")
+    assert rc == 2 and data["status"] == "error"
+
+
 def test_findings_name_the_file_of_the_resource(repo):
     put(repo, "deploy.json", deployment())
     put(repo, "netpol.json", netpol("default-deny", "shop"))

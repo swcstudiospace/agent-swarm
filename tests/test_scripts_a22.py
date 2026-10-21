@@ -574,6 +574,17 @@ def test_an_overlay_pin_does_not_hide_the_same_image_in_an_unrelated_kustomize_t
 
 
 @needs_yaml
+def test_an_unpinned_overlay_does_not_inherit_the_pin_of_another_overlay_that_renders_the_same_base(tmp_path):
+    put(tmp_path, "base/kustomization.yaml", "resources:\n  - d.yaml\n")
+    put(tmp_path, "base/d.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/acme/web:latest\n")
+    put(tmp_path, "overlays/prod/kustomization.yaml", "resources:\n  - ../../base\nimages:\n  - name: r.io/acme/web\n    newTag: 1.4.2\n")
+    put(tmp_path, "overlays/dev/kustomization.yaml", "resources:\n  - ../../base\n")
+    _, result = scan(tmp_path)
+    floating = [(f["id"], f["file"]) for f in result["findings"] if f["check"] == "images" and "latest" in f["id"]]
+    assert floating == [("images:floating-tag:r.io/acme/web:latest", "base/d.yaml")]
+
+
+@needs_yaml
 def test_a_pin_in_an_overlay_covers_the_images_of_the_components_it_includes(tmp_path):
     put(tmp_path, "comp/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\nresources:\n  - d.yaml\n")
     put(tmp_path, "comp/d.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n        - name: c\n          image: r.io/acme/web:latest\n")

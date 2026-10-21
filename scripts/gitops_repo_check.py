@@ -509,8 +509,7 @@ def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set, fields: tupl
 
 
 def _check_waves(repo: Repo, kusts: dict) -> None:
-    referenced = {child for directory, (_, kust) in kusts.items() for field in DIRECTORY_FIELDS for entry in _strings(kust.get(field))
-                  if not _remote(entry) and (child := _join(directory, entry)) in kusts and child != directory}
+    referenced = _referenced(kusts)
     units: list[tuple[str, list[str]]] = []
     covered: set[str] = set()
     for directory in sorted(kusts):
@@ -555,21 +554,57 @@ def _image_name(image: str) -> str:
     return name.rsplit(":", 1)[0] if ":" in name.rsplit("/", 1)[-1] else name
 
 
+def _referenced(kusts: dict) -> set[str]:
+    """Kustomization directories that another kustomization includes as a base, component or resource. The rest are roots, the overlays
+    a render starts from."""
+    return {child for directory, (_, kust) in kusts.items() for field in DIRECTORY_FIELDS for entry in _strings(kust.get(field))
+            if not _remote(entry) and (child := _join(directory, entry)) in kusts and child != directory}
+
+
+def _kust_pins(kust: dict) -> frozenset[str]:
+    """Image names that this kustomization's `images:` entries pin by digest or tag: the references its render rewrites."""
+    return frozenset(entry["name"] for entry in kust.get("images") or []
+                     if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                     and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float))))
+
+
+def _render_pins(repo: Repo, kusts: dict, root: str) -> dict[str, set[frozenset[str]]]:
+    """Each file the tree rooted at root renders, with the image names pinned along every path that renders it: the `images:` of each
+    kustomization from the root down to the file. A pin in one overlay therefore never reaches a base that another overlay renders."""
+    rendered: dict[str, set[frozenset[str]]] = {}
+    seen: set[tuple[str, frozenset[str]]] = set()
+
+    def walk(directory: str, inherited: frozenset[str]) -> None:
+        if (directory, inherited) in seen:
+            return
+        seen.add((directory, inherited))
+        rel, kust = kusts[directory]
+        pinned = inherited | _kust_pins(kust)
+        rendered.setdefault(rel, set()).add(pinned)
+        for field in DIRECTORY_FIELDS:
+            for entry in _strings(kust.get(field)):
+                target = None if _remote(entry) else _join(directory, entry)
+                if target in kusts:
+                    walk(target, pinned)
+                elif target in repo.docs:
+                    rendered.setdefault(target, set()).add(pinned)
+
+    walk(root, frozenset())
+    return rendered
+
+
 def _check_images(repo: Repo, kusts: dict) -> None:
     where: dict[str, list[str]] = {}
-    # per file: the image names of each Kustomize tree that renders it and re-tags or pins them (the base reference is rewritten at build time there)
-    pins_of: dict[str, list[set[str]]] = {}
-    for directory, (rel, kust) in sorted(kusts.items()):
-        pinned = {entry["name"] for entry in kust.get("images") or []
-                  if isinstance(entry, dict) and isinstance(entry.get("name"), str) and (isinstance(entry.get("digest"), str) or isinstance(entry.get("newTag"), (str, int, float)))}
-        for file in set(_tree_files(repo, kusts, directory, set(), ("resources", "bases", "components"))):
-            pins_of.setdefault(file, []).append(pinned)
+    renders = [_render_pins(repo, kusts, root) for root in sorted(set(kusts) - _referenced(kusts))]
     for rel in sorted(repo.docs):
         for doc in repo.docs[rel]:
             for image in _images(doc, [0]):
-                if any(_image_name(image) in pinned for pinned in pins_of.get(rel, [])):
-                    continue
-                where.setdefault(image, []).append(rel)
+                # judged on every render that includes the file: a file that an unpinned overlay renders floats there, whatever another overlay
+                # pins; a file no overlay renders is judged as it stands
+                pinned_renders = [pinned for render in renders for pinned in render.get(rel, ())]
+                name = _image_name(image)
+                if not pinned_renders or any(name not in pinned for pinned in pinned_renders):
+                    where.setdefault(image, []).append(rel)
     for directory, (rel, kust) in sorted(kusts.items()):
         for entry in kust.get("images") or []:
             if not isinstance(entry, dict):

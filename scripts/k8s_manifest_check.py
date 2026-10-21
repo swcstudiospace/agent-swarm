@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -132,12 +133,16 @@ def _alias_count(text: str, yaml_module) -> int:
 def _documents(path: Path, root: Path, yaml_module, counters: dict, reasons: list[str]):
     """Parsed documents of one file, or None when it was not analysed (the reason is recorded)."""
     label = _relative(path, root)
-    if not path.is_file():  # a FIFO or device named like a manifest would block the read
-        return _skip(counters, reasons, "unreadable", f"{label}: not a readable regular file")
-    try:
-        if path.stat().st_size > MAX_FILE_BYTES:
-            return _skip(counters, reasons, "too_large", f"{label}: larger than {MAX_FILE_BYTES} bytes")
-        data = path.read_bytes()
+    try:  # the type is checked on the open descriptor: a FIFO or device named like a manifest is refused before a read, and O_NONBLOCK
+        # makes the open of a FIFO with no writer return at once. A symlink is followed here as it was before.
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return _skip(counters, reasons, "unreadable", f"{label}: not a readable regular file")
+            if info.st_size > MAX_FILE_BYTES:
+                return _skip(counters, reasons, "too_large", f"{label}: larger than {MAX_FILE_BYTES} bytes")
+            data = handle.read()
     except OSError:
         return _skip(counters, reasons, "unreadable", f"{label}: not a readable regular file")
     if b"\x00" in data[:8192]:

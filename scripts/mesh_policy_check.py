@@ -19,6 +19,8 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
+import stat
 import sys
 from pathlib import Path
 
@@ -43,6 +45,7 @@ MAX_FINDINGS = 500
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".swarm", ".tox"}
 SUFFIXES = (".yaml", ".yml", ".json")
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
+ROOT_NAMESPACE_RE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 CHECKS = (
     ("netpol-default-deny", ("NetworkPolicy", "Deployment", "StatefulSet", "DaemonSet")),
@@ -155,18 +158,25 @@ def _load(root: Path, files: list[Path], yaml_module, labels) -> tuple[list[tupl
     for path in files:
         rel = path_label(_rel(root, path), next(labels))
         try:
-            if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the scan
-                stats["unparsable"] += 1
-                stats["reasons"].append(f"{rel}: not a regular file, not opened")
-                continue
-            if path.stat().st_size > MAX_FILE_BYTES:
-                stats["too_large"] += 1
-                stats["reasons"].append(f"{rel}: larger than {MAX_FILE_BYTES} bytes")
-                continue
-            raw = path.read_bytes()
+            # the type is checked on the open descriptor, not on the path: a FIFO swapped in after the walk is refused before a read.
+            # O_NONBLOCK makes the open of a FIFO with no writer return at once. A symlink is followed here as it was before.
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):  # named pipes, sockets and devices are never read: a read could block the scan
+                    stats["unparsable"] += 1
+                    stats["reasons"].append(f"{rel}: not a regular file, not opened")
+                    continue
+                if info.st_size > MAX_FILE_BYTES:
+                    stats["too_large"] += 1
+                    stats["reasons"].append(f"{rel}: larger than {MAX_FILE_BYTES} bytes")
+                    continue
+                raw = handle.read()
         except OSError:
             stats["unparsable"] += 1
-            stats["reasons"].append(f"{rel}: unreadable")
+            # a path that is not a regular file (directory, socket, missing) keeps its not-regular reason; any other failure is unreadable
+            reason = "unreadable" if path.is_file() else "not a regular file, not opened"
+            stats["reasons"].append(f"{rel}: {reason}")
             continue
         if b"\x00" in raw[:8192]:
             stats["binary"] += 1
@@ -250,7 +260,7 @@ def _sorted(findings: list[dict]) -> list[dict]:
     return sorted(findings, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["id"], f["summary"]))
 
 
-def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 100) -> dict:
+def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 100, root_namespace: str = a23_tools.DEFAULT_ROOT_NAMESPACE) -> dict:
     """Scan `start` (inside `root`) and return the result document. An input that was not analysed, or a check that could not be
     evaluated, makes the scan incomplete: its status is `fail` (swarm/scan_status.py)."""
     labels = itertools.count(1)  # one numbering for every redacted path, by position in the scan, so no two labels collide
@@ -284,10 +294,10 @@ def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 
         "netpol-default-deny": (bool(by_kind.get("NetworkPolicy") or workloads or by_kind.get("Namespace")), a23_tools.netpol_coverage,
                                 {"network_policies": by_kind.get("NetworkPolicy", []), "pods": workloads, "namespaces": namespaces}),
         "authz-default-deny": (mesh_in_use, a23_tools.authz_lint,
-                               {"policies": by_kind.get("AuthorizationPolicy", []), "namespaces": namespaces}),
+                               {"policies": by_kind.get("AuthorizationPolicy", []), "namespaces": namespaces, "root_namespace": root_namespace}),
         "mtls-coverage": (mesh_in_use and bool(workloads), a23_tools.mtls_coverage,
                           {"peer_authentications": by_kind.get("PeerAuthentication", []), "workloads": workloads,
-                           "min_strict_pct": min_strict_pct}),
+                           "min_strict_pct": min_strict_pct, "root_namespace": root_namespace}),
         "gateway-references": (bool(by_kind.get("Gateway") or by_kind.get("HTTPRoute")), a23_tools.gateway_api_check,
                                {"gateways": by_kind.get("Gateway", []), "routes": by_kind.get("HTTPRoute", []),
                                 "reference_grants": by_kind.get("ReferenceGrant", []),
@@ -371,6 +381,8 @@ def run(args, ctx) -> dict:
         }
     if not 0 <= args.min_strict_pct <= 100:
         raise SwarmError(ErrorCode.E_INPUT, "--min-strict-pct must be between 0 and 100")
+    if not ROOT_NAMESPACE_RE.fullmatch(args.root_namespace):
+        raise SwarmError(ErrorCode.E_INPUT, "--root-namespace must be a Kubernetes namespace name")
     target = (ctx.root / args.path).resolve()
     labels = itertools.count(1)  # one numbering for the redacted paths of this call, as scan numbers its own
     if not target.is_relative_to(ctx.root):
@@ -380,12 +392,14 @@ def run(args, ctx) -> dict:
         shown = path_label(args.path, next(labels))
         root = path_label(str(ctx.root), next(labels))  # the root is a path in this envelope too
         raise SwarmError(ErrorCode.E_INPUT, f"--path {shown!r} does not exist under {root}")
-    return scan(ctx.root, target, min_strict_pct=args.min_strict_pct)
+    return scan(ctx.root, target, min_strict_pct=args.min_strict_pct, root_namespace=args.root_namespace)
 
 
 def add_args(p) -> None:
     p.add_argument("--path", default=".", help="file or directory under --root to scan")
     p.add_argument("--min-strict-pct", type=float, default=100.0, help="required share of workloads under strict mTLS (default 100)")
+    p.add_argument("--root-namespace", default=a23_tools.DEFAULT_ROOT_NAMESPACE,
+                   help="Istio rootNamespace whose policies apply mesh-wide (default istio-system; set it to the mesh's rootNamespace)")
 
 
 if __name__ == "__main__":
