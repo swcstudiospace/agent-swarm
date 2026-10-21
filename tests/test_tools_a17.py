@@ -547,6 +547,19 @@ def test_claim_enum_rules():
     assert has(validate(numeric, [cl("n", "number", "3")]), "enum-violation", "blocker")
 
 
+def test_enum_candidate_beyond_the_decimal_range_is_skipped_not_a_crash():
+    schema = [fld("parameters.size", required=True), fld("parameters.n", "number", enum_values=["1e99999999999999999999", "2"])]
+    assert validate(schema, [cl("parameters.size", "string", "small"), cl("parameters.n", "number", "2")])["valid"] is True
+    assert has(validate(schema, [cl("parameters.size", "string", "small"), cl("parameters.n", "number", "3")]), "enum-violation", "blocker")
+
+
+def test_claim_number_exponent_beyond_the_decimal_range_is_invalid_input():
+    base = [cl("parameters.size", "string", "small")]
+    for value in ("1e99999999999999999999", "-1e99999999999999999999", "1e-99999999999999999999"):
+        result = invalid("plat_claim_validate", {"schema": SCHEMA, "claim": [*base, cl("parameters.ratio", "number", value)]}, "claim")
+        assert result["message"].endswith("value is outside the supported magnitude")
+
+
 @pytest.mark.parametrize("value, rule", [("1", None), ("0", "below-minimum"), ("5", None), ("6", "above-maximum")])
 def test_claim_integer_bounds_are_inclusive(value, rule):
     result = validate(SCHEMA, [cl("parameters.size", "string", "small"), cl("parameters.replicas", "integer", value)])
@@ -574,6 +587,24 @@ def test_claim_invalid_input():
     invalid("plat_claim_validate", {"schema": SCHEMA, "claim": [*base, *base]}, "claim")
     invalid("plat_claim_validate", {"schema": [fld("a"), fld("a")], "claim": []}, "schema")
     invalid("plat_claim_validate", {"schema": [fld("a", "number", minimum=3, maximum=2)], "claim": []}, "schema")
+
+
+def test_non_finite_numbers_are_invalid_input_never_a_value():
+    # the registry refuses NaN and infinity in its own top-level inputs; a handler called directly must refuse them too
+    handler = importlib.import_module("swarm.tools.a17_tools")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        for bounds in ({"minimum": bad}, {"maximum": bad}, {"minimum": bad, "maximum": 2}, {"min_length": bad}, {"max_length": bad}):
+            result = handler.claim_validate({"schema": [fld("n", "number", **bounds)], "claim": [cl("n", "number", "1")]})
+            assert result["state"] == "INVALID_INPUT" and result["field"] == "schema", result
+
+
+def test_non_finite_coverage_threshold_names_its_field_instead_of_crashing():
+    handler = importlib.import_module("swarm.tools.a17_tools")
+    with pytest.raises(handler._Bad) as raised:
+        handler._frac(float("nan"), "min_coverage_pct")
+    assert raised.value.field == "min_coverage_pct"
+    with pytest.raises(handler._Bad):
+        handler._frac("0.5", "min_coverage_pct")  # text is not a number either
 
 
 # --- plat_maturity_scorecard ----------------------------------------------------------------------------------
@@ -1137,6 +1168,13 @@ def test_deprecation_notice_window_by_stability(stability, days, short):
     announced = CHECKED - timedelta(days=10)
     result = deprecations(api(stability=stability, announced=announced, sunset=announced + timedelta(days=days), consumers=0))
     assert has(result, "window-too-short", "major", "catalog/v1") is short
+
+
+def test_beta_window_summary_names_the_nine_month_floor_and_the_unmodelled_release_arm():
+    announced = CHECKED - timedelta(days=10)
+    result = deprecations(api(stability="beta", announced=announced, sunset=announced + timedelta(days=273), consumers=0))
+    assert [f["summary"] for f in result["findings"]] == [
+        "notice window 273.0 days is below the 9-month floor of 274.0 days for beta APIs (the 3-release arm of Kubernetes rule 4a is not modelled)"]
 
 
 def test_deprecation_window_override_replaces_the_table():

@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 
 from swarm.tools.support import respond
@@ -119,8 +119,19 @@ def _guarded(work):
     return run
 
 
-def _frac(value) -> Fraction:
-    """Exact fraction of the number as written (shortest repr): 0.1 is 1/10, not its binary neighbour."""
+def _is_finite_number(value) -> bool:
+    """True when the value is a number Decimal reads as finite (NaN, infinity, booleans and text are not)."""
+    try:
+        return Decimal(repr(value)).is_finite()
+    except (InvalidOperation, ValueError):  # ValueError: an integer past Python's digit limit
+        return False
+
+
+def _frac(value, field: str) -> Fraction:
+    """Exact fraction of the number as written (shortest repr): 0.1 is 1/10, not its binary neighbour. A non-finite or
+    non-numeric value is INVALID_INPUT naming `field`, never a value."""
+    if not _is_finite_number(value):
+        raise _Bad(field, f"{field} is not a finite number")
     return Fraction(Decimal(repr(value)))
 
 
@@ -440,7 +451,10 @@ def _schema_fields(items: list[dict], field: str) -> dict[str, dict]:
             raise _Bad(field, f"{field}: path {_ident(path, 200)} must be dot-separated non-blank segments")
         if path in out:
             raise _Bad(field, f"{field}: duplicate path {_ident(path, 200)}")
-        if "minimum" in item and "maximum" in item and _frac(item["minimum"]) > _frac(item["maximum"]):
+        for key in ("minimum", "maximum", "min_length", "max_length"):
+            if key in item and not _is_finite_number(item[key]):
+                raise _Bad(field, f"{field}: {_ident(path, 200)} {key} is not a finite number")
+        if "minimum" in item and "maximum" in item and _frac(item["minimum"], "minimum") > _frac(item["maximum"], "maximum"):
             raise _Bad(field, f"{field}: {_ident(path, 200)} minimum exceeds maximum")
         if "min_length" in item and "max_length" in item and item["min_length"] > item["max_length"]:
             raise _Bad(field, f"{field}: {_ident(path, 200)} min_length exceeds max_length")
@@ -462,7 +476,7 @@ def _limit_change(found: list[dict], stem: str, path: str, old, new, upper: bool
     elif new is None:
         found.append(_finding(f"{stem}-removed", path, "info", f"{stem.replace('-', ' ')} {old} was removed"))
     else:
-        before, after = _frac(old), _frac(new)
+        before, after = _frac(old, stem), _frac(new, stem)
         if before == after:
             return
         tighter = after < before if upper else after > before
@@ -559,6 +573,14 @@ def composition_diff(payload: dict) -> dict:
 # =============================================================================================================
 
 
+def _decimal(text: str) -> Decimal | None:
+    """The exact Decimal of numeric text, or None when its exponent is outside the Decimal range (the value is then out of range)."""
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
+
 def _claim_number(item: dict, index: int) -> Decimal | None:
     """The numeric reading of a claim value, or None for non-numeric types. Out-of-range or malformed text is INVALID_INPUT."""
     text = item["value"]
@@ -570,8 +592,8 @@ def _claim_number(item: dict, index: int) -> Decimal | None:
     if kind == "number":
         if not _NUMERIC_TEXT.fullmatch(text):
             raise _Bad("claim", f"claim[{index}] {_ident(item['path'], 200)}: value ({len(text)} chars) is not a number")
-        number = Decimal(text)
-        if number.adjusted() > 100 or number.adjusted() < -100:
+        number = _decimal(text)
+        if number is None or number.adjusted() > 100 or number.adjusted() < -100:
             raise _Bad("claim", f"claim[{index}] {_ident(item['path'], 200)}: value is outside the supported magnitude")
         return number
     if kind == "boolean" and item["value"] not in ("true", "false"):
@@ -583,7 +605,8 @@ def _enum_hit(value: str, number: Decimal | None, allowed: list[str]) -> bool:
     if number is None:
         return value in allowed
     for candidate in allowed:
-        if _NUMERIC_TEXT.fullmatch(candidate) and Decimal(candidate) == number:
+        # a candidate beyond the Decimal range can never equal a supported claim number (those are bounded), so it never matches
+        if _NUMERIC_TEXT.fullmatch(candidate) and _decimal(candidate) == number:
             return True
     return False
 
@@ -660,7 +683,7 @@ def maturity_scorecard(payload: dict) -> dict:
     """Cumulative maturity level (none, bronze, silver, gold) per service from ownership, SLO, runbook, on-call, tests, security."""
 
     def work() -> dict:
-        minimum = _frac(payload.get("min_coverage_pct", DEFAULT_MIN_COVERAGE_PCT))
+        minimum = _frac(payload.get("min_coverage_pct", DEFAULT_MIN_COVERAGE_PCT), "min_coverage_pct")
         required = dict(DEFAULT_REQUIRED_LEVELS)
         override = payload.get("required_levels")
         if override is not None:
@@ -675,7 +698,7 @@ def maturity_scorecard(payload: dict) -> dict:
                 raise _Bad("services", f"services: name {_ident(name)} is blank or duplicated")
             seen.add(name)
             name = _label(name, f"services[{position}]")
-            coverage_ok = _frac(service["test_coverage_pct"]) >= minimum
+            coverage_ok = _frac(service["test_coverage_pct"], "test_coverage_pct") >= minimum
             tiers = (
                 (("owner", service["has_owner"]), ("runbook", service["has_runbook"])),
                 (("slo", service["has_slo"]), ("on-call", service["has_on_call"]), ("test-coverage", coverage_ok)),
@@ -1013,9 +1036,9 @@ def ephemeral_env_policy(payload: dict) -> dict:
 
     def work() -> dict:
         checked = _ts(payload["checked_at"], "checked_at", "checked_at")
-        max_ttl = _frac(payload["max_ttl_hours"])
-        idle_limit = _frac(payload["idle_after_hours"])
-        max_cost = _frac(payload["max_cost_usd"])
+        max_ttl = _frac(payload["max_ttl_hours"], "max_ttl_hours")
+        idle_limit = _frac(payload["idle_after_hours"], "idle_after_hours")
+        max_cost = _frac(payload["max_cost_usd"], "max_cost_usd")
         found: list[dict] = []
         reclaim: set[str] = set()
         seen: set[str] = set()
@@ -1039,9 +1062,9 @@ def ephemeral_env_policy(payload: dict) -> dict:
                     raise _Bad("environments", f"environments[{index}]: last_active_at must lie between created_at and checked_at")
                 idle_us = _micro(last, checked)
             age_h = Fraction(age_us, HOUR_US)
-            ttl = _frac(env["ttl_hours"])
+            ttl = _frac(env["ttl_hours"], "ttl_hours")
             effective = min(ttl, max_ttl) if ttl > 0 else max_ttl
-            hourly = _frac(env["hourly_cost_usd"])
+            hourly = _frac(env["hourly_cost_usd"], "hourly_cost_usd")
             accrued, projected = hourly * age_h, hourly * effective
             accrued_total += accrued
             projected_total += projected
@@ -1065,7 +1088,7 @@ def ephemeral_env_policy(payload: dict) -> dict:
             if not _s(env.get("owner")):
                 found.append(_finding("owner-missing", name, "minor", "no owner to notify before reclaim"))
         total_budget = payload.get("total_budget_usd")
-        if total_budget is not None and accrued_total > _frac(total_budget):
+        if total_budget is not None and accrued_total > _frac(total_budget, "total_budget_usd"):
             found.append(_finding("total-budget-exceeded", "", "major", f"accrued {_r(accrued_total, 2)} USD exceeds the total budget {total_budget} USD"))
         findings, total = _finish(found)
         return {
@@ -1094,15 +1117,15 @@ def quota_fit(payload: dict) -> dict:
     """Do the teams' quotas fit capacity (after platform reserve and overcommit)? Also flags over-quota, hot and idle teams."""
 
     def work() -> dict:
-        reserve = _frac(payload.get("reserve_pct", 0))
-        overcommit = _frac(payload.get("overcommit_ratio", 1))
+        reserve = _frac(payload.get("reserve_pct", 0), "reserve_pct")
+        overcommit = _frac(payload.get("overcommit_ratio", 1), "overcommit_ratio")
         capacity: dict[str, Fraction] = {}
         labels: dict[str, str] = {}
         for position, item in enumerate(payload["capacity"]):
             resource = _s(item["resource"])
             if not resource or resource in capacity:
                 raise _Bad("capacity", f"capacity: resource {_ident(resource)} is blank or duplicated")
-            capacity[resource] = _frac(item["total"])
+            capacity[resource] = _frac(item["total"], "total")
             labels[resource] = _label(resource, f"capacity[{position}]")
         grants: dict[tuple[str, str], tuple[Fraction, Fraction]] = {}
         for position, item in enumerate(payload["allocations"]):
@@ -1111,7 +1134,7 @@ def quota_fit(payload: dict) -> dict:
                 raise _Bad("allocations", f"allocations[{position}]: team is blank or resource is blank or has no capacity entry")
             if (team, resource) in grants:
                 raise _Bad("allocations", f"allocations[{position}]: team and resource are listed twice")
-            grants[(team, resource)] = (_frac(item["quota"]), _frac(item["used"]))
+            grants[(team, resource)] = (_frac(item["quota"], "quota"), _frac(item["used"], "used"))
         found: list[dict] = []
         rows: list[dict] = []
         oversubscribed = over_quota = 0
@@ -1221,7 +1244,7 @@ def golden_path_coverage(payload: dict) -> dict:
         count = len(seen)
         on_path = count - off_path
         coverage = Fraction(on_path, count)
-        meets = coverage >= _frac(payload["target_ratio"])
+        meets = coverage >= _frac(payload["target_ratio"], "target_ratio")
         if not meets:
             found.append(_finding("coverage-below-target", "", "major", f"coverage {_r(coverage)} is below the target {payload['target_ratio']}"))
         findings, total = _finish(found)
@@ -1296,7 +1319,13 @@ def api_deprecation(payload: dict) -> dict:
                 window = Fraction(_micro(announced, sunset), DAY_US)
                 needed = Fraction(override) if override is not None else Fraction(DEPRECATION_WINDOW_DAYS[api["stability"]])
                 if window < needed:
-                    emit("window-too-short", "major", f"notice window {_r(window, 2)} days is below {_r(needed, 2)} days for {api['stability']} APIs")
+                    if override is not None:
+                        floor = f"the min_window_days override of {_r(needed, 2)} days"
+                    elif api["stability"] == "beta":
+                        floor = f"the 9-month floor of {_r(needed, 2)} days for beta APIs (the 3-release arm of Kubernetes rule 4a is not modelled)"
+                    else:
+                        floor = f"{_r(needed, 2)} days for {api['stability']} APIs"
+                    emit("window-too-short", "major", f"notice window {_r(window, 2)} days is below {floor}")
             if checked >= sunset:
                 past += 1
                 if consumers > 0:
@@ -1371,7 +1400,7 @@ def request_guardrails(payload: dict) -> dict:
             elif order.index(size) > order.index(auto):
                 approval.append(_finding("size-needs-approval", rid, "minor", f"size {_ident(size)} is above the auto-approved size {_ident(auto)}"))
             for key, rule in caps:
-                if _frac(request[key]) > _frac(limits[key]):
+                if _frac(request[key], key) > _frac(limits[key], key):
                     denied.append(_finding(rule, rid, "major", f"{key} {request[key]} is above the cap {limits[key]}"))
             if request["environment"] == "prod" and request["replicas"] < payload["min_prod_replicas"]:
                 denied.append(_finding("replicas-below-prod-minimum", rid, "major", f"{request['replicas']} replica(s) in prod, minimum {payload['min_prod_replicas']}"))

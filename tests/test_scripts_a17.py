@@ -175,13 +175,16 @@ def test_descriptor_file_names(tmp_path, repo, name):
 def test_other_file_names_are_not_descriptors(tmp_path, repo, name):
     (repo / name).write_text(json.dumps(descriptor(spec__owner=None)), encoding="utf-8")
     code, report = run_script(tmp_path)
-    assert code == 0 and report["scanned_files"] == 0 and ids(report) == ["no-descriptors"]
-    assert report["findings"][0]["severity"] == "info"
+    assert code == 1 and report["status"] == "fail" and report["scanned_files"] == 0
+    assert ids(report) == ["scan/incomplete", "no-descriptors"]  # no descriptor is an empty scan: incomplete, never clean
+    assert [f["severity"] for f in report["findings"]] == ["major", "info"]
 
 
-def test_empty_repository_reports_no_descriptors_as_info(tmp_path, repo):
+def test_empty_repository_fails_closed_with_no_descriptors_info(tmp_path, repo):
     code, report = run_script(tmp_path)
-    assert code == 0 and report["status"] == "ok" and ids(report) == ["no-descriptors"]
+    assert code == 1 and report["status"] == "fail" and report["scanned_files"] == 0
+    assert ids(report) == ["scan/incomplete", "no-descriptors"]
+    assert "no in-scope input was analysed" in report["findings"][0]["summary"]
 
 
 def test_tier_from_label_or_annotation_and_tiers_option(tmp_path, repo):
@@ -264,11 +267,21 @@ def test_dependson_rules_from_the_lint_apply_to_flattened_descriptors(tmp_path, 
     assert {(f["id"].split("@")[0], f["severity"]) for f in report["findings"]} >= {("dependson-self", "major"), ("dependson-invalid", "major"), ("dependson-duplicate", "minor")}
 
 
-def test_graph_check_is_skipped_beyond_300_entities(tmp_path, repo):
+def test_graph_check_skipped_beyond_300_entities_is_incomplete_not_ok(tmp_path, repo):
     write_json(repo, "catalog-info.json", [descriptor(f"svc-{i}") for i in range(301)])
     code, report = run_script(tmp_path)
-    assert code == 0 and report["entity_count"] == 301
+    assert code == 1 and report["status"] == "fail" and report["entity_count"] == 301
     assert [(f["id"], f["severity"]) for f in by_rule(report, "graph-skipped")] == [("graph-skipped", "info")]
+    assert ids(report).count("scan/incomplete") == 1
+
+
+def test_a_live_cycle_beyond_the_graph_bound_fails_closed(tmp_path, repo):
+    a, b = descriptor("svc-a"), descriptor("svc-b")
+    a["spec"]["dependsOn"], b["spec"]["dependsOn"] = ["component:default/svc-b"], ["component:default/svc-a"]
+    write_json(repo, "catalog-info.json", [a, b, *[descriptor(f"svc-{i}") for i in range(300)]])
+    code, report = run_script(tmp_path)
+    assert code == 1 and report["status"] == "fail" and report["entity_count"] == 302
+    assert not by_rule(report, "dependency-cycle") and "scan/incomplete" in ids(report)
 
 
 # --- --path ------------------------------------------------------------------------------------------------------
@@ -313,7 +326,7 @@ def test_oversized_binary_and_ignored_directories_are_skipped(tmp_path, repo):
     write_json(repo, "node_modules/pkg/catalog-info.json", descriptor("ignored", spec__owner=None))
     write_json(repo, ".git/catalog-info.json", descriptor("ignored-too", spec__owner=None))
     code, report = run_script(tmp_path)
-    assert code == 0
+    assert code == 1 and report["status"] == "fail" and "scan/incomplete" in ids(report)
     assert report["skipped"] == ["skipped:binary:bin/catalog-info.json", "skipped:binary:latin/catalog-info.json", "skipped:too-large:big/catalog-info.json"]
     assert (report["scanned_files"], report["entity_count"]) == (1, 1) and not by_rule(report, "owner-missing")
 
@@ -327,7 +340,7 @@ def test_symlinks_leaving_the_root_are_not_followed(tmp_path, repo):
     write_json(repo, "real/catalog-info.json", descriptor("inside"))
     (repo / "inner-link.json").symlink_to(repo / "real" / "catalog-info.json")
     code, report = run_script(tmp_path)
-    assert code == 0 and report["skipped"] == ["skipped:symlink-outside-root:catalog-info.json"]
+    assert code == 1 and report["status"] == "fail" and report["skipped"] == ["skipped:symlink-outside-root:catalog-info.json"]
     assert (report["scanned_files"], report["entity_count"]) == (1, 1)
     code, report = run_script(tmp_path, "--path", "linked-dir")
     assert code == 2 and report["error"]["code"] == "E-INPUT"
@@ -339,7 +352,7 @@ def test_scan_stops_at_2000_descriptors(tmp_path, repo):
     code, report = run_script(tmp_path)
     assert (report["scanned_files"], report["truncated"]) == (2000, True)
     assert [(f["id"], f["severity"]) for f in by_rule(report, "scan-truncated")] == [("scan-truncated", "minor")]
-    assert report["entity_count"] == 2000 and code == 0
+    assert report["entity_count"] == 2000 and code == 1 and report["status"] == "fail" and "scan/incomplete" in ids(report)
 
 
 def test_findings_list_is_cut_but_finding_count_is_the_total(tmp_path, repo):
@@ -446,7 +459,7 @@ def test_skipped_list_is_bounded_and_the_summary_counts_skips(tmp_path, repo):
         path.parent.mkdir()
         path.write_bytes(b"\x00\x01")
     code, report = run_script(tmp_path)
-    assert code == 0 and len(report["skipped"]) == 101 and report["skipped"][-1] == "skipped:more:50"
+    assert code == 1 and len(report["skipped"]) == 101 and report["skipped"][-1] == "skipped:more:50" and "scan/incomplete" in ids(report)
     assert "150 skipped" in report["summary"]
 
 
@@ -503,6 +516,36 @@ def test_fifo_named_like_a_descriptor_is_skipped_and_the_valid_file_is_still_lin
                           env=env, check=False, timeout=60)
     assert "Traceback" not in done.stderr, done.stderr
     report = json.loads(done.stdout)
-    assert done.returncode == 0 and report["status"] == "ok"
+    assert done.returncode == 1 and report["status"] == "fail" and "scan/incomplete" in ids(report)  # an unreadable descriptor is not analysed
     assert report["scanned_files"] == 1 and report["entity_count"] == 1
     assert report["skipped"] == ["skipped:unreadable:c/catalog-info.yaml: NotRegularFile"]
+
+
+@needs_yaml
+def test_non_string_annotation_key_does_not_abort_the_scan(tmp_path, repo):
+    (repo / "web").mkdir()
+    (repo / "web" / "catalog-info.yaml").write_text(
+        "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: web\n  annotations:\n    1: numeric-key\n"
+        "    backstage.io/techdocs-ref: dir:.\nspec:\n  type: service\n  lifecycle: production\n  owner: group:default/g\n  system: s\n",
+        encoding="utf-8",
+    )
+    write_json(repo, "api/catalog-info.json", descriptor("api-svc"))
+    code, report = run_script(tmp_path)
+    assert code == 1 and (report["scanned_files"], report["entity_count"]) == (2, 2)
+    assert [f["location"] for f in by_rule(report, "tier-missing")] == ["web/catalog-info.yaml"]
+
+
+@pytest.mark.parametrize("depends", ["component:default/billing", ["component:default/billing", 7]])
+def test_depends_on_that_is_not_a_list_of_references_is_a_major_finding(tmp_path, repo, depends):
+    doc = descriptor()
+    doc["spec"]["dependsOn"] = depends
+    write_json(repo, "catalog-info.json", doc)
+    code, report = run_script(tmp_path)
+    assert code == 1 and [(f["severity"], f["location"]) for f in by_rule(report, "dependson-invalid")] == [("major", "catalog-info.json")]
+
+
+def test_descriptor_names_match_in_any_letter_case(tmp_path, repo):
+    write_json(repo, "upper/catalog-info.YAML", descriptor("up-svc", spec__owner=None))
+    code, report = run_script(tmp_path)
+    assert code == 1 and report["scanned_files"] == 1
+    assert [f["location"] for f in by_rule(report, "owner-missing")] == ["upper/catalog-info.YAML"]

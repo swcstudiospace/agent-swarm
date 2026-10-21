@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """A17 - lint service-catalog descriptors (catalog-info.yaml or JSON) in a repository for owner, lifecycle, system, tier, dependsOn and docs annotations.
 
-Scans catalog-info.{yaml,yml,json} (also catalog-info.<name>.yaml) under --root (or the file/directory given by --path), flattens
+Scans catalog-info.{yaml,yml,json} (also catalog-info.<name>.yaml, in any letter case) under --root (or the file/directory given by --path), flattens
 every Backstage-style entity and applies the same rules as the registry tool plat_catalog_lint (swarm/tools/a17_tools.py), plus a
 repository-wide dependsOn graph check (cycles, dangling targets, deprecated or experimental dependencies) and an apiVersion check.
 Bounded: files over 1 MiB, binaries and symlinks that leave the root are skipped and listed under `skipped` (at most 100 entries, then
-a `skipped:more:<n>` marker); at most 2000 descriptors are read. YAML needs PyYAML: without it a YAML file that is not also valid
-JSON is reported as `skipped:tool-missing`, and JSON descriptors are always handled natively; a skipped file was NOT linted, so
-read `skipped` and the summary before treating `status: ok` as a clean catalog.
+a `skipped:more:<n>` marker); at most 2000 descriptors are read and the dependsOn graph check covers at most 300 entities. YAML needs
+PyYAML: without it a YAML file that is not also valid JSON is reported as `skipped:tool-missing`; JSON descriptors are always handled natively.
+Every skipped file, a truncated scan, a skipped graph check and an empty scan (no descriptor analysed) add a major `scan-incomplete`
+finding, so `status` is `fail` until every in-scope input is analysed (the shared rule in swarm/scan_status.py).
 Read-only: it reads files under --root and writes nothing. Stdlib only; problems are findings (severity info|minor|major|blocker,
 status "fail" when any major or blocker exists) and it never crashes on malformed input. Findings never echo descriptor values:
 annotation values (except a `tier` annotation, compared and not echoed) and link URLs are not read, and parse errors report only the
@@ -25,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a17_tools  # noqa: E402
 
@@ -34,7 +36,7 @@ MAX_VISITED = 100_000
 MAX_SKIPPED = 100
 MAX_GRAPH_ENTRIES = 300
 SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".swarm", "target", "vendor"})
-DESCRIPTOR_NAME = re.compile(r"catalog-info(\.[A-Za-z0-9_-]+)?\.(ya?ml|json)")
+DESCRIPTOR_NAME = re.compile(r"catalog-info(\.[A-Za-z0-9_-]+)?\.(ya?ml|json)", re.IGNORECASE)
 API_VERSION_PREFIXES = ("backstage.io/", "scaffolder.backstage.io/")
 GRAPH_RULES = ("dependency-cycle", "self-dependency", "dangling-dependency", "deprecated-dependency", "experimental-dependency")
 DEFAULT_TIERS = ",".join(a17_tools.DEFAULT_TIERS)
@@ -136,8 +138,8 @@ def _tier(metadata: dict, annotations: dict) -> str:
     labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
     if _text(labels.get("tier")):
         return _text(labels["tier"])
-    for key in sorted(annotations):
-        if isinstance(key, str) and key.rsplit("/", 1)[-1] == "tier" and _text(annotations[key]):
+    for key in sorted(k for k in annotations if isinstance(k, str)):
+        if key.rsplit("/", 1)[-1] == "tier" and _text(annotations[key]):
             return _text(annotations[key])
     return ""
 
@@ -177,6 +179,7 @@ def _finding(rule: str, subject: str, severity: str, summary: str, location: str
 
 def lint_tree(root: Path, target: Path, tiers: tuple[str, ...]) -> dict:
     skipped: list[str] = []
+    incomplete_reasons: list[str] = []
     files, truncated = _discover(target)
     yaml_module = _yaml_module()
     findings: list[dict] = []
@@ -213,6 +216,10 @@ def lint_tree(root: Path, target: Path, tiers: tuple[str, ...]) -> dict:
             elif not api_version.startswith(API_VERSION_PREFIXES):
                 findings.append(_finding("apiversion-unknown", subject, "minor", "apiVersion is not a Backstage catalog apiVersion (backstage.io/... or scaffolder.backstage.io/...)", location))
             entry = _flatten(doc)
+            spec = doc.get("spec")
+            depends = spec.get("dependsOn") if isinstance(spec, dict) else None
+            if depends is not None and not (isinstance(depends, list) and all(isinstance(item, str) for item in depends)):
+                findings.append(_finding("dependson-invalid", subject, "major", "dependsOn must be a list of entity references: a value that is not a reference string is not checked", location))
             entries.append(entry)
             where.append(location)
             ref = a17_tools._parse_ref(f"{entry['kind']}:{entry['namespace'] or 'default'}/{entry['name']}", "component")
@@ -221,20 +228,27 @@ def lint_tree(root: Path, target: Path, tiers: tuple[str, ...]) -> dict:
     for index, finding in a17_tools._lint_entries(entries, tiers):
         findings.append({**finding, "location": where[index]})
     if entries and len(entries) <= MAX_GRAPH_ENTRIES:
-        findings.extend(_graph_findings(entries, refs))
+        graph, graph_reason = _graph_findings(entries, refs)
+        findings.extend(graph)
+        if graph_reason:
+            incomplete_reasons.append(graph_reason)
     elif len(entries) > MAX_GRAPH_ENTRIES:
         findings.append(_finding("graph-skipped", "", "info", f"dependency graph check skipped: {len(entries)} entities exceed {MAX_GRAPH_ENTRIES}", "."))
+        incomplete_reasons.append(f"dependency graph check skipped: {len(entries)} entities exceed {MAX_GRAPH_ENTRIES}")
     if truncated:
         findings.append(_finding("scan-truncated", "", "minor", f"scan stopped at the bound ({MAX_DESCRIPTORS} descriptors or {MAX_VISITED} files)", "."))
+        incomplete_reasons.append(f"scan stopped at the bound ({MAX_DESCRIPTORS} descriptors or {MAX_VISITED} files)")
     if not files:
         findings.append(_finding("no-descriptors", "", "info", "no catalog-info descriptor found", "."))
+    for incomplete in incomplete_findings([*skipped, *incomplete_reasons], scanned):
+        findings.append({**incomplete, "summary": incomplete["summary"][: a17_tools.MAX_SUMMARY], "location": "."})
     findings.sort(key=lambda f: (a17_tools.SEVERITY_RANK[f["severity"]], f["location"], f["id"], f["summary"]))
     blocking = sum(1 for f in findings if f["severity"] in ("blocker", "major"))
     listed = sorted(skipped)
     if len(listed) > MAX_SKIPPED:
         listed = [*listed[:MAX_SKIPPED], f"skipped:more:{len(listed) - MAX_SKIPPED}"]
     return {
-        "status": "fail" if blocking else "ok",
+        "status": scan_status(findings),
         "scanned_files": scanned,
         "entity_count": len(entries),
         "finding_count": len(findings),
@@ -245,8 +259,8 @@ def lint_tree(root: Path, target: Path, tiers: tuple[str, ...]) -> dict:
     }
 
 
-def _graph_findings(entries: list[dict], refs: dict[str, str]) -> list[dict]:
-    """Cross-file dependsOn findings from the tool's graph analysis, on entities whose references are well-formed."""
+def _graph_findings(entries: list[dict], refs: dict[str, str]) -> tuple[list[dict], str | None]:
+    """Cross-file dependsOn findings from the tool's graph analysis, on entities whose references are well-formed. A graph the tool did not complete is a reason, never a silent clean result."""
     graph_entries = []
     for entry in entries:
         parsed = a17_tools._parse_ref(f"{entry['kind']}:{entry['namespace'] or 'default'}/{entry['name']}", "component")
@@ -259,13 +273,13 @@ def _graph_findings(entries: list[dict], refs: dict[str, str]) -> list[dict]:
         unique.setdefault(g["ref"], g)  # duplicates are reported by the lint rules; the first definition wins here
     result = a17_tools.catalog_graph({"entries": list(unique.values())})
     if result.get("state") != "SUCCESS":
-        return []
+        return [], f"dependency graph check did not complete: {result.get('state')}"
     out = []
     for f in result["findings"]:
         rule, _, subject = f["id"].partition("@")
         if rule in GRAPH_RULES:
             out.append({**f, "location": refs.get(subject, ".")})
-    return out
+    return out, None
 
 
 def run(args, ctx) -> dict:
