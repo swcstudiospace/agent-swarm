@@ -370,6 +370,17 @@ def test_unparseable_manifests_are_incomplete_reasons_and_fail_the_scan(tmp_path
     assert "cloud.manifest-unparseable" not in [f["id"] for f in result["findings"]]
 
 
+def test_a_yaml_manifest_nested_past_the_parser_limit_is_unparseable_and_the_good_file_is_still_judged(tmp_path):
+    pytest.importorskip("yaml")
+    write(tmp_path, "k8s/deep.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: deep}\nspec: {junk: " + "[" * 600 + "]" * 600 + "}\n")
+    write(tmp_path, "k8s/good.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: bare}\nspec: {replicas: 1, template: {spec: {containers: [{name: c}]}}}\n")
+    result = scan(tmp_path)
+    assert result["status"] == "fail" and result["signals"]["kubernetes_workloads"] == 1
+    summary = next(f for f in result["findings"] if f["id"] == "scan/incomplete")["summary"]
+    assert "skipped:unparseable-manifest: k8s/deep.yaml" in summary
+    assert ("cloud.k8s-probes-missing", "major", "k8s/good.yaml") in brief(result)
+
+
 # --- bounds -----------------------------------------------------------------------------------------------------
 
 

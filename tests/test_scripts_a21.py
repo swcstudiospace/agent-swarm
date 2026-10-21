@@ -136,6 +136,34 @@ def test_a_limit_without_a_request_counts_as_the_request_because_kubernetes_copi
         ("missing-request/Deployment/c/app/memory", "major", "cpu-only.json")]
 
 
+def test_a_limit_only_container_under_init_containers_or_a_cronjob_is_not_flagged(tmp_path):
+    limits = {"resources": {"limits": {"cpu": "500m", "memory": "256Mi"}}}
+    init = deployment("init")
+    init["spec"]["template"]["spec"] = {"initContainers": [{"name": "init", "image": "x", **limits}], "containers": [{"name": "app", "image": "x", **limits}]}
+    put(tmp_path, "init.json", init)
+    put(tmp_path, "cron.json", {"apiVersion": "batch/v1", "kind": "CronJob", "metadata": {"name": "nightly"},
+                                "spec": {"schedule": "0 3 * * *", "jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "job", "image": "x", **limits}]}}}}}})
+    code, result = scan(tmp_path, "--target-version", "1.30")
+    assert code == 0 and result["manifests_scanned"] == 2 and result["findings"] == []
+
+
+def test_an_unlistable_directory_is_an_incomplete_scan_not_ok(tmp_path, monkeypatch, capsys):
+    put(tmp_path, "ok/web.json", deployment("web", FULL_RESOURCES))
+    put(tmp_path, "locked/bad.json", deployment("bad"))
+    listed = os.scandir
+
+    def refuse(path="."):
+        if os.path.basename(os.fspath(path)) == "locked":
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return listed(path)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    code, result = run_in_process(load_module(), tmp_path, capsys, "--target-version", "1.30")
+    assert code == 1 and result["status"] == "fail"
+    assert [f["id"] for f in result["findings"]] == ["scan/incomplete"]
+    assert "locked: directory could not be listed" in result["findings"][0]["summary"]
+
+
 def test_empty_quantities_count_as_missing_and_partial_resources_report_only_the_gap(tmp_path):
     put(tmp_path, "d.json", deployment("d", {"requests": {"cpu": "100m", "memory": ""}, "limits": {"cpu": "200m", "memory": "128Mi"}}))
     _, result = scan(tmp_path, "--target-version", "1.30")

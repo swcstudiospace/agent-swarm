@@ -618,6 +618,75 @@ def test_a_base_reached_by_many_resource_paths_is_rendered_once_and_still_judged
     assert [(f["id"], f["file"]) for f in result["findings"] if f["check"] == "images"] == [("images:floating-tag:r.io/leaf:latest", "leaf/deploy.yaml")]
 
 
+def _kustomization(resources: list[str]) -> str:
+    if not resources:
+        return "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources: []\n"
+    return "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n" + "".join(f"- {entry}\n" for entry in resources)
+
+
+CONFIGMAP_DUP = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: dup\n  namespace: shop\n"
+
+
+@needs_yaml
+def test_a_render_cut_at_the_depth_limit_is_an_incomplete_result_not_ok(tmp_path):
+    """A duplicate that sits deeper than RENDER_DEPTH cannot be seen: the scan says so and never reports ok."""
+    for i in range(22):
+        resources = ([f"../k{i + 1:02d}"] if i < 21 else []) + (["cm.yaml"] if i in (0, 21) else [])
+        put(tmp_path, f"k{i:02d}/kustomization.yaml", _kustomization(resources))
+        if i in (0, 21):
+            put(tmp_path, f"k{i:02d}/cm.yaml", CONFIGMAP_DUP)
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and "scan/incomplete" in ids(result)
+    assert any("render stops 20 levels below a root" in f["summary"] for f in result["findings"])
+
+
+@needs_yaml
+def test_a_render_cut_at_the_depth_limit_is_not_reused_as_the_complete_render_of_a_shorter_path(tmp_path):
+    """X is first reached 20 levels down, where its own render is cut. R1 renders X one level down and must still see the duplicate under X."""
+    for i in range(20):
+        put(tmp_path, f"L{i:02d}/kustomization.yaml", _kustomization([f"../L{i + 1:02d}"] if i < 19 else ["../X"]))
+    put(tmp_path, "X/kustomization.yaml", _kustomization(["../Y"]))
+    put(tmp_path, "Y/kustomization.yaml", _kustomization(["cm.yaml"]))
+    put(tmp_path, "Y/cm.yaml", CONFIGMAP_DUP)
+    put(tmp_path, "R1/kustomization.yaml", _kustomization(["../X", "cm.yaml"]))
+    put(tmp_path, "R1/cm.yaml", CONFIGMAP_DUP)
+    _, result = scan(tmp_path)
+    assert ("kustomize:duplicate-resource:ConfigMap/shop/dup", "blocker", "R1/kustomization.yaml") in found(result)
+
+
+@needs_yaml
+def test_a_chain_longer_than_the_recursion_limit_is_reported_not_a_crash(tmp_path):
+    for i in range(1100):
+        put(tmp_path, f"k{i:04d}/kustomization.yaml", _kustomization([f"../k{i + 1:04d}"] if i < 1099 else []))
+    code, result = scan(tmp_path)
+    assert code == 1 and result["status"] == "fail" and "scan/incomplete" in ids(result)
+
+
+@needs_yaml
+def test_an_unlistable_directory_is_an_incomplete_scan_not_ok(tmp_path, monkeypatch, capsys):
+    put(tmp_path, "ok/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n"
+                                    "        - name: c\n          image: r.io/acme/web@sha256:" + "a" * 64 + "\n")
+    put(tmp_path, "ok/kustomization.yaml", _kustomization(["deploy.yaml"]))
+    put(tmp_path, "locked/deploy.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: bad\nspec:\n  template:\n    spec:\n      containers:\n"
+                                        "        - name: c\n          image: r.io/acme/web:latest\n")
+    listed = os.scandir
+
+    def refuse(path="."):
+        if os.path.basename(os.fspath(path)) == "locked":
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return listed(path)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    spec = importlib.util.spec_from_file_location("gitops_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    code = module.AgentScript("A22", "gitops_repo_check", module.run, description=module.__doc__, add_args=module.add_args).main(
+        ["--root", str(tmp_path), "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert code == 1 and result["status"] == "fail"
+    assert [f["summary"] for f in result["findings"] if f["id"] == "scan/incomplete" and "locked: directory could not be listed" in f["summary"]]
+
+
 
 @needs_yaml
 def test_a_pin_in_an_overlay_covers_the_images_of_the_components_it_includes(tmp_path):

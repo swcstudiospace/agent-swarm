@@ -93,6 +93,8 @@ class Repo:
         self.examined = 0
         self.findings: list[dict] = []
         self.reasons: list[str] = []  # one label and path per in-scope input or check that was not analysed; never a value
+        self.depth_cut: set[str] = set()  # the render-depth reasons already recorded, one per cut
+        self.cuts = 0  # render cuts seen so far; a render that contains one is memoised by depth, not by name
 
     def add(self, check: str, file: str, fid: str, severity: str, summary: str) -> None:
         scrub = rules._scrub  # findings never quote a credential-shaped value
@@ -150,7 +152,12 @@ def _parse(text: str, name: str, yaml_mod):
 
 def _scan(repo: Repo, base: Path, yaml_mod) -> None:
     done = False
-    for current, dirnames, filenames in os.walk(base, followlinks=False):
+
+    def unlistable(error: OSError) -> None:  # a directory that cannot be listed is never read: a reason, never a silent pass
+        label = os.path.relpath(error.filename or base, repo.real_root)
+        repo.reasons.append(f"{label}: directory could not be listed ({type(error).__name__}); its files were not scanned")
+
+    for current, dirnames, filenames in os.walk(base, followlinks=False, onerror=unlistable):
         kept = []
         for name in sorted(dirnames):
             if name in SKIP_DIRS:
@@ -334,19 +341,25 @@ def _check_references(repo: Repo, kusts: dict) -> dict[str, list[str]]:
                          f"{rel}: file {entry} is outside the kustomization directory; kustomize refuses it unless run with --load-restrictor LoadRestrictionsNone")
     state: dict[str, int] = {}
 
-    def visit(node: str, trail: list[str]) -> None:
-        state[node] = 1
-        for child in edges.get(node, []):
-            if state.get(child) == 1:
+    def visit(root: str) -> None:  # iterative depth-first walk: a long chain of kustomizations must not exhaust the recursion limit
+        state[root] = 1
+        stack = [(root, iter(edges.get(root, [])), [root])]
+        while stack:
+            node, children, trail = stack[-1]
+            child = next(children, None)
+            if child is None:
+                state[node] = 2
+                stack.pop()
+            elif state.get(child) == 1:
                 cycle = " -> ".join(trail[trail.index(child):] + [child])
                 repo.add("kustomize", kusts[node][0], f"cycle:{child}", "blocker", f"kustomization cycle: {cycle}")
             elif child not in state:
-                visit(child, trail + [child])
-        state[node] = 2
+                state[child] = 1
+                stack.append((child, iter(edges.get(child, [])), trail + [child]))
 
     for directory in sorted(edges):
         if directory not in state:
-            visit(directory, [directory])
+            visit(directory)
     return edges
 
 
@@ -368,13 +381,29 @@ def _minimal(doc: dict, name: str | None = None, namespace: str | None = None) -
 
 
 
+def _depth_cut(repo: Repo, rel: str, child_rel: str) -> None:
+    """Records that the render of rel stops RENDER_DEPTH levels down, before child_rel: the objects below that point are not checked, so the
+    scan cannot report ok. Reported once per cut."""
+    repo.cuts += 1
+    reason = f"{rel}: kustomize render stops {RENDER_DEPTH} levels below a root, so {child_rel} and the objects it renders were not checked"
+    if reason not in repo.depth_cut:
+        repo.depth_cut.add(reason)
+        repo.reasons.append(reason)
+
+
 def _items_of(repo: Repo, kusts: dict, directory: str, memo: dict, active: frozenset = frozenset()) -> list[dict]:
     """Objects this kustomization renders before its own patches; children arrive transformed by their prefix, suffix and namespace.
-    A kustomization that several paths reach is rendered once and memoised, so the work is linear in the graph however many paths lead
-    through it. At most ITEM_LIMIT + 1 objects are kept per kustomization. active holds the kustomizations on the current path: a cycle
-    is cut where it closes."""
+    A render that reaches no RENDER_DEPTH cut is the same on every path, so it is memoised by name, as is each kustomization that several paths
+    reach; a render that was cut depends on the depth it was reached at and is memoised by (name, depth). At most ITEM_LIMIT + 1 objects are
+    kept per kustomization. active holds the kustomizations on the current path: a cycle is cut where it closes, and a child beyond
+    RENDER_DEPTH is not rendered and is recorded as an incomplete result (_depth_cut)."""
     if directory in memo:
         return memo[directory]
+    key = (directory, len(active))
+    if key in memo:
+        repo.cuts += 1  # a cut render reused: the render that contains it is cut too
+        return memo[key]
+    before = repo.cuts
     rel, kust = kusts[directory]
     path = active | {directory}
     items: list[dict] = []
@@ -396,6 +425,8 @@ def _items_of(repo: Repo, kusts: dict, directory: str, memo: dict, active: froze
                     changes = bool((renamed and named and (prefix or suffix)) or (namespace and not cluster))
                     new_name = (prefix + real + suffix if renamed else real) if named else None
                     items.append(_minimal(item, new_name, namespace if namespace and not cluster else None) if changes else item)
+            elif target in kusts and target not in path:  # the render is cut here: the child is not part of this render
+                _depth_cut(repo, rel, kusts[target][0])
             elif target in repo.docs:
                 for doc in repo.docs[target]:
                     if len(items) > ITEM_LIMIT:
@@ -408,7 +439,7 @@ def _items_of(repo: Repo, kusts: dict, directory: str, memo: dict, active: froze
                 namespace = generator.get("namespace")
                 items.append({"apiVersion": "v1", "kind": kind, "metadata": {"name": generator["name"], **({"namespace": namespace} if isinstance(namespace, str) and namespace else {})}})
     del items[ITEM_LIMIT + 1:]
-    memo[directory] = items
+    memo[key if repo.cuts != before else directory] = items
     return items
 
 
@@ -446,11 +477,16 @@ def _inline_patches(repo: Repo, directory: str, kust: dict) -> dict:
     return inlined
 
 
-def _opaque(kusts: dict, directory: str, memo: dict, active: frozenset = frozenset()) -> bool:
-    """Whether the tree under a kustomization renders objects that are not in the scanned files. Each kustomization is judged once (memo),
-    and a cycle is cut on the current path as in _items_of."""
+def _opaque(repo: Repo, kusts: dict, directory: str, memo: dict, active: frozenset = frozenset()) -> bool:
+    """Whether the tree under a kustomization renders objects that are not in the scanned files. Memoised like _items_of. A cycle is cut on
+    the current path; a child beyond RENDER_DEPTH is not seen, so the tree counts as opaque."""
     if directory in memo:
         return memo[directory]
+    key = (directory, len(active))
+    if key in memo:
+        repo.cuts += 1
+        return memo[key]
+    before = repo.cuts
     _, kust = kusts[directory]
     result = bool(kust.get("components") or kust.get("helmCharts") or kust.get("generators") or kust.get("transformers"))
     path = active | {directory}
@@ -462,8 +498,12 @@ def _opaque(kusts: dict, directory: str, memo: dict, active: frozenset = frozens
                 result = True
                 continue
             child = _join(directory, entry)
-            result = child in kusts and child not in path and len(active) < RENDER_DEPTH and _opaque(kusts, child, memo, path)
-    memo[directory] = result
+            if child in kusts and child not in path and len(active) >= RENDER_DEPTH:
+                repo.cuts += 1  # beyond the render depth the objects are unseen, so a patch target is unproven rather than missing
+                result = True
+            else:
+                result = child in kusts and child not in path and _opaque(repo, kusts, child, memo, path)
+    memo[key if repo.cuts != before else directory] = result
     return result
 
 
@@ -478,7 +518,7 @@ def _check_kustomize(repo: Repo) -> dict[str, tuple[str, dict]]:
         if len(every) > ITEM_LIMIT:
             repo.reasons.append(f"{rel}: kustomize checked the first {ITEM_LIMIT} of more than {ITEM_LIMIT} rendered objects for duplicate ids and patch targets")
         result = rules.kustomize_check({"kustomization": _inline_patches(repo, directory, kust), "resources": items})
-        if result.get("state") == "SUCCESS" and _opaque(kusts, directory, opaque):
+        if result.get("state") == "SUCCESS" and _opaque(repo, kusts, directory, opaque):
             # remote bases, components, Helm charts and generators add objects this scan cannot see: a patch target that matches none of the visible ones is unproven, not missing
             hidden = [f for f in result["findings"] if f["id"].startswith("patch-target-not-found")]
             if hidden:
@@ -516,19 +556,29 @@ def _check_apps(repo: Repo) -> None:
 
 
 def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set, fields: tuple = ("resources", "bases")) -> list[str]:
-    """Files whose objects belong to the Kustomize tree rooted at directory."""
+    """Files whose objects belong to the Kustomize tree rooted at directory, in the order a depth-first walk meets them. Iterative, so a long
+    chain of kustomizations cannot exhaust the interpreter's recursion limit."""
     if directory in seen:
         return []
-    seen.add(directory)
-    rel, kust = kusts[directory]
-    files = [rel]
-    for field in fields:
-        for entry in _strings(kust.get(field)):
-            target = None if _remote(entry) else _join(directory, entry)
-            if target in kusts:
-                files += _tree_files(repo, kusts, target, seen, fields)
-            elif target in repo.docs:
-                files.append(target)
+    files: list[str] = []
+    end = object()
+
+    def enter(node: str):
+        seen.add(node)
+        files.append(kusts[node][0])
+        kust = kusts[node][1]
+        return iter([None if _remote(entry) else _join(node, entry) for field in fields for entry in _strings(kust.get(field))])
+
+    stack = [(directory, enter(directory))]
+    while stack:
+        target = next(stack[-1][1], end)
+        if target is end:
+            stack.pop()
+        elif target in kusts:
+            if target not in seen:
+                stack.append((target, enter(target)))
+        elif target in repo.docs:
+            files.append(target)
     return files
 
 

@@ -301,7 +301,7 @@ def _k8s_docs(text: str, suffix: str) -> tuple[list[dict], list[tuple[str, str]]
             loaded = [json.loads(text)]
         else:
             loaded = list(yaml.safe_load_all(text))
-    except (ValueError, yaml.YAMLError if yaml else ValueError):
+    except (ValueError, RecursionError, yaml.YAMLError if yaml else ValueError):  # a document nested past the parser's limit is unparseable, not a scan abort
         return None
     docs: list[dict] = []
     odd: list[tuple[str, str]] = []

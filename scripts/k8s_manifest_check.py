@@ -100,7 +100,11 @@ def _candidates(base: Path, root: Path, counters: dict, reasons: list[str]) -> l
     if base.is_file():
         return [base] if _manifest_name(base.name) else []
     found: list[Path] = []
-    for current, dirs, files in os.walk(base, followlinks=False):
+
+    def unlistable(error: OSError) -> None:  # a directory that cannot be listed is never read: a reason, never a silent pass
+        reasons.append(f"{_relative(Path(error.filename or base), root)}: directory could not be listed ({type(error).__name__}); its manifests were not scanned")
+
+    for current, dirs, files in os.walk(base, followlinks=False, onerror=unlistable):
         kept = []
         for d in sorted(dirs):
             if d in SKIP_DIRS:

@@ -426,6 +426,28 @@ def test_fifo_named_like_a_json_descriptor_is_skipped_and_the_valid_file_is_stil
     assert result["scanned"]["cloudevents"] == 1 and result["scanned"]["skipped_binary"] == 1
 
 
+def test_an_unlistable_directory_fails_the_scan_by_name_and_the_readable_file_is_still_checked(repo, monkeypatch, capsys):
+    put(repo, "ok/asyncapi.json", ASYNCAPI)
+    put(repo, "locked/asyncapi.json", {**ASYNCAPI, "info": {}})
+    listed = os.scandir
+
+    def refuse(path="."):
+        if os.path.basename(os.fspath(path)) == "locked":
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return listed(path)
+
+    module = load_module()
+    monkeypatch.setenv("SWARM_DIR", str(repo.parent / "state"))
+    monkeypatch.setattr(os, "scandir", refuse)
+    script = module.AgentScript("A19", "event_schema_check", module.run, add_args=module.add_args)
+    code = script.main(["--json", "--root", str(repo)])
+    result = json.loads(capsys.readouterr().out)
+    assert code == 1 and result["status"] == "fail"
+    incomplete = next(f for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert incomplete["severity"] == "major" and "locked: directory could not be listed (PermissionError)" in incomplete["summary"]
+    assert result["scanned"]["asyncapi"] == 1  # the readable file was checked
+
+
 # --- QA-03 regressions ----------------------------------------------------------------------------------------------
 
 

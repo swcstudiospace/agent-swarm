@@ -111,7 +111,11 @@ def _rel(root: Path, path: Path) -> str:
 def _walk(root: Path, start: Path, stats: dict, reasons: list):
     """Candidate files under `start` in sorted order, bounded by MAX_FILES visited files. Symlinks are never followed; each
     skipped symlink and a stopped scan is a reason."""
-    for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
+
+    def unlistable(error: OSError) -> None:  # a directory that cannot be listed is never read: a reason, never a silent pass
+        reasons.append(f"{_rel(root, Path(error.filename or start))}: directory could not be listed ({type(error).__name__}); its files were not scanned")
+
+    for dirpath, dirnames, filenames in os.walk(start, followlinks=False, onerror=unlistable):
         keep = []
         for name in sorted(dirnames):
             if name in SKIP_DIRS:
