@@ -405,22 +405,35 @@ _ROLE_WORDS = r"(?:admin|owner|operator|minter|authori[sz]ed|whitelist|allow|rol
 ENTRY_KINDS = ("function", "fallback", "receive")  # externally callable entry points: a fallback or receive can write state too
 
 
+_TYPE_SPELLING = {"uint": "uint256", "int": "int256", "byte": "bytes1"}  # spellings that solc equates in a signature
+_TYPE_SPELLING_RE = re.compile(r"\b(uint|int|byte)\b")
+
+
+def _hiding_key(fn: dict) -> tuple:
+    """What a definition hides in the bases it overrides: a function by its name and parameter types (an overload with other types is
+    still inherited, and `uint` is `uint256`), a modifier by its name (Solidity has no modifier overloads)."""
+    if fn["kind"] == "modifier":
+        return ("modifier", fn["name"])
+    return ("function", fn["name"], tuple(_TYPE_SPELLING_RE.sub(lambda m: _TYPE_SPELLING[m.group(1)], t) for t, _ in fn["params"]))
+
+
 def visible_index(contract: dict, contracts: list[dict]) -> dict[str, list[dict]]:
     """Functions and modifiers `contract` can call or apply: its own and those of its bases defined in this source, the most
-    derived first. A name defined by a more derived contract hides the base's, and a same-named callable of an unrelated
-    contract is never visible: a guard belongs to the contract that defines it."""
+    derived first. A definition hides only the base definitions it overrides (see _hiding_key), so an inherited overload the child
+    does not redefine stays callable; a same-named callable of an unrelated contract is never visible: a guard belongs to the
+    contract that defines it."""
     by_name: dict[str, dict] = {}
     for c in contracts:
         by_name.setdefault(c["name"], c)
     index: dict[str, list[dict]] = {}
-    hidden: set[str] = set()
+    hidden: set[tuple] = set()
     queue, seen = [contract], {id(contract)}
     for current in queue:  # the list grows while it is walked: a breadth-first walk up the bases
         own = [fn for fn in current["functions"] if fn["kind"] in ("function", "modifier")]
         for fn in own:
-            if fn["name"] not in hidden:
+            if _hiding_key(fn) not in hidden:
                 index.setdefault(fn["name"], []).append(fn)
-        hidden.update(fn["name"] for fn in own)
+        hidden.update(_hiding_key(fn) for fn in own)
         for base in current["bases"]:
             parent = by_name.get(base)
             if parent is not None and id(parent) not in seen:
@@ -1402,6 +1415,7 @@ class _CallSites:
                 self.brace_close[stack.pop()] = m.start()
         self.opens = sorted(self.brace_close)
         self.lowlevel = [m.start() for m in _LOW_LEVEL.finditer(clean)]
+        self._verdicts: dict[int, bool] | None = None
 
     def _expression_braces(self) -> set[int]:
         """The '{' and '}' offsets that sit inside a matched parenthesis: part of an expression such as the struct literal in
@@ -1498,26 +1512,46 @@ class _CallSites:
                     return True  # `if (ok) ... else revert ...`: the else-branch is the failure path
         return False
 
-    def _flag_checked(self, flag: str, start: int, limit: int) -> bool:
-        """The first read of `flag` after `start`, before `limit` (the end of its scope), before any reassignment or redeclaration of
-        the name and before the next low-level call, is a check. A value overwritten by a later call, or read only outside its scope,
-        checks nothing (D-A)."""
+    def _is_tuple_target(self, p: int) -> bool:
+        """Whether the name at `p` is a slot of a tuple assignment target, `(x, name) = ...`: the nearest '(' around it, in its
+        statement, closes before an assignment operator (a comparison does not count)."""
         clean = self.clean
-        k = bisect.bisect_right(self.lowlevel, start)
-        stop = min(limit, self.lowlevel[k] if k < len(self.lowlevel) else len(clean))
-        m = _name_pattern(flag).search(clean, start, stop)
-        if m is None:
-            return False
-        p = m.start()
-        if _ASSIGN_AFTER.match(clean, m.end()) or _DECL_BEFORE.search(clean, max(0, p - 64), p):
-            return False  # the name is overwritten or redeclared before it is read
-        return self._is_check_read(flag, p)
+        i = bisect.bisect_left(self.seps, p)
+        s = self.seps[i - 1] + 1 if i else 0
+        depth = 0
+        for j in range(p - 1, s - 1, -1):
+            if clean[j] == ")":
+                depth += 1
+            elif clean[j] == "(":
+                if depth:
+                    depth -= 1
+                    continue
+                close = self.paren.get(j)
+                return close is not None and close > p and _ASSIGN_AFTER.match(clean, close + 1) is not None
+        return False
 
-    def checked(self, pos: int) -> bool:
-        """The result of the call at `pos` is tested when, within its statement before the call, a require, assert, if or return
-        appears, or the call sits in the condition of an if, for or while, or its success flag is bound and its next read in the
-        scope is a check (see _flag_checked). A bare body (`if (c) a.call(...)`) is not a test: the leading control heads of the
-        statement are skipped first."""
+    def _first_check(self, flag: str, start: int, limit: int) -> int | None:
+        """Offset of the first read of `flag` after `start`, before `limit` (the end of its scope), that checks the call. A read that
+        only stores, logs or tests something else is passed over (`emit E(ok); require(ok);` checks the call). None when the name is
+        reassigned or redeclared before any check reads it, or when the scope holds no check (D-A)."""
+        clean = self.clean
+        pattern = _name_pattern(flag)
+        at = start
+        while (m := pattern.search(clean, at, limit)) is not None:
+            p = m.start()
+            if _ASSIGN_AFTER.match(clean, m.end()) or self._is_tuple_target(p) or _DECL_BEFORE.search(clean, max(0, p - 64), p):
+                return None  # the name is overwritten or redeclared before a check reads it
+            if self._is_check_read(flag, p):
+                return p
+            at = m.end()
+        return None
+
+    def _judged(self, pos: int, nearest_unchecked: int | None) -> bool:
+        """Whether the low-level call at `pos` is tested: within its statement before the call, a require, assert, if or return
+        appears, or the call sits in the condition of an if, for or while; or its success flag is bound and a check of that flag
+        (see _first_check) comes before `nearest_unchecked`, the earliest unchecked low-level call after `pos`. A check after an
+        unchecked call does not count for the earlier call. A bare body (`if (c) a.call(...)`) is not a test: the leading control
+        heads of the statement are skipped first."""
         clean = self.clean
         i = bisect.bisect_left(self.seps, pos)
         s = self.seps[i - 1] + 1 if i else 0
@@ -1536,8 +1570,27 @@ class _CallSites:
         if j >= 0 and self.assigns[j] >= s:
             lhs = clean[max(s, self.assigns[j] - _BINDING_CAP):self.assigns[j]]
             limit = self._scope_close(pos)
-            return any(self._flag_checked(flag, pos + 1, limit) for flag in _bound_flags(lhs))
+            for flag in _bound_flags(lhs):
+                p = self._first_check(flag, pos + 1, limit)
+                if p is not None and (nearest_unchecked is None or nearest_unchecked > p):
+                    return True
         return False
+
+    def verdicts(self) -> dict[int, bool]:
+        """Whether each low-level call is checked, keyed by its offset. Calls are judged last to first, so a later call's verdict is
+        known when an earlier one is judged: a check of a call's flag counts only when no unchecked low-level call lies between the
+        call and that check. Independent calls that are each checked by a later test are all checked; a flag checked only after a
+        later call that is itself unchecked is not (D-A)."""
+        if self._verdicts is None:
+            verdict: dict[int, bool] = {}
+            nearest: int | None = None  # the earliest unchecked call judged so far, which lies after the calls still to judge
+            for pos in reversed(self.lowlevel):
+                verdict[pos] = self._judged(pos, nearest)
+                if not verdict[pos]:
+                    nearest = pos
+            self._verdicts = verdict
+        return self._verdicts
+
 
 
 _ASM_DELEGATECALL = re.compile(r"(?<![\w$.])delegatecall\s*\(")  # inline assembly: `delegatecall(gas(), target, ...)`
@@ -1562,10 +1615,26 @@ def _compared_with_principal(clean: str, start: int, end: int) -> bool:
     return bool(before and _is_principal(before.group(1)))
 
 
-def _origin_is_authorization(clean: str, origin: re.Match, positions: dict[str, list[int]], compared: dict[str, bool]) -> bool:
+def _alias_scope(function_at, name: str, pos: int) -> tuple[int, int] | None:
+    """The source span in which the local `name` that holds tx.origin at `pos` is visible: from its declaration to the end of its
+    block. None when `name` is no local of the function around `pos` (a state variable or an unknown name): every use counts."""
+    fn = function_at(pos)
+    if fn is None:
+        return None
+    lo = fn["body_span"][0]
+    spans = [(d, e) for d, e in _scoped_locals(fn).get(name, ()) if d < pos - lo < e]
+    if not spans:
+        return None
+    d, e = max(spans)  # the innermost declaration that holds `pos`
+    return lo + d, lo + e
+
+
+def _origin_is_authorization(clean: str, origin: re.Match, positions: dict[str, list[int]], compared: dict[str, list[int]],
+                             function_at) -> bool:
     """tx.origin compared with a principal, directly or through a local name that holds it (`address o = tx.origin;` then
-    `require(o == owner)`). `positions` is the one-pass index of identifier offsets and `compared` caches each name's verdict,
-    so a name is searched once and not once per tx.origin read."""
+    `require(o == owner)`). Only the uses of that name inside its scope count: a same-named variable of another function is a
+    different variable. `positions` is the one-pass index of identifier offsets; `compared` caches, per name, the sorted offsets of
+    its uses that are compared with a principal, so each name's uses are judged once and each scope is one binary search."""
     if _compared_with_principal(clean, origin.start(), origin.end()):
         return True
     assigned = re.search(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*$", clean[max(0, origin.start() - 64):origin.start()])
@@ -1573,8 +1642,13 @@ def _origin_is_authorization(clean: str, origin: re.Match, positions: dict[str, 
         return False
     name = assigned.group(1)
     if name not in compared:
-        compared[name] = any(_compared_with_principal(clean, use, use + len(name)) for use in positions.get(name, ()))
-    return compared[name]
+        compared[name] = sorted(use for use in positions.get(name, ()) if _compared_with_principal(clean, use, use + len(name)))
+    hits = compared[name]
+    scope = _alias_scope(function_at, name, origin.start())
+    if scope is None:
+        return bool(hits)
+    i = bisect.bisect_right(hits, scope[0])  # the first compared use after the declaration
+    return i < len(hits) and hits[i] < scope[1]
 
 
 _BINDING_CAP = 256  # characters before the `=` of a call's binding that are read for the bound flag: a longer target is cut short
@@ -1593,19 +1667,43 @@ def _name_pattern(name: str) -> re.Pattern:
     return pattern
 
 
+def _slots(text: str) -> list[str]:
+    """The top-level comma slots of a tuple target, empty slots kept: `(, data)` has no success slot in front."""
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for c in text:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    parts.append("".join(cur))
+    return parts
+
+
 def _bound_flags(lhs: str) -> list[str]:
-    """The success flags a low-level call's binding names: `bool ok` in `(bool ok, ) =`, or the bare name in `ok =`."""
+    """The success flags a low-level call's binding names: `bool ok` in `(bool ok, ) =`, the first slot of a tuple otherwise (`ok`
+    in `(ok, data) =` for a variable declared earlier: a low-level call returns its success first), or the bare name in `ok =`.
+    An empty first slot names no flag."""
     lhs = lhs.strip()
-    if lhs.startswith("(") and lhs.endswith(")"):
+    tuple_form = lhs.startswith("(") and lhs.endswith(")")
+    if tuple_form:
         lhs = lhs[1:-1]
-    parts = split_top(lhs)
     flags: list[str] = []
-    for part in parts:
+    for i, part in enumerate(_slots(lhs)):
+        part = part.strip()
         tokens = re.findall(_IDENT, part)
         if len(tokens) >= 2 and tokens[0] == "bool":
             flags.append(tokens[-1])
-    if not flags and len(parts) == 1 and re.fullmatch(_IDENT, parts[0]):
-        flags.append(parts[0])
+        elif tuple_form and i == 0 and len(tokens) == 1 and re.fullmatch(_IDENT, part):
+            flags.append(part)
+    if not tuple_form and not flags and re.fullmatch(_IDENT, lhs.strip()):
+        flags.append(lhs.strip())
     return flags
 
 
@@ -1667,19 +1765,19 @@ def lint_source(rel: str, raw: str) -> list[dict]:
             continue
         for f in review["findings"]:
             add("SOL-" + f["id"], f["severity"], f["summary"], start)
+    contracts = parse_source(raw)
+    function_at = _function_lookup(contracts)
     origins = list(_ORIGIN.finditer(clean))
     positions = _identifier_positions(clean) if origins else {}
-    compared: dict[str, bool] = {}  # a name's uses are judged once, however many tx.origin reads it holds
+    compared: dict[str, list[int]] = {}  # per name: the offsets of its uses compared with a principal, judged once
     for m in origins:
-        authz = _origin_is_authorization(clean, m, positions, compared)
+        authz = _origin_is_authorization(clean, m, positions, compared, function_at)
         add("SOL-TX-ORIGIN", "major" if authz else "minor",
             "tx.origin used in an authorization comparison (phishable through any contract the user calls; use msg.sender)"
             if authz else "tx.origin read: never use it for authorization", m.start())
     for m in re.finditer(r"\b(selfdestruct|suicide)\s*\(", clean):
         add("SOL-SELFDESTRUCT", "major", "selfdestruct: deprecated, since EIP-6780 (Cancun) it only deletes code in the creating "
             "transaction, and it breaks proxy implementations", m.start())
-    contracts = parse_source(raw)
-    function_at = _function_lookup(contracts)
     exposed: set[int] | None = None  # computed on the first delegatecall only: most sources have none and guard analysis is not free
 
     def delegatecall(pos: int) -> None:
@@ -1694,10 +1792,11 @@ def lint_source(rel: str, raw: str) -> list[dict]:
             pos)
 
     sites = _CallSites(clean)
+    verdict = sites.verdicts()
     for m in _LOW_LEVEL.finditer(clean):
         if m.group(1) == "delegatecall":
             delegatecall(m.start())
-        if not sites.checked(m.start()):
+        if not verdict[m.start()]:
             add("SOL-UNCHECKED-LOW-LEVEL-CALL", "major",
                 f".{m.group(1)}(...) result is discarded: a failed call goes unnoticed (check the returned bool)", m.start())
     for m in _ASM_DELEGATECALL.finditer(clean):
@@ -1778,8 +1877,26 @@ def _collect(root: Path, start: Path) -> tuple[list[tuple[str, str]], dict, list
 
 
 _OPENER = {")": "(", "]": "[", "}": "{"}
-# a visibility-bearing function, or a modifier, constructor, receive or fallback, at file level: no contract body holds it
-_TOP_LEVEL_DECL = re.compile(r"\bfunction\b[^;{]*?\b(?:external|public|internal|private)\b|\b(?:modifier|constructor|receive|fallback)\s*\(")
+# a function at file level with a visibility keyword outside its own parameter list (a function-type parameter such as
+# `function() external` has its own), or a modifier, constructor, receive or fallback keyword: no contract body holds it
+_TOP_LEVEL_FUNCTION = re.compile(r"\bfunction\b[^;{]*?\b(?:external|public|internal|private)\b")
+_TOP_LEVEL_OTHER = re.compile(r"\b(?:modifier|constructor|receive|fallback)\s*\(")
+
+
+def _outside_parens(text: str) -> str:
+    """`text` with every parenthesised span blanked to spaces (length kept): the header words outside any parameter list."""
+    out: list[str] = []
+    depth = 0
+    for c in text:
+        if c == "(":
+            depth += 1
+            out.append(" ")
+        elif c == ")":
+            depth = max(depth - 1, 0)
+            out.append(" ")
+        else:
+            out.append(" " if depth else c)
+    return "".join(out)
 
 
 def source_problems(raw: str) -> list[str]:
@@ -1809,7 +1926,8 @@ def source_problems(raw: str) -> list[str]:
         last = m.end()
     if depth == 0:
         top.append(clean[last:])
-    if _TOP_LEVEL_DECL.search(" ".join(top)):
+    joined = " ".join(top)
+    if _TOP_LEVEL_FUNCTION.search(_outside_parens(joined)) or _TOP_LEVEL_OTHER.search(joined):
         problems.append("a function, modifier, constructor, receive or fallback outside any contract body")
     return problems
 

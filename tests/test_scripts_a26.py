@@ -775,3 +775,50 @@ def test_a_brace_inside_call_arguments_is_an_expression_not_a_block(branch, flag
     snippet = f"    function f(address t) external {{ (bool ok, ) = t.call(\"\"); {branch} }}"
     rules = [rule for rule, _, _ in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
     assert bool(rules) is flagged
+
+
+# --- review follow-ups: valid code the lint must not fail on, and checks it must not credit ---
+
+
+@pytest.mark.parametrize("snippet, flagged", [
+    # a success flag declared earlier and bound by a tuple assignment is checked; an empty first slot names no flag
+    ("    function f(address t) external { bool ok; bytes memory d; (ok, d) = t.call(\"\"); require(ok); }", False),
+    ("    function f(address t) external { bytes memory d; (, d) = t.call(\"\"); require(d.length > 0); }", True),
+    # a read that only logs the flag is passed over; the next read that tests it is the check
+    ("    function f(address t) external { (bool ok, ) = t.call(\"\"); emit E(); require(ok); }", False),
+    ("    function f(address a, address b) external { (bool ok1, ) = a.call(\"\"); (bool ok2, ) = b.call(\"\"); "
+     "require(ok2); require(ok1); }", False),
+    # a flag overwritten by a later call, as a plain assignment or as a tuple slot, is never checked
+    ("    function f(address a, address b) external { (bool ok, ) = a.call(\"\"); (ok, ) = b.call(\"\"); require(ok); }", True),
+])
+def test_a_success_flag_is_checked_by_a_later_test_and_never_after_an_overwrite(snippet, flagged):
+    rules = [rule for rule, _, _ in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert bool(rules) is flagged
+
+
+BASE_WITH_EMITTING_OVERLOAD = ("pragma solidity 0.8.28;\ncontract Base {\n    event Logged(address who);\n"
+                               "    function _log(address who) internal { emit Logged(who); }\n}\n")
+
+
+@pytest.mark.parametrize("override, emits", [
+    ("function _log(uint256 v) internal { x = v; }", True),  # another overload: the base's emitting _log(address) stays callable
+    ("function _log(address who) internal { x = 2; }", False),  # the same signature overrides the base, which is hidden
+])
+def test_an_inherited_overload_stays_callable_and_only_an_override_hides_its_base(override, emits):
+    text = BASE_WITH_EMITTING_OVERLOAD + ("contract Child is Base {\n    uint256 public x;\n    " + override + "\n"
+                                          "    function run(address a) external { x = 1; _log(a); }\n}\n")
+    missing = [rule for rule, _, _ in findings(text) if rule == "SOL-MISSING-EVENT"]
+    assert bool(missing) is (not emits)
+
+
+def test_a_function_type_parameter_is_not_a_visibility_of_a_free_function():
+    assert load_module().source_problems("pragma solidity 0.8.28;\nfunction invoke(function() external callback) { callback(); }\n") == []
+    assert load_module().source_problems("pragma solidity 0.8.28;\nfunction bad() external { }\n") != []
+
+
+def test_a_tx_origin_alias_is_judged_only_within_the_scope_that_declares_it():
+    other = body("    function peek() external view returns (address) { address who = tx.origin; return who; }\n"
+                 "    function set(address who) external { require(who == owner); }")
+    assert [sev for rule, sev, _ in findings(other) if rule == "SOL-TX-ORIGIN"] == ["minor"]
+    same = body("    function auth() external view { address o = tx.origin; require(o == owner); }")
+    assert [sev for rule, sev, _ in findings(same) if rule == "SOL-TX-ORIGIN"] == ["major"]
