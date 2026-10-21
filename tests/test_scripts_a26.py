@@ -851,3 +851,50 @@ def test_a_check_inside_a_conditional_for_condition_does_not_guard_the_write_aft
     result = access_matrix({"source": text, "contract": "C"})
     assert result["verdict"] == "fail" and result["unprotected"] == 1 and result["guarded"] == 0
     assert [f["id"] for f in result["findings"]] == ["ACCESS-UNPROTECTED-PRIVILEGED"]
+
+
+@pytest.mark.parametrize("stmts, flagged", [
+    # a check in an `if` the call does not sit in is skipped on the path where the condition is false
+    ('(bool ok, ) = t.call("");\n        if (check) { require(ok); }', True),
+    ('(bool ok, ) = t.call("");\n        if (check) require(ok);', True),
+    ('(bool ok, ) = t.call("");\n        for (uint i; i < 2; i++) { require(ok); }', True),
+    # a return between the call and the check skips the check on that path
+    ('(bool ok, ) = t.call("");\n        if (check) return;\n        require(ok);', True),
+    # a check every path reaches, and a call inside the same `if` as its check, stay checked
+    ('(bool ok, ) = t.call("");\n        require(ok);', False),
+    ('if (check) {\n            (bool ok, ) = t.call("");\n            require(ok);\n        }', False),
+    ('(bool ok, ) = t.call("");\n        emit E(ok);\n        require(ok);', False),
+    ('(bool ok, ) = t.call("");\n        if (!ok) revert();', False),
+])
+def test_a_check_counts_only_on_every_path_that_continues_after_the_call(stmts, flagged):  # round 4, Greptile 4339466024
+    snippet = f"    function f(address t, bool check) external {{\n        {stmts}\n    }}"
+    rules = [rule for rule, _, _ in findings(body(snippet)) if rule == "SOL-UNCHECKED-LOW-LEVEL-CALL"]
+    assert bool(rules) is flagged
+
+
+def test_a_disabled_modifier_check_does_not_guard_on_a_sender_mention():  # round 4, Greptile 4339219956
+    text = ("pragma solidity 0.8.28;\ncontract C {\n    address owner;\n    uint256 public x;\n"
+            "    modifier onlyOwner(bool check) {\n        if (check) require(msg.sender == owner);\n        _;\n    }\n"
+            "    function mint(uint256 v) external onlyOwner(false) { x += v; }\n}\n")
+    access_matrix = importlib.import_module("swarm.tools.a26_tools").access_matrix
+    result = access_matrix({"source": text})
+    assert result["verdict"] == "fail" and result["guarded"] == 0
+    assert [f["id"] for f in result["findings"]] == ["ACCESS-UNPROTECTED-PRIVILEGED"]
+
+
+def test_an_unlistable_directory_is_recorded_as_an_incomplete_scan_reason(tmp_path, monkeypatch):  # round 4, Greptile 4339465971
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "A.sol").write_text("pragma solidity 0.8.28;\ncontract A { }\n")
+    (tmp_path / "locked").mkdir()
+    (tmp_path / "locked" / "B.sol").write_text("pragma solidity 0.8.28;\ncontract B { }\n")
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if str(path).endswith("locked"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    files, _, reasons = load_module()._collect(tmp_path, tmp_path)
+    assert [rel for rel, _ in files] == ["src/A.sol"]
+    assert reasons == ["directory cannot be listed, its .sol files not scanned: locked"]

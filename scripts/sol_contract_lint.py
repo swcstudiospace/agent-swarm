@@ -806,9 +806,6 @@ def _unconditional_calls(fn: dict) -> list[tuple[str, int, int]]:
     return cached
 
 
-_SENDER_AWARE = re.compile(r"msg\.sender|_msgSender\s*\(|\b_?check\w*\s*\(|\b_only\w*\s*\(|\bhasRole\b|\bisOwner\b|\bowner\s*\(|\bauth\w*\s*\(")
-
-
 _PLACEHOLDER = re.compile(r"(?<![\w$])_\s*;")  # a modifier's placeholder: the function body runs there
 _MODIFIER_UNIT = 1 << 24  # offsets of one applied modifier's own text; the modifiers of a chain occupy consecutive units before the body
 _POST = 1 << 40  # a write after a modifier's `_;`: it runs after the function body, so any guard before the body covers it
@@ -872,15 +869,11 @@ def _modifier_site(name: str, args: str, index: dict[str, list[dict]]) -> tuple[
     if not defined:
         return (0, label) if named else None
     best: int | None = None
-    for t in defined:
+    for t in defined:  # the body is available: only a check on every path before its `_;` counts, never a sender mention
         ph = _placeholder(t["body"])
         for pos, _, _ in _guard_labels(t["body"], index, _profile_of(t)):
             if pos < ph and (best is None or pos < best):
                 best = pos
-        if best is None and named:
-            m = _SENDER_AWARE.search(t["body"], 0, ph)
-            if m:
-                best = m.start()
     return None if best is None else (best, label)
 
 
@@ -1504,6 +1497,7 @@ class _CallSites:
         self.lowlevel = [m.start() for m in _LOW_LEVEL.finditer(clean)]
         self._verdicts: dict[int, bool] | None = None
         self._uses: dict[str, list[int]] | None = None
+        self._index_coverage()
         # every '(' with the '(' that encloses it (one stack pass, as _paren_pairs), and the check heads: require/assert/if with the
         # offset of their '(', and return; both sorted, so a flag read finds its statement's heads by binary search
         self.opens_all: list[int] = []
@@ -1634,19 +1628,79 @@ class _CallSites:
             o = self.parent[o]
         return False
 
-    def _first_check(self, flag: str, start: int, limit: int) -> int | None:
-        """Offset of the first read of `flag` after `start`, before `limit` (the end of its scope), that checks the call. A read that
-        only stores, logs or tests something else is passed over (`emit E(ok); require(ok);` checks the call). None when the name is
-        reassigned or redeclared before any check reads it, or when the scope holds no check (D-A)."""
+    def _index_coverage(self) -> None:
+        """Conditional bodies (if, else, for, while, catch) as (start, end) spans, nested or disjoint, with each span's parent, and
+        the offsets of every exit (return, revert, throw, break, continue, a modifier's `_;`). Built once per source."""
+        clean, n = self.clean, len(self.clean)
+        raw: list[tuple[int, int]] = []
+        for m in _COND_HEAD.finditer(clean):
+            keyword = m.group(0)
+            if keyword == "else":
+                start = _WS.match(clean, m.end()).end()
+            elif keyword == "catch":
+                start = clean.find("{", m.end())
+                if start < 0:
+                    continue
+            else:
+                k = _WS.match(clean, m.end()).end()
+                close = self.paren.get(k) if clean[k:k + 1] == "(" else None
+                if close is None:
+                    continue
+                start = _WS.match(clean, close + 1).end()
+            if start >= n:
+                continue
+            if clean[start:start + 1] == "{":
+                end = self.brace_close.get(start, n - 1) + 1
+            elif _COND_HEAD.match(clean, start):
+                end = self._scope_close(start)  # a brace-less control statement: its body is taken to the end of its block
+            else:
+                end = self._branch_end(start)
+            raw.append((start, end))
+        raw.sort(key=lambda span: (span[0], -span[1]))
+        self._spans = raw
+        self._span_starts = [s for s, _ in raw]
+        self._span_parent: list[int] = []
+        stack: list[int] = []
+        for idx, (s, _) in enumerate(raw):
+            while stack and raw[stack[-1]][1] <= s:
+                stack.pop()
+            self._span_parent.append(stack[-1] if stack else -1)
+            stack.append(idx)
+        self._exits = [m.start() for m in _EXIT.finditer(clean)]
+
+    def _innermost_span(self, p: int) -> int:
+        """Index of the innermost conditional span holding offset `p`, or -1 when none does."""
+        i = bisect.bisect_right(self._span_starts, p) - 1
+        while i >= 0 and self._spans[i][1] <= p:
+            i = self._span_parent[i]
+        return i
+
+    def _covers(self, pos: int, p: int) -> bool:
+        """Whether the check at `p` lies on every path that continues after the call at `pos`: the innermost conditional body holding
+        `p` also holds the call (a check in an `if` the call does not sit in is skipped on some path), and no return, revert, throw,
+        break, continue or `_;` lies between the call and the check outside the check's own statement."""
+        i = self._innermost_span(p)
+        if i >= 0 and not self._spans[i][0] <= pos < self._spans[i][1]:
+            return False
+        k = bisect.bisect_left(self.seps, p)
+        stmt = self.seps[k - 1] + 1 if k else 0
+        j = bisect.bisect_right(self._exits, pos)
+        return not (j < len(self._exits) and self._exits[j] < stmt)
+
+    def _first_check(self, pos: int, flag: str, limit: int) -> int | None:
+        """Offset of the first read of `flag` after the call at `pos`, before `limit` (the end of its scope), that checks the call on
+        every path that continues after it (see _covers). A read that only stores, logs or tests something else is passed over
+        (`emit E(ok); require(ok);` checks the call). None when the name is reassigned or redeclared before any covering check reads
+        it, or when the scope holds no covering check (D-A)."""
         clean = self.clean
         uses = self.name_uses().get(flag, [])  # sorted offsets of the whole-identifier uses of the flag, indexed once per source
-        for i in range(bisect.bisect_left(uses, start), len(uses)):
+        for i in range(bisect.bisect_right(uses, pos), len(uses)):
             p = uses[i]
             if p + len(flag) > limit:
                 break
             if _ASSIGN_AFTER.match(clean, p + len(flag)) or self._is_tuple_target(p) or _DECL_BEFORE.search(clean, max(0, p - 64), p):
                 return None  # the name is overwritten or redeclared before a check reads it
-            if self._is_check_read(flag, p):
+            if self._is_check_read(flag, p) and self._covers(pos, p):
                 return p
         return None
 
@@ -1681,7 +1735,7 @@ class _CallSites:
             lhs = clean[max(s, self.assigns[j] - _BINDING_CAP):self.assigns[j]]
             limit = self._scope_close(pos)
             for flag in _bound_flags(lhs):
-                p = self._first_check(flag, pos + 1, limit)
+                p = self._first_check(pos, flag, limit)
                 if p is not None and (nearest_unchecked is None or nearest_unchecked > p):
                     return True
         return False
@@ -1766,6 +1820,8 @@ _ASSIGN_AFTER = re.compile(r"\s*(?:<<|>>|[-+*/%&|^])?=(?![=>])")  # a write to t
 _DECL_BEFORE = re.compile(r"\b(?:bool|address|string|bytes\d*|u?int\d*|byte|[A-Z]\w*)\s+(?:(?:memory|storage|calldata)\s+)?\Z")
 _REVERT_OR_RETURN = re.compile(r"(?:revert|return|throw)\b")
 _CHECK_HEAD = re.compile(r"\b(?:(require|assert|if)\s*\(|(return)\b)")  # a check head: its keyword and '(' (or a return)
+_COND_HEAD = re.compile(r"\b(?:if|for|while|catch)\b|\belse\b")  # a head whose body may not run: its body is a conditional span
+_EXIT = re.compile(r"\b(?:return|revert|throw|break|continue)\b|(?<![\w$])_\s*;")  # a statement that leaves or skips the code after it
 
 
 def _slots(text: str) -> list[str]:
@@ -1929,7 +1985,17 @@ def _collect(root: Path, start: Path) -> tuple[list[tuple[str, str]], dict, list
         candidates = [start]
     else:
         candidates = []
-        for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
+
+        def unlistable(err: OSError) -> None:  # os.walk would skip the tree silently: the scan must say it did not look there
+            where = Path(err.filename) if err.filename else start
+            try:
+                label = rel(where)
+            except ValueError:
+                label = where.name
+            skipped["unreadable"] += 1
+            reasons.append(f"directory cannot be listed, its .sol files not scanned: {label}")
+
+        for dirpath, dirnames, filenames in os.walk(start, followlinks=False, onerror=unlistable):
             kept = []
             for name in sorted(dirnames):
                 child = Path(dirpath) / name
