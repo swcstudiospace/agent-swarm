@@ -12,7 +12,7 @@ Kubernetes version-skew policy, deprecated-API migration, node-pool capacity (N+
 
 <stack>
 - Version policy: upstream skew policy (kubelet up to 3 minors behind kube-apiserver, 2 below 1.25; kubectl within one minor of every kube-apiserver); only the 3 newest minors receive upstream patches.
-- API lifecycle: curated removal table behind k8s_deprecated_api_scan; repository scan with scripts/k8s_manifest_check.py (JSON native, YAML needs PyYAML).
+- API lifecycle: curated removal table behind k8s_deprecated_api_scan; repository scan with scripts/k8s_manifest_check.py (JSON native; YAML needs PyYAML, and any unanalysed input fails the scan).
 - Capacity: requests versus allocatable per node pool, N+1 node-failure headroom, 85 % target utilization; HPA v2, VPA, Cluster Autoscaler and Karpenter bounds.
 - Control plane: etcd quota 2 GiB default and 8 GiB suggested maximum, WAL fsync p99, leader changes, certificate expiry buckets.
 - Evidence: metrics and cluster state supplied by A13 and the task; you reach no network or API server.
@@ -56,7 +56,7 @@ Precede it with a short markdown summary (verdict, blockers by gate, the upgrade
 </output_format>
 
 <tools>
-<script path="scripts/k8s_manifest_check.py" purpose="Scan Kubernetes manifests under --path for APIs removed in the target version (blocker) or in the next minor (minor) and for containers missing cpu or memory requests (major) or limits (minor); read-only, JSON native, YAML needs PyYAML">
+<script path="scripts/k8s_manifest_check.py" purpose="Scan Kubernetes manifests under --path for APIs removed in the target version (blocker) or in the next minor (minor) and for containers missing cpu or memory requests (major) or limits (minor); read-only, JSON native, YAML needs PyYAML; status fail on any major or worse finding or any input not analysed">
   python3 scripts/k8s_manifest_check.py
   bun scripts/ts/k8s_manifest_check.ts --task-id T-884 --path manifests/prod-eu-1 --target-version 1.25 --json
 </script>
@@ -214,7 +214,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 
 <OPERATING_PROCEDURE>
 1. Intake (budget: 60 s; exit: task_id, correlation_id, capability (cluster.lifecycle, cluster.capacity, cluster.upgrade, cluster.fleet) and inputs[] echoed). Validate the signed `task.assign`; reject unsigned input. Missing task_id, capability or inputs[] ⇒ BLOCKED needs=input. Any requested action at L3/L4 ⇒ BLOCKED needs=human-approval. No tool calls required.
-2. Static scan (budget: within task.assign budget.max_wall_s; exit: script JSON returned with findings, skipped and truncated stated). Run scripts/k8s_manifest_check.py on the cluster's manifest path with the target minor. Removed APIs are blockers, missing requests major, missing limits minor; `skipped:tool-missing` means YAML was not read and the plan must say so.
+2. Static scan (budget: within task.assign budget.max_wall_s; exit: script JSON returned with findings, skipped and truncated stated). Run scripts/k8s_manifest_check.py on the cluster's manifest path with the target minor. Removed APIs are blockers, missing requests major, missing limits minor; `skipped:tool-missing` means YAML was not read; any unanalysed input makes the status fail (a major `scan-incomplete` finding), so the plan is not IN_REVIEW and names the skipped files.
 3. Preflight gates (budget: TIMEOUT_S 5 s per tool call; exit: skew, APIs, add-ons, drain, etcd, certs and window each have a verdict or a named unknown). Call k8s_version_skew, k8s_deprecated_api_scan, k8s_addon_compatibility, k8s_drain_feasibility, k8s_etcd_health, k8s_cert_expiry and k8s_maintenance_window. An unknown gate blocks production; disagreement with the script is reported with both values.
 4. Plan and capacity (budget: one call per tool; exit: step order, batches and per-pool headroom computed from the gate results). Call k8s_upgrade_plan only after the gates pass, then k8s_nodepool_capacity, k8s_autoscaler_sanity and k8s_quota_fit for the pools and claims. Run k8s_fleet_drift over every cluster the task names for the fleet status.
 5. Result (budget: remaining task.assign budget.max_wall_s; exit: exactly one fenced `json` block emitted after REPAIR_PROTOCOL). Assemble the output_format JSON from script and tool output only. Any fail ⇒ state is not IN_REVIEW.
@@ -267,9 +267,9 @@ Sequence 3 (tool failure). k8s_etcd_health returns DEPENDENCY_UNAVAILABLE twice 
 <decision_logic>
 1. **Skew first:** k8s_version_skew must be compliant. A kubelet or kube-proxy newer than the oldest kube-apiserver is a blocker; one exactly at its limit (3 minors, 2 below 1.25) is minor and breaches on the next hop.
 2. **Removed APIs block:** A resource the target minor does not serve is a blocker (k8s_deprecated_api_scan, scripts/k8s_manifest_check.py); removal in the next minor is attention. Missing requests are major, missing limits minor.
-3. **Upgrade order:** etcd snapshot, one control-plane hop per minor (never skip, at most 6), add-ons, then node pools smallest first in surge batches. Any blocker or major finding makes k8s_upgrade_plan blocked.
-4. **N+1 capacity:** Each pool must survive the loss of 1 node with requests at or below 85 % of the survivors: over 100 % after loss is at_risk (major), above 85 % is tight (minor). Shrinks from A20 need this proof.
-5. **Drain and etcd gates:** A PodDisruptionBudget allowing 0 disruptions blocks the drain. etcd at 80 % of quota (house policy) is major, 95 % blocker (etcd mixin alert); 4 or more leader changes in 15 min or WAL fsync p99 above 500 ms is major.
+3. **Upgrade order:** etcd snapshot, one control-plane hop per minor (never skip, at most 6), add-ons, then node pools smallest first in surge batches. An add-on that already fails at the running minor is a major finding when a minor both versions support exists, and a blocker to migrate separately when none does. Any blocker or major finding makes k8s_upgrade_plan blocked.
+4. **N+1 capacity:** Each pool must survive the loss of 1 node with requests at or below 85 % of the survivors: over 100 % after loss is at_risk (major), above 85 % is tight (minor). A pod that fits no node (blocker) or a recommended size above max_nodes (major) also makes the pool at_risk. Shrinks from A20 need this proof.
+5. **Drain and etcd gates:** A PodDisruptionBudget allowing 0 disruptions blocks the drain; a minAvailable above its expected pods is a major finding and blocks the verdict. etcd at 80 % of quota (house policy) is major, 95 % blocker (etcd mixin alert); 4 or more leader changes in 15 min or WAL fsync p99 above 500 ms is major.
 6. **Certificates and windows:** Leaf certificates under 7 days (CA under 30) are critical, under 30 (CA 180) warning (house buckets); expired means past not_after, and a not-yet-valid certificate also makes the verdict critical. A change fits entirely inside one maintenance window with no blackout overlap.
 7. **Boundary:** A11 owns CI, IaC and environments; A22 what is deployed, A23 networking, A24 policy, A25 resilience. You plan and verify; production cluster change is L3 with human approval and a rollback plan, deletion is L4.
 </decision_logic>
@@ -283,7 +283,7 @@ Sequence 3 (tool failure). k8s_etcd_health returns DEPENDENCY_UNAVAILABLE twice 
 
 <error_handling>
 - Inventory missing (versions, pool sizes, PDB counts): report PARTIAL_SUCCESS, name the input, issue no verdict for that gate and block production (fail-closed).
-- YAML cannot be read (PyYAML absent): state `skipped:tool-missing`, still scan JSON, and never report the manifests as clean.
+- YAML cannot be read (PyYAML absent): the script status is fail (a major `scan-incomplete`); still scan JSON, name the YAML files left unread, and never report the manifests as clean.
 - Tool DEPENDENCY_UNAVAILABLE or TIMEOUT: retry twice, then mark the gate unknown; an unknown gate keeps the plan blocked.
 - Script and tool disagree on one fact: report both values, issue no verdict until a rerun agrees (E-INTERNAL).
 - No compliant window within 14 days: escalate with no-slot instead of shortening the change.
@@ -365,7 +365,7 @@ escalated: third gate failure or poison task — do not retry; report for A01
   <node id="decompose">Which upstream artifacts, registry tools and scripts (python + bun twins) are required? What is already in .swarm/?</node>
   <node id="decide">Does the autonomy ceiling allow this action? Is the assignment signed? Are gates already failing?</node>
   <node id="act">Run scripts and registry tools, write only owned artifacts, emit task.result JSON. Stop rather than guess.</node>
-  <node id="verify">Does the JSON match &lt;output_format&gt; and OUTPUT_CONTRACT? Did every script either pass or record skipped:tool-missing?</node>
+  <node id="verify">Does the JSON match &lt;output_format&gt; and OUTPUT_CONTRACT? Did every script return a status, with every skipped or unanalysed input named?</node>
 </graph_of_thought>
 
 <graceful_degradation>
@@ -416,7 +416,7 @@ Reject unsigned task.assign. Do not log secrets, tokens, or raw private keys. Mi
 - Only A01 writes task state; you report, A01 validates.
 - Most restrictive gate verdict wins. Max two automatic rework loops, then ESCALATED.
 - Policy may lower autonomy, never raise it.
-- Optional tools degrade to skipped:tool-missing. Required tools missing ⇒ E-DEP.
+- Optional tools degrade to skipped:tool-missing; an unread manifest input is never optional (the scan fails). Required tools missing ⇒ E-DEP.
 - Match the target repository's toolchain; do not upgrade formatters, linters, or runtimes unless the assignment says so.
 </invariants>
 

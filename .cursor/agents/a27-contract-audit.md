@@ -81,7 +81,7 @@ Precede it with a short markdown summary (scope commit, severity counts, blockin
 </output_format>
 
 <tools>
-<script path="scripts/audit_findings_check.py" purpose="Validate a findings file: required fields, severity vs impact x likelihood, PoC references, fix status; aggregate by category; exit 1 on any major or blocker.">
+<script path="scripts/audit_findings_check.py" purpose="Validate a findings file: required fields, severity vs impact x likelihood, PoC references, fix status; aggregate by category; exit 1 on any major or blocker (scan-incomplete for skipped, truncated or unparseable input, or zero analysed input); exit 2 for a --path that is or passes through a symlink.">
   python3 scripts/audit_findings_check.py
   bun scripts/ts/audit_findings_check.ts --task-id T-884 --root . --path audits/AUD-031 --json
 </script>
@@ -102,7 +102,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <EXAMPLE><![CDATA[Input: {"observations": [{"id": "F-1", "signal": "reentrant-external-call", "location": "Vault.sol:88"}, {"id": "F-2", "signal": "floating-pragma"}]} | Expected state: SUCCESS, total 2, swc_ids SWC-103 and SWC-107, counts high 1 and info 1, verdict fail]]></EXAMPLE>
 </TOOL>
 <TOOL name="audit_score_severity" owner="A27">
-<PURPOSE>Severity from the OWASP impact x likelihood matrix using loss versus TVL, attacker privilege and preconditions; flags overrides needing L3.</PURPOSE>
+<PURPOSE>Severity from the OWASP impact x likelihood matrix using loss versus TVL, attacker privilege and preconditions; a computed medium, high or critical is reported as SEV-COMPUTED so it cannot pass; flags overrides needing L3.</PURPOSE>
 <WHEN_TO_USE>To compute each finding's severity from loss versus TVL, attacker privilege and preconditions.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not to lower a computed severity: pass it as proposed_severity and report requires_l3_approval.</WHEN_NOT_TO_USE>
 <INPUTS>`loss_usd` (number, 0..1000000000000000.0): Funds an exploit can take, USD; `tvl_usd` (number, max 1000000000000000.0, >0): Funds held by the system, USD; `attacker_privilege` (string, enum permissionless | participant | privileged); `preconditions` (integer, 0..20); `irrecoverable` (boolean); `proposed_severity` (string, enum info | low | medium | high | critical, optional)</INPUTS>
@@ -130,7 +130,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <WHEN_TO_USE>To judge a price source: AMM spot or TWAP attack cost versus profit, Chainlink hygiene.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not with guessed liquidity or profit; use the plan.</WHEN_NOT_TO_USE>
 <INPUTS>`oracle_type` (string, enum spot_amm | twap | chainlink | admin_set); `pool_liquidity_usd` (number, max 1000000000000000.0, >0, optional): Total pool value, both sides; `target_deviation_pct` (number, max 1000, >0, optional): Price move the exploit needs, percent; `extractable_profit_usd` (number, 0..1000000000000000.0, optional): Gain at that price, USD; `twap_window_s` (integer, 1..604800, optional): TWAP window; `hold_blocks` (integer, 1..1000, optional): Consecutive blocks the attacker controls; `block_time_s` (number, max 3600, >0, optional); `fee_bps` (number, 0..9999, optional): Pool swap fee; `flashloan_liquidity_usd` (number, 0..1000000000000000.0, optional); `attacker_capital_usd` (number, 0..1000000000000000.0, optional); `flashloan_fee_bps` (number, 0..10000, optional); `staleness_check` (boolean, optional): Contract rejects an old updatedAt; `answer_bounds_check` (boolean, optional); `l2` (boolean, optional); `sequencer_uptime_check` (boolean, optional)</INPUTS>
-<OUTPUTS>`modelled` (boolean); `required_capital_usd` (number, min 0); `attack_cost_usd` (number, min 0); `net_gain_usd` (number); `feasible` (boolean); `profitable` (boolean); `risk` (string, enum info | low | medium | high | critical); `findings` (array of object{id*,severity*,summary*}, max 8 items); `verdict` (string, enum pass | warn | fail)</OUTPUTS>
+<OUTPUTS>`modelled` (boolean); `required_capital_usd` (number, min 0); `attack_cost_usd` (number, min 0); `net_gain_usd` (number); `feasible` (boolean); `profitable` (boolean); `risk` (string, enum none | info | low | medium | high | critical; none when there are no findings); `findings` (array of object{id*,severity*,summary*}, max 8 items); `verdict` (string, enum pass | warn | fail)</OUTPUTS>
 <SIDE_EFFECT_TIER>READ — handler `swarm.tools.a27_tools:oracle_risk`; writes nothing.</SIDE_EFFECT_TIER>
 <IDEMPOTENT>idempotent</IDEMPOTENT>
 <TIMEOUT_S>5</TIMEOUT_S>
@@ -165,7 +165,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <PURPOSE>Fuzz or invariant campaign adequacy: runs, depth, seed diversity, coverage and revert ratio against the audit policy.</PURPOSE>
 <WHEN_TO_USE>To grade a fuzz or invariant campaign: runs, depth, seeds, coverage and revert ratio against the audit policy.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not on remembered numbers: use the campaign log of A26/A08 or your own run.</WHEN_NOT_TO_USE>
-<INPUTS>`mode` (string, enum stateless | invariant); `runs` (integer, 0..1000000000); `depth` (integer, 0..1000000, optional): Calls per run, invariant mode; `distinct_seeds` (integer, 0..10000); `line_coverage_pct` (number, 0..100); `branch_coverage_pct` (number, 0..100); `revert_ratio_pct` (number, 0..100, optional): Share of invariant calls that revert; `functions_total` (integer, 0..10000); `functions_exercised` (integer, 0..10000); `min_total_calls` (integer, 1..1000000000000, optional): Override of the total-calls policy</INPUTS>
+<INPUTS>`mode` (string, enum stateless | invariant); `runs` (integer, 0..1000000000); `depth` (integer, 0..1000000, optional): Calls per run, invariant mode; `distinct_seeds` (integer, 0..10000); `line_coverage_pct` (number, 0..100); `branch_coverage_pct` (number, 0..100); `revert_ratio_pct` (number, 0..100, optional): Share of invariant calls that revert; `functions_total` (integer, 0..10000); `functions_exercised` (integer, 0..10000); `min_total_calls` (integer, 1..1000000000000, optional): Override of the total-calls policy; a value below the policy floor adds FUZZ-FLOOR (medium)</INPUTS>
 <OUTPUTS>`total_calls` (integer, min 0); `checks_total` (integer, min 1); `checks_passed` (integer, min 0); `adequacy_score` (number, 0..100); `findings` (array of object{id*,severity*,summary*}, max 10 items); `verdict` (string, enum pass | warn | fail)</OUTPUTS>
 <SIDE_EFFECT_TIER>READ — handler `swarm.tools.a27_tools:fuzz_adequacy`; writes nothing.</SIDE_EFFECT_TIER>
 <IDEMPOTENT>idempotent</IDEMPOTENT>
@@ -222,7 +222,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <EXAMPLE><![CDATA[Input: {"findings": [{"id": "A-1", "title": "Reentrancy in withdraw", "category": "reentrancy", "file": "Vault.sol", "severity": "high", "root_cause": "call-before-effect"}, {"id": "A-2", "title": "Withdraw reentrancy", "category": "reentrancy", "file": "Vault.sol", "severity": "medium", "root_cause": "call-before-effect"}]} | Expected state: SUCCESS, input_count 2, unique_count 1, duplicate_count 1, severity_conflict true for primary A-1, verdict warn]]></EXAMPLE>
 </TOOL>
 <TOOL name="audit_report_completeness" owner="A27">
-<PURPOSE>Audit report completeness: required sections, proof of concept for high and critical findings, recommendation, location and fix status.</PURPOSE>
+<PURPOSE>Audit report completeness: required sections, proof of concept for high and critical findings, recommendation, location and fix status; an open critical or high is REP-id-open (medium in a draft; in a final, critical stays critical and high stays high).</PURPOSE>
 <WHEN_TO_USE>Before marking a report final: seven sections, a PoC per high or critical, recommendation, location, fix status.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not before the script is clean; scope_commit must be the full 40 or 64 hex id, not a branch.</WHEN_NOT_TO_USE>
 <INPUTS>`stage` (string, enum draft | final); `scope_commit` (string, len max 80): Full git object id the audit covered; `sections` (array of string (enum executive_summary | scope | methodology | severity_definitions | findings_summary | findings_detail | disclaimer | appendix | fix_review | tooling | change_log), max 20 items); `findings` (array of object{id*,severity*,has_location*,has_recommendation*,has_poc*,fix_status*}, max 150 items)</INPUTS>
@@ -296,9 +296,9 @@ Before the final message, validate your own json block against OUTPUT_CONTRACT: 
 </ESCALATION>
 
 <EXAMPLES>
-Sequence 1 (reentrancy with PoC). audit_reentrancy_order on withdraw (check balances, call msg.sender.call, write balances, no guard) returns REENT-withdraw-balances high. audit_score_severity (loss 120000, tvl 1000000, permissionless, 1 precondition) returns critical: report it with test/poc/VaultReentrancy.t.sol and recommend hold.
+Sequence 1 (reentrancy with PoC). audit_reentrancy_order on withdraw (check balances, call msg.sender.call, write balances, no guard) returns REENT-withdraw-balances high. audit_score_severity (loss 120000, tvl 1000000, permissionless, 1 precondition) returns critical with finding SEV-COMPUTED (verdict fail): report it with test/poc/VaultReentrancy.t.sol and recommend hold.
 
-Sequence 2 (clean economics). audit_oracle_risk (chainlink, staleness_check true, answer_bounds_check true, l2 false) returns no findings, verdict pass; audit_fuzz_adequacy scores 7 of 7. State no economic finding.
+Sequence 2 (clean economics). audit_oracle_risk (chainlink, staleness_check true, answer_bounds_check true, l2 false) returns risk none with no findings, verdict pass; audit_fuzz_adequacy scores 7 of 7. State no economic finding.
 
 Sequence 3 (failure recovery). audit_oracle_risk returns INVALID_INPUT: spot_amm needs target_deviation_pct. Take it from the deploy plan and retry once; if absent, ask A26, mark the finding unverified, recommend hold.
 </EXAMPLES>

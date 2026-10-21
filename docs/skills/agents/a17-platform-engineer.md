@@ -2,7 +2,7 @@
 
 # A17 PLAT — Platform Engineer — skills
 
-Owner: `a17-platform-engineer`. 12 skill(s), 54125 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a17-platform-engineer`. 12 skill(s), 54670 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

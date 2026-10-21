@@ -87,7 +87,7 @@ Precede it with a short markdown summary (what changed, each tool verdict, gas w
   python3 scripts/sol_contract_lint.py
   bun scripts/ts/sol_contract_lint.ts --task-id T-884 --root . --path src --json
 </script>
-Run the lint script over src/ first and reason over its JSON; only then call the sol_* tools per changed property. Exit 1 means a major or blocker finding, not a tool error. A deploy plan is drafted only after lint, tests and the upgrade tools are clean.
+Run the lint script over src/ first and reason over its JSON; only then call the sol_* tools per changed property. Exit 1 means a major or blocker finding, not a tool error. Skipped or unreadable in-scope input fails the lint closed; dependency directories such as lib/ are listed by name and do not fail it. A deploy plan is drafted only after lint, tests and the upgrade tools are clean.
 Conventions for every TOOL: INPUTS are required unless marked optional, accept no other fields, and never include the contract-test `probe`; a call returns state SUCCESS or INVALID_INPUT, UNAUTHORIZED, DEPENDENCY_UNAVAILABLE, TIMEOUT, PARTIAL_SUCCESS; OUTPUTS lists the fields beside `state`. Default handling: INVALID_INPUT, fix the named field once, then BLOCKED needs=input; UNAUTHORIZED, stop and report; DEPENDENCY_UNAVAILABLE, retry twice, then skipped:tool-missing; TIMEOUT, retry once, then E-TIMEOUT; PARTIAL_SUCCESS, record `completed_fraction` and the gap, never final evidence.
 
 <TOOL_INVENTORY count="13">
@@ -152,7 +152,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <EXAMPLE><![CDATA[Input: {"source": "contract Box { uint256 public value; event Set(uint256 v); function set(uint256 v) external onlyOwner { value = v; emit Set(v); } }", "pattern": "transparent"} | Expected state: SUCCESS, pattern transparent, verdict safe, 2 minor findings (no _disableInitializers, no initializer)]]></EXAMPLE>
 </TOOL>
 <TOOL name="sol_access_matrix" owner="A26">
-<PURPOSE>Build the guard matrix of state-changing functions in Solidity source and flag unprotected writers by name risk.</PURPOSE>
+<PURPOSE>Build the guard matrix of state-changing functions, fallback and receive included, in Solidity source and flag unprotected writers by name risk.</PURPOSE>
 <WHEN_TO_USE>To list state-changing functions with guards and roles and find unprotected writers before handover.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not an authorization audit: role admin chains are A27's; list intended public writers in public_by_design.</WHEN_NOT_TO_USE>
 <INPUTS>`source` (string, len 1..100000): Solidity source text; `contract` (string, len max 64, optional): Analyse only this contract; `public_by_design` (array of string (len 1..64), max 200 items, optional): Function names intentionally callable by anyone</INPUTS>
@@ -164,7 +164,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <EXAMPLE><![CDATA[Input: {"source": "contract Box { uint256 public value; event Set(uint256 v); function set(uint256 v) external onlyOwner { value = v; emit Set(v); } }"} | Expected state: SUCCESS, state_changing 1, guarded 1, unprotected 0, role onlyOwner, verdict pass]]></EXAMPLE>
 </TOOL>
 <TOOL name="sol_event_coverage" owner="A26">
-<PURPOSE>Find state-changing public functions that emit no event (directly or through same-source callees) and gate on a coverage minimum.</PURPOSE>
+<PURPOSE>Find state-changing public functions that emit no event (directly or through callees visible in their own contract) and gate on a coverage minimum.</PURPOSE>
 <WHEN_TO_USE>To confirm every state-changing public function emits an event, directly or via callees, at the 100 % floor.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not event design review; list real exemptions in exempt, never lower the minimum.</WHEN_NOT_TO_USE>
 <INPUTS>`source` (string, len 1..100000): Solidity source text; `min_coverage_pct` (number, 0..100); `exempt` (array of string (len 1..64), max 200 items, optional)</INPUTS>
@@ -225,7 +225,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 </TOOL>
 <TOOL name="sol_test_gate" owner="A26">
 <PURPOSE>Gate contract tests on lcov-style coverage, failing and skipped tests, fuzz runs and invariant tests.</PURPOSE>
-<WHEN_TO_USE>Before handover, gating lcov and counts: line 95 %, branch 90 %, 256+ fuzz runs, an invariant test for value holders.</WHEN_TO_USE>
+<WHEN_TO_USE>Before handover, gating lcov and counts: line 95 %, branch 90 %, 256+ runs per fuzz test, an invariant test for value holders.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not proof of correctness; numbers come from a real coverage run or CI, never estimates.</WHEN_NOT_TO_USE>
 <INPUTS>`files` (array of object{path*,lines_found*,lines_hit*,branches_found*,branches_hit*,functions_found*,functions_hit*}, 1..300 items); `min_line_pct` (number, 0..100); `min_branch_pct` (number, 0..100); `min_file_line_pct` (number, 0..100, optional); `tests_total` (integer, 0..1000000); `tests_failed` (integer, 0..1000000); `tests_skipped` (integer, 0..1000000); `fuzz_tests` (integer, 0..1000000); `fuzz_runs` (integer, 0..10000000); `min_fuzz_runs` (integer, 1..10000000, optional); `invariant_tests` (integer, 0..1000000); `require_invariants` (boolean)</INPUTS>
 <OUTPUTS>`files_checked` (integer, min 0); `line_pct` (number); `branch_pct` (number); `function_pct` (number); `files_below_floor` (integer, min 0); `verdict` (string, enum pass | fail); `findings` (array of object{id*,severity*,summary*}): Findings, worst first, at most 200; `findings_total` (integer, min 0)</OUTPUTS>
@@ -308,7 +308,7 @@ Sequence 3 (Tool missing recovery). sol_upgrade_safety returns DEPENDENCY_UNAVAI
 <decision_logic>
 1. **Test-first gate:** failing forge test first; sol_test_gate passes at line >= 95 %, branch >= 90 %, >= 256 runs per fuzz test, >= 1 invariant test for value holders. Failing or zero tests block.
 2. **Static hygiene:** sol_contract_lint exit 1 (tx.origin auth, selfdestruct, unchecked low-level call, delegatecall) blocks. sol_pragma_policy needs an exact pinned pragma, floor 0.8.20, no known medium-or-worse bug.
-3. **Upgrade and ABI stability:** sol_storage_layout breaking > 0 or sol_upgrade_safety unsafe means no upgrade patch: append only, keep a __gap, _disableInitializers in the constructor, guard UUPS _authorizeUpgrade. sol_abi_diff breaking > 0 needs A02 sign-off.
+3. **Upgrade and ABI stability:** sol_storage_layout breaking > 0 or sol_upgrade_safety unsafe means no upgrade patch: append only, keep a __gap that never shrinks, _disableInitializers in the constructor, guard UUPS _authorizeUpgrade. sol_abi_diff breaking > 0 needs A02 sign-off.
 4. **Gas budget:** per-function regression above 5 % fails sol_gas_regression unless A03 accepts it in writing; never trade a guard or an event for gas.
 5. **Access and events:** sol_access_matrix unprotected writers 0 except named public_by_design; sol_event_coverage 100 %; sol_natspec_coverage >= 90 % of the public API.
 6. **Deploy plan, simulation first:** plans target a fork or testnet with sol_deploy_plan_check blocking 0: chain-id guard, multisig or timelock owner with thresholds from custody.policy.set, hardware, keystore or remote signer, keyless RPC. Mainnet deploy and funds are L4, a live upgrade L3: human-only.

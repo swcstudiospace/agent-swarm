@@ -16,7 +16,7 @@ disable-model-invocation: true
 
 1. Render the objects of the one Application with `bash` (`kustomize build <overlay>` or `helm template --include-crds`) into a file and read it with `read`. Keep the objects of exactly one Application; hooks come from `argocd.argoproj.io/hook`.
 2. Call `gitops_sync_wave_check` with `manifests` (the rendered objects, parsed). Read `plan` (groups in sync order), `wave_count` and `findings`. Argo CD runs phase PreSync, then Sync, then PostSync; inside a phase, ascending `argocd.argoproj.io/sync-wave` (default 0, negatives allowed), then kind order, then name.
-3. Fix each `gitops_sync_wave_check` finding class by rule: Namespace after its contents or CRD in the same or a later wave than its custom resources: give Namespaces and CRDs a lower wave (-2 for Namespaces, -1 for CRDs is a common convention, not a requirement); workloads before the ConfigMap, Secret, ServiceAccount or PVC they reference: raise the workload wave above the dependency. A wave that does not parse is silently 0 in Argo CD: treat as `major`.
+3. Fix each `gitops_sync_wave_check` finding class by rule: Namespace after its contents or CRD in the same or a later wave than its custom resources: give Namespaces and CRDs a lower wave (-2 for Namespaces, -1 for CRDs is a common convention, not a requirement); workloads before the ConfigMap, Secret, ServiceAccount or PVC they reference: raise the workload wave above the dependency. A `sync-wave` that is not an int64 written as a string is `wave-invalid` (major): Argo CD treats it as 0. A dependency or Namespace with hook `Skip` is never applied, so `dependency-skipped` or `namespace-skipped` (major) means it must already exist in the cluster.
 4. Hooks, written with `edit`: a database migration is a `PreSync` Job with `argocd.argoproj.io/hook-delete-policy: BeforeHookCreation` (or `HookSucceeded`). A hook without a delete policy blocks the next sync with a name clash. SyncFail hooks must be idempotent.
 5. Apply the fix as annotations in the base or a Kustomize patch with `edit`. Call `gitops_kustomize_check` with `kustomization` and `resources`: a patch target that matches nothing means your annotation never lands (`unresolved_patch_count` above 0 fails).
 6. Re-run `gitops_sync_wave_check` on the fixed render. Expected: `verdict: pass`, `wave_count` as designed, no finding for Namespace, CRD or dependency order. Count of resources must equal the first run (`resource_count`); a difference means you dropped objects.
@@ -31,7 +31,7 @@ disable-model-invocation: true
 
 - INVALID_INPUT: fix the named object (missing `apiVersion`, `kind` or `metadata`) or BLOCKED needs=input.
 - PARTIAL_SUCCESS: use `completed_fraction`; objects not parsed are unchecked, not ordered.
-- DEPENDENCY_UNAVAILABLE: retry once, then `skipped:tool-missing`. Without PyYAML the script skips YAML files.
+- DEPENDENCY_UNAVAILABLE: retry once, then `skipped:tool-missing`. Without PyYAML the script does not read YAML files: it reports a major `scan/incomplete` and status `fail`.
 - Argo CD waits a short delay between waves and health-gates each one (the delay is configurable); exact defaults depend on the version: defer to the cluster's Argo CD docs and say so.
 - Never retry a sync from this skill; production sync is BLOCKED needs=human-approval.
 

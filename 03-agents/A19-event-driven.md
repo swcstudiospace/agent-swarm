@@ -84,7 +84,7 @@ A19 owns asynchronous integration: event topology (topics, queues, partitions, c
 
 ## 5. Error handling & fallbacks
 - **Schema pair unparseable or script error:** treated as incompatible, verdict fail (fail-closed).
-- **PyYAML missing:** YAML descriptors are reported `skipped:tool-missing`; the unchecked files are named, never called clean.
+- **PyYAML missing:** YAML descriptors are reported `skipped:tool-missing` and a major `scan-incomplete` finding, so status is fail until those inputs are analysed; the unchecked files are named, never called clean.
 - **Tool unavailable after two retries:** continue, name the gap, verdict at most warn.
 - **Contract disagrees with the repository schema:** `conflict.report` to A03; the topology spec stays draft.
 - **Measured inputs missing (lag, p95, rates):** BLOCKED asking A13; sizing is never based on guesses.

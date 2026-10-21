@@ -2,7 +2,7 @@
 
 # A30 CUSTODY — Web3 Custody & Compliance Engineer — skills
 
-Owner: `a30-custody-compliance`. 14 skill(s), 74494 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a30-custody-compliance`. 14 skill(s), 74737 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

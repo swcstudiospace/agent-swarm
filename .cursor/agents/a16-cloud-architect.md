@@ -147,7 +147,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <IDEMPOTENT>idempotent</IDEMPOTENT>
 <TIMEOUT_S>5</TIMEOUT_S>
 <FAILURE_HANDLING>SUCCESS: cite the outputs. INVALID_INPUT, PARTIAL_SUCCESS, DEPENDENCY_UNAVAILABLE, TIMEOUT: default handling. UNAUTHORIZED: only A16.</FAILURE_HANDLING>
-<EXAMPLE><![CDATA[Input: {"accounts": [{"id": "1", "role": "management", "ou": "", "root_mfa": true, "iam_users": 0, "guardrails": []}], "break_glass": {"configured": true, "hardware_mfa": true, "alert_on_use": true, "last_tested_days_ago": 30}} | Expected state: SUCCESS, guardrail_coverage_pct 100.0, no-log-archive-account (blocker), no-security-audit-account (major), verdict fail]]></EXAMPLE>
+<EXAMPLE><![CDATA[Input: {"accounts": [{"id": "1", "role": "management", "ou": "", "root_mfa": true, "iam_users": 0, "guardrails": []}], "break_glass": {"configured": true, "hardware_mfa": true, "alert_on_use": true, "last_tested_days_ago": 30}} | Expected state: SUCCESS, guardrail_coverage_pct 0.0, guardrails-not-evaluated (major), no-log-archive-account (blocker), no-security-audit-account (major), verdict fail]]></EXAMPLE>
 </TOOL>
 <TOOL name="cloud_wellarch_scorecard" owner="A16">
 <PURPOSE>Score the six Well-Architected pillars from weighted risk answers and rank the remediation by impact.</PURPOSE>
@@ -387,7 +387,7 @@ escalated: third gate failure or poison task — do not retry; report for A01
   <node id="decompose">Which upstream artifacts, registry tools and scripts (python + bun twins) are required? What is already in .swarm/?</node>
   <node id="decide">Does the autonomy ceiling allow this action? Is the assignment signed? Are gates already failing?</node>
   <node id="act">Run scripts and registry tools, write only owned artifacts, emit task.result JSON. Stop rather than guess.</node>
-  <node id="verify">Does the JSON match &lt;output_format&gt; and OUTPUT_CONTRACT? Did every script either pass or record skipped:tool-missing?</node>
+  <node id="verify">Does the JSON match &lt;output_format&gt; and OUTPUT_CONTRACT? Did every script reach status ok, or record skipped:tool-missing with the verdict below pass?</node>
 </graph_of_thought>
 
 <graceful_degradation>

@@ -14,7 +14,7 @@ disable-model-invocation: true
 
 ## Procedure
 
-1. List repo files read-only with `bash` (`git ls-files`) and read CODEOWNERS with `read`. Call `gitops_repo_layout` with `paths`, `expected_envs`, `production_envs`, `clusters` (names registered in the task), `engine` (`argocd` or `flux`) and `codeowners` (the file text). `missing_envs` must be empty and `cluster_dirs` must equal `clusters`; `codeowners_evaluated` false means production ownership is unverified: BLOCKED needs=input. Any private-key file finding is a blocker.
+1. List repo files read-only with `bash` (`git ls-files`) and read CODEOWNERS with `read`. Call `gitops_repo_layout` with `paths`, `expected_envs`, `production_envs`, `clusters` (names registered in the task), `engine` (`argocd` or `flux`) and `codeowners` (the file text). `missing_envs` must be empty and `cluster_dirs` must equal `clusters`; `codeowners_evaluated` false means production ownership is unverified: BLOCKED needs=input. Any `secret-like-file` finding (major) blocks the tree.
 2. Design the tree with `write`: `clusters/<cluster>/` holds the root (`apps` Application, or Flux `gotk-sync.yaml`); `apps/<name>/base` plus `overlays/<env>`; children grouped as platform (CRDs, namespaces), policies (A24) and workloads. Do not invent a cluster that is not in `clusters`.
 3. Write the root. Argo CD: `spec.source.path: clusters/<cluster>/apps`, `targetRevision` a branch for non-prod, a tag or commit for prod, AppProject other than `default`, `destination.name` of the registered cluster. Flux: Kustomization `kustomize.toolkit.fluxcd.io/v1` with `interval` 10m or more, `prune` explicit, `serviceAccountName` set for production.
 4. Call `gitops_app_sync_policy` with `resource` (the root object) and `environment`. Production decision rule: `auto_sync` and `prune_enabled` must both be false and `revision_class` must be `pinned` or `tag`; any blocker or major finding is fixed before the PR. Non-prod: `auto_sync` true is acceptable, `prune_enabled` stays false until `skill://a22-gitops--prune-safety-review` clears it.
@@ -32,7 +32,7 @@ disable-model-invocation: true
 
 - INVALID_INPUT: fix the named field (empty `clusters`, unknown `engine`) or BLOCKED needs=input.
 - PARTIAL_SUCCESS: use `completed_fraction`, name the unchecked files; never call the tree `pass`.
-- DEPENDENCY_UNAVAILABLE: retry once, then record `skipped:tool-missing`. Without PyYAML the script reports YAML files as `skipped:tool-missing`: not clean.
+- DEPENDENCY_UNAVAILABLE: retry once, then record `skipped:tool-missing`. Without PyYAML the script reports a major `scan/incomplete` and status `fail` for the YAML files: not clean.
 - Wave ordering between Application objects needs Argo CD to assess Application health; behaviour depends on the Argo CD version, so state the version assumed and have a human confirm.
 - L3/L4 steps: BLOCKED needs=human-approval; never retry a PR creation that succeeded.
 

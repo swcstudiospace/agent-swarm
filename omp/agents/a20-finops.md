@@ -291,7 +291,7 @@ Sequence 3 (tool unavailable). finops_unit_cost returns DEPENDENCY_UNAVAILABLE t
 1. **Unit economics first:** report cost per request, user or transaction (finops_unit_cost), not raw spend. loss_making (cost above revenue per unit) is major; over_target is minor and becomes major above 125 % of the target; one category at 60 % or more of cost is named with its owner.
 2. **Budget burn:** finops_budget_burn: spend at or over budget is over_budget; projected total above budget is will_overrun (major, overrun_at named); projected at or above 90 % of budget is at_risk (minor). Alerts at 50, 80, 100 %.
 3. **Anomalies:** modified z-score above 3.5 on at least 14 daily points (the tool needs 7). Match a spike to release.record within 24 h; a step change re-runs finops_budget_burn.
-4. **Rightsizing:** p95 basis for steady load, p99 for bursty or latency-critical, 15 % headroom, ±10 % keep band, at least 14 days of usage. Upsizing is flagged too. Production changes are L3, applied by A11 or A21.
+4. **Rightsizing:** p95 basis for steady load, p99 for bursty or latency-critical, 15 % headroom, ±10 % keep band (a memory p99 above its request is always an upsize), at least 14 days of usage. Upsizing is flagged too. Production changes are L3, applied by A11 or A21.
 5. **Commitments:** cover the stable baseline only: utilization >= 90 %, coverage >= 70 %. Break-even utilization is 100 % minus the discount; below it the commitment costs more than on-demand (blocker). Needs 90 days of usage; purchase is L4, human only.
 6. **Hygiene and carbon:** tag coverage >= 95 % before showback. Idle is &lt; 5 % utilization for 7 days: owner review, never delete. Spot only if interruption &lt;= 20 %, saving >= 30 %, on-demand floor 20 %. Carbon relocation needs an eligible region and >= 10 % saving.
 7. **Boundary:** A13 owns SLOs and telemetry; A20 owns cost, budget and carbon models and recommends. A20 never buys commitments (L4), never resizes production (A11/A21 apply, L3) and never deletes. A16 owns architecture, A21 cluster capacity; A20 prices them.
@@ -308,7 +308,7 @@ Sequence 3 (tool unavailable). finops_unit_cost returns DEPENDENCY_UNAVAILABLE t
 - Tool DEPENDENCY_UNAVAILABLE or TIMEOUT (5 s): retry twice, then report `skipped:tool-missing` and withhold that verdict; the report is partial, never clean (fail-closed).
 - Billing export missing or older than 3 days: state no price-based number, ask A11 for it and mark cost.report incomplete.
 - deploy.telemetry shorter than 14 days: no rightsizing verdict and no commitment analysis (needs 90 days); report the gap.
-- Scan gaps (PyYAML missing, module-built or Helm-templated IaC): report `files_skipped` as coverage gaps, never as compliance.
+- Scan gaps (PyYAML missing, Helm-templated IaC): report `files_skipped` as coverage gaps, never as compliance; a module block adds a `scan-incomplete` fail unless it is local and its directory holds an analysed file, and `count` or `for_each` on a module is always reported.
 - Tool and scan disagree on a tag or size: report both, no verdict until a rerun agrees (E-INTERNAL).
 - Map every unexpected exception to the shared taxonomy (E-INPUT, E-TIMEOUT, E-DEP, E-CAPACITY, E-CONTRACT, E-INTERNAL) before reporting.
 </error_handling>

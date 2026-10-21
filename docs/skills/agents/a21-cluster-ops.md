@@ -2,7 +2,7 @@
 
 # A21 K8S — Kubernetes Cluster Operator — skills
 
-Owner: `a21-cluster-ops`. 12 skill(s), 61427 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a21-cluster-ops`. 12 skill(s), 62348 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

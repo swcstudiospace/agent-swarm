@@ -2,7 +2,7 @@
 
 # A27 AUDIT — Smart Contract Auditor — skills
 
-Owner: `a27-contract-audit`. 14 skill(s), 69823 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a27-contract-audit`. 14 skill(s), 70413 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

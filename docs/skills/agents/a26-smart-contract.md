@@ -2,7 +2,7 @@
 
 # A26 SOL — Smart Contract Engineer — skills
 
-Owner: `a26-smart-contract`. 13 skill(s), 72623 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a26-smart-contract`. 13 skill(s), 73603 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

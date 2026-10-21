@@ -2,7 +2,7 @@
 
 # A18 SUPPLY — Supply-Chain Security Engineer — skills
 
-Owner: `a18-supply-chain`. 12 skill(s), 62262 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a18-supply-chain`. 12 skill(s), 62702 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

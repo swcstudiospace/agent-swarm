@@ -61086,7 +61086,6 @@
               "state",
               "level",
               "workload_count",
-              "highest_compliant_level",
               "finding_count",
               "verdict",
               "findings"
@@ -61109,7 +61108,7 @@
               },
               "highest_compliant_level": {
                 "type": "string",
-                "description": "Strictest level every supplied workload satisfies.",
+                "description": "Strictest level every supplied workload satisfies; absent when no pod spec was checked.",
                 "enum": [
                   "privileged",
                   "baseline",
@@ -67667,9 +67666,13 @@
               },
               "quorum_size": {
                 "type": "integer",
-                "description": "override of the majority quorum, e.g. Kafka min.insync.replicas",
+                "description": "quorum size; defaults to the majority. Below majority only when consensus is false (e.g. Kafka min.insync.replicas)",
                 "minimum": 1,
                 "maximum": 99
+              },
+              "consensus": {
+                "type": "boolean",
+                "description": "true (default): consensus quorum (etcd, ZooKeeper, Consul), a quorum below majority blocks; false: non-consensus replica set (e.g. Kafka), a quorum below majority is allowed"
               },
               "unavailable_members": {
                 "type": "integer",
@@ -70567,6 +70570,7 @@
               },
               "fuzz_runs": {
                 "type": "integer",
+                "description": "runs of each fuzz test, not a total across fuzz_tests; compared with min_fuzz_runs",
                 "minimum": 0,
                 "maximum": 10000000
               },
@@ -71917,6 +71921,7 @@
               "risk": {
                 "type": "string",
                 "enum": [
+                  "none",
                   "info",
                   "low",
                   "medium",
@@ -84684,8 +84689,7 @@
                   "additionalProperties": false,
                   "required": [
                     "scenario",
-                    "status",
-                    "age_days"
+                    "status"
                   ],
                   "properties": {
                     "scenario": {
@@ -84702,7 +84706,8 @@
                       ]
                     },
                     "age_days": {
-                      "type": "number"
+                      "type": "number",
+                      "description": "days since the last drill; absent when the scenario was never drilled"
                     }
                   }
                 }

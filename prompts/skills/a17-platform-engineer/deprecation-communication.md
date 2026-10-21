@@ -33,7 +33,7 @@ tools: [plat_api_deprecation, plat_golden_path_coverage, plat_catalog_graph, sha
 - INVALID_INPUT (blank `name` or `version`, `deprecated_at` after `checked_at`, `sunset_at` not after `deprecated_at`, timestamp without offset): fix the named field once, else BLOCKED `needs=input`.
 - Tools DEPENDENCY_UNAVAILABLE: retry once, then `skipped:tool-missing`; no status is declared on a skipped check.
 - PARTIAL_SUCCESS: use `completed_fraction`, name unchecked APIs.
-- Notice windows by stability: beta 274 days and alpha 0 follow the Kubernetes deprecation policy; the GA 365 days is house policy (Kubernetes sets none). Defer to the approved record.
+- Notice windows by stability: beta 274 days is the 9-month arm of the Kubernetes deprecation policy rule 4a (the tool does not model its 3-release arm, so say so); alpha 0 follows the same rule; the GA 365 days is house policy (Kubernetes sets none). Defer to the approved record.
 
 ## Handover
 

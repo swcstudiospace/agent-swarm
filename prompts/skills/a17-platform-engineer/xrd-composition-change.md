@@ -30,7 +30,7 @@ tools: [plat_composition_diff, plat_claim_validate, plat_api_deprecation, shared
 
 ## Failure Handling
 
-- INVALID_INPUT on a duplicate or malformed `path`, or a claim `value` that is not numeric for an `integer` or `number` type: fix the named list once, else BLOCKED `needs=input`.
+- INVALID_INPUT on a duplicate or malformed `path`, a claim `value` that is not numeric for an `integer` or `number` type, or a numeric `value` whose decimal exponent is beyond ±100 (for example `1e999999999`): fix the named list once, else BLOCKED `needs=input`.
 - Tools DEPENDENCY_UNAVAILABLE: retry once, then `skipped:tool-missing`; never print `compatible`.
 - PARTIAL_SUCCESS: use `completed_fraction`, name unchecked claims.
 - No claims found: say so; the verdict then rests on the diff alone.

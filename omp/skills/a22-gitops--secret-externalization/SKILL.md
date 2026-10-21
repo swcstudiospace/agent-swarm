@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 ## When to Use
 
-- `scripts/gitops_repo_check.py` or an A10 or A24 finding reports `secrets:plaintext-secret:*`, a credential pattern, a secret-looking env var or a private-key file in a manifest repository, or a task asks to make a repo safe to publish.
+- `scripts/gitops_repo_check.py` or an A10 or A24 finding reports `secrets:plaintext-secret:*`, a credential pattern, a secret-looking env or Helm parameter value, or a private-key or credential-looking file name in a manifest repository, or a task asks to make a repo safe to publish.
 - Not for secret detection in application code (A10) and not for cluster encryption at rest or RBAC (A24). Rotation of the leaked value is a human step: this skill never reads, prints or rewrites a secret value.
 - Writing references is L2. A production secret change and any history rewrite (`git filter-repo`, force-push) are L4: BLOCKED needs=human-approval.
 
@@ -32,7 +32,7 @@ disable-model-invocation: true
 - INVALID_INPUT: fix the named field (`manifests` item without `kind`) or BLOCKED needs=input.
 - PARTIAL_SUCCESS: use `completed_fraction`; unscanned files are unknown, not clean.
 - DEPENDENCY_UNAVAILABLE: retry once, then `skipped:tool-missing`; the PR stays `draft`.
-- Scanner patterns are heuristics (names, known formats, `user:password@` in URLs): a clean scan is "none found". Placeholders such as `CHANGEME` are ignored by design; a reviewer checks those files.
+- Scanner patterns are heuristics (secret-looking key names such as `password`, `token` or `key`; known credential formats; URL userinfo with a password, including one that contains `:`, or a bare token of 16 or more letters and digits before `@`). Secret annotations and labels are scanned too. A clean scan is "none found". Placeholders such as `CHANGEME` are ignored by design; a reviewer checks those files.
 - Never retry an escalation; never paste a value into a handover, PR or log.
 
 ## Handover

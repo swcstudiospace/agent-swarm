@@ -2,7 +2,7 @@
 
 # A29 DAPP — dApp & Wallet Integration Engineer — skills
 
-Owner: `a29-dapp-wallet`. 13 skill(s), 58014 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a29-dapp-wallet`. 13 skill(s), 59907 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

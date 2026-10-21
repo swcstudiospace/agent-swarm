@@ -2,7 +2,7 @@
 
 # A20 FINOPS — FinOps & GreenOps Analyst — skills
 
-Owner: `a20-finops`. 12 skill(s), 67934 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a20-finops`. 12 skill(s), 68112 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

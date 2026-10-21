@@ -2,7 +2,7 @@
 
 # A22 GITOPS — GitOps & Progressive Delivery Engineer — skills
 
-Owner: `a22-gitops`. 12 skill(s), 58258 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a22-gitops`. 12 skill(s), 59206 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

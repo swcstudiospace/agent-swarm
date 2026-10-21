@@ -2,7 +2,7 @@
 
 # A19 EVENT — Event-Driven & Serverless Engineer — skills
 
-Owner: `a19-event-driven`. 12 skill(s), 60341 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a19-event-driven`. 12 skill(s), 61697 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

@@ -75,7 +75,7 @@ Precede it with a short markdown summary (network guard decision, RPC order and 
 </output_format>
 
 <tools>
-<script path="scripts/chain_config_check.py" purpose="Validate chain and RPC configuration files: https endpoints, no credentials embedded in URLs, chain-id consistency and an explicit mainnet opt-in; findings carry file and key path, never the URL.">
+<script path="scripts/chain_config_check.py" purpose="Validate chain and RPC configuration files: https endpoints, no credentials embedded in URLs, chain-id consistency, testnet names and test-network hosts on mainnet or unknown chain ids, and an explicit mainnet opt-in; a file it cannot analyse is a scan-incomplete major; findings carry file and key path, never the URL.">
   python3 scripts/chain_config_check.py
   bun scripts/ts/chain_config_check.ts --task-id T-884 --path config/chains --json
 </script>
@@ -120,7 +120,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <EXAMPLE><![CDATA[Input: {"providers": [{"name": "alpha", "p95_latency_ms": 120, "error_rate_pct": 0.2, "rate_limit_rps": 200, "lag_blocks": 0, "archive": true}, {"name": "beta", "p95_latency_ms": 90, "error_rate_pct": 0.5, "rate_limit_rps": 150, "lag_blocks": 1, "archive": false}], "demand_rps": 100, "max_error_rate_pct": 1, "max_lag_blocks": 2, "need_archive": false} | Expected state: SUCCESS, primary beta, order [beta, alpha], hedge_after_ms 90.0, capacity_after_loss_rps 150.0, survives_single_loss true]]></EXAMPLE>
 </TOOL>
 <TOOL name="chain_confirmation_depth" owner="A28">
-<PURPOSE>Confirmations, block tag and worst-case wait for a finality model (Nakamoto depth, Ethereum safe or finalized, BFT) from value at risk and loss tolerance.</PURPOSE>
+<PURPOSE>Confirmations, block tag and worst-case wait for a finality model (Nakamoto depth, Ethereum safe or finalized, BFT) from value at risk, loss tolerance and observed reorg depth; probabilistic and ethereum_pos depth is at least reorg + 1.</PURPOSE>
 <WHEN_TO_USE>To set confirmations and block tag from finality model and value at risk for rpc.policy.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not to approve a payout or release; it sets a wait only.</WHEN_NOT_TO_USE>
 <INPUTS>`finality_model` (string, enum probabilistic | ethereum_pos | instant_bft); `value_at_risk_usd` (number, 0..1000000000000.0); `loss_tolerance_usd` (number, 0.01..1000000000000.0): loss accepted if the transaction is reversed; `block_time_s` (number, max 3600, >0): block or slot time; `attacker_share` (number, 0.001..0.49): assumed attacker hash share, probabilistic model; `observed_max_reorg_blocks` (integer, 0..10000)</INPUTS>
@@ -156,7 +156,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <EXAMPLE><![CDATA[Input: {"samples": [{"observed_at": "2026-10-20T10:00:00Z", "head_block": 1000, "indexed_block": 900}, {"observed_at": "2026-10-20T10:01:00Z", "head_block": 1005, "indexed_block": 960}], "block_time_s": 12, "freshness_slo_s": 120} | Expected state: SUCCESS, lag_blocks 45, lag_seconds 540.0, trend closing, eta_catch_up_s 49.1, within_slo false, verdict fail, slo-breach-severe blocker]]></EXAMPLE>
 </TOOL>
 <TOOL name="chain_backfill_plan" owner="A28">
-<PURPOSE>Backfill plan: getLogs window sized to provider block-range and result caps, request count, duration, catch-up against the moving head and bisect depth.</PURPOSE>
+<PURPOSE>Backfill plan: getLogs window sized to provider block-range and result caps with a half-cap log margin, request count, duration, catch-up against the moving head and bisect depth.</PURPOSE>
 <WHEN_TO_USE>To size getLogs windows and workers for a backfill.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not to start the backfill or with guessed caps.</WHEN_NOT_TO_USE>
 <INPUTS>`from_block` (integer, 0..10000000000); `to_block` (integer, 0..10000000000): inclusive; `max_block_range` (integer, 1..1000000): provider eth_getLogs block-range limit; `max_logs_per_response` (integer, 1..1000000): provider result cap; `est_logs_per_block` (number, 0..1000000.0): average matching logs per block; `requests_per_chunk` (integer, 1..100): RPC calls per window; `workers` (integer, 1..1024): parallel workers; `request_latency_ms` (number, max 1000000.0, >0); `provider_rate_limit_rps` (number, max 1000000.0, >0); `block_time_s` (number, max 3600, >0): chain block time, the head keeps moving</INPUTS>
@@ -232,7 +232,7 @@ Conventions for every TOOL: INPUTS are required unless marked optional, accept n
 <WHEN_TO_USE>To choose public or private routing for a swap, liquidation or mint from value and slippage.</WHEN_TO_USE>
 <WHEN_NOT_TO_USE>Not to submit a transaction; submission is A29's or a human's.</WHEN_NOT_TO_USE>
 <INPUTS>`network_kind` (string, enum l1_public_mempool | l2_sequencer); `tx_kind` (string, enum swap | liquidation | nft_mint | arbitrage | transfer | governance); `value_usd` (number, 0..1000000000000.0); `slippage_bps` (integer, 0..10000): swap slippage tolerance in basis points; `max_acceptable_loss_usd` (number, 0..1000000000000.0); `private_route_available` (boolean); `revert_protection` (boolean): the private route drops reverting transactions; `has_deadline` (boolean); `submitted_route` (string, enum public | private)</INPUTS>
-<OUTPUTS>`route` (string, len max 24); `exposure` (string, len max 8); `max_sandwich_loss_usd` (number); `slippage_bps_cap` (integer, -1..10000); `route_change_required` (boolean); `verdict` (string, enum pass | warn | fail); `findings` (array of object{id*,severity*,summary*}, max 4 items)</OUTPUTS>
+<OUTPUTS>`route` (string, len max 24); `exposure` (string, len max 8); `max_sandwich_loss_usd` (number); `slippage_bps_cap` (integer, -1..10000); `route_change_required` (boolean): true only when the route is private_relay and the submission was public; `verdict` (string, enum pass | warn | fail); `findings` (array of object{id*,severity*,summary*}, max 4 items)</OUTPUTS>
 <SIDE_EFFECT_TIER>READ — handler `swarm.tools.a28_tools:mempool_privacy`; writes nothing.</SIDE_EFFECT_TIER>
 <IDEMPOTENT>idempotent</IDEMPOTENT>
 <TIMEOUT_S>5</TIMEOUT_S>
@@ -300,9 +300,9 @@ Sequence 3 (failure recovery). chain_indexer_lag returns INVALID_INPUT for one s
 1. **Network guard first:** unknown chain ids count as mainnet; a non-production environment on a mainnet or an endpoint chain id that differs from the target is a blocker; mainnet-grade targets need explicit mainnet_approved.
 2. **Approval levels:** reads L0, testnet node change L2, mainnet-grade node change L3, any validator key operation L4. Missing approval is a blocker, never a downgrade.
 3. **Diversity and capacity:** one client above 1/3 of a layer is minor, above 1/2 major, at 2/3 or more blocker. Disk above 80 % is major, above 90 % or HDD a blocker; peak IOPS above 70 % major.
-4. **RPC and finality:** drop providers above the error cap, behind max_lag_blocks or without archive; one eligible provider is major. Value up to 100x loss tolerance waits for safe (64 blocks), above that finalized (96); probabilistic chains need Nakamoto z + 1 confirmations.
+4. **RPC and finality:** drop providers above the error cap, behind max_lag_blocks or without archive; one eligible provider is major. Value up to 100x loss tolerance waits for safe (64 blocks), above that finalized (96); probabilistic chains need Nakamoto z + 1 confirmations; an observed reorg of r blocks raises the depth to at least r + 1.
 5. **Validators and bridges:** a key active on two hosts is a blocker; a standby needs an imported EIP-3076 history and at least 2 epochs of wait. Minted above locked, or overdue messages at pause_overdue_ratio, is a blocker and a human pause escalation.
-6. **Indexer freshness:** lag above 1x the freshness SLO is major, above 3x a blocker; backfill plans must show catches_up true.
+6. **Indexer freshness:** lag above 1x the freshness SLO is major, above 3x a blocker; backfill plans must show catches_up true, and a `no-log-margin` major (one average block above half the response cap) goes into the plan.
 7. **Boundary:** A11 owns generic infrastructure; A28 owns nodes, RPC, indexers, L2 and bridges. Mainnet node changes are L3, validator key operations L4 and key policy is A30's; A26 builds, A27 audits, A10 gates, A12 releases.
 </decision_logic>
 

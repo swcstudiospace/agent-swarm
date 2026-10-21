@@ -2,7 +2,7 @@
 
 # A25 RESIL — Resilience & Chaos Engineer — skills
 
-Owner: `a25-resilience`. 12 skill(s), 56489 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a25-resilience`. 12 skill(s), 57118 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 
@@ -18,7 +18,7 @@ Owner: `a25-resilience`. 12 skill(s), 56489 bytes of source. Overview: [catalog]
 | `a25-resilience--pdb-and-spread-hardening` | Use when workload manifests lack PodDisruptionBudgets, zone spread or anti-affinity, or a drain stalls; fix budgets and spread against replica and zone counts. | `resil_pdb_check`, `resil_spread_check`, `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write` |
 | `a25-resilience--post-drill-report` | Use when a drill, game day or chaos run has finished and needs a resilience.report: hypothesis result, measured RTO and RPO, defects and next due date. | `resil_drill_cadence`, `resil_restore_rto`, `resil_fmea_rpn`, `shared_artifact_digest`, `shared_open_findings`, `shared_handover_validate`, `shared_handover_write` |
 | `a25-resilience--probe-tuning` | Use when pods restart in loops, receive traffic before they are ready, or probes look wrong; tune startup, liveness and readiness against measured start time. | `resil_probe_check`, `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write` |
-| `a25-resilience--quorum-protection` | Use when a replicated StatefulSet such as etcd, ZooKeeper or Kafka must keep quorum through drains and a zone loss; check members per zone and its PDB. | `resil_quorum_safety`, `resil_pdb_check`, `resil_spread_check`, `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write` |
+| `a25-resilience--quorum-protection` | Use when a replicated StatefulSet such as etcd or ZooKeeper must keep quorum through drains and a zone loss; check members per zone and its PDB. | `resil_quorum_safety`, `resil_pdb_check`, `resil_spread_check`, `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write` |
 | `a25-resilience--resilience-regression-gate` | Use when a manifest or release change must not weaken resilience; block on new blocker or major PDB, spread, probe or shutdown findings in changed manifests. | `resil_pdb_check`, `resil_probe_check`, `resil_quorum_safety`, `shared_open_findings`, `shared_artifact_digest`, `shared_handover_validate`, `shared_handover_write` |
 
 ## Handover notes

@@ -2,7 +2,7 @@
 
 # A24 KSEC — Cluster Security & Policy Engineer — skills
 
-Owner: `a24-cluster-security`. 12 skill(s), 57692 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a24-cluster-security`. 12 skill(s), 58482 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 

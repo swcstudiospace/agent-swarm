@@ -2,7 +2,7 @@
 
 # A28 CHAIN — Blockchain Infrastructure Engineer — skills
 
-Owner: `a28-chain-infra`. 14 skill(s), 70484 bytes of source. Overview: [catalog](../catalog.md).
+Owner: `a28-chain-infra`. 14 skill(s), 71429 bytes of source. Overview: [catalog](../catalog.md).
 
 ## Index
 
