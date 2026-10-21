@@ -23,8 +23,8 @@ Owned-file rules, first match:
 
 - ``*.md`` → A15 docs
 - ``*.sql`` or a ``migrations/`` path → A07 data
-- ``*.sol``, ``*.vy``, ``foundry.toml``, ``hardhat.config.*``, or a JSON ABI (``*.abi.json``, or a ``.json`` under an ``abi/`` directory) inside ``contracts/`` → A26
-  smart contracts (API descriptors such as ``contracts/openapi.yaml`` and ``.ts``/``.py`` files under ``contracts/`` keep their code owner)
+- ``*.sol``, ``*.vy``, ``foundry.toml``, ``hardhat.config.*``, or a JSON ABI (``*.abi.json``, or a ``.json`` under an ``abi/`` directory other than an OpenAPI, Swagger, AsyncAPI or schema descriptor) inside ``contracts/`` → A26
+  smart contracts (API descriptors such as ``contracts/openapi.yaml`` and ``contracts/abi/openapi.json``, and ``.ts``/``.py`` files under ``contracts/``, keep their existing owner)
 - anything under a ``web3/`` or ``wagmi/`` directory, or a script (``.ts`` ``.tsx`` ``.js`` ``.jsx``) under ``wallet/`` → A29 dapp and wallet
 - ``kustomization.yaml``, or a ``.json``/``.yaml``/``.yml`` file under ``charts/``, ``helm/``, ``k8s/``, ``kubernetes/``,
   ``manifests/`` or ``overlays/`` that is not under a components, frontend or ui directory → A22 GitOps
@@ -95,6 +95,8 @@ _DOCKERFILE = re.compile(r"dockerfile(?:[.-][\w-]+)*")
 _SOURCE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".sh", ".sql", ".yaml", ".yml", ".toml", ".tf", ".css",
                ".html", ".json", ".sol", ".vy")
 _EVENT_CONFIG = re.compile(r"(?:asyncapi|serverless)\.(?:ya?ml|json|ts|js)")
+# JSON API descriptors (OpenAPI, Swagger, AsyncAPI, schema) are not ABIs, even under an abi/ directory.
+_API_DESCRIPTOR = re.compile(r"(?:openapi|swagger|asyncapi|api|schema)(?:[.-][\w.-]*)?\.json")
 # orch_plan stores "{prefix}-{id}". The default prefix is "T" + 4 hex + "-"
 # (6 characters). A collision fallback uses 6 hex (8 characters); the default
 # is what a fresh plan gets. A split appends "-aNN" (4). check_task_id allows
@@ -119,7 +121,8 @@ def _owner(path: str) -> str | None:
     if base.endswith(".sql") or "migrations" in dirs:
         return "A07"
     if (base.endswith((".sol", ".vy")) or base == "foundry.toml" or base.startswith("hardhat.config.")
-            or ("contracts" in dirs and base.endswith(".json") and (base.endswith(".abi.json") or "abi" in dirs))):
+            or ("contracts" in dirs and base.endswith(".json") and (base.endswith(".abi.json")
+                or ("abi" in dirs and not _API_DESCRIPTOR.fullmatch(base))))):
         return "A26"
     if any(part in _WEB3_DIRS for part in dirs) or ("wallet" in dirs and base.endswith(_SCRIPT_EXT)):
         return "A29"

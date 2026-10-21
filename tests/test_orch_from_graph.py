@@ -337,6 +337,7 @@ def test_existing_routes_still_win_where_they_always_did(tmp_path, step, owner):
     ("Edit contracts/openapi.yaml", "A05"),
     ("Edit contracts/Vault.sol", "A26"),
     ("Edit contracts/abi/Vault.json", "A26"),
+    ("Edit contracts/abi/openapi.json", "A03"),
 ])
 def test_contracts_dir_routes_only_smart_contracts_to_a26(tmp_path, step, owner):
     """An API descriptor under contracts/ keeps its code owner; Solidity and JSON ABIs go to A26."""
