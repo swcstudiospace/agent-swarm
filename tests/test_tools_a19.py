@@ -1509,3 +1509,86 @@ def test_very_long_names_are_answered_quickly_and_never_echoed():
     assert fx(result) == [("blocker", f"[backward] $.<redacted: {len(name)} chars>: accepted by the source but rejected by the closed target schema")]
     channel = aa({"asyncapi": "2.6.0", "info": {"title": "T", "version": "1"}, "channels": {name: {}}})
     assert fx(channel) == [("minor", f"channels/<redacted: {len(name)} chars>: no publish or subscribe operation")]
+
+
+# --- QA-03 regressions ----------------------------------------------------------------------------------------------
+
+
+def _tuple_items(*entries):
+    return {"type": "array", "items": list(entries)}
+
+
+def test_schema_compat_ref_siblings_apply_in_addition_to_the_target():
+    # the sibling `minimum: 0` must not replace the target's `minimum: 5`: the head still loosens the source's bound
+    base = {"type": "number", "minimum": 1}
+    head = {"$defs": {"P": {"type": "number", "minimum": 5}}, "$ref": "#/$defs/P", "minimum": 0}
+    result = compat(base, head)
+    assert (result["backward_compatible"], result["verdict"]) == (False, "fail")
+    assert fx(result) == [("major", "[backward] $: numeric lower bound loosened (target >= 5)")]
+    # the target's required `a` is still required when the sibling adds `b`
+    base = obj_schema({"a": STR, "b": STR}, ["b"], additionalProperties=False)
+    head = {"$defs": {"P": obj_schema({"a": STR, "b": STR}, ["a"], additionalProperties=False)}, "$ref": "#/$defs/P",
+            "required": ["b"]}
+    assert fx(compat(base, head)) == [
+        ("blocker", "[backward] $.a: required by the target but optional or undeclared in the source")]
+
+
+def test_schema_compat_ref_siblings_on_the_source_side_are_applied_too():
+    base = obj_schema({"a": STR, "b": STR}, ["b"])
+    head = {"$defs": {"P": obj_schema({"a": STR, "b": STR}, ["a"])}, "$ref": "#/$defs/P", "required": ["b"]}
+    result = compat(base, head, "full")
+    assert (result["backward_compatible"], result["forward_compatible"]) == (False, True)
+
+
+def test_schema_compat_tuple_form_items_are_compared_position_by_position():
+    base = _tuple_items(STR, INT)
+    assert fx(_backward(base, _tuple_items(STR, STR))) == [
+        ("blocker", "[backward] $[1]: type ['integer'] is not accepted by target type ['string']")]
+    assert _backward(base, _tuple_items(STR, STR))["backward_compatible"] is False
+    assert _backward(base, _tuple_items(STR, INT))["backward_compatible"] is True
+    assert _backward(base, {"type": "array", "items": STR})["backward_compatible"] is False  # tuple to single form
+
+
+def test_schema_compat_pointer_array_index_takes_ascii_digits_without_leading_zero():
+    base = {"allOf": [STR], "properties": {"a": {"$ref": "#/allOf/0"}}}
+    assert compat(base, copy.deepcopy(base), "full")["compatible"] is True  # index 0 resolves
+    for ref in ("#/allOf/\u00b2", "#/allOf/01"):  # superscript two passes str.isdigit(); RFC 6901 forbids a leading zero
+        base["properties"]["a"]["$ref"] = ref
+        result = invalid("event_schema_compat", {"format": "json-schema", "mode": "backward", "base_schema": json.dumps(base),
+                                                 "head_schema": json.dumps({"type": "object"})}, "base_schema")
+        assert "does not resolve" in result["message"]
+
+
+def test_asyncapi_cyclic_message_one_of_is_reported_once_not_recursed():
+    loop = {"oneOf": [{"$ref": "#/components/messages/M"}]}
+    doc3 = {"asyncapi": "3.0.0", "info": {"title": "t", "version": "1"},
+            "channels": {"c": {"address": "a", "messages": {"m": {"$ref": "#/components/messages/M"}}}},
+            "components": {"messages": {"M": loop}}}
+    assert fx(aa(doc3)) == [("major", "channels/c/messages/m/oneOf/0: message $ref is cyclic: a oneOf refers back to itself")]
+    doc2 = {"asyncapi": "2.6.0", "info": {"title": "t", "version": "1"},
+            "channels": {"c": {"subscribe": {"operationId": "s", "message": {"$ref": "#/components/messages/M"}}}},
+            "components": {"messages": {"M": loop}}, "servers": {"s": {"url": "u", "protocol": "kafka"}}}
+    assert ("major", "channels/c/subscribe/message/oneOf/0: message $ref is cyclic: a oneOf refers back to itself") in fx(aa(doc2))
+
+
+def test_asyncapi_version_is_echoed_only_through_the_redaction_rule():
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    result = aa({"asyncapi": f"3.0.0-{secret}", "info": {"title": "t", "version": "1"}, "channels": {}})
+    assert secret not in json.dumps(result) and result["asyncapi_version"] == "<redacted: 26 chars>"
+    unsupported = aa({"asyncapi": f"1.0.0-{secret}", "info": {"title": "t", "version": "1"}})
+    assert secret not in json.dumps(unsupported)
+    assert fx(unsupported) == [("blocker", "AsyncAPI <redacted: 26 chars> is not supported by this lint (2.x and 3.x)")]
+
+
+def test_retry_queue_redelivery_refuses_a_visibility_timeout_beyond_the_sqs_maximum():
+    over = retry(base_delay_s=1, max_delay_s=2, max_attempts=2, processing_timeout_s=10, visibility_timeout_s=50000, budget_s=1e6)
+    assert (over["fits_visibility"], over["verdict"]) == (False, "fail")
+    assert fx(over) == [("major", "visibility timeout 50000 s exceeds the 43200 s SQS maximum")]
+    edge = retry(base_delay_s=1, max_delay_s=2, max_attempts=2, processing_timeout_s=10, visibility_timeout_s=43200, budget_s=1e6)
+    assert edge["fits_visibility"] is True and edge["findings"] == []
+
+
+def test_ordering_without_an_entity_key_is_not_reported_as_ordered():
+    result = order(order_required=False, entity_key_fields=[])
+    assert (result["ordered"], result["verdict"]) == (False, "pass")
+    assert fx(result) == [("info", "entity_key_fields is empty: per-entity order cannot be judged, so ordered is false")]

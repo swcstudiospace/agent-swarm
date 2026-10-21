@@ -236,6 +236,9 @@ def _anchor(root, name: str):
     return None
 
 
+_ARRAY_INDEX = re.compile(r"0|[1-9][0-9]{0,8}")  # RFC 6901 array index: ASCII digits, no leading zero
+
+
 def _pointer(root, ref: str):
     """Resolve a local reference ("#", "#/a/b" as an RFC 6901 pointer in a percent-encoded fragment, or "#anchor");
     None when it does not resolve. An empty reference token is a real (empty) key, not a skipped segment."""
@@ -251,7 +254,7 @@ def _pointer(root, ref: str):
         part = part.replace("~1", "/").replace("~0", "~")
         if isinstance(node, dict) and part in node:
             node = node[part]
-        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+        elif isinstance(node, list) and _ARRAY_INDEX.fullmatch(part) and int(part) < len(node):
             node = node[int(part)]
         else:
             return None
@@ -297,42 +300,90 @@ def _value_fits(value, types: set) -> bool:
     return "array" in types if isinstance(value, list) else "object" in types
 
 
+def _position(items, extra, index: int):
+    """The schema of array position `index`: a tuple entry, the schema past the tuple, or the one `items` schema."""
+    if not isinstance(items, list):
+        return items
+    return items[index] if index < len(items) else extra
+
+
 class _JsonCompare:
     """Does every instance valid under `sub` stay valid under `sup`? Sound for the supported keyword set: where it cannot
     decide (a keyword in `_UNANALYSED` that differs, a oneOf whose alternatives it cannot prove exclusive, an unresolvable
     pattern) it reports a major finding rather than a pass. Keywords of `sub` that are ignored only make it stricter.
-    Siblings of a `$ref` apply to `sup` (Draft 2019-09 and later) and are ignored for `sub` (Draft 7 and earlier)."""
+    Siblings of a `$ref` apply in addition to its target on both sides (Draft 2019-09 and later)."""
 
     def __init__(self, base, head):
         self.roots = {"base": base, "head": head}
         self.nodes = 0
         self.stack: set = set()
         self.unanalysed: set = set()
+        self.cache: dict = {}  # derived schemas keep one identity, so the cycle check recognises them
 
     @staticmethod
     def _field(side: str) -> str:
         return f"{side}_schema"
 
-    def _resolve(self, schema, side: str, merge: bool = True):
-        for _ in range(20):
-            if isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
-                target = _pointer(self.roots[side], schema["$ref"])
-                if target is None:
-                    raise _Bad(self._field(side), f"$ref {_safe(schema['$ref'], 60)!r} does not resolve inside the document")
-                siblings = {k: v for k, v in schema.items() if k != "$ref" and k not in _ANNOTATIONS} if merge else {}
-                if target is False:
-                    return False
-                if siblings and target is True:
-                    schema = siblings
-                elif siblings and isinstance(target, dict):
-                    schema = {**target, **siblings}
+    def _conjuncts(self, schema, side: str, depth: int = 0) -> list:
+        """The schemas whose conjunction `schema` denotes. A `$ref` contributes its target, and its sibling keywords apply
+        in addition (Draft 2019-09 and later, on both sides). Booleans may appear in the list."""
+        if depth > 20:
+            raise _Bad(self._field(side), "$ref chain is too long or cyclic")
+        if isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
+            target = _pointer(self.roots[side], schema["$ref"])
+            if target is None:
+                raise _Bad(self._field(side), f"$ref {_safe(schema['$ref'], 60)!r} does not resolve inside the document")
+            siblings = self._siblings(schema)
+            return [*self._conjuncts(target, side, depth + 1), *([siblings] if siblings else [])]
+        if not isinstance(schema, (dict, bool)):
+            raise _Bad(self._field(side), "every schema must be an object or a boolean")
+        return [schema]
+
+    def _siblings(self, schema: dict) -> dict:
+        """The non-annotation keywords beside a `$ref`, cached per node so that the cycle check sees a stable identity."""
+        key = ("siblings", id(schema))
+        if key not in self.cache:
+            self.cache[key] = ({k: v for k, v in schema.items() if k != "$ref" and k not in _ANNOTATIONS}, schema)
+        return self.cache[key][0]
+
+    def _merged(self, parts: list):
+        """A schema at least as weak as the conjunction of `parts`, so a proof for it proves the conjunction. None when
+        if/then/else come from two parts, which cannot be merged keyword by keyword. Cached per list of parts."""
+        key = ("merged", tuple(id(part) for part in parts))
+        if key not in self.cache:
+            self.cache[key] = (self._merge(parts), parts)
+        return self.cache[key][0]
+
+    @staticmethod
+    def _merge(parts: list):
+        if sum(1 for part in parts if isinstance(part, dict) and {"if", "then", "else"} & part.keys()) > 1:
+            return None
+        merged: dict = {}
+        for part in parts:
+            for key, value in part.items():
+                if key not in merged:
+                    merged[key] = value
+                elif key in ("properties", "patternProperties") and isinstance(merged[key], dict) and isinstance(value, dict):
+                    merged[key] = {**merged[key], **value}  # a name keeps the constraint of the side that declares it
+                elif key == "required" and isinstance(merged[key], list) and isinstance(value, list):
+                    merged[key] = merged[key] + [name for name in value if name not in merged[key]]
+                elif key == "additionalProperties":
+                    merged[key] = False if merged[key] is False or value is False else value
                 else:
-                    schema = target
-                continue
-            if not isinstance(schema, (dict, bool)):
-                raise _Bad(self._field(side), "every schema must be an object or a boolean")
-            return schema
-        raise _Bad(self._field(side), "$ref chain is too long or cyclic")
+                    merged[key] = value  # a keyword alone is implied by the conjunction it came from
+        return merged
+
+    def _flat(self, schema, side: str):
+        """A schema at least as weak as `schema`, for the disjointness test; True when no proof is possible."""
+        parts = [part for part in self._conjuncts(schema, side) if part is not True]
+        if any(part is False for part in parts):
+            return False
+        if not parts:
+            return True
+        if len(parts) == 1:
+            return parts[0]
+        merged = self._merged(parts)
+        return True if merged is None else merged
 
     def _types(self, node: dict, side: str):
         declared = node.get("type")
@@ -350,25 +401,53 @@ class _JsonCompare:
         return text == _canon(sup) and "$ref" not in text
 
     def compare(self, sub, sub_side: str, sup, sup_side: str, path: str, out: list) -> None:
+        """Every instance valid under `sub` is valid under `sup`; findings cover the parts that are not provably valid. Both
+        sides are conjunctions (see _conjuncts). The source is accepted against one target part when one of its conjuncts
+        alone is, or when their merged superset is; otherwise the findings of the merged superset are reported."""
         self.nodes += 1
         if self.nodes > _NODE_BUDGET:
             raise _Bad(self._field(sub_side), "schema comparison exceeds the node budget; split the schema")
-        sub, sup = self._resolve(sub, sub_side, merge=False), self._resolve(sup, sup_side)
-        if sup is True or sub is False:
-            return
-        if sup is False:
-            out.append(("blocker", f"{path}: no longer accepted (the target schema is `false`)"))
-            return
-        key = (id(sub), id(sup))
-        if key in self.stack:
-            return
-        self.stack.add(key)
-        if len(self.stack) > _MAX_DEPTH:
-            raise _Bad(self._field(sub_side), f"schema nesting exceeds {_MAX_DEPTH} levels after resolving $ref")
-        try:
-            self._body(sub if sub is not True else {}, sub_side, sup, sup_side, path, out)
-        finally:
-            self.stack.discard(key)
+        sub_all = self._conjuncts(sub, sub_side)
+        if any(part is False for part in sub_all):
+            return  # the source accepts nothing
+        sub_parts = [part for part in sub_all if part is not True]
+        for part in self._conjuncts(sup, sup_side):
+            if part is True:
+                continue
+            if part is False:
+                out.append(("blocker", f"{path}: no longer accepted (the target schema is `false`)"))
+                return
+            merged = None
+            if not sub_parts:
+                candidates = [{}]
+            elif len(sub_parts) == 1:
+                candidates = sub_parts
+            else:
+                merged = self._merged(sub_parts)
+                candidates = sub_parts if merged is None else [*sub_parts, merged]
+            trials, accepted = [], False
+            for candidate in candidates:
+                trial: list = []
+                key = (id(candidate), id(part))
+                if key not in self.stack:  # a pair met again is a $ref cycle, already being decided further up
+                    self.stack.add(key)
+                    if len(self.stack) > _MAX_DEPTH:
+                        raise _Bad(self._field(sub_side), f"schema nesting exceeds {_MAX_DEPTH} levels after resolving $ref")
+                    try:
+                        self._body(candidate, sub_side, part, sup_side, path, trial)
+                    finally:
+                        self.stack.discard(key)
+                if not trial:
+                    accepted = True
+                    break
+                trials.append(trial)
+            if accepted:
+                continue
+            if merged is None and len(sub_parts) > 1:
+                out.append(("major", f"{path}: the $ref siblings combine if/then/else, which cannot be merged: "
+                                     "compatibility is not proven"))
+            else:
+                out.extend(trials[-1])
 
     def _body(self, sub: dict, ss: str, sup: dict, ps: str, path: str, out: list) -> None:
         for keyword in _UNANALYSED:
@@ -443,7 +522,7 @@ class _JsonCompare:
         set that fits no type of the other, or a required property whose two schemas are disjoint (a discriminator)."""
         if depth > 6:
             return False
-        first, second = self._resolve(first, fs), self._resolve(second, ss)
+        first, second = self._flat(first, fs), self._flat(second, ss)
         if first is False or second is False:
             return True
         if first is True or second is True:
@@ -536,8 +615,14 @@ class _JsonCompare:
             out.append(("major", f"{path}: target requires uniqueItems but the source does not"))
         sub_items, sup_items = sub.get("items", True), sup.get("items", True)
         if isinstance(sub_items, list) or isinstance(sup_items, list):
-            if _canon(sub_items) != _canon(sup_items):
-                self.unanalysed.add((path, "items (tuple form)"))
+            # tuple form: position by position, then the schema past the tuples (additionalItems, or items in single form)
+            sub_extra, sup_extra = sub.get("additionalItems", True), sup.get("additionalItems", True)
+            width = max(len(items) for items in (sub_items, sup_items) if isinstance(items, list))
+            for index in range(width):
+                self.compare(_position(sub_items, sub_extra, index), ss, _position(sup_items, sup_extra, index), ps,
+                             f"{path}[{index}]", out)
+            self.compare(_position(sub_items, sub_extra, width), ss, _position(sup_items, sup_extra, width), ps,
+                         f"{path}[]", out)
             return
         self.compare(sub_items, ss, sup_items, ps, f"{path}[]", out)
 
@@ -578,8 +663,8 @@ class _JsonCompare:
                                  "provably accept"))
 
     def _constrains(self, schema, side: str) -> bool:
-        resolved = self._resolve(schema, side)
-        return resolved is False or (isinstance(resolved, dict) and any(k not in _ANNOTATIONS for k in resolved))
+        return any(part is False or (isinstance(part, dict) and any(k not in _ANNOTATIONS for k in part))
+                   for part in self._conjuncts(schema, side))
 
 
 def _json_schema_compat(base, head) -> tuple[list, list, list]:
@@ -916,12 +1001,17 @@ def _asyncapi_refs(document, raw: list) -> None:
             stack.extend((f"{where}/{i}", v) for i, v in enumerate(node))
 
 
-def _asyncapi_message(message, document, where: str, default_ct: bool, raw: list, counted: set) -> None:
+def _asyncapi_message(message, document, where: str, default_ct: bool, raw: list, counted: set, chain: tuple = ()) -> None:
+    """A message or a oneOf of messages. `chain` holds the ids of the $ref targets already on the walk: meeting one again
+    is a cycle, reported once and not followed."""
     if isinstance(message, dict) and isinstance(message.get("$ref"), str):
         target = _pointer(document, message["$ref"])
         if target is None:
             return  # reported by the global $ref walk
-        message, counted_as = target, message["$ref"]
+        if id(target) in chain:
+            raw.append(("major", f"{where}: message $ref is cyclic: a oneOf refers back to itself"))
+            return
+        message, counted_as, chain = target, message["$ref"], (*chain, id(target))
     else:
         counted_as = where
     if not isinstance(message, dict):
@@ -929,7 +1019,7 @@ def _asyncapi_message(message, document, where: str, default_ct: bool, raw: list
         return
     if isinstance(message.get("oneOf"), list):
         for index, alt in enumerate(message["oneOf"]):
-            _asyncapi_message(alt, document, f"{where}/oneOf/{index}", default_ct, raw, counted)
+            _asyncapi_message(alt, document, f"{where}/oneOf/{index}", default_ct, raw, counted, chain)
         return
     counted.add(counted_as)
     if "payload" not in message:
@@ -962,7 +1052,7 @@ def asyncapi_lint(payload: dict) -> dict:
         default_ct = isinstance(document.get("defaultContentType"), str) and bool(document["defaultContentType"])
         operations_seen, messages = 0, set()
         if major not in (2, 3):
-            raw.append(("blocker", f"AsyncAPI {version} is not supported by this lint (2.x and 3.x)"))
+            raw.append(("blocker", f"AsyncAPI {_safe(version, 40)} is not supported by this lint (2.x and 3.x)"))
             channels = None
         elif major == 2:
             if not isinstance(channels, dict):
@@ -1040,7 +1130,8 @@ def asyncapi_lint(payload: dict) -> dict:
                             raw.append(("blocker", f"servers/{_safe(name, 60)}: {key} is required"))
         _asyncapi_refs(document, raw)
         verdict, findings = _wrap(raw, "AA")
-        return {"state": "SUCCESS", "asyncapi_version": version, "channels": len(channels) if isinstance(channels, dict) else 0,
+        return {"state": "SUCCESS", "asyncapi_version": _safe(version, 40),
+                "channels": len(channels) if isinstance(channels, dict) else 0,
                 "operations": operations_seen, "messages": len(messages), "verdict": verdict, "findings": findings}
 
     return respond(payload, work)
@@ -1192,6 +1283,9 @@ def retry_schedule(payload: dict) -> dict:
                 raw.append(("blocker", f"in-process retries take up to {_n(worst)} s, beyond the {_n(visibility)} s visibility "
                                        "timeout: the message becomes visible again mid-retry"))
         else:
+            if visibility > SQS_MAX_VISIBILITY_S:
+                fits_visibility = False
+                raw.append(("major", f"visibility timeout {_n(visibility)} s exceeds the {SQS_MAX_VISIBILITY_S} s SQS maximum"))
             longest = max((_dec(s["delay_max_s"]) for s in schedule), default=Decimal(0))
             if longest + processing > SQS_MAX_VISIBILITY_S:
                 fits_visibility = False
@@ -1359,6 +1453,9 @@ def ordering_check(payload: dict) -> dict:
             elif unit:
                 notes.append(("info", f"partitions_will_change does not apply to {broker}: its ordering unit ({unit}) is not a fixed "
                                       "partition set"))
+        entity_unknown = bool(unit) and keyed and not entity
+        if entity_unknown:
+            notes.append(("info", "entity_key_fields is empty: per-entity order cannot be judged, so ordered is false"))
         raw: list[tuple[str, str]] = list(notes)
         if needed and not unit:
             raw.append(("blocker", "eventbridge (classic event bus) gives no ordering guarantee; the Custom Event Bus orders per event "
@@ -1369,7 +1466,7 @@ def ordering_check(payload: dict) -> dict:
         else:
             raw += [("info", f"order is not required here; for information: {text}") for _, text in breaks]
         verdict, findings = _wrap(raw, "OR")
-        ordered = bool(unit) and not any(sev in ("blocker", "major") for sev, _ in breaks)
+        ordered = bool(unit) and not entity_unknown and not any(sev in ("blocker", "major") for sev, _ in breaks)
         return {"state": "SUCCESS", "ordering_unit": unit, "ordered": ordered, "verdict": verdict, "findings": findings}
 
     return respond(payload, work)

@@ -148,9 +148,11 @@ def test_avsc_files_are_validated_as_avro(repo):
     put(repo, "schemas/unknown.avsc", {"type": "record", "name": "R", "fields": [{"name": "a", "type": "Missing"}]})
     code, result = cli(repo)
     assert code == 1
-    assert rules(result) == [("blocker", "avro-invalid", "schemas/broken.avsc"), ("blocker", "avro-invalid", "schemas/unknown.avsc")]
+    assert rules(result) == [("blocker", "avro-invalid", "schemas/broken.avsc"), ("blocker", "avro-invalid", "schemas/unknown.avsc"),
+                             ("major", "scan-incomplete", ".")]
     assert result["findings"][0]["summary"] == "the .avsc file is not valid JSON"
     assert "unknown Avro type reference 'Missing'" in result["findings"][1]["summary"]
+    assert "schemas/broken.avsc: not parseable, not analysed" in result["findings"][2]["summary"]
     assert result["scanned"]["avro"] == 2 and result["scanned"]["unparsable"] == 1
 
 
@@ -176,7 +178,11 @@ def test_oversized_binary_and_symlinked_files_are_skipped(repo, tmp_path):
     (repo / "linkdir").symlink_to(outside, target_is_directory=True)
     put(repo, "ok/asyncapi.json", ASYNCAPI)
     code, result = cli(repo)
-    assert code == 0 and result["findings"] == []
+    assert code == 1 and result["status"] == "fail" and rules(result) == [("major", "scan-incomplete", ".")]
+    reasons = result["findings"][0]["summary"]
+    assert all(text in reasons for text in ("big/asyncapi.json: larger than 1048576 bytes, not analysed",
+                                            "bin/asyncapi.json: binary, not analysed", "link.json: symbolic link not followed",
+                                            "linkdir: symbolic link not followed"))
     scanned = result["scanned"]
     assert (scanned["skipped_large"], scanned["skipped_binary"], scanned["skipped_symlink"], scanned["asyncapi"]) == (1, 1, 2, 1)
 
@@ -195,9 +201,9 @@ def test_scan_stops_after_2000_files_and_reports_it(repo):
         put(repo, f"data/f{index:04d}.txt", "x")
     put(repo, "zz/asyncapi.json", {**ASYNCAPI, "info": {}})  # sorted after data/: beyond the cap
     code, result = cli(repo)
-    assert code == 0 and result["scanned"]["files_visited"] == 2000 and result["scanned"]["truncated"] is True
-    assert result["scanned"]["asyncapi"] == 0
-    assert rules(result) == [("info", "scan-truncated", ".")]
+    assert code == 1 and result["status"] == "fail" and result["scanned"]["files_visited"] == 2000
+    assert result["scanned"]["truncated"] is True and result["scanned"]["asyncapi"] == 0
+    assert rules(result) == [("major", "scan-incomplete", "."), ("info", "scan-truncated", ".")]
 
 
 def test_exactly_2000_files_are_not_truncated(repo):
@@ -353,9 +359,10 @@ def test_yaml_schema_comparison_is_skipped_without_pyyaml(repo, monkeypatch, cap
     script = module.AgentScript("A19", "event_schema_check", module.run, add_args=module.add_args)
     code = script.main(["--json", "--root", str(repo), "--base", "base.yaml", "--head", "head.json"])
     result = json.loads(capsys.readouterr().out)
-    assert code == 0 and result["status"] == "ok" and result["comparison"]["performed"] is False
+    assert code == 1 and result["status"] == "fail" and result["comparison"]["performed"] is False
     assert result["skipped"][0] == {"check": "schema-compat", "reason": "skipped:tool-missing", "tool": "PyYAML", "files": 1}
-    assert result["findings"][0]["summary"] == "skipped:tool-missing: PyYAML is needed to read base.yaml"
+    assert ("major", "scan-incomplete", ".") in rules(result) and ("info", "tool-missing", "base.yaml") in rules(result)
+    assert "base.yaml: PyYAML is needed to read it, schema comparison not performed" in result["findings"][0]["summary"]
 
 
 def test_yaml_schema_files_are_compared_with_pyyaml(repo):
@@ -414,5 +421,31 @@ def test_fifo_named_like_a_json_descriptor_is_skipped_and_the_valid_file_is_stil
                           env=env, cwd=str(repo.parent), check=False, timeout=60)
     assert "Traceback" not in proc.stderr, proc.stderr
     result = json.loads(proc.stdout)
-    assert proc.returncode == 0 and result["findings"] == []
+    assert proc.returncode == 1 and [(f["severity"], f["rule"]) for f in result["findings"]] == [("major", "scan-incomplete")]
+    assert "e/a.json: unreadable, not analysed" in result["findings"][0]["summary"]
     assert result["scanned"]["cloudevents"] == 1 and result["scanned"]["skipped_binary"] == 1
+
+
+# --- QA-03 regressions ----------------------------------------------------------------------------------------------
+
+
+def test_cloudevents_array_beyond_200_events_is_incomplete_not_ok(repo):
+    put(repo, "events/big.json", [EVENT] * 200 + [{**EVENT, "id": ""}])
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert result["scanned"]["cloudevents"] == 200
+    assert [(f["severity"], f["rule"], f["location"]) for f in result["findings"]] == [
+        ("major", "scan-incomplete", "."), ("major", "cloudevents", "events/big.json")]
+    assert "events/big.json: 201 events in one array, events after the first 200 not validated" in result["findings"][0]["summary"]
+
+
+def test_avro_is_detected_in_json_files_and_list_typed_json_schema_does_not_crash(repo):
+    put(repo, "base.json", {"type": "array", "items": "int"})
+    put(repo, "head.json", {"type": "array", "items": "long"})
+    code, result = cli(repo, "--base", "base.json", "--head", "head.json")
+    assert code == 0 and result["status"] == "ok"
+    assert result["comparison"]["format"] == "avro" and result["comparison"]["backward_compatible"] is True
+    put(repo, "typed-base.json", {"type": ["string", "null"]})
+    put(repo, "typed-head.json", {"type": ["string", "null"]})
+    code, result = cli(repo, "--base", "typed-base.json", "--head", "typed-head.json")
+    assert code == 0 and result["status"] == "ok" and result["comparison"]["format"] == "json-schema"
