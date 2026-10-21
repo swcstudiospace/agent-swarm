@@ -837,3 +837,15 @@ def test_a_call_credits_only_the_overload_its_argument_types_select():  # round 
     literal = text.replace("_log(v);", "_log(1);")
     # a literal argument has no declared type: every overload is a possible target, and the base's emitting overload does not hold
     assert [rule for rule, _, _ in findings(literal) if rule == "SOL-MISSING-EVENT"] == ["SOL-MISSING-EVENT"]
+
+
+def test_a_check_inside_a_conditional_for_condition_does_not_guard_the_write_after_it():  # round 3: _Ends keeps its control heads
+    text = ("pragma solidity 0.8.28;\ncontract C {\n    address owner;\n    uint256 public x;\n"
+            "    function _checkOwner() internal view returns (bool) {\n"
+            "        require(msg.sender == owner);\n        return false;\n    }\n"
+            "    function mint(bool audit) external {\n        if (audit) for (; _checkOwner(); ) { break; }\n        x++;\n    }\n}\n")
+    # mint(false) skips the owner check and writes x: the access matrix must flag mint
+    access_matrix = importlib.import_module("swarm.tools.a26_tools").access_matrix
+    result = access_matrix({"source": text, "contract": "C"})
+    assert result["verdict"] == "fail" and result["unprotected"] == 1 and result["guarded"] == 0
+    assert [f["id"] for f in result["findings"]] == ["ACCESS-UNPROTECTED-PRIVILEGED"]

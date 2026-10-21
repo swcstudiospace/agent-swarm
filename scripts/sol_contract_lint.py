@@ -1518,7 +1518,7 @@ class _CallSites:
                 paren_stack.pop()
         self.heads: list[tuple[int, str, int]] = [
             (m.start(), m.group(1) or "return", m.end() - 1 if m.group(1) else -1)
-            for m in _HEAD_AT.finditer(clean)]
+            for m in _CHECK_HEAD.finditer(clean)]
         self._head_starts = [h[0] for h in self.heads]
 
     def _expression_braces(self) -> set[int]:
@@ -1765,7 +1765,7 @@ _BINDING_CAP = 256  # characters before the `=` of a call's binding that are rea
 _ASSIGN_AFTER = re.compile(r"\s*(?:<<|>>|[-+*/%&|^])?=(?![=>])")  # a write to the name: `ok = `, `ok += `; not `ok == `
 _DECL_BEFORE = re.compile(r"\b(?:bool|address|string|bytes\d*|u?int\d*|byte|[A-Z]\w*)\s+(?:(?:memory|storage|calldata)\s+)?\Z")
 _REVERT_OR_RETURN = re.compile(r"(?:revert|return|throw)\b")
-_HEAD_AT = re.compile(r"\b(?:(require|assert|if)\s*\(|(return)\b)")  # a check head: its keyword and '(' (or a return)
+_CHECK_HEAD = re.compile(r"\b(?:(require|assert|if)\s*\(|(return)\b)")  # a check head: its keyword and '(' (or a return)
 
 
 def _slots(text: str) -> list[str]:
