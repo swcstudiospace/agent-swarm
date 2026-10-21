@@ -17,8 +17,8 @@ jobs:
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
-      - name: install pytest
-        run: python3 -m pip install pytest ruff
+      - name: install test dependencies
+        run: python3 -m pip install pytest ruff pyyaml cryptography
       - name: ruff
         run: ruff check .
       - name: pytest
