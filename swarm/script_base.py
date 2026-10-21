@@ -35,11 +35,37 @@ ROOT = Path(__file__).resolve().parent.parent
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
+_ID_FIRST = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+_ID_CHARS = _ID_FIRST | frozenset("._-")
+
+
+def _is_safe_id(value: str) -> bool:
+    return bool(TASK_ID_RE.fullmatch(value)) and ".." not in value
+
+
+def _logged_id(value: str | None) -> str | None:
+    """The id as the run log may carry it: an absent id stays absent, a safe id stays, an invalid one is dropped."""
+    return value if value is None or _is_safe_id(value) else None
+
+
+def _broken_id_rule(value: str) -> str:
+    """The first rule of the canonical id shape that `value` breaks, named without the value itself."""
+    if not value:
+        return "is empty"
+    if len(value) > 128:
+        return "is longer than 128 characters"
+    if value[0] not in _ID_FIRST:
+        return "does not start with a letter or digit"
+    if any(c not in _ID_CHARS for c in value):
+        return "contains a character outside [A-Za-z0-9._-]"
+    return "contains '..'"
+
+
 def check_task_id(value: str, what: str = "task id") -> str:
-    """Return `value` if it is a safe task id, else E-INPUT."""
-    if not TASK_ID_RE.fullmatch(value) or ".." in value:
-        raise SwarmError(ErrorCode.E_INPUT, f"invalid {what} {value!r}: use [A-Za-z0-9._-], starting alphanumeric, "
-                                            "no '..', at most 128 chars")
+    """Return `value` if it is a safe task id, else E-INPUT. The message names the rule broken and the length; it never echoes the value."""
+    if not _is_safe_id(value):
+        raise SwarmError(ErrorCode.E_INPUT, f"invalid {what}: {len(value)} characters, {_broken_id_rule(value)}; "
+                                            "expected [A-Za-z0-9._-], starting alphanumeric, no '..', at most 128 chars")
     return value
 
 
@@ -97,6 +123,8 @@ class AgentScript:
             policy_fail = any(f.get("severity") in ("blocker", "major") for f in findings)
             return self.EXIT_FAIL if result.get("status") == "fail" or policy_fail else self.EXIT_OK
         except SwarmError as e:
+            # the run log carries task_id and correlation_id verbatim: an id that failed the shape check is never written to it
+            ctx.task_id, ctx.correlation_id = _logged_id(ctx.task_id), _logged_id(ctx.correlation_id)
             err = {"agent": self.agent_id, "script": self.name, "status": "error", "error": e.to_dict()}
             ctx.emit(f"script.{self.name}.error", err)
             self._print(err, args.json)

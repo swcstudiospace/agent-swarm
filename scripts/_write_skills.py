@@ -143,7 +143,7 @@ Don't use for: pure questions ("what is"), `/uplift`, `/think`.
 ## Procedure
 
 1. Identify the target application repo (`--repo` or cwd).
-2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency|cloud-native|cluster|web3 --json`
+2. `python3 $SWARM_ROOT/scripts/orch_plan.py --repo <app> --brief-text "<user request>" --pattern feature|hotfix|dependency|cloud-native|cluster|web3|parallel --json`
    (or `bun scripts/ts/orch_plan.ts` with the same flags).
 3. Spawn subagent `a01-orchestrator` (Claude Agent tool / Grok `spawn_subagent` `subagent_type=a01-orchestrator`) with the plan JSON and the user brief.
 4. A01 plans and spawns: {slugs}.

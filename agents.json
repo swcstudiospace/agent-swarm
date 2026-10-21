@@ -77305,6 +77305,10 @@
               "collateral_surplus": {
                 "type": "number"
               },
+              "collateral_surplus_exact": {
+                "type": "string",
+                "description": "exact decimal text of collateral_surplus, not rounded"
+              },
               "undercollateralized": {
                 "type": "boolean"
               },
