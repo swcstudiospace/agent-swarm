@@ -626,6 +626,34 @@ test("real orch_plan: the same brief reuses one plan; a different brief gets its
   expect(others).toContain(other.payload.ready_tasks[0]);
 });
 
+test("reused plan with a whole-number stored metric still dispatches a verifiable assignment", async () => {
+  // JS has one number type: the bridge would read 100.0 back as 100. The controller must sign the form that survives.
+  const repo = gitRepo();
+  process.env.SWARM_DIR = tmpDir("swarm-omp-metric-");
+  const args = [`--root=${repo}`, `--brief-text=${BRIEF}`, `--correlation-id=${BRIEF_CORR}`];
+  const initial = await runPy({ script: "orch_plan", args, cwd: repo });
+  expect(initial.json.execution_assignment_verified).toBe(true);
+  const taskId = (initial.json.tasks as Array<{ task_id: string }>)[0].task_id;
+  const recorded = Bun.spawnSync(["python3", "-c", `
+import json, sys
+from swarm.taskstore import TaskStore
+store = TaskStore(root=sys.argv[1])
+store.update(sys.argv[2], notes=json.dumps(dict(store.get(sys.argv[2])["notes_json"], result={"metric": 100.0, "ratio": 0.5})))
+`, repo, taskId], { cwd: REPO_ROOT, env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+  expect(recorded.stderr.toString()).toBe("");
+  expect(recorded.exitCode).toBe(0);
+  const log: CallLog = [];
+  const pi = fakePi({ sendUserMessage: (text) => void log.push({ call: "sendUserMessage", text }) });
+  pi.load(createSwarmExtension({ bridge: runPy }));
+  await pi.command("swarm").handler(BRIEF, commandCtx(repo, [], { log }));
+  const text = dispatchText(log) ?? "";
+  expect(text).not.toContain("100.0");
+  const envelope = payload(text);
+  const signed = envelope.payload as { inputs: Array<{ tasks: Array<{ task_id: string; notes: { result?: unknown } }> }> };
+  expect(signed.inputs[0].tasks.find((task) => task.task_id === taskId)?.notes.result).toEqual({ metric: 100, ratio: 0.5 });
+  expect(dispatchEvidence(envelope, BRIEF_CORR)).toEqual({ verified: true, authorized: true });
+});
+
 test("reused live plan dispatches newly ready dependencies, not its stale initial snapshot", async () => {
   const repo = gitRepo();
   process.env.SWARM_DIR = tmpDir("swarm-omp-dir-");

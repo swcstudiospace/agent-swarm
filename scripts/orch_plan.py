@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -274,6 +275,30 @@ def _reuse_result(store: TaskStore, ctx, corr: str, pattern: str) -> dict:
         "summary": f"reused existing plan for correlation {corr} ({len(tasks)} tasks, no changes)"})
 
 
+_JS_SAFE_INT = 2 ** 53 - 1
+
+
+def _json_safe(value):
+    """The one number form signer and verifier share. JavaScript has a single number type, so the TS bridge turns
+    100.0 into 100 on the way back; a signature over 100.0 would then cover different bytes. Whole floats therefore
+    sign as ints. A number JSON cannot round-trip exactly fails closed rather than being signed."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or (value.is_integer() and abs(value) > _JS_SAFE_INT):
+            raise SwarmError(ErrorCode.E_CONTRACT, "controller assignment carries a number JSON cannot round-trip")
+        return int(value) if value.is_integer() else value
+    if isinstance(value, int):
+        if abs(value) > _JS_SAFE_INT:
+            raise SwarmError(ErrorCode.E_CONTRACT, "controller assignment carries a number JSON cannot round-trip")
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    raise SwarmError(ErrorCode.E_CONTRACT, "controller assignment carries a value that is not JSON")
+
+
 def _execution_result(store: TaskStore, ctx, result: dict) -> dict:
     """Authenticate a controller kickoff from persisted tasks, without claiming any work."""
     if any(os.environ.get(name) == "1" for name in ("SWARM_AGENT_SESSION", "SWARM_CHILD")):
@@ -310,7 +335,7 @@ def _execution_result(store: TaskStore, ctx, result: dict) -> dict:
                                and store.deps_satisfied(t, tasks)], "inputs": [plan],
                "acceptance": acceptance, "budget": budget, "risk_class": risk}
     assignment = build_envelope(source="A01@controller", target="A01", msg_type="task.assign",
-                                correlation_id=corr, payload=payload, risk_class=risk)
+                                correlation_id=corr, payload=_json_safe(payload), risk_class=risk)
     sign_envelope(assignment, root=ctx.root)
     if not real_key_configured() or not verify_envelope(assignment):
         raise SwarmError(ErrorCode.E_POLICY, "fail-closed: controller assignment signature invalid")

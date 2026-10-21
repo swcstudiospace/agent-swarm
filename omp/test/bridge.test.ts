@@ -10,12 +10,13 @@ import { runScript, SwarmToolError, swarmRoot } from "../src/bridge.ts";
 import { createSwarmExtension } from "../src/index.ts";
 import { callTool, fakeCtx, fakePi, gitRepo, isolateEnv, REPO_ROOT, tmpDir } from "./helpers.ts";
 
-isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "PATH");
+isolateEnv("SWARM_DIR", "SWARM_ROOT", "SWARM_TASK_ID", "SWARM_CORRELATION_ID", "SWARM_ED25519_KEY_FILE", "PATH");
 
 const FIXTURES: Record<string, string> = {
   fx_env: `import json, os, sys
 print(json.dumps({"status": "ok", "SWARM_DIR": os.environ.get("SWARM_DIR"), "SWARM_TASK_ID": os.environ.get("SWARM_TASK_ID"),
-                  "SWARM_CORRELATION_ID": os.environ.get("SWARM_CORRELATION_ID"), "cwd": os.getcwd(), "argv": sys.argv[1:]}))
+                  "SWARM_CORRELATION_ID": os.environ.get("SWARM_CORRELATION_ID"), "cwd": os.getcwd(), "argv": sys.argv[1:],
+                  "SWARM_ED25519_KEY_FILE": os.environ.get("SWARM_ED25519_KEY_FILE")}))
 `,
   fx_ok: `print('{"status": "ok", "summary": "fine", "n": 1}')
 `,
@@ -139,6 +140,16 @@ test("env: absolute SWARM_DIR, stale ids stripped, --flag=value argv then --json
   expect(res.json.SWARM_TASK_ID).toBeNull();
   expect(res.json.SWARM_CORRELATION_ID).toBeNull();
   expect(res.json.argv).toEqual(["--root=/x", "--brief-text=--pattern", "--json"]);
+});
+
+test("env: a relative SWARM_ED25519_KEY_FILE resolves against the session cwd, never the runtime root", async () => {
+  const { cwd } = setup();
+  process.env.SWARM_ED25519_KEY_FILE = "secrets/key.hex";
+  const relative = await runScript({ script: "fx_env", args: [], cwd });
+  expect(relative.json.SWARM_ED25519_KEY_FILE).toBe(resolve(cwd, "secrets/key.hex"));
+  process.env.SWARM_ED25519_KEY_FILE = "/abs/key.hex";
+  const absolute = await runScript({ script: "fx_env", args: [], cwd });
+  expect(absolute.json.SWARM_ED25519_KEY_FILE).toBe("/abs/key.hex");
 });
 
 test("env: unset SWARM_DIR falls back to the git toplevel of cwd", async () => {

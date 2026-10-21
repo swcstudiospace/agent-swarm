@@ -9,7 +9,7 @@
  * Nothing here runs at import: the root and SWARM_DIR are resolved inside each call.
  */
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { swarmDir } from "./paths.ts";
 
 export type Script = "orch_plan" | "orch_status" | "orch_assign" | "qa_gate" | "rev_gate" | "sec_gate" | "rel_plan" | "swarm_tool";
@@ -126,6 +126,9 @@ export async function runScript({ script, args, cwd, signal, timeoutMs = DEFAULT
   if (!existsSync(path)) throw new SwarmToolError("E-DEP", `script not found: scripts/${script}.py under SWARM_ROOT`);
   const dir = swarmDir(cwd); // D-08: env SWARM_DIR (absolute) → <git toplevel of cwd>/.swarm → <cwd>/.swarm
   const env: Record<string, string | undefined> = { ...process.env, SWARM_DIR: dir };
+  // python runs in the runtime root, so a relative key reference must be made absolute against the session workspace here
+  const keyFile = env.SWARM_ED25519_KEY_FILE;
+  if (keyFile && !isAbsolute(keyFile)) env.SWARM_ED25519_KEY_FILE = resolve(cwd, keyFile);
   for (const key of STRIPPED_ENV) delete env[key];
 
   let child: Bun.Subprocess<"ignore", "pipe", "pipe">;
