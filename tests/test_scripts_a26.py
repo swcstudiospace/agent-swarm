@@ -789,6 +789,8 @@ def test_a_brace_inside_call_arguments_is_an_expression_not_a_block(branch, flag
     ("    function f(address t) external { bytes memory d; (, d) = t.call(\"\"); require(d.length > 0); }", True),
     # a read that only logs the flag is passed over; the next read that tests it is the check
     ("    function f(address t) external { (bool ok, ) = t.call(\"\"); emit E(); require(ok); }", False),
+    ("    function f(address t) external { (bool ok, ) = t.call(\"\"); emit E(ok); require(ok); }", False),
+    ("    function f(address t) external { (bool ok, ) = t.call(\"\"); emit E(ok); }", True),
     ("    function f(address a, address b) external { (bool ok1, ) = a.call(\"\"); (bool ok2, ) = b.call(\"\"); "
      "require(ok2); require(ok1); }", False),
     # a flag overwritten by a later call, as a plain assignment or as a tuple slot, is never checked

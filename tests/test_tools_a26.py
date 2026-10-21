@@ -2273,6 +2273,36 @@ def test_a_modifier_call_to_an_undefined_function_before_its_check_is_an_unverif
     assert checked_first["findings"] == [] and checked_first["verdict"] == "pass"
 
 
+def test_a_callee_guard_is_credited_only_where_the_called_overload_runs_it_on_every_path():
+    # the unrelated contract's guarded _settle is not A's _settle; an optional helper call guards nothing; a call to the
+    # child's empty overload does not borrow the base overload's check
+    unrelated = ok("sol_access_matrix", {"contract": "A", "source": "pragma solidity 0.8.28;\ncontract A { uint256 public x;\n"
+                                                                   "    function _settle() internal { x += 1; }\n"
+                                                                   "    function mint(uint v) external { _settle(); x = v; }\n}\n"
+                                                                   "contract B { address owner; modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+                                                                   "    function _settle() internal onlyOwner {}\n}"})
+    assert ids(unrelated) == ["ACCESS-UNPROTECTED-PRIVILEGED"] and unrelated["unprotected"] == 1
+    optional = ok("sol_access_matrix", {"contract": "C", "source": "pragma solidity 0.8.28;\ncontract C { address owner; uint256 x;\n"
+                                                                  "    modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+                                                                  "    function mint(bool audit) external { x += 1; if (audit) _audit(); }\n"
+                                                                  "    function _audit() internal onlyOwner {}\n}"})
+    assert ids(optional) == ["ACCESS-UNPROTECTED-PRIVILEGED"] and optional["verdict"] == "fail"
+    always = ok("sol_access_matrix", {"contract": "C", "source": "pragma solidity 0.8.28;\ncontract C { address owner; uint256 x;\n"
+                                                                "    modifier onlyOwner() { require(msg.sender == owner); _; }\n"
+                                                                "    function mint(bool audit) external { _audit(); x += 1; }\n"
+                                                                "    function _audit() internal onlyOwner {}\n}"})
+    assert always["findings"] == [] and always["guarded"] == 1
+    base = ("contract Base { address owner; event Logged(address who);\n"
+            "    function _check(address who) internal view { require(msg.sender == owner); }\n"
+            "    function _log(address who) internal { emit Logged(who); }\n}\n")
+    child = base + ("contract Child is Base { uint256 x;\n    function _check(uint256 v) internal {}\n    function _log(uint256 v) internal {}\n"
+                    "    function mint(uint256 v) external { _check(v); _log(v); x = v; }\n}")
+    overloads = ok("sol_access_matrix", {"contract": "Child", "source": "pragma solidity 0.8.28;\n" + child})
+    assert ids(overloads) == ["ACCESS-UNPROTECTED-PRIVILEGED"] and overloads["unprotected"] == 1
+    events = ok("sol_event_coverage", {"source": "pragma solidity 0.8.28;\n" + child, "min_coverage_pct": 100})
+    assert set(ids(events)) == {"EVENT-MISSING", "EVENT-COVERAGE-BELOW-MIN"} and events["missing"] == 1 and events["verdict"] == "fail"
+
+
 # --- round four (N-1, N-3): a _checkRole credited by its account, and applied modifiers judged in the order they are applied
 
 
