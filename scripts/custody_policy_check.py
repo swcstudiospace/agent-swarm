@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -159,15 +160,20 @@ def walk(base: Path, reasons: list[str], root: Path):
 
 def read_text(path: Path) -> tuple[str | None, str]:
     """(text, "") for a readable regular file within the size bound, else (None, reason). Named pipes, sockets and devices are
-    "unreadable": opening a FIFO with no writer blocks the scan, so they are never opened."""
+    "unreadable": they are opened without blocking and refused on their descriptor, so a FIFO with no writer never stalls the scan."""
     try:
         if path.is_symlink():
             return None, "symlink"
-        if not path.is_file():
-            return None, "unreadable"
-        if path.stat().st_size > MAX_BYTES:
-            return None, "too_large"
-        data = path.read_bytes()
+        # the type is checked on the open descriptor, not on the path: a path swapped for a FIFO after any earlier check is still
+        # refused before a read. O_NONBLOCK makes that open return at once for a FIFO with no writer
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return None, "unreadable"
+            if info.st_size > MAX_BYTES:
+                return None, "too_large"
+            data = handle.read()
     except OSError:
         return None, "unreadable"
     if b"\0" in data[:BINARY_PROBE]:

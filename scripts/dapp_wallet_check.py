@@ -27,6 +27,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -1349,15 +1350,20 @@ def scan_tree(base: Path, root: Path) -> dict:
                 skipped_files += 1
                 skipped.append(f"{rel}: skipped:symlink-outside-root")
                 continue
-            if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the whole scan
-                skipped_files += 1
-                skipped.append(f"{rel}: skipped:not-a-regular-file")
-                continue
-            if path.stat().st_size > MAX_FILE_BYTES:
-                skipped_files += 1
-                skipped.append(f"{rel}: skipped:oversized")
-                continue
-            data = path.read_bytes()
+            # the type is checked on the open descriptor, not on the path: a path swapped for a FIFO after the earlier checks is still
+            # refused before a read. O_NONBLOCK makes the open of a FIFO with no writer return at once. Symlinks were resolved above.
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):  # named pipes, sockets and devices are never read: a read could block the whole scan
+                    skipped_files += 1
+                    skipped.append(f"{rel}: skipped:not-a-regular-file")
+                    continue
+                if info.st_size > MAX_FILE_BYTES:
+                    skipped_files += 1
+                    skipped.append(f"{rel}: skipped:oversized")
+                    continue
+                data = handle.read()
         except OSError:
             skipped_files += 1
             skipped.append(f"{rel}: skipped:unreadable")

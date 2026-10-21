@@ -697,6 +697,15 @@ class _Scan:
                     frame.setdefault((chain_id, dirs), where)
                 scope = _Scope(frame, scope)
             here["scope"] = scope
+            # an object with chain ids of its own judges its endpoints by those ids alone, as check_names does for its names; an
+            # inherited id must not stand in for them. An object without its own ids leaves own_scope None and inherits the scope.
+            own_scope = None
+            if own:
+                own_frame: dict = {}
+                for chain_id, dirs, where in own:
+                    own_frame.setdefault((chain_id, dirs), where)
+                own_scope = _Scope(own_frame, None)
+            here["own_scope"] = own_scope
             # the holding context of this object: the key that holds it. An unrecognised key inherits its enclosing holder's context only
             # when that holder has no chain id of its own, i.e. a keyed map (ND9-3). A list passes its own context to its items. The root declares networks.
             h = ROOT_HOLD if hold is None else hold
@@ -906,7 +915,9 @@ class _Scan:
     def check_url(self, rel: str, url: str, where: str, ctx: dict, key_dirs: frozenset = frozenset()) -> None:
         for rule, severity, message in _url_problems(url):
             self.add(rel, rule, severity, where, message)
-        scope = ctx.get("scope")
+        scope = ctx.get("own_scope")
+        if scope is None:
+            scope = ctx.get("scope")
         if scope is None:
             return
         # a host under a directed key is compared with the ids of that direction; with none, with every id in scope (fail closed)
