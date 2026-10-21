@@ -996,7 +996,6 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
   test.each<[string, string]>([
     ["cast send 0xabc 'transfer(address,uint256)' 0xdef 1", "chain-broadcast"],
     ["cast s 0xabc 'f()'", "chain-broadcast"],
-    ["cast send --rpc-url http://localhost:8545 0xabc 'f()'", "chain-broadcast"],
     ["cast publish 0x02f8", "chain-broadcast"],
     ["cast rpc eth_sendRawTransaction 0x02f8", "chain-broadcast"],
     ["cast rpc --rpc-url sepolia eth_sendTransaction '{}'", "chain-broadcast"],
@@ -1179,6 +1178,7 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     "near contract call-function as-read-only c.testnet m json-args '{}' network-config testnet now", "near tokens a.testnet view-near-balance network-config testnet now",
     "sui client dry-run-transaction --tx-bytes b", "aptos move view --function-id 0x1::m::f", "aptos stake show-stake-pool --owner-address 0x1",
     "export HARDHAT_NETWORK=localhost && npx hardhat run scripts/deploy.ts", "export HARDHAT_NETWORK=mainnet && npx hardhat run s.ts --network localhost",
+    "cast send --rpc-url http://localhost:8545 0xabc 'f()'", "cast send --rpc-url http://127.0.0.1:8545 0xabc 'f()'", "hardhat run --network localhost scripts/deploy.ts",
   ])("chain read-only or local form: %s passes for a26", (command) => {
     expect(guardToolCall(bash(command), insideAs(A26))).toBeUndefined();
   });
@@ -1229,7 +1229,7 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
   });
 
-  test("an exec -a operand is an argv[0] name, not an assignment: the leading mainnet decides, and an inherited mainnet still reaches the run", () => {
+  test("an exec -a operand that assigns blocks: the wrapper's argv[0] cannot be modelled, so every framework run on the line needs approval", () => {
     const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
     expect(guardToolCall(bash("HARDHAT_NETWORK=mainnet exec -a HARDHAT_NETWORK=localhost hardhat run scripts/deploy.ts"), insideAs(A26))?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
@@ -1237,7 +1237,9 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("exec -a HARDHAT_NETWORK=localhost hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(
       "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
     );
-    expect(guardToolCall(bash("exec -a HARDHAT_NETWORK=localhost hardhat test"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("exec -a HARDHAT_NETWORK=localhost hardhat test"), insideAs(A26))?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
   });
 
   test("a redirection that may fail keeps the earlier network: unset behind a failing redirect leaves inherited mainnet; /dev/null and a stdout dup do not", () => {
@@ -1460,6 +1462,94 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
 
   test("a quoted x=$PWD is a reader: a bare test run with no environment network passes", () => {
     expect(guardToolCall(bash("printf '%s' \"x=$PWD\"; hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("P2: a local export that succeeds before && decides the run after it; the same export before ; leaves the inherited mainnet possible", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost >local.log && hardhat test"), inherited)).toBeUndefined();
+    expect(guardToolCall(bash("export HARDHAT_NETWORK=localhost >local.log; hardhat test"), inherited)?.reason).toBe(
+      "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)",
+    );
+  });
+
+  test("a run that a failed redirection skips never happens: unset behind a failing && redirect leaves the run out of the decision", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "mainnet" } };
+    expect(guardToolCall(bash("unset HARDHAT_NETWORK >/dev/null/x && hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
+  });
+
+  test("env -S splits its line like a command: an assignment in the split line blocks, a plain split line is judged as its command", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("env -S 'HARDHAT_NETWORK=localhost hardhat test'"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("env -S 'hardhat run --network mainnet scripts/x.ts'"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(guardToolCall(bash("env -S 'hardhat test'"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("eval, source, an expansion assigning the network, and an append each make every framework run on the line need approval", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    for (const command of [
+      'eval "x=1"; hardhat test',
+      "source ./env.sh; hardhat test",
+      "HARDHAT_NETWORK=$X hardhat test",
+      'export HARDHAT_NETWORK="$N"; hardhat test',
+      "HARDHAT_NETWORK+=x hardhat run scripts/deploy.ts",
+    ]) {
+      expect({ command, reason: guardToolCall(bash(command), insideAs(A26))?.reason }).toEqual({ command, reason: CHAIN });
+    }
+  });
+
+  test("a loop body that writes mainnet after an if still reaches the run on a later iteration; the same loop after a local export and outside the loop passes", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("for i in 1 2; do if [ $i = 2 ]; then hardhat run scripts/deploy.ts; fi; export HARDHAT_NETWORK=mainnet; done"), insideAs(A26))?.reason).toBe(CHAIN);
+    expect(
+      guardToolCall(bash("export HARDHAT_NETWORK=localhost; for i in 1 2; do if [ $i = 2 ]; then hardhat run scripts/deploy.ts; fi; done; export HARDHAT_NETWORK=mainnet"), insideAs(A26)),
+    ).toBeUndefined();
+  });
+
+  test("the --network flag decides a hardhat run: a local one passes, a mainnet one blocks", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("hardhat run --network localhost scripts/deploy.ts"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("hardhat run --network mainnet scripts/x.ts"), insideAs(A26))?.reason).toBe(CHAIN);
+  });
+
+  test("cast and forge judge the RPC endpoint: a loopback or local endpoint passes; no endpoint, a variable, a repeated flag or a non-local one blocks", () => {
+    const CHAIN = "BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)";
+    expect(guardToolCall(bash("cast send --rpc-url http://127.0.0.1:8545 0xabc 'f()'"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("forge create src/C.sol:C --rpc-url http://localhost:8545"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("forge script S.s.sol --broadcast --rpc-url http://127.0.0.1:8545"), insideAs(A26))).toBeUndefined();
+    for (const command of [
+      "cast send 0xabc 'f()'",
+      "cast send --rpc-url $RPC 0xabc 'f()'",
+      "cast send --rpc-url http://localhost:8545 --rpc-url https://mainnet.example 0xabc 'f()'",
+      "cast send -r sepolia 0xabc 'f()'",
+      "cast --rpc-url sepolia send 0xabc 'f()'",
+    ]) {
+      expect({ command, reason: guardToolCall(bash(command), insideAs(A26))?.reason }).toEqual({ command, reason: CHAIN });
+    }
+  });
+
+  test("exec with a plain local operand is not an assignment: a bare test run through it passes", () => {
+    expect(guardToolCall(bash("exec localhost hardhat test"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("an unnamed truffle migrate needs approval: its network is in the config the guard does not read", () => {
+    expect(guardToolCall(bash("truffle migrate"), insideAs(A26))?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+    expect(guardToolCall(bash("truffle deploy"), insideAs(A26))?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+    expect(guardToolCall(bash("truffle exec scripts/deploy.js"), insideAs(A26))?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+  });
+
+  test("an unnamed brownie run needs approval: its network is in the config the guard does not read", () => {
+    expect(guardToolCall(bash("brownie run scripts/deploy.py"), insideAs(A26))?.reason).toBe("BLOCKED needs: human-approval (chain_broadcast: chain-broadcast)");
+  });
+
+  test("unnamed truffle test, brownie test and a truffle exec of a non-deploy script stay local", () => {
+    expect(guardToolCall(bash("truffle test"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("brownie test"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("truffle exec scripts/s.js"), insideAs(A26))).toBeUndefined();
+  });
+
+  test("named development runs of truffle migrate and brownie run pass; the config is not read for a named local network", () => {
+    expect(guardToolCall(bash("truffle migrate --network development"), insideAs(A26))).toBeUndefined();
+    expect(guardToolCall(bash("brownie run scripts/deploy.py --network development"), insideAs(A26))).toBeUndefined();
   });
 });
 

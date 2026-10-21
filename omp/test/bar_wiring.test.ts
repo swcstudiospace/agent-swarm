@@ -91,10 +91,15 @@ interface WidgetCall {
 function fakeUi(options: { throwOnWidget?: boolean; theme?: BarTheme } = {}) {
   const calls: WidgetCall[] = [];
   const stack = new Map<string, WidgetComponent | string[]>();
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
   const tui = { renders: 0, requestRender() { this.renders++; } } satisfies WidgetHost & { renders: number };
   let throwOnWidget = options.throwOnWidget ?? false;
   const ui = {
     notify() {},
+    /** The footer status channel: every write is recorded, so a footer line the bar draws is seen by the tests, never dropped. */
+    setStatus(key: string, text: string | undefined) {
+      statuses.push({ key, text });
+    },
     setWidget(key: string, content: string[] | WidgetFactory | undefined, widgetOptions?: { placement?: string }) {
       if (throwOnWidget) throw new Error("host widget failure");
       calls.push({ op: "widget", key, content, options: widgetOptions });
@@ -111,6 +116,7 @@ function fakeUi(options: { throwOnWidget?: boolean; theme?: BarTheme } = {}) {
     tui,
     calls,
     stack,
+    statuses,
     widgetCalls: () => calls.filter((call): call is WidgetCall => call.op === "widget"),
     order: () => [...stack.keys()],
     /** The component's rows exactly as rendered (colours stripped, padding kept). */
@@ -2089,23 +2095,11 @@ describe("stack order with a rank-20 peer bar (restack protocol)", () => {
   });
 });
 
-/** A host whose footer is recorded: the widget host plus a recording `setStatus`, the status channel a footer line would use. */
-function footerHost(swarmDir?: string) {
-  const h = harness({ swarmDir });
-  const statuses: Array<{ key: string; text: string | undefined }> = [];
-  const ui: NonNullable<ExtensionContext["ui"]> & { setStatus(key: string, text: string | undefined): void } = {
-    ...h.host.ui,
-    setStatus: (key, text) => void statuses.push({ key, text }),
-  };
-  h.ctx.ui = ui;
-  return { h, statuses, ui };
-}
-
 describe("footer status stays absent", () => {
-  test("the recording footer records a status write, so the empty-footer assertions below can fail", () => {
-    const { statuses, ui } = footerHost();
-    ui.setStatus("swarm", "swarm: control write");
-    expect(statuses).toEqual([{ key: "swarm", text: "swarm: control write" }]);
+  test("the shared host records every footer write, so an empty footer assertion can fail", () => {
+    const h = harness();
+    h.host.ui.setStatus("swarm", "swarm: control write");
+    expect(h.host.statuses).toEqual([{ key: "swarm", text: "swarm: control write" }]);
   });
 
   test("no status or footer text is written in the loading, idle, running, completed or error states, nor as the timers drive them", () => {
@@ -2137,18 +2131,18 @@ describe("footer status stays absent", () => {
       error: { swarmDir: errorDir, setup: () => {}, rows: (lines) => lines.join("\n") === TELEMETRY.join("\n") },
     };
     for (const [name, state] of Object.entries(states)) {
-      const { h, statuses } = footerHost(state.swarmDir);
+      const h = harness({ swarmDir: state.swarmDir });
       h.fire("session_start");
       state.setup(h);
       expect({ state: name, mounted: h.host.order(), rows: state.rows(h.host.lines()) }).toEqual({ state: name, mounted: [SWARM_BAR_KEY], rows: true });
       h.timers.turn();
       h.timers.tickInterval();
-      expect({ state: name, statuses }).toEqual({ state: name, statuses: [] });
+      expect({ state: name, statuses: h.host.statuses }).toEqual({ state: name, statuses: [] });
     }
   });
 
   test("a state change writes no status text: one session walks loading, running, completed and the linger clear, checking the footer at each step", () => {
-    const { h, statuses } = footerHost();
+    const h = harness();
     const started = { id: "a", agent: "a05-backend", status: "started", index: 0 };
     const steps: Array<{ step: string; act: () => void; marker: string }> = [
       {
@@ -2179,7 +2173,7 @@ describe("footer status stays absent", () => {
       act();
       const shown = marker === "" || h.host.lines().join("\n").includes(marker);
       expect({ step, shown, mounted: h.host.order() }).toEqual({ step, shown: true, mounted: [SWARM_BAR_KEY] });
-      expect({ step, statuses }).toEqual({ step, statuses: [] });
+      expect({ step, statuses: h.host.statuses }).toEqual({ step, statuses: [] });
     }
   });
 });

@@ -719,6 +719,8 @@ interface Normalized {
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
 const COMPOUND_WORD = /^(?:(while|until|for|select)|(if)|(case)|(fi|done|esac))(?=[\s;]|$)/;
+/** The words a compound keyword may follow inside the same piece (`do if`, `then fi`, `! done`): they are prefixes, not part of the keyword. */
+const COMPOUND_LEAD = /^(?:(?:do|then|else|elif|!)\s+)+/;
 
 /**
  * D-03 normalization: the inner text of every `$(…)` / backtick substitution becomes its own command, the rest is
@@ -778,7 +780,8 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
   let pipeIn = false;
   for (const piece of splitTopLevel(rest)) {
     let seg = simplifyWords(piece.text.trim());
-    const keyword = COMPOUND_WORD.exec(seg);
+    // a compound keyword after `do`/`then`/`else`/`!` (`do if …`, `then fi`) opens or closes its group like one at the start
+    const keyword = COMPOUND_WORD.exec(seg.replace(COMPOUND_LEAD, ""));
     const compound = keyword === null ? undefined : keyword[1] ? "loop" : keyword[2] ? "if" : keyword[3] ? "case" : "close";
     // sticky: each match starts where the last one ended, so k prefixes cost O(n), not O(k·n) (WR-09)
     let at = 0;
@@ -2316,8 +2319,46 @@ function kubeadmChange({ words }: Segment): boolean {
 const LOCAL_CHAIN_NETWORK = /^(?:hardhat|localhost|anvil|development|local)$/i;
 /** An anchor cluster that is local: `localnet` (`l`), or a loopback URL. */
 const LOCAL_ANCHOR_CLUSTER = /^(?:localnet|l|localhost|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?)$/i;
+/** A loopback RPC endpoint: `http(s)://localhost|127.0.0.1|[::1]` with an optional port. */
+const LOCAL_RPC_URL = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?\/?$/i;
+/** The RPC flags of cast and forge: each names the endpoint a submitting run reaches. */
+const RPC_FLAG = /^(?:-r|--rpc-url|--fork-url)$/;
+
+/**
+ * Whether a cast or forge line's RPC endpoint is provably local: at least one RPC flag, and every one of them names a local
+ * chain or a loopback URL. No RPC flag leaves the endpoint to ETH_RPC_URL or the project config, which the guard does not read.
+ */
+function rpcLocal(flags: CliFlag[]): boolean {
+  const rpcs = flags.filter((f) => RPC_FLAG.test(f.flag));
+  return rpcs.length > 0 && rpcs.every((f) => f.value !== undefined && (LOCAL_CHAIN_NETWORK.test(f.value) || LOCAL_RPC_URL.test(f.value)));
+}
+
+/**
+ * The line cannot be modelled with certainty: an assigning expansion, an arithmetic command, or a writer whose target or value
+ * is unknown (`eval`, `source`, `read`, a nameref, an indirect or dynamic write, an exec or env -S assignment). Every framework run on it needs approval.
+ */
+function lineUnknown(command: string): boolean {
+  return ASSIGNING_EXPANSION.test(activeText(command, true)) || ARITHMETIC_COMMAND.test(activeText(command, false)) || hasNonPlainWriter(normalizeSegments(command, 0, []));
+}
+
+/** `exec -a NAME` and `exec NAME=…` after the wrapper: an assignment-like word after `exec` is argv[0] or an operand that cannot be modelled. */
+function execAssigns(prefix: string[]): boolean {
+  const exec = prefix.indexOf("exec");
+  return exec !== -1 && prefix.slice(exec + 1).some((w) => w.includes("="));
+}
+
+/** `env -S LINE` / `--split-string LINE`: a split line that assigns or expands (`NAME=v`, `$X`) cannot be modelled, so its run needs approval. */
+function envSplitAssigns(words: string[]): boolean {
+  for (let i = 0; i < words.length; i++) {
+    const m = /^(?:-[A-Za-z]*S|--split-string=?)(.*)$/.exec(words[i]);
+    if (m === null) continue;
+    const line = m[1] !== "" ? m[1] : (words[i + 1] ?? "");
+    return /[=$`]/.test(line);
+  }
+  return false;
+}
 /** Options foundry's cast and forge take a value for: the global ones that may precede the verb (`cast --color never send`) and the wallet selectors (so `cast wallet address --account deployer` has no key operand). */
-const FOUNDRY_VALUE_FLAG = /^(?:--color|-j|--threads|--network|--account|--keystore|--password|--password-file|--from|--mnemonic-index|--mnemonic-derivation-path|--hd-path)$/;
+const FOUNDRY_VALUE_FLAG = /^(?:-r|--rpc-url|--fork-url|--color|-j|--threads|--network|--account|--keystore|--password|--password-file|--from|--mnemonic-index|--mnemonic-derivation-path|--hd-path)$/;
 const FRAMEWORK_VALUE_FLAG = /^--(?:network|config|tsconfig|root|cache-path|max-memory)$/;
 /** The first two words (`verb sub`) of a framework command that talks to the chain its network names. */
 const FRAMEWORK_NETWORK_VERB: Record<string, RegExp> = {
@@ -2504,11 +2545,6 @@ function redirectMayFail(text: string): boolean {
   return false;
 }
 
-/** The HARDHAT_NETWORK writes of an item. When one of its redirections may fail, the write may not happen: it is kept possible, not certain. */
-function networkWrites(item: Normalized): NetworkWrite[] {
-  const risky = redirectMayFail(`${item.prefix} ${item.text}`);
-  return statementWrites(item).map((write) => (risky ? { ...write, plain: false } : write));
-}
 
 /**
  * The HARDHAT_NETWORK writes of a plain statement: `NAME=v` words, `export NAME=v` and `unset HARDHAT_NETWORK`, each with
@@ -2582,6 +2618,7 @@ function nonPlainWriter(item: Normalized): boolean {
   if (item.opaque) return true;
   const { prefix, prefixRaw, raw, words, at } = itemWords(item);
   if (prefix.some((w) => CODE_PREFIX.test(w))) return true;
+  if (execAssigns(prefix)) return true;
   const keep = prefix.map((w) => !COMPOUND_KEYWORD.test(w));
   const prefixWords = prefix.filter((_, i) => keep[i]);
   if (at === -1) {
@@ -2590,6 +2627,9 @@ function nonPlainWriter(item: Normalized): boolean {
   }
   const rest = unwrapCommand(words.slice(at));
   const cmd = raw.slice(raw.length - rest.length);
+  // `NAME+=v` before the command word is an append the normalizer leaves in the text (only `NAME=v` moves to the prefix): its value is unknown
+  if (words.slice(0, at).some((w) => /^HARDHAT_NETWORK\+=/.test(w))) return true;
+  if ((prefix.includes("env") || rest[0] === "env") && envSplitAssigns(rest)) return true;
   if (prefixWords.length === 0 && rest.length === words.length - at) {
     const [head = "", ...args] = cmd;
     if (unquote(head) === "export") {
@@ -2624,7 +2664,7 @@ function printfWrites(args: string[]): boolean {
 
 /** Every value any write under `items` (payloads included) may leave, as if all of them ran. */
 function collectWrites(items: Normalized[]): NetworkValue[] {
-  return items.flatMap((item) => [...networkWrites(item).map((write) => write.value), ...collectWrites(item.payload)]);
+  return items.flatMap((item) => [...statementWrites(item).map((write) => write.value), ...collectWrites(item.payload)]);
 }
 
 /** Track the groups an item opens or closes: compounds, `(`/`{` subshells and groups; a case pattern's `)` opens nothing. */
@@ -2649,8 +2689,9 @@ function compoundEnd(items: Normalized[], start: number): number {
 /**
  * Walk the items of a command line in order, carrying every HARDHAT_NETWORK value that may be in effect. A plain write
  * that is not inside any group, loop, pipeline, background job or `&&`/`||` replaces the set; every other write adds to it.
- * A loop body may run again, so every value written under it is added before the loop starts. A bare run is recorded by
- * its marked text when its possible values include a non-local one, or when a non-plain writer runs on the line.
+ * A loop body may run again, so every value written under it is added before the loop starts. An item that runs after `&&`
+ * runs only when the item before it succeeded, so the network it sees is that item's success-path network. A bare run is
+ * recorded by its marked text when its possible values include a non-local one, or when the line is not modelable.
  */
 function scanNetwork(
   items: Normalized[],
@@ -2660,6 +2701,7 @@ function scanNetwork(
 ): void {
   const groups: string[] = inGroup ? ["payload"] : [];
   let prev: Op = "";
+  let succeeded: NetworkValue[] | undefined;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (item.compound === "loop") {
@@ -2667,12 +2709,15 @@ function scanNetwork(
     }
     scanNetwork(item.payload, state, out, true);
     const marked = `${item.prefix} ${item.text}`;
-    const nonLocal = state.possible.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));
+    const seen = prev === "&&" && succeeded !== undefined ? succeeded : state.possible;
+    const nonLocal = seen.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));
     if (state.unknownWriter || nonLocal) out.add(marked);
     const may = groups.length > 0 || prev === "&&" || prev === "||" || prev === "|" || prev === "&" || item.end === "|" || item.end === "&";
-    for (const write of networkWrites(item)) {
-      state.possible = write.plain && !may ? [write.value] : [...new Set([...state.possible, write.value])];
-    }
+    let done = state.possible;
+    for (const write of statementWrites(item)) done = write.plain && !may ? [write.value] : [...new Set([...done, write.value])];
+    succeeded = done;
+    // a redirection that may fail may skip the statement's write: then the earlier network stays possible as well
+    state.possible = redirectMayFail(marked) ? [...new Set([...state.possible, ...done])] : done;
     enterLeave(groups, item);
     prev = item.end;
   }
@@ -2680,46 +2725,59 @@ function scanNetwork(
 
 /**
  * The bare runs of `command` (by marked text) that may see a non-local HARDHAT_NETWORK: the value the line starts from is
- * the environment it inherits (facts.env, bash's own env override included), and scanNetwork follows the plain writes in
- * order. A non-plain writer anywhere on the line (payloads and substitutions included), or an assigning expansion in any
- * word, makes every bare run non-local.
+ * the environment it inherits (facts.env, bash's own env override included), and scanNetwork follows the writes in order.
  */
 function unnamedNetworkRuns(command: string, facts: GuardFacts): Set<string> {
-  const items = normalizeSegments(command, 0, []);
   const out = new Set<string>();
-  const unknownWriter =
-    ASSIGNING_EXPANSION.test(activeText(command, true)) || ARITHMETIC_COMMAND.test(activeText(command, false)) || hasNonPlainWriter(items);
-  scanNetwork(items, { possible: [facts.env.HARDHAT_NETWORK || undefined], unknownWriter }, out, false);
+  scanNetwork(normalizeSegments(command, 0, []), { possible: [facts.env.HARDHAT_NETWORK || undefined], unknownWriter: lineUnknown(command) }, out, false);
   return out;
 }
 
 /**
- * `hardhat run|deploy|ignition deploy|console|test`, `truffle migrate|deploy|exec|console|test`, `brownie
- * run|console|test` against a `--network` that is not a local one: any of several `--network` flags that is not local
- * counts. A hardhat command that gives no flag runs on its own `HARDHAT_NETWORK` prefix when it has one; otherwise on
- * the value the line leaves HARDHAT_NETWORK at (unnamedNetworkRuns). A run with none of these is the in-process chain.
- * compile, a run on `localhost|hardhat|anvil|development|local`, and `--help` never match.
+ * `hardhat run|deploy|ignition deploy|console|test`, `truffle migrate|deploy|exec|console|test`, `brownie run|console|test`.
+ * Provably local only: a line the normalizer cannot model blocks every such run (lineUnknown); a `--network` flag must
+ * name a local chain, and every one of several flags counts. Without a flag, hardhat's own `HARDHAT_NETWORK` prefix
+ * decides, else the network the line leaves at (unnamedNetworkRuns). An unnamed truffle or brownie run takes its network
+ * from its config, which the guard does not read, so its deploy verbs block (unnamedConfigDeploy); test and console pass.
+ * compile and `--help` never match.
  */
 function frameworkDeploy({ words, marked, prefix }: Segment, facts: GuardFacts, command: string): boolean {
   return eachTool(words, /^(?:hardhat|truffle|brownie)$/, (at) => {
     const tool = posix.basename(words[at]).replace(/@[^/]*$/, "");
     const { positional, flags } = argsAfter(words, at, FRAMEWORK_VALUE_FLAG);
     if (helpOnly(flags) || !verbStarts(positional, at).some((p) => FRAMEWORK_NETWORK_VERB[tool].test(p.slice(0, 2).join(" ")))) return false;
+    if (lineUnknown(command)) return true;
     const named = flags.filter((f) => f.flag === "--network");
-    if (named.length > 0) return named.some((f) => f.value !== undefined && !LOCAL_CHAIN_NETWORK.test(f.value));
-    if (tool !== "hardhat") return false;
+    if (named.length > 0) return !named.every((f) => f.value !== undefined && LOCAL_CHAIN_NETWORK.test(f.value));
+    if (tool !== "hardhat") return unnamedConfigDeploy(tool, verbStarts(positional, at));
     const own = prefixNetwork(prefix);
-    if (own !== undefined) return own !== "" && !LOCAL_CHAIN_NETWORK.test(own);
+    if (own !== undefined) return !(own === "" || LOCAL_CHAIN_NETWORK.test(own));
     return unnamedNetworkRuns(command, facts).has(marked);
   });
 }
 
-/** `forge script … --broadcast|--resume` and `forge create` (also `c`); `forge script` without them only simulates, test, build, fmt never match. */
+/**
+ * An unnamed truffle or brownie run: its network comes from the project config, which the guard does not read, so it cannot be
+ * proven local. `truffle migrate|deploy`, `truffle exec` of a deploy-named script (`deploy` or `migrat` in its name) and any
+ * `brownie run` block. Other unnamed runs (`truffle test|console|exec` of another script, `brownie test|console`) keep passing.
+ */
+function unnamedConfigDeploy(tool: string, starts: string[][]): boolean {
+  return starts.some(([verb = "", script = ""]) => {
+    if (tool === "brownie") return verb === "run";
+    return verb === "migrate" || verb === "deploy" || (verb === "exec" && /deploy|migrat/i.test(script));
+  });
+}
+
+/**
+ * `forge script … --broadcast|--resume` and `forge create` (also `c`); `forge script` without them only simulates, test, build, fmt never match.
+ * A submitting run is judged by its RPC endpoint (rpcLocal): only a local one passes.
+ */
 function forgeBroadcast({ words }: Segment): boolean {
   return eachTool(words, /^forge$/, (at) => {
     const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
     if (helpOnly(flags)) return false;
-    return verbStarts(positional, at).some(([verb]) => verb === "create" || verb === "c" || (verb === "script" && (flagOn(flags, "--broadcast") || flagOn(flags, "--resume"))));
+    const submits = verbStarts(positional, at).some(([verb]) => verb === "create" || verb === "c" || (verb === "script" && (flagOn(flags, "--broadcast") || flagOn(flags, "--resume"))));
+    return submits && !rpcLocal(flags);
   });
 }
 
@@ -2736,12 +2794,14 @@ const CAST_SUBMIT =
  * `cast send|publish|batch-send` and the other submitting subcommands (CAST_SUBMIT), and `cast rpc|rp` of a `*_send*`
  * method (`eth_sendRawTransaction`, `personal_sendTransaction`, `wallet_sendCalls`, `eth_sendBundle`); call, balance,
  * block, 4byte, and `mktx`/`batch-mktx` (they sign and print, nothing reaches a network) only read or sign offline.
+ * A submitting run is judged by its RPC endpoint (rpcLocal): only a local one passes.
  */
 function castBroadcast({ words }: Segment): boolean {
   return eachTool(words, /^cast$/, (at) => {
     const { positional, flags } = argsAfter(words, at, FOUNDRY_VALUE_FLAG);
     if (helpOnly(flags)) return false;
-    return verbStarts(positional, at).some((p) => CAST_SUBMIT.test(p.slice(0, 3).join(" ")) || (/^(?:rpc|rp)$/.test(p[0] ?? "") && p.some((w) => /^[a-z0-9]+_send/i.test(w))));
+    const submits = verbStarts(positional, at).some((p) => CAST_SUBMIT.test(p.slice(0, 3).join(" ")) || (/^(?:rpc|rp)$/.test(p[0] ?? "") && p.some((w) => /^[a-z0-9]+_send/i.test(w))));
+    return submits && !rpcLocal(flags);
   });
 }
 
