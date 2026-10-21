@@ -2194,7 +2194,7 @@ const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
  * (a D-04 marker in an operand or in the value of a destination or selector flag: `--server`, `--dest-namespace`,
  * `--project`, `-l` …) or that prune, force or replace (`--prune`, `--force`, `--replace`, unless `=false`). The verb is
  * the first positional after the group word that is a known verb, so a flag value never stands in for it; `--dry-run` is
- * exempt only as argocd's own flag, and `--help` prints usage. get, list, diff, history, logs, wait and manifests never match.
+ * exempt only as argocd's own flag, and `--help` prints usage. `app actions run` takes the production checks like a sync; get, list, diff, history, logs, wait and manifests never match.
  */
 function argocdChange({ words }: Segment): boolean {
   return eachTool(words, /^argocd$/, (at) => {
@@ -2206,9 +2206,11 @@ function argocdChange({ words }: Segment): boolean {
     const v = positional.findIndex((w, i) => i > g && (verbs.change.test(w) || verbs.other.test(w)));
     // `--dry-run`, `--dry-run=client|server|true` render only; an exemption counts only as argocd's own flag, not as another flag's value
     const dryRun = flags.some((f) => f.flag === "--dry-run" && (f.value === undefined || /^(?:client|server|true)$/.test(f.value)));
-    if (v === -1 || !verbs.change.test(positional[v]) || dryRun) return false;
+    // `app actions run APP ACTION` changes the app's workloads, so it takes the production checks; `app actions list` stays read-only
+    const actionRun = positional[g] === "app" && positional[v] === "actions" && positional[v + 1] === "run";
+    if (v === -1 || dryRun || (!verbs.change.test(positional[v]) && !actionRun)) return false;
     if (["--prune", "--force", "--replace"].some((f) => flagOn(flags, f))) return true;
-    return [...positional.slice(v + 1), ...flagValues(flags, ARGOCD_TARGET_FLAG)].some(prodWord);
+    return [...positional.slice(actionRun ? v + 2 : v + 1), ...flagValues(flags, ARGOCD_TARGET_FLAG)].some(prodWord);
   });
 }
 
@@ -2719,7 +2721,14 @@ function scanNetwork(
     if (item.compound === "loop") {
       state.possible = [...new Set([...state.possible, ...collectWrites(items.slice(i, compoundEnd(items, i) + 1))])];
     }
-    scanNetwork(item.payload, state, out, true);
+    // a child shell (`bash -c`, `sh -c`) inherits the HARDHAT_NETWORK its own prefix assigns, not the parent's state; its writes never persist, so only merge them back conservatively
+    const own = prefixNetwork(item.prefix);
+    if (own === undefined) scanNetwork(item.payload, state, out, true);
+    else {
+      const child = { possible: [own || undefined], unknownWriter: state.unknownWriter };
+      scanNetwork(item.payload, child, out, true);
+      state.possible = [...new Set([...state.possible, ...child.possible])];
+    }
     const marked = `${item.prefix} ${item.text}`;
     const seen = prev === "&&" && succeeded !== undefined ? succeeded : state.possible;
     const nonLocal = seen.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));

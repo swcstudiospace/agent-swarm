@@ -105,7 +105,7 @@ python3 scripts/receipt_export.py --repo /path/to/codebase --json  # desk verifi
 python3 -m pytest -q                                                # runtime + orchestration tests
 ```
 
-`orch_plan.py --pattern` takes `feature` (13 tasks), `hotfix` (8), `dependency` (8), the three domain patterns `cloud-native` (16 tasks, with A16–A20), `cluster` (12, with A21–A25) and `web3` (14, with A26–A30), each also running the core gates and release agents, `parallel` (one short lane per disjoint path set) and `custom --plan plan.json`. The `cluster` and `web3` patterns pin their implementer tasks to risk class `high` (all four gates); `cloud-native` follows `--risk-class`. A file path in a graph plan (`scripts/orch_from_graph.py`) routes to the owning specialist, e.g. `*.sol` to A26, `charts/` to A22, `Dockerfile*` to A18.
+`orch_plan.py --pattern` takes `feature` (13 tasks), `hotfix` (8), `dependency` (8), the three domain patterns `cloud-native` (16 tasks, with A16–A20), `cluster` (14, with A21–A25) and `web3` (15, with A26–A30), each also running the core gates and release agents, `parallel` (one short lane per disjoint path set) and `custom --plan plan.json`. The `cluster` and `web3` patterns pin their implementer tasks to risk class `high` (all four gates); `cloud-native` follows `--risk-class`. A file path in a graph plan (`scripts/orch_from_graph.py`) routes to the owning specialist, e.g. `*.sol` to A26, `charts/` to A22, `Dockerfile*` to A11.
 
 `scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
 

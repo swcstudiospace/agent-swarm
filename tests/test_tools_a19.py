@@ -1580,6 +1580,18 @@ def test_schema_compat_const_is_not_a_keyword_of_draft_3_or_4():
     assert _backward({**base4, "$schema": d6}, {**head4, "$schema": d6})["backward_compatible"] is True
 
 
+def test_schema_compat_identical_subtree_under_different_drafts_is_not_shortcut():
+    # draft 4 ignores const, so the draft 4 base accepts {"x": 2} while the draft 7 head rejects it: identical text is not the same schema
+    d4, d7 = "http://json-schema.org/draft-04/schema#", "http://json-schema.org/draft-07/schema#"
+    base = {"$schema": d4, "type": "object", "properties": {"x": {"anyOf": [{"const": 1}]}}}
+    head = {"$schema": d7, "type": "object", "properties": {"x": {"anyOf": [{"const": 1}]}}}
+    result = _backward(base, head)
+    assert result["backward_compatible"] is False
+    assert fx(result) == [("major", "[backward] $.x<alt0>: not accepted by any alternative of the target anyOf/oneOf")]
+    # the same pair under one declared draft is still a shortcut, so the identical union passes
+    assert _backward({**base, "$schema": d7}, head)["backward_compatible"] is True
+
+
 def test_schema_compat_keywords_beside_anyof_apply_to_each_alternative():
     # the source is a string AND (minLength 1): a string target is backward compatible, and the empty string is the forward break
     base = {"type": "string", "anyOf": [{"minLength": 1}]}

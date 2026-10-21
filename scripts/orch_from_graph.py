@@ -23,19 +23,20 @@ Owned-file rules, first match:
 
 - ``*.md`` → A15 docs
 - ``*.sql`` or a ``migrations/`` path → A07 data
-- ``*.sol``, ``*.vy``, ``foundry.toml``, ``hardhat.config.*``, or a JSON ABI (``*.abi.json``, or a ``.json`` under an ``abi/`` directory other than an OpenAPI, Swagger, AsyncAPI or schema descriptor) inside ``contracts/`` → A26
+- ``*.sol``, ``foundry.toml``, ``hardhat.config.*``, or a JSON ABI (``*.abi.json``, or a ``.json`` under an ``abi/`` directory other than an OpenAPI, Swagger, AsyncAPI or schema descriptor) inside ``contracts/`` → A26
   smart contracts (API descriptors such as ``contracts/openapi.yaml`` and ``contracts/abi/openapi.json``, and ``.ts``/``.py`` files under ``contracts/``, keep their existing owner)
+  Vyper (``*.vy``) has no owner: A26's required checks are Solidity-only and fail on Vyper source, so a Vyper step falls to the default design owner
 - anything under a ``web3/`` or ``wagmi/`` directory, or a script (``.ts`` ``.tsx`` ``.js`` ``.jsx``) under ``wallet/`` → A29 dapp and wallet
 - ``kustomization.yaml``, or a ``.json``/``.yaml``/``.yml`` file under ``charts/``, ``helm/``, ``k8s/``, ``kubernetes/``,
   ``manifests/`` or ``overlays/`` that is not under a components, frontend or ui directory → A22 GitOps
-- a ``Dockerfile`` or ``Dockerfile.<variant>`` (not ``dockerfile_lint.py``) → A18 supply chain
+- a ``Dockerfile`` or ``Dockerfile.<variant>`` (not ``dockerfile_lint.py``) → A11 build and IaC (A18 is report-only and never edits a Dockerfile)
 - ``asyncapi.<yaml|yml|json|ts|js>`` or ``serverless.<yaml|yml|json|ts|js>`` → A19 event-driven
 - ``catalog-info.yaml`` → A17 platform
 - ``*.tsx`` / ``*.jsx`` / ``*.css`` or a components, frontend or ui directory → A06
 - ``infra/``, ``.github/workflows/``, ``*.tf``, ``*.sh`` → A11
 - ``*.py`` ``*.go`` ``*.rs`` ``*.ts`` ``*.js`` ``*.toml`` ``*.yml`` ``*.yaml`` → A05
 
-Implementation agents (A05, A06, A07, A11, A17, A18, A19, A22, A26, A29) are medium risk with review and
+Implementation agents (A05, A06, A07, A11, A17, A19, A22, A26, A29) are medium risk with review and
 quality gates. Every other agent is low risk with a review gate. The plan
 records ``summary_sha256`` of the summary file's raw bytes.
 """
@@ -73,13 +74,12 @@ _OWNER_CAPABILITY = {
     "A11": "iac.change",
     "A15": "docs.bundle",
     "A17": "platform.catalog",
-    "A18": "supply.image",
     "A19": "event.topology",
     "A22": "gitops.manifest",
     "A26": "web3.contract",
     "A29": "dapp.wallet",
 }
-_MEDIUM = frozenset({"A05", "A06", "A07", "A11", "A17", "A18", "A19", "A22", "A26", "A29"})
+_MEDIUM = frozenset({"A05", "A06", "A07", "A11", "A17", "A19", "A22", "A26", "A29"})
 _UI_DIRS = frozenset({"components", "frontend", "ui"})
 _WEB3_DIRS = frozenset({"web3", "wagmi"})
 _CLUSTER_DIRS = frozenset({"charts", "helm", "k8s", "kubernetes", "manifests", "overlays"})
@@ -120,7 +120,7 @@ def _owner(path: str) -> str | None:
         return "A15"
     if base.endswith(".sql") or "migrations" in dirs:
         return "A07"
-    if (base.endswith((".sol", ".vy")) or base == "foundry.toml" or base.startswith("hardhat.config.")
+    if (base.endswith(".sol") or base == "foundry.toml" or base.startswith("hardhat.config.")
             or ("contracts" in dirs and base.endswith(".json") and (base.endswith(".abi.json")
                 or ("abi" in dirs and not _API_DESCRIPTOR.fullmatch(base))))):
         return "A26"
@@ -130,7 +130,7 @@ def _owner(path: str) -> str | None:
                                   and not any(part in _UI_DIRS for part in dirs)):
         return "A22"
     if _DOCKERFILE.fullmatch(base) and not base.endswith(_SOURCE_EXT):
-        return "A18"
+        return "A11"
     if _EVENT_CONFIG.fullmatch(base):
         return "A19"
     if base in _CATALOG_FILES:

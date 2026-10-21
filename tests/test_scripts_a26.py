@@ -697,6 +697,23 @@ def test_a_success_flag_counts_as_checked_only_when_a_condition_reads_it(snippet
     assert bool(rules) is flagged
 
 
+def test_a_success_flag_in_a_require_message_checks_nothing_for_the_call():  # thread on _is_check_read: the message is not the condition
+    snippet = ('    function f(address t, uint amount) external { (bool ok, ) = t.call(""); require(amount > 0, ok ? "sent" : "failed"); emit E(); }')
+    assert [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == ["SOL-UNCHECKED-LOW-LEVEL-CALL"]
+
+
+def test_the_base_written_last_is_the_most_derived_so_its_override_hides_the_guarded_base_function():  # thread on visible_index
+    text = ("pragma solidity 0.8.28;\n"
+            "contract A {\n    address owner;\n    function _check() internal virtual { require(msg.sender == owner); }\n}\n"
+            "contract B is A {\n    function _check() internal virtual override { }\n}\n"
+            "contract C is A, B {\n    uint256 public supply;\n    function mint(uint v) external {\n        _check();\n        supply += v;\n    }\n}\n")
+    module = load_module()
+    contracts = module.parse_source(text)
+    child = next(c for c in contracts if c["name"] == "C")
+    [visible] = module.visible_index(child, contracts)["_check"]
+    assert visible["body"].strip() == ""  # B's empty override, not A's require: C.mint's call is unguarded
+
+
 @pytest.mark.parametrize("call, severity", [
     ("if (f > 0) { _auth(); }", "major"),  # the guard runs on one path only: the delegatecall is exposed
     ("_auth();", "minor"),  # the guard runs on every path: the delegatecall is guarded

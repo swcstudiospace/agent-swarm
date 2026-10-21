@@ -96,7 +96,7 @@ def _parse(path: Path, text: str):
             return None, "tool-missing"
         try:
             return yaml.safe_load(text), ""
-        except yaml.YAMLError:
+        except (yaml.YAMLError, ValueError, RecursionError):  # a constructor rejects 2021-02-30 with ValueError; deep nesting recurses
             return None, "invalid"
     try:
         return json.loads(text), ""
@@ -384,8 +384,11 @@ def _where(rel: str, pointer: str) -> str:
 
 
 def _token(key) -> str:
-    """One RFC 6901 reference token: the key with `~` and `/` escaped."""
-    return str(key).replace("~", "~0").replace("/", "~1")
+    """One RFC 6901 reference token: the key with `~` and `/` escaped. A key with a secret shape (URL credentials, a key=value
+    credential, a token) is replaced by the length-only marker `_safe` gives before escaping, so no credential reaches a finding
+    location or the run log, whose URL mask the escaped `/` would otherwise defeat."""
+    text = _safe(str(key), limit=max(len(str(key)), 1))
+    return text.replace("~", "~0").replace("/", "~1")
 
 
 def _scan_cloudevents(document, rel: str, stats: dict, findings: list, reasons: list) -> bool:
