@@ -468,29 +468,74 @@ def _reachable(fn: dict, index: dict[str, list[dict]]) -> list[dict]:
     return order
 
 
+def _holding(universe: list[dict], index: dict[str, list[dict]], own) -> set[int]:
+    """ids of the functions of `universe` for which `own` holds, or that make a call at which every function it may resolve to
+    (see _targets) holds: one such call is enough. A least fixpoint, so a cycle holds only through a witness; each call site is
+    counted down once per target, so the work is linear in the call sites."""
+    holds: set[int] = set()
+    queue: list[dict] = []
+    for f in universe:
+        if own(f):
+            holds.add(id(f))
+            queue.append(f)
+    site_fn: list[dict] = []  # per call site: the function that makes it
+    left: list[int] = []  # per call site: its targets that do not hold yet
+    site_of: dict[int, list[int]] = {}  # id of a function -> the call sites that may target it
+    for f in universe:
+        for m in _CALL.finditer(f["body"]):
+            name = m.group(1)
+            if name in _NOT_CALLS:
+                continue
+            targets = _targets(f, index, name, m.end() - 1)
+            if not targets:
+                continue
+            sid = len(site_fn)
+            site_fn.append(f)
+            left.append(len(targets))
+            for t in targets:
+                site_of.setdefault(id(t), []).append(sid)
+    while queue:
+        t = queue.pop()
+        for sid in site_of.get(id(t), ()):
+            left[sid] -= 1
+            if left[sid] == 0 and id(site_fn[sid]) not in holds:
+                holds.add(id(site_fn[sid]))
+                queue.append(site_fn[sid])
+    return holds
+
+
 def emission_status(contracts: list[dict]) -> dict[int, str]:
     """id(function) -> 'emits' | 'delegated' | 'missing' for every state-changing entry point with a body: a public or external
     function, a fallback or a receive.
 
     'emits': the body, a modifier named initializer/reinitializer, or an internal function it calls (the callables its own
-    contract can see, followed transitively) contains `emit`. 'delegated': it emits nothing visible but calls an
-    underscore-prefixed internal function or `super.` that this source does not define (inherited code may emit).
-    'missing': neither."""
+    contract can see, followed transitively, a call counting only when every overload of its name emits) contains `emit`.
+    'delegated': it emits nothing visible but calls an underscore-prefixed internal function or `super.` that this source does
+    not define (inherited code may emit), under the same every-overload rule. 'missing': neither."""
     result: dict[int, str] = {}
     for contract in contracts:
         if contract["kind"] != "contract":
             continue
         index = visible_index(contract, contracts)
+        universe: dict[int, dict] = {}
+        for fns in index.values():
+            for f in fns:
+                if f["kind"] == "function":
+                    universe.setdefault(id(f), f)
+        for fn in contract["functions"]:
+            if fn["kind"] in ENTRY_KINDS:
+                universe.setdefault(id(fn), fn)
+        emitting = _holding(list(universe.values()), index,
+                            lambda f: bool(re.search(r"\bemit\s+" + _IDENT, f["body"]))
+                            or any(m in ("initializer", "reinitializer") for m, _ in f["modifiers"]))
+        delegating = _holding(list(universe.values()), index,
+                              lambda f: bool(re.search(r"\bsuper\s*\.", f["body"]))
+                              or any(n.startswith("_") and n not in index for n in _calls_of(f)))
         for fn in contract["functions"]:
             if not (fn["kind"] in ENTRY_KINDS and fn["visibility"] in ("public", "external") and fn["mutability"] in ("nonpayable", "payable")
                     and fn["has_body"] and fn["body"].strip()):
                 continue
-            reach = _reachable(fn, index)
-            emits = any(re.search(r"\bemit\s+" + _IDENT, f["body"]) or any(m in ("initializer", "reinitializer") for m, _ in f["modifiers"])
-                        for f in reach)
-            delegated = any(re.search(r"\bsuper\s*\.", f["body"]) or any(n.startswith("_") and n not in index for n in _calls_of(f))
-                            for f in reach)
-            result[id(fn)] = "emits" if emits else "delegated" if delegated else "missing"
+            result[id(fn)] = "emits" if id(fn) in emitting else "delegated" if id(fn) in delegating else "missing"
     return result
 
 
@@ -725,13 +770,13 @@ def _helper_checks_sender(index: dict[str, list[dict]], name: str, visiting: fro
     defs = [d for d in index.get(name, []) if d["kind"] == "function"]
     if not defs:
         return True
-    for d in defs:
+    for d in defs:  # a call may resolve to any overload of the name: every one of them must check the sender
         cached = d.get("_sender_check")
         if cached is None:
             cached = d["_sender_check"] = bool(_guard_labels(d["body"], index, _profile_of(d), visiting | {name}))
-        if cached:
-            return True
-    return False
+        if not cached:
+            return False
+    return True
 
 
 def _guard_labels(body: str, index: dict[str, list[dict]] | None, profile: _Profile,
@@ -749,20 +794,15 @@ def _guard_labels(body: str, index: dict[str, list[dict]] | None, profile: _Prof
     return found
 
 
-def _unconditional_calls(fn: dict) -> list[tuple[str, int]]:
-    """(name, offset) of each same-source call name that `fn` makes at a point that always runs, at its first such call;
-    cached on the function."""
+def _unconditional_calls(fn: dict) -> list[tuple[str, int, int]]:
+    """(name, offset, offset of its '(') of each same-source call that `fn` makes at a point that always runs; cached on the
+    function. Every call site is kept: overloads of one name may be resolved differently at each site (see _targets)."""
     cached = fn.get("_uncalls")
     if cached is None:
         profile = _profile_of(fn)
-        first: dict[str, int] = {}
-        for m in _CALL.finditer(fn["body"]):
-            name = m.group(1)
-            if name in _NOT_CALLS or name in first:
-                continue
-            if m.start() < profile.terminator and not profile.cond[m.start()]:
-                first[name] = m.start()
-        cached = fn["_uncalls"] = list(first.items())
+        cached = fn["_uncalls"] = [
+            (m.group(1), m.start(), m.end() - 1) for m in _CALL.finditer(fn["body"])
+            if m.group(1) not in _NOT_CALLS and m.start() < profile.terminator and not profile.cond[m.start()]]
     return cached
 
 
@@ -1002,6 +1042,53 @@ def _own_writes(fn: dict, index: dict[str, list[dict]]) -> list[int]:
 _NO_GUARD = (sys.maxsize, sys.maxsize)
 
 
+def _candidates(index: dict[str, list[dict]], name: str) -> list[dict]:
+    """The same-source functions a call of `name` may resolve to: every overload of that name visible to the contract."""
+    return [t for t in index.get(name, []) if t["kind"] == "function"]
+
+
+_IDENT_ONLY = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def _canon(text: str) -> str:
+    """A type as solc spells it in a signature: `uint` is `uint256`, `int` is `int256`, `byte` is `bytes1`."""
+    return _TYPE_SPELLING_RE.sub(lambda m: _TYPE_SPELLING[m.group(1)], text)
+
+
+def _arg_types(fn: dict, args: list[str]) -> list[str] | None:
+    """The declared type of each argument when every one is a parameter of `fn` that no local of `fn` shadows; None otherwise (a
+    literal, an expression, a state variable or a local: the type is not known here, so the call is not resolved)."""
+    scoped = _scoped_locals(fn)
+    declared = {name: t for t, name in fn["params"] if name}
+    types: list[str] = []
+    for arg in args:
+        if not _IDENT_ONLY.fullmatch(arg) or arg not in declared or "payable" in declared[arg]:
+            return None
+        if any(d >= 0 for d, _ in scoped.get(arg, ())):
+            return None  # a local of the same name: its type is not the parameter's
+        types.append(_canon(declared[arg]))
+    return types
+
+
+def _targets(fn: dict, index: dict[str, list[dict]], name: str, open_: int) -> list[dict]:
+    """The same-source functions the call of `name` whose '(' is at `open_` in fn's body may resolve to. When the argument types
+    are known and exactly one overload has exactly those parameter types, that overload is the target (solc prefers an exact
+    match); otherwise every overload of the name is a possible target, and a call credits a check or an emit only when all of them
+    give it."""
+    cands = _candidates(index, name)
+    if len(cands) < 2:
+        return cands
+    body = fn["body"]
+    close = match_close(body, open_)
+    if close < 0:
+        return cands
+    types = _arg_types(fn, split_top(body[open_ + 1:close]))
+    if types is None:
+        return cands
+    exact = [t for t in cands if [_canon(p) for p, _ in t["params"]] == types]
+    return exact if len(exact) == 1 else cands
+
+
 def _first(fn: dict, index: dict[str, list[dict]], memo: dict) -> tuple[int, int]:
     """(pos, end) of the first check that every run of `fn` certainly executes: its own (see _own_guards), or an unconditional call
     to a same-source function that certainly executes one, placed at the call. _NO_GUARD when there is none."""
@@ -1010,9 +1097,9 @@ def _first(fn: dict, index: dict[str, list[dict]], memo: dict) -> tuple[int, int
         return memo[key]
     memo[key] = _NO_GUARD  # a cycle contributes no guard of its own
     best = min(((pos, end) for pos, end, _ in _own_guards(fn, index)), default=_NO_GUARD)
-    for name, pos in _unconditional_calls(fn):
-        if pos < best[0] and any(t["kind"] == "function" and t is not fn and _first(t, index, memo)[0] < sys.maxsize
-                                 for t in index.get(name, [])):
+    for name, pos, open_ in _unconditional_calls(fn):
+        targets = _targets(fn, index, name, open_)
+        if pos < best[0] and targets and all(_first(t, index, memo)[0] < sys.maxsize for t in targets):
             best = (pos, pos + 1)
     memo[key] = best
     return best
@@ -1034,7 +1121,7 @@ def _covered(fn: dict, entered: bool, index: dict[str, list[dict]], memo: dict) 
             if name in _NOT_CALLS:
                 continue
             entry = entered or first < m.start()
-            if any(t["kind"] == "function" and not _covered(t, entry, index, memo) for t in index.get(name, [])):
+            if any(not _covered(t, entry, index, memo) for t in _targets(fn, index, name, m.end() - 1)):
                 ok = False
                 break
     memo[key] = ok
@@ -1049,10 +1136,10 @@ def _certain(fn: dict, index: dict[str, list[dict]], memo: dict) -> set[str]:
         return memo[key]
     memo[key] = set()
     labels = {label for _, _, label in _own_guards(fn, index)}
-    for name, _ in _unconditional_calls(fn):
-        for t in index.get(name, []):
-            if t["kind"] == "function" and t is not fn:
-                labels |= _certain(t, index, memo)
+    for name, _, open_ in _unconditional_calls(fn):
+        targets = _targets(fn, index, name, open_)
+        if targets:  # the call resolves to one of these: only a check every one of them makes is certain
+            labels |= set.intersection(*(_certain(t, index, memo) for t in targets))
     memo[key] = labels
     return labels
 
@@ -1416,6 +1503,23 @@ class _CallSites:
         self.opens = sorted(self.brace_close)
         self.lowlevel = [m.start() for m in _LOW_LEVEL.finditer(clean)]
         self._verdicts: dict[int, bool] | None = None
+        self._uses: dict[str, list[int]] | None = None
+        # every '(' with the '(' that encloses it (one stack pass, as _paren_pairs), and the check heads: require/assert/if with the
+        # offset of their '(', and return; both sorted, so a flag read finds its statement's heads by binary search
+        self.opens_all: list[int] = []
+        self.parent: dict[int, int] = {}
+        paren_stack: list[int] = []
+        for m in re.finditer(r"[()]", clean):
+            if m.group() == "(":
+                self.parent[m.start()] = paren_stack[-1] if paren_stack else -1
+                self.opens_all.append(m.start())
+                paren_stack.append(m.start())
+            elif paren_stack:
+                paren_stack.pop()
+        self.heads: list[tuple[int, str, int]] = [
+            (m.start(), m.group(1) or "return", m.end() - 1 if m.group(1) else -1)
+            for m in _HEAD_AT.finditer(clean)]
+        self._head_starts = [h[0] for h in self.heads]
 
     def _expression_braces(self) -> set[int]:
         """The '{' and '}' offsets that sit inside a matched parenthesis: part of an expression such as the struct literal in
@@ -1488,21 +1592,22 @@ class _CallSites:
         clean = self.clean
         i = bisect.bisect_left(self.seps, p)
         s = self.seps[i - 1] + 1 if i else 0
-        prefix = clean[s:p]
-        for m in re.finditer(r"\b(?:require|assert)\s*\(", prefix):
-            close = self.paren.get(s + m.end() - 1)
-            if close is not None and close > p:
-                return True
-        if re.search(r"\breturn\b", prefix):
-            return True
-        escaped = re.escape(flag)
-        for m in _IF_HEAD.finditer(prefix):
-            open_ = s + m.end() - 1
+        for k in range(bisect.bisect_left(self._head_starts, s), len(self.heads)):
+            start, kind, open_ = self.heads[k]
+            if start >= p:
+                break
+            if kind == "return":
+                return True  # a return expression before the read in this statement
+            if open_ >= p:
+                continue  # the head's parenthesis opens after the read: the read is not in it
             close = self.paren.get(open_)
             if close is None or close <= p:
                 continue  # the read is not in this condition
+            if kind != "if":
+                return True  # the read is an argument of a require or assert
             cond = clean[open_ + 1:close].strip()
             then_start = _WS.match(clean, close + 1).end()
+            escaped = re.escape(flag)
             if re.fullmatch(r"!\s*\(?\s*" + escaped + r"\s*\)?", cond):
                 if self._branch_exits(then_start):
                     return True  # `if (!ok) revert ...`: the then-branch is the failure path
@@ -1518,16 +1623,15 @@ class _CallSites:
         clean = self.clean
         i = bisect.bisect_left(self.seps, p)
         s = self.seps[i - 1] + 1 if i else 0
-        depth = 0
-        for j in range(p - 1, s - 1, -1):
-            if clean[j] == ")":
-                depth += 1
-            elif clean[j] == "(":
-                if depth:
-                    depth -= 1
-                    continue
-                close = self.paren.get(j)
-                return close is not None and close > p and _ASSIGN_AFTER.match(clean, close + 1) is not None
+        k = bisect.bisect_left(self.opens_all, p) - 1  # the nearest '(' before the name
+        o = self.opens_all[k] if k >= 0 else -1
+        while o >= s:  # the '(' that enclose the name in its statement, innermost first
+            close = self.paren.get(o)
+            if close is None:
+                return False  # a '(' that never closes encloses the name: no tuple target
+            if close > p:
+                return _ASSIGN_AFTER.match(clean, close + 1) is not None
+            o = self.parent[o]
         return False
 
     def _first_check(self, flag: str, start: int, limit: int) -> int | None:
@@ -1535,16 +1639,22 @@ class _CallSites:
         only stores, logs or tests something else is passed over (`emit E(ok); require(ok);` checks the call). None when the name is
         reassigned or redeclared before any check reads it, or when the scope holds no check (D-A)."""
         clean = self.clean
-        pattern = _name_pattern(flag)
-        at = start
-        while (m := pattern.search(clean, at, limit)) is not None:
-            p = m.start()
-            if _ASSIGN_AFTER.match(clean, m.end()) or self._is_tuple_target(p) or _DECL_BEFORE.search(clean, max(0, p - 64), p):
+        uses = self.name_uses().get(flag, [])  # sorted offsets of the whole-identifier uses of the flag, indexed once per source
+        for i in range(bisect.bisect_left(uses, start), len(uses)):
+            p = uses[i]
+            if p + len(flag) > limit:
+                break
+            if _ASSIGN_AFTER.match(clean, p + len(flag)) or self._is_tuple_target(p) or _DECL_BEFORE.search(clean, max(0, p - 64), p):
                 return None  # the name is overwritten or redeclared before a check reads it
             if self._is_check_read(flag, p):
                 return p
-            at = m.end()
         return None
+
+    def name_uses(self) -> dict[str, list[int]]:
+        """Offsets of every identifier token of the source, by name; built on first use, one pass."""
+        if self._uses is None:
+            self._uses = _identifier_positions(self.clean)
+        return self._uses
 
     def _judged(self, pos: int, nearest_unchecked: int | None) -> bool:
         """Whether the low-level call at `pos` is tested: within its statement before the call, a require, assert, if or return
@@ -1655,16 +1765,7 @@ _BINDING_CAP = 256  # characters before the `=` of a call's binding that are rea
 _ASSIGN_AFTER = re.compile(r"\s*(?:<<|>>|[-+*/%&|^])?=(?![=>])")  # a write to the name: `ok = `, `ok += `; not `ok == `
 _DECL_BEFORE = re.compile(r"\b(?:bool|address|string|bytes\d*|u?int\d*|byte|[A-Z]\w*)\s+(?:(?:memory|storage|calldata)\s+)?\Z")
 _REVERT_OR_RETURN = re.compile(r"(?:revert|return|throw)\b")
-_IF_HEAD = re.compile(r"\bif\s*\(")
-_NAME_PATTERNS: dict[str, re.Pattern] = {}
-
-
-def _name_pattern(name: str) -> re.Pattern:
-    """Whole-identifier match of `name`: a member `x.name` is another variable."""
-    pattern = _NAME_PATTERNS.get(name)
-    if pattern is None:
-        pattern = _NAME_PATTERNS[name] = re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
-    return pattern
+_HEAD_AT = re.compile(r"\b(?:(require|assert|if)\s*\(|(return)\b)")  # a check head: its keyword and '(' (or a return)
 
 
 def _slots(text: str) -> list[str]:

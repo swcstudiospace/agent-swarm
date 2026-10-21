@@ -628,6 +628,9 @@ def test_a_guard_on_a_conditional_or_dead_path_does_not_guard_the_delegatecall(s
 @pytest.mark.parametrize("make", [
     lambda: "pragma solidity 0.8.20;\ncontract C { address owner; function f() external { " + "address o = tx.origin; " * 2800 + "} }",  # 64 KiB
     lambda: "pragma solidity 0.8.28;\ncontract C { function f(address t) external { " + 't.call("") ' * 6000 + "} }",  # 64 KiB of call sites
+    lambda: "pragma solidity 0.8.28;\ncontract C { function f(address t) external { " + "".join(
+        f'(bool k{i}, ) = t.call(""); ' for i in range(1400)) + "".join(f"require(k{i}); " for i in range(1400))
+        + "} }",  # ~63 KiB: calls whose checks come later
 ])
 def test_a_64_kib_source_of_repeated_origin_or_call_sites_is_scanned_in_seconds(make):
     import time
@@ -822,3 +825,15 @@ def test_a_tx_origin_alias_is_judged_only_within_the_scope_that_declares_it():
     assert [sev for rule, sev, _ in findings(other) if rule == "SOL-TX-ORIGIN"] == ["minor"]
     same = body("    function auth() external view { address o = tx.origin; require(o == owner); }")
     assert [sev for rule, sev, _ in findings(same) if rule == "SOL-TX-ORIGIN"] == ["major"]
+
+
+def test_a_call_credits_only_the_overload_its_argument_types_select():  # round 2: an unresolved overload gives no credit
+    text = ("pragma solidity 0.8.28;\n"
+            "contract Base {\n    event Logged(address who);\n    function _log(address who) internal { emit Logged(who); }\n}\n"
+            "contract Child is Base {\n    uint256 public total;\n    function _log(uint256 v) internal { total = v; }\n"
+            "    function mint(uint256 v) external {\n        _log(v);\n        total += v;\n    }\n}\n")
+    # `_log(v)` with a uint256 argument resolves to the child's empty overload, not the base's emitting one: mint is missing its event
+    assert [rule for rule, _, _ in findings(text) if rule == "SOL-MISSING-EVENT"] == ["SOL-MISSING-EVENT"]
+    literal = text.replace("_log(v);", "_log(1);")
+    # a literal argument has no declared type: every overload is a possible target, and the base's emitting overload does not hold
+    assert [rule for rule, _, _ in findings(literal) if rule == "SOL-MISSING-EVENT"] == ["SOL-MISSING-EVENT"]
