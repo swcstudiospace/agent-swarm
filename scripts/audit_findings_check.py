@@ -4,8 +4,10 @@
 Scans `*findings*.json|yaml|yml` under --root (or the one file given with --path), checks every finding and reports problems as
 findings with severity info|minor|major|blocker; the run status is "fail" when any major or blocker exists. The audit severity
 scale inside a findings file is info|low|medium|high|critical (see swarm/tools/a27_tools.py, which supplies the shared rules).
-Read-only and bounded: files over 1 MiB are skipped, at most 2000 files are visited, symlinks are never followed, binaries are
-skipped, YAML needs PyYAML (otherwise `skipped:tool-missing`; JSON is always native). No external binary is required.
+Read-only and bounded: files over 1 MiB are skipped, at most 2000 files are visited, symlinks are never followed (a --path that is
+or passes through one is refused), binaries are skipped, YAML needs PyYAML (otherwise `skipped:tool-missing`; JSON is always native).
+Every input that is skipped, truncated, unreadable or unparseable, and a run that analysed no input at all, adds a major
+`scan-incomplete` finding (swarm/scan_status.py), so the status is "fail" until every in-scope input is analysed.
 `--dry-run` prints deterministic canned output and reads nothing. Stdlib only.
 """
 from __future__ import annotations
@@ -19,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.gates import make_finding  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a27_tools  # noqa: E402
 
@@ -61,22 +64,51 @@ def _regular(path: Path) -> bool:
         return False
 
 
-def _discover(root: Path, target: Path) -> tuple[list[Path], bool]:
-    """Candidate findings files: the target itself, or `*findings*` json/yaml files below it. (files, truncated)"""
-    if target.is_file():
-        return [target], False
+def _rel(root: Path, path: Path) -> str:
+    return _clean(path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name)
+
+
+def _discover(root: Path, target: Path) -> tuple[list[Path], list[str], bool]:
+    """Candidate findings files: the target itself, or `*findings*` json/yaml files below it. (files, reasons, truncated)
+
+    A symlink is never followed and a non-regular file is never opened; each one is a reason the scan is incomplete.
+    """
+    if not target.is_dir():
+        if _regular(target):
+            return [target], [], False
+        return [], [f"skipped:not-regular: {_rel(root, target)}"], False
     found: list[Path] = []
+    reasons: list[str] = []
     visited = 0
     for current, dirs, names in os.walk(target, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not os.path.islink(os.path.join(current, d)))
+        kept = []
+        for d in sorted(dirs):
+            if d in SKIP_DIRS:
+                continue
+            if os.path.islink(os.path.join(current, d)):
+                reasons.append(f"skipped:symlink: {_rel(root, Path(current) / d)}")
+            else:
+                kept.append(d)
+        dirs[:] = kept
         for name in sorted(names):
             visited += 1
             if visited > MAX_FILES:
-                return found, True
+                reasons.append(f"file-limit: scan stopped after {MAX_FILES} files")
+                return found, reasons, True
             path = Path(current) / name
-            if path.suffix.lower() in SUFFIXES and "findings" in name.lower() and not path.is_symlink() and _regular(path):
+            if path.suffix.lower() not in SUFFIXES or "findings" not in name.lower():
+                continue
+            if path.is_symlink():
+                reasons.append(f"skipped:symlink: {_rel(root, path)}")
+            elif _regular(path):
                 found.append(path)
-    return found, False
+            else:
+                reasons.append(f"skipped:not-regular: {_rel(root, path)}")
+    return found, reasons, False
+
+
+def _incomplete(reasons: list[str], analysed: int) -> list[dict]:
+    return [make_finding(f["id"], f["severity"], f["rule"], f["summary"]) for f in incomplete_findings(reasons, analysed)]
 
 
 def _load(path: Path):
@@ -184,7 +216,7 @@ def _check_finding(root: Path, rel: str, index: int, item, seen: set[str], out: 
         elif not a27_tools._is_commit(commit.strip()):
             add("fix-commit-invalid", "major", f"{label}: fix_commit {_shown(commit)} is not a git object id (7-40 or 64 hex characters)")
         if serious and not (item.get("regression_test") is True and item.get("reaudited") is True):
-            add("fix-unverified", "minor", f"{label}: {severity} fix lacks a regression test or a re-audit (regression_test, reaudited)")
+            add("fix-unverified", "major", f"{label}: {severity} fix lacks a regression test or a re-audit (regression_test, reaudited)")
     elif status == "open":
         if severity == "critical":
             add("open-blocking", "blocker", f"{label}: critical finding is still open")
@@ -235,15 +267,20 @@ def run(args, ctx) -> dict:
     target = (root / args.path).resolve()
     if not target.is_relative_to(root):
         raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} leaves the repository root")
+    probe = Path(os.path.normpath(root / args.path))
+    while probe != root and probe.is_relative_to(root):
+        if probe.is_symlink():
+            raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} is or passes through a symbolic link; symlinks are never followed")
+        probe = probe.parent
     if not target.exists():
         raise SwarmError(ErrorCode.E_INPUT, f"--path {_shown(args.path)} does not exist under {root}")
-    files, truncated = _discover(root, target)
+    files, reasons, truncated = _discover(root, target)
     out: list[dict] = []
     skipped: list[str] = []
     stats = {"by_category": {}, "by_severity": {}, "by_status": {}}
-    checked = total = 0
+    checked = total = analysed = 0
     for path in files:
-        rel = _clean(path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name)
+        rel = _rel(root, path)
         try:
             document, skip, error = _load(path)
         except OSError as exc:
@@ -255,28 +292,33 @@ def run(args, ctx) -> dict:
         checked += 1
         if error:
             out.append(make_finding(f"unparseable:{rel}", "major", "unparseable", f"{rel}: {error}", location=rel))
+            reasons.append(f"unparseable: {rel}")
             continue
         items = document.get("findings") if isinstance(document, dict) else document
         if not isinstance(items, list):
             out.append(make_finding(f"bad-shape:{rel}", "major", "bad-shape", f"{rel}: expected a list of findings or an object with a 'findings' list", location=rel))
+            reasons.append(f"bad-shape: {rel}")
             continue
+        analysed += 1
         seen: set[str] = set()
         for index, item in enumerate(items):
             _check_finding(root, rel, index, item, seen, out, stats)
         total += len(items)
         _duplicates(rel, items, out)
+    reasons.extend(skipped)
     if not files:
         out.append(make_finding("no-findings-file", "info", "no-findings-file", f"no *findings*.json|yaml|yml file found under {_clean(args.path)}"))
+    out.extend(_incomplete(reasons, analysed))
     rank = {name: index for index, name in enumerate(("info", "minor", "major", "blocker"))}
     out.sort(key=lambda f: (-rank[f["severity"]], f["id"]))
+    status = scan_status(out)
     majors = sum(1 for f in out if f["severity"] in ("major", "blocker"))
-    failing = majors > 0
     capped = len(out) > MAX_REPORTED
     if capped:
         out = out[:MAX_REPORTED]
-    summary = f"{total} finding(s) in {checked} file(s): " + (f"{majors} major or worse problem(s)" if failing else "no major or worse problem")
+    summary = f"{total} finding(s) in {checked} file(s): " + (f"{majors} major or worse problem(s)" if status == "fail" else "no major or worse problem")
     return {
-        "status": "fail" if failing else "ok",
+        "status": status,
         "findings": out,
         "summary": summary + (f"; {len(skipped)} file(s) skipped" if skipped else ""),
         "files_checked": checked,

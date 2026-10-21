@@ -233,11 +233,18 @@ def test_score_irrecoverable_bumps_impact_one_level_up_to_high():
 
 def test_score_override_needs_l3_only_when_the_proposal_differs():
     same = score(100_000, proposed_severity="critical")
-    assert same["requires_l3_approval"] is False and same["findings"] == [] and same["verdict"] == "pass"
+    assert same["requires_l3_approval"] is False and sev(same) == {"SEV-COMPUTED": "critical"} and same["verdict"] == "fail"  # a computed critical is a finding, not a pass
     other = score(100_000, proposed_severity="high")
     assert other["requires_l3_approval"] is True and other["severity"] == "critical"
-    assert sev(other) == {"SEV-OVERRIDE": "medium"} and other["verdict"] == "warn"
+    assert sev(other) == {"SEV-OVERRIDE": "medium", "SEV-COMPUTED": "critical"} and other["verdict"] == "fail"
     assert score(100_000)["requires_l3_approval"] is False
+
+
+def test_a_computed_medium_high_or_critical_severity_is_a_finding_so_it_is_never_a_pass():
+    assert sev(score(1_000_000)) == {"SEV-COMPUTED": "critical"} and score(1_000_000)["verdict"] == "fail"
+    assert sev(score(10_000)) == {"SEV-COMPUTED": "high"} and score(10_000)["verdict"] == "fail"
+    assert sev(score(0)) == {"SEV-COMPUTED": "medium"} and score(0)["verdict"] == "warn"
+    assert score(0, "privileged")["findings"] == [] and score(0, "privileged")["verdict"] == "pass"
 
 
 def test_score_rejects_loss_above_tvl_but_accepts_equal():
@@ -402,12 +409,12 @@ def test_oracle_twap_outcomes_by_feasibility_and_profit():
     unprofitable = twap(extractable_profit_usd=500_000)  # equal to the cost: not profitable
     assert unprofitable["profitable"] is False and sev(unprofitable) == {"ORACLE-ATTACK-UNPROFITABLE": "low"} and unprofitable["verdict"] == "pass"
     quiet = twap(attacker_capital_usd=0, extractable_profit_usd=0)
-    assert quiet["findings"] == [] and quiet["risk"] == "low" and quiet["verdict"] == "pass"
+    assert quiet["findings"] == [] and quiet["risk"] == "none" and quiet["verdict"] == "pass"
 
 
 def test_oracle_chainlink_hygiene_findings():
     good = ok("audit_oracle_risk", {"oracle_type": "chainlink", "staleness_check": True, "answer_bounds_check": True})
-    assert good["findings"] == [] and good["modelled"] is False and good["risk"] == "low" and good["verdict"] == "pass"
+    assert good["findings"] == [] and good["modelled"] is False and good["risk"] == "none" and good["verdict"] == "pass"
     assert (good["required_capital_usd"], good["attack_cost_usd"], good["net_gain_usd"], good["feasible"], good["profitable"]) == (0.0, 0.0, 0.0, False, False)
     bad = ok("audit_oracle_risk", {"oracle_type": "chainlink", "staleness_check": False, "answer_bounds_check": False, "l2": True})
     assert sev(bad) == {"ORACLE-STALE": "high", "ORACLE-SEQUENCER": "high", "ORACLE-BOUNDS": "medium"} and bad["verdict"] == "fail"
@@ -584,8 +591,8 @@ def test_fuzz_invariant_depth_and_total_call_thresholds():
 
 
 def test_fuzz_invariant_min_total_calls_override_and_revert_ratio():
-    assert invariant(runs=10, min_total_calls=500)["findings"] == []
-    assert sev(invariant(runs=9, min_total_calls=500)) == {"FUZZ-CALLS": "medium"}
+    assert sev(invariant(runs=10, min_total_calls=500)) == {"FUZZ-FLOOR": "medium"}  # a caller-lowered floor is reported, not accepted silently
+    assert sev(invariant(runs=9, min_total_calls=500)) == {"FUZZ-CALLS": "medium", "FUZZ-FLOOR": "medium"}
     assert invariant(revert_ratio_pct=50)["findings"] == []
     assert sev(invariant(revert_ratio_pct=50.01)) == {"FUZZ-REVERTS": "medium"}
     assert fuzz(revert_ratio_pct=99)["findings"] == []  # the revert ratio only applies to invariant campaigns
@@ -792,7 +799,7 @@ def test_dedupe_groups_by_category_file_and_function_with_path_normalisation():
     result = dedupe(item("A", "x one", function="withdraw"), item("B", "completely different", file="./src/V.sol", function="Withdraw"),
                     item("C", "other", file="src\\V.sol", function="withdraw"), item("D", "other", file="src/W.sol", function="withdraw"))
     assert result["groups"] == [{"primary_id": "A", "duplicate_ids": ["B", "C"], "severity": "high", "severity_conflict": False}]
-    assert (result["input_count"], result["unique_count"], result["duplicate_count"]) == (4, 2, 2) and result["verdict"] == "pass"
+    assert (result["input_count"], result["unique_count"], result["duplicate_count"]) == (4, 2, 2) and result["verdict"] == "fail"  # four high inputs: the verdict is fail
 
 
 def test_dedupe_root_cause_takes_precedence_over_function():
@@ -819,8 +826,8 @@ def test_dedupe_requires_same_category_and_file():
 def test_dedupe_primary_is_the_highest_severity_then_lowest_id_and_conflicts_are_flagged():
     result = dedupe(item("C", "same title", severity="low"), item("B", "same title", severity="high"), item("A", "same title", severity="high"))
     assert result["groups"] == [{"primary_id": "A", "duplicate_ids": ["B", "C"], "severity": "high", "severity_conflict": True}]
-    assert sev(result) == {"DEDUP-A": "medium"} and result["verdict"] == "warn"
-    assert result["findings"][0]["summary"] == "duplicates of A disagree on severity (low, high); resolving needs L3 approval"
+    assert sev(result) == {"DEDUP-A": "medium", "INPUT-SEVERITY": "high"} and result["verdict"] == "fail"  # the verdict covers the highest input severity
+    assert next(f for f in result["findings"] if f["id"] == "DEDUP-A")["summary"] == "duplicates of A disagree on severity (low, high); resolving needs L3 approval"
 
 
 def test_dedupe_is_transitive():
@@ -874,8 +881,9 @@ def test_report_acceptance_and_open_status_rules():
     result = report([rfind("A", status="acknowledged"), rfind("B", "critical", status="wontfix"), rfind("C", "medium", status="acknowledged")])
     assert result["risk_acceptances_needed"] == 2 and sev(result) == {"REP-A-acceptance": "medium", "REP-B-acceptance": "medium"}
     final = report([rfind("O", "critical", status="open")])
-    assert sev(final) == {"REP-O-open": "high"} and final["verdict"] == "fail"
-    assert report([rfind("O", "critical", status="open")], stage="draft")["findings"] == []
+    assert sev(final) == {"REP-O-open": "critical"} and final["verdict"] == "fail"
+    draft = report([rfind("O", "critical", status="open")], stage="draft")
+    assert sev(draft) == {"REP-O-open": "medium"} and draft["verdict"] == "warn"  # an open critical is a finding in a draft too
     assert report([rfind("O", "medium", status="open")])["findings"] == []
 
 
@@ -1043,7 +1051,7 @@ def test_flashloan_matches_exact_rational_arithmetic(fee_bps, flash_bps):
 def test_fuzz_stateless_min_total_calls_override_replaces_the_run_minimum():
     assert sev(fuzz(runs=5_000)) == {"FUZZ-RUNS": "medium"}
     lowered = fuzz(runs=5_000, min_total_calls=5_000)
-    assert lowered["findings"] == [] and lowered["checks_passed"] == 5
+    assert sev(lowered) == {"FUZZ-FLOOR": "medium"} and lowered["checks_passed"] == 5 and lowered["verdict"] == "warn"  # a lowered floor is reported
     assert sev(fuzz(runs=20_000, min_total_calls=50_000)) == {"FUZZ-RUNS": "medium"}  # raised floor
     assert sev(fuzz(runs=4_999, min_total_calls=50_000)) == {"FUZZ-RUNS": "high"}  # under a tenth of the floor
     assert sev(fuzz(runs=5_000, min_total_calls=50_000)) == {"FUZZ-RUNS": "medium"}  # exactly a tenth

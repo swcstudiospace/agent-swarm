@@ -247,7 +247,7 @@ def classify_vulnerability(payload: dict) -> dict:
     def work() -> dict:
         observations = payload["observations"]
         seen: set[str] = set()
-        counts = dict.fromkeys(reversed(SEVERITIES), 0)
+        counts = dict.fromkeys(SEVERITIES, 0)
         swc_ids: set[str] = set()
         findings = []
         for index, observation in enumerate(observations):
@@ -300,6 +300,8 @@ def score_severity(payload: dict) -> dict:
         proposed = payload.get("proposed_severity")
         needs_l3 = proposed is not None and proposed != severity
         findings = []
+        if _RANK[severity] >= _RANK["medium"]:
+            findings.append(_finding("SEV-COMPUTED", severity, f"computed {severity} severity from impact {impact} and likelihood {likelihood}: a {severity} result needs triage, it is not a pass"))
         if needs_l3:
             findings.append(
                 _finding("SEV-OVERRIDE", "medium", f"proposed severity {proposed} differs from the computed {severity}; a change needs L3 approval")
@@ -454,7 +456,7 @@ def oracle_risk(payload: dict) -> dict:
                 findings.append(_finding("ORACLE-SEQUENCER", "high", "L2 deployment without a sequencer uptime feed check (answer 0 = up) and a grace period after it restarts"))
         else:
             findings.append(_finding("ORACLE-ADMIN", "high", "price is set by a privileged key: compromise or error misprices the protocol"))
-        risk = max((f["severity"] for f in findings), key=_RANK.__getitem__, default="low")
+        risk = max((f["severity"] for f in findings), key=_RANK.__getitem__, default="none")
         return {
             "state": "SUCCESS",
             "modelled": modelled,
@@ -624,6 +626,10 @@ def fuzz_adequacy(payload: dict) -> dict:
         severity = "medium" if exercised * 10 >= total * 9 else "high"
         checks.append((exercised >= total, severity, "FUZZ-FUNCTIONS", f"{exercised} of {total} functions exercised"))
         findings = [_finding(fid, sev, summary) for passed, sev, fid, summary in checks if not passed]
+        lowered = payload.get("min_total_calls")
+        default_floor = FUZZ_RUNS_MIN if mode == "stateless" else INVARIANT_CALLS_MIN
+        if lowered is not None and lowered < default_floor:
+            findings.append(_finding("FUZZ-FLOOR", "medium", f"caller lowered the policy minimum from {default_floor} to {lowered} total calls; a lowered floor needs L3 approval"))
         passed_count = sum(1 for passed, *_ in checks if passed)
         return {
             "state": "SUCCESS",
@@ -823,7 +829,7 @@ def _tokens(title: str) -> frozenset[str]:
 
 
 def dedupe_findings(payload: dict) -> dict:
-    """Group findings that share category, file and root cause (or function), or whose titles are >= 80% alike, and flag severity conflicts."""
+    """Group findings that share category, file and root cause (or function), or whose titles are >= 80% alike; flag severity conflicts and surface the highest input severity, which the verdict covers."""
 
     def work() -> dict:
         items = payload["findings"]
@@ -873,6 +879,11 @@ def dedupe_findings(payload: dict) -> dict:
             if conflict:
                 severities = ", ".join(sorted({item["severity"] for item in group}, key=_RANK.__getitem__))
                 findings.append(_finding(f"DEDUP-{primary['id']}", "medium", f"duplicates of {primary['id']} disagree on severity ({severities}); resolving needs L3 approval"))
+        if items:
+            top = max((item["severity"] for item in items), key=_RANK.__getitem__)
+            if _RANK[top] >= _RANK["medium"]:
+                at_top = sum(1 for item in items if item["severity"] == top)
+                findings.append(_finding("INPUT-SEVERITY", top, f"{at_top} input finding(s) at {top} severity: the verdict covers the highest input severity"))
         groups.sort(key=lambda group: group["primary_id"])
         duplicates = sum(len(group["duplicate_ids"]) for group in groups)
         return {
@@ -934,8 +945,12 @@ def report_completeness(payload: dict) -> dict:
                 if item["fix_status"] in ("acknowledged", "wontfix"):
                     acceptances += 1
                     findings.append(_finding(f"REP-{item['id']}-acceptance", "medium", f"{item['id']} is {item['fix_status']}: needs an L4 risk acceptance"))
-                elif item["fix_status"] == "open" and final:
-                    findings.append(_finding(f"REP-{item['id']}-open", "high", f"final report lists {item['severity']} finding {item['id']} as open"))
+                elif item["fix_status"] == "open":
+                    if final:
+                        open_severity = "critical" if item["severity"] == "critical" else "high"
+                        findings.append(_finding(f"REP-{item['id']}-open", open_severity, f"final report lists {item['severity']} finding {item['id']} as open"))
+                    else:
+                        findings.append(_finding(f"REP-{item['id']}-open", "medium", f"draft lists {item['severity']} finding {item['id']} as open; fix, mitigate or accept it before the final report"))
             incomplete += 1 if problems else 0
         ordered = _ordered(findings)
         if len(ordered) > REPORT_FINDINGS_CAP:  # the registered output_schema allows this many; the verdict below still uses every finding

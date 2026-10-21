@@ -102,9 +102,9 @@ def test_top_level_list_is_accepted_as_well_as_an_object(repo):
     assert rc == 0 and data["findings_total"] == 1
 
 
-def test_no_findings_file_is_an_info_not_a_failure(repo):
+def test_no_findings_file_leaves_nothing_analysed_so_the_scan_is_incomplete(repo):
     rc, data, _ = repo.run()
-    assert rc == 0 and data["status"] == "ok" and kinds(data) == {"no-findings-file": "info"} and data["files_checked"] == 0
+    assert rc == 1 and data["status"] == "fail" and kinds(data) == {"no-findings-file": "info", "scan-incomplete": "major"} and data["files_checked"] == 0
 
 
 # --- required fields and identity -----------------------------------------------------------------------------
@@ -212,11 +212,13 @@ def test_fix_commit_must_be_a_git_object_id(repo, commit, valid):
     assert ("fix-commit-invalid" not in kinds(data)) is valid and (rc == 0) is valid
 
 
-def test_serious_fix_without_regression_test_or_reaudit_is_minor(repo):
+def test_serious_fix_without_regression_test_or_reaudit_is_major(repo):
     rc, data, _ = repo.check([good(regression_test=False)])
-    assert rc == 0 and kinds(data) == {"fix-unverified": "minor"}
+    assert rc == 1 and kinds(data) == {"fix-unverified": "major"}  # the fix tool rates this unverified fix as failing too
+    rc, data, _ = repo.check([good(severity="critical", regression_test=False)])
+    assert rc == 1 and kinds(data) == {"fix-unverified": "major"}  # a critical fix is never reported ok without verification
     rc, data, _ = repo.check([good(reaudited=None)])
-    assert rc == 0 and kinds(data) == {"fix-unverified": "minor"}
+    assert rc == 1 and kinds(data) == {"fix-unverified": "major"}
     rc, data, _ = repo.check([good(severity="medium", regression_test=False, reaudited=False)])
     assert rc == 0 and data["findings"] == []
 
@@ -260,14 +262,14 @@ def test_duplicate_detection_notes_when_it_only_covered_the_first_200(repo):
 def test_invalid_json_is_unparseable_major(repo):
     repo.write("audit/findings.json", "{not json")
     rc, data, _ = repo.run()
-    assert rc == 1 and kinds(data) == {"unparseable": "major"} and data["files_checked"] == 1
+    assert rc == 1 and kinds(data) == {"unparseable": "major", "scan-incomplete": "major"} and data["files_checked"] == 1
 
 
 @pytest.mark.parametrize("document", [{"issues": []}, "text", 3, {"findings": {"a": 1}}])
 def test_wrong_document_shape_is_major(repo, document):
     repo.write("audit/findings.json", json.dumps(document))
     rc, data, _ = repo.run()
-    assert rc == 1 and kinds(data) == {"bad-shape": "major"}
+    assert rc == 1 and kinds(data) == {"bad-shape": "major", "scan-incomplete": "major"}
 
 
 # --- discovery and bounds -------------------------------------------------------------------------------------
@@ -301,7 +303,7 @@ def test_files_over_one_mebibyte_are_skipped_not_parsed(repo):
     big = {"findings": [good()], "padding": "x" * (1 << 20)}
     repo.write("audit/findings.json", big)
     rc, data, _ = repo.run()
-    assert rc == 0 and data["files_checked"] == 0 and data["files_skipped"] == ["skipped:too-large: audit/findings.json"]
+    assert rc == 1 and data["files_checked"] == 0 and data["files_skipped"] == ["skipped:too-large: audit/findings.json"] and kinds(data) == {"scan-incomplete": "major"}
     exact = repo.write("audit/findings.json", {"findings": [good()]})
     exact.write_text(exact.read_text(encoding="utf-8") + " " * ((1 << 20) - exact.stat().st_size), encoding="utf-8")
     assert exact.stat().st_size == 1 << 20
@@ -313,7 +315,7 @@ def test_binary_files_are_skipped(repo):
     (repo.root / "audit").mkdir()
     (repo.root / "audit" / "findings.json").write_bytes(b"\x00\x01\x02 binary")
     rc, data, _ = repo.run()
-    assert rc == 0 and data["files_skipped"] == ["skipped:binary: audit/findings.json"] and data["files_checked"] == 0
+    assert rc == 1 and data["files_skipped"] == ["skipped:binary: audit/findings.json"] and data["files_checked"] == 0 and kinds(data) == {"scan-incomplete": "major"}
 
 
 def test_symlinks_are_never_followed(repo, tmp_path):
@@ -323,9 +325,21 @@ def test_symlinks_are_never_followed(repo, tmp_path):
     (repo.root / "linkdir").symlink_to(outside, target_is_directory=True)
     (repo.root / "linkfile-findings.json").symlink_to(outside / "findings.json")
     rc, data, _ = repo.run()
-    assert rc == 0 and data["files_checked"] == 0 and kinds(data) == {"no-findings-file": "info"}
+    assert rc == 1 and data["files_checked"] == 0 and kinds(data) == {"no-findings-file": "info", "scan-incomplete": "major"}
+    reason = next(f["summary"] for f in data["findings"] if f["kind"] == "scan-incomplete")
+    assert "skipped:symlink: linkdir" in reason and "skipped:symlink: linkfile-findings.json" in reason
     result = run_script(SCRIPT, "--root", str(repo.root), "--json", "--path", "linkfile-findings.json", env={"SWARM_DIR": str(repo.state)})
     assert result.returncode == 2  # an explicit path that resolves outside the root is refused
+
+
+def test_a_path_that_is_or_passes_through_an_in_root_symlink_is_refused(repo):
+    (repo.root / "audit").mkdir()
+    (repo.root / "audit" / "findings.json").write_text(json.dumps({"findings": [good()]}), encoding="utf-8")
+    (repo.root / "alias.json").symlink_to(repo.root / "audit" / "findings.json")
+    (repo.root / "alias-dir").symlink_to(repo.root / "audit", target_is_directory=True)
+    for path in ("alias.json", "alias-dir", "alias-dir/findings.json"):
+        result = run_script(SCRIPT, "--root", str(repo.root), "--json", "--path", path, env={"SWARM_DIR": str(repo.state)})
+        assert result.returncode == 2 and json.loads(result.stdout)["error"]["code"] == "E-INPUT", path
 
 
 def test_at_most_2000_files_are_visited(repo):
@@ -335,7 +349,7 @@ def test_at_most_2000_files_are_visited(repo):
         (root / f"f{index:04d}.txt").write_text("x", encoding="utf-8")
     (root / "zzz-findings.json").write_text(json.dumps({"findings": [good()]}), encoding="utf-8")
     rc, data, _ = repo.run("--path", "bulk")
-    assert data["truncated"] is True and data["files_checked"] == 0  # the 2001st file is never reached
+    assert data["truncated"] is True and data["files_checked"] == 0 and data["status"] == "fail" and kinds(data)["scan-incomplete"] == "major"  # the 2001st file is never reached, so the scan is incomplete
     (root / "f0000.txt").unlink()
     rc, data, _ = repo.run("--path", "bulk")
     assert data["truncated"] is False and data["files_checked"] == 1  # exactly 2000 files are still all visited
@@ -361,7 +375,7 @@ def test_yaml_findings_are_checked_when_pyyaml_is_available(repo):
     assert rc == 1 and data["files_checked"] == 1 and set(kinds(data)) == {"poc-missing", "open-high"}
     repo.write("audit/findings.yaml", "findings: [unclosed")
     rc, data, _ = repo.run()
-    assert rc == 1 and kinds(data) == {"unparseable": "major"}
+    assert rc == 1 and kinds(data) == {"unparseable": "major", "scan-incomplete": "major"}
 
 
 def test_yaml_without_pyyaml_is_skipped_as_tool_missing_while_json_still_runs(repo, tmp_path):
@@ -372,7 +386,7 @@ def test_yaml_without_pyyaml_is_skipped_as_tool_missing_while_json_still_runs(re
     repo.write("audit/findings.json", {"findings": [good(severity="critical", poc=None)]})
     rc, data, _ = repo.run(env={"PYTHONPATH": str(shim)})
     assert data["files_skipped"] == ["skipped:tool-missing: audit/findings.yaml (yaml needs PyYAML)"]
-    assert rc == 1 and data["files_checked"] == 1 and kinds(data) == {"poc-missing": "major"}  # JSON handling is native
+    assert rc == 1 and data["files_checked"] == 1 and kinds(data) == {"poc-missing": "major", "scan-incomplete": "major"}  # JSON handling is native; the skipped YAML keeps the scan incomplete
 
 
 # --- ordering and exit codes ----------------------------------------------------------------------------------
@@ -382,9 +396,9 @@ def test_findings_are_sorted_by_severity_then_id_and_status_is_fail_on_major_onl
         good(id="A", regression_test=False, title="Different bug", category="SWC-104", location="src/Other.sol:2"),
     ])
     assert rc == 1 and data["status"] == "fail"
-    assert [f["severity"] for f in data["findings"]] == ["blocker", "major", "minor"]
+    assert [f["severity"] for f in data["findings"]] == ["blocker", "major", "major"]
     assert data["findings"][0]["id"] == "open-blocking:audit/findings.json:B" and data["findings"][0]["location"] == "audit/findings.json"
-    only_minor = repo.check([good(regression_test=False)])
+    only_minor = repo.check([good(severity="medium", poc="test/Missing.t.sol")])
     assert only_minor[0] == 0 and only_minor[1]["status"] == "ok" and only_minor[1]["findings"][0]["severity"] == "minor"
 
 
@@ -444,7 +458,7 @@ def test_secret_values_in_a_malformed_findings_file_are_never_echoed(repo, kind)
     repo.write("audit/findings.yaml", f"findings: [{secret}, unclosed")
     repo.write("audit/other-findings.json", f'{{"findings": [ {secret} ')
     rc, data, result = repo.run()
-    assert rc == 1 and {f["kind"] for f in data["findings"]} == {"unparseable"} and len(data["findings"]) == 2
+    assert rc == 1 and {f["kind"] for f in data["findings"]} == {"unparseable", "scan-incomplete"} and len(data["findings"]) == 3
     assert _leaks(data, secret) == [] and _leaks({"stderr": result.stderr}, secret) == []
     assert any("line" in f["summary"] for f in data["findings"])
 
@@ -460,4 +474,4 @@ def test_a_named_pipe_named_like_a_findings_file_is_skipped_and_the_valid_file_i
         capture_output=True, text=True, timeout=60, cwd=ROOT, env={**os.environ, "SWARM_DIR": str(repo.state)},
     )
     data = json.loads(result.stdout)
-    assert result.returncode == 0 and data["files_checked"] == 1 and data["findings_total"] == 1 and data["findings"] == []
+    assert result.returncode == 1 and data["files_checked"] == 1 and data["findings_total"] == 1 and {f["kind"] for f in data["findings"]} == {"scan-incomplete"}  # the FIFO is skipped, so the scan is incomplete
