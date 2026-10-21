@@ -600,17 +600,19 @@ def _check_images(repo: Repo, kusts: dict) -> None:
     where: dict[str, list[str]] = {}
     roots = sorted(set(kusts) - _referenced(kusts))
     rendered = _reached(repo, kusts, roots)
-    unpinned: dict[str, set[str]] = {}  # image name -> files that some render leaves unpinned, computed once per name
+    pinned_names = {name for _, kust in kusts.values() for name in _kust_pins(kust)}
+    occurrences: dict[str, list[tuple[str, str]]] = {}  # image name -> (file, image reference) of each occurrence
     for rel in sorted(repo.docs):
         for doc in repo.docs[rel]:
             for image in _images(doc, [0]):
-                name = _image_name(image)
-                if name not in unpinned:
-                    unpinned[name] = _reached(repo, kusts, roots, name)
-                # judged on every render that includes the file: a file that an unpinned overlay renders floats there, whatever another overlay
-                # pins; a file no overlay renders is judged as it stands
-                if rel not in rendered or rel in unpinned[name]:
-                    where.setdefault(image, []).append(rel)
+                occurrences.setdefault(_image_name(image), []).append((rel, image))
+    for name in sorted(occurrences):
+        # a name that no kustomization pins blocks nothing, so the plain reach answers for it and no set is built; a pinned name gets its own
+        # walk, and that set is dropped once its occurrences are judged. Every render that includes a file is judged, whatever another pins.
+        unpinned = _reached(repo, kusts, roots, name) if name in pinned_names else rendered
+        for rel, image in occurrences.pop(name):
+            if rel not in rendered or rel in unpinned:
+                where.setdefault(image, []).append(rel)
     for directory, (rel, kust) in sorted(kusts.items()):
         for entry in kust.get("images") or []:
             if not isinstance(entry, dict):
