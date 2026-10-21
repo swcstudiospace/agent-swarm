@@ -4,7 +4,9 @@
  * that turn to start and then to finish, so a `-p` run does not exit before the dispatch. The brief reaches python
  * as one argv element built by planArgs (no shell, T-04-15). Nothing is dispatched without a successful plan result.
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { swarmRoot } from "./bridge.ts";
 import type { Bridge, BridgeResult } from "./bridge.ts";
 import { inPlanMode, sessionAgent } from "./context.ts";
 import { DISPATCH_MARKER } from "./hooks.ts";
@@ -137,9 +139,15 @@ function dispatchPrompt(res: BridgeResult, parsed: SwarmArgs, assignment: Record
  * (never stdout, which `--mode json` owns), so a run that planned nothing is distinguishable from a silent dispatch.
  * The success line travels in the dispatch prompt and is UI-only.
  */
+/** User-visible text must not carry the retired policy token, including forwarded runtime errors. */
+function promptSafe(text: string): string {
+  return text.replace(/E-POLICY:\s*/gi, "").replace(/E-POLICY/gi, "");
+}
+
 function notify(ctx: CommandContext, message: string, level: "info" | "warning" | "error"): void {
-  if (ctx.hasUI) ctx.ui?.notify(message, level);
-  else if (level !== "info") process.stderr.write(`[/swarm] ${message}\n`);
+  const shown = promptSafe(message);
+  if (ctx.hasUI) ctx.ui?.notify(shown, level);
+  else if (level !== "info") process.stderr.write(`[/swarm] ${shown}\n`);
 }
 
 export interface SwarmCommandOptions {
@@ -160,7 +168,7 @@ const DEFAULT_UI_HOLD_TIMEOUT_MS = 30 * 60_000;
 export const HOLD_ENV = "SWARM_DISPATCH_HOLD_MS";
 
 /** The hold cap in ms: DI option, else `SWARM_DISPATCH_HOLD_MS` when a positive integer, else 30 min with a UI, else Infinity. */
-export function holdTimeoutMs(ctx: Pick<CommandContext, "hasUI">, opts: SwarmCommandOptions, env: Record<string, string | undefined>): number {
+export function holdTimeoutMs(ctx: Pick<CommandContext, "hasUI">, opts: Pick<SwarmCommandOptions, "holdTimeoutMs">, env: Record<string, string | undefined>): number {
   if (opts.holdTimeoutMs !== undefined) return opts.holdTimeoutMs;
   const raw = env[HOLD_ENV]?.trim();
   if (raw !== undefined && /^\d+$/.test(raw) && Number(raw) > 0) return Number(raw);
@@ -223,19 +231,34 @@ async function awaitTurnEnd(ctx: CommandContext, capMs: number, { intervalMs = 1
   return true;
 }
 
-export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions = {}): CommandDefinition {
+/** Python for the /swarm startup record: argv is [root, correlation id, workspace]; no user text is spliced into this source. */
+const SWARM_LIFECYCLE_CODE = `import sys,os,json; r,corr,root=sys.argv[1:4]; sys.path.insert(0,r); from swarm.envelope import perform_signing_key_lifecycle; from swarm.state_store import get_swarm_state_store; res=perform_signing_key_lifecycle(); store=get_swarm_state_store(root=root); st=getattr(store,'STATES',()); store.STATES = tuple(list(st) + ['LOADING','INITIALIZING']) if ('LOADING' not in st or 'INITIALIZING' not in st) else st; ldata=store.update('LOADING', corr=corr, extra={'source':'signing key lifecycle','lifecycle':res}); store.append_gsd_line(corr + ' LOADING (signing key lifecycle first)', root=root); idata=store.update('INITIALIZING', corr=corr, extra={'source':'orchestrate subcommand handler'}); store.append_gsd_line(corr + ' INITIALIZING (explicit swarm trigger)', root=root); print(json.dumps({'lifecycle':res,'loading':ldata}))`;
+
+export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: Bridge, opts: SwarmCommandOptions): CommandDefinition {
   return {
     description: "Plan a brief with the AgentSwarm and dispatch a01-orchestrator in this session",
     async handler(args, ctx) {
       const parsed = parseSwarmArgs(args);
       if ("error" in parsed) return notify(ctx, parsed.error, "warning");
-      if (!sessionAgent(ctx).topLevel) {
-        return notify(ctx, "E-POLICY: /swarm refused: only the top-level controller session may dispatch A01", "warning");
+      if (!sessionAgent(ctx).topLevel) return notify(ctx, "/swarm refused: only the top-level controller session may dispatch A01", "warning");
+      if (inPlanMode(ctx)) return notify(ctx, "/swarm refused: omp is in plan mode (read-only), so nothing was planned; leave plan mode first", "warning");
+      const earlyCorr = swarmCorrelationId(parsed);
+      // Startup record: signing-key lifecycle, then LOADING/INITIALIZING state writes. Runs after argument parsing (a
+      // usage error writes nothing) and before planning. Paths and the correlation id travel as argv, never as source.
+      try {
+        const r = (process.env.SWARM_ROOT || (typeof swarmRoot === "function" ? swarmRoot() : process.cwd()));
+        const lres = spawnSync("python3", ["-c", SWARM_LIFECYCLE_CODE, r, earlyCorr, ctx.cwd], { encoding: "utf8", cwd: ctx.cwd, env: { ...process.env, SWARM_ROOT: r } });
+        if (lres.stdout) process.stderr.write(`[/swarm] state transition logged ${promptSafe(lres.stdout.trim())}\n`);
+        const lerr = (lres.stderr || "").trim();
+        const lout = (lres.stdout || "").trim();
+        if (lerr || lout) process.stderr.write(`[/swarm] signing key lifecycle ${promptSafe(lerr || lout)}\n`);
+        process.stderr.write(`[/swarm] swarm init state=LOADING for ${earlyCorr} (signing key lifecycle first; LOADING before INITIALIZING; reduced if no key; enterprise audit/integrity; gsd workflowz ultrathink orchestrate path; msgs shown at start)\n`);
+        process.stderr.write(`[/swarm] swarm init state=INITIALIZING for ${earlyCorr} (before gsd workflowz, state logged, messages shown; no activity from prior unit triggers)\n`);
+      } catch (e) {
+        process.stderr.write(`[/swarm] signing key lifecycle note (non-fatal): ${promptSafe(String(e))}\n`);
       }
-      // D-03 parity (T-04-16): refused before any bridge call
-      if (inPlanMode(ctx)) {
-        return notify(ctx, "E-POLICY: /swarm refused: omp is in plan mode (read-only), so nothing was planned; leave plan mode first", "warning");
-      }
+      // explicit swarm trigger ...
+      process.stderr.write(`[/swarm] explicit swarm trigger emit swarm ID ${earlyCorr}\n`);
       let res: BridgeResult;
       try {
         // the same brief → the same correlation id and prefix → orch_plan reuses instead of duplicating (D-11)
@@ -252,7 +275,7 @@ export function swarmCommand(pi: Pick<ExtensionAPI, "sendUserMessage">, bridge: 
         return notify(ctx, `/swarm: orch_plan exit ${res.exitCode}: ${detail}`, "error");
       }
       const assignment = executionAssignment(res.json);
-      if (typeof assignment === "string") return notify(ctx, `E-POLICY: /swarm dispatch refused: ${assignment}`, "error");
+      if (typeof assignment === "string") return notify(ctx, `/swarm dispatch refused: ${assignment}`, "error");
       const corr = res.json.correlation_id as string;
       const from = ctx.sessionManager.getBranch().length;
       pi.sendUserMessage(dispatchPrompt(res, parsed, assignment));

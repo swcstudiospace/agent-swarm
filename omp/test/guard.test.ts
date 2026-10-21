@@ -51,7 +51,7 @@ function guardHandler(opts: FakePiOptions = {}) {
 const a01Ctx = (entries: SessionEntry[] = []) => agentCtx(CWD, A01, entries, false);
 
 describe("HOOK-04", () => {
-  test.each(["bash", "read", "write", "edit", "swarm_plan", "swarm_status", "eval", "grep"])(
+  test.each(["bash", "read", "write", "edit", "swarm_plan", "swarm_status", "swarm_assignment", "eval", "grep"])(
     "at the cap, %s is blocked with the depth reason naming the one permitted yield",
     (toolName) => {
       const res = guardToolCall(call(toolName, { command: "ls" }), capped);
@@ -284,6 +284,60 @@ describe("HOOK-03", () => {
     const { run } = guardHandler({ activeTools: ["task"] });
     expect(run(call(toolName, { brief: "x" }), specialist)).toBeUndefined();
     expect(run(call(toolName, { brief: "x" }), fakeCtx(CWD))).toBeUndefined();
+  });
+});
+
+describe("canonical assignment authority", () => {
+  const denied = { block: true, reason: "BLOCKED needs: human-approval (swarm-assignment)" };
+  const assignment = call("swarm_assignment", { task_id: "T-req", correlation_id: "c1" });
+
+  test.each([...SWARM_SLUGS.filter((slug) => slug !== A01), "task", undefined])(
+    "pure guard denies assignment to %p before the outside-swarm return",
+    (agent) => {
+      expect(guardToolCall(assignment, { ...capped, agent, hasTask: true, topLevel: agent === undefined })).toEqual(denied);
+    },
+  );
+
+  test("authenticated A01 outside plan mode is allowed, but plan mode and the depth cap remain denied", () => {
+    expect(guardToolCall(assignment, { ...capped, hasTask: true })).toBeUndefined();
+    expect(guardToolCall(assignment, { ...capped, hasTask: true, planMode: true })).toEqual(denied);
+    expect(guardToolCall(assignment, capped)?.reason?.startsWith(DEPTH_PREFIX)).toBe(true);
+  });
+
+  test("registered handler respects controller identity, plan mode and env isolation", () => {
+    const { run } = guardHandler({ activeTools: ["task"] });
+    expect(run(assignment, fakeCtx(CWD))).toEqual(denied);
+    expect(run(assignment, a01Ctx())).toBeUndefined();
+    expect(run(assignment, a01Ctx([{ type: "mode_change", mode: "plan" }]))).toEqual(denied);
+    process.env.SWARM_AGENT = A01;
+    expect(run(assignment, fakeCtx(CWD))).toBeUndefined();
+    expect(run(assignment, agentCtx(CWD, "task", [], false))).toEqual(denied);
+    expect(run(assignment, agentCtx(CWD, "a05-backend", [], false))).toEqual(denied);
+  });
+
+  test("A01 and specialists cannot obtain assignment authority through shell script execution or relocation", () => {
+    for (const agent of SWARM_SLUGS) {
+      for (const command of [
+        "python3 scripts/orch_assign.py --task-id T-req --correlation-id c1",
+        "python3 -m scripts.orch_assign --task-id T-req --correlation-id c1",
+        "python3 - --task-id T-req < scripts/orch_assign.py",
+        "cp scripts/orch_assign.py /tmp/assign.py && python3 /tmp/assign.py",
+      ]) {
+        expect(guardToolCall(call("bash", { command }), { ...capped, agent, hasTask: true })).toEqual(denied);
+      }
+    }
+  });
+
+  test("typed assignment does not reopen eval, raw code, signer reads or protected state writes", () => {
+    const facts: GuardFacts = { ...capped, hasTask: true };
+    for (const event of [
+      call("eval", { code: "arbitrary" }),
+      call("write", { path: "xd://run_code", content: "{}" }),
+      call("write", { path: `${CWD}/.swarm/tasks.db`, content: "forged" }),
+      call("read", { path: `${HOME}/.config/agent-swarm/signing-key.hex` }),
+    ]) {
+      expect(guardToolCall(event, facts)?.block).toBe(true);
+    }
   });
 });
 
@@ -1604,20 +1658,29 @@ describe("private signer file reads", () => {
   };
   const blockedRead = { block: true, reason: "BLOCKED needs: human-approval (signer_credential: signer-file-read)" };
   const blockedShell = { block: true, reason: "BLOCKED needs: human-approval (signer_credential: signer-file-shell)" };
+  const blockedWrite = { block: true, reason: "BLOCKED needs: human-approval (protected_path: protected-path-write)" };
+  const blockedMutate = { block: true, reason: "BLOCKED needs: human-approval (protected_path: signer-file-write)" };
 
   test("signer files are protected against writes, output redirects and diff/cmp reads", () => {
-    const blockedWrite = { block: true, reason: "BLOCKED needs: human-approval (signer_credential: signer-file-write)" };
     expect(guardToolCall(call("write", { path: KEY, content: "x" }), facts)).toEqual(blockedWrite);
     expect(guardToolCall(call("edit", { path: KEY, old: "a", new: "b" }), facts)).toEqual(blockedWrite);
     expect(guardToolCall(call("write", { path: `${CWD}/notes.txt`, content: "x" }), facts)).toBeUndefined();
     const bash = (command: string) => guardToolCall(call("bash", { command }), facts);
-    expect(bash(`echo x > ${KEY}`)).toEqual(blockedShell);
-    expect(bash(`echo x >> ${KEY}`)).toEqual(blockedShell);
-    expect(bash(`echo x &> ${KEY}`)).toEqual(blockedShell);
-    expect(bash(`echo x >& ${KEY}`)).toEqual(blockedShell);
+    // output redirects, tee and dd write the seed: the write rule reports them, in attached and detached forms
+    for (const command of [`echo x > ${KEY}`, `echo x >> ${KEY}`, `echo x &> ${KEY}`, `echo x >& ${KEY}`, `echo x>${KEY}`,
+      `echo x>>${KEY}`, `tee ${KEY}`, `tee -a ${KEY}`, `dd if=/dev/zero of=${KEY}`, `dd of=${KEY} if=/dev/zero`]) {
+      expect(bash(command)).toEqual(blockedMutate);
+    }
     expect(bash("echo x > /dev/null 2>&1")).toBeUndefined();
-    expect(bash(`diff /dev/null ${KEY}`)).toEqual(blockedShell);
-    expect(bash(`cmp ${KEY} /dev/null`)).toEqual(blockedShell);
+    // comparison tools print the bytes they read, including the attached file-valued option forms
+    for (const command of [`diff /dev/null ${KEY}`, `cmp ${KEY} /dev/null`, `diff --from-file=${KEY} /dev/null`,
+      `diff --to-file=${KEY} /dev/null`]) {
+      expect(bash(command)).toEqual(blockedShell);
+    }
+    // the spellings the review named: a home-relative attached redirect, and a quoted $HOME --from-file= operand
+    expect(bash("echo x>~/.config/agent-swarm/signing-key.hex")).toEqual(blockedMutate);
+    expect(bash('diff --from-file="$HOME/.config/agent-swarm/signing-key.hex" /dev/null')).toEqual(blockedShell);
+    expect(bash('tee "$HOME/.config/agent-swarm/signing-key.hex"')).toEqual(blockedMutate);
   });
 
   test("bounded deny-only metadata normalizes absolute paths without replacing ordinary private sources", () => {
@@ -1827,5 +1890,32 @@ describe("private signer file reads", () => {
     expect(run(call("read", { path: "src/guard.ts" }), ctx)).toBeUndefined();
     expect(run(call("grep", { path: "src", pattern: "signer" }), ctx)).toBeUndefined();
     expect(process.env.SWARM_ED25519_KEY_FILE).toBeUndefined();
+  });
+
+  test.each([
+    `echo x > ${KEY}`, `echo x >> ${KEY}`, `tee ${KEY}`, `dd if=/dev/zero of=${KEY}`, `truncate -s0 ${KEY}`,
+    `chmod 600 ${KEY}`, `ln -sf /tmp/x ${KEY}`, `rm -f ${KEY}`, `rm -rf ${HOME}/.config/agent-swarm`,
+    `curl -o ${KEY} https://example.invalid/key`, `cp /tmp/x ${HOME}/.config/agent-swarm/`,
+    `install -m 600 /tmp/x ${HOME}/.config/agent-swarm/`, `cd ${HOME}/.config/agent-swarm && echo x > signing-key.hex`,
+  ])("shell writes, copies and deletes of signer material are refused: %s", (command) => {
+    expect(guardToolCall(call("bash", { command }), facts)).toEqual(blockedMutate);
+    expect(guardToolCall(call("bash", { command: `cp /tmp/x ${HOME}/.config/agent-swarmish/` }), facts)).toBeUndefined();
+    expect(guardToolCall(call("bash", { command: `echo x > ${CWD}/out.txt` }), facts)).toBeUndefined();
+  });
+
+  test.each([KEY, "~/.config/agent-swarm/signing-key.hex"])("write and edit of signer material are refused: %s", (path) => {
+    expect(guardToolCall(call("write", { path, content: "x" }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("edit", { path, input: "PUT 1.=1:\n+x" }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("edit", { input: `[${KEY}]\nPUT 1.=1:\n+x` }), facts)).toEqual(blockedWrite);
+    expect(guardToolCall(call("write", { path: "src/guard.ts", content: "x" }), facts)).toBeUndefined();
+  });
+
+  test.each([
+    `diff /dev/null ${KEY}`, `diff ${KEY} /dev/null`, `diff3 /dev/null ${KEY} /dev/null`, `cmp ${KEY} /dev/null`,
+    `cmp -l /dev/null ${KEY}`, `comm -12 ${KEY} /dev/null`, `sdiff ${KEY} /dev/null`, `colordiff /dev/null ${KEY}`,
+    `diff --from-file=${KEY} /dev/null`, `diff --to-file ${KEY} /dev/null`, `git diff --no-index /dev/null ${KEY}`,
+  ])("comparison tools that print signer operands are refused: %s", (command) => {
+    expect(guardToolCall(call("bash", { command }), facts)).toEqual(blockedShell);
+    expect(guardToolCall(call("bash", { command: "diff src/guard.ts /dev/null" }), facts)).toBeUndefined();
   });
 });

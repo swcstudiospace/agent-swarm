@@ -107,6 +107,7 @@ class TaskStore:
         self.conn = sqlite3.connect(self.path, timeout=30)  # contenders wait for the write lock, not "database is locked"
         self.conn.row_factory = sqlite3.Row
         self._tx_depth = 0
+        self._live_dirty = False  # a transition committed-in-intent inside transaction(): refresh live.json after the outermost commit
         self.conn.executescript(_SCHEMA)
         self._migrate_verdicts()
 
@@ -144,11 +145,15 @@ class TaskStore:
         except BaseException:
             self._tx_depth -= 1
             if self._tx_depth == 0:
+                self._live_dirty = False  # rolled back: nothing to publish
                 self.conn.rollback()
             raise
         self._tx_depth -= 1
         if self._tx_depth == 0:
             self.conn.commit()
+            if self._live_dirty:  # after the write lock is released
+                self._live_dirty = False
+                self._notify_committed()
 
     # ---- CRUD -------------------------------------------------------------
     def create(self, *, task_id: str, correlation_id: str, capability: str, title: str = "",
@@ -263,7 +268,21 @@ class TaskStore:
                     raise SwarmError(ErrorCode.E_POLICY,
                                      f"fail-closed: {task_id} has unaccepted gates {sorted(unaccepted)}", task_id=task_id)
             self._apply(task_id, from_state, to_state, actor, reason, **extra)
+        self._notify_committed()
         return self.get(task_id)
+
+    def _notify_committed(self) -> None:
+        """Post-commit observer: refresh `live.json` (best effort). Skipped inside an enclosing transaction() (not yet
+        committed) and never raises; it runs after the write lock is released."""
+        if self._tx_depth:
+            self._live_dirty = True  # refreshed by the outermost transaction() once it has committed
+            return
+        try:
+            from . import telemetry  # lazy: keeps taskstore import cost unchanged
+            telemetry.refresh_live(db_path=self.path)
+        except Exception:  # noqa: BLE001 - observer must never fail a committed transition
+            import logging
+            logging.getLogger("swarm.telemetry").warning("live.json refresh failed", exc_info=True)
 
     def _apply(self, task_id, from_state, to_state, actor, reason, **extra):
         """State write conditional on from_state plus its audit row; the caller's transaction() commits both."""

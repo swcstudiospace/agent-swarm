@@ -164,7 +164,11 @@ def _nodes(data: dict) -> list[dict]:
 
 
 def _dependencies(nodes: list[dict]) -> dict[str, list[str]]:
-    ids = {node["id"] for node in nodes}
+    ids: set[str] = set()
+    for node in nodes:
+        if node["id"] in ids:
+            raise SwarmError(ErrorCode.E_INPUT, f"duplicate node id {node['id']}")
+        ids.add(node["id"])
     deps: dict[str, list[str]] = {}
     for node in nodes:
         cleaned: list[str] = []

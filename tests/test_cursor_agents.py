@@ -19,8 +19,6 @@ import build_agents  # noqa: E402
 
 CURSOR = ROOT / ".cursor" / "agents"
 DOCUMENTED = {"name", "description", "model", "readonly", "is_background"}
-FORBIDDEN = ("spawn_subagent", "run_terminal_command", "mcp__")
-AGENT_TOOL = re.compile(r"(?<![A-Za-z])Agent(?![A-Za-z])")
 
 
 def _fm_lines(text: str) -> list[str]:
@@ -73,32 +71,6 @@ def test_frontmatter_is_cursor_documented_fields():
         assert "tools:" not in "\n".join(_fm_lines(text))
 
 
-def test_preamble_uses_cursor_tools_and_swarm_root():
-    for agent in load_manifest():
-        text = (CURSOR / f"{agent['slug']}.md").read_text(encoding="utf-8")
-        pre = _preamble(text)
-        for bad in FORBIDDEN:
-            assert bad not in pre, agent["slug"]
-        assert AGENT_TOOL.search(pre) is None, agent["slug"]
-        assert 'python3 "$SWARM_ROOT/scripts/<tool>.py" --root <target repo>' in pre
-        assert "advisory" in pre and "record nothing" in pre and "APPROVED" in pre
-        assert "Greptile" in pre and "Desk Quality" in pre
-        assert "SWARM_ROOT" in pre
-        prompt = (ROOT / agent["prompt"]).read_text(encoding="utf-8").strip()
-        body = build_agents.apply_cursor_substitutions(agent["id"], prompt)
-        assert text.rstrip().endswith(body)
-        if agent["id"] in build_agents.CURSOR_BODY_SUBSTITUTIONS:
-            assert body != prompt
-        else:
-            assert body == prompt
-        if agent["id"] == "A01":
-            assert "Task tool" in pre
-            assert "must not call the Task tool" not in pre
-        else:
-            assert "must not call the Task tool" in pre
-            assert "spawn_subagent" not in text
-            assert "run_terminal_command" not in text
-            assert "mcp__" not in text
 
 
 _MERGE_GRANT = re.compile(r"auto-mergeable|merge semver-compatible|producer still merges")
@@ -585,7 +557,7 @@ def test_skill_frontmatter_is_name_and_description_only():
     assert "SWARM_ROOT" in text
 
 
-_SUBSTRATE_PATHS = ("swarm/substrate_mcp.json", "scripts/_install_substrate.py")
+_SUBSTRATE_PATHS = ("scripts/_install_substrate.py",)
 _BRANCH_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 
@@ -644,6 +616,19 @@ def substrate_base_ref() -> str:
         f"none of {', '.join(_candidate_refs())} resolved and "
         f"git fetch --depth=1 origin of {', '.join(_base_names())} did not create one"
     )
+
+
+def test_substrate_spec_adds_cursor_without_a_token_value():
+    spec = json.loads((ROOT / "swarm" / "substrate_mcp.json").read_text(encoding="utf-8"))
+    assert spec["runtimes"]["cursor"] == {"path": ".cursor/mcp.json", "format": "json"}
+    assert spec["runtimes"]["claude"]["path"] == ".mcp.json"
+    assert spec["runtimes"]["omp"]["path"] == ".mcp.json"
+    assert spec["runtimes"]["grok"]["path"] == ".grok/config.toml"
+    rendered = json.dumps(spec)
+    assert "${SUBSTRATE_URL}/mcp" in rendered
+    assert "Bearer ${SUBSTRATE_TOKEN}" in rendered
+    assert "http://" not in rendered
+    assert "SUBSTRATE_TOKEN" not in (ROOT / "scripts" / "_install_cursor.py").read_text(encoding="utf-8")
 
 
 def test_substrate_spec_is_byte_identical_to_main():

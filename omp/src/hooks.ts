@@ -19,21 +19,30 @@ export const DISPATCH_MARKER = "[agent-swarm:dispatch]";
 const QUESTION = /^(what|why|how|when|where|who|which|is|are|can|could|does|do|should|explain|describe)\b/i;
 const TRIVIAL = /\btypos?\b|^rename\b/i;
 const SDLC =
-  /\b(build|implement|add|create|fix|refactor|migrate|deploy|release|ship|write tests?|set up|setup|integrate|scaffold|upgrade)\b/i;
+  /\b(build|implement|add|create|fix|refactor|migrate|deploy|release|ship|write tests?|set up|setup|integrate|scaffold|upgrade|orchestrate)\b/i;
 
 export const SWARM_CONTEXT = `## AgentSwarm
 
-This is SDLC work: route it through the AgentSwarm instead of implementing it in this session.
+This is SDLC work (including requests that say "orchestrate"): route it through the AgentSwarm instead of implementing it in this session.
 - Run \`/swarm <brief>\` with the request as the brief, or
 - call \`task\` with \`agent: "a01-orchestrator"\` and the request as the brief.
-A01 plans the work and dispatches a02–a15 by slug.
+A01 plans the work and dispatches a02–a15 by slug (parallel waves, bounded concurrency).
 `;
 
-/** True only for SDLC-shaped prompts (D-09). */
+/** Appended on /gsd-autonomous. Does not refuse the command and does not replace the milestone loop. */
+export const GSD_HANDOFF = `## gsd-autonomous
+
+Do not refuse this command.
+Run the gsd-autonomous workflow (discuss, plan, execute) for the remaining milestone phases.
+Agent Swarm must not block that loop. When a phase needs implementation, dispatch Agent Swarm: \`/swarm <phase brief>\` or \`task\` with \`agent: "a01-orchestrator"\`.
+GSD owns the milestone. Swarm owns the parallel implementation lanes.
+`;
+
+/** True only for SDLC-shaped prompts (D-09). `/gsd-autonomous` is the milestone runner, not a swarm refuse. */
 export function classifyPrompt(prompt: string): boolean {
   const t = prompt.trim();
-  if (!t || t.startsWith("/") || t.startsWith("<system-reminder")) return false;
   const low = t.toLowerCase();
+  if (!t || t.startsWith("/") || t.startsWith("<system-reminder")) return false;
   if (low.includes(DISPATCH_MARKER) || NEGATIVE.some((n) => low.includes(n))) return false;
   if (t.endsWith("?") || QUESTION.test(t) || TRIVIAL.test(t)) return false;
   return SDLC.test(t);
@@ -121,9 +130,19 @@ export function swarmContext(
   if (agent !== undefined || restricted) return undefined;
   if (env.SWARM_CHILD === "1" || env.SWARM_AGENT?.trim()) return undefined;
   const prior = event.systemPrompt ?? [];
+  let text = event.prompt;
+  try {
+    text = classifiedText(event.prompt);
+  } catch {
+    text = event.prompt;
+  }
+  if (/^\s*\/gsd-autonomous(?:\s|$)/i.test(text)) {
+    if (prior.includes(GSD_HANDOFF)) return undefined;
+    return { systemPrompt: [...prior, GSD_HANDOFF] };
+  }
   if (prior.includes(SWARM_CONTEXT)) return undefined;
   try {
-    if (!classify(classifiedText(event.prompt))) return undefined;
+    if (!classify(text)) return undefined;
   } catch {
     return undefined;
   }

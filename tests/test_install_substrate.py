@@ -66,6 +66,8 @@ def test_a_fresh_workspace_gets_an_entry_per_runtime_file(tree, gws, home):
     grok = tomllib.loads((gws / ".grok" / "config.toml").read_text())
     assert grok["mcp_servers"] == {"substrate": {"url": "${SUBSTRATE_URL}/mcp",
                                                  "headers": {"Authorization": "Bearer ${SUBSTRATE_TOKEN}"}}}
+    cursor = json.loads((gws / ".cursor" / "mcp.json").read_text())
+    assert cursor["mcpServers"] == claude["mcpServers"]
     # a Claude session sees only the tools its agent names, so the installed agents name the server's
     for agent in AGENTS:
         fm = (gws / ".claude" / "agents" / f"{agent['slug']}.md").read_text().split("---")[1]
@@ -173,9 +175,9 @@ def test_env_files_inside_a_checkout_or_the_workspace_are_refused(tree, gws, hom
 
 def test_a_runtime_that_cannot_call_mcp_is_refused_as_an_executor(tree, gws, home):
     before = _snapshot(tree, gws, home)
-    r = _install(tree, gws, home, "--runtimes", "claude,trae")
+    r = _install(tree, gws, home, "--runtimes", "claude,nonexistent")
     assert r.returncode == 2, r.stdout + r.stderr
-    assert "refusing to wire trae as an executing agent" in r.stderr
+    assert "refusing to wire nonexistent as an executing agent" in r.stderr
     assert _snapshot(tree, gws, home) == before
 
 
@@ -208,6 +210,7 @@ def test_dry_run_prints_the_additions_and_the_env_files_and_writes_nothing(tree,
     assert r.returncode == 0, r.stdout + r.stderr
     assert _snapshot(tree, gws, home) == before
     assert "+ create .mcp.json (claude, omp):" in r.stdout and "+ create .grok/config.toml (grok):" in r.stdout
+    assert "+ create .cursor/mcp.json (cursor):" in r.stdout
     assert '"Authorization": "Bearer ${SUBSTRATE_TOKEN}"' in r.stdout
     assert f"agent env files in {_env_dir(gws, home)}" in r.stdout
     for agent in AGENTS:
@@ -229,6 +232,7 @@ def test_no_substrate_installs_the_rest_without_tokens(tree, gws, home):
     r = _install(tree, gws, home, "--no-substrate", tokens={})
     assert r.returncode == 0, r.stdout + r.stderr
     assert not (gws / ".mcp.json").exists() and not (gws / ".grok" / "config.toml").exists()
+    assert not (gws / ".cursor" / "mcp.json").exists()
     assert not _env_dir(gws, home).exists()
     assert (gws / ".claude" / "agents" / "a05-backend.md").exists()
 

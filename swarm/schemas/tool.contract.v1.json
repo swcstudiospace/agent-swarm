@@ -33,6 +33,10 @@
     "entrypoint": {"type": "string"},
     "handler": {"type": "string", "description": "swarm.tools.<module>:<function>"},
     "examples": {"type": "object"},
+    "side_effect_tier": {
+      "enum": ["READ", "WRITE", "DESTRUCTIVE", "EXTERNAL"],
+      "description": "Optional; absent means READ. WRITE tools write only inside the swarm state dir (swarm_dir()), never the repo tree. In v2.2 the checker rejects DESTRUCTIVE and EXTERNAL; they are reserved. swarm_tool_call refuses WRITE tools in omp plan mode."
+    },
     "stub": {"type": "boolean"}
   },
   "additionalProperties": true

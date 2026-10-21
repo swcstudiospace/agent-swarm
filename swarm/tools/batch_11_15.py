@@ -42,7 +42,12 @@ def error_burn(payload: dict) -> dict:
     def work() -> dict:
         if payload["objective"] >= 1 or payload["objective"] < 0:
             return {"state": "INVALID_INPUT", "field": "objective", "message": "objective must be in [0, 1)"}
-        sli, rate = script("obs_slo").burn(payload["good"], payload["total"], payload["objective"])
+        slo = script("obs_slo")
+        if payload["total"] > 0:
+            problem = slo.count_problem(payload["good"], payload["total"])
+            if problem:
+                return {"state": "INVALID_INPUT", "field": problem[0], "message": problem[1]}
+        sli, rate = slo.burn(payload["good"], payload["total"], payload["objective"])
         if sli is None or rate is None:
             return {"state": "INVALID_INPUT", "field": "total", "message": "total must be positive"}
         return {"state": "SUCCESS", "sli": sli, "burn_rate": rate}

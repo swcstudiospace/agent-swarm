@@ -14,6 +14,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.script_base import AgentScript, sh, which, iter_files  # noqa: E402
@@ -29,8 +30,54 @@ CC_GROUPS = {"feat": "Added", "fix": "Fixed", "perf": "Changed", "refactor": "Ch
 CC_RE = re.compile(r"^(\w+)(\([^)]*\))?(!)?:\s*(.+)$")
 
 
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_QUOTE_RE = re.compile(r"(?: {0,3}>[ \t]?)+")  # blockquote markers: `>`, `> `, `> >`, ...
+
+
 def strip_code(text: str) -> str:
-    return re.sub(r"```.*?```", "", text, flags=re.S)
+    """Blank out fenced code blocks (CommonMark): a ``` or ~~~ fence of 3+ characters opens a block that
+    only a fence of the same character, at least as long and with nothing after it, closes; an unclosed
+    fence runs to the end of the document. Fence lines and their content become empty lines so line
+    numbers stay aligned with the source.
+
+    A fence inside a blockquote (`> ```md` ... `> ```) is a fence too: the leading `>` markers are removed before
+    matching, the closing fence must sit at the same quote depth, and the block ends where the quote ends (a line
+    with fewer markers, including a blank line). Limit: blockquotes are the only container tracked; a fence inside
+    a list item is matched by its indentation alone."""
+    out: list[str] = []
+    fence: str | None = None  # opening run of the fence that is currently open
+    fence_depth = 0  # blockquote depth of that fence
+    for line in text.split("\n"):
+        quote = _QUOTE_RE.match(line)
+        depth, inner = (quote.group(0).count(">"), line[quote.end():]) if quote else (0, line)
+        if fence is not None and depth < fence_depth:
+            fence = None  # the blockquote holding the fence ended, and the fence with it
+        m = _FENCE_RE.match(inner)
+        if fence is None:
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):  # a backtick info string may not contain backticks
+                fence, fence_depth = m.group(1), depth
+            else:
+                out.append(line)
+                continue
+        elif depth == fence_depth and m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+            fence = None
+        out.append("")
+    return "\n".join(out)
+
+
+def decode_link_path(target: str) -> str | None:
+    """Filesystem path a markdown link target names: query and fragment dropped, then each segment
+    percent-decoded (`my%20doc.md` -> `my doc.md`). None when a decoded segment would contain a path
+    separator or NUL (`..%2F..%2Fetc`): an encoded slash is data inside one segment, never a way to
+    climb out of the tree, so such a target is unresolvable."""
+    path = target.split("#", 1)[0].split("?", 1)[0]
+    segments = []
+    for segment in path.split("/"):
+        decoded = unquote(segment)
+        if "/" in decoded or "\\" in decoded or "\0" in decoded:
+            return None
+        segments.append(decoded)
+    return "/".join(segments)
 
 
 def analyse_md(path: Path, root: Path) -> tuple[dict, list[dict]]:
@@ -62,7 +109,13 @@ def analyse_md(path: Path, root: Path) -> tuple[dict, list[dict]]:
         target = m.group(1)
         if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith(("#", "<")):
             continue  # external URL, mailto, in-page anchor
-        clean = target.split("#", 1)[0].split("?", 1)[0]
+        clean = decode_link_path(target)
+        if clean is None:
+            links.append({"target": target, "resolved": False})
+            broken.append(target)
+            findings.append(make_finding("", "major", "broken-link", f"link target not found: {target}",
+                                         location=rel, evidence="percent-encoded path separator in link target", owner_suggestion="A15"))
+            continue
         if not clean:
             continue
         dest = (root / clean.lstrip("/")) if target.startswith("/") else (path.parent / clean)

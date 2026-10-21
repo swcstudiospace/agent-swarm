@@ -34,6 +34,9 @@ def runner_detect(payload: dict) -> dict:
 
 def diff_size(payload: dict) -> dict:
     def work() -> dict:
+        for field in ("added", "deleted", "max_lines"):
+            if payload[field] < 0:
+                return {"state": "INVALID_INPUT", "field": field, "message": f"{field} must be >= 0"}
         over = payload["added"] + payload["deleted"] > payload["max_lines"]
         return {"state": "SUCCESS", "over_budget": over}
 

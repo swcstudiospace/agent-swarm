@@ -1,6 +1,8 @@
 """Stdlib-only validator for the Draft 2020-12 subset used by swarm/schemas/*.json.
 
-Supported keywords: type, required, enum, properties, items, additionalProperties.
+Supported keywords: type, required, enum, const, properties, items, additionalProperties, minimum, maximum,
+minLength, allOf, if/then. (const, minimum, maximum, minLength, allOf and if/then serve the v2.2 event, live and
+handover schemas; `if` is matched by "validates with no errors".)
 Schemas are read-only at runtime; nothing in the swarm writes them.
 """
 from __future__ import annotations
@@ -35,6 +37,19 @@ def validate(obj, schema: dict, path: str = "") -> list[str]:
     errors: list[str] = []
     if "enum" in schema and obj not in schema["enum"]:
         errors.append(f"{where}: {obj!r} not one of {schema['enum']}")
+    if "const" in schema and (obj != schema["const"] or type(obj) is not type(schema["const"])):
+        errors.append(f"{where}: {obj!r} is not the constant {schema['const']!r}")
+    if _TYPES["number"](obj):
+        if "minimum" in schema and obj < schema["minimum"]:
+            errors.append(f"{where}: {obj!r} is below the minimum {schema['minimum']!r}")
+        if "maximum" in schema and obj > schema["maximum"]:
+            errors.append(f"{where}: {obj!r} is above the maximum {schema['maximum']!r}")
+    if isinstance(obj, str) and "minLength" in schema and len(obj) < schema["minLength"]:
+        errors.append(f"{where}: string shorter than minLength {schema['minLength']}")
+    for sub in schema.get("allOf", []):
+        errors += validate(obj, sub, path)
+    if "if" in schema and "then" in schema and not validate(obj, schema["if"], path):
+        errors += validate(obj, schema["then"], path)
     if isinstance(obj, dict):
         for key in schema.get("required", []):
             if key not in obj:

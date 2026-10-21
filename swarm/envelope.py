@@ -10,7 +10,9 @@ emits a `security.dev_key` event, except a key-less agent-session preview.
 Without a real key and without the opt-in, signing refuses and APPROVED fails closed.
 Raw signing variables take precedence over SWARM_ED25519_KEY_FILE and the conventional
 XDG_CONFIG_HOME-or-HOME/.config/agent-swarm/signing-key.hex source. Private references
-are never read inside agent/child sessions. Configuration failures are redacted.
+are never read inside agent sessions (SWARM_AGENT_SESSION=1, set for every specialist). The trusted controller and
+autonomous hook, which carry only SWARM_CHILD=1, may use them. Configuration failures are redacted.
+Private references must be absolute; a relative one fails closed instead of resolving against the caller's cwd.
 """
 from __future__ import annotations
 import base64
@@ -20,12 +22,13 @@ import hmac
 import json
 import os
 import stat
+import sys
 import time
 import uuid
 from pathlib import Path
 
 from .errors import SwarmError, ErrorCode
-
+from .state_store import get_swarm_state_store
 SCHEMA_PREFIX = "swarm.v1."
 PRIORITIES = {"P0", "P1", "P2", "P3"}
 RISK_CLASSES = {"low", "medium", "high"}
@@ -35,6 +38,7 @@ SIGNATURE_REQUIRED = {
 }
 REQUIRED_FIELDS = ("msg_id", "correlation_id", "trace_id", "source", "target", "type",
                    "schema", "ts", "ttl_s", "priority", "risk_class", "payload")
+
 
 
 def _uuid7() -> str:
@@ -102,7 +106,9 @@ def _canonical(env: dict) -> bytes:
 
 
 def _agent_session() -> bool:
-    return any(os.environ.get(name) == "1" for name in ("SWARM_AGENT_SESSION", "SWARM_CHILD"))
+    # Only SWARM_AGENT_SESSION marks a model session: swarm_run sets it for every specialist. SWARM_CHILD alone is
+    # not enough, because the trusted autonomous hook starts its planner and runner with SWARM_CHILD=1 and they sign.
+    return os.environ.get("SWARM_AGENT_SESSION") == "1"
 
 
 def _private_seed(path: Path, *, fallback: bool) -> bytes | None:
@@ -153,6 +159,14 @@ def _private_seed(path: Path, *, fallback: bool) -> bytes | None:
         os.close(directory)
 
 
+def _conventional_reference() -> Path | None:
+    """`${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex`, or None without a base directory."""
+    config = os.environ.get("XDG_CONFIG_HOME")
+    home = os.environ.get("HOME")
+    if not config and not home:
+        return None
+    return (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
+
 def _ed25519_material() -> tuple[object | None, str | None]:
     raw = os.environ.get("SWARM_ED25519_KEY")
     if raw:
@@ -175,11 +189,12 @@ def _ed25519_material() -> tuple[object | None, str | None]:
                 raise ValueError("empty reference")
             path = Path(reference)
         else:
-            config = os.environ.get("XDG_CONFIG_HOME")
-            home = os.environ.get("HOME")
-            if not config and not home:
+            path = _conventional_reference()
+            if path is None:
                 return None, None
-            path = (Path(config) if config else Path(home) / ".config") / "agent-swarm" / "signing-key.hex"
+        if not path.is_absolute():
+            # A relative reference would name a different file for each caller's working directory.
+            return None, "fail-closed: private Ed25519 signing reference must be an absolute path"
         seed = _private_seed(path, fallback=reference is None)
         if seed is None:
             return None, None
@@ -245,7 +260,14 @@ def _signing_hmac() -> tuple[bytes, bool] | None:
 
 
 def signing_config_error() -> str | None:
-    """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None."""
+    """Why a verdict signed now could never verify (fail-closed key misconfiguration), else None.
+
+    Per q1: the check (and any material loads) is performed only if a key is supplied
+    via env (optional case); enterprise REQUIRE=1 always forces the path.
+    """
+    require = os.environ.get("SWARM_REQUIRE_KEY") == "1"
+    if not _signing_key_supplied() and not require:
+        return None
     _key, error = _ed25519_material()
     if error and (not os.environ.get("SWARM_SIGNING_KEY")
                   or not os.environ.get("SWARM_ED25519_KEY")):
@@ -253,8 +275,71 @@ def signing_config_error() -> str | None:
     if os.environ.get("SWARM_REQUIRE_KEY") == "1" and not real_key_configured():
         return "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
     return None
+def _signing_key_supplied() -> bool:
+    """Whether a signing key is supplied via env, or a conventional reference file exists.
+    Presence only (no open or read): a present but invalid conventional file must surface its
+    configuration error, while a missing one stays keyless. Per q1: REQUIRE=1 forces the path.
+    """
+    a = bool(os.environ.get("SWARM_SIGNING_KEY"))
+    b = bool(os.environ.get("SWARM_ED25519_KEY"))
+    c = bool(os.environ.get("SWARM_ED25519_KEY_FILE"))
+    d = (os.environ.get("SWARM_REQUIRE_KEY") == "1")
+    conventional = _conventional_reference()
+    e = conventional is not None and os.path.lexists(conventional)
+    return (a + b + c + d + e) > 0
+def perform_signing_key_lifecycle(*, root=None) -> dict:
+    """Signing key lifecycle as FIRST step in swarm coordinator init.
+
+    Uses existing _ed25519_material/_signing_key_supplied/validate_signing_key/
+    real_key_configured/signing_config_error (never raw keys).
+    Sets LOADING first.
+    Decides reduced for keyless non-mand (q1).
+    Exact enterprise msgs to sys.stderr .
+    Raise on mand fail.
+    Return {'status': 'full'|'reduced'|'blocked', 'message': str}
+    """
+    get_swarm_state_store(root=root).update("LOADING")
+
+    supplied = _signing_key_supplied()
+    require = os.environ.get("SWARM_REQUIRE_KEY") == "1"
+    err = validate_signing_key()
+    configured = real_key_configured()
+
+    if require and (err or not configured):
+        detail = err or "fail-closed: SWARM_REQUIRE_KEY=1 but no signing key configured"
+        msg = f"Signing key required for enterprise audit/integrity of parallel swarm. {detail} Actionable: provide via env; swarm start blocked."
+        print(msg, file=sys.stderr)
+        raise SwarmError(ErrorCode.E_POLICY, detail)
+
+    if err:
+        # supplied but invalid, not mandatory: actionable, do not block unrelated work
+        msg = (
+            "Signing key required for enterprise audit/integrity of parallel swarm. "
+            f"{err} Actionable: provide a valid key via env. Proceeding reduced-privilege."
+        )
+        print(msg, file=sys.stderr)
+        return {"status": "reduced", "message": msg}
+
+    if supplied and configured:
+        # present/valid (purpose)
+        msg = "Signing key required for enterprise audit/integrity of parallel swarm; validated successfully."
+        print(msg, file=sys.stderr)
+        return {"status": "full", "message": msg}
+
+    # absent non-mand
+    msg = "Signing key absent: purpose is enterprise audit/integrity of parallel swarm. Proceeding reduced-privilege."
+    print(msg, file=sys.stderr)
+    return {"status": "reduced", "message": msg}
 
 
+def validate_signing_key() -> str | None:
+    """Signing key validation routine: constant-time conditional validation only if key supplied (q1).
+    Delegates to guarded signing_config_error. Clear messages for optional vs enterprise REQUIRE=1
+    (REQUIRE produces dedicated "fail-closed: SWARM_REQUIRE_KEY=1 ..." message; optional non-supplied
+    yields no error from validation path).
+    Acceptance: const time branch decision when present; clear msgs; used by init/preflight.
+    """
+    return signing_config_error()
 def _warn_dev_key(env: dict, root: str | Path | None) -> None:
     try:
         from .runlog import emit

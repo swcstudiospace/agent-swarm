@@ -13,6 +13,7 @@
     "set up CI for the monorepo with lint and test jobs",
     "create a dashboard page that shows swarm task status",
     "integrate Stripe webhooks into the billing service",
+    "orchestrate the rollout of the new service across parallel agents and lanes",
     "Le code fixé hier doit être revu"
   ],
   "negative": [
@@ -30,6 +31,8 @@
     "explain only: implement the billing module",
     "/all-in-one: build a billing feature",
     "/swarm add a /health endpoint",
+    "/gsd-autonomous",
+    "/gsd-autonomous workflowz ultrathink orchestrate",
     "<system-reminder>implement the billing feature</system-reminder>",
     "[agent-swarm:dispatch] Use task with agent a01-orchestrator to implement the plan",
     "",

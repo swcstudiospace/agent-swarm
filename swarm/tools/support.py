@@ -1,6 +1,7 @@
 """Shared helpers for lane and pool handlers. Not a registered tool."""
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import importlib.util
 import threading
@@ -13,6 +14,22 @@ _SCRIPTS: dict[str, Any] = {}
 _running: set[int] = set()
 _lane = threading.Condition()
 _cancel: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar("swarm_call_cancel", default=None)
+_caller: contextvars.ContextVar[str | None] = contextvars.ContextVar("swarm_call_caller", default=None)
+
+
+def current_caller() -> str | None:
+    """Agent id (for example "A05") that the registry authorized for the running handler call, else None."""
+    return _caller.get()
+
+
+@contextlib.contextmanager
+def caller_scope(caller: str | None):
+    """Bind ``caller`` for the duration of the block and restore the previous value on any exit."""
+    token = _caller.set(caller)
+    try:
+        yield
+    finally:
+        _caller.reset(token)
 
 
 class StillRunning(Exception):
@@ -72,15 +89,18 @@ def invoke_bounded(fn, arg, timeout_s: float):
     done = threading.Event()
     outcome: dict[str, Any] = {}
     cancel = threading.Event()
+    caller = _caller.get()
 
     def target() -> None:
         token = _cancel.set(cancel)
+        caller_token = _caller.set(caller)
         try:
             outcome["value"] = fn(arg)
         except Exception as exc:
             outcome["error"] = exc
         finally:
             _cancel.reset(token)
+            _caller.reset(caller_token)
             with _lane:
                 _running.discard(key)
                 _lane.notify_all()
