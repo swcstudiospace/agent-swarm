@@ -108,11 +108,21 @@ def test_bun_twin_matches_the_python_dry_run(repo):
 # --- real mode: findings and exit codes -----------------------------------------------------------------------
 
 
-def test_empty_tree_runs_no_check_and_is_ok(repo):
+def test_empty_tree_runs_no_check_and_fails_as_incomplete(repo):
     rc, data = run(repo)
-    assert rc == 0 and data["status"] == "ok" and data["findings"] == [] and data["finding_count"] == 0
+    assert rc == 1 and data["status"] == "fail" and data["finding_count"] == 1
+    assert [(f["id"], f["severity"], f["location"]) for f in data["findings"]] == [("scan/incomplete", "major", ".")]
+    assert "no in-scope input was analysed" in data["findings"][0]["summary"]
     assert {c["status"] for c in data["checks"]} == {"skipped:no-input"}
     assert data["counts"]["files_scanned"] == 0 and data["skipped"] == [] and data["truncated"] is False
+
+
+def test_a_single_valid_clean_manifest_is_ok(repo):
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+    rc, data = run(repo)
+    assert rc == 0 and data["status"] == "ok" and data["findings"] == [] and data["finding_count"] == 0
+    assert data["counts"]["files_scanned"] == 1 and data["counts"]["documents"] == 1
+    assert [c["status"] for c in data["checks"]] == ["ran", "skipped:no-input", "skipped:no-input", "skipped:no-input"]
 
 
 def test_workloads_without_a_network_policy_fail_with_a_default_deny_finding(repo):
@@ -287,7 +297,8 @@ def test_yaml_without_pyyaml_reports_tool_missing_and_keeps_json_native(repo):
     module = load_script()
     put(repo, "k8s/app.yaml", YAML_DOCS)
     only_yaml = module.scan(repo, repo, yaml_module=None)
-    assert only_yaml["status"] == "ok" and only_yaml["counts"]["documents"] == 0
+    assert only_yaml["status"] == "fail" and only_yaml["counts"]["documents"] == 0
+    assert [f["id"] for f in only_yaml["findings"]] == ["scan/incomplete"]
     assert [c["status"] for c in only_yaml["checks"]] == ["skipped:tool-missing"] * 4
     assert only_yaml["skipped"] == [{"what": "yaml-manifests", "status": "skipped:tool-missing", "files": 1}]
     put(repo, "k8s/deploy.json", deployment())
@@ -297,23 +308,25 @@ def test_yaml_without_pyyaml_reports_tool_missing_and_keeps_json_native(repo):
     assert mixed["skipped"][0]["what"] == "yaml-manifests"
 
 
-def test_malformed_yaml_and_json_are_info_findings_not_failures(repo):
+def test_malformed_yaml_and_json_are_info_findings_and_make_the_scan_incomplete(repo):
     pytest.importorskip("yaml")
     put(repo, "bad.yaml", "key: [unclosed\n  - x: : :")
     put(repo, "bad.json", "{not json")
     rc, data = run(repo)
-    assert rc == 0 and data["status"] == "ok"
+    assert rc == 1 and data["status"] == "fail"
     assert sorted((f["id"], f["severity"], f["location"]) for f in data["findings"]) == [("MESH-SCAN-UNPARSABLE", "info", "bad.json"),
-                                                                                       ("MESH-SCAN-UNPARSABLE", "info", "bad.yaml")]
+                                                                                       ("MESH-SCAN-UNPARSABLE", "info", "bad.yaml"),
+                                                                                       ("scan/incomplete", "major", ".")]
 
 
 def test_a_malformed_manifest_is_reported_without_hiding_other_checks(repo):
     put(repo, "bad-netpol.json", {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy", "metadata": {"name": "bad", "namespace": "shop"}, "spec": {}})
     put(repo, "authz.json", authz("deny-all", "shop"))
     rc, data = run(repo)
-    assert rc == 0
-    assert [(f["id"], f["severity"]) for f in data["findings"]] == [("MESH-SCAN-INVALID-INPUT", "minor")]
-    assert "spec.podSelector is required" in data["findings"][0]["summary"]
+    assert rc == 1 and data["status"] == "fail"
+    assert [(f["id"], f["severity"]) for f in data["findings"]] == [("scan/incomplete", "major"), ("MESH-SCAN-INVALID-INPUT", "minor")]
+    summary = next(f["summary"] for f in data["findings"] if f["id"] == "MESH-SCAN-INVALID-INPUT")
+    assert "network_policies" in summary and "spec.podSelector" not in summary
     assert check_status(data, "netpol-default-deny") == "error" and check_status(data, "authz-default-deny") == "ran"
 
 
@@ -350,6 +363,7 @@ def test_symlinks_leaving_the_root_are_never_followed(repo, tmp_path):
     assert data["counts"]["workloads"] == 2  # real.json and the in-root symlink to it
     assert not any("leaked" in f["summary"] for f in data["findings"])
     assert {s["what"]: s["files"] for s in data["skipped"]} == {"symlinks-outside-root": 2}
+    assert data["status"] == "fail" and "symlink leaves the root" in next(f["summary"] for f in data["findings"] if f["id"] == "scan/incomplete")
 
 
 def test_skip_directories_are_not_scanned(repo):
@@ -441,3 +455,30 @@ def test_named_pipe_manifest_is_never_opened_and_the_scan_completes(repo):
     assert not proc.stderr.strip().startswith("Traceback"), proc.stderr
     report = json.loads(proc.stdout)
     assert report["counts"]["documents"] == 1 and report["counts"]["workloads"] == 1
+
+
+def test_a_check_that_cannot_be_evaluated_makes_the_scan_fail(repo, monkeypatch):
+    module = load_script()
+    put(repo, "deploy.json", deployment())
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+
+    def broken(payload):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(module.a23_tools, "netpol_coverage", broken)
+    data = module.scan(repo, repo)
+    assert data["status"] == "fail" and check_status(data, "netpol-default-deny") == "error"
+    incomplete = [f for f in data["findings"] if f["id"] == "scan/incomplete"]
+    assert len(incomplete) == 1 and incomplete[0]["severity"] == "major" and "RuntimeError" in incomplete[0]["summary"]
+
+
+def test_a_rejected_manifest_fails_the_gate_and_its_value_is_never_echoed(repo):
+    put(repo, "netpol.json", netpol("default-deny", "shop"))
+    put(repo, "deploy.json", deployment())
+    put(repo, "authz.json", authz("deny-all", "shop"))
+    put(repo, "pa.json", peer_auth("default", "shop", "STRCT"))
+    rc, data = run(repo)
+    assert rc == 1 and data["status"] == "fail"
+    assert check_status(data, "mtls-coverage") == "error" and check_status(data, "authz-default-deny") == "ran"
+    assert {f["id"] for f in data["findings"]} == {"MESH-SCAN-INVALID-INPUT", "scan/incomplete"}
+    assert "STRCT" not in json.dumps(data)

@@ -193,6 +193,36 @@ def test_authz_workload_scoped_allow_all_is_major_and_keeps_the_namespace_defaul
     assert result["namespaces_without_default_deny"] == []
 
 
+def test_authz_negative_matches_in_an_allow_rule_are_not_a_default_deny():
+    # istio.io authorization policy: not* source and operation fields admit every value except the listed ones
+    rules = [{"from": [{"source": {"notPrincipals": ["cluster.local/ns/x/sa/y"]}}]}, {"from": [{"source": {"notRequestPrincipals": ["*"]}}]},
+             {"from": [{"source": {"notNamespaces": ["web"]}}]}, {"from": [{"source": {"notIpBlocks": ["10.0.0.0/8"]}}]},
+             {"from": [{"source": {"notRemoteIpBlocks": ["10.0.0.0/8"]}}]}, {"to": [{"operation": {"notPorts": ["22"]}}]},
+             {"to": [{"operation": {"notHosts": ["admin.example.com"]}}]}, {"to": [{"operation": {"notPaths": ["/admin"]}}]},
+             {"to": [{"operation": {"notMethods": ["DELETE"]}}]}, {"when": [{"key": "request.headers[x-team]", "notValues": ["ops"]}]}]
+    for rule in rules:
+        result = ok("mesh_authz_lint", {"policies": [res("allow-but-one", "a", {"rules": [rule]})], "namespaces": ["a"]})
+        assert result["namespaces_without_default_deny"] == ["a"] and result["verdict"] == "fail", rule
+        assert severity(result, "AUTHZ-NEGATIVE-MATCH") == "major", rule
+    cancelled = ok("mesh_authz_lint", {"policies": [res("deny-all", "a"), res("open", "a", {"rules": [rules[2]]})], "namespaces": ["a"]})
+    assert cancelled["namespaces_without_default_deny"] == ["a"]
+    scoped = res("api-not-web", "a", {"selector": {"matchLabels": {"app": "api"}}, "rules": [rules[2]]})
+    scoped_result = ok("mesh_authz_lint", {"policies": [res("deny-all", "a"), scoped], "namespaces": ["a"]})
+    assert scoped_result["namespaces_without_default_deny"] == [] and severity(scoped_result, "AUTHZ-NEGATIVE-MATCH") == "major"
+    deny = res("deny-not-web", "a", {"action": "DENY", "rules": [rules[2]]})
+    assert "AUTHZ-NEGATIVE-MATCH" not in ids(ok("mesh_authz_lint", {"policies": [deny], "namespaces": ["a"]}))
+
+
+def test_authz_selector_keys_other_than_match_labels_scope_the_policy_and_are_reported():
+    expressions = res("api-only", "a", {"selector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["api"]}]}, "rules": []})
+    alone = ok("mesh_authz_lint", {"policies": [expressions], "namespaces": ["a"]})
+    assert alone["namespaces_without_default_deny"] == ["a"] and severity(alone, "AUTHZ-SELECTOR-UNSUPPORTED") == "minor"
+    with_deny = ok("mesh_authz_lint", {"policies": [res("deny-all", "a"), expressions], "namespaces": ["a"]})
+    assert with_deny["namespaces_without_default_deny"] == [] and severity(with_deny, "AUTHZ-SELECTOR-UNSUPPORTED") == "minor"
+    empty = res("deny", "a", {"selector": {"matchLabels": {}, "matchExpressions": []}})
+    assert "AUTHZ-SELECTOR-UNSUPPORTED" not in ids(ok("mesh_authz_lint", {"policies": [empty], "namespaces": ["a"]}))
+
+
 def test_authz_wildcards_in_allow_rules_are_major_and_prefix_patterns_minor():
     rules = [allow_from(["*"]), allow_from(requestPrincipals=["*"]), allow_from(namespaces=["*"]),
              allow_from(["cluster.local/ns/*"]), allow_from(namespaces=["*-prod"]),
@@ -311,7 +341,7 @@ def test_mtls_min_strict_pct_boundary_is_inclusive():
     assert ok("mesh_mtls_coverage", {**base, "min_strict_pct": 50})["strict_pct"] == 50.0
     assert "MTLS-COVERAGE-BELOW-TARGET" not in ids(ok("mesh_mtls_coverage", {**base, "min_strict_pct": 50}))
     below = ok("mesh_mtls_coverage", {**base, "min_strict_pct": 50.01})
-    assert found(below, "MTLS-COVERAGE-BELOW-TARGET")[0]["summary"] == "strict mTLS covers 50.0% of workloads, target 50.01%"
+    assert found(below, "MTLS-COVERAGE-BELOW-TARGET")[0]["summary"] == "strict mTLS covers 2 of 4 workloads (50.0000%), target 50.01%"
 
 
 def test_mtls_oldest_policy_wins_and_undated_conflicts_are_flagged():
@@ -320,10 +350,34 @@ def test_mtls_oldest_policy_wins_and_undated_conflicts_are_flagged():
     assert result["disabled_count"] == 1 and "MTLS-CONFLICT" not in ids(result)
     undated = [pa("b", "a", "STRICT", {"app": "x"}), pa("a", "a", "DISABLE", {"app": "x"})]
     flagged = ok("mesh_mtls_coverage", {"peer_authentications": undated, "workloads": [wl("a", "x", app="x")]})
-    assert flagged["disabled_count"] == 1
-    assert found(flagged, "MTLS-CONFLICT")[0]["summary"].endswith("using a/a")
+    assert (flagged["disabled_count"], flagged["strict_count"]) == (1, 0)
+    assert severity(flagged, "MTLS-CONFLICT") == "major" and "(a/a, a/b)" in found(flagged, "MTLS-CONFLICT")[0]["summary"]
     same_mode = [pa("b", "a", "STRICT", {"app": "x"}), pa("a", "a", "STRICT", {"app": "x"})]
     assert "MTLS-CONFLICT" not in ids(ok("mesh_mtls_coverage", {"peer_authentications": same_mode, "workloads": [wl("a", "x", app="x")]}))
+
+
+def test_mtls_conflicts_never_count_strict_whatever_the_names_or_timestamps():
+    for first, second in (("a-strict", "z-permissive"), ("a-permissive", "z-strict")):
+        policies = [pa(first, "a", "STRICT", {"app": "x"}), pa(second, "a", "PERMISSIVE", {"app": "x"})]
+        result = ok("mesh_mtls_coverage", {"peer_authentications": policies, "workloads": [wl("a", "x", app="x")]})
+        assert (result["strict_count"], result["permissive_count"], result["verdict"]) == (0, 1, "fail")
+        assert severity(result, "MTLS-CONFLICT") == "major"
+    tied = [pa("x", "a", "STRICT", {"app": "x"}, created="2026-01-01T00:00:00Z"), pa("y", "a", "PERMISSIVE", {"app": "x"}, created="2026-01-01T00:00:00Z")]
+    undated_rival = [pa("old", "a", "STRICT", {"app": "x"}, created="2026-01-01T00:00:00Z"), pa("new", "a", "PERMISSIVE", {"app": "x"})]
+    for policies in (tied, undated_rival):
+        result = ok("mesh_mtls_coverage", {"peer_authentications": policies, "workloads": [wl("a", "x", app="x")]})
+        assert result["strict_count"] == 0 and severity(result, "MTLS-CONFLICT") == "major"
+    decided = [pa("old", "a", "STRICT", {"app": "x"}, created="2026-01-01T00:00:00Z"),
+               pa("new", "a", "PERMISSIVE", {"app": "x"}, created="2026-02-01T00:00:00Z")]
+    result = ok("mesh_mtls_coverage", {"peer_authentications": decided, "workloads": [wl("a", "x", app="x")]})
+    assert result["strict_count"] == 1 and "MTLS-CONFLICT" not in ids(result)
+
+
+def test_mtls_selector_keys_other_than_match_labels_and_empty_workloads_are_refused():
+    expressions = res("p", "a", {"mtls": {"mode": "STRICT"}, "selector": {"matchExpressions": [{"key": "app", "operator": "Exists"}]}})
+    invalid("mesh_mtls_coverage", {"peer_authentications": [expressions], "workloads": [wl("a", "x")]}, "peer_authentications")
+    direct = importlib.import_module("swarm.tools.a23_tools").mtls_coverage({"peer_authentications": [], "workloads": []})
+    assert (direct["state"], direct["field"]) == ("INVALID_INPUT", "workloads")
 
 
 def test_mtls_custom_root_namespace_and_invalid_inputs():
@@ -861,6 +915,21 @@ def test_netpol_allow_all_rule_reopens_pods_despite_default_deny():
     assert ports_only["namespaces"][0]["ingress_open_pods"] == 0 and "NETPOL-ALLOW-ALL-INGRESS" not in ids(ports_only)
 
 
+def test_netpol_port_less_entries_admit_every_port_and_coverage_agrees_with_reachability():
+    # Kubernetes NetworkPolicyPort: an entry without `port` allows every port of its protocol, so `[{}]` re-opens the pod
+    allow_all = netpol("allow-all-ports", "shop", {"matchLabels": {"app": "api"}}, ["Ingress"], ingress=[{"ports": [{}]}])
+    result = coverage([allow_all], [pod("shop", "api-0", app="api")])
+    assert result["namespaces"][0]["ingress_open_pods"] == 1 and severity(result, "NETPOL-ALLOW-ALL-INGRESS") == "minor"
+    assert severity(result, "NETPOL-NO-DEFAULT-DENY-INGRESS") == "major" and result["verdict"] == "fail"
+    assert reach([allow_all], source=WEB, destination=API)["reachable"] is True
+    tcp_all = netpol("tcp-all", "shop", {"matchLabels": {"app": "api"}}, ["Ingress"], ingress=[{"ports": [{"protocol": "TCP"}]}])
+    assert coverage([tcp_all], [pod("shop", "api-0", app="api")])["namespaces"][0]["ingress_open_pods"] == 1
+    ported = netpol("web", "shop", {"matchLabels": {"app": "api"}}, ["Ingress"], ingress=[{"ports": [{"port": 8080}]}])
+    assert coverage([ported], [pod("shop", "api-0", app="api")])["namespaces"][0]["ingress_open_pods"] == 0
+    cidr = netpol("world", "shop", {"matchLabels": {"app": "api"}}, ["Egress"], egress=[{"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}], "ports": [{}]}])
+    assert found(coverage([cidr], [pod("shop", "api-0", app="api")]), "NETPOL-ALLOW-ANY-CIDR-EGRESS")
+
+
 def test_netpol_missing_policies_and_extra_namespaces():
     result = coverage([], [pod("a", "p")], namespaces=["empty"])
     assert [(r["namespace"], r["pod_count"], r["ingress_open_pods"]) for r in result["namespaces"]] == [("a", 1, 1), ("empty", 0, 0)]
@@ -1180,6 +1249,14 @@ def test_timeout_hierarchy_uses_the_per_try_budget_of_the_caller():
     assert ids(result) == ["TIMEOUT-INVERTED"] and result["tightest_gap_ms"] == -500
     ok_chain = hierarchy([tcall("gw", "a", 10000, 1000, 2), tcall("a", "b", 900)])
     assert ok_chain["findings"] == [] and ok_chain["tightest_gap_ms"] == 100
+
+
+def test_timeout_hierarchy_per_try_above_the_total_is_capped_at_the_total():
+    # the caller cannot wait longer than its total timeout: a 5000ms per-try on a 1000ms route is a 1000ms attempt
+    result = hierarchy([tcall("gw", "a", 1000, 5000, 0), tcall("a", "b", 2000)])
+    assert result["tightest_gap_ms"] == -1000 and result["verdict"] == "fail"
+    assert ids(result) == ["TIMEOUT-INVERTED", "TIMEOUT-PERTRY-EXCEEDS-TOTAL"] and severity(result, "TIMEOUT-INVERTED") == "major"
+
 
 
 def test_timeout_hierarchy_per_try_and_retry_rules():
@@ -1581,6 +1658,10 @@ def test_ingress_tls_hsts_boundaries():
     assert ids(hsts(hsts_preload=True)) == ["TLS-HSTS-PRELOAD-INVALID"] and severity(hsts(hsts_preload=True), "TLS-HSTS-PRELOAD-INVALID") == "major"
     assert ids(hsts(hsts_preload=True, hsts_include_subdomains=True, hsts_max_age_s=31_535_999)) == ["TLS-HSTS-PRELOAD-INVALID", "TLS-HSTS-SHORT"]
     assert hsts(hsts_preload=False)["findings"] == []
+    # the preload rule holds even with no max-age: the header is missing, and preload needs a one-year max-age
+    no_age = hsts(hsts_preload=True, hsts_include_subdomains=True, hsts_max_age_s=None)
+    assert ids(no_age) == ["TLS-HSTS-MISSING", "TLS-HSTS-PRELOAD-INVALID"] and severity(no_age, "TLS-HSTS-PRELOAD-INVALID") == "major"
+    assert no_age["verdict"] == "fail"
 
 
 def test_ingress_tls_plaintext_listeners_and_redirects():

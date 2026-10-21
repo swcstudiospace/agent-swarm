@@ -9,8 +9,10 @@ tree contains an Istio security resource, because a plain cluster has no mesh to
 files are not read and every check that depends on them reports `skipped:tool-missing`; JSON is always handled natively.
 
 Read-only and bounded: files over 1 MiB and binary files are skipped, at most 2000 manifest files are read, symlinks that
-leave the root are never followed. Findings use info|minor|major|blocker; `status` is `fail` when any major or blocker
-finding exists. `--dry-run` prints deterministic canned output and reads nothing. Stdlib only (PyYAML optional).
+leave the root are never followed. Findings use info|minor|major|blocker. `status` is `fail` when any major or blocker finding
+exists, and also when no in-scope input was analysed (none found, or none parsed) or one was not (skipped, unparsable, over a
+bound, or rejected by a check): the shared rule in swarm/scan_status.py. `--dry-run` prints deterministic canned output and
+reads nothing. Stdlib only (PyYAML optional).
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from swarm.errors import ErrorCode, SwarmError  # noqa: E402
 from swarm.script_base import AgentScript  # noqa: E402
 from swarm.tools import a23_tools  # noqa: E402
+from swarm.scan_status import incomplete_findings, scan_status  # noqa: E402
 
 try:  # optional: only YAML-dependent checks need it
     import yaml as _YAML
@@ -48,9 +51,14 @@ COUNT_KEYS = ("files_scanned", "documents", "NetworkPolicy", "AuthorizationPolic
               "ReferenceGrant", "workloads")
 
 
+def _rel(root: Path, path: Path) -> str:
+    """The path relative to the root for a finding or a skip reason; the bare name when the path is not under the root."""
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
+
+
 def _walk(root: Path, start: Path) -> tuple[list[Path], dict]:
-    """Candidate manifest files in deterministic order plus what the bounds skipped."""
-    stats = {"symlink_outside_root": 0, "truncated": False}
+    """Candidate manifest files in deterministic order, what the bounds skipped, and a reason for each input left unread."""
+    stats = {"symlink_outside_root": 0, "truncated": False, "reasons": []}
     if start.is_file():
         return [start], stats
     files: list[Path] = []
@@ -61,6 +69,7 @@ def _walk(root: Path, start: Path) -> tuple[list[Path], dict]:
             visited += 1
             if visited > MAX_VISITED:
                 stats["truncated"] = True
+                stats["reasons"].append(f"directory entry limit of {MAX_VISITED} reached; the rest of the tree was not read")
                 return files, stats
             if not name.lower().endswith(SUFFIXES):
                 continue
@@ -72,9 +81,11 @@ def _walk(root: Path, start: Path) -> tuple[list[Path], dict]:
                     inside = False
                 if not inside:
                     stats["symlink_outside_root"] += 1
+                    stats["reasons"].append(f"{_rel(root, path)}: symlink leaves the root, not followed")
                     continue
             if len(files) >= MAX_FILES:
                 stats["truncated"] = True
+                stats["reasons"].append(f"file limit of {MAX_FILES} reached; the rest of the tree was not read")
                 return files, stats
             files.append(path)
     return files, stats
@@ -100,46 +111,56 @@ def _expand(value, ancestors: set[int] | None = None) -> list[dict]:
 
 
 def _load(root: Path, files: list[Path], yaml_module) -> tuple[list[tuple[str, dict]], dict, list[dict]]:
-    """(relative path, document) pairs, skip counters and info findings for unreadable files."""
-    stats = {"too_large": 0, "binary": 0, "yaml_skipped": 0, "unparsable": 0}
+    """(relative path, document) pairs, skip counters, info findings for unparsable files, and a reason per input not analysed.
+    A reason names the path and the cause only, never the content that failed to parse."""
+    stats = {"too_large": 0, "binary": 0, "yaml_skipped": 0, "unparsable": 0, "parsed": 0, "reasons": []}
     docs: list[tuple[str, dict]] = []
     findings: list[dict] = []
     for path in files:
-        rel = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
+        rel = _rel(root, path)
         try:
             if not path.is_file():  # named pipes, sockets and devices are never opened: a read could block the scan
                 stats["unparsable"] += 1
+                stats["reasons"].append(f"{rel}: not a regular file, not opened")
                 continue
             if path.stat().st_size > MAX_FILE_BYTES:
                 stats["too_large"] += 1
+                stats["reasons"].append(f"{rel}: larger than {MAX_FILE_BYTES} bytes")
                 continue
             raw = path.read_bytes()
         except OSError:
             stats["unparsable"] += 1
+            stats["reasons"].append(f"{rel}: unreadable")
             continue
         if b"\x00" in raw[:8192]:
             stats["binary"] += 1
+            stats["reasons"].append(f"{rel}: binary")
             continue
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             stats["binary"] += 1
+            stats["reasons"].append(f"{rel}: not UTF-8")
             continue
         is_json = path.suffix.lower() == ".json"
         if not is_json and yaml_module is None:
             stats["yaml_skipped"] += 1
+            stats["reasons"].append(f"{rel}: YAML not read, PyYAML is not importable")
             continue
         try:
             parsed = [json.loads(text)] if is_json else list(yaml_module.safe_load_all(text))
         except Exception as exc:  # noqa: BLE001 - YAMLError and JSONDecodeError: report and go on
             stats["unparsable"] += 1
+            stats["reasons"].append(f"{rel}: not parsed ({type(exc).__name__})")
             findings.append({"id": "MESH-SCAN-UNPARSABLE", "severity": "info", "summary": f"{rel}: not parsed ({type(exc).__name__})",
                              "location": rel})
             continue
+        stats["parsed"] += 1
         for value in parsed:
             for doc in _expand(value):
                 if len(docs) >= MAX_DOCUMENTS:
                     stats["truncated_documents"] = True
+                    stats["reasons"].append(f"document limit of {MAX_DOCUMENTS} reached; the rest of the documents were not read")
                     return docs, stats, findings
                 docs.append((rel, doc))
     return docs, stats, findings
@@ -182,9 +203,11 @@ def _sorted(findings: list[dict]) -> list[dict]:
 
 
 def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 100) -> dict:
-    """Scan `start` (inside `root`) and return the result document."""
+    """Scan `start` (inside `root`) and return the result document. An input that was not analysed, or a check that could not be
+    evaluated, makes the scan incomplete: its status is `fail` (swarm/scan_status.py)."""
     files, walk_stats = _walk(root, start)
     docs, load_stats, findings = _load(root, files, yaml_module)
+    reasons = [*walk_stats["reasons"], *load_stats["reasons"]]
     by_kind: dict[str, list[dict]] = {}
     locations: dict[str, str] = {}
     for rel, doc in docs:
@@ -225,11 +248,13 @@ def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 
             result = handler(payload)
         except Exception as exc:  # noqa: BLE001 - one malformed manifest must not hide the other checks
             findings.append({"id": "MESH-SCAN-ERROR", "severity": "minor", "summary": f"{name}: analysis failed ({type(exc).__name__})"})
+            reasons.append(f"{name}: analysis failed ({type(exc).__name__}), check not evaluated")
             checks.append({"check": name, "status": "error", "findings": 1})
             continue
         if result.get("state") != "SUCCESS":
             findings.append({"id": "MESH-SCAN-INVALID-INPUT", "severity": "minor",
-                             "summary": f"{name}: {result.get('field')}: {result.get('message')}"})
+                             "summary": f"{name}: input rejected at {result.get('field')}; the check was not evaluated"})
+            reasons.append(f"{name}: input rejected at {result.get('field')}, check not evaluated")
             checks.append({"check": name, "status": "error", "findings": 1})
             continue
         got = []
@@ -256,8 +281,9 @@ def scan(root: Path, start: Path, *, yaml_module=_YAML, min_strict_pct: float = 
     if walk_stats["symlink_outside_root"]:
         skipped.append({"what": "symlinks-outside-root", "status": "skipped:bounded", "files": walk_stats["symlink_outside_root"]})
     truncated = bool(walk_stats["truncated"] or load_stats.get("truncated_documents"))
+    findings.extend({**item, "location": "."} for item in incomplete_findings(reasons, load_stats["parsed"]))
     ordered = _sorted(findings)
-    status = "fail" if any(SEVERITY_RANK[f["severity"]] >= SEVERITY_RANK["major"] for f in findings) else "ok"
+    status = scan_status(findings)
     return {
         "status": status,
         "findings": ordered[:MAX_FINDINGS],

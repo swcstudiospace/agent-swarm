@@ -34,7 +34,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from swarm.tools.support import respond
 
@@ -49,6 +49,8 @@ DEFAULT_CLUSTER_DOMAIN = "cluster.local"
 
 # --- Istio AuthorizationPolicy -------------------------------------------------------------------------------------
 AUTHZ_ACTIONS = ("ALLOW", "DENY", "AUDIT", "CUSTOM")  # AuthorizationPolicy.spec.action; ALLOW is the default
+AUTHZ_NEGATIVE_SOURCE = ("notPrincipals", "notRequestPrincipals", "notNamespaces", "notIpBlocks", "notRemoteIpBlocks")  # source.not*
+AUTHZ_NEGATIVE_OPERATION = ("notHosts", "notPorts", "notPaths", "notMethods")  # to.operation.not*
 # --- Istio PeerAuthentication --------------------------------------------------------------------------------------
 MTLS_MODES = ("UNSET", "DISABLE", "PERMISSIVE", "STRICT")  # UNSET inherits from the parent; with no parent it is PERMISSIVE
 # --- Istio VirtualService / DestinationRule ------------------------------------------------------------------------
@@ -336,8 +338,12 @@ def _authz_lint(payload: dict) -> dict:
         spec = _spec(doc, "policies", index)
         subject = f"{namespace}/{name}"
         seen.add(namespace)
-        selector = spec.get("selector") or {}
-        selected = bool((selector.get("matchLabels") or {}) if isinstance(selector, dict) else selector)
+        selector = _dict(spec.get("selector") or {}, "policies", f"policies[{index}].spec.selector")
+        unsupported = sorted(key for key, value in selector.items() if key != "matchLabels" and value)
+        if unsupported:
+            findings.append(_finding("AUTHZ-SELECTOR-UNSUPPORTED", "minor", f"{subject}: selector sets {', '.join(unsupported)}, which is not part "
+                                     "of Istio's WorkloadSelector (matchLabels only); the policy is treated as scoped to workloads"))
+        selected = bool(selector.get("matchLabels")) or bool(unsupported)
         target_refs = bool(spec.get("targetRefs") or spec.get("targetRef"))
         if selected and target_refs:
             findings.append(_finding("AUTHZ-SCOPE-CONFLICT", "major", f"{subject}: selector and targetRefs are mutually exclusive"))
@@ -383,6 +389,7 @@ def _authz_lint(payload: dict) -> dict:
                 elif not scoped:
                     allow_all.add(namespace)
                 continue
+            negated: list[str] = []  # negative matches in this rule: the rule admits everything except the listed values
             sources = _list(rule.get("from"), "policies", f"policies[{index}].spec.rules[{rule_index}].from")
             if not sources and not rule.get("when"):
                 findings.append(_finding("AUTHZ-NO-SOURCE", "minor", f"{subject}: rules[{rule_index}] has no from: any source, including "
@@ -401,6 +408,22 @@ def _authz_lint(payload: dict) -> dict:
                 for key in ("ipBlocks", "remoteIpBlocks"):
                     if any(v in ("0.0.0.0/0", "::/0") for v in _list(source.get(key), "policies", f"from.source.{key}")):
                         findings.append(_finding("AUTHZ-OPEN-IPBLOCK", "major", f"{subject}: rules[{rule_index}] {key} admits every address"))
+                negated.extend(f"from.source.{key}" for key in AUTHZ_NEGATIVE_SOURCE if _list(source.get(key), "policies", f"from.source.{key}"))
+            for op_item in _list(rule.get("to"), "policies", f"policies[{index}].spec.rules[{rule_index}].to"):
+                operation = _dict(_dict(op_item, "policies", "to item").get("operation") or {}, "policies", "to.operation")
+                negated.extend(f"to.operation.{key}" for key in AUTHZ_NEGATIVE_OPERATION
+                               if _list(operation.get(key), "policies", f"to.operation.{key}"))
+            for condition in _list(rule.get("when"), "policies", f"policies[{index}].spec.rules[{rule_index}].when"):
+                if _list(_dict(condition, "policies", "when item").get("notValues"), "policies", "when.notValues"):
+                    negated.append("when.notValues")
+            if negated:  # an ALLOW rule admitting all but some values is not a default-deny, like the empty rule {}
+                findings.append(_finding("AUTHZ-NEGATIVE-MATCH", "major", f"{subject}: rules[{rule_index}] has a negative match "
+                                         f"({', '.join(sorted(set(negated)))}): it admits every value except the listed ones"))
+                allows_everything = True
+                if mesh_wide:
+                    mesh_allow = True
+                elif not scoped:
+                    allow_all.add(namespace)
         if not scoped and not allows_everything:  # any ALLOW policy in scope makes a request need a matching rule
             if mesh_wide:
                 mesh_deny = True
@@ -432,22 +455,30 @@ def authz_lint(payload: dict) -> dict:
     matching DENY denies, then with no ALLOW policy in scope everything is allowed, otherwise a request needs a matching ALLOW.
     A namespace is default-deny when a namespace-wide (or root-namespace) ALLOW policy applies to it (empty `spec`, the
     allow-nothing idiom, or specific rules) or a namespace-wide DENY policy has the rule `{}`; an ALLOW rule `{}` (matches
-    everything) cancels the ALLOW-based form, a DENY `{}` cannot be cancelled. Wildcards are only a risk in ALLOW rules:
-    principals/requestPrincipals/namespaces "*" (any authenticated identity, issuer or namespace), prefix/suffix patterns,
-    0.0.0.0/0 ip blocks, and rules without `from` (admit unauthenticated plaintext clients)."""
+    everything) cancels the ALLOW-based form, a DENY `{}` cannot be cancelled. An ALLOW rule with a negative match (source
+    notPrincipals, notRequestPrincipals, notNamespaces, notIpBlocks, notRemoteIpBlocks; to.operation notHosts, notPorts, notPaths,
+    notMethods; when notValues) admits every value but the listed ones: AUTHZ-NEGATIVE-MATCH (major), and it cancels the
+    ALLOW-based form like `{}`. Wildcards are only a risk in ALLOW rules: principals/requestPrincipals/namespaces "*" (any
+    authenticated identity, issuer or namespace), prefix/suffix patterns, 0.0.0.0/0 ip blocks, and rules without `from` (admit
+    unauthenticated plaintext clients). A selector key other than matchLabels is AUTHZ-SELECTOR-UNSUPPORTED and scopes the policy
+    to workloads. Without `namespaces`, only namespaces that hold a policy are checked: list every namespace to catch one with none."""
     return respond(payload, _guarded(_authz_lint, payload))
 
 
 # --- mesh_mtls_coverage --------------------------------------------------------------------------------------------
 
 
-def _pick_oldest(candidates: list[dict]) -> tuple[dict, bool]:
-    """The PeerAuthentication Istio would use among same-level candidates: the oldest. Candidates without a `created`
-    timestamp sort after dated ones, ties by name. The bool is True when the choice is ambiguous (differing modes)."""
+def _contenders(candidates: list[dict]) -> tuple[dict, list[dict]]:
+    """The oldest same-level candidate (dated ones first, ties by name) and every candidate that could be the effective one: those
+    sharing its creationTimestamp, and every undated one, since an undated object cannot be ordered against the others."""
     ordered = sorted(candidates, key=lambda c: (c["created"] is None, c["created"].timestamp() if c["created"] else 0.0, c["name"]))
-    modes = {c["mode"] for c in ordered}
-    undated = any(c["created"] is None for c in ordered)
-    return ordered[0], len(ordered) > 1 and len(modes) > 1 and undated
+    top = ordered[0]
+    return top, [c for c in ordered if c["created"] is None or c["created"] == top["created"]]
+
+
+def _ambiguous(contenders: list[dict]) -> bool:
+    """True when the contenders differ in mode or port rules, so the effective posture depends on which one Istio picks."""
+    return len({(c["mode"], tuple(sorted(c["ports"].items()))) for c in contenders}) > 1
 
 
 def _parse_peer_auth(doc, index: int) -> dict:
@@ -458,6 +489,8 @@ def _parse_peer_auth(doc, index: int) -> dict:
     if mode not in MTLS_MODES:
         raise _Invalid("peer_authentications", f"{namespace}/{name}: mtls.mode {mode!r} must be one of {', '.join(MTLS_MODES)}")
     selector = _dict(spec.get("selector") or {}, "peer_authentications", "spec.selector")
+    if any(value for key, value in selector.items() if key != "matchLabels"):
+        raise _Invalid("peer_authentications", f"{namespace}/{name}: spec.selector supports matchLabels only")
     match_labels = _labels(selector.get("matchLabels"), "peer_authentications", "spec.selector.matchLabels")
     ports: dict[int, str] = {}
     for key, value in _dict(spec.get("portLevelMtls") or {}, "peer_authentications", "spec.portLevelMtls").items():
@@ -506,10 +539,14 @@ def _mtls_coverage(payload: dict) -> dict:
         for level, candidates in levels:
             if not candidates:
                 continue
-            pick, ambiguous = _pick_oldest(candidates)
-            if ambiguous:
-                findings.append(_finding("MTLS-CONFLICT", "minor", f"{subject}: {len(candidates)} {level}s with different modes and no "
-                                         f"creationTimestamp; using {pick['namespace']}/{pick['name']}"))
+            pick, contenders = _contenders(candidates)
+            if _ambiguous(contenders):
+                names = ", ".join(sorted(f"{c['namespace']}/{c['name']}" for c in contenders)[:5])
+                findings.append(_finding("MTLS-CONFLICT", "major", f"{subject}: {len(contenders)} {level}(s) tie or are undated with different "
+                                         f"modes or port rules ({names}); the effective mode is unknown, so the workload is not counted strict"))
+                mode = "DISABLE" if any(c["mode"] == "DISABLE" for c in contenders) else "PERMISSIVE"
+                source, chosen = f"{level} conflict", None
+                break
             if level == "workload policy":
                 chosen = pick
             if pick["mode"] != "UNSET":
@@ -547,9 +584,14 @@ def _mtls_coverage(payload: dict) -> dict:
     if len(rows) > MAX_NAMESPACES:
         raise _Invalid("workloads", f"at most {MAX_NAMESPACES} namespaces are analysed per call, got {len(rows)}")
     total = len(workloads)
-    pct = round(float(Decimal(strict) * 100 / Decimal(total)), 2)
-    if _dec(target) > Decimal(strict) * 100 / Decimal(total):
-        findings.append(_finding("MTLS-COVERAGE-BELOW-TARGET", "major", f"strict mTLS covers {pct}% of workloads, target {target}%"))
+    if total == 0:
+        raise _Invalid("workloads", "at least one workload is required")
+    share = Decimal(strict) * 100 / Decimal(total)
+    pct = round(float(share), 2)
+    if _dec(target) > share:
+        exact = share.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+        findings.append(_finding("MTLS-COVERAGE-BELOW-TARGET", "major",
+                                 f"strict mTLS covers {strict} of {total} workloads ({exact}%), target {target}%"))
     table = []
     for row in sorted(rows.values(), key=lambda r: r["namespace"]):
         row["strict_pct"] = round(row["strict_count"] * 100 / row["workload_count"], 2)
@@ -572,8 +614,9 @@ def mtls_coverage(payload: dict) -> dict:
     """Effective PeerAuthentication mode per workload. Istio precedence: the oldest workload-selector policy that matches
     the pod labels, else the oldest namespace-wide policy, else the mesh-wide policy in the root namespace, else PERMISSIVE;
     mode UNSET at a level defers to the parent. portLevelMtls (selector policies only) can weaken a STRICT workload on single
-    ports. A workload counts as strict only when its mode is STRICT and no port is weaker. `non_strict_workloads` lists the
-    first 100 names; at most 200 namespaces are analysed."""
+    ports. A workload counts as strict only when its mode is STRICT and no port is weaker. Same-level policies that tie on
+    creationTimestamp (or are undated) with different modes or port rules are MTLS-CONFLICT (major) and the workload is not
+    counted strict. `non_strict_workloads` lists the first 100 names; at most 200 namespaces are analysed."""
     return respond(payload, _guarded(_mtls_coverage, payload))
 
 
@@ -1144,14 +1187,20 @@ def _parse_pods(items: list, field: str) -> list[dict]:
 _PEER_KEY = {"Ingress": "from", "Egress": "to"}
 
 
+def _all_ports(rule: dict) -> bool:
+    """Whether a rule's ports admit every port: no ports at all, or an entry without `port` (every port of its protocol)."""
+    entries = _list(rule.get("ports"), "network_policies", "ports")
+    return not entries or any(_dict(entry, "network_policies", "NetworkPolicy port").get("port") is None for entry in entries)
+
+
 def _rule_open(rule: dict, direction: str) -> bool:
-    """A rule without peers and without ports matches all traffic of its direction (empty from/to/ports mean 'any')."""
-    return not rule.get(_PEER_KEY[direction]) and not rule.get("ports")
+    """A rule without peers that admits every port matches all traffic of its direction (empty from/to mean 'any')."""
+    return not rule.get(_PEER_KEY[direction]) and _all_ports(rule)
 
 
 def _rule_world_open(rule: dict, direction: str) -> bool:
-    """A rule without ports whose peers include an ipBlock that spans the whole address space (a /0 without `except`)."""
-    if rule.get("ports"):
+    """A rule that admits every port whose peers include an ipBlock that spans the whole address space (a /0 without `except`)."""
+    if not _all_ports(rule):
         return False
     for peer in rule.get(_PEER_KEY[direction]) or []:
         block = peer.get("ipBlock") if isinstance(peer, dict) else None
@@ -1228,11 +1277,13 @@ def _netpol_coverage(payload: dict) -> dict:
 def netpol_coverage(payload: dict) -> dict:
     """NetworkPolicy default-deny coverage per namespace. Kubernetes semantics: a pod is isolated for a direction once any
     policy selects it with that policyType (default policyTypes: Ingress always, Egress only when the egress list is non-empty);
-    policies are purely additive allow-lists, so a rule with no peers and no ports re-opens the pod. A default-deny policy has
-    an empty podSelector, lists the direction and has no rules for it. A rule without ports whose peers include an ipBlock /0
-    without `except` is reported as NETPOL-ALLOW-ANY-CIDR-* (minor; it re-opens the pod to every address, CNI-dependent for pod
-    IPs). Missing ingress default-deny is major (minor/info for egress and when every pod is already isolated individually);
-    `require_egress` raises egress to major."""
+    policies are purely additive allow-lists, so a rule with no peers that admits every port (no ports, or an entry without
+    `port`, which is every port of its protocol) re-opens the pod. A default-deny policy has an empty podSelector, lists the
+    direction and has no rules for it. A rule admitting every port whose peers include an ipBlock /0 without `except` is
+    reported as NETPOL-ALLOW-ANY-CIDR-* (minor; it re-opens the pod to every address, CNI-dependent for pod IPs). Missing
+    ingress default-deny is major (minor/info for egress and when every pod is already isolated individually); `require_egress`
+    raises egress to major. A port entry without `port` counts as open whatever its protocol, so an allow-all UDP entry is
+    treated as open too (conservative: the reachability tool checks one protocol at a time)."""
     return respond(payload, _guarded(_netpol_coverage, payload))
 
 
@@ -1468,7 +1519,7 @@ def _timeout_hierarchy(payload: dict) -> dict:
         elif retries and per_try * (retries + 1) > timeout:
             findings.append(_finding("TIMEOUT-RETRIES-EXCEED-TOTAL", "minor", f"{label}: {retries + 1} tries of {per_try}ms cannot finish within {timeout}ms"))
         totals.append(timeout)
-        attempts.append(per_try if per_try is not None else timeout)
+        attempts.append(min(per_try, timeout) if per_try is not None else timeout)
     gaps = []
     for index in range(len(chain) - 1):
         gap = attempts[index] - totals[index + 1]
@@ -1484,10 +1535,10 @@ def _timeout_hierarchy(payload: dict) -> dict:
 
 
 def timeout_hierarchy(payload: dict) -> dict:
-    """Timeouts must shrink toward the leaf. For consecutive calls the caller's attempt budget (per_try_timeout_ms, else
-    timeout_ms) must exceed the callee's own total timeout by at least `min_gap_ms`: a negative gap is major (the caller
-    gives up first and the callee keeps working), a gap below the minimum is minor, equality with the minimum is accepted.
-    Also flags per-try above total, retries without a per-try timeout, and (retries+1) x per-try above the total."""
+    """Timeouts must shrink toward the leaf. For consecutive calls the caller's attempt budget (per_try_timeout_ms capped at
+    timeout_ms, else timeout_ms) must exceed the callee's own total timeout by at least `min_gap_ms`: a negative gap is major
+    (the caller gives up first and the callee keeps working), a gap below the minimum is minor, equality with the minimum is
+    accepted. Also flags per-try above total, retries without a per-try timeout, and (retries+1) x per-try above the total."""
     return respond(payload, _guarded(_timeout_hierarchy, payload))
 
 
@@ -1813,9 +1864,9 @@ def _ingress_tls(payload: dict) -> dict:
                 findings.append(_finding("TLS-HSTS-DISABLED", "minor", f"{name}: max-age=0 clears HSTS in browsers"))
             elif age < HSTS_RECOMMENDED_MAX_AGE_S:
                 findings.append(_finding("TLS-HSTS-SHORT", "minor", f"{name}: HSTS max-age {age}s is below one year ({HSTS_RECOMMENDED_MAX_AGE_S}s)"))
-            if item.get("hsts_preload") and (age < HSTS_RECOMMENDED_MAX_AGE_S or not item.get("hsts_include_subdomains")):
-                findings.append(_finding("TLS-HSTS-PRELOAD-INVALID", "major", f"{name}: preload needs max-age >= {HSTS_RECOMMENDED_MAX_AGE_S}s and "
-                                         "includeSubDomains (hstspreload.org)"))
+        if item.get("hsts_preload") and (age is None or age < HSTS_RECOMMENDED_MAX_AGE_S or not item.get("hsts_include_subdomains")):
+            findings.append(_finding("TLS-HSTS-PRELOAD-INVALID", "major", f"{name}: preload needs max-age >= {HSTS_RECOMMENDED_MAX_AGE_S}s and "
+                                     "includeSubDomains (hstspreload.org)"))
         if item.get("redirect_http_to_https") is False:
             findings.append(_finding("TLS-NO-HTTP-REDIRECT", "minor", f"{name}: plain HTTP is not redirected to HTTPS"))
     return {"state": "SUCCESS", "listener_count": len(listeners), "tls_listener_count": terminating, **_report(findings)}
