@@ -1408,8 +1408,10 @@ def test_full_non_dry_run_outage_preserves_the_disabled_dag_budgets_and_results(
             "tasks": [(t["task_id"], t["state"], t["depends_on"], t["budget"], t["attempt"],
                        t["notes_json"]["result"]) for t in tasks],
             "histories": [[h["to_state"] for h in store.history(t["task_id"])] for t in tasks],
+            # Scheduler and run-level records (no task_id) count wall-clock poll ticks, which vary under load; the per-task records
+            # are deterministic and carry the outage comparison.
             "records": [(r["type"], r["task_id"]) for r in records
-                        if not r["type"].startswith(("lease.", "handoff."))],
+                        if r["task_id"] is not None and not r["type"].startswith(("lease.", "handoff."))],
         })
         for tid in ("T-first", "T-next"):
             assignment = json.loads((repo / f"{tid}.assignment.json").read_text())
