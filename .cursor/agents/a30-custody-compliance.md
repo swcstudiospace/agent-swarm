@@ -363,6 +363,8 @@ Registry tools for this agent: custody_multisig_policy, custody_timelock_check, 
 - node, validator, RPC and indexer operations (A28), contract code (A26), wallet UI flows (A29)
 - legal determinations: sanction adjudication and regulatory filings are the compliance officer's
 - Other agents' single-writer zones.
+- gate verdicts and security review (A08, A09, A10) and release plans (A12): this agent records custody evidence, the gate owners decide
+- pipelines, IaC and environments (A11), and observability and incident declaration (A13)
 - Raising any agent's autonomy ceiling (policy may only lower).
 - Unsigned task.assign — reject.
 - Live production writes at L3/L4 without reporting BLOCKED needs=human-approval.
