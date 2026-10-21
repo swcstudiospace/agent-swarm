@@ -115,6 +115,42 @@ def test_immediate_reuse_retains_authenticated_payload(controller, tmp_path, mon
     _assert_signed_result(result, tmp_path)
 
 
+def _store_task_result(tmp_path, task_id, result):
+    from swarm.taskstore import TaskStore
+    store = TaskStore(root=tmp_path)
+    store.update(task_id, notes=json.dumps(dict(store.get(task_id)["notes_json"], result=result)))
+
+
+def test_reused_plan_whole_number_metric_signs_js_stable_bytes(controller, tmp_path, monkeypatch):
+    # The TS bridge reads 100.0 back as 100 (one JS number type). The controller must sign the form that survives that.
+    _signer(tmp_path, monkeypatch)
+    first = controller.run(_args(), _ctx(tmp_path, "metric-correlation"))
+    task_id = first["tasks"][0]["task_id"]
+    _store_task_result(tmp_path, task_id, {"metric": 100.0, "ratio": 0.5})
+    result = controller.run(_args(), _ctx(tmp_path))
+    assert result["reused"] is True
+    _assert_signed_result(result, tmp_path)
+    assignment = result["execution_assignment"]
+    stored = next(t for t in assignment["payload"]["inputs"][0]["tasks"] if t["task_id"] == task_id)
+    assert stored["notes"]["result"] == {"metric": 100, "ratio": 0.5}
+    assert type(stored["notes"]["result"]["metric"]) is int
+    wire = json.dumps(assignment, separators=(",", ":"))
+    assert "100.0" not in wire
+    from swarm.envelope import verify_envelope
+    assert verify_envelope(json.loads(wire))
+
+
+@pytest.mark.parametrize("value", [2 ** 53, 1e300, float("nan")])
+def test_controller_refuses_numbers_json_cannot_round_trip(controller, tmp_path, monkeypatch, value):
+    from swarm.errors import SwarmError
+    _signer(tmp_path, monkeypatch)
+    first = controller.run(_args(), _ctx(tmp_path, "unsafe-correlation"))
+    _store_task_result(tmp_path, first["tasks"][0]["task_id"], {"metric": value})
+    with pytest.raises(SwarmError, match="cannot round-trip"):
+        controller.run(_args(), _ctx(tmp_path))
+
+
+
 def test_reuse_refuses_persisted_snapshot_correlation_mismatch(controller, tmp_path, monkeypatch):
     from swarm.errors import SwarmError
     _signer(tmp_path, monkeypatch)

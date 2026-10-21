@@ -85,7 +85,7 @@ python3 -m pytest -q                                                # runtime + 
 
 `scripts/receipt_export.py` (and `scripts/ts/receipt_export.ts`) reads the Task Store the status command uses and prints a desk verification receipt. Swarm verdicts are marked advisory, `approved_by` stays empty, and a credential-shaped string that survives redaction exits 2 without writing `--out`.
 
-Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE` (which must be an absolute path),
+Trusted controllers can load an **existing** private Ed25519 seed through `SWARM_ED25519_KEY_FILE` (an absolute path; the OMP bridge resolves a relative value against the session workspace before the controller runs),
 or from `${XDG_CONFIG_HOME:-$HOME/.config}/agent-swarm/signing-key.hex` when neither raw signing
 variable is set. References must resolve to an owner-only regular file without symlink components;
 the conventional directory must also be private. Key contents never belong in prompts, argv,
