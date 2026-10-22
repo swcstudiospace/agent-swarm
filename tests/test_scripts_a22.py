@@ -940,6 +940,16 @@ def test_a_child_namespace_renames_a_namespace_object_so_it_collides_with_the_ov
 
 
 @needs_yaml
+def test_a_generated_name_child_namespace_is_renamed_so_it_collides_with_the_overlays_namespace(tmp_path):
+    put(tmp_path, "base/kustomization.yaml", "namespace: new\nresources:\n  - ns.yaml\n")
+    put(tmp_path, "base/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata: {generateName: team-}\n")
+    put(tmp_path, "overlay/kustomization.yaml", "resources:\n  - ../base\n  - ns.yaml\n")
+    put(tmp_path, "overlay/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata: {name: new}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and "kustomize:duplicate-resource:Namespace/new" in ids(result, "kustomize")
+
+
+@needs_yaml
 def test_a_patch_target_past_the_500_objects_the_scan_judges_is_unproven_not_missing(tmp_path):
     put(tmp_path, "k/kustomization.yaml", "resources:\n  - many.yaml\npatches:\n  - target: {kind: ConfigMap, name: c500}\n    patch: |-\n      - op: add\n        path: /data\n        value: {a: b}\n")
     put(tmp_path, "k/many.yaml", "".join(f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{index}}}\n---\n" for index in range(501)))

@@ -29,7 +29,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
-from swarm.redact import REDACTED, redact_text
+from swarm.redact import REDACTED, redact_spans, redact_text
 from swarm.tools.support import respond
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
@@ -72,19 +72,50 @@ def _dec(value) -> Decimal:
 
 def _public(text: str) -> str:
     """`text` with credentials replaced by swarm.redact's `[REDACTED]`. A string with no credential comes back unchanged.
-    Otherwise each word is checked alone, as before. A word after an authentication scheme (`Bearer <token>`, `Basic <token>`)
-    is checked together with the scheme: when the pair is a credential, that second word is masked and the scheme is kept.
-    No other pair is joined, so a key-value phrase such as `automountServiceAccountToken: false` is not cut at its colon."""
+    The credential spans are taken from the whole string, so a secret whose key and value are separate words (`password: hunter2`)
+    is masked. A false, true or null value is left as written only under a known boolean setting (`automountServiceAccountToken:
+    false`); under any other key a boolean-looking value is still a credential (`password=false` is masked)."""
     if redact_text(text) == text:
         return text
-    parts = re.split(r"(\s+)", text)
-    words = parts[0::2]
-    masked = [False] * len(words)
-    for k in range(len(words) - 1):
-        pair = f"{words[k]} {words[k + 1]}"
-        if words[k].lower() in ("bearer", "basic") and redact_text(pair) != pair:
-            masked[k + 1] = True
-    return "".join((REDACTED if masked[i // 2] else redact_text(part)) if i % 2 == 0 else part for i, part in enumerate(parts))
+    masked_text = []
+    last = 0
+    for start, end in redact_spans(text):
+        if _is_boolean_setting(text, start, end):
+            continue
+        masked_text.append(text[last:start])
+        masked_text.append(REDACTED)
+        last = end
+    masked_text.append(text[last:])
+    return "".join(masked_text)
+
+
+_BOOLEAN_SETTINGS = frozenset({"automountserviceaccounttoken"})  # keys whose false, true or null value is a setting, not a secret
+_NOT_SECRET_VALUES = frozenset({"true", "false", "null", "none", "nil"})
+_KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+_MAX_KEY = 128  # a longer key is not a known boolean setting
+
+
+def _key_before_value(text: str, start: int) -> str:
+    """The key of the `key: value` or `key=value` pair whose value starts at `start`, lower-cased; "" when there is none or the
+    key is longer than _MAX_KEY. One backward pass, so the cost is bounded by the prefix length (no regex rescans it)."""
+    i = start
+    while i > 0 and text[i - 1] in " \t\"'":
+        i -= 1
+    if i == 0 or text[i - 1] not in ":=":
+        return ""
+    i -= 1
+    while i > 0 and text[i - 1] in " \t\"'":
+        i -= 1
+    end = i
+    while i > 0 and end - i < _MAX_KEY and text[i - 1] in _KEY_CHARS:
+        i -= 1
+    if i == end or (end - i == _MAX_KEY and i > 0 and text[i - 1] in _KEY_CHARS):
+        return ""
+    return text[i:end].lower()
+
+
+def _is_boolean_setting(text: str, start: int, end: int) -> bool:
+    return text[start:end].lower() in _NOT_SECRET_VALUES and _key_before_value(text, start) in _BOOLEAN_SETTINGS
 
 
 def _finding(rule: str, severity: str, location: str, summary: str) -> dict:

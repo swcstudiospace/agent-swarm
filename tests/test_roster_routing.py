@@ -318,6 +318,12 @@ def test_load_custom_rejects_a_capability_nobody_offers(tmp_path):
         orch_plan.load_custom(_custom(tmp_path, {"capability": "chain.mint"}))
 
 
+def test_load_custom_reserves_the_rerun_suffix_for_rework_reruns(tmp_path):
+    orch_plan = _load("orch_plan")
+    with pytest.raises(orch_plan.SwarmError, match="ends in .rN"):
+        orch_plan.load_custom(_custom(tmp_path, {"id": "scan.r1", "capability": "mesh.netpol", "agent": "A23"}))
+
+
 def test_the_planner_exits_with_an_input_error_for_a_mismatched_custom_task(tmp_path):
     done = run_script("orch_plan.py", "--plan", str(_custom(tmp_path, {"capability": "dapp.wallet", "agent": "A26"})),
                       "--prefix", "C", "--json", env={"SWARM_DIR": str(tmp_path / ".swarm")})

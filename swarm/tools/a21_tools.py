@@ -278,13 +278,29 @@ def _version_skew(payload: dict) -> dict:
                 findings.append(_finding(
                     f"kube-proxy/{name}/kubelet-skew", "major",
                     f"kube-proxy {name} on node {node} differs from its kubelet by {gap} minors; at most {limit} are supported"))
-    next_newest = newest + 1
-    upgrade_safe = True
+    next_newest, next_oldest = newest + 1, oldest + 1
+    # The hop moves every kube-apiserver one minor up; each component is checked against the same rule the policy applies at that position.
+    # A kubelet/kube-proxy breach always carries a current-state finding that names it: too-old or at-skew-limit for lag, newer-than-apiserver for a minor above the oldest kube-apiserver.
+    upgrade_safe = newest - oldest <= 1
+    upgrade_findings: list[dict] = []
     for comp in payload["components"]:
-        if comp["kind"] in ("kubelet", "kube-proxy"):
-            minor = _minor(comp["version"], "components")
-            if next_newest - minor > _skew_older_limit(minor):
+        minor = _minor(comp["version"], "components")
+        kind, name = comp["kind"], comp["name"]
+        if kind in ("kubelet", "kube-proxy"):
+            if minor > next_oldest or next_newest - minor > _skew_older_limit(minor):
                 upgrade_safe = False
+            continue
+        after_span = _label(next_oldest) if next_oldest == next_newest else f"{_label(next_oldest)}..{_label(next_newest)}"
+        if kind == "kubectl":
+            breached = minor < next_newest - 1 or minor > next_oldest + 1
+            message = f"kubectl {name} is {_label(minor)}; after the upgrade it must be within one minor of every kube-apiserver ({after_span})"
+        else:  # kube-controller-manager, kube-scheduler, cloud-controller-manager
+            breached = minor > next_oldest or next_newest - minor > 1
+            message = f"{kind} {name} is {_label(minor)}; after the upgrade the kube-apiserver is {after_span}, so it must be at most one minor older than the newest and not newer than the oldest"
+        if breached:
+            upgrade_safe = False
+            upgrade_findings.append(_finding(f"{kind}/{name}/upgrade-breach", "minor", message))
+    findings.extend(upgrade_findings)
     return {
         "state": "SUCCESS",
         "apiserver_oldest": _label(oldest),

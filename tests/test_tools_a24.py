@@ -2227,6 +2227,38 @@ def test_aggregation_graph_over_the_step_budget_is_refused_with_its_reason():
     assert "the aggregation graph is too large" in refused["message"]
 
 
+def test_public_masks_a_password_whose_key_and_value_are_separate_words():  # thread: whole-string spans, not per-word checks
+    from swarm.tools import a24_tools
+
+    assert a24_tools._public("password: hunter2") == "password: [REDACTED]"
+    assert a24_tools._public("user password: hunter2 end") == "user password: [REDACTED] end"
+    assert a24_tools._public("password=hunter2") == "password=[REDACTED]"
+    assert "hunter2" not in a24_tools._public("binding subject password: hunter2")
+
+
+def test_public_keeps_only_a_known_boolean_setting_and_masks_a_boolean_looking_secret():  # thread: exception limited to known settings
+    from swarm.tools import a24_tools
+
+    assert a24_tools._public("automountServiceAccountToken: false") == "automountServiceAccountToken: false"
+    assert a24_tools._public("automountServiceAccountToken: false and password: hunter2") == (
+        "automountServiceAccountToken: false and password: [REDACTED]")
+    assert a24_tools._public("password=false") == "password=[REDACTED]"
+    assert a24_tools._public("password: true") == "password: [REDACTED]"
+    assert a24_tools._public("accessToken: null") == "accessToken: [REDACTED]"
+
+
+def test_public_masks_a_secret_after_a_long_name_in_bounded_time():  # thread: the key lookup must not rescan the whole prefix
+    import time
+
+    from swarm.tools import a24_tools
+
+    text = "A" * 32_000 + " password=false"
+    started = time.monotonic()
+    masked = a24_tools._public(text)
+    assert time.monotonic() - started < 2.0
+    assert masked == "A" * 32_000 + " password=[REDACTED]"
+
+
 def test_a_credential_pasted_into_a_role_name_is_masked_in_the_finding_id_and_summary():  # thread: _finding copies manifest names
     token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
     result = scan([role(token, [rule(["*"], ["*"], ("*",))])])

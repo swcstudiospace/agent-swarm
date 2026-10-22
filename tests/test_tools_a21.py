@@ -157,7 +157,7 @@ def test_skew_kubelet_newer_than_any_apiserver_is_a_blocker():
 
 
 def test_skew_ha_apiserver_spread_and_lag_measured_from_the_newest():
-    assert finds(ok("k8s_version_skew", {"apiserver_versions": ["1.31.0", "1.29.0"], "components": [comp("kubectl", "1.30.0")]})) == [("apiserver/spread", "major")]
+    assert finds(ok("k8s_version_skew", {"apiserver_versions": ["1.31.0", "1.29.0"], "components": [comp("kubectl", "1.30.0")]})) == [("apiserver/spread", "major"), ("kubectl/c1/upgrade-breach", "minor")]
     result = ok("k8s_version_skew", {"apiserver_versions": ["1.30.0", "1.29.0"], "components": [comp("kubelet", "1.27.0", "n")]})
     assert finds(result) == [("kubelet/n/at-skew-limit", "minor")]
 
@@ -165,14 +165,39 @@ def test_skew_ha_apiserver_spread_and_lag_measured_from_the_newest():
 def test_skew_controller_manager_scheduler_and_ccm_may_be_one_minor_behind():
     base = {"apiserver_versions": ["1.30.0"]}
     assert ok("k8s_version_skew", {**base, "components": [comp("kube-controller-manager", "1.30.1", "m")]})["findings"] == []
-    assert finds(ok("k8s_version_skew", {**base, "components": [comp("kube-scheduler", "1.29.1", "s")]})) == [("kube-scheduler/s/one-behind", "info")]
-    assert finds(ok("k8s_version_skew", {**base, "components": [comp("cloud-controller-manager", "1.28.1", "c")]})) == [("cloud-controller-manager/c/too-old", "major")]
+    assert finds(ok("k8s_version_skew", {**base, "components": [comp("kube-scheduler", "1.29.1", "s")]})) == [("kube-scheduler/s/upgrade-breach", "minor"), ("kube-scheduler/s/one-behind", "info")]
+    assert finds(ok("k8s_version_skew", {**base, "components": [comp("cloud-controller-manager", "1.28.1", "c")]})) == [("cloud-controller-manager/c/too-old", "major"), ("cloud-controller-manager/c/upgrade-breach", "minor")]
     assert finds(ok("k8s_version_skew", {**base, "components": [comp("kube-scheduler", "1.31.0", "s")]})) == [("kube-scheduler/s/newer-than-apiserver", "blocker")]
 
 
 def test_skew_kubectl_is_allowed_one_minor_either_way():
-    for version, expected in (("1.29.0", []), ("1.31.0", []), ("1.32.0", [("kubectl/k/skew", "minor")]), ("1.28.0", [("kubectl/k/skew", "minor")])):
+    for version, expected in (("1.29.0", [("kubectl/k/upgrade-breach", "minor")]), ("1.31.0", []), ("1.32.0", [("kubectl/k/skew", "minor")]), ("1.28.0", [("kubectl/k/skew", "minor"), ("kubectl/k/upgrade-breach", "minor")])):
         assert finds(ok("k8s_version_skew", {"apiserver_versions": ["1.30.0"], "components": [comp("kubectl", version, "k")]})) == expected
+
+
+def test_skew_upgrade_safety_checks_control_plane_kinds_after_the_hop():
+    # F-01: the hop moves each kube-apiserver one minor up; controller-manager/scheduler/CCM, kubectl and the apiserver spread must stay within policy.
+    result = skew(["1.30"], comp("kube-controller-manager", "1.29", "cm"), comp("kubelet", "1.30", "k1", "n1"))
+    assert result["control_plane_upgrade_safe"] is False and result["verdict"] == "compliant"
+    assert finds(result) == [("kube-controller-manager/cm/upgrade-breach", "minor"), ("kube-controller-manager/cm/one-behind", "info")]
+    assert result["findings"][0]["summary"].startswith("kube-controller-manager cm is 1.29; after the upgrade")
+    safe = skew(["1.30.0"], comp("kube-controller-manager", "1.30.1", "m"), comp("kube-scheduler", "1.30.0", "s"), comp("cloud-controller-manager", "1.30.0", "c"), comp("kubectl", "1.31.0", "k"))
+    assert safe["control_plane_upgrade_safe"] is True and safe["findings"] == []
+    spread = skew(["1.31.0", "1.29.0"], comp("kubelet", "1.29.0", "n"))
+    assert spread["control_plane_upgrade_safe"] is False and finds(spread) == [("apiserver/spread", "major")]
+    ha = skew(["1.30.0", "1.31.0"], comp("kube-scheduler", "1.30.0", "s"))
+    assert ha["control_plane_upgrade_safe"] is False and finds(ha) == [("kube-scheduler/s/upgrade-breach", "minor"), ("kube-scheduler/s/one-behind", "info")]
+    far = skew(["1.31.0", "1.32.0"], comp("kubectl", "1.27.0", "c0"))
+    assert far["control_plane_upgrade_safe"] is False and finds(far) == [("kubectl/c0/skew", "minor"), ("kubectl/c0/upgrade-breach", "minor")]
+
+
+def test_skew_upgrade_safety_rejects_kubelet_newer_than_the_post_hop_oldest_apiserver():
+    # R-01: after the hop the oldest kube-apiserver is 1.31, so a 1.32 kubelet or kube-proxy breaches the upgrade.
+    newer = skew(["1.30", "1.31"], comp("kubelet", "1.32", "k", "n"))
+    assert newer["control_plane_upgrade_safe"] is False and newer["verdict"] == "violations"
+    assert finds(newer) == [("kubelet/k/newer-than-apiserver", "blocker")]
+    assert skew(["1.30", "1.31"], comp("kube-proxy", "1.32", "p", "n"))["control_plane_upgrade_safe"] is False
+    assert skew(["1.30", "1.31"], comp("kubelet", "1.31", "k", "n"))["control_plane_upgrade_safe"] is True
 
 
 def test_skew_kube_proxy_is_paired_with_the_kubelet_on_its_node():
@@ -1306,7 +1331,9 @@ def test_oracle_version_skew_matches_the_published_policy():
             api[1] = api[0] + 1
         comps = [{"name": f"c{i}", "kind": rng.choice(["kubelet", "kube-proxy", "kube-controller-manager", "kubectl"]), "version": f"1.{rng.randint(20, 40)}.0"}
                  for i in range(rng.randint(1, 4))]
-        got = {(f["id"], f["severity"]) for f in _handlers()._version_skew({"apiserver_versions": [f"1.{m}.0" for m in api], "components": comps})["findings"]}
+        # Post-hop breaches are covered by the dedicated upgrade test; this oracle models current-state skew only.
+        findings = _handlers()._version_skew({"apiserver_versions": [f"1.{m}.0" for m in api], "components": comps})["findings"]
+        got = {(f["id"], f["severity"]) for f in findings if not f["id"].endswith("/upgrade-breach")}
         new, old, want = max(api), min(api), set()
         for c in comps:
             minor, kind, ident = int(c["version"].split(".")[1]), c["kind"], f"{c['kind']}/{c['name']}"

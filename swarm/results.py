@@ -332,6 +332,20 @@ def _rerun_index(task: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _ancestors(task: dict, rows: list[dict]) -> set[str]:
+    """Every task id that `task` depends on, directly or through other tasks of `rows`."""
+    by_id = {row["task_id"]: row for row in rows}
+    seen: set[str] = set()
+    frontier = list(task["depends_on"])
+    while frontier:
+        dep = frontier.pop()
+        if dep in seen or dep not in by_id:
+            continue
+        seen.add(dep)
+        frontier.extend(by_id[dep]["depends_on"])
+    return seen
+
+
 def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=None, *, approve: bool = True) -> list[str]:
     """Apply A01 gate/rework rules to IN_REVIEW tasks; reopen gate tasks after rework; escalate stalled gates.
 
@@ -372,9 +386,12 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                 # numbered by the lineage (a multi-target gate's members are triggered by different targets). A leased
                 # latest member runs against the pre-rework artifact, so it gets a rerun too (WR-04); a member that has
                 # not started (PLANNED/RETRY) or is left to A01 (FAILED/BLOCKED/ESCALATED/CANCELLED) gets none
+                # a completed scan (a non-gate task that depends on the target: netchk, polchk, res) holds a result from the
+                # pre-rework artifact too, so it joins its lineage; the consumers that have not finished wait for its rerun
                 lineages: dict[str, list[dict]] = {}
                 for g in store.list(correlation_id=corr):
-                    if tid in g["notes_json"].get("gate_for", []):
+                    if tid in g["notes_json"].get("gate_for", []) or (not g["notes_json"].get("gate") and tid in g["depends_on"]
+                                                                      and not store.required_gates(g["task_id"])):
                         lineages.setdefault(RERUN_SUFFIX.sub("", g["task_id"]), []).append(g)
                 created: dict[str, tuple[str, set[str]]] = {}  # new rerun id → (its gate, its lineage's member ids)
                 for base, members in lineages.items():
@@ -392,14 +409,18 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                     store.transition(new_id, S.PLANNED, reason="gate rerun")
                     created[new_id] = (g["notes_json"].get("gate"), {m["task_id"] for m in members})
                 # once every rerun of this rework exists: downstream of any lineage member waits for that lineage's
-                # rerun, and a release-gate rerun (it reads the other gates' verdicts) waits for the other reruns
-                for d in store.list(correlation_id=corr):
+                # rerun. A release-gate rerun (it reads the other gate reruns' verdicts and the rollout plan) waits for the
+                # other gate reruns and for the scan reruns upstream of it; a scan downstream of the release gate does not hold it
+                rows = store.list(correlation_id=corr)
+                for d in rows:
                     if d["state"] == S.DONE.value:
                         continue
                     release_rerun = created.get(d["task_id"], ("", set()))[0] == "release"
+                    upstream = _ancestors(d, rows) if release_rerun else set()
                     extra = [nid for nid, (gate, mids) in created.items()
                              if nid != d["task_id"] and nid not in d["depends_on"]
-                             and (mids.intersection(d["depends_on"]) or (release_rerun and gate != "release"))]
+                             and (mids.intersection(d["depends_on"])
+                                  or (release_rerun and ((gate and gate != "release") or RERUN_SUFFIX.sub("", nid) in upstream)))]
                     if extra:
                         store.update(d["task_id"], depends_on=d["depends_on"] + extra)
             continue
