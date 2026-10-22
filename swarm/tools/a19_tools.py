@@ -312,6 +312,16 @@ def _position(items, extra, index: int):
     return items[index] if index < len(items) else extra
 
 
+_DRAFT_URI = re.compile(r"https?://json-schema\.org/(draft-0[3467]|draft/(?:2019-09|2020-12))/schema#?\Z")
+
+
+def _draft_identity(declared):
+    """The draft a `$schema` value names. Spellings of one draft (with or without the trailing `#`, http or https) give the same
+    identity; any other value is its own identity, so unrecognised or different drafts stay apart."""
+    match = _DRAFT_URI.match(declared) if isinstance(declared, str) else None
+    return match.group(1) if match else declared
+
+
 class _JsonCompare:
     """Does every instance valid under `sub` stay valid under `sup`? Sound for the supported keyword set: where it cannot
     decide (a keyword in `_UNANALYSED` that differs, a oneOf whose alternatives it cannot prove exclusive, an unresolvable
@@ -419,9 +429,9 @@ class _JsonCompare:
         return set(names)
 
     def _declared(self, side: str):
-        """The `$schema` the root of `side` declares, or None when it declares none."""
+        """The draft identity of the root `$schema` of `side` (see _draft_identity), or None when it declares none."""
         root = self.roots[side]
-        return root.get("$schema") if isinstance(root, dict) else None
+        return _draft_identity(root.get("$schema")) if isinstance(root, dict) else None
 
     def _same(self, sub: dict, ss: str, sup: dict, ps: str) -> bool:
         """Both subtrees are textually identical, carry no `$ref` (which may resolve differently on each side), and are read under

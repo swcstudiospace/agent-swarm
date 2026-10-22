@@ -352,6 +352,22 @@ def test_a_crd_and_its_custom_resource_are_checked_even_when_nothing_is_annotate
     assert code == 1 and ids(result) == {"waves:cr-with-crd-same-wave:W/w"}
 
 
+@needs_yaml
+def test_a_base_shared_by_two_namespaced_overlays_keeps_its_objects_in_both_namespaces(tmp_path):
+    put(tmp_path, "root/kustomization.yaml", "resources:\n  - ../red\n  - ../blue\n")
+    put(tmp_path, "red/kustomization.yaml", "namespace: red\nresources:\n  - ../base\n")
+    put(tmp_path, "blue/kustomization.yaml", "namespace: blue\nresources:\n  - ../base\n")
+    put(tmp_path, "base/kustomization.yaml", "resources:\n  - cm.yaml\n  - deploy.yaml\n")
+    put(tmp_path, "base/cm.yaml", f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n  annotations: {{{WAVE}: '1'}}\n")
+    put(tmp_path, "base/deploy.yaml", f"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations: {{{WAVE}: '0'}}\n"
+        "spec:\n  template:\n    spec:\n      volumes:\n        - name: c\n          configMap: {name: cfg}\n"
+        "      containers:\n        - name: web\n          image: ghcr.io/acme/web:1.4.2\n")
+    code, result = scan(tmp_path)
+    assert code == 1
+    # the blue Deployment runs at wave 0 and needs the blue ConfigMap, which the base renders into namespace blue at wave 1
+    assert "waves:dependency-after-workload:Deployment/blue/web:ConfigMap/cfg" in ids(result, "waves")
+
+
 # --- images -----------------------------------------------------------------------------------------------------
 
 

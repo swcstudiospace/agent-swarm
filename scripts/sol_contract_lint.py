@@ -430,7 +430,7 @@ def _direct_parents(contract: dict, by_name: dict[str, dict]) -> list[dict]:
 def _c3(name: str, parents: list[dict]) -> list[str]:
     """C3 merge of the parents' linearizations and of the parents themselves, last-written first: Solidity's order. An
     inconsistent order (solc rejects it) keeps the leftover names in the order they were listed."""
-    sequences = [list(p["_linearization"]) for p in parents] + [[p["name"] for p in reversed(parents)]]
+    sequences = [list(p["_linearization"]) for p in reversed(parents)] + [[p["name"] for p in reversed(parents)]]
     sequences = [s for s in sequences if s]
     pos = [0] * len(sequences)
     in_tail: dict[str, int] = {}  # how many sequences hold a name after their head
@@ -1669,8 +1669,9 @@ class _CallSites:
 
     def _requires_flag(self, flag: str, open_: int, close: int, p: int) -> bool:
         """Whether the read at `p` is in the condition of the require or assert whose '(' is at `open_`, and that condition tests
-        `flag`: the flag is one conjunct of its top-level `&&` chain (`ok`, `(ok)`, `ok == true`). The first top-level argument is the
-        condition; a message argument (`require(x, ok ? "a" : "b")`) and a disjunct (`x || ok`) do not test the flag."""
+        `flag`: the flag is one conjunct of its top-level `&&` chain, enclosing parentheses removed (`ok`, `(ok)`, `(ok && x)`,
+        `ok == true`, `ok != false`). The first top-level argument is the condition; a message argument (`require(x, ok ? "a" : "b")`)
+        and a disjunct (`x || ok`) do not test the flag."""
         clean = self.clean
         end, depth = close, 0
         for j in range(open_ + 1, close):
@@ -1683,21 +1684,8 @@ class _CallSites:
                 break
         if p >= end:
             return False
-        cond, parts, depth, start, j = clean[open_ + 1:end], [], 0, 0, 0
-        while j < len(cond):
-            if cond[j] in "([{":
-                depth += 1
-            elif cond[j] in ")]}":
-                depth -= 1
-            elif depth == 0 and cond.startswith("&&", j):
-                parts.append(cond[start:j])
-                start = j + 2
-                j += 2
-                continue
-            j += 1
-        parts.append(cond[start:])
-        conjunct = re.compile(r"\(*\s*" + re.escape(flag) + r"\s*(?:==\s*true\s*)?\)*")
-        return any(conjunct.fullmatch(part.strip()) for part in parts)
+        conjunct = re.compile(r"\(*\s*" + re.escape(flag) + r"\s*(?:(?:==\s*true|!=\s*false)\s*)?\)*")
+        return any(conjunct.fullmatch(part) for part in _conjuncts(clean[open_ + 1:end]))
 
     def _is_tuple_target(self, p: int) -> bool:
         """Whether the name at `p` is a slot of a tuple assignment target, `(x, name) = ...`: the nearest '(' around it, in its
@@ -1910,6 +1898,64 @@ _REVERT_OR_RETURN = re.compile(r"(?:revert|return|throw)\b")
 _CHECK_HEAD = re.compile(r"\b(?:(require|assert|if)\s*\(|(return)\b)")  # a check head: its keyword and '(' (or a return)
 _COND_HEAD = re.compile(r"\b(?:if|for|while|catch)\b|\belse\b")  # a head whose body may not run: its body is a conditional span
 _EXIT = re.compile(r"\b(?:return|revert|throw|break|continue)\b|(?<![\w$])_\s*;")  # a statement that leaves or skips the code after it
+
+
+def _wrapped(text: str) -> bool:
+    """Whether `text` is one parenthesised group: its first '(' closes at its last character, `(ok && x)` but not `(a) && (b)`."""
+    if not (text.startswith("(") and text.endswith(")")):
+        return False
+    depth = 0
+    for j, c in enumerate(text):
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j == len(text) - 1
+    return False
+
+
+def _top_level_or(text: str) -> bool:
+    """Whether `text` has a `||` outside every bracket: `a || b && c` is `a || (b && c)`, so no conjunct of it is required."""
+    depth = 0
+    for j, c in enumerate(text):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and text.startswith("||", j):
+            return True
+    return False
+
+
+def _conjuncts(text: str) -> list[str]:
+    """The `&&` conjuncts of a condition, flattened: a parenthesised group is opened whether it encloses the whole condition or one
+    conjunct, so `((ok && x))` and `allowed && (ok && x)` both yield `ok` and `x`. A top-level `||` or `!` keeps its operand whole,
+    and a group holding a top-level `||` is never split at `&&`: `(skipCheck || allowed && ok)` requires nothing."""
+    text = text.strip()
+    if _wrapped(text):
+        return _conjuncts(text[1:-1])
+    if _top_level_or(text):
+        return [text]
+    parts: list[str] = []
+    depth, start, j = 0, 0, 0
+    while j < len(text):
+        if text[j] in "([{":
+            depth += 1
+        elif text[j] in ")]}":
+            depth -= 1
+        elif depth == 0 and text.startswith("&&", j):
+            parts.append(text[start:j])
+            start = j + 2
+            j += 2
+            continue
+        j += 1
+    parts.append(text[start:])
+    flat: list[str] = []
+    for part in parts:
+        part = part.strip()
+        flat.extend(_conjuncts(part) if _wrapped(part) else [part])
+    return flat
 
 
 def _slots(text: str) -> list[str]:

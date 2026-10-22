@@ -2036,6 +2036,16 @@ def test_dockerfile_lint_env_inherited_from_an_in_file_parent_stage_takes_preced
     assert ids(lint(f"FROM alpine@{DIGEST} AS base\nFROM base\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
 
 
+def test_dockerfile_lint_unknown_env_value_is_not_known_empty_for_a_later_default():
+    # `${U:+root}` is a form the reader does not evaluate; Docker sets V to root here, so `${V:-1000}` must not fall back to 1000
+    unknown = lint(f"FROM alpine@{DIGEST}\nENV U=app\nENV V=${{U:+root}}\nUSER ${{V:-1000}}\nHEALTHCHECK CMD true\n")
+    assert ids(unknown) == ["docker.final-user-unresolved"] and unknown["verdict"] == "fail"
+    chained = lint(f"FROM alpine@{DIGEST}\nENV U=app\nENV V=${{U:+root}}\nENV W=${{V:-x}}\nUSER $W\nHEALTHCHECK CMD true\n")
+    assert ids(chained) == ["docker.final-user-unresolved"]
+    # a value that is known to be empty still takes the default, as Docker does
+    assert ids(lint(f"FROM alpine@{DIGEST}\nENV U=\nUSER ${{U:-1000}}\nHEALTHCHECK CMD true\n")) == []
+
+
 def test_bare_userinfo_with_an_empty_user_is_masked():
     a18 = importlib.import_module("swarm.tools.a18_tools")
     assert a18._echo_value(":hunter2@host") == "(value with an @, not echoed)"

@@ -345,6 +345,15 @@ def _ref_pinning(parsed: dict) -> str:
 _HEREDOC = re.compile(r"<<-?\s*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _VAR = re.compile(r"\$\{(\w+)(?::?-([^}]*))?\}|\$(\w+)")
 _UNSUPPORTED_VAR = re.compile(r"\$\{(?!\w+(?::?-[^}]*)?\})")
+
+
+class _Unknown(str):
+    """Marker for a build value this reader cannot evaluate. It compares equal to "" but is not a known empty value."""
+
+
+_UNKNOWN = _Unknown()
+
+
 _URL_CREDENTIALS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,20}://[^\s/:@]{1,200}:[^\s/@]{1,200}@")
 _SECRET_WORDS = {"PASSWORD", "PASSWD", "PASSPHRASE", "SECRET", "SECRETS", "TOKEN", "TOKENS", "CREDENTIAL", "CREDENTIALS", "APIKEY"}
 _SECRET_PAIRS = {("API", "KEY"), ("PRIVATE", "KEY"), ("ACCESS", "KEY"), ("SECRET", "KEY"), ("AUTH", "KEY")}
@@ -464,8 +473,12 @@ def _expand(text: str, variables: dict) -> tuple[str, bool]:
     def replace(match: re.Match) -> str:
         nonlocal resolved
         name = match.group(1) or match.group(3)
-        if name in variables and variables[name] != "":
-            return variables[name]
+        value = variables.get(name)
+        if value is _UNKNOWN:
+            resolved = False  # an unknown value stays unknown under `:-` too: Docker may or may not take the default
+            return match.group(0)
+        if value:
+            return value
         if match.group(2) is not None:
             return match.group(2)
         resolved = False
@@ -476,9 +489,9 @@ def _expand(text: str, variables: dict) -> tuple[str, bool]:
 
 def _resolved(value: str, variables: dict) -> str:
     """`value` with its `$NAME` and `${NAME}` read from `variables`, as Docker expands them at build time. A value that stays unresolved
-    becomes empty, so a later use of it is unresolved too, never a literal `$X`."""
+    becomes `_UNKNOWN`: a later use is unresolved too, even under a `:-` default, and never a literal `$X` or a known empty value."""
     expanded, resolved = _expand(value, variables)
-    return expanded if resolved else ""
+    return expanded if resolved else _UNKNOWN
 
 
 def _bind(variables: dict, name: str, value: str) -> None:

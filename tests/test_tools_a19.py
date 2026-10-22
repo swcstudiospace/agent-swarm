@@ -1294,6 +1294,19 @@ def test_schema_compat_oneof_target_must_stay_exclusive():
     assert compat(same, copy.deepcopy(same), "full")["findings"] == []  # an unchanged oneOf is not re-judged
 
 
+def test_schema_compat_unchanged_oneof_is_not_rejudged_when_draft_spellings_are_equivalent():
+    # "draft-07/schema#" and "draft-07/schema" name one draft, so an unchanged oneOf is the same schema and is not re-judged;
+    # genuinely different drafts keep the textual check and are still compared conservatively
+    number_or_integer = {"oneOf": [{"type": "number"}, {"type": "integer"}]}
+    base = {"$schema": "http://json-schema.org/draft-07/schema#", "properties": {"x": number_or_integer}}
+    head = {"$schema": "http://json-schema.org/draft-07/schema", "properties": {"x": copy.deepcopy(number_or_integer)}}
+    assert compat(base, head, "full")["findings"] == []
+    https = {**head, "$schema": "https://json-schema.org/draft-07/schema#"}
+    assert compat(base, https, "full")["findings"] == []
+    other_draft = {**head, "$schema": "http://json-schema.org/draft-04/schema#"}
+    assert compat(base, other_draft, "full")["findings"] != []
+
+
 def test_schema_compat_target_siblings_of_anyof_and_ref_still_apply():
     assert _backward(INT, {"type": "string", "anyOf": [{"minLength": 1}]})["backward_compatible"] is False
     defs = {"$schema": MODERN, "$defs": {"s": STR}}
