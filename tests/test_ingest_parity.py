@@ -138,37 +138,40 @@ def test_repeated_rework_creates_one_rerun_per_gate_lineage(tmp_path, swarm_dir)
     assert reruns().keys() == {"P-rev.r1", "P-rev.r2"}
 
 
-def test_rework_reruns_a_completed_scan_that_a_gate_reads_and_only_that_scan(tmp_path, swarm_dir):
-    """A scan that completed against the reworked target and that a gate reads holds a pre-rework result: the rework reruns it
-    once and the gate waits for the rerun. A scan that never ran, and a completed scan no gate reads, get no rerun."""
+def test_rework_reruns_every_completed_scan_of_the_target_and_its_consumers_wait(tmp_path, swarm_dir):
+    """Each completed scan of the reworked target reruns once. A gate that reads two of them waits for both reruns, a rollout
+    plan that reads one waits for its rerun, and a scan that never ran gets none."""
     from swarm.results import reconcile
     from swarm.taskstore import TaskStore, TaskState as S
 
     plan = [
         {"id": "gitops", "capability": "gitops.manifest", "agent": "A22"},
+        {"id": "netchk", "capability": "mesh.netpol", "agent": "A23", "depends_on": ["gitops"]},
         {"id": "polchk", "capability": "kpol.admission", "agent": "A24", "depends_on": ["gitops"]},
-        {"id": "orphan", "capability": "mesh.netpol", "agent": "A23", "depends_on": ["gitops"]},
+        {"id": "res", "capability": "resilience.backup", "agent": "A25", "depends_on": ["gitops"]},
+        {"id": "late", "capability": "mesh.netpol", "agent": "A23", "depends_on": ["gitops"]},
+        {"id": "roll", "capability": "gitops.rollout", "agent": "A22", "depends_on": ["netchk"]},
         {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["gitops"], "gates": {"gate": "review", "for": ["gitops"]}},
-        {"id": "sec", "capability": "gate.security", "agent": "A10", "depends_on": ["gitops", "polchk"],
+        {"id": "sec", "capability": "gate.security", "agent": "A10", "depends_on": ["gitops", "polchk", "res"],
          "gates": {"gate": "security", "for": ["gitops"]}},
     ]
     ts, swarm, work, corr = _setup(tmp_path, plan=plan, risk="low", targets=("P-gitops",), leased=("P-rev",))
     store = TaskStore(swarm / "tasks.db")
-    _lease(store, "P-orphan")
-    store.transition("P-orphan", S.IN_REVIEW)  # completed against the original gitops, but no gate reads it
-    _lease(store, "P-polchk")
-    store.transition("P-polchk", S.IN_REVIEW)  # completed against the original gitops, and sec reads it
+    for scan in ("P-netchk", "P-polchk", "P-res"):
+        _lease(store, scan)
+        store.transition(scan, S.IN_REVIEW)  # completed against the original gitops
     _rev_gate(swarm, work, corr, {"P-gitops": [{"severity": "major", "kind": "x", "summary": "rework"}]})
     assert _ingest(swarm, {"P-gitops": {"verdict": "request_changes", "findings": []}}, gate_id="P-rev").returncode == 0
 
     reconcile(store, corr, lambda *a, **k: None)
 
     tasks = {t["task_id"]: t for t in store.list(correlation_id=corr)}
-    assert "P-polchk.r1" in tasks and tasks["P-polchk.r1"]["state"] == S.PLANNED.value
-    assert "P-polchk.r2" not in tasks  # one rerun for this rework loop
-    assert "P-polchk.r1" in tasks["P-sec"]["depends_on"]  # the security gate waits for the fresh scan
-    assert "P-orphan.r1" not in tasks  # no gate reads it
-    assert not any(t.startswith("P-polchk.r") and t != "P-polchk.r1" for t in tasks)
+    for rerun in ("P-netchk.r1", "P-polchk.r1", "P-res.r1"):
+        assert tasks[rerun]["state"] == S.PLANNED.value
+    assert "P-late.r1" not in tasks  # never ran, so nothing is stale
+    assert {"P-polchk.r1", "P-res.r1"} <= set(tasks["P-sec"]["depends_on"])  # the gate waits for both reruns
+    assert "P-netchk.r1" in tasks["P-roll"]["depends_on"]  # the rollout plan reads netchk and waits for its rerun
+    assert not any(t.endswith(".r2") for t in tasks)
 
 
 def test_second_rework_reruns_the_latest_scan_member_without_a_duplicate_id(tmp_path, swarm_dir):

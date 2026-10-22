@@ -422,7 +422,7 @@ def _items_of(repo: Repo, kusts: dict, directory: str, memo: dict, active: froze
                     real = item["metadata"].get("name")
                     named = isinstance(real, str) and bool(real)
                     renamed = item["kind"] not in PREFIX_EXEMPT_KINDS
-                    namespace_object = bool(namespace) and named and item["apiVersion"] == "v1" and item["kind"] == "Namespace"  # kustomize's namespace transformer renames it
+                    namespace_object = bool(namespace) and item["apiVersion"] == "v1" and item["kind"] == "Namespace"  # kustomize's namespace transformer renames it
                     changes = bool((renamed and named and (prefix or suffix)) or (namespace and not cluster) or namespace_object)
                     if namespace_object:
                         new_name = namespace
