@@ -1225,6 +1225,8 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     expect(guardToolCall(bash("HARDHAT_NETWORK=localhost npx hardhat test; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
     // a substitution expands before the command's own prefix assignment: the inherited mainnet still reaches the run inside it
     expect(guardToolCall(bash('HARDHAT_NETWORK=localhost echo "$(hardhat run scripts/deploy.ts)"'), inherited)?.reason).toBe(CHAIN);
+    // the substitution sits inside a single-quoted -c body: the child shell expands it under its own localhost, the outer shell never does
+    expect(guardToolCall(bash("HARDHAT_NETWORK=localhost bash -c 'echo \"$(hardhat run scripts/deploy.ts)\"'"), inherited)).toBeUndefined();
   });
 
   test("a prefix on a command with no nested command does not persist: an inherited local network stays local for the next run", () => {

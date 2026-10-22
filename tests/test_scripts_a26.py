@@ -563,6 +563,12 @@ def test_a_require_that_tests_the_call_flag_in_any_boolean_form_is_a_check(condi
     assert [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == []
 
 
+@pytest.mark.parametrize("condition", ["(skipCheck || allowed && ok)"])
+def test_a_disjunction_in_a_require_does_not_test_the_call_flag(condition):
+    snippet = f'    function f(address t, bool skipCheck, bool allowed) external {{ emit E(); (bool ok, ) = t.call(""); require({condition}); }}'
+    assert [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == ["SOL-UNCHECKED-LOW-LEVEL-CALL"]
+
+
 @pytest.mark.parametrize("snippet, severity", [
     # reached from an unguarded public function: the callee runs for any caller
     ('    function execute(address t, bytes memory d) public { emit E(); _run(t, d); }\n'

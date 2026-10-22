@@ -1915,12 +1915,28 @@ def _wrapped(text: str) -> bool:
     return False
 
 
+def _top_level_or(text: str) -> bool:
+    """Whether `text` has a `||` outside every bracket: `a || b && c` is `a || (b && c)`, so no conjunct of it is required."""
+    depth = 0
+    for j, c in enumerate(text):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and text.startswith("||", j):
+            return True
+    return False
+
+
 def _conjuncts(text: str) -> list[str]:
     """The `&&` conjuncts of a condition, flattened: a parenthesised group is opened whether it encloses the whole condition or one
-    conjunct, so `((ok && x))` and `allowed && (ok && x)` both yield `ok` and `x`. A top-level `||` or `!` keeps its operand whole."""
+    conjunct, so `((ok && x))` and `allowed && (ok && x)` both yield `ok` and `x`. A top-level `||` or `!` keeps its operand whole,
+    and a group holding a top-level `||` is never split at `&&`: `(skipCheck || allowed && ok)` requires nothing."""
     text = text.strip()
     if _wrapped(text):
         return _conjuncts(text[1:-1])
+    if _top_level_or(text):
+        return [text]
     parts: list[str] = []
     depth, start, j = 0, 0, 0
     while j < len(text):
