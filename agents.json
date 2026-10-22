@@ -49334,7 +49334,7 @@
               },
               "control_plane_upgrade_safe": {
                 "type": "boolean",
-                "description": "True when moving the apiserver one minor up keeps every kubelet and kube-proxy inside the skew policy"
+                "description": "True when moving the apiserver one minor up keeps every kubelet, kube-proxy, control-plane component and kubectl inside the skew policy, and the apiserver spread within one minor"
               },
               "verdict": {
                 "type": "string",

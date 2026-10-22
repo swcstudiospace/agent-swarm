@@ -590,17 +590,10 @@ def helm_values_drift(payload: dict) -> dict:
                     else:
                         groups.append((value, [env]))
                 if len(groups) > 1:
-                    # A value is shown only when it is a boolean, number or null under a key that does not look like a secret; everything
-                    # else (strings, lists, maps, anything under password/token/key-like names) is named by type and group, never echoed.
-                    secretive = any(word in leaf.lower() for word in _SECRET_WORDS)
+                    # Values are never echoed, whatever the key name: each distinct value is named by its type and group, and a missing one as <unset>.
                     parts = []
                     for position, (value, holders) in enumerate(groups, 1):
-                        if value is missing:
-                            shown = "<unset>"
-                        elif not secretive and (value is None or isinstance(value, (bool, int, float))):
-                            shown = json.dumps(value)
-                        else:
-                            shown = f"<{_value_type(value)} #{position}>"
+                        shown = "<unset>" if value is missing else f"<{_value_type(value)} #{position}>"
                         parts.append(f"{', '.join(holders)}: {shown}")
                     findings.append(_finding(f"invariant-key-differs:{_redact(leaf)}", "major",
                                              f"{_redact(leaf)} must be identical in every environment but differs: {'; '.join(parts)}"))
@@ -1345,7 +1338,8 @@ def prune_risk(payload: dict) -> dict:
     """What a prune would delete. `pruned` are the live objects that are no longer in Git. Namespaces and CRDs cascade
     to everything inside them (blocker); PVCs lose data (blocker in production), StatefulSets whose
     persistentVolumeClaimRetentionPolicy.whenDeleted is Delete take their PVCs along; Secrets, access-control objects,
-    Crossplane managed resources (deletionPolicy Delete) and Argo CD Applications or ApplicationSets (their finalizer cascades to
+    Crossplane managed resources (upbound and crossplane groups) and any non-config object with deletionPolicy Delete in any API group
+    (claims, composites, other external-resource kinds) and Argo CD Applications or ApplicationSets (their finalizer cascades to
     the workloads) are flagged. `argocd.argoproj.io/sync-options: Prune=false` or the Flux annotation or label
     `kustomize.toolkit.fluxcd.io/prune: disabled` protects an object and Prune=confirm makes the sync wait for a human.
     Autonomy: non-production L2, production sync L3, production prune L4 (any unprotected object). An empty desired state with
@@ -1408,12 +1402,15 @@ def prune_risk(payload: dict) -> dict:
                 findings.append(_finding(f"prune-applicationset:{label}", "minor" if preserved else severity("blocker", "major"),
                                          f"pruning ApplicationSet {label} keeps the Applications it generated (preserveResourcesOnDeletion)" if preserved
                                          else f"pruning ApplicationSet {label} deletes every Application it generated and, through their finalizers, their workloads"))
-            elif group.endswith((".upbound.io", ".crossplane.io")) and group not in _CROSSPLANE_CONFIG_GROUPS:
+            # Crossplane-suffixed groups match regardless of deletionPolicy. The explicit deletionPolicy Delete rule applies to any non-config group.
+            elif group not in _CROSSPLANE_CONFIG_GROUPS and (group.endswith((".upbound.io", ".crossplane.io")) or spec.get("deletionPolicy") == "Delete"):
                 if spec.get("deletionPolicy") == "Orphan":
                     findings.append(_finding(f"prune-managed-orphan:{label}", "info", f"{label} is a managed resource with deletionPolicy Orphan: the external resource survives"))
                 else:
+                    crossplane = group.endswith((".upbound.io", ".crossplane.io"))
                     findings.append(_finding(f"prune-managed-resource:{label}", severity("blocker", "major"),
-                                             f"{label} is a Crossplane managed resource with deletionPolicy Delete: pruning deletes the external resource"))
+                                             f"{label} is a Crossplane resource with deletionPolicy Delete: pruning deletes the external resource it manages" if crossplane
+                                             else f"{label} has deletionPolicy Delete: pruning deletes the external resource it manages"))
         unprotected = len(pruned) - protected
         desired = payload["desired_count"]
         if desired == 0 and unprotected:

@@ -308,8 +308,18 @@ def test_helm_drift_reports_required_invariant_type_and_key_drift():
     assert result["verdict"] == "fail" and result["severity_counts"] == {"blocker": 0, "major": 7, "minor": 1, "info": 1}
     by_id = {f["id"]: f["summary"] for f in result["findings"]}
     assert by_id["invariant-key-differs:a.c"] == "a.c must be identical in every environment but differs: s: <string #1>; p: <unset>"
-    assert by_id["invariant-key-differs:a.b"] == "a.b must be identical in every environment but differs: s: 1; p: <string #2>"
+    assert by_id["invariant-key-differs:a.b"] == "a.b must be identical in every environment but differs: s: <number #1>; p: <string #2>"
     assert by_id["key-missing-in-env:p"] == "p lacks 1 key(s) set in s: a.c"
+
+
+def test_helm_drift_never_echoes_scalar_values_under_innocuous_keys():
+    result = hdrift([("staging", {"authCode": 482910, "debug": True, "opt": None}), ("prod", {"authCode": 482911, "debug": False, "opt": "x"})],
+                    invariant=["authCode", "debug", "opt"])
+    by_id = {f["id"]: f["summary"] for f in result["findings"]}
+    assert by_id["invariant-key-differs:authCode"] == "authCode must be identical in every environment but differs: staging: <number #1>; prod: <number #2>"
+    assert by_id["invariant-key-differs:debug"] == "debug must be identical in every environment but differs: staging: <boolean #1>; prod: <boolean #2>"
+    assert by_id["invariant-key-differs:opt"] == "opt must be identical in every environment but differs: staging: <null #1>; prod: <string #2>"
+    assert "482910" not in json.dumps(result) and "482911" not in json.dumps(result)
 
 
 def test_helm_drift_counts_diverging_values_of_the_same_type_without_findings():
@@ -885,6 +895,7 @@ def test_prune_of_nothing_needs_only_the_sync_level():
     ("ValidatingAdmissionPolicyBinding", "admissionregistration.k8s.io/v1", None, "major", "minor"),
     ("Bucket", "s3.aws.upbound.io/v1beta1", {}, "blocker", "major"),
     ("Cluster", "rds.aws.crossplane.io/v1alpha1", {"deletionPolicy": "Delete"}, "blocker", "major"),
+    ("PostgreSQL", "database.example.org/v1alpha1", {"deletionPolicy": "Delete"}, "blocker", "major"),
 ])
 def test_prune_severity_by_kind_and_environment(kind, api, spec, prod, nonprod):
     item = obj(kind, "x", api, spec=spec)
@@ -900,6 +911,16 @@ def test_prune_ignores_harmless_kinds_orphaned_cloud_resources_and_crossplane_co
     assert severities(orphan) == {"prune-managed-orphan:Bucket/app/b": "info"}
     assert prune([obj("Composition", "c", "apiextensions.crossplane.io/v1", spec={})], "prod")["findings"] == []
     assert prune([obj("Provider", "p", "pkg.crossplane.io/v1", spec={})], "prod")["findings"] == []
+
+
+def test_prune_flags_claims_in_user_defined_groups_only_for_deletion_delete():
+    claim = obj("PostgreSQL", "db", "database.example.org/v1alpha1", spec={"deletionPolicy": "Delete"})
+    assert severities(prune([claim], "prod")) == {"prune-managed-resource:PostgreSQL/app/db": "blocker"}
+    assert severities(prune([claim])) == {"prune-managed-resource:PostgreSQL/app/db": "major"}
+    kept = [obj("PostgreSQL", "db", "database.example.org/v1alpha1", spec={"deletionPolicy": "Orphan"}),
+            obj("PostgreSQL", "db2", "database.example.org/v1alpha1", spec={}),
+            obj("XNetwork", "n", "example.org/v1", spec={"deletionPolicy": "Orphan"})]
+    assert prune(kept, "prod")["findings"] == []
 
 
 def test_prune_protection_annotations():
@@ -1925,8 +1946,8 @@ def test_review_helm_drift_never_echoes_values_and_names_the_groups():
         "invariant-key-differs:auth.token_ttl": "auth.token_ttl must be identical in every environment but differs: staging: <number #1>; prod: <number #2>; qa: <unset>",
         "invariant-key-differs:db.host": "db.host must be identical in every environment but differs: staging, qa: <string #1>; prod: <string #2>",
         "invariant-key-differs:db.password": "db.password must be identical in every environment but differs: staging, qa: <string #1>; prod: <string #2>",
-        "invariant-key-differs:debug": "debug must be identical in every environment but differs: staging, qa: true; prod: false",
-        "invariant-key-differs:replicas": "replicas must be identical in every environment but differs: staging, qa: 2; prod: 4",
+        "invariant-key-differs:debug": "debug must be identical in every environment but differs: staging, qa: <boolean #1>; prod: <boolean #2>",
+        "invariant-key-differs:replicas": "replicas must be identical in every environment but differs: staging, qa: <number #1>; prod: <number #2>",
     }
     assert_no_canary(result)
 
