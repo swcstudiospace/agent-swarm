@@ -376,7 +376,8 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                 # pre-rework artifact too, so it joins its lineage; the consumers that have not finished wait for its rerun
                 lineages: dict[str, list[dict]] = {}
                 for g in store.list(correlation_id=corr):
-                    if tid in g["notes_json"].get("gate_for", []) or (not g["notes_json"].get("gate") and tid in g["depends_on"]):
+                    if tid in g["notes_json"].get("gate_for", []) or (not g["notes_json"].get("gate") and tid in g["depends_on"]
+                                                                      and not store.required_gates(g["task_id"])):
                         lineages.setdefault(RERUN_SUFFIX.sub("", g["task_id"]), []).append(g)
                 created: dict[str, tuple[str, set[str]]] = {}  # new rerun id → (its gate, its lineage's member ids)
                 for base, members in lineages.items():
@@ -394,14 +395,14 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                     store.transition(new_id, S.PLANNED, reason="gate rerun")
                     created[new_id] = (g["notes_json"].get("gate"), {m["task_id"] for m in members})
                 # once every rerun of this rework exists: downstream of any lineage member waits for that lineage's
-                # rerun, and a release-gate rerun (it reads the other gates' verdicts) waits for the other reruns
+                # rerun, and a release-gate rerun (it reads the other gates' verdicts) waits for the other gate reruns
                 for d in store.list(correlation_id=corr):
                     if d["state"] == S.DONE.value:
                         continue
                     release_rerun = created.get(d["task_id"], ("", set()))[0] == "release"
                     extra = [nid for nid, (gate, mids) in created.items()
                              if nid != d["task_id"] and nid not in d["depends_on"]
-                             and (mids.intersection(d["depends_on"]) or (release_rerun and gate != "release"))]
+                             and (mids.intersection(d["depends_on"]) or (release_rerun and gate and gate != "release"))]
                     if extra:
                         store.update(d["task_id"], depends_on=d["depends_on"] + extra)
             continue
