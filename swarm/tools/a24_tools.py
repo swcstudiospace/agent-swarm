@@ -91,12 +91,31 @@ def _public(text: str) -> str:
 
 _BOOLEAN_SETTINGS = frozenset({"automountserviceaccounttoken"})  # keys whose false, true or null value is a setting, not a secret
 _NOT_SECRET_VALUES = frozenset({"true", "false", "null", "none", "nil"})
-_KEY_BEFORE_VALUE = re.compile(r"([A-Za-z0-9_.-]+)[\"']?\s*[:=]\s*[\"']?$")
+_KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+_MAX_KEY = 128  # a longer key is not a known boolean setting
+
+
+def _key_before_value(text: str, start: int) -> str:
+    """The key of the `key: value` or `key=value` pair whose value starts at `start`, lower-cased; "" when there is none or the
+    key is longer than _MAX_KEY. One backward pass, so the cost is bounded by the prefix length (no regex rescans it)."""
+    i = start
+    while i > 0 and text[i - 1] in " \t\"'":
+        i -= 1
+    if i == 0 or text[i - 1] not in ":=":
+        return ""
+    i -= 1
+    while i > 0 and text[i - 1] in " \t\"'":
+        i -= 1
+    end = i
+    while i > 0 and end - i < _MAX_KEY and text[i - 1] in _KEY_CHARS:
+        i -= 1
+    if i == end or (end - i == _MAX_KEY and i > 0 and text[i - 1] in _KEY_CHARS):
+        return ""
+    return text[i:end].lower()
 
 
 def _is_boolean_setting(text: str, start: int, end: int) -> bool:
-    key = _KEY_BEFORE_VALUE.search(text[:start])
-    return text[start:end].lower() in _NOT_SECRET_VALUES and key is not None and key.group(1).lower() in _BOOLEAN_SETTINGS
+    return text[start:end].lower() in _NOT_SECRET_VALUES and _key_before_value(text, start) in _BOOLEAN_SETTINGS
 
 
 def _finding(rule: str, severity: str, location: str, summary: str) -> dict:
