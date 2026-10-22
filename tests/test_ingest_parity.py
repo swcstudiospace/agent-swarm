@@ -171,6 +171,43 @@ def test_rework_reruns_a_completed_scan_that_a_gate_reads_and_only_that_scan(tmp
     assert not any(t.startswith("P-polchk.r") and t != "P-polchk.r1" for t in tasks)
 
 
+def test_second_rework_reruns_the_latest_scan_member_without_a_duplicate_id(tmp_path, swarm_dir):
+    """A second rework reruns the newest completed scan rerun (<scan>.r2), never the original again: re-creating <scan>.r1
+    raised a duplicate-id integrity error and crashed the ingest."""
+    from swarm.results import reconcile
+    from swarm.taskstore import TaskStore, TaskState as S
+
+    plan = [
+        {"id": "gitops", "capability": "gitops.manifest", "agent": "A22"},
+        {"id": "polchk", "capability": "kpol.admission", "agent": "A24", "depends_on": ["gitops"]},
+        {"id": "rev", "capability": "gate.review", "agent": "A09", "depends_on": ["gitops"], "gates": {"gate": "review", "for": ["gitops"]}},
+        {"id": "sec", "capability": "gate.security", "agent": "A10", "depends_on": ["gitops", "polchk"],
+         "gates": {"gate": "security", "for": ["gitops"]}},
+    ]
+    ts, swarm, work, corr = _setup(tmp_path, plan=plan, risk="low", targets=("P-gitops",), leased=("P-rev",))
+    store = TaskStore(swarm / "tasks.db")
+    _lease(store, "P-polchk")
+    store.transition("P-polchk", S.IN_REVIEW)
+
+    def rework(gate_id, n):
+        if store.get(gate_id)["state"] == S.PLANNED.value:
+            _lease(store, gate_id)
+        _rev_gate(swarm, work, corr, {"P-gitops": [{"severity": "major", "kind": "x", "summary": f"rework {n}"}]}, gate_id=gate_id)
+        assert _ingest(swarm, {"P-gitops": {"verdict": "request_changes", "findings": []}}, gate_id=gate_id).returncode == 0
+        reconcile(store, corr, lambda *a, **k: None)
+
+    rework("P-rev", 1)
+    _lease(store, "P-polchk.r1")  # the first rerun completes against the reworked gitops
+    store.transition("P-polchk.r1", S.IN_REVIEW)
+    store.transition("P-gitops", S.IN_REVIEW) if store.get("P-gitops")["state"] != S.IN_REVIEW.value else None
+    rework("P-rev.r1", 2)
+
+    tasks = {t["task_id"]: t for t in store.list(correlation_id=corr)}
+    assert "P-polchk.r2" in tasks and tasks["P-polchk.r2"]["state"] == S.PLANNED.value
+    assert "P-polchk.r2" in tasks["P-sec"]["depends_on"]  # the security gate waits on the newest rerun
+    assert not any(t.startswith("P-polchk.r") and t not in ("P-polchk.r1", "P-polchk.r2") for t in tasks)
+
+
 def test_consistent_pass_done(tmp_path, swarm_dir):
     ts, swarm, work, corr = _setup(tmp_path)
     _rev_gate(swarm, work, corr, {"P-be": []})

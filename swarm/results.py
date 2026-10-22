@@ -407,12 +407,21 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                 # (cluster netchk/polchk feed roll/sec). One rerun per scan; a scan that has not finished has nothing stale.
                 all_tasks = store.list(correlation_id=corr)
                 gate_reads = {dep for g in all_tasks if g["notes_json"].get("gate") for dep in g["depends_on"]}
+                # one rerun per scan lineage (<base>, <base>.r1, ...), cloned from its latest member: an earlier member is
+                # superseded, so a second rework reruns the newest completed rerun, never the original again (that id exists)
+                scan_lineages: dict[str, list[dict]] = {}
                 for scan in all_tasks:
-                    sid = scan["task_id"]
-                    if (scan["notes_json"].get("gate") or tid not in scan["depends_on"] or sid not in gate_reads
-                            or scan["state"] not in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value)):
+                    if scan["notes_json"].get("gate") or scan["task_id"] not in gate_reads:
                         continue
-                    new_id = f"{sid}.r{_rerun_index(scan) + 1}"
+                    scan_lineages.setdefault(RERUN_SUFFIX.sub("", scan["task_id"]), []).append(scan)
+                for base, members in scan_lineages.items():
+                    scan = max(members, key=_rerun_index)
+                    sid = scan["task_id"]
+                    if (tid not in scan["depends_on"] or scan["state"] not in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value)):
+                        continue
+                    new_id = f"{base}.r{_rerun_index(scan) + 1}"
+                    if any(t["task_id"] == new_id for t in all_tasks):
+                        continue
                     store.create(task_id=new_id, correlation_id=corr, capability=scan["capability"],
                                  title=scan["title"].removesuffix(" (rerun)") + " (rerun)", agent_id=scan["agent_id"],
                                  dag_depth=scan["dag_depth"], depends_on=scan["depends_on"], acceptance=scan["acceptance"],
