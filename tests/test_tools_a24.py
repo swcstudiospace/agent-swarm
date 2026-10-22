@@ -2236,11 +2236,15 @@ def test_public_masks_a_password_whose_key_and_value_are_separate_words():  # th
     assert "hunter2" not in a24_tools._public("binding subject password: hunter2")
 
 
-def test_public_keeps_a_boolean_key_value_phrase_and_still_masks_a_secret_beside_it():
+def test_public_keeps_only_a_known_boolean_setting_and_masks_a_boolean_looking_secret():  # thread: exception limited to known settings
     from swarm.tools import a24_tools
 
     assert a24_tools._public("automountServiceAccountToken: false") == "automountServiceAccountToken: false"
-    assert a24_tools._public("automount: false and password: hunter2") == "automount: false and password: [REDACTED]"
+    assert a24_tools._public("automountServiceAccountToken: false and password: hunter2") == (
+        "automountServiceAccountToken: false and password: [REDACTED]")
+    assert a24_tools._public("password=false") == "password=[REDACTED]"
+    assert a24_tools._public("password: true") == "password: [REDACTED]"
+    assert a24_tools._public("accessToken: null") == "accessToken: [REDACTED]"
 
 
 def test_a_credential_pasted_into_a_role_name_is_masked_in_the_finding_id_and_summary():  # thread: _finding copies manifest names

@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -151,6 +152,8 @@ def load_custom(path: Path) -> list[tuple]:
     data = json.loads(path.read_text())
     rows = []
     for t in data["tasks"]:
+        if re.search(r"\.r\d+$", str(t["id"])):  # rework reruns take <task>.rN; a planned task must not claim that name
+            raise SwarmError(ErrorCode.E_INPUT, f"task id {t['id']!r} ends in .rN, which rework reruns use; rename the task")
         agent = t.get("agent")
         if not agent:
             cands = by_capability(t["capability"])

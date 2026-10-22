@@ -139,8 +139,8 @@ def test_repeated_rework_creates_one_rerun_per_gate_lineage(tmp_path, swarm_dir)
 
 
 def test_rework_reruns_every_completed_scan_of_the_target_and_its_consumers_wait(tmp_path, swarm_dir):
-    """Each completed scan of the reworked target reruns once. A gate that reads two of them waits for both reruns, a rollout
-    plan that reads one waits for its rerun, and a scan that never ran gets none."""
+    """Each scan of the reworked target that finished or is still running reruns once. A gate that reads two of them waits for
+    both reruns, a rollout plan that reads one waits for its rerun, and a scan that never ran gets none."""
     from swarm.results import reconcile
     from swarm.taskstore import TaskStore, TaskState as S
 
@@ -157,9 +157,10 @@ def test_rework_reruns_every_completed_scan_of_the_target_and_its_consumers_wait
     ]
     ts, swarm, work, corr = _setup(tmp_path, plan=plan, risk="low", targets=("P-gitops",), leased=("P-rev",))
     store = TaskStore(swarm / "tasks.db")
-    for scan in ("P-netchk", "P-polchk", "P-res"):
+    for scan in ("P-netchk", "P-polchk"):
         _lease(store, scan)
         store.transition(scan, S.IN_REVIEW)  # completed against the original gitops
+    _lease(store, "P-res")  # still running against the original gitops: it reruns too
     _rev_gate(swarm, work, corr, {"P-gitops": [{"severity": "major", "kind": "x", "summary": "rework"}]})
     assert _ingest(swarm, {"P-gitops": {"verdict": "request_changes", "findings": []}}, gate_id="P-rev").returncode == 0
 

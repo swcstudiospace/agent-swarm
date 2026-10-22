@@ -73,13 +73,14 @@ def _dec(value) -> Decimal:
 def _public(text: str) -> str:
     """`text` with credentials replaced by swarm.redact's `[REDACTED]`. A string with no credential comes back unchanged.
     The credential spans are taken from the whole string, so a secret whose key and value are separate words (`password: hunter2`)
-    is masked. A bare boolean or null value (`automountServiceAccountToken: false`) is not a secret and is left as written."""
+    is masked. A false, true or null value is left as written only under a known boolean setting (`automountServiceAccountToken:
+    false`); under any other key a boolean-looking value is still a credential (`password=false` is masked)."""
     if redact_text(text) == text:
         return text
     masked_text = []
     last = 0
     for start, end in redact_spans(text):
-        if text[start:end].lower() in _NOT_SECRET_VALUES:
+        if _is_boolean_setting(text, start, end):
             continue
         masked_text.append(text[last:start])
         masked_text.append(REDACTED)
@@ -88,7 +89,14 @@ def _public(text: str) -> str:
     return "".join(masked_text)
 
 
+_BOOLEAN_SETTINGS = frozenset({"automountserviceaccounttoken"})  # keys whose false, true or null value is a setting, not a secret
 _NOT_SECRET_VALUES = frozenset({"true", "false", "null", "none", "nil"})
+_KEY_BEFORE_VALUE = re.compile(r"([A-Za-z0-9_.-]+)[\"']?\s*[:=]\s*[\"']?$")
+
+
+def _is_boolean_setting(text: str, start: int, end: int) -> bool:
+    key = _KEY_BEFORE_VALUE.search(text[:start])
+    return text[start:end].lower() in _NOT_SECRET_VALUES and key is not None and key.group(1).lower() in _BOOLEAN_SETTINGS
 
 
 def _finding(rule: str, severity: str, location: str, summary: str) -> dict:
