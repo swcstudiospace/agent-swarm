@@ -761,29 +761,6 @@ const CUT_TOKEN = /\u0001([\uE000-\uF8FF])/g;
 const MAX_CUTS = 4096;
 
 /**
- * The cuts `text` holds inside single quotes: the shell reading `text` never expands them. Empty when a quote is left
- * open, so every cut stays the outer command's (fail closed).
- */
-function singleQuotedCuts(text: string): Set<number> {
-  if (!text.includes(CUT)) return new Set();
-  const out = new Set<number>();
-  let quote: string | undefined;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === CUT && /[\uE000-\uF8FF]/.test(text[i + 1] ?? "")) {
-      if (quote === "'") out.add(text.charCodeAt(i + 1) - 0xe000);
-      i++;
-    } else if (quote === "'") {
-      if (c === "'") quote = undefined;
-    } else if (c === "\\") i++;
-    else if (quote === '"') {
-      if (c === '"') quote = undefined;
-    } else if (c === "'" || c === '"') quote = c;
-  }
-  return quote === undefined ? out : new Set();
-}
-
-/**
  * Normalize `command` (see normalize). A `$(…)`/backtick substitution is cut out into `cuts` and leaves CUT plus the
  * index of its body in its place; the body becomes a payload (a subshell) of the piece that holds it, so it runs in
  * the directory of that piece and a `cd` inside it moves nothing outside. A body whose place no piece holds (a
@@ -802,12 +779,12 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
   }
   const items: Normalized[] = [];
   const attached = new Set<number>();
-  /** The bodies of the substitutions `text` holds, normalized, as payload of `item`; an `exempt` cut is no payload. */
-  const attach = (item: Normalized, text: string, exempt: Set<number>) => {
+  /** The bodies of the substitutions `text` holds, normalized, as payload of `item`. */
+  const attach = (item: Normalized, text: string) => {
     for (const m of text.matchAll(CUT_TOKEN)) {
       const n = m[1].charCodeAt(0) - 0xe000;
       attached.add(n);
-      if (n < cuts.length && !exempt.has(n)) {
+      if (n < cuts.length) {
         item.payload.push(...normalizeSegments(cuts[n], depth, cuts).map((sub) => ({ ...sub, substitution: true })));
       }
     }
@@ -834,15 +811,12 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     // `sudo -e FILE` edits FILE
     if (info?.edit === true && seg !== "") seg = `sudoedit ${seg}`;
     let payload: Normalized[] = [];
-    // the cuts a literal `-c` line holds (filled below), which the child shell normalizes itself
-    const childCuts = new Set<number>();
     if (seg !== "" && depth < MAX_LITERAL_DEPTH) {
       const shellLines = shellDashC(shellWords(seg));
       if (shellLines !== undefined) {
         // a literal `-c` body runs with the shell's stdin: the pipe, and `< file` / `0<file` (not `bash -c "$VAR"`)
         const suffix = stdinFileSuffix(`${prefix} ${seg}`);
         for (const line of shellLines) {
-          for (const m of line.matchAll(CUT_TOKEN)) childCuts.add(m[1].charCodeAt(0) - 0xe000);
           if (!literalShellLine(line)) {
             payload.push(...normalizeSegments(line, depth + 1, cuts));
             continue;
@@ -857,13 +831,11 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
       if (joined !== undefined) payload.push(...normalizeSegments(joined, depth + 1, cuts));
       if (/^(?:\S*\/)?find\s/.test(seg)) payload.push(...findCommands(seg, depth, cuts));
     }
-    // a cut in single quotes that a literal `-c` line of this command hands to its child shell: that child normalizes the line itself
-    const exempt = new Set([...singleQuotedCuts(seg)].filter((n) => childCuts.has(n)));
     const runtime = info?.runtime;
     if (runtime !== undefined) payload = withReplace(payload, runtime.replace);
     const opaque = /(?:^|\s)(?:\u0001[\uE000-\uF8FF])+(?:\s|$)/.test(prefix);
     const item: Normalized = { text: seg, end: piece.end, chdirs: info?.chdirs ?? [], prefixed: at > 0, compound, payload, runtime, prefix, opaque, piped: pipeIn };
-    attach(item, `${prefix} ${seg} ${piece.body ?? ""}`, exempt);
+    attach(item, `${prefix} ${seg} ${piece.body ?? ""}`);
     items.push(item);
     pipeIn = piece.end === "|" || (pipeIn && seg === "" && (piece.end === "(" || piece.end === "{"));
   }
