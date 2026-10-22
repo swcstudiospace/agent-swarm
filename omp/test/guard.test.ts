@@ -1223,6 +1223,13 @@ describe("HOOK-02 v2.3 lanes: cluster tooling and chain rows", () => {
     // the run's own prefix is its network; a bare run after a local one still inherits mainnet
     expect(guardToolCall(bash("HARDHAT_NETWORK=localhost npx hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
     expect(guardToolCall(bash("HARDHAT_NETWORK=localhost npx hardhat test; hardhat run scripts/deploy.ts"), inherited)?.reason).toBe(CHAIN);
+    // a substitution expands before the command's own prefix assignment: the inherited mainnet still reaches the run inside it
+    expect(guardToolCall(bash('HARDHAT_NETWORK=localhost echo "$(hardhat run scripts/deploy.ts)"'), inherited)?.reason).toBe(CHAIN);
+  });
+
+  test("a prefix on a command with no nested command does not persist: an inherited local network stays local for the next run", () => {
+    const inherited = { ...insideAs(A26), env: { HARDHAT_NETWORK: "localhost" } };
+    expect(guardToolCall(bash("HARDHAT_NETWORK=mainnet true; hardhat run scripts/deploy.ts"), inherited)).toBeUndefined();
   });
 
   test("a bare hardhat run with a local or no environment network behaves as before", () => {

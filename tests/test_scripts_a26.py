@@ -557,6 +557,12 @@ def test_a_bound_low_level_result_must_be_read(snippet, flagged):
     assert bool([r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"]) is flagged
 
 
+@pytest.mark.parametrize("condition", ["(ok && allowed)", "((ok && allowed))", "allowed && (ok && allowed)", "ok != false", "ok == true"])
+def test_a_require_that_tests_the_call_flag_in_any_boolean_form_is_a_check(condition):
+    snippet = f'    function f(address t, bool allowed) external {{ emit E(); (bool ok, ) = t.call(""); require({condition}); }}'
+    assert [r for r, _, _ in findings(body(snippet)) if r == "SOL-UNCHECKED-LOW-LEVEL-CALL"] == []
+
+
 @pytest.mark.parametrize("snippet, severity", [
     # reached from an unguarded public function: the callee runs for any caller
     ('    function execute(address t, bytes memory d) public { emit E(); _run(t, d); }\n'
@@ -831,6 +837,14 @@ def test_an_inherited_overload_stays_callable_and_only_an_override_hides_its_bas
                                           "    function run(address a) external { x = 1; _log(a); }\n}\n")
     missing = [rule for rule, _, _ in findings(text) if rule == "SOL-MISSING-EVENT"]
     assert bool(missing) is (not emits)
+
+
+def test_linearization_merges_the_parents_last_written_first_as_solidity_does():
+    module = load_module()
+    contracts = module.parse_source("pragma solidity 0.8.28;\n"
+                                    "contract X {}\ncontract Y {}\ncontract P is X {}\ncontract Q is Y {}\ncontract C is P, Q {}\n")
+    by_name = {c["name"]: c for c in contracts}
+    assert module._linearization(by_name["C"], by_name) == ["C", "Q", "Y", "P", "X"]
 
 
 def test_a_function_type_parameter_is_not_a_visibility_of_a_free_function():

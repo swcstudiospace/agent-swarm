@@ -724,6 +724,8 @@ interface Normalized {
   opaque: boolean;
   /** Its stdin is a pipe: the piece before it ended in `|`/`|&`. */
   piped: boolean;
+  /** A top-level item of a `$(…)`/backtick body in `payload`: it expands before the command's own prefix assignment takes effect. */
+  substitution?: boolean;
 }
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
@@ -782,7 +784,9 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     for (const m of text.matchAll(CUT_TOKEN)) {
       const n = m[1].charCodeAt(0) - 0xe000;
       attached.add(n);
-      if (n < cuts.length) item.payload.push(...normalizeSegments(cuts[n], depth, cuts));
+      if (n < cuts.length) {
+        item.payload.push(...normalizeSegments(cuts[n], depth, cuts).map((sub) => ({ ...sub, substitution: true })));
+      }
     }
   };
   // stdin of the current piece is a pipe: the previous piece ended in `|`/`|&` (a `(`/`{` opener in between keeps it)
@@ -2721,14 +2725,18 @@ function scanNetwork(
     if (item.compound === "loop") {
       state.possible = [...new Set([...state.possible, ...collectWrites(items.slice(i, compoundEnd(items, i) + 1))])];
     }
-    // a child shell (`bash -c`, `sh -c`) inherits the HARDHAT_NETWORK its own prefix assigns, not the parent's state; its writes never persist, so only merge them back conservatively
+    // a substitution expands before the command's own prefix assignment takes effect, so it sees the state the command starts from
+    scanNetwork(
+      item.payload.filter((sub) => sub.substitution === true),
+      state,
+      out,
+      true,
+    );
+    // a child shell (`bash -c`, `sh -c`) inherits the HARDHAT_NETWORK its own prefix assigns, not the parent's state; that value and
+    // the child's writes never persist past the command, so the child is scanned on its own state and nothing merges back
     const own = prefixNetwork(item.prefix);
-    if (own === undefined) scanNetwork(item.payload, state, out, true);
-    else {
-      const child = { possible: [own || undefined], unknownWriter: state.unknownWriter };
-      scanNetwork(item.payload, child, out, true);
-      state.possible = [...new Set([...state.possible, ...child.possible])];
-    }
+    const inherited = item.payload.filter((sub) => sub.substitution !== true);
+    scanNetwork(inherited, own === undefined ? state : { possible: [own || undefined], unknownWriter: state.unknownWriter }, out, true);
     const marked = `${item.prefix} ${item.text}`;
     const seen = prev === "&&" && succeeded !== undefined ? succeeded : state.possible;
     const nonLocal = seen.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));

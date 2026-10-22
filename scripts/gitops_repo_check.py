@@ -576,33 +576,39 @@ def _in_namespace(doc: dict, namespace: str) -> dict:
     return {**doc, "metadata": {**doc["metadata"], "namespace": namespace}}
 
 
-def _tree_files(repo: Repo, kusts: dict, directory: str, seen: set, fields: tuple = DIRECTORY_FIELDS) -> list[tuple[str, str]]:
+def _tree_files(repo: Repo, kusts: dict, directory: str, fields: tuple = DIRECTORY_FIELDS) -> list[tuple[str, str]]:
     """(file, namespace) of the objects that belong to the Kustomize tree rooted at directory, in the order a depth-first walk meets them.
     namespace is the one kustomize leaves on the object: that of the outermost kustomization on the walk which sets one, "" when none does.
-    Components are part of the tree, so their objects are ordered with the objects that use them. Iterative, so a long chain of
-    kustomizations cannot exhaust the interpreter's recursion limit."""
-    if directory in seen:
-        return []
+    A kustomization reached again under a different namespace is walked again, so a base shared by two namespaced overlays renders its
+    objects into each namespace. Visits are memoised by (directory, namespace), which bounds the walk; a reference back to a kustomization
+    on the current walk is a cycle and is not followed. Components are part of the tree, so their objects are ordered with the objects that
+    use them. Iterative, so a long chain of kustomizations cannot exhaust the interpreter's recursion limit."""
     files: list[tuple[str, str]] = []
+    visited: set[tuple[str, str]] = set()
+    on_walk: set[str] = set()
     end = object()
 
-    def enter(node: str, outer: str):
-        seen.add(node)
-        kust = kusts[node][1]
-        own = kust.get("namespace")
-        space = outer or (own if isinstance(own, str) else "")
-        files.append((kusts[node][0], space))
-        return space, iter([None if _remote(entry) else _join(node, entry) for field in fields for entry in _strings(kust.get(field))])
+    def namespace_under(node: str, outer: str) -> str:
+        own = kusts[node][1].get("namespace")
+        return outer or (own if isinstance(own, str) else "")
 
-    stack = [enter(directory, "")]
+    def enter(node: str, space: str):
+        visited.add((node, space))
+        on_walk.add(node)
+        files.append((kusts[node][0], space))
+        return node, space, iter([None if _remote(entry) else _join(node, entry) for field in fields for entry in _strings(kusts[node][1].get(field))])
+
+    stack = [enter(directory, namespace_under(directory, ""))]
     while stack:
-        space, targets = stack[-1]
+        node, space, targets = stack[-1]
         target = next(targets, end)
         if target is end:
             stack.pop()
+            on_walk.discard(node)
         elif target in kusts:
-            if target not in seen:
-                stack.append(enter(target, space))
+            child_space = namespace_under(target, space)
+            if target not in on_walk and (target, child_space) not in visited:
+                stack.append(enter(target, child_space))
         elif target in repo.docs:
             files.append((target, space))
     return files
@@ -614,7 +620,7 @@ def _check_waves(repo: Repo, kusts: dict) -> None:
     covered: set[str] = set()
     for directory in sorted(kusts):
         if directory not in referenced:
-            files = _tree_files(repo, kusts, directory, set())
+            files = _tree_files(repo, kusts, directory)
             covered.update(rel for rel, _ in files)
             units.append((kusts[directory][0], files))
     loose: dict[str, list[str]] = {}
