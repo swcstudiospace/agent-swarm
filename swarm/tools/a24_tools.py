@@ -29,7 +29,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
-from swarm.redact import REDACTED, redact_text
+from swarm.redact import REDACTED, redact_spans, redact_text
 from swarm.tools.support import respond
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
@@ -72,19 +72,23 @@ def _dec(value) -> Decimal:
 
 def _public(text: str) -> str:
     """`text` with credentials replaced by swarm.redact's `[REDACTED]`. A string with no credential comes back unchanged.
-    Otherwise each word is checked alone, as before. A word after an authentication scheme (`Bearer <token>`, `Basic <token>`)
-    is checked together with the scheme: when the pair is a credential, that second word is masked and the scheme is kept.
-    No other pair is joined, so a key-value phrase such as `automountServiceAccountToken: false` is not cut at its colon."""
+    The credential spans are taken from the whole string, so a secret whose key and value are separate words (`password: hunter2`)
+    is masked. A bare boolean or null value (`automountServiceAccountToken: false`) is not a secret and is left as written."""
     if redact_text(text) == text:
         return text
-    parts = re.split(r"(\s+)", text)
-    words = parts[0::2]
-    masked = [False] * len(words)
-    for k in range(len(words) - 1):
-        pair = f"{words[k]} {words[k + 1]}"
-        if words[k].lower() in ("bearer", "basic") and redact_text(pair) != pair:
-            masked[k + 1] = True
-    return "".join((REDACTED if masked[i // 2] else redact_text(part)) if i % 2 == 0 else part for i, part in enumerate(parts))
+    masked_text = []
+    last = 0
+    for start, end in redact_spans(text):
+        if text[start:end].lower() in _NOT_SECRET_VALUES:
+            continue
+        masked_text.append(text[last:start])
+        masked_text.append(REDACTED)
+        last = end
+    masked_text.append(text[last:])
+    return "".join(masked_text)
+
+
+_NOT_SECRET_VALUES = frozenset({"true", "false", "null", "none", "nil"})
 
 
 def _finding(rule: str, severity: str, location: str, summary: str) -> dict:

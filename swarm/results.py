@@ -402,6 +402,27 @@ def reconcile(store: TaskStore, corr: str, emit: Emit, leases=None, handoffs=Non
                              and (mids.intersection(d["depends_on"]) or (release_rerun and gate != "release"))]
                     if extra:
                         store.update(d["task_id"], depends_on=d["depends_on"] + extra)
+                # a scan (a non-gate task) that completed against the reworked target and that a gate reads holds a result
+                # from the pre-rework artifact: rerun it the same way, so the gate that reads it waits for the fresh result
+                # (cluster netchk/polchk feed roll/sec). One rerun per scan; a scan that has not finished has nothing stale.
+                all_tasks = store.list(correlation_id=corr)
+                gate_reads = {dep for g in all_tasks if g["notes_json"].get("gate") for dep in g["depends_on"]}
+                for scan in all_tasks:
+                    sid = scan["task_id"]
+                    if (scan["notes_json"].get("gate") or tid not in scan["depends_on"] or sid not in gate_reads
+                            or scan["state"] not in (S.DONE.value, S.IN_REVIEW.value, S.APPROVED.value)):
+                        continue
+                    new_id = f"{sid}.r{_rerun_index(scan) + 1}"
+                    store.create(task_id=new_id, correlation_id=corr, capability=scan["capability"],
+                                 title=scan["title"].removesuffix(" (rerun)") + " (rerun)", agent_id=scan["agent_id"],
+                                 dag_depth=scan["dag_depth"], depends_on=scan["depends_on"], acceptance=scan["acceptance"],
+                                 budget=scan["budget"], risk_class=scan["risk_class"], priority=scan["priority"],
+                                 notes={k: v for k, v in scan["notes_json"].items() if k not in ("result", "meta")})
+                    store.transition(new_id, S.VALIDATED)
+                    store.transition(new_id, S.PLANNED, reason="scan rerun after rework")
+                    for reader in all_tasks:
+                        if reader["notes_json"].get("gate") and sid in reader["depends_on"] and new_id not in reader["depends_on"]:
+                            store.update(reader["task_id"], depends_on=reader["depends_on"] + [new_id])
             continue
         # CR-01: a leased (CLAIMED/IN_PROGRESS) gate task of a required gate for this target has no accepted result
         # yet, or its result was refused (review verdict mismatch): a row it recorded may be contradicted, so hold

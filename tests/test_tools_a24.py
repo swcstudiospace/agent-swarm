@@ -2227,6 +2227,22 @@ def test_aggregation_graph_over_the_step_budget_is_refused_with_its_reason():
     assert "the aggregation graph is too large" in refused["message"]
 
 
+def test_public_masks_a_password_whose_key_and_value_are_separate_words():  # thread: whole-string spans, not per-word checks
+    from swarm.tools import a24_tools
+
+    assert a24_tools._public("password: hunter2") == "password: [REDACTED]"
+    assert a24_tools._public("user password: hunter2 end") == "user password: [REDACTED] end"
+    assert a24_tools._public("password=hunter2") == "password=[REDACTED]"
+    assert "hunter2" not in a24_tools._public("binding subject password: hunter2")
+
+
+def test_public_keeps_a_boolean_key_value_phrase_and_still_masks_a_secret_beside_it():
+    from swarm.tools import a24_tools
+
+    assert a24_tools._public("automountServiceAccountToken: false") == "automountServiceAccountToken: false"
+    assert a24_tools._public("automount: false and password: hunter2") == "automount: false and password: [REDACTED]"
+
+
 def test_a_credential_pasted_into_a_role_name_is_masked_in_the_finding_id_and_summary():  # thread: _finding copies manifest names
     token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
     result = scan([role(token, [rule(["*"], ["*"], ("*",))])])
