@@ -1041,6 +1041,8 @@ def test_sa_dedicated_account_still_mounting_a_token_is_minor():
     assert rules_of(result) == [("sa.automount-enabled", "minor")] and result["verdict"] == "pass"
     legacy = sa_audit([pod(serviceAccount="builder")])
     assert rules_of(legacy) == [("sa.automount-enabled", "minor")]
+    summaries = [f["summary"] for f in sa_audit([pod(serviceAccountName="builder")])["findings"] if f["id"].startswith("sa.automount-enabled")]
+    assert summaries and all("automountServiceAccountToken: false" in s and "[REDACTED]" not in s for s in summaries)
 
 
 def test_sa_automount_precedence_pod_then_service_account_then_default_true():
@@ -1216,6 +1218,13 @@ def test_falco_append_and_override_fragments_do_not_need_the_full_rule():
     assert falco([frule(), {"rule": "Shell in container", "append": True, "condition": "and not proc.pname = ci"}])["finding_count"] == 0
     assert falco([frule(), {"rule": "Shell in container", "override": {"condition": "append"}, "condition": "and x"}])["finding_count"] == 0
     assert rule_ids(falco([{"rule": "Lonely", "condition": "evt.type = open"}])) == {"falco.missing-field"}
+
+
+def test_falco_bearer_token_after_a_space_is_masked_in_finding_id():
+    token = "q8Lk2mPz9Rt4VbXw7Yn3Hc6Jd1Fg5Sa"  # opaque: no JWT shape, so only the Bearer rule can mask it
+    result = falco([frule(name=f"Shell Bearer {token}", desc=None)])
+    assert [f["id"] for f in result["findings"]] == ["falco.missing-field:Shell Bearer [REDACTED]"]
+    assert token not in json.dumps(result)
 
 
 def test_falco_duplicate_rule_names_are_minor_unless_appended():
@@ -2216,3 +2225,10 @@ def test_aggregation_graph_over_the_step_budget_is_refused_with_its_reason():
     refused = call("kpol_rbac_risk_scan", {"roles": roles, "bindings": []})
     assert refused["state"] == "INVALID_INPUT" and refused["field"] == "roles"
     assert "the aggregation graph is too large" in refused["message"]
+
+
+def test_a_credential_pasted_into_a_role_name_is_masked_in_the_finding_id_and_summary():  # thread: _finding copies manifest names
+    token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    result = scan([role(token, [rule(["*"], ["*"], ("*",))])])
+    assert [f["id"] for f in result["findings"]] == ["rbac.admin-equivalent:ClusterRole/[REDACTED]"]
+    assert token not in json.dumps(result)

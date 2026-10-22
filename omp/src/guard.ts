@@ -724,6 +724,8 @@ interface Normalized {
   opaque: boolean;
   /** Its stdin is a pipe: the piece before it ended in `|`/`|&`. */
   piped: boolean;
+  /** A top-level item of a `$(…)`/backtick body in `payload`: it expands before the command's own prefix assignment takes effect. */
+  substitution?: boolean;
 }
 type Compound = "loop" | "if" | "case";
 /** The compound keyword a piece starts with, before prefix stripping. */
@@ -782,7 +784,9 @@ function normalizeSegments(command: string, depth: number, cuts: string[]): Norm
     for (const m of text.matchAll(CUT_TOKEN)) {
       const n = m[1].charCodeAt(0) - 0xe000;
       attached.add(n);
-      if (n < cuts.length) item.payload.push(...normalizeSegments(cuts[n], depth, cuts));
+      if (n < cuts.length) {
+        item.payload.push(...normalizeSegments(cuts[n], depth, cuts).map((sub) => ({ ...sub, substitution: true })));
+      }
     }
   };
   // stdin of the current piece is a pipe: the previous piece ended in `|`/`|&` (a `(`/`{` opener in between keeps it)
@@ -2194,7 +2198,7 @@ const ARGOCD_VERBS: Record<string, { change: RegExp; other: RegExp }> = {
  * (a D-04 marker in an operand or in the value of a destination or selector flag: `--server`, `--dest-namespace`,
  * `--project`, `-l` …) or that prune, force or replace (`--prune`, `--force`, `--replace`, unless `=false`). The verb is
  * the first positional after the group word that is a known verb, so a flag value never stands in for it; `--dry-run` is
- * exempt only as argocd's own flag, and `--help` prints usage. get, list, diff, history, logs, wait and manifests never match.
+ * exempt only as argocd's own flag, and `--help` prints usage. `app actions run` takes the production checks like a sync; get, list, diff, history, logs, wait and manifests never match.
  */
 function argocdChange({ words }: Segment): boolean {
   return eachTool(words, /^argocd$/, (at) => {
@@ -2206,9 +2210,11 @@ function argocdChange({ words }: Segment): boolean {
     const v = positional.findIndex((w, i) => i > g && (verbs.change.test(w) || verbs.other.test(w)));
     // `--dry-run`, `--dry-run=client|server|true` render only; an exemption counts only as argocd's own flag, not as another flag's value
     const dryRun = flags.some((f) => f.flag === "--dry-run" && (f.value === undefined || /^(?:client|server|true)$/.test(f.value)));
-    if (v === -1 || !verbs.change.test(positional[v]) || dryRun) return false;
+    // `app actions run APP ACTION` changes the app's workloads, so it takes the production checks; `app actions list` stays read-only
+    const actionRun = positional[g] === "app" && positional[v] === "actions" && positional[v + 1] === "run";
+    if (v === -1 || dryRun || (!verbs.change.test(positional[v]) && !actionRun)) return false;
     if (["--prune", "--force", "--replace"].some((f) => flagOn(flags, f))) return true;
-    return [...positional.slice(v + 1), ...flagValues(flags, ARGOCD_TARGET_FLAG)].some(prodWord);
+    return [...positional.slice(actionRun ? v + 2 : v + 1), ...flagValues(flags, ARGOCD_TARGET_FLAG)].some(prodWord);
   });
 }
 
@@ -2719,7 +2725,18 @@ function scanNetwork(
     if (item.compound === "loop") {
       state.possible = [...new Set([...state.possible, ...collectWrites(items.slice(i, compoundEnd(items, i) + 1))])];
     }
-    scanNetwork(item.payload, state, out, true);
+    // a substitution expands before the command's own prefix assignment takes effect, so it sees the state the command starts from
+    scanNetwork(
+      item.payload.filter((sub) => sub.substitution === true),
+      state,
+      out,
+      true,
+    );
+    // a child shell (`bash -c`, `sh -c`) inherits the HARDHAT_NETWORK its own prefix assigns, not the parent's state; that value and
+    // the child's writes never persist past the command, so the child is scanned on its own state and nothing merges back
+    const own = prefixNetwork(item.prefix);
+    const inherited = item.payload.filter((sub) => sub.substitution !== true);
+    scanNetwork(inherited, own === undefined ? state : { possible: [own || undefined], unknownWriter: state.unknownWriter }, out, true);
     const marked = `${item.prefix} ${item.text}`;
     const seen = prev === "&&" && succeeded !== undefined ? succeeded : state.possible;
     const nonLocal = seen.some((network) => network !== undefined && !LOCAL_CHAIN_NETWORK.test(network));

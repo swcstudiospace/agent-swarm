@@ -312,6 +312,16 @@ def _position(items, extra, index: int):
     return items[index] if index < len(items) else extra
 
 
+_DRAFT_URI = re.compile(r"https?://json-schema\.org/(draft-0[3467]|draft/(?:2019-09|2020-12))/schema#?\Z")
+
+
+def _draft_identity(declared):
+    """The draft a `$schema` value names. Spellings of one draft (with or without the trailing `#`, http or https) give the same
+    identity; any other value is its own identity, so unrecognised or different drafts stay apart."""
+    match = _DRAFT_URI.match(declared) if isinstance(declared, str) else None
+    return match.group(1) if match else declared
+
+
 class _JsonCompare:
     """Does every instance valid under `sub` stay valid under `sup`? Sound for the supported keyword set: where it cannot
     decide (a keyword in `_UNANALYSED` that differs, a oneOf whose alternatives it cannot prove exclusive, an unresolvable
@@ -418,11 +428,17 @@ class _JsonCompare:
             raise _Bad(self._field(side), f"unsupported JSON Schema type {_safe(declared, 40)!r}")
         return set(names)
 
-    @staticmethod
-    def _same(sub: dict, sup: dict) -> bool:
-        """Both subtrees are textually identical and carry no `$ref` (which may resolve differently on each side)."""
+    def _declared(self, side: str):
+        """The draft identity of the root `$schema` of `side` (see _draft_identity), or None when it declares none."""
+        root = self.roots[side]
+        return _draft_identity(root.get("$schema")) if isinstance(root, dict) else None
+
+    def _same(self, sub: dict, ss: str, sup: dict, ps: str) -> bool:
+        """Both subtrees are textually identical, carry no `$ref` (which may resolve differently on each side), and are read under
+        the same declared draft: identical text means different things under draft 4 and draft 7 (`const`, a boolean
+        `exclusiveMinimum`), so the shortcut is taken only when both roots declare the same `$schema`."""
         text = _canon(sub)
-        return text == _canon(sup) and "$ref" not in text
+        return text == _canon(sup) and "$ref" not in text and self._declared(ss) == self._declared(ps)
 
     def compare(self, sub, sub_side: str, sup, sup_side: str, path: str, out: list) -> None:
         """Every instance valid under `sub` is valid under `sup`; findings cover the parts that are not provably valid. Both
@@ -486,7 +502,7 @@ class _JsonCompare:
                 self.unanalysed.add((path, keyword))
         sub_alts = next((sub[k] for k in ("anyOf", "oneOf") if isinstance(sub.get(k), list)), None)
         if sub_alts is not None:
-            if self._same(sub, sup):
+            if self._same(sub, ss, sup, ps):
                 return
             # the source is the union of its alternatives, and each one keeps the source keywords beside anyOf/oneOf
             beside = self._beside(sub)

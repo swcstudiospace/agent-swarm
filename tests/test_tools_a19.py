@@ -1294,6 +1294,19 @@ def test_schema_compat_oneof_target_must_stay_exclusive():
     assert compat(same, copy.deepcopy(same), "full")["findings"] == []  # an unchanged oneOf is not re-judged
 
 
+def test_schema_compat_unchanged_oneof_is_not_rejudged_when_draft_spellings_are_equivalent():
+    # "draft-07/schema#" and "draft-07/schema" name one draft, so an unchanged oneOf is the same schema and is not re-judged;
+    # genuinely different drafts keep the textual check and are still compared conservatively
+    number_or_integer = {"oneOf": [{"type": "number"}, {"type": "integer"}]}
+    base = {"$schema": "http://json-schema.org/draft-07/schema#", "properties": {"x": number_or_integer}}
+    head = {"$schema": "http://json-schema.org/draft-07/schema", "properties": {"x": copy.deepcopy(number_or_integer)}}
+    assert compat(base, head, "full")["findings"] == []
+    https = {**head, "$schema": "https://json-schema.org/draft-07/schema#"}
+    assert compat(base, https, "full")["findings"] == []
+    other_draft = {**head, "$schema": "http://json-schema.org/draft-04/schema#"}
+    assert compat(base, other_draft, "full")["findings"] != []
+
+
 def test_schema_compat_target_siblings_of_anyof_and_ref_still_apply():
     assert _backward(INT, {"type": "string", "anyOf": [{"minLength": 1}]})["backward_compatible"] is False
     defs = {"$schema": MODERN, "$defs": {"s": STR}}
@@ -1578,6 +1591,18 @@ def test_schema_compat_const_is_not_a_keyword_of_draft_3_or_4():
     assert fx(_backward(base4, head4)) == [("major", "[backward] $: target restricts to an enum but the source accepts any value")]
     assert _backward(head4, base4)["backward_compatible"] is True
     assert _backward({**base4, "$schema": d6}, {**head4, "$schema": d6})["backward_compatible"] is True
+
+
+def test_schema_compat_identical_subtree_under_different_drafts_is_not_shortcut():
+    # draft 4 ignores const, so the draft 4 base accepts {"x": 2} while the draft 7 head rejects it: identical text is not the same schema
+    d4, d7 = "http://json-schema.org/draft-04/schema#", "http://json-schema.org/draft-07/schema#"
+    base = {"$schema": d4, "type": "object", "properties": {"x": {"anyOf": [{"const": 1}]}}}
+    head = {"$schema": d7, "type": "object", "properties": {"x": {"anyOf": [{"const": 1}]}}}
+    result = _backward(base, head)
+    assert result["backward_compatible"] is False
+    assert fx(result) == [("major", "[backward] $.x<alt0>: not accepted by any alternative of the target anyOf/oneOf")]
+    # the same pair under one declared draft is still a shortcut, so the identical union passes
+    assert _backward({**base, "$schema": d7}, head)["backward_compatible"] is True
 
 
 def test_schema_compat_keywords_beside_anyof_apply_to_each_alternative():

@@ -411,6 +411,31 @@ def test_script_findings_never_echo_secret_shaped_values(repo):
         assert secret not in text, secret
 
 
+def test_yaml_constructor_and_recursion_errors_mark_only_that_file_invalid_and_the_scan_continues(repo):
+    # PyYAML's date constructor raises ValueError for 2021-02-30 and its composer raises RecursionError on deep nesting; both used to
+    # escape the per-file path and end the whole scan
+    pytest.importorskip("yaml")
+    put(repo, "events/date.yaml", 'specversion: "1.0"\nid: A\nsource: /s\ntype: a.b\ntime: 2021-02-30\n')
+    put(repo, "events/deep.yaml", "x: " + "[" * 5000 + "]" * 5000 + '\nspecversion: "1.0"\n')
+    put(repo, "events/bad.json", {"specversion": "1.0", "id": "", "source": "/s", "type": "a.b"})
+    code, result = cli(repo)
+    assert code == 1 and result["status"] == "fail"
+    assert ("blocker", "cloudevents", "events/bad.json") in rules(result)
+    summary = next(f["summary"] for f in result["findings"] if f["rule"] == "scan-incomplete")
+    assert "events/date.yaml: not parseable, not analysed" in summary and "events/deep.yaml: not parseable, not analysed" in summary
+
+
+def test_credentialed_mapping_key_is_scrubbed_from_the_finding_location(repo):
+    # the key is a URL with a password; its JSON pointer must not carry the credential, escaped or not
+    key = "https://reader:password@rpc.example"
+    put(repo, "events/wrap.json", {"wrap": {key: {"specversion": "1.0", "id": "", "source": "/s", "type": "a.b"}}})
+    code, result = cli(repo)
+    assert code == 1
+    locations = [f["location"] for f in result["findings"] if f["rule"] == "cloudevents"]
+    assert locations == [f"events/wrap.json#/wrap/<redacted: {len(key)} chars>"]
+    assert "reader:password" not in json.dumps(result)
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
 def test_fifo_named_like_a_json_descriptor_is_skipped_and_the_valid_file_is_still_scanned(tmp_path, repo):
     (repo / "e").mkdir()

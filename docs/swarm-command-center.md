@@ -693,7 +693,7 @@ v2.3 takes the swarm from 15 agents to 30. The runtime of sections 2 to 8 is unc
 
 The new agents' L4 ceilings (a human decides) are: A16 `commitment_or_exit_plan`; A18 `signing_key_change`; A20 `commitment_purchase`; A21 `cluster_delete`; A22 `prod_prune`; A24 `exception_grant`; A25 `dr_failover_prod`; A26 `mainnet_deploy` and `fund_moving`; A27 `accept_risk`; A28 `validator_key_ops`; A30 `key_ceremony` and `fund_moving`.
 
-**Patterns** (`scripts/orch_plan.py`): three new `PATTERNS`, `cloud-native` (16 tasks), `cluster` (12) and `web3` (14), selectable with `--pattern`. The `cluster` and `web3` implementer rows (A22, A26 and A29) are `risk_class` high, so all four gates apply. Blast-radius lanes (`_LANE_AGENTS`) cover 25 agents: every agent except A01, A08, A09, A10 and A12. No new agent owns a gate.
+**Patterns** (`scripts/orch_plan.py`): three new `PATTERNS`, `cloud-native` (16 tasks), `cluster` (14) and `web3` (15), selectable with `--pattern`. The `cluster` and `web3` implementer rows (A22, A26 and A29) are `risk_class` high, so all four gates apply. Blast-radius lanes (`_LANE_AGENTS`) cover 25 agents: every agent except A01, A08, A09, A10 and A12. No new agent owns a gate.
 
 **Guard** (`omp/src/guard.ts`): six `prod_infra` rows for the cluster tooling (`argocd-change`, `flux-change`, `mesh-lifecycle`, `velero-change`, `managed-cluster-lifecycle`, `kubeadm-lifecycle`) and two chain rows (`chain-broadcast`, capability `chain_broadcast`; `chain-key-material`, capability `chain_key_material`). Section 12 lists what each blocks and passes.
 

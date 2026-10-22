@@ -239,6 +239,13 @@ def test_dockerfile_lint_package_cache_rules():
     assert ids(lint(head + "RUN apt-get update\n")) == []
 
 
+def test_dockerfile_lint_package_cache_setting_is_inherited_from_an_in_file_parent_stage():
+    # Docker keeps a parent stage's ENV for its children: PIP_NO_CACHE_DIR set in the base silences the child's pip install
+    head = f"FROM python:3@{DIGEST} AS base\nENV PIP_NO_CACHE_DIR=1\nFROM base\nUSER app\nHEALTHCHECK CMD true\n"
+    assert ids(lint(head + "RUN pip install requests\n")) == []
+    assert ids(lint(f"FROM python:3@{DIGEST} AS base\nFROM base\nUSER app\nHEALTHCHECK CMD true\nRUN pip install requests\n")) == ["docker.pip-cache"]
+
+
 def test_dockerfile_lint_pipe_to_shell_and_credential_urls():
     head = f"FROM alpine:3@{DIGEST}\nUSER app\nHEALTHCHECK CMD true\n"
     assert ids(lint(head + "RUN curl -fsSL https://get.example.com | sh\n")) == ["docker.pipe-to-shell"]
@@ -1936,6 +1943,24 @@ def test_dockerfile_lint_global_arg_defaults_do_not_reach_a_stage_unless_redecla
     assert ids(lint(f"ARG U=1000\nFROM alpine:3@{DIGEST}\nARG U\nUSER ${{U:-0}}\nHEALTHCHECK CMD true\n")) == []
 
 
+def test_dockerfile_lint_substitution_forms_this_reader_does_not_evaluate_are_unresolved():
+    # Docker: ${U:+root} is root when U is set; the reader does not evaluate :+, so the user is unresolved, never a pass
+    unresolved = lint(f"FROM alpine:3@{DIGEST}\nENV U=app\nUSER ${{U:+root}}\nHEALTHCHECK CMD true\n")
+    assert ids(unresolved) == ["docker.final-user-unresolved"] and unresolved["verdict"] == "fail"
+    assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV U=app\nUSER ${{U:-root}}\nHEALTHCHECK CMD true\n")) == []
+
+
+def test_dockerfile_lint_stage_arg_reaches_a_child_stage_through_from():
+    # Docker: a stage's ARG is a build variable of a child that does FROM it, redeclared or not; a global ARG is not (see above)
+    base = f"FROM alpine:3@{DIGEST} AS base\nARG U=root\nFROM base\n"
+    assert ids(lint(base + "USER ${U:-1000}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(base + "ARG U\nUSER ${U:-1000}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(base + "ARG U=app\nUSER ${U:-1000}\nHEALTHCHECK CMD true\n")) == []
+    assert ids(lint(base + "ENV U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
+    assert ids(lint(f"FROM alpine:3@{DIGEST} AS base\nARG U=root\nFROM base AS mid\nFROM mid\nUSER ${{U:-1000}}\nHEALTHCHECK CMD true\n")) == ["docker.final-user-root"]
+    assert ids(lint(f"FROM alpine:3@{DIGEST} AS base\nARG U=root\nFROM scratch\nUSER ${{U:-1000}}\nHEALTHCHECK CMD true\n")) == []
+
+
 def test_dockerfile_lint_env_pairs_of_one_instruction_expand_against_the_earlier_environment():
     # Docker expands every pair of one ENV against the environment from before it: V takes the earlier U=app, not this instruction's root
     assert ids(lint(f"FROM alpine:3@{DIGEST}\nENV U=app\nENV U=root V=$U\nUSER $V\nHEALTHCHECK CMD true\n")) == []
@@ -2009,6 +2034,16 @@ def test_dockerfile_lint_env_inherited_from_an_in_file_parent_stage_takes_preced
     assert ids(two_hops) == ["docker.final-user-root"]
     assert ids(lint(f"FROM alpine@{DIGEST} AS base\nENV U=root\nFROM base\nENV U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
     assert ids(lint(f"FROM alpine@{DIGEST} AS base\nFROM base\nARG U=app\nUSER $U\nHEALTHCHECK CMD true\n")) == []
+
+
+def test_dockerfile_lint_unknown_env_value_is_not_known_empty_for_a_later_default():
+    # `${U:+root}` is a form the reader does not evaluate; Docker sets V to root here, so `${V:-1000}` must not fall back to 1000
+    unknown = lint(f"FROM alpine@{DIGEST}\nENV U=app\nENV V=${{U:+root}}\nUSER ${{V:-1000}}\nHEALTHCHECK CMD true\n")
+    assert ids(unknown) == ["docker.final-user-unresolved"] and unknown["verdict"] == "fail"
+    chained = lint(f"FROM alpine@{DIGEST}\nENV U=app\nENV V=${{U:+root}}\nENV W=${{V:-x}}\nUSER $W\nHEALTHCHECK CMD true\n")
+    assert ids(chained) == ["docker.final-user-unresolved"]
+    # a value that is known to be empty still takes the default, as Docker does
+    assert ids(lint(f"FROM alpine@{DIGEST}\nENV U=\nUSER ${{U:-1000}}\nHEALTHCHECK CMD true\n")) == []
 
 
 def test_bare_userinfo_with_an_empty_user_is_masked():

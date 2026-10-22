@@ -352,6 +352,22 @@ def test_a_crd_and_its_custom_resource_are_checked_even_when_nothing_is_annotate
     assert code == 1 and ids(result) == {"waves:cr-with-crd-same-wave:W/w"}
 
 
+@needs_yaml
+def test_a_base_shared_by_two_namespaced_overlays_keeps_its_objects_in_both_namespaces(tmp_path):
+    put(tmp_path, "root/kustomization.yaml", "resources:\n  - ../red\n  - ../blue\n")
+    put(tmp_path, "red/kustomization.yaml", "namespace: red\nresources:\n  - ../base\n")
+    put(tmp_path, "blue/kustomization.yaml", "namespace: blue\nresources:\n  - ../base\n")
+    put(tmp_path, "base/kustomization.yaml", "resources:\n  - cm.yaml\n  - deploy.yaml\n")
+    put(tmp_path, "base/cm.yaml", f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n  annotations: {{{WAVE}: '1'}}\n")
+    put(tmp_path, "base/deploy.yaml", f"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations: {{{WAVE}: '0'}}\n"
+        "spec:\n  template:\n    spec:\n      volumes:\n        - name: c\n          configMap: {name: cfg}\n"
+        "      containers:\n        - name: web\n          image: ghcr.io/acme/web:1.4.2\n")
+    code, result = scan(tmp_path)
+    assert code == 1
+    # the blue Deployment runs at wave 0 and needs the blue ConfigMap, which the base renders into namespace blue at wave 1
+    assert "waves:dependency-after-workload:Deployment/blue/web:ConfigMap/cfg" in ids(result, "waves")
+
+
 # --- images -----------------------------------------------------------------------------------------------------
 
 
@@ -911,3 +927,41 @@ def test_more_than_500_rendered_items_record_a_reason_and_do_not_pass_silently(t
     code, result = scan(tmp_path)
     assert code == 1 and result["status"] == "fail" and ids(result) == {"scan/incomplete"}
     assert "500" in next(f["summary"] for f in result["findings"] if f["id"] == "scan/incomplete")
+
+
+@needs_yaml
+def test_a_child_namespace_renames_a_namespace_object_so_it_collides_with_the_overlays_namespace(tmp_path):
+    put(tmp_path, "base/kustomization.yaml", "namespace: new\nresources:\n  - ns.yaml\n")
+    put(tmp_path, "base/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata: {name: old}\n")
+    put(tmp_path, "overlay/kustomization.yaml", "resources:\n  - ../base\n  - ns.yaml\n")
+    put(tmp_path, "overlay/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata: {name: new}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and "kustomize:duplicate-resource:Namespace/new" in ids(result, "kustomize")
+
+
+@needs_yaml
+def test_a_patch_target_past_the_500_objects_the_scan_judges_is_unproven_not_missing(tmp_path):
+    put(tmp_path, "k/kustomization.yaml", "resources:\n  - many.yaml\npatches:\n  - target: {kind: ConfigMap, name: c500}\n    patch: |-\n      - op: add\n        path: /data\n        value: {a: b}\n")
+    put(tmp_path, "k/many.yaml", "".join(f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{index}}}\n---\n" for index in range(501)))
+    code, result = scan(tmp_path)
+    assert code == 1 and not any("patch-target-not-found" in fid for fid in ids(result, "kustomize"))
+    assert ids(result) == {"scan/incomplete"}
+
+
+@needs_yaml
+def test_a_component_is_part_of_its_overlays_sync_order(tmp_path):
+    put(tmp_path, "overlay/kustomization.yaml", "resources:\n  - deploy.yaml\ncomponents:\n  - ../comp\n")
+    put(tmp_path, "overlay/deploy.yaml", f"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations: {{{WAVE}: '0'}}\nspec:\n  template:\n    spec:\n      volumes:\n        - name: cfg\n          configMap: {{name: cfg}}\n      containers:\n        - name: web\n          image: ghcr.io/acme/web:1.4.2\n")
+    put(tmp_path, "comp/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\nresources:\n  - cm.yaml\n")
+    put(tmp_path, "comp/cm.yaml", f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n  annotations: {{{WAVE}: '1'}}\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and "waves:dependency-after-workload:Deployment/web:ConfigMap/cfg" in ids(result, "waves")
+
+
+@needs_yaml
+def test_an_overlay_namespace_is_applied_before_the_sync_order_is_checked(tmp_path):
+    put(tmp_path, "overlay/kustomization.yaml", "namespace: shop\nresources:\n  - ns.yaml\n  - deploy.yaml\n")
+    put(tmp_path, "overlay/ns.yaml", f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: shop\n  annotations: {{{WAVE}: '1'}}\n")
+    put(tmp_path, "overlay/deploy.yaml", f"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  annotations: {{{WAVE}: '0'}}\nspec:\n  template:\n    spec:\n      containers:\n        - name: web\n          image: ghcr.io/acme/web:1.4.2\n")
+    code, result = scan(tmp_path)
+    assert code == 1 and "waves:namespace-after-use:Deployment/shop/web" in ids(result, "waves")

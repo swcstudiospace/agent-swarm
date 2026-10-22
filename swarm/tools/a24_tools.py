@@ -29,6 +29,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
+from swarm.redact import REDACTED, redact_text
 from swarm.tools.support import respond
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
@@ -69,7 +70,27 @@ def _dec(value) -> Decimal:
     return Decimal(repr(value))
 
 
+def _public(text: str) -> str:
+    """`text` with credentials replaced by swarm.redact's `[REDACTED]`. A string with no credential comes back unchanged.
+    Otherwise each word is checked alone, as before. A word after an authentication scheme (`Bearer <token>`, `Basic <token>`)
+    is checked together with the scheme: when the pair is a credential, that second word is masked and the scheme is kept.
+    No other pair is joined, so a key-value phrase such as `automountServiceAccountToken: false` is not cut at its colon."""
+    if redact_text(text) == text:
+        return text
+    parts = re.split(r"(\s+)", text)
+    words = parts[0::2]
+    masked = [False] * len(words)
+    for k in range(len(words) - 1):
+        pair = f"{words[k]} {words[k + 1]}"
+        if words[k].lower() in ("bearer", "basic") and redact_text(pair) != pair:
+            masked[k + 1] = True
+    return "".join((REDACTED if masked[i // 2] else redact_text(part)) if i % 2 == 0 else part for i, part in enumerate(parts))
+
+
 def _finding(rule: str, severity: str, location: str, summary: str) -> dict:
+    """A finding. Its location and summary copy names from the manifest, and a name can hold a pasted credential, so both pass
+    through `_public`. The rule id is a fixed identifier and is left as written."""
+    location, summary = _public(location), _public(summary)
     return {"id": f"{rule}:{location}" if location else rule, "severity": severity, "summary": summary}
 
 
